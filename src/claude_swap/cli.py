@@ -973,6 +973,7 @@ Commands:
   %(prog)s alias                      list all aliases
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
+  %(prog)s pin [<num|email>|--clear]  pin remote control / artifacts to an account
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
