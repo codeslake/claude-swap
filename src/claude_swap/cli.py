@@ -216,6 +216,69 @@ Examples:
         sys.exit(130)
 
 
+def _pin_command(argv: list[str]) -> None:
+    """Handle `cswap pin [NUM|EMAIL] [--clear]`.
+
+    Pins Remote Control and Artifacts to one account: sessions launched
+    through cswap route those routes' auth to the pinned account while
+    inference keeps following the active (swapped) account. With no
+    arguments, shows the current pin.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} pin",
+        description=(
+            "[EXPERIMENTAL] Pin Remote Control and Artifacts to one account. "
+            "Inference keeps following the active account; only sessions "
+            "launched via cswap (run/tui) are affected."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap pin 2                # pin RC/artifacts to account 2
+  cswap pin user@example.com
+  cswap pin                  # show the current pin
+  cswap pin --clear          # remove the pin
+        """,
+    )
+    parser.add_argument(
+        "account", nargs="?", metavar="NUM|EMAIL",
+        help="Account to pin (number or email). Omit to show the current pin.",
+    )
+    parser.add_argument("--clear", action="store_true", help="Remove the pin")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.pin_proxy import load_pin, save_pin
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.clear:
+            save_pin(switcher.backup_dir, None, None)
+            print(f"{accent('Unpinned')} remote control / artifacts")
+            return
+        if args.account is None:
+            pin = load_pin(switcher.backup_dir)
+            if pin:
+                print(f"Remote control / artifacts pinned to {pin[0]}")
+            else:
+                print(dimmed("No remote-control pin set"))
+            return
+        account_num, email, org_uuid = switcher.resolve_account(args.account)
+        save_pin(switcher.backup_dir, email, org_uuid)
+        print(
+            f"{accent('Pinned')} remote control / artifacts to "
+            f"Account-{account_num} ({email})"
+        )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
     """Refuse to run as root outside a container (shared by run/map/unmap)."""
     if sys.platform != "win32":
@@ -868,6 +931,9 @@ def main() -> None:
         return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
+        return
+    if argv and argv[0] == "pin":
+        _pin_command(argv[1:])
         return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
