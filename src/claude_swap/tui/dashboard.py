@@ -79,6 +79,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            ("Pin remote control…", "pin-menu"),
             ("Remove account…", "remove-menu"),
             ("Quit", "quit"),
         ]
@@ -115,6 +116,21 @@ class DashboardScreen(Screen):
             entries.append(
                 (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
             )
+        entries.append(_BACK)
+        return entries
+
+    def _pin_entries(self) -> MenuEntries:
+        """One row per account (→ pin RC/artifacts to it), plus clear."""
+        from claude_swap.pin_proxy import load_pin
+
+        pin = load_pin(self.app.switcher.backup_dir)
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            state = "  (pinned)" if pin and pin[0] == acc.email else ""
+            entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
+        entries.append(("Clear pin", "pin:clear"))
         entries.append(_BACK)
         return entries
 
@@ -173,6 +189,25 @@ class DashboardScreen(Screen):
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
+            await self._pop_menu()
+        elif action_id == "pin-menu":
+            await self._push_menu("pin remote control", self._pin_entries())
+        elif action_id.startswith("pin:"):
+            from claude_swap.pin_proxy import save_pin
+
+            target = action_id.split(":", 1)[1]
+            snap = app.snapshot
+            if target == "clear":
+                save_pin(app.switcher.backup_dir, None, None)
+                app.notify("Remote-control pin cleared")
+            else:
+                acc = next(
+                    (a for a in (snap.accounts if snap else ()) if a.number == target),
+                    None,
+                )
+                if acc is not None:
+                    save_pin(app.switcher.backup_dir, acc.email, acc.org_uuid)
+                    app.notify(f"Remote control pinned to {acc.email}")
             await self._pop_menu()
         else:
             actions[action_id]()

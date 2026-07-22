@@ -654,6 +654,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                "pin-menu",
                 "remove-menu",
                 "quit",
             ]
