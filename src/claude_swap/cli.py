@@ -216,6 +216,32 @@ Examples:
         sys.exit(130)
 
 
+def _pin_env_command(argv: list[str]) -> None:
+    """Handle `cswap pin-env` — emit shell exports to route this shell's Claude
+    through the pin proxy, for `eval "$(cswap pin-env)"` in a launcher.
+
+    This is the hook for people who DON'T launch via `cswap run` (they run
+    plain `claude`, often behind their own wrapper). `cswap run`/TUI wire the
+    proxy in-process; a plain `claude` needs its env set by the shell, so the
+    launcher evals this. Emits nothing when no pin is set, the pin is the
+    active account, or the pinned account is gone — so it's always safe to
+    eval unconditionally.
+    """
+    from claude_swap import pin_proxy
+
+    try:
+        switcher = ClaudeAccountSwitcher()
+        pinned = pin_proxy.ensure_proxy(switcher)
+    except ClaudeSwitchError:
+        return  # never break a shell startup over a pin problem
+    if not pinned:
+        return
+    port, ca_path = pinned
+    env = pin_proxy.wire_env({}, port, ca_path, ca_path.parent)
+    for key in ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"):
+        print(f"export {key}={env[key]}")
+
+
 def _pin_command(argv: list[str]) -> None:
     """Handle `cswap pin [NUM|EMAIL] [--clear]`.
 
@@ -931,6 +957,9 @@ def main() -> None:
         return
     if argv and argv[0] == "move":
         _move_command(argv[1:])
+        return
+    if argv and argv[0] == "pin-env":
+        _pin_env_command(argv[1:])
         return
     if argv and argv[0] == "pin":
         _pin_command(argv[1:])
