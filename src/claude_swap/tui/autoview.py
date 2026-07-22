@@ -200,9 +200,28 @@ class AutoScreen(Screen):
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
+        pin_label = self._pinned_rc_label()
+        if pin_label:
+            text.append(" · ")
+            text.append(f"pinned rc: {pin_label}", style=ACCENT)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
+
+    def _pinned_rc_label(self) -> str | None:
+        """`#<slot> <email>` for the remote-control-pinned account, or just the
+        email if no snapshot slot matches, or None when nothing is pinned."""
+        from claude_swap.pin_proxy import load_pin
+
+        pin = load_pin(self.app.switcher.backup_dir)
+        if not pin:
+            return None
+        email = pin[0]
+        snap = self.app.snapshot
+        for acc in (snap.accounts if snap else ()):
+            if acc.email == email:
+                return f"#{acc.number} {email}"
+        return email
 
     # -- engine -------------------------------------------------------------
 
