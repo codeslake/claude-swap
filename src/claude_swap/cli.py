@@ -237,7 +237,11 @@ def _pin_env_command(argv: list[str]) -> None:
     if not pinned:
         return
     port, ca_path = pinned
-    env = pin_proxy.wire_env({}, port, ca_path, ca_path.parent)
+    # Read os.environ so wire_env MERGES any ambient NODE_EXTRA_CA_CERTS (the
+    # CCF/corp bundle) with our CA — the client still blind-tunnels to corp
+    # hosts and must keep trusting their CAs. HTTPS_PROXY is replaced (the pin
+    # proxy chains onward to it).
+    env = pin_proxy.wire_env(dict(os.environ), port, ca_path, ca_path.parent)
     for key in ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"):
         print(f"export {key}={env[key]}")
 
