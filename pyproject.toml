@@ -5,6 +5,7 @@ description = "Multi-account switcher for Claude Code"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=42.0.0",
     "keyring>=25.0.0",
     "textual>=8.2.8,<9",
     "truststore>=0.10.4",
