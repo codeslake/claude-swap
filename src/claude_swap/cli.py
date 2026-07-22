@@ -241,10 +241,21 @@ def _pin_env_command(argv: list[str]) -> None:
     # Read os.environ so wire_env MERGES any ambient NODE_EXTRA_CA_CERTS (the
     # CCF/corp bundle) with our CA — the client still blind-tunnels to corp
     # hosts and must keep trusting their CAs. HTTPS_PROXY is replaced (the pin
-    # proxy chains onward to it).
-    env = pin_proxy.wire_env(dict(os.environ), port, ca_path, ca_path.parent)
+    # proxy chains onward to it). open_refcount=False: the SHELL opens the
+    # refcount fd (below), not this short-lived process.
+    env = pin_proxy.wire_env(
+        dict(os.environ), port, ca_path, ca_path.parent, open_refcount=False
+    )
     for key in ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"):
         print(f"export {key}={env[key]}")
+    # Refcount holder: have the SHELL open a write fd on the FIFO (CCF's
+    # `exec {fd}<>fifo`). O_RDWR (<>) so the open never blocks; the fd is
+    # inherited by the claude the shell launches next and closes when that
+    # session ends, letting the daemon idle-teardown. A missing FIFO (daemon
+    # not up) is skipped without failing the eval.
+    fifo = env.get("CSWAP_PIN_FIFO")
+    if fifo and os.path.exists(fifo):
+        print(f'exec {{__cswap_pin_fd}}<>"{fifo}" 2>/dev/null || true')
 
 
 def _pin_command(argv: list[str]) -> None:
