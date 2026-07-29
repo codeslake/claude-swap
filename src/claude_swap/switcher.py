@@ -161,7 +161,7 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
 # identically (e.g. owned-and-expired means Claude Code will refresh, not that
 # the user must re-login).
 SENTINEL_NOTES = {
-    USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
+    USAGE_TOKEN_EXPIRED: "token expired — auto-refreshing on the next pass (≤1m); no action needed",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
