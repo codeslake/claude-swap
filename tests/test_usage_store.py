@@ -1128,3 +1128,32 @@ class TestFingerprintBoundStrikes:
         self._record_invalid_grant(store, fp=None)
         entry = store.entries({"1": ("a@example.com", "")}, [])["1"]
         assert entry.token_dead(stored_fp="fp-anything") is True
+
+
+class TestStruckFingerprintHygiene:
+    """A new strike must never inherit a stale struckFingerprint from an
+    earlier, already-healed strike: a legacy writer (struck_fp=None) binds
+    unconditionally, and clearing a quarantine drops the fingerprint too."""
+
+    def test_legacy_strike_overwrites_stale_fingerprint(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(["1"], ident)
+        # legacy writer strikes without a fingerprint
+        store.record({"1": FetchRecord(error="invalid_grant")}, ident)
+        entry = store.entries(ident)["1"]
+        assert entry.struck_fingerprint is None
+        # unconditional binding: differs-from-old-fp must NOT heal it
+        assert entry.token_dead(stored_fp="sha256:new")
+
+    def test_clear_dead_token_drops_fingerprint(self, store):
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", struck_fp="sha256:old")},
+            ident,
+        )
+        store.clear_dead_token(["1"], ident)
+        assert store.entries(ident)["1"].struck_fingerprint is None
