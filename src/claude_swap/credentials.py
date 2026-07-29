@@ -82,10 +82,17 @@ class ActiveCredentials(NamedTuple):
     (locked / denied / timeout) and nothing else covered it — letting callers
     distinguish a transiently unreadable Keychain from a genuinely empty slot,
     instead of collapsing both into a misleading "no credentials".
+    ``degraded`` is True whenever the OAuth Keychain read failed, even when a
+    fallback covered it: the bytes served may then be a stale generation (on
+    macOS Claude Code rotates keychain-only, so the plaintext file can lag).
+    A degraded credential may be adopted or served, but its refresh token
+    must never be consumed — POSTing a superseded one-time rt yields
+    invalid_grant and a false dead-token strike on a live account.
     """
 
     value: str | None
     keychain_unavailable: bool
+    degraded: bool = False
 
 
 def looks_like_api_key(credentials: str | None) -> bool:
@@ -370,23 +377,26 @@ class CredentialStore:
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
+        # After a FAILED keychain read this file may hold a stale generation
+        # (CC writes rotations keychain-only on macOS) — the flag travels as
+        # ``degraded`` so consume paths refuse these bytes.
         cred_file = get_credentials_path()
         if cred_file.exists():
             try:
                 text = cred_file.read_text(encoding="utf-8")
             except Exception as e:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
-                return ActiveCredentials(None, False)
+                return ActiveCredentials(None, False, keychain_failed)
             if text.strip():
-                return ActiveCredentials(text, False)
+                return ActiveCredentials(text, False, keychain_failed)
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
         if key:
-            return ActiveCredentials(key, False)
+            return ActiveCredentials(key, False, keychain_failed)
         # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
         # UI distinguishes it from a real empty slot.
-        return ActiveCredentials("", keychain_failed)
+        return ActiveCredentials("", keychain_failed, keychain_failed)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -876,6 +886,33 @@ class CredentialStore:
             except macos_keychain.KEYCHAIN_ERRORS as e:
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
+
+    def _read_account_credentials_ex(
+        self, account_num: str, email: str
+    ) -> tuple[str, bool]:
+        """Backup read with an unreadable-vs-absent verdict.
+
+        Returns ``(value, unreadable)``. ``unreadable`` is True only when the
+        ``.enc`` had nothing AND the macOS Keychain read *raised* (locked /
+        denied / timeout) — the backup may exist but cannot be seen right
+        now. A genuinely absent backup (no .enc, keychain answered "not
+        found") reads as ``("", False)``. Callers use the distinction to say
+        "keychain unavailable — retry from a GUI session" instead of
+        nudging the user into an unnecessary re-add/re-login.
+        """
+        value = self._read_account_credentials(account_num, email)
+        if value:
+            return value, False
+        if self._host.platform != Platform.MACOS:
+            return "", False
+        # The read above already consulted the Keychain; a raising read
+        # flipped the capability cache to file mode, while an rc-44
+        # "not found" answered cleanly and left it usable. A cache pinned
+        # False (now or by an earlier op) means the Keychain cannot be
+        # asked — the backup may exist unseen, so report unreadable.
+        if self._keychain_usable_cache is False:
+            return "", True
+        return "", False
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
