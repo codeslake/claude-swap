@@ -556,10 +556,16 @@ def try_fetch_usage_for_account(
     credentials: str,
     is_active: bool,
     persist_credentials: Callable[[str, str, str], None] | None = None,
+    refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
+    ``refresh_via(account_num, email, snapshot)`` supersedes the direct POST
+    when given: the switcher passes its consume gate, which re-reads the
+    freshest copy under the slot lock, persists via fingerprint CAS, and
+    never consumes a superseded snapshot. ``persist_credentials`` is then
+    unused for the refresh (the gate persists internally).
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -574,10 +580,14 @@ def try_fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
-        refresh = try_refresh_oauth_credentials(working_credentials)
+        if refresh_via is not None:
+            refresh = refresh_via(account_num, email, working_credentials)
+        else:
+            refresh = try_refresh_oauth_credentials(working_credentials)
         if refresh.credentials:
             working_credentials = refresh.credentials
-            _persist(persist_credentials, account_num, email, working_credentials)
+            if refresh_via is None:
+                _persist(persist_credentials, account_num, email, working_credentials)
             oauth = extract_oauth_data(working_credentials) or oauth
             access_token = oauth.get("accessToken") or access_token
         elif refresh.error == "invalid_grant":
@@ -608,14 +618,18 @@ def try_fetch_usage_for_account(
         # is permanently dead — surface it distinctly (not the generic
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
-        refresh = try_refresh_oauth_credentials(working_credentials)
+        if refresh_via is not None:
+            refresh = refresh_via(account_num, email, working_credentials)
+        else:
+            refresh = try_refresh_oauth_credentials(working_credentials)
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error == "invalid_grant"
             return UsageOutcome(None, error="invalid_grant" if dead else "refresh-failed")
 
         working_credentials = refresh.credentials
-        _persist(persist_credentials, account_num, email, working_credentials)
+        if refresh_via is None:
+            _persist(persist_credentials, account_num, email, working_credentials)
         refreshed_oauth = extract_oauth_data(working_credentials)
         new_token = refreshed_oauth.get("accessToken") if refreshed_oauth else None
         if not new_token:

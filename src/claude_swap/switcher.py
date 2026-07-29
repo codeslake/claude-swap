@@ -1739,6 +1739,111 @@ class ClaudeAccountSwitcher:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
 
+    def consume_backup_grant(
+        self, account_num: str, email: str, snapshot: str
+    ) -> "oauth.RefreshOutcome":
+        """The single gate through which a backup refresh token is consumed.
+
+        A refresh token is one-time-use, so the POST must consume the
+        provably-freshest copy of the slot's grant — never a caller's
+        snapshot, which may be a superseded generation (rotation landed
+        between the caller's read and this call; a dead ``cswap run``
+        session rotated inside its profile — #96's shape). Sequence:
+
+        1. Under the slot ``FileLock``: re-read the backup, and consult the
+           session profile when no live session owns it — a profile
+           credential on a *different* lineage with a strictly newer
+           ``expiresAt`` supersedes the backup (the backup rt is the
+           consumed predecessor by construction), so it is resynced into
+           the backup and becomes the refresh input.
+        2. Outside the lock: POST the re-read bytes (network never runs
+           under locks; the refresh has its own bounded timeout).
+        3. Reacquire the lock and compare-and-swap on the refresh-token
+           fingerprint: if the store still holds the lineage we consumed,
+           persist the successor. If a writer moved it mid-flight, the
+           successor is stashed as an unclaimed credential (a consumed
+           generation is never discarded) and the store's newer lineage is
+           adopted as the outcome.
+
+        Returns a ``RefreshOutcome``: ``credentials`` is the slot's
+        now-current credential on success (ours, or a racing writer's
+        adopted newer lineage); ``error`` carries the refresh failure
+        (``invalid_grant`` / ``no_refresh_token`` / transient) unchanged.
+        The caller must NOT hold ``self.lock_file`` (non-reentrant).
+        """
+        from claude_swap.session import (
+            read_session_credentials,
+            session_dir_for,
+            session_identity_drifted,
+        )
+
+        with FileLock(self.lock_file):
+            current = self._read_account_credentials(account_num, email)
+            refresh_input = current or snapshot
+            input_oauth = oauth.extract_oauth_data(refresh_input)
+            # Session-profile precedence: only when no live session owns the
+            # profile (a live claude rotates its own tokens — #97's rule) and
+            # the profile identity still matches the slot.
+            if not self._live_session_pids(account_num, email):
+                sdir = session_dir_for(self.backup_dir, account_num, email)
+                profile = read_session_credentials(sdir)
+                if profile and not session_identity_drifted(
+                    sdir, email, ""
+                ):
+                    prof_oauth = oauth.extract_oauth_data(profile)
+                    cur_exp = (input_oauth or {}).get("expiresAt") or 0
+                    prof_exp = (prof_oauth or {}).get("expiresAt") or 0
+                    if (
+                        prof_oauth
+                        and prof_oauth.get("accessToken")
+                        and prof_oauth.get("refreshToken")
+                        and oauth.credential_fingerprint(profile)
+                        != oauth.credential_fingerprint(refresh_input)
+                        and prof_exp > cur_exp
+                    ):
+                        # The profile holds the newer generation: the backup
+                        # rt is already consumed. Resync so the slot's stored
+                        # credential is the live lineage, then consume THAT.
+                        self._write_account_credentials(
+                            account_num, email, profile
+                        )
+                        refresh_input = profile
+            consumed_fp = oauth.credential_fingerprint(refresh_input)
+
+        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        if result.error is not None or not result.credentials:
+            return result
+
+        with FileLock(self.lock_file):
+            store_now = self._read_account_credentials(account_num, email)
+            store_fp = oauth.credential_fingerprint(store_now)
+            if store_now and store_fp != consumed_fp:
+                # A writer replaced the lineage while our POST was in
+                # flight. Never discard a consumed generation: stash our
+                # successor, adopt the store's newer credential.
+                self._store._write_unclaimed_credential(
+                    result.credentials,
+                    {
+                        "reason": "consume-gate-cas-conflict",
+                        "configSlot": account_num,
+                        "fingerprint": oauth.credential_fingerprint(
+                            result.credentials
+                        ),
+                    },
+                )
+                self._logger.warning(
+                    "Backup lineage for account %s moved during a refresh "
+                    "POST; successor stashed, adopting the newer store "
+                    "credential.", account_num,
+                )
+                return oauth.RefreshOutcome(
+                    store_now, None, result.token_account
+                )
+            self._write_account_credentials(
+                account_num, email, result.credentials
+            )
+        return result
+
     def list_unclaimed_credentials(self) -> dict[str, dict]:
         """Internal safety copies preserved at switch time (diagnostics only).
 
@@ -3474,6 +3579,9 @@ class ClaudeAccountSwitcher:
             str(num), email, creds,
             is_active=has_live_session,
             persist_credentials=persist,
+            refresh_via=(
+                None if has_live_session else self.consume_backup_grant
+            ),
         )
         return FetchRecord(
             usage=outcome.usage,

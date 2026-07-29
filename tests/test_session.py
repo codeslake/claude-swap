@@ -152,13 +152,20 @@ def auth_status_tracks_seed(monkeypatch):
 
 @pytest.fixture
 def refresh_rotates(monkeypatch):
+    """Track consume-gate calls; the gate persists ROTATED_CREDS like the
+    real one does (bootstrap re-reads the backup afterwards)."""
     calls: list[str] = []
 
-    def fake_refresh(creds: str) -> str:
-        calls.append(creds)
-        return ROTATED_CREDS
+    def fake_gate(self, account_num: str, email: str, snapshot: str):
+        from claude_swap import oauth as oauth_mod
+        calls.append(snapshot)
+        self._write_account_credentials(account_num, email, ROTATED_CREDS)
+        return oauth_mod.RefreshOutcome(ROTATED_CREDS, None)
 
-    monkeypatch.setattr(session_mod, "refresh_oauth_credentials", fake_refresh)
+    from claude_swap.switcher import ClaudeAccountSwitcher
+    monkeypatch.setattr(
+        ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
+    )
     return calls
 
 
@@ -1374,7 +1381,7 @@ class TestGuards:
         make_live(session_dir)
         seen: dict[str, bool] = {}
 
-        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None):
+        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
             seen[num] = is_active
             return oauth.UsageOutcome(None)
 
@@ -2063,3 +2070,64 @@ class TestCaptureCredentials:
             switcher.add_account()
 
         assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
+
+class TestBootstrapRefreshRoutesThroughGate:
+    """M2: the session-profile bootstrap refresh consumes the backup rt via
+    the switcher's consume gate, not a direct POST of its own read."""
+
+    def test_bootstrap_uses_gate(self, temp_home, monkeypatch):
+        from claude_swap import oauth as oauth_mod
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._init_sequence_file()
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-o", "refreshToken": "rt-o",
+                "expiresAt": 1000,
+            }
+        })
+        s._write_account_credentials("1", "a@example.com", expired)
+        s._write_account_config("1", "a@example.com", json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com"},
+        }))
+        data = s._get_sequence_data()
+        data["accounts"]["1"] = {"email": "a@example.com", "uuid": "u1",
+                                 "organizationUuid": "", "organizationName": ""}
+        data["sequence"] = [1]
+        s._write_json(s.sequence_file, data)
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-f", "refreshToken": "rt-f",
+                "expiresAt": 9999999999000,
+            }
+        })
+        gate = {}
+
+        def mock_gate(num, email, snapshot):
+            gate["args"] = (num, email)
+            return oauth_mod.RefreshOutcome(fresh, None)
+
+        monkeypatch.setattr(s, "consume_backup_grant", mock_gate)
+        direct = {}
+
+        def direct_post(credentials):
+            direct["called"] = True
+            return None
+
+        monkeypatch.setattr(
+            "claude_swap.session.refresh_oauth_credentials", direct_post
+        )
+        from claude_swap.session import SessionManager
+        mgr = SessionManager(s)
+        # run() is the seam: it must call the gate BEFORE the bootstrap
+        # lock (the gate takes the same non-reentrant FileLock). exec is
+        # stubbed out; we only need the profile-preparation phase.
+        monkeypatch.setattr(mgr, "_exec", lambda *a, **k: None)
+        try:
+            mgr.run("1", [])
+        except Exception:
+            pass  # profile validation may fail in this stub env — the
+                  # assertion below is about the gate routing only
+        assert gate.get("args") == ("1", "a@example.com")
+        assert "called" not in direct
