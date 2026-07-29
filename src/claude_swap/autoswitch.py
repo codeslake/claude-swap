@@ -1046,21 +1046,15 @@ class AutoSwitchEngine:
                 continue
             return self._perform(num, email, trigger)
 
-        if store_unmirrored:
+        if store_unmirrored or transient_failure:
             self._emit(
                 ErrorEvent(
                     message=(
                         "could not freshen: CLAUDE_SECURESTORAGE_CONFIG_DIR "
                         "is set — unset it or run cswap from a normal shell"
+                        if store_unmirrored
+                        else "could not freshen any candidate (network?)"
                     ),
-                    transient=True,
-                )
-            )
-            return TickOutcome.ERROR
-        if transient_failure:
-            self._emit(
-                ErrorEvent(
-                    message="could not freshen any candidate (network?)",
                     transient=True,
                 )
             )
