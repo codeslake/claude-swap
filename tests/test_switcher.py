@@ -8612,3 +8612,47 @@ class TestInactiveRefreshRoutesThroughGate:
         assert gate["args"] == ("2", "b@example.com")
         assert "called" not in direct
         assert record.error is None
+
+
+class TestStrikeUnbindsInCollector:
+    """M3: the collector's quarantine scan passes the stored credential's
+    fingerprint — a replaced credential lifts 're-login needed' without a
+    clear call."""
+
+    def test_relogin_lifts_after_credential_replaced(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        from claude_swap.usage_store import FetchRecord as StoreRecord
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt-dead",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", dead)
+        # strike the dead generation (fp recorded)
+        identities = {"2": ("b@example.com", "")}
+        store = s._usage_store
+        claims = store.reserve(["2"], identities, respect_plans=False)
+        store.record(
+            {"2": StoreRecord(error="invalid_grant",
+                              struck_fp=oauth.credential_fingerprint(dead))},
+            identities, claims,
+        )
+        info = [(2, "b@example.com", "", "", False, dead, "")]
+        entries = s._collect_usage_entries(info, fetch=set())
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+        # replace the credential (fresh lineage) — quarantine must lift
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", fresh)
+        info = [(2, "b@example.com", "", "", False, fresh, "")]
+        entries = s._collect_usage_entries(info, fetch=set())
+        assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED
