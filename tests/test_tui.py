@@ -1710,3 +1710,19 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestAutoStartLive:
+    """autoStartLive: a confirmed Go-live persists; a restarted TUI resumes
+    the auto view with the engine LIVE instead of re-asking."""
+
+    def test_setting_roundtrip(self, tmp_path):
+        from claude_swap.settings import load_settings, set_setting
+        set_setting(tmp_path, "autoswitch.autoStartLive", "true")
+        assert load_settings(tmp_path).auto_start_live is True
+        set_setting(tmp_path, "autoswitch.autoStartLive", "false")
+        assert load_settings(tmp_path).auto_start_live is False
+
+    def test_default_off(self, tmp_path):
+        from claude_swap.settings import load_settings
+        assert load_settings(tmp_path).auto_start_live is False

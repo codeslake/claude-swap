@@ -111,7 +111,9 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        # autoStartLive records a prior confirmed "Go live" — resume LIVE
+        # without re-asking; otherwise the safe default, dry-run.
+        self._start_engine(dry_run=not self._settings.auto_start_live)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -262,11 +264,25 @@ class AutoScreen(Screen):
                 self._on_live_confirm,
             )
         else:
+            self._persist_auto_start_live(False)
             self._restart_engine(dry_run=True)
 
     def _on_live_confirm(self, confirmed: bool | None) -> None:
         if confirmed:
+            self._persist_auto_start_live(True)
             self._restart_engine(dry_run=False)
+
+    def _persist_auto_start_live(self, live: bool) -> None:
+        """Remember the confirmed mode so a restarted TUI resumes it."""
+        from claude_swap.settings import set_setting
+        try:
+            set_setting(
+                self.app.switcher.backup_dir,
+                "autoswitch.autoStartLive", "true" if live else "false",
+            )
+            self._settings = replace(self._settings, auto_start_live=live)
+        except Exception:
+            pass  # a failed persist must never block the toggle itself
 
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
