@@ -1777,6 +1777,21 @@ class ClaudeAccountSwitcher:
             session_identity_drifted,
         )
 
+        # Store-resolution parity: CC ≥2.1.220 honors
+        # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store; cswap
+        # does not mirror that resolution yet. Consuming a grant read from
+        # the DEFAULT store while CC reads/writes the redirected one is the
+        # stale-copy failure class by construction — refuse (transient, so
+        # nothing strikes) rather than operate on a store CC left behind.
+        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+            self._logger.warning(
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR is set but not mirrored by "
+                "cswap; refusing to consume account %s's refresh token "
+                "(unset the variable or run from a normal shell).",
+                account_num,
+            )
+            return oauth.RefreshOutcome(None, "transient")
+
         with FileLock(self.lock_file):
             current = self._read_account_credentials(account_num, email)
             refresh_input = current or snapshot
@@ -2744,6 +2759,26 @@ class ClaudeAccountSwitcher:
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
         the TUI, which collects confirmation before calling).
         """
+        # A CLAUDE_CONFIG_DIR pointing inside a cswap run session profile
+        # means this shell IS a session — its "live store" is the profile,
+        # not the default login. Switching from here would splice the
+        # default sequence against the wrong live store (mirrors the guard
+        # SessionManager applies on the run path).
+        cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if cfg_dir:
+            try:
+                Path(cfg_dir).resolve().relative_to(
+                    (self.backup_dir / "sessions").resolve()
+                )
+            except ValueError:
+                pass
+            else:
+                raise SwitchError(
+                    "This shell is inside a cswap run session profile "
+                    "(CLAUDE_CONFIG_DIR points at it). Switching here would "
+                    "operate on the wrong live store — unset CLAUDE_CONFIG_DIR "
+                    "or run from a normal shell."
+                )
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -4763,6 +4798,26 @@ class ClaudeAccountSwitcher:
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
         """
+        # A CLAUDE_CONFIG_DIR pointing inside a cswap run session profile
+        # means this shell IS a session — its "live store" is the profile,
+        # not the default login. Switching from here would splice the
+        # default sequence against the wrong live store (mirrors the guard
+        # SessionManager applies on the run path).
+        cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        if cfg_dir:
+            try:
+                Path(cfg_dir).resolve().relative_to(
+                    (self.backup_dir / "sessions").resolve()
+                )
+            except ValueError:
+                pass
+            else:
+                raise SwitchError(
+                    "This shell is inside a cswap run session profile "
+                    "(CLAUDE_CONFIG_DIR points at it). Switching here would "
+                    "operate on the wrong live store — unset CLAUDE_CONFIG_DIR "
+                    "or run from a normal shell."
+                )
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
