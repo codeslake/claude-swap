@@ -402,9 +402,15 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
+        # The switch and watch screens render through here, so without this
+        # the ☁ marker showed only on the dashboard — and those two are
+        # exactly where you compare accounts and would want to know which one
+        # owns the claude.ai side.
+        pinned_email = _cloud_pinned_email(self.app)
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
+            cloud_pinned=bool(pinned_email and self._acc.email == pinned_email),
         )
 
 

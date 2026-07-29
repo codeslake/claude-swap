@@ -1739,6 +1739,40 @@ class TestCloudPinBadge:
         card = account_card_text(make_account(1), 80).plain
         assert "cloud" not in card
 
+    def test_account_card_widget_passes_the_pin_through(self, monkeypatch):
+        """The switch and watch screens render through AccountCard, not the
+        dashboard's panel. It used to drop cloud_pinned, so the badge showed
+        only on the dashboard — measured live: a pinned account looked
+        unpinned on both of the screens where you compare accounts."""
+        from claude_swap.tui import widgets
+
+        acc = make_account(1)
+        monkeypatch.setattr(widgets, "_cloud_pinned_email", lambda app: acc.email)
+
+        seen = {}
+
+        def spy(account, width, **kw):
+            seen.update(kw)
+            return widgets.Text("")
+
+        monkeypatch.setattr(widgets, "account_card_text", spy)
+
+        # size/app are read-only properties on the real widget.
+        monkeypatch.setattr(
+            widgets.AccountCard, "size",
+            property(lambda self: type("S", (), {"width": 80})()),
+        )
+        monkeypatch.setattr(
+            widgets.AccountCard, "app",
+            property(lambda self: type("A", (), {"current_theme": "dark"})()),
+        )
+        monkeypatch.setattr(widgets.Palette, "from_theme", staticmethod(
+            lambda theme: widgets.Palette.DARK
+        ))
+        widgets.AccountCard(acc).render()
+
+        assert seen.get("cloud_pinned") is True
+
     def test_active_and_pinned_can_coexist(self):
         from claude_swap.tui.widgets import account_card_text
 
