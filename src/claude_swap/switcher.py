@@ -3155,13 +3155,38 @@ class ClaudeAccountSwitcher:
                         ):
                             # Permanently unrefreshable: dead lineage or a
                             # credential with no refresh token at all.
-                            # Surface it as an ERROR so the store advances
-                            # auth strikes, applies backoff, and the
-                            # quarantine scan flips the account to
-                            # "re-login needed" — a bare sentinel is a no-op
-                            # to the store and would re-POST every pass.
+                            # Demotion check before condemning: re-read the
+                            # POSTed source — a lineage that moved while our
+                            # POST was in flight means we consumed a
+                            # superseded copy (a writer raced us), which is
+                            # evidence about OUR bytes, not the slot.
+                            # Record transient; the next pass consumes the
+                            # newer lineage. (#121 discipline: local reads
+                            # only, no network, failure degrades to today.)
+                            try:
+                                now_live = self._read_credentials() or ""
+                                moved = (
+                                    oauth.credential_fingerprint(now_live)
+                                    != oauth.credential_fingerprint(
+                                        refresh_input
+                                    )
+                                    and bool(now_live)
+                                )
+                            except Exception:
+                                moved = False
+                            if moved:
+                                return FetchRecord(error="refresh-failed")
+                            # Surface as an ERROR so the store advances auth
+                            # strikes, applies backoff, and the quarantine
+                            # scan flips the account to "re-login needed" —
+                            # a bare sentinel is a no-op to the store and
+                            # would re-POST every pass. The strike binds to
+                            # the consumed generation's fingerprint.
                             return FetchRecord(
-                                error=result.error or "invalid_grant"
+                                error=result.error or "invalid_grant",
+                                struck_fp=oauth.credential_fingerprint(
+                                    refresh_input
+                                ),
                             )
                         if result.error is not None:
                             # Transient (network) failure: backoff via store.
@@ -3501,6 +3526,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            struck_fp=outcome.struck_fp,
         )
 
     def _run_usage_fetches(
@@ -3562,7 +3588,9 @@ class ClaudeAccountSwitcher:
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
         for num in info_by_num:
-            if num not in sentinels and entries[num].token_dead():
+            if num not in sentinels and entries[num].token_dead(
+                stored_fp=oauth.credential_fingerprint(info_by_num[num][5])
+            ):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
         requested = [
             num
@@ -3624,7 +3652,11 @@ class ClaudeAccountSwitcher:
             # so surface "re-login needed" in *this* pass instead of leaving the
             # slot looking merely refresh-failed until the next refresh notices.
             for num in accepted:
-                if entries[num].token_dead():
+                if entries[num].token_dead(
+                    stored_fp=oauth.credential_fingerprint(
+                        info_by_num[num][5]
+                    )
+                ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
         return {

@@ -105,11 +105,18 @@ def try_refresh_oauth_credentials(
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
     """
+    # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
+    # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
+    # genuinely missing the field. An unparseable or non-dict blob is more
+    # likely a torn/partial read than a real credential shape — transient:
+    # the next pass re-reads and either succeeds or sees the true shape.
     try:
         data = json.loads(credentials)
     except json.JSONDecodeError:
-        return RefreshOutcome(None, "no_refresh_token")
-    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+        return RefreshOutcome(None, "transient")
+    if not isinstance(data, dict):
+        return RefreshOutcome(None, "transient")
+    oauth = data.get("claudeAiOauth")
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
 
@@ -151,10 +158,25 @@ def try_refresh_oauth_credentials(
         # an explicit marker in the body. Anything ambiguous stays transient —
         # a misclassified transient costs one retry, a misclassified permanent
         # would wrongly quarantine a live token.
-        if e.code in (400, 401, 403) and (
-            "invalid_grant" in body or "invalid_client" in body
-        ):
-            return RefreshOutcome(None, "invalid_grant")
+        if e.code in (400, 401, 403):
+            # RFC 6749 §5.2: the verdict is the top-level ``error`` member of
+            # the JSON body. A substring scan misclassifies — the marker can
+            # appear inside another envelope's detail text, and a dead-token
+            # verdict at AUTH_DEAD_STRIKES=1 quarantines the slot on the
+            # spot. Unparseable bodies stay transient (a misclassified
+            # transient costs one retry; a misclassified permanent wrongly
+            # quarantines a live token).
+            try:
+                err = json.loads(body).get("error")
+            except (ValueError, AttributeError):
+                err = None
+            if err == "invalid_grant":
+                return RefreshOutcome(None, "invalid_grant")
+            if err == "invalid_client":
+                # OUR client credential is rejected — a systemic condition
+                # (client_id rotated/blocked), not evidence any slot's
+                # refresh token is dead. Distinct kind so no strike lands.
+                return RefreshOutcome(None, "invalid_client")
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
@@ -537,6 +559,10 @@ class UsageOutcome:
     usage: dict | None
     error: str | None = None
     retry_after_s: float | None = None
+    # Fingerprint of the credential whose rt was POSTed when error is a
+    # permanent auth kind — lets the store bind the strike to that
+    # generation (see usage_store.FetchRecord.struck_fp).
+    struck_fp: str | None = None
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -595,7 +621,10 @@ def try_fetch_usage_for_account(
             # Don't hit the usage endpoint with a token we know is expired
             # (that just adds a 401/429 to a lost cause): report the permanent
             # failure distinctly so the store can quarantine the account.
-            return UsageOutcome(None, error="invalid_grant")
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
@@ -625,7 +654,14 @@ def try_fetch_usage_for_account(
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error == "invalid_grant"
-            return UsageOutcome(None, error="invalid_grant" if dead else "refresh-failed")
+            return UsageOutcome(
+                None,
+                error="invalid_grant" if dead else "refresh-failed",
+                struck_fp=(
+                    credential_fingerprint(working_credentials)
+                    if dead else None
+                ),
+            )
 
         working_credentials = refresh.credentials
         if refresh_via is None:
