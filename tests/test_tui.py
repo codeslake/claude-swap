@@ -1803,6 +1803,57 @@ class TestCloudPinMenuLabel:
 
         assert cloud_menu_label(None) == "Cloud account (RC/artifacts)… — none"
 
+    def test_root_menu_refreshes_when_the_pin_changes_outside(self, monkeypatch):
+        """The pin can change from another process (`cswap pin` over ssh).
+        Menu entries are built once and frozen into the stack, so the row went
+        stale while the account list — snapshot-driven — showed the new pin:
+        one screen disagreeing with itself. Reported on wmac."""
+        from claude_swap.tui import dashboard
+
+        pin = {"email": None}
+        monkeypatch.setattr(
+            dashboard, "_current_pin_email", lambda screen: pin["email"]
+        )
+
+        screen = dashboard.DashboardScreen()
+        rendered: list = []
+
+        async def fake_render():
+            rendered.append(list(screen._menu_stack[-1][1]))
+
+        screen._render_menu = fake_render
+        screen.query_one = lambda *a, **k: type(
+            "LV", (), {"index": 0, "focus": lambda s: None}
+        )()
+
+        screen._menu_stack = [("menu", screen._root_entries())]
+        assert any("— none" in label for label, _ in screen._menu_stack[0][1])
+
+        pin["email"] = "codeslake@gmail.com"
+        import asyncio
+        asyncio.run(screen._refresh_root_menu(None))
+
+        labels = [label for label, _ in screen._menu_stack[0][1]]
+        assert any("codeslake@gmail.com" in x for x in labels), labels
+        assert rendered, "the menu was not re-rendered"
+
+    def test_root_menu_not_rebuilt_inside_a_submenu(self, monkeypatch):
+        """Re-rendering while the user is inside a submenu would yank the list
+        out from under them."""
+        from claude_swap.tui import dashboard
+
+        monkeypatch.setattr(dashboard, "_current_pin_email", lambda s: "x@y.z")
+        screen = dashboard.DashboardScreen()
+        touched = []
+        async def fake_render():
+            touched.append(1)
+        screen._render_menu = fake_render
+        screen._menu_stack = [("menu", []), ("cloud account", [])]
+
+        import asyncio
+        asyncio.run(screen._refresh_root_menu(None))
+        assert not touched, "rebuilt the menu while a submenu was open"
+
 
 class TestCloudPinBadgeOnMiniLine:
     """Inactive accounts render as one-line minis on the dashboard. The pin

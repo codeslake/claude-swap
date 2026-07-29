@@ -90,6 +90,32 @@ class DashboardScreen(Screen):
     async def on_mount(self) -> None:
         self.query_one("#menu", ListView).focus()
         await self._push_menu("menu", self._root_entries())
+        # The cloud row names the pinned account, and the pin can change from
+        # outside this process (`cswap pin` over ssh, another terminal). Menu
+        # entries are built once and frozen into the stack, so without this the
+        # account list would show the new pin while the row still read "none" —
+        # one screen disagreeing with itself. Re-read on the same beat the
+        # accounts panel refreshes on.
+        self.watch(self.app, "snapshot", self._refresh_root_menu)
+
+    async def _refresh_root_menu(self, _snap: AccountsSnapshot | None) -> None:
+        """Rebuild the root menu when a stale label would otherwise linger.
+
+        Only at the root, and only when a label actually changed: re-rendering
+        while the user is inside a submenu would yank the list out from under
+        them, and rebuilding unconditionally resets the cursor to the top on
+        every poll.
+        """
+        if len(self._menu_stack) != 1:
+            return
+        fresh = self._root_entries()
+        if fresh == self._menu_stack[0][1]:
+            return
+        self._menu_stack[0] = (self._menu_stack[0][0], fresh)
+        keep = self.query_one("#menu", ListView).index
+        await self._render_menu()
+        if keep is not None and keep < len(fresh):
+            self.query_one("#menu", ListView).index = keep
 
     # -- menu plumbing --------------------------------------------------------
 
