@@ -1,25 +1,38 @@
 """Cadence policy for the ``/api/oauth/usage`` endpoint — every number in one place.
 
-The endpoint enforces a per-access-token budget on non-first-party clients:
-a **rolling ~60-minute window of ~28-30 requests per token × UA-class**
-(measured 2026-07-11, probe3, two runs: a rested token admitted 30 requests
-before the first 429; the post-drain 429 oscillation ended exactly when the
-drain burst aged 60 minutes; steady 1/180 s polling then ran 96 minutes from
-a rested window with zero 429s). It is NOT a bucket with a refill rate:
-capacity returns only as old requests age out of the trailing hour, so a
-burst saturates the token for up to a full hour — pausing does not restore
-headroom early, and earlier "refill rate" estimates were artifacts of
-measuring while saturated. Error bars: the horizon is bracketed to ~55-64
-minutes from a single transition event, the exact edge algorithm (likely a
-Cloudflare sliding-window approximation) is undocumented, and Anthropic can
-retune it any day — so the constants below lean only on the robust parts:
-a sustained rate safely under the cap, and an ~hour recovery horizon. The
-budget target is an **average of at most ~1 request / 3 minutes per token**
-(20/hour vs the ~28-30/hour cap), leaving ~8-10 requests/hour of headroom
-for manual commands, wake-from-sleep catch-up, and the bounded urgent mode
-below. Health invariant to watch in the logs: steady state shows zero
-http-429, and any post-burst 429 clears within ≤60 minutes — an episode
-outlasting an hour at modest rates means this model needs revisiting.
+The endpoint enforces a budget on non-first-party clients: a **~60-minute
+window of ~28-30 requests per identity × UA-class** (measured 2026-07-11,
+probe3, two runs: a rested identity admitted 30 requests before the first
+429; the post-drain 429 oscillation ended exactly when the drain burst aged
+60 minutes; steady 1/180 s polling then ran 96 minutes from a rested window
+with zero 429s). It is NOT a bucket with a refill rate: capacity returns
+only as old requests age out of the trailing hour, so a burst saturates the
+identity for up to a full hour — pausing does not restore headroom early,
+and earlier "refill rate" estimates were artifacts of measuring while
+saturated.
+
+The identity is the **account/org, not the access token** (corrected
+2026-07-28: a freshly minted token was blocked 135 s after issue, which a
+per-token counter cannot produce). So re-authenticating does not clear a
+block, and two machines holding different tokens for one account share one
+budget — which is what ``POST_429_BACKOFF_MULT`` below exists to converge.
+
+Error bars: the horizon is bracketed to ~55-64 minutes from a single
+transition event, the exact edge algorithm (likely a Cloudflare
+sliding-window approximation) is undocumented, and Anthropic can retune it
+any day — so the constants below lean only on the robust parts: a sustained
+rate safely under the cap, and an ~hour recovery horizon. The budget target
+is an **average of at most ~1 request / 3 minutes** (20/hour vs the ~28-30/
+hour cap), leaving ~8-10 requests/hour of headroom for manual commands,
+wake-from-sleep catch-up, and the bounded urgent mode below.
+
+Health invariant to watch in the logs: steady state shows zero http-429.
+A post-burst 429 does NOT reliably clear at its stated horizon — measured
+over one machine's full log, 10 of 19 lapsed blocks re-blocked within 900 s
+of their own deadline, each for a fresh full hour. That is why the wait is
+Retry-After *plus* ``usage_store.RETRY_AFTER_MARGIN_S`` and not Retry-After
+alone. What would mean this model needs revisiting is a 429 episode at
+modest rates that outlasts an hour *past* that margin.
 
 Plans computed here are persisted per account in the usage store
 (``nextPollAt``/``pollIntervalS``) by whichever collector fetched, so every
@@ -66,7 +79,7 @@ CANDIDATE_MAX_INTERVAL_S = 600.0
 # reported reset. Quota grants and provider-side corrections can make an
 # account usable before that timestamp, and decision-grade status must not age
 # into "unavailable" while the scheduler is deliberately waiting. Ten-minute
-# polling (six requests/hour) stays below the measured per-token budget and
+# polling (six requests/hour) stays below the measured budget and
 # detects recovery promptly; a nearer reported reset still pulls the next poll
 # forward.
 EXHAUSTED_INTERVAL_S = 600.0
@@ -91,11 +104,13 @@ EDGE_BACKOFF_S = 300.0
 POST_429_MIN_INTERVAL_S = 360.0
 RECENT_429_WINDOW_S = 3600.0
 
-# AIMD on a contended token. The usage endpoint's per-token budget is shared
-# across every machine polling the same account, and none of them can see the
-# others (there is no cross-machine coordination, and the endpoint exposes no
-# remaining-request count — only a Retry-After once already blocked). So while
-# 429s recur on a token, each successful poll multiplicatively grows the
+# AIMD on a contended account. The usage endpoint's budget is shared across
+# every machine polling the same account — and, since the budget is scoped to
+# the account rather than the token (see the module docstring), a machine
+# holding its own separate token is no less a competitor. None of them can see
+# the others (there is no cross-machine coordination, and the endpoint exposes
+# no remaining-request count — only a Retry-After once already blocked). So
+# while 429s recur on an account, each successful poll multiplicatively grows the
 # interval (×POST_429_BACKOFF_MULT) toward POST_429_MAX_INTERVAL_S — wider than
 # the normal candidate ceiling so several machines can each back off far enough
 # that their combined rate fits under the budget. Movement (a real success run

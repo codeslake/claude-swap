@@ -52,7 +52,7 @@ SCHEMA_VERSION = 2
 
 # Freshness is the reader's judgment per purpose, not a global TTL.
 # SERVE_TTL_S (re-exported from poll_policy — fresher than this → serve
-# without fetching) doubles as the per-token sustained-rate governor: see
+# without fetching) doubles as the per-account sustained-rate governor: see
 # poll_policy's module docstring for the measured budget it must stay under.
 STALE_OK_S = 300.0  # trusted for switch decisions; older → headroom unknown
 # Covers the bounded refresh + usage path, the full inventory's stagger, and
@@ -91,7 +91,7 @@ def _live_claim(
 TRUST_MAX_AGE_S = 3600.0
 
 # A usage-endpoint 429 is a polling throttle, not a change in the account's
-# real model quota: the endpoint budgets *usage requests* per token (see
+# real model quota: the endpoint budgets *usage requests* per account (see
 # poll_policy), independent of the 5h/7d limits it reports. It does NOT move
 # the account's real windows, and usage only rises within a window (monotone
 # until the window resets), so last_good is a valid lower bound on the true
@@ -116,12 +116,15 @@ BACKOFF_CAP_S = 600.0
 # that is behaviour-preserving.
 BACKOFF_MAX_SHIFT = 32
 
-# The usage endpoint enforces a per-access-token request budget on
-# non-first-party User-Agents (proven 2026-07-11: an idle token, polling
-# alone trips it; poll_policy documents the measured shape — an hour-scale
-# rolling window, exact edge algorithm undocumented). Cumulative polling from
-# cswap's own surfaces is exactly what saturates it. Retry-After tells the
-# rules apart:
+# The usage endpoint enforces a request budget on non-first-party
+# User-Agents (proven 2026-07-11: an idle token, polling alone trips it;
+# poll_policy documents the measured shape — an hour-scale window, exact edge
+# algorithm undocumented). The budget is **not** scoped to the access token:
+# on 2026-07-28 a freshly minted token was blocked 135s after issue, which a
+# per-token counter cannot produce, so the scope is the account/org. Nothing
+# below depends on which it is — the wait comes from the server's own deadline.
+# Cumulative polling from cswap's own surfaces is what saturates it.
+# Retry-After tells the rules apart:
 # - "Retry-After: 0" = the saturated-budget edge: the trailing hour's budget
 #   is spent and frees only as old requests age out, so immediate retries
 #   mostly prolong the oscillating state. Wait at least
@@ -140,7 +143,31 @@ BACKOFF_MAX_SHIFT = 32
 # let recover, with no benefit. Honoring the whole Retry-After spends one
 # request per block instead. The cap still bounds a pathological header to one
 # window, never hours.
-RETRY_AFTER_FLOOR_CAP_S = 3600.0
+#
+# Honoring it EXACTLY is not enough, though: the retry then lands on the
+# deadline itself, and the server is not reliably ready there. Measured over
+# this machine's whole log (511 http-429 lines → 39 deadline blocks; of the 19
+# post-fix lapses that were followed by another 429): 10 re-blocked within 900s
+# of their own deadline — +2s, +3s, +3s, +71s, +79s, +101s, +337s, +346s,
+# +714s, +716s — and each earned a fresh full-hour penalty. The next one after
+# that is +3853s, so the distribution is bimodal with an empty band between:
+# retry inside ~900s of an hour-scale deadline and it costs another hour, retry
+# past it and it is clean. The margin lands the retry in that empty band, and
+# costs one wait per block rather than per probe, since the deadline is fixed
+# and not re-armed.
+#
+# Proportional, not a flat 900s, because the evidence is entirely hour-scale:
+# 37 of those 39 blocks opened at exactly 3600. Short blocks were measured
+# separately (2026-07-06) as *accurate* — Retry-After 300 meant a 300s block —
+# so a flat margin would inflate a 300s block by 4x on no evidence, and would
+# also let a 90s server ask overtake our own saturated failure curve. A
+# fraction extends the hour-scale finding (0.25 × 3600 = the measured 900s)
+# without extrapolating it onto short blocks.
+RETRY_AFTER_MARGIN_FRAC = 0.25
+# Bounds Retry-After × (1 + MARGIN_FRAC), so a pathological header still cannot
+# park an account for hours. Raised with the margin so a normal full-window
+# block is not clipped back onto the bare deadline it is meant to clear.
+RETRY_AFTER_FLOOR_CAP_S = 4500.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
@@ -424,9 +451,13 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     if retry_after_s == 0:
         # Saturated-budget edge: wait before probing again.
         return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
-    # Burst rule: wait at least what the server asked (up to the safety cap);
-    # our own curve may wait longer.
-    return max(min(retry_after_s, RETRY_AFTER_FLOOR_CAP_S), computed)
+    # Burst rule: wait what the server asked plus a margin (up to the safety
+    # cap); our own curve may wait longer. The margin is what keeps the retry
+    # off the deadline itself — see RETRY_AFTER_MARGIN_FRAC.
+    asked = min(
+        retry_after_s * (1.0 + RETRY_AFTER_MARGIN_FRAC), RETRY_AFTER_FLOOR_CAP_S
+    )
+    return max(asked, computed)
 
 
 class UsageStore:
