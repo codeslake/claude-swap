@@ -239,11 +239,12 @@ def _pin_env_command(argv: list[str]) -> None:
     if not pinned:
         return
     port, ca_path = pinned
-    # Read os.environ so wire_env MERGES any ambient NODE_EXTRA_CA_CERTS (the
-    # CCF/corp bundle) with our CA — the client still blind-tunnels to corp
-    # hosts and must keep trusting their CAs. HTTPS_PROXY is replaced (the pin
-    # proxy chains onward to it). open_refcount=False: the SHELL opens the
-    # refcount fd (below), not this short-lived process.
+    # Read os.environ so wire_env MERGES any ambient NODE_EXTRA_CA_CERTS (a
+    # corporate or local-MITM bundle) with our CA — the client still
+    # blind-tunnels to those hosts and must keep trusting their CAs.
+    # HTTPS_PROXY is replaced (the pin proxy chains onward to it).
+    # open_refcount=False: the SHELL opens the refcount fd (below), not this
+    # short-lived process.
     env = pin_proxy.wire_env(
         dict(os.environ), port, ca_path, ca_path.parent, open_refcount=False
     )
