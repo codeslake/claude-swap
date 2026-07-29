@@ -135,6 +135,13 @@ class FakeSwitcher:
     def current_account_number(self) -> str | None:
         return self.active
 
+    def resolve_account(self, identifier: str) -> tuple[str, str, str]:
+        """Used by the pin path (apply_pin -> ensure_proxy)."""
+        for a in self._accounts:
+            if a.number == str(identifier) or a.email == identifier:
+                return a.number, a.email, getattr(a, "org_uuid", "") or ""
+        raise KeyError(identifier)
+
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict:

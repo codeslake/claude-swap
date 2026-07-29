@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 
 from claude_swap import __version__, paths, printer
@@ -246,8 +247,13 @@ def _pin_env_command(argv: list[str]) -> None:
     env = pin_proxy.wire_env(
         dict(os.environ), port, ca_path, ca_path.parent, open_refcount=False
     )
-    for key in ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS"):
-        print(f"export {key}={env[key]}")
+    # CSWAP_PIN_PORT rides along as the self-loop marker: without it, the next
+    # cswap invocation in this shell reads our own proxy as its ambient one and
+    # records the daemon as its own upstream, making it CONNECT to itself.
+    # Values are quoted — a backup dir under a home with a space would
+    # otherwise break the caller's eval.
+    for key in ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS", "CSWAP_PIN_PORT"):
+        print(f"export {key}={shlex.quote(env[key])}")
     # Refcount holder: have the SHELL open a write fd on the FIFO (CCF's
     # `exec {fd}<>fifo`). O_RDWR (<>) so the open never blocks; the fd is
     # inherited by the claude the shell launches next and closes when that
@@ -255,7 +261,7 @@ def _pin_env_command(argv: list[str]) -> None:
     # not up) is skipped without failing the eval.
     fifo = env.get("CSWAP_PIN_FIFO")
     if fifo and os.path.exists(fifo):
-        print(f'exec {{__cswap_pin_fd}}<>"{fifo}" 2>/dev/null || true')
+        print(f"exec {{__cswap_pin_fd}}<>{shlex.quote(fifo)} 2>/dev/null || true")
 
 
 def _pin_command(argv: list[str]) -> None:
@@ -290,20 +296,14 @@ Examples:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
-    from claude_swap.pin_proxy import (
-        ensure_proxy,
-        load_pin,
-        save_pin,
-        wire_global_config,
-    )
+    from claude_swap.pin_proxy import apply_pin, load_pin
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
 
         if args.clear:
-            save_pin(switcher.backup_dir, None, None)
-            wire_global_config(None, None)
+            apply_pin(switcher, None, None)
             print(f"{accent('Unpinned')} the cloud account")
             return
         if args.account is None:
@@ -314,15 +314,15 @@ Examples:
                 print(dimmed("No cloud account pinned"))
             return
         account_num, email, org_uuid = switcher.resolve_account(args.account)
-        save_pin(switcher.backup_dir, email, org_uuid)
+        # Saves the pin, starts the proxy, and records it where Claude Code
+        # reads env at startup — so a `claude` launched by hand is pinned too,
+        # with no settings.json edit, no shell rc, and no shim on PATH.
+        started = apply_pin(switcher, email, org_uuid)
         print(
             f"{accent('Pinned')} the cloud account (RC/artifacts) to "
             f"Account-{account_num} ({email})"
         )
-        # Start the proxy now; ensure_proxy also records it where Claude Code
-        # reads env at startup, so a `claude` the user launches by hand is
-        # pinned too — no settings.json edit, no shell rc, no shim on PATH.
-        if ensure_proxy(switcher):
+        if started:
             print(dimmed("New sessions pick this up; restart a running one."))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")

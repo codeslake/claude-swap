@@ -234,12 +234,12 @@ class DashboardScreen(Screen):
         elif action_id == "pin-menu":
             await self._push_menu("cloud account", self._pin_entries())
         elif action_id.startswith("pin:"):
-            from claude_swap.pin_proxy import save_pin
+            from claude_swap.pin_proxy import apply_pin
 
             target = action_id.split(":", 1)[1]
             snap = app.snapshot
             if target == "clear":
-                save_pin(app.switcher.backup_dir, None, None)
+                apply_pin(app.switcher, None, None)
                 app.notify("Cloud pin cleared")
             else:
                 acc = next(
@@ -247,7 +247,7 @@ class DashboardScreen(Screen):
                     None,
                 )
                 if acc is not None:
-                    save_pin(app.switcher.backup_dir, acc.email, acc.org_uuid)
+                    apply_pin(app.switcher, acc.email, acc.org_uuid)
                     app.notify(f"Remote control pinned to {acc.email}")
             await self._pop_menu()
         else:

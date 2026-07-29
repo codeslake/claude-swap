@@ -203,7 +203,7 @@ class AutoScreen(Screen):
         pin_label = self._pinned_rc_label()
         if pin_label:
             text.append(" · ")
-            text.append(f"☁ cloud: {pin_label}", style=ACCENT)
+            text.append(f"☁ cloud: {pin_label}", style=palette.accent)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
