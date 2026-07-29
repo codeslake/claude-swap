@@ -2864,7 +2864,20 @@ class ClaudeAccountSwitcher:
                 error=outcome.error, retry_after_s=outcome.retry_after_s,
             )
 
-        # Expired (or server-rejected). Attribution against the slot's
+        # Expired (or server-rejected). Before any recovery that would
+        # CONSUME a refresh token: a degraded read (the OAuth Keychain
+        # failed and a fallback covered it) may be serving a stale
+        # generation — on macOS Claude Code rotates keychain-only, so the
+        # plaintext file and the slot backup can both hold the consumed
+        # predecessor and AGREE with each other. POSTing that rt would
+        # yield invalid_grant and a false dead-token strike on a live
+        # account (measured field incident). Adopt/serve stays allowed
+        # above; consumption is refused until the keychain reads again —
+        # CC refreshes on its own next use, exactly the pre-#167 shape.
+        if self._store._read_active_credentials().degraded:
+            return FetchRecord(sentinel=USAGE_KEYCHAIN_UNAVAILABLE)
+
+        # Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up
         # outright: attributable live → refresh it; unattributable live but
         # usable backup → restore the backup (the slot's own credential —
@@ -3373,6 +3386,11 @@ class ClaudeAccountSwitcher:
             return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
             if is_active and self._active_keychain_unavailable:
+                return USAGE_KEYCHAIN_UNAVAILABLE
+            if not is_active and self._store._keychain_usable_cache is False:
+                # The empty read happened with the Keychain pinned unusable:
+                # the backup may exist unseen. "keychain unavailable" — not
+                # "no credentials", which nudges an unnecessary re-add.
                 return USAGE_KEYCHAIN_UNAVAILABLE
             return USAGE_NO_CREDENTIALS
         # An expired active token is no longer a static state: the fetch path
@@ -5125,8 +5143,23 @@ class ClaudeAccountSwitcher:
                 target_creds = self._read_account_credentials(
                     target_account, target_email
                 )
+                backup_unreadable = (
+                    not target_creds
+                    and self.platform == Platform.MACOS
+                    and self._store._keychain_usable_cache is False
+                )
                 target_config = self._read_account_config(target_account, target_email)
                 if not target_creds:
+                    if backup_unreadable:
+                        # The backup may exist but the Keychain cannot be
+                        # read right now (locked / non-GUI session) — a
+                        # re-add would needlessly burn the stored grant.
+                        raise SwitchError(
+                            f"Account-{target_account}'s backup is in the "
+                            f"macOS Keychain but it is unreadable right now "
+                            f"(locked or no GUI session). Retry from a GUI "
+                            f"terminal; do not re-add."
+                        )
                     raise SwitchError(
                         f"Account-{target_account} has no stored credentials. "
                         f"Re-add with: cswap --add-account --slot {target_account}"
