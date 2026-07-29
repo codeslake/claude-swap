@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -334,6 +335,17 @@ class AutoScreen(Screen):
                 ranked.append((999.0, acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # Per-window reset countdowns: a saturated candidate's worth
+                # is WHEN it comes back, so say so right where it's ranked.
+                now = time.time()
+                for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
+                    reset = data.window_reset_text(
+                        acc.usage.last_good, key, now
+                    )
+                    if reset:
+                        entry.append(
+                            f" · {label} {reset}", style=palette.muted
+                        )
                 ranked.append((pct, acc.number))
             lines[acc.number] = entry
 
