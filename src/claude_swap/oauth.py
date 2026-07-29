@@ -94,6 +94,11 @@ class RefreshOutcome:
     credentials: str | None
     error: str | None
     token_account: dict | None = None
+    # Fingerprint of the generation actually consumed (POSTed). Set by the
+    # consume gate, which may substitute a fresher re-read or a session
+    # profile for the caller's snapshot — strike binding must follow the
+    # POSTed bytes, not the snapshot.
+    consumed_fp: str | None = None
 
 
 def try_refresh_oauth_credentials(
@@ -616,15 +621,27 @@ def try_fetch_usage_for_account(
                 _persist(persist_credentials, account_num, email, working_credentials)
             oauth = extract_oauth_data(working_credentials) or oauth
             access_token = oauth.get("accessToken") or access_token
-        elif refresh.error == "invalid_grant":
-            # The refresh-token lineage is server-rejected — permanently dead.
-            # Don't hit the usage endpoint with a token we know is expired
-            # (that just adds a 401/429 to a lost cause): report the permanent
-            # failure distinctly so the store can quarantine the account.
+        elif refresh.error in ("invalid_grant", "no_refresh_token"):
+            # The refresh-token lineage is server-rejected (or structurally
+            # absent) — permanently dead. Don't hit the usage endpoint with
+            # a token we know is expired (that just adds a 401/429 to a lost
+            # cause): report the permanent failure distinctly so the store
+            # can quarantine the account. The strike binds to the bytes the
+            # gate actually POSTed (it may have substituted a fresher
+            # re-read for our snapshot) — fall back to the snapshot's
+            # fingerprint only for the direct-POST path.
             return UsageOutcome(
-                None, error="invalid_grant",
-                struck_fp=credential_fingerprint(working_credentials),
+                None, error=refresh.error,
+                struck_fp=(
+                    refresh.consumed_fp
+                    or credential_fingerprint(working_credentials)
+                ),
             )
+        elif refresh.error == "store-unmirrored":
+            # Deterministic local refusal (M4 parity guard): hitting the
+            # usage endpoint with the known-expired token would 401 every
+            # pass. Surface the distinct kind instead.
+            return UsageOutcome(None, error="store-unmirrored")
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
@@ -653,12 +670,13 @@ def try_fetch_usage_for_account(
             refresh = try_refresh_oauth_credentials(working_credentials)
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
-            dead = refresh.error == "invalid_grant"
+            dead = refresh.error in ("invalid_grant", "no_refresh_token")
             return UsageOutcome(
                 None,
-                error="invalid_grant" if dead else "refresh-failed",
+                error=refresh.error if dead else "refresh-failed",
                 struck_fp=(
-                    credential_fingerprint(working_credentials)
+                    (refresh.consumed_fp
+                     or credential_fingerprint(working_credentials))
                     if dead else None
                 ),
             )
