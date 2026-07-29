@@ -582,14 +582,15 @@ class AutoSwitchEngine:
         )
         if not near_expiry:
             return "ok"
-        outcome = oauth.try_refresh_oauth_credentials(creds)
+        # The consume gate is the single place a backup rt may be POSTed:
+        # it re-reads under the slot lock (our snapshot may be superseded),
+        # consults the session profile for a newer generation, and persists
+        # via fingerprint CAS — so a freshen racing the collector (or a
+        # sibling surface) can no longer double-consume one grant.
+        outcome = self.switcher.consume_backup_grant(number, email, creds)
         if outcome.error is None and outcome.credentials:
-            # Persist first, unconditionally: the grant consumed a generation,
-            # and not writing the successor would kill the lineage regardless
-            # of whose it turns out to be.
-            self.switcher.persist_backup_credentials(
-                number, email, outcome.credentials
-            )
+            # The gate already persisted the successor (or adopted a racing
+            # writer's newer lineage) under its own lock.
             if self._note_token_identity(number, outcome.token_account):
                 # The slot's stored credential authenticates as a *different*
                 # account — activating it would put the user on the wrong
