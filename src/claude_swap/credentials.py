@@ -892,6 +892,11 @@ class CredentialStore:
     ) -> tuple[str, bool]:
         """Backup read with an unreadable-vs-absent verdict.
 
+        The switch/display paths currently derive the same verdict inline
+        from ``_keychain_usable_cache`` (their reads go through patchable
+        switcher seams); this method is the standalone form of that
+        contract for callers outside those paths.
+
         Returns ``(value, unreadable)``. ``unreadable`` is True only when the
         ``.enc`` had nothing AND the macOS Keychain read *raised* (locked /
         denied / timeout) — the backup may exist but cannot be seen right
