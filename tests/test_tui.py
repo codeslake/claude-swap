@@ -1716,22 +1716,22 @@ class TestThemeWiring:
 class TestCloudPinBadge:
     """The pinned account must be visible on the account list itself.
 
-    `● active` says where inference bills; `☁ cloud` says where Remote
+    `● active` says where inference bills; `○ cloud` says where Remote
     Control and Artifacts live. Without the badge the pin is invisible on
     the screen the user actually looks at — they'd have to open a menu to
     learn which account owns their RC sessions.
 
-    Text-presentation ☁ (U+2601, no VS16) is deliberate: the emoji form
-    renders double-width in a terminal and breaks column alignment
-    (measured on the real terminal).
+    The marker mirrors `● active` deliberately: the two are sibling states
+    of one account, and a bare glyph read as decoration next to the usage
+    figures rather than as a label (measured on the real terminal).
     """
 
     def test_pinned_account_shows_cloud_badge(self):
         from claude_swap.tui.widgets import account_card_text
 
         card = account_card_text(make_account(1), 80, cloud_pinned=True).plain
-        assert "☁ cloud" in card
-        assert "️" not in card, "emoji-presentation ☁ breaks alignment"
+        assert "○ cloud" in card
+        assert "☁" not in card, "the pin marker mirrors ● active, not a glyph"
 
     def test_unpinned_account_has_no_badge(self):
         from claude_swap.tui.widgets import account_card_text
@@ -1779,7 +1779,7 @@ class TestCloudPinBadge:
         card = account_card_text(
             make_account(1, active=True), 80, cloud_pinned=True
         ).plain
-        assert "● active" in card and "☁ cloud" in card
+        assert "● active" in card and "○ cloud" in card
 
 
 class TestCloudPinMenuLabel:
@@ -1816,10 +1816,10 @@ class TestCloudPinBadgeOnMiniLine:
         line = mini_account_text(
             make_account(1), time.time(), cloud_pinned=True
         ).plain
-        assert "☁" in line
+        assert "○ cloud" in line
 
     def test_mini_line_without_pin_has_no_badge(self):
         from claude_swap.tui.widgets import mini_account_text
 
         line = mini_account_text(make_account(1), time.time()).plain
-        assert "☁" not in line
+        assert "cloud" not in line

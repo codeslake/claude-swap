@@ -162,7 +162,7 @@ class DashboardScreen(Screen):
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
             name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
-            state = "  ☁ pinned" if pin and pin[0] == acc.email else ""
+            state = "  ○ cloud" if pin and pin[0] == acc.email else ""
             entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
         # Only offer the clear when there is something to clear — an inert row
         # reads as "a pin exists" to anyone scanning the menu.

@@ -188,9 +188,10 @@ def account_card_text(
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
     if cloud_pinned:
-        # Text-presentation U+2601 (no VS16): the emoji form is double-width
-        # in a terminal and shifts every column after it.
-        text.append("   ☁ cloud", style=f"bold {palette.sev_warn}")
+        # Same marker shape as "● active" — the two are sibling states of one
+        # account, and a lone glyph read as decoration next to the usage
+        # figures rather than as a label.
+        text.append("   ○ cloud", style=f"bold {palette.sev_warn}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
@@ -281,7 +282,9 @@ def mini_account_text(
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if cloud_pinned:
-        text.append("  ☁", style=f"bold {palette.sev_warn}")
+        # Labelled, like the full card: a bare glyph sitting between the
+        # org tag and the usage figures read as decoration, not as a state.
+        text.append("  ○ cloud", style=f"bold {palette.sev_warn}")
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     text.append("   ")
@@ -403,7 +406,7 @@ class AccountCard(Static):
 
     def render(self) -> Text:
         # The switch and watch screens render through here, so without this
-        # the ☁ marker showed only on the dashboard — and those two are
+        # the cloud marker showed only on the dashboard — and those two are
         # exactly where you compare accounts and would want to know which one
         # owns the claude.ai side.
         pinned_email = _cloud_pinned_email(self.app)
