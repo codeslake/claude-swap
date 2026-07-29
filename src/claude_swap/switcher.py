@@ -1923,6 +1923,7 @@ class ClaudeAccountSwitcher:
                                 account_num, email, profile
                             )
                             refresh_input = profile
+                            input_oauth = prof_oauth
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
@@ -1943,13 +1944,13 @@ class ClaudeAccountSwitcher:
             )
             return oauth.RefreshOutcome(None, "transient")
 
-        input_oauth_now = oauth.extract_oauth_data(refresh_input) or {}
+        input_oauth = input_oauth or {}
         snap_at = (oauth.extract_oauth_data(snapshot) or {}).get("accessToken")
         if (
-            input_oauth_now.get("accessToken")
+            input_oauth.get("accessToken")
             and snap_at
-            and input_oauth_now.get("accessToken") != snap_at
-            and not oauth.is_oauth_token_expired(input_oauth_now.get("expiresAt"))
+            and input_oauth.get("accessToken") != snap_at
+            and not oauth.is_oauth_token_expired(input_oauth.get("expiresAt"))
         ):
             # The world already moved past the caller's snapshot AND the
             # current generation is fresh: the refresh the caller wanted

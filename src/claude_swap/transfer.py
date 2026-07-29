@@ -480,11 +480,8 @@ def import_accounts(
                 switcher._usage_store.entries(
                     {existing_slot: (entry["email"], entry["org_uuid"])}
                 )[existing_slot].token_dead(
-                    # Fingerprint-bound, same as the collectors: a strike
-                    # condemns the generation it POSTed, and a credential
-                    # written since (re-add, sibling sync) heals the verdict.
-                    # An unbound check here would let a stale strike license
-                    # replacing that newer live credential without --force.
+                    # Fingerprint-bound like the collectors — a stale strike
+                    # must not license replacing a newer credential.
                     stored_fp=oauth.credential_fingerprint(
                         switcher._read_account_credentials(
                             existing_slot, entry["email"]
