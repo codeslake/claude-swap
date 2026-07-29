@@ -8656,3 +8656,58 @@ class TestStrikeUnbindsInCollector:
         info = [(2, "b@example.com", "", "", False, fresh, "")]
         entries = s._collect_usage_entries(info, fetch=set())
         assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED
+
+
+class TestStoreResolutionParity:
+    """M4: when CC resolves its credential store somewhere cswap does not
+    mirror, consuming/mutating operations refuse instead of operating on a
+    store CC no longer uses."""
+
+    def test_securestorage_env_refuses_consume(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/tmp/other")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", creds)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_post:
+            result = s.consume_backup_grant("1", "test@example.com", creds)
+        mock_post.assert_not_called()
+        assert result.error == "transient"
+
+    def test_session_shell_config_dir_refuses_switch(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        inside = s.backup_dir / "sessions" / "1-test-example-com"
+        inside.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(inside))
+        with pytest.raises(SwitchError) as exc:
+            s.switch_to("2")
+        assert "session" in str(exc.value).lower()
+
+    def test_normal_env_unaffected(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", creds)
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt2",
+                              "expiresAt": 9999999999000}})
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(fresh, None)):
+            result = s.consume_backup_grant("1", "test@example.com", creds)
+        assert result.credentials == fresh
