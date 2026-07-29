@@ -1048,7 +1048,7 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        def mock_fetch(account_num, email, credentials, is_active, persist_credentials=None):
+        def mock_fetch(account_num, email, credentials, is_active, persist_credentials=None, **kwargs):
             # Simulate a refresh on the inactive account only.
             if not is_active and persist_credentials is not None:
                 persist_credentials(account_num, email, refreshed_creds)
@@ -8425,3 +8425,190 @@ class TestSwitchUnreadableBackup:
         msg = str(exc.value).lower()
         assert "keychain" in msg
         assert "add-account" not in msg   # the remedy must not be a re-add
+
+
+class TestConsumeGate:
+    """M2: every backup-refresh-token POST goes through consume_backup_grant —
+    locked re-read → unlocked POST → reacquire-and-CAS persist. The gate is
+    the single place a backup rt may be consumed."""
+
+    _OLD = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 1000,
+        }
+    })
+    _NEW = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-new", "refreshToken": "rt-new",
+            "expiresAt": 9999999999000,
+        }
+    })
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def test_gate_rereads_under_lock_and_posts_rereread_bytes(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The POST must consume the bytes RE-READ under the lock, not the
+        caller's snapshot — a fresher backup written since the caller read
+        means the caller's rt is the consumed predecessor."""
+        s = self._switcher(sample_sequence_data)
+        fresher = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-fresher", "refreshToken": "rt-fresher",
+                "expiresAt": 2000,
+            }
+        })
+        s._write_account_credentials("1", "test@example.com", fresher)
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            # caller holds a STALE snapshot (_OLD); gate must ignore it
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted["creds"] == fresher      # re-read bytes, not snapshot
+        assert result.credentials == self._NEW
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW
+
+    def test_gate_cas_persist_detects_racing_writer(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """If the backup's lineage moved while our POST was in flight,
+        a writer won the race: the successor is stashed (never discarded),
+        the store's newer lineage is adopted, nothing overwritten."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        racer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-racer", "refreshToken": "rt-racer",
+                "expiresAt": 8888888888000,
+            }
+        })
+
+        def mock_refresh(credentials, **kw):
+            # while the POST is in flight, another writer replaces the backup
+            s._store._write_account_credentials(
+                "1", "test@example.com", racer
+            )
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        # racer's write survives; our successor was stashed, not written over it
+        assert s._read_account_credentials("1", "test@example.com") == racer
+        assert result.credentials == racer      # adopt the store's newer lineage
+        unclaimed = s.list_unclaimed_credentials()
+        assert unclaimed, "consumed successor must be stashed, never discarded"
+
+    def test_gate_prefers_newer_session_profile_lineage(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A dead session profile holding a NEWER lineage than the backup
+        (claude rotated inside the profile — #96's shape) means the backup rt
+        is the consumed predecessor: the gate must resync profile→backup and
+        POST the profile's rt, never the backup's."""
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        profile_newer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-prof", "refreshToken": "rt-prof",
+                "expiresAt": 5000,   # newer generation than backup's 1000
+            }
+        })
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(profile_newer)
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted["creds"] == profile_newer
+
+    def test_gate_invalid_grant_returns_error_without_persist(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert result.error == "invalid_grant"
+        # the dead bytes stay put — no destructive write
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+
+class TestInactiveRefreshRoutesThroughGate:
+    """M2: the collector's inactive-account refresh consumes via the gate,
+    not via a direct POST of its own snapshot."""
+
+    def test_expired_inactive_fetch_uses_gate(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-old", "refreshToken": "rt-old",
+                "expiresAt": 1000,
+            }
+        })
+        s._write_account_credentials("2", "b@example.com", expired)
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-new", "refreshToken": "rt-new",
+                "expiresAt": 9999999999000,
+            }
+        })
+        gate = {}
+
+        def mock_gate(num, email, snapshot):
+            gate["args"] = (num, email)
+            s._store._write_account_credentials(num, email, fresh)
+            return oauth.RefreshOutcome(fresh, None)
+
+        monkeypatch.setattr(s, "consume_backup_grant", mock_gate)
+        direct = {}
+
+        def direct_post(*a, **k):
+            direct["called"] = True
+            return oauth.RefreshOutcome(None, "transient")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=direct_post), \
+             patch.object(s, "_live_session_pids", return_value=[]), \
+             patch("claude_swap.oauth.request_usage_data",
+                   return_value={"five_hour": {"utilization": 5}}):
+            info = (2, "b@example.com", "", "", False, expired, "")
+            record = s._fetch_account_usage(info)
+
+        assert gate["args"] == ("2", "b@example.com")
+        assert "called" not in direct
+        assert record.error is None
