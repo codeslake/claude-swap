@@ -1,6 +1,6 @@
 # claude-swap
 
-Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
+Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Pin Remote Control and Artifacts to one account so they stay put while inference follows the switch. Works with both the Claude Code CLI and the VS Code extension.
 
 ## Installation
 
@@ -174,7 +174,8 @@ cswap pin            # show the current pin
 cswap pin --clear    # remove it
 ```
 
-In the TUI, the pinned account is marked `☁` and the menu names it inline.
+In the TUI the pinned account is marked `○ cloud` — next to the `● active`
+marker that says where inference bills — and the menu row names it inline.
 
 Re-pinning takes effect immediately — no session restart, same as switching
 accounts. One thing does not move: a Remote Control session that is **already

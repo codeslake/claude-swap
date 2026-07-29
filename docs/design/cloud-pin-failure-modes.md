@@ -64,7 +64,7 @@ touches `/api/oauth/usage` (0 calls in 433 traced requests) — this is a
 Every case above is survivable; what makes them dangerous is that most are
 *quiet*. The mitigations that matter:
 
-1. Surface the pin in the UI — done (`☁ cloud` badge, menu label).
+1. Surface the pin in the UI — done (`○ cloud` marker, menu label).
 2. Report daemon health where the pin is shown, so C1/C3 are visible
    rather than inferred.
 3. Clear the pin when its account is removed (B4).
