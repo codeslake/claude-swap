@@ -334,18 +334,33 @@ class AutoScreen(Screen):
                 entry.append("  usage unknown", style=palette.muted)
                 ranked.append((999.0, acc.number))
             else:
-                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                # Per-window reset countdowns: a saturated candidate's worth
-                # is WHEN it comes back, so say so right where it's ranked.
+                # Per-window "5h(⟳53m):99%" chips: a saturated candidate's
+                # worth is WHEN it comes back, so the reset countdown sits
+                # inside each window's own reading (statusline format).
                 now = time.time()
+                first = True
                 for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
-                    reset = data.window_reset_text(
-                        acc.usage.last_good, key, now
+                    wpct = data.window_pct(acc.usage.last_good, key)
+                    if wpct is None:
+                        continue
+                    rt = data.window_reset_text(acc.usage.last_good, key, now)
+                    dur = (
+                        rt.removeprefix("resets ").replace(" ", "")
+                        if rt else None
                     )
-                    if reset:
-                        entry.append(
-                            f" · {label} {reset}", style=palette.muted
-                        )
+                    entry.append("  " if first else " · ", style=palette.muted)
+                    entry.append(
+                        f"{label}({chr(0x27F3)}{dur}):" if dur else f"{label}:",
+                        style=palette.muted,
+                    )
+                    entry.append(
+                        f"{wpct:.0f}%", style=palette.severity(wpct)
+                    )
+                    first = False
+                if first:  # no window data at all — keep the old reading
+                    entry.append(
+                        f"  {pct:3.0f}% used", style=palette.severity(pct)
+                    )
                 ranked.append((pct, acc.number))
             lines[acc.number] = entry
 
