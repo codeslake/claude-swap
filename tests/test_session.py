@@ -362,7 +362,12 @@ class TestBootstrap:
     def test_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
-        monkeypatch.setattr(session_mod, "refresh_oauth_credentials", lambda c: None)
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(
+                None, "transient"
+            ),
+        )
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
@@ -377,9 +382,9 @@ class TestBootstrap:
         seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds)
         refresh_calls = []
         monkeypatch.setattr(
-            session_mod,
-            "refresh_oauth_credentials",
-            lambda c: refresh_calls.append(c) or None,
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: refresh_calls.append(snap)
+            or oauth.RefreshOutcome(None, "transient"),
         )
 
         session_dir, _, _ = manager.setup_session("2", share=False)
@@ -2111,12 +2116,17 @@ class TestBootstrapRefreshRoutesThroughGate:
         monkeypatch.setattr(s, "consume_backup_grant", mock_gate)
         direct = {}
 
-        def direct_post(credentials):
+        def direct_post(credentials, **kw):
             direct["called"] = True
-            return None
+            return oauth_mod.RefreshOutcome(None, "transient")
 
+        # The bypass seam: session.py no longer imports any direct refresh
+        # helper, so a regression would have to call oauth's POST directly.
         monkeypatch.setattr(
-            "claude_swap.session.refresh_oauth_credentials", direct_post
+            "claude_swap.oauth.try_refresh_oauth_credentials", direct_post
+        )
+        monkeypatch.setattr(
+            "claude_swap.oauth.refresh_oauth_credentials", direct_post
         )
         from claude_swap.session import SessionManager
         mgr = SessionManager(s)

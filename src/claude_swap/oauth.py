@@ -637,11 +637,12 @@ def try_fetch_usage_for_account(
                     or credential_fingerprint(working_credentials)
                 ),
             )
-        elif refresh.error == "store-unmirrored":
-            # Deterministic local refusal (M4 parity guard): hitting the
-            # usage endpoint with the known-expired token would 401 every
-            # pass. Surface the distinct kind instead.
-            return UsageOutcome(None, error="store-unmirrored")
+        elif refresh.error in ("store-unmirrored", "invalid_client"):
+            # Deterministic refusals (M4 parity guard; a systemic client_id
+            # rejection): hitting the usage endpoint with the known-expired
+            # token would 401 every pass. Surface the distinct kind instead
+            # — ERROR_NOTES renders the remedy for both.
+            return UsageOutcome(None, error=refresh.error)
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
 
@@ -671,9 +672,16 @@ def try_fetch_usage_for_account(
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error in ("invalid_grant", "no_refresh_token")
+            # Deterministic kinds keep their identity here too — collapsing
+            # them to "refresh-failed" would hide the ERROR_NOTES remedy
+            # exactly on the 401 path (a not-yet-locally-expired token the
+            # server already rotated past).
+            distinct = dead or refresh.error in (
+                "store-unmirrored", "invalid_client"
+            )
             return UsageOutcome(
                 None,
-                error=refresh.error if dead else "refresh-failed",
+                error=refresh.error if distinct else "refresh-failed",
                 struck_fp=(
                     (refresh.consumed_fp
                      or credential_fingerprint(working_credentials))
