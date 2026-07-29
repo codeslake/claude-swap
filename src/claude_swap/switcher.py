@@ -1781,59 +1781,53 @@ class ClaudeAccountSwitcher:
         if result.error is not None or not result.credentials:
             return result
 
-        try:
-            with FileLock(self.lock_file):
-                store_now = self._read_account_credentials(account_num, email)
-                store_fp = oauth.credential_fingerprint(store_now)
-                if store_now and store_fp != consumed_fp:
-                    # A writer replaced the lineage while our POST was in
-                    # flight. Never discard a consumed generation: stash our
-                    # successor, adopt the store's newer credential.
-                    self._store._write_unclaimed_credential(
-                        result.credentials,
-                        {
-                            "reason": "consume-gate-cas-conflict",
-                            "configSlot": account_num,
-                            "fingerprint": oauth.credential_fingerprint(
-                                result.credentials
-                            ),
-                        },
-                    )
-                    self._logger.warning(
-                        "Backup lineage for account %s moved during a refresh "
-                        "POST; successor stashed, adopting the newer store "
-                        "credential.", account_num,
-                    )
-                    return oauth.RefreshOutcome(
-                        store_now, None, result.token_account, consumed_fp
-                    )
-                self._write_account_credentials(
-                    account_num, email, result.credentials
-                )
-        except LockError:
-            # The grant IS consumed — the successor must survive even
-            # though the persist lock is unavailable. Stash it (the same
-            # never-discard rule as the CAS conflict) and hand it to the
-            # caller: the token works, and the next pass adopts/persists.
+        def stash_successor(reason: str, note: str) -> None:
+            # A consumed generation is never discarded: park the successor
+            # where diagnostics (and a future pass) can find it.
             self._store._write_unclaimed_credential(
                 result.credentials,
                 {
-                    "reason": "consume-gate-persist-lock-failed",
+                    "reason": reason,
                     "configSlot": account_num,
                     "fingerprint": oauth.credential_fingerprint(
                         result.credentials
                     ),
                 },
             )
-            self._logger.warning(
-                "Slot lock unavailable after consuming account %s's grant; "
-                "successor stashed for the next pass.", account_num,
-            )
-            return oauth.RefreshOutcome(
-                result.credentials, None, result.token_account, consumed_fp
+            self._logger.warning(note, account_num)
+
+        outcome_creds = result.credentials
+        try:
+            with FileLock(self.lock_file):
+                store_now = self._read_account_credentials(account_num, email)
+                if store_now and (
+                    oauth.credential_fingerprint(store_now) != consumed_fp
+                ):
+                    # A writer replaced the lineage while our POST was in
+                    # flight: stash our successor, adopt the store's newer
+                    # credential.
+                    stash_successor(
+                        "consume-gate-cas-conflict",
+                        "Backup lineage for account %s moved during a "
+                        "refresh POST; successor stashed, adopting the "
+                        "newer store credential.",
+                    )
+                    outcome_creds = store_now
+                else:
+                    self._write_account_credentials(
+                        account_num, email, result.credentials
+                    )
+        except LockError:
+            # The grant IS consumed — the successor must survive even
+            # though the persist lock is unavailable. The token works;
+            # the next pass adopts/persists.
+            stash_successor(
+                "consume-gate-persist-lock-failed",
+                "Slot lock unavailable after consuming account %s's "
+                "grant; successor stashed for the next pass.",
             )
         return oauth.RefreshOutcome(
-            result.credentials, None, result.token_account, consumed_fp
+            outcome_creds, None, result.token_account, consumed_fp
         )
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
