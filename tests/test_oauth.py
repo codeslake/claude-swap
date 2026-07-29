@@ -994,9 +994,11 @@ class TestTryFetchUsageOutcome:
         assert "account 1" in line
         assert "retry-after 42s" in line
         assert "a@b.c" not in line
-        # Any 429 = the per-token usage budget, which cumulative polling
+        # Any 429 = the usage endpoint's own budget, which cumulative polling
         # across cswap surfaces can drain — the log says what is happening.
-        assert "per-token usage budget" in line
+        # Deliberately not scoped to the token in the wording: the budget is
+        # account/org-scoped (see poll_policy), so a re-login does not clear it.
+        assert "usage-endpoint budget" in line
 
     def test_edge_429_warning_names_the_budget(self, caplog):
         import email.message
@@ -1022,7 +1024,7 @@ class TestTryFetchUsageOutcome:
         )
         # "Retry-After: 0" is the saturated-budget edge — same hint.
         assert "retry-after 0s" in line
-        assert "per-token usage budget" in line
+        assert "usage-endpoint budget" in line
 
     def test_timeout_outcome(self):
         with patch(

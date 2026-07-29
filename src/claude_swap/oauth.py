@@ -384,7 +384,7 @@ def _log_usage_failure(
         # The endpoint budgets requests per access token (see poll_policy):
         # cumulative polling across cswap surfaces can saturate it, and
         # backoff plus the adaptive cadence are the recovery.
-        cause += " (per-token usage budget reached; backing off)"
+        cause += " (usage-endpoint budget reached; backing off)"
     _logger.warning("Usage fetch failed%s: %s", where, cause)
     _logger.debug("Usage fetch failure detail%s: %r", where, e)
 
