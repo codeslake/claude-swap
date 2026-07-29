@@ -2120,12 +2120,11 @@ class TestBootstrapRefreshRoutesThroughGate:
         )
         from claude_swap.session import SessionManager
         mgr = SessionManager(s)
-        # run() is the seam: it must call the gate BEFORE the bootstrap
-        # lock (the gate takes the same non-reentrant FileLock). exec is
-        # stubbed out; we only need the profile-preparation phase.
-        monkeypatch.setattr(mgr, "_exec", lambda *a, **k: None)
+        # setup_session is the seam: it must call the gate BEFORE the
+        # bootstrap lock (the gate takes the same non-reentrant FileLock).
+        # (run() itself needs a claude binary on PATH — absent on CI.)
         try:
-            mgr.run("1", [])
+            mgr.setup_session("1", share=False)
         except Exception:
             pass  # profile validation may fail in this stub env — the
                   # assertion below is about the gate routing only
