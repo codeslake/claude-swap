@@ -75,10 +75,13 @@ class AutoScreen(Screen):
 
     app: "CswapApp"
 
-    def __init__(self) -> None:
+    def __init__(self, *, start_live: bool = False) -> None:
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
+        # Consent already given: `cswap tui --auto` or a persisted
+        # autoStartLive — the engine starts LIVE without the modal.
+        self._start_live = start_live
         # Session-only threshold adjustment (t, then arrows). Never written
         # to settings.json — same memory-only precedent as the dry-run
         # toggle. ``_configured_threshold`` is the mount-time file value the
@@ -112,9 +115,12 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        # autoStartLive records a prior confirmed "Go live" — resume LIVE
+        # Prior consent (constructor flag from --auto / app-launch resume,
+        # or the persisted setting when entered from the menu) starts LIVE
         # without re-asking; otherwise the safe default, dry-run.
-        self._start_engine(dry_run=not self._settings.auto_start_live)
+        self._start_engine(
+            dry_run=not (self._start_live or self._settings.auto_start_live)
+        )
 
     def on_unmount(self) -> None:
         if self._engine is not None:
