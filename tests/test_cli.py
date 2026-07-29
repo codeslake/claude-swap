@@ -1491,3 +1491,38 @@ class TestDisableEnableDispatch:
             with pytest.raises(SystemExit) as excinfo:
                 cli.main()
         assert excinfo.value.code == 2
+
+
+class TestTuiAutoFlag:
+    """`cswap tui --auto` opens the TUI on the auto view with the engine
+    LIVE — the flag itself is the go-live consent."""
+
+    def test_tui_auto_passes_start_auto(self, monkeypatch):
+        import claude_swap.cli as cli
+        called = {}
+
+        def fake_run(switcher, start="dashboard"):
+            called["start"] = start
+            return 0
+
+        import claude_swap.tui as tui_pkg
+        monkeypatch.setattr(tui_pkg, "run", fake_run)
+        monkeypatch.setattr("sys.argv", ["cswap", "tui", "--auto"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert called["start"] == "auto"
+
+    def test_tui_without_auto_stays_dashboard(self, monkeypatch):
+        import claude_swap.cli as cli
+        called = {}
+
+        def fake_run(switcher, start="dashboard"):
+            called["start"] = start
+            return 0
+
+        import claude_swap.tui as tui_pkg
+        monkeypatch.setattr(tui_pkg, "run", fake_run)
+        monkeypatch.setattr("sys.argv", ["cswap", "tui"])
+        with pytest.raises(SystemExit):
+            cli.main()
+        assert called["start"] == "dashboard"
