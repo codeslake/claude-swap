@@ -8240,3 +8240,188 @@ class TestDisableEnableAccount:
         assert rows[2].get("disabled") is True
         # Additive: absent (not False) on enabled rows.
         assert "disabled" not in rows[1]
+
+
+class TestDegradedReadProvenance:
+    """M1 (stale-credential robustness): a credential read that fell back
+    after a Keychain failure carries ``degraded=True`` — the bytes may be a
+    stale generation (CC rotates keychain-only on macOS), so they may be
+    ADOPTED/served but never CONSUMED (their rt POSTed)."""
+
+    def _macos_switcher(self) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        return s
+
+    def test_file_covered_keychain_failure_is_degraded(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("FROM-FILE")
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+        result = s._read_active_credentials()
+        assert result.value == "FROM-FILE"
+        assert result.keychain_unavailable is False  # display contract intact
+        assert result.degraded is True               # consume ban signal
+
+    def test_healthy_keychain_read_is_not_degraded(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        acct = macos_keychain.keychain_account_name()
+        block_real_keychain.data[(CLAUDE_CODE_KEYCHAIN_SERVICE, acct)] = "FROM-KC"
+        result = s._read_active_credentials()
+        assert result.value == "FROM-KC"
+        assert result.degraded is False
+
+    def test_linux_file_read_is_not_degraded(self, temp_home: Path):
+        s = ClaudeAccountSwitcher()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("FROM-FILE")
+        result = s._read_active_credentials()
+        assert result.value == "FROM-FILE"
+        assert result.degraded is False
+
+    def test_degraded_active_read_never_consumes(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        """The field incident: keychain unreadable, stale file+backup agree,
+        token expired → the fetch path must NOT POST the (possibly superseded)
+        rt. It defers with the keychain-unavailable sentinel; no strike."""
+        from claude_swap.credentials import ActiveCredentials
+        from claude_swap.json_output import USAGE_KEYCHAIN_UNAVAILABLE
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        stale = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-stale", "refreshToken": "rt-stale",
+                "expiresAt": 1000,
+            }
+        })
+        monkeypatch.setattr(
+            switcher._store, "_read_active_credentials",
+            lambda: ActiveCredentials(stale, False, True),
+        )
+        with patch.object(
+                 switcher, "_read_account_credentials", return_value=stale
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", stale
+            )
+        mock_refresh.assert_not_called()   # the rt is never consumed
+        assert result.sentinel == USAGE_KEYCHAIN_UNAVAILABLE
+        assert result.error is None        # no strike-advancing error
+
+
+class TestBackupReadTriState:
+    """M1: a backup read that failed at the Keychain (not rc-44 absent) must
+    be distinguishable from a genuinely absent backup — 'unreadable' shows
+    keychain-unavailable, never 'no credentials / re-add'."""
+
+    def _macos_switcher(self) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        return s
+
+    def test_keychain_error_reports_unreadable(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        monkeypatch.setattr(
+            macos_keychain, "get_password",
+            lambda *a, **k: (_ for _ in ()).throw(KeychainError("locked")),
+        )
+        value, unreadable = s._store._read_account_credentials_ex(
+            "1", "test@example.com"
+        )
+        assert value == ""
+        assert unreadable is True
+
+    def test_absent_backup_is_not_unreadable(
+        self, temp_home: Path, block_real_keychain
+    ):
+        s = self._macos_switcher()
+        value, unreadable = s._store._read_account_credentials_ex(
+            "1", "test@example.com"
+        )
+        assert value == ""
+        assert unreadable is False
+
+    def test_enc_file_read_is_not_unreadable(self, temp_home: Path):
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._store._write_account_credentials("1", "test@example.com", "CREDS")
+        value, unreadable = s._store._read_account_credentials_ex(
+            "1", "test@example.com"
+        )
+        assert value == "CREDS"
+        assert unreadable is False
+
+
+class TestBackupUnreadableDisplay:
+    """M1: an idle slot whose backup is keychain-unreadable shows
+    'keychain unavailable', never 'no credentials' (which nudges re-add)."""
+
+    def test_idle_slot_unreadable_backup_shows_keychain_unavailable(
+        self, temp_home: Path, monkeypatch, block_real_keychain,
+        sample_sequence_data: dict,
+    ):
+        from claude_swap.json_output import (
+            USAGE_KEYCHAIN_UNAVAILABLE, USAGE_NO_CREDENTIALS,
+        )
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        monkeypatch.setattr(
+            macos_keychain, "get_password",
+            lambda *a, **k: (_ for _ in ()).throw(KeychainError("locked")),
+        )
+        # idle slot (is_active=False), empty creds, keychain pinned unusable
+        s._store._read_account_credentials_ex("2", "b@example.com")  # pins cache
+        info = (2, "b@example.com", "", "", False, "", "")
+        assert s._static_usage_sentinel(info) == USAGE_KEYCHAIN_UNAVAILABLE
+
+    def test_idle_slot_absent_backup_still_no_credentials(
+        self, temp_home: Path, block_real_keychain,
+    ):
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        info = (2, "b@example.com", "", "", False, "", "")
+        assert s._static_usage_sentinel(info) == USAGE_NO_CREDENTIALS
+
+
+class TestSwitchUnreadableBackup:
+    """M1: switching to a slot whose backup is keychain-unreadable errors
+    with 'keychain locked/unavailable', never the re-add instruction."""
+
+    def test_switch_to_unreadable_backup_says_keychain(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch, block_real_keychain,
+    ):
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        monkeypatch.setattr(
+            macos_keychain, "get_password",
+            lambda *a, **k: (_ for _ in ()).throw(KeychainError("locked")),
+        )
+        with pytest.raises(SwitchError) as exc:
+            s.switch_to("2")
+        msg = str(exc.value).lower()
+        assert "keychain" in msg
+        assert "add-account" not in msg   # the remedy must not be a re-add
