@@ -53,7 +53,6 @@ from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions

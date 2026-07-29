@@ -1223,3 +1223,29 @@ class CredentialStore:
         except OSError:
             pass
         return entries
+
+    def _read_unclaimed_credential(self, entry_id: str) -> str:
+        """Decode one stashed credential's bytes; "" when unreadable/absent."""
+        try:
+            encoded = self._stash_entry_path(entry_id).read_text(
+                encoding="utf-8"
+            ).strip()
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
+        except Exception as e:
+            self._host._logger.warning(
+                f"Failed to read unclaimed credential {entry_id}: {e}"
+            )
+            return ""
+
+    def _remove_unclaimed_credential(self, entry_id: str) -> None:
+        """Delete a stash entry (bytes + manifest row) after it was adopted."""
+        try:
+            self._stash_entry_path(entry_id).unlink(missing_ok=True)
+        except OSError as e:
+            self._host._logger.warning(
+                f"Failed to remove unclaimed credential {entry_id}: {e}"
+            )
+        entries = self._read_stash_manifest()
+        if entry_id in entries:
+            del entries[entry_id]
+            self._write_stash_manifest(entries)
