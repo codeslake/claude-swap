@@ -162,11 +162,18 @@ BACKOFF_MAX_SHIFT = 32
 # so a flat margin would inflate a 300s block by 4x on no evidence, and would
 # also let a 90s server ask overtake our own saturated failure curve. A
 # fraction extends the hour-scale finding (0.25 × 3600 = the measured 900s)
-# without extrapolating it onto short blocks.
+# without extrapolating it onto short blocks. 900s is the edge of the observed
+# band (last in-band re-block +716s, next +3853s), so a future re-block past
+# +900s means raising this fraction, not the cap below.
 RETRY_AFTER_MARGIN_FRAC = 0.25
 # Bounds Retry-After × (1 + MARGIN_FRAC), so a pathological header still cannot
-# park an account for hours. Raised with the margin so a normal full-window
-# block is not clipped back onto the bare deadline it is meant to clear.
+# park an account for hours. Sized to clear the measured shape exactly: every
+# observed block opens at 3600, and 3600 × 1.25 = this. Above that the cap
+# starts eating the margin (a 3700s ask keeps only +800s), which is deliberate
+# — an ask past the measured window is already outside the evidence, and
+# bounding it matters more there than preserving a margin derived from
+# hour-scale blocks. If real blocks ever open above 3600, raise this with the
+# shape rather than letting the cap silently shorten the margin.
 RETRY_AFTER_FLOOR_CAP_S = 4500.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
