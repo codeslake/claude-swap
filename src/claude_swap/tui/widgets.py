@@ -15,7 +15,12 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import pace
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_NO_CREDENTIALS,
+    USAGE_RELOGIN_REQUIRED,
+)
 from claude_swap.models import AccountSnapshot
 from claude_swap.usage_store import STALE_OK_S
 from claude_swap.tui import data
@@ -159,6 +164,23 @@ def usage_rows(
     return rows
 
 
+def pin_is_broken(acc: AccountSnapshot) -> bool:
+    """Whether pinning to ``acc`` currently cannot produce a bearer.
+
+    Only the states where the pinned account genuinely has no usable
+    credential count. ``token expired`` deliberately does not: the proxy
+    refreshes that itself, and flagging it would cry wolf on the normal case.
+    ``keychain unavailable`` is a read problem on THIS process, not evidence
+    about the credential, so it is left alone too — a warning that fires on
+    "I could not look" teaches people to ignore warnings.
+    """
+    return acc.usage.sentinel in (
+        USAGE_NO_CREDENTIALS,      # nothing stored for the slot
+        USAGE_RELOGIN_REQUIRED,    # refresh lineage dead; only a human fixes it
+        USAGE_FOREIGN_CREDENTIAL,  # the stored credential is another account's
+    )
+
+
 def account_card_text(
     acc: AccountSnapshot,
     width: int,
@@ -192,6 +214,14 @@ def account_card_text(
         # account, and a lone glyph read as decoration next to the usage
         # figures rather than as a label.
         text.append("   ○ cloud", style=f"bold {palette.sev_warn}")
+        if pin_is_broken(acc):
+            # The pin is FAIL-OPEN: an account that cannot mint a bearer sends
+            # RC and Artifacts back to whichever account is active, silently.
+            # The account's own row already says "re-login needed", but the
+            # cloud marker looked healthy right next to it — so the one place
+            # that claims "your claude.ai side lives here" was the one place
+            # not admitting it no longer does.
+            text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
@@ -285,6 +315,8 @@ def mini_account_text(
         # Labelled, like the full card: a bare glyph sitting between the
         # org tag and the usage figures read as decoration, not as a state.
         text.append("  ○ cloud", style=f"bold {palette.sev_warn}")
+        if pin_is_broken(acc):
+            text.append(" (not applying)", style=f"bold {palette.sev_crit}")
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     text.append("   ")

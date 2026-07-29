@@ -1739,6 +1739,46 @@ class TestCloudPinBadge:
         card = account_card_text(make_account(1), 80).plain
         assert "cloud" not in card
 
+    def test_pin_marked_not_applying_when_the_account_cannot_authenticate(self):
+        """The pin is fail-open: an account that cannot mint a bearer sends RC
+        and Artifacts back to the active account, silently. The account's own
+        row already says "re-login needed", but the cloud marker looked healthy
+        right beside it — so the one line claiming "your claude.ai side lives
+        here" was the one line not admitting it no longer does."""
+        from claude_swap.json_output import (
+            USAGE_FOREIGN_CREDENTIAL,
+            USAGE_NO_CREDENTIALS,
+            USAGE_RELOGIN_REQUIRED,
+        )
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        for sentinel in (
+            USAGE_RELOGIN_REQUIRED,
+            USAGE_NO_CREDENTIALS,
+            USAGE_FOREIGN_CREDENTIAL,
+        ):
+            acc = make_account(1, entry=make_usage_at(time.time(), sentinel=sentinel))
+            card = account_card_text(acc, 80, cloud_pinned=True).plain
+            assert "○ cloud (not applying)" in card, sentinel
+            mini = mini_account_text(acc, time.time(), cloud_pinned=True).plain
+            assert "○ cloud (not applying)" in mini, sentinel
+
+    def test_pin_not_flagged_for_a_merely_expired_token(self):
+        """The proxy refreshes an expired token itself, and a keychain it could
+        not read is not evidence about the credential. Flagging either would
+        fire on the normal case and train people to ignore the warning."""
+        from claude_swap.json_output import (
+            USAGE_KEYCHAIN_UNAVAILABLE,
+            USAGE_TOKEN_EXPIRED,
+        )
+        from claude_swap.tui.widgets import account_card_text
+
+        for sentinel in (USAGE_TOKEN_EXPIRED, USAGE_KEYCHAIN_UNAVAILABLE, None):
+            acc = make_account(1, entry=make_usage_at(time.time(), sentinel=sentinel))
+            card = account_card_text(acc, 80, cloud_pinned=True).plain
+            assert "○ cloud" in card, sentinel
+            assert "not applying" not in card, sentinel
+
     def test_account_card_widget_passes_the_pin_through(self, monkeypatch):
         """The switch and watch screens render through AccountCard, not the
         dashboard's panel. It used to drop cloud_pinned, so the badge showed
