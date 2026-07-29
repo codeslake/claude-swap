@@ -50,6 +50,10 @@ class AutoSwitchSettings:
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    # TUI: reopen the auto-switch view with the engine LIVE on launch.
+    # Recorded when the user confirms "Go live" (and cleared on the toggle
+    # back), so a restarted TUI resumes switching without re-confirmation.
+    auto_start_live: bool = False
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -130,6 +134,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
             help="Consecutive failed polls before an account is unhealthy",
+        ),
+        SettingSpec(
+            "autoswitch", "autoStartLive", "auto_start_live", "bool",
+            help="Open the TUI on the auto-switch view with the engine LIVE",
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",
