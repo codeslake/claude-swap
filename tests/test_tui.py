@@ -1704,3 +1704,81 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestCloudPinBadge:
+    """The pinned account must be visible on the account list itself.
+
+    `● active` says where inference bills; `☁ cloud` says where Remote
+    Control and Artifacts live. Without the badge the pin is invisible on
+    the screen the user actually looks at — they'd have to open a menu to
+    learn which account owns their RC sessions.
+
+    Text-presentation ☁ (U+2601, no VS16) is deliberate: the emoji form
+    renders double-width in a terminal and breaks column alignment
+    (measured on the real terminal).
+    """
+
+    def test_pinned_account_shows_cloud_badge(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        card = account_card_text(make_account(1), 80, cloud_pinned=True).plain
+        assert "☁ cloud" in card
+        assert "️" not in card, "emoji-presentation ☁ breaks alignment"
+
+    def test_unpinned_account_has_no_badge(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        card = account_card_text(make_account(1), 80).plain
+        assert "cloud" not in card
+
+    def test_active_and_pinned_can_coexist(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        card = account_card_text(
+            make_account(1, active=True), 80, cloud_pinned=True
+        ).plain
+        assert "● active" in card and "☁ cloud" in card
+
+
+class TestCloudPinMenuLabel:
+    """The dashboard menu must name the pinned account without being opened.
+
+    'Pin remote control…' told the user a pin feature exists but not whether
+    one is set or where it points — they had to open the submenu to find out.
+    It also under-sells the scope: the pin steers Artifacts, triggers and the
+    rest of the claude.ai surface, not just RC.
+    """
+
+    def test_menu_row_names_the_pinned_account(self):
+        from claude_swap.tui.dashboard import cloud_menu_label
+
+        assert cloud_menu_label("codeslake@gmail.com") == (
+            "Cloud account (RC/artifacts)… — codeslake@gmail.com"
+        )
+
+    def test_menu_row_says_none_when_unpinned(self):
+        from claude_swap.tui.dashboard import cloud_menu_label
+
+        assert cloud_menu_label(None) == "Cloud account (RC/artifacts)… — none"
+
+
+class TestCloudPinBadgeOnMiniLine:
+    """Inactive accounts render as one-line minis on the dashboard. The pin
+    usually sits on an INACTIVE account (that is the whole point — inference
+    elsewhere), so the badge has to show there too or it is invisible in the
+    common case."""
+
+    def test_mini_line_shows_cloud_badge(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        line = mini_account_text(
+            make_account(1), time.time(), cloud_pinned=True
+        ).plain
+        assert "☁" in line
+
+    def test_mini_line_without_pin_has_no_badge(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        line = mini_account_text(make_account(1), time.time()).plain
+        assert "☁" not in line

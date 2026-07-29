@@ -298,19 +298,19 @@ Examples:
 
         if args.clear:
             save_pin(switcher.backup_dir, None, None)
-            print(f"{accent('Unpinned')} remote control / artifacts")
+            print(f"{accent('Unpinned')} the cloud account")
             return
         if args.account is None:
             pin = load_pin(switcher.backup_dir)
             if pin:
-                print(f"Remote control / artifacts pinned to {pin[0]}")
+                print(f"Cloud account (RC/artifacts): {pin[0]}")
             else:
-                print(dimmed("No remote-control pin set"))
+                print(dimmed("No cloud account pinned"))
             return
         account_num, email, org_uuid = switcher.resolve_account(args.account)
         save_pin(switcher.backup_dir, email, org_uuid)
         print(
-            f"{accent('Pinned')} remote control / artifacts to "
+            f"{accent('Pinned')} the cloud account (RC/artifacts) to "
             f"Account-{account_num} ({email})"
         )
     except ClaudeSwitchError as e:
@@ -1038,7 +1038,7 @@ Commands:
   %(prog)s alias                      list all aliases
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
-  %(prog)s pin [<num|email>|--clear]  pin remote control / artifacts to an account
+  %(prog)s pin [<num|email>|--clear]  pin the cloud account (RC/artifacts, triggers)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts

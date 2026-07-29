@@ -38,6 +38,29 @@ MenuEntries = list[tuple[str, str]]  # (label, action_id)
 _BACK = ("← back", "back")
 
 
+def _current_pin_email(screen) -> str | None:
+    """The pinned account's email, or None. Never raises — a broken pin file
+    must not take the whole menu down."""
+    try:
+        from claude_swap.pin_proxy import load_pin
+
+        pin = load_pin(screen.app.switcher.backup_dir)
+        return pin[0] if pin else None
+    except Exception:
+        return None
+
+
+def cloud_menu_label(pinned_email: str | None) -> str:
+    """Menu row for the cloud pin, naming the pinned account inline.
+
+    The row has to answer "is a pin set, and where does it point" without
+    being opened — that is the whole question a user has when they glance at
+    the menu. "RC/artifacts" names the scope, which is wider than Remote
+    Control alone (artifacts, triggers, marketplace sync all follow the pin).
+    """
+    return f"Cloud account (RC/artifacts)… — {pinned_email or 'none'}"
+
+
 class DashboardScreen(Screen):
     BINDINGS = [
         Binding("s", "open_switch", "Switch accounts"),
@@ -79,7 +102,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
-            ("Pin remote control…", "pin-menu"),
+            (cloud_menu_label(_current_pin_email(self)), "pin-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -131,7 +154,7 @@ class DashboardScreen(Screen):
         return entries
 
     def _pin_entries(self) -> MenuEntries:
-        """One row per account (→ pin RC/artifacts to it), plus clear."""
+        """One row per account (→ pin the claude.ai surface to it), plus clear."""
         from claude_swap.pin_proxy import load_pin
 
         pin = load_pin(self.app.switcher.backup_dir)
@@ -139,9 +162,9 @@ class DashboardScreen(Screen):
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
             name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
-            state = "  (pinned)" if pin and pin[0] == acc.email else ""
+            state = "  ☁ pinned" if pin and pin[0] == acc.email else ""
             entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
-        entries.append(("Clear pin", "pin:clear"))
+        entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
         return entries
 
@@ -209,7 +232,7 @@ class DashboardScreen(Screen):
             app.do_toggle_disabled(number)
             await self._pop_menu()
         elif action_id == "pin-menu":
-            await self._push_menu("pin remote control", self._pin_entries())
+            await self._push_menu("cloud account", self._pin_entries())
         elif action_id.startswith("pin:"):
             from claude_swap.pin_proxy import save_pin
 
@@ -217,7 +240,7 @@ class DashboardScreen(Screen):
             snap = app.snapshot
             if target == "clear":
                 save_pin(app.switcher.backup_dir, None, None)
-                app.notify("Remote-control pin cleared")
+                app.notify("Cloud pin cleared")
             else:
                 acc = next(
                     (a for a in (snap.accounts if snap else ()) if a.number == target),

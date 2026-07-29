@@ -203,13 +203,13 @@ class AutoScreen(Screen):
         pin_label = self._pinned_rc_label()
         if pin_label:
             text.append(" · ")
-            text.append(f"pinned rc: {pin_label}", style=ACCENT)
+            text.append(f"☁ cloud: {pin_label}", style=ACCENT)
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
 
     def _pinned_rc_label(self) -> str | None:
-        """`#<slot> <email>` for the remote-control-pinned account, or just the
+        """`#<slot> <email>` for the cloud-pinned account, or just the
         email if no snapshot slot matches, or None when nothing is pinned."""
         from claude_swap.pin_proxy import load_pin
 

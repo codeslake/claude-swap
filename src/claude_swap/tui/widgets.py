@@ -166,8 +166,15 @@ def account_card_text(
     threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    cloud_pinned: bool = False,
 ) -> Text:
-    """The full account card: header line + per-window bar rows."""
+    """The full account card: header line + per-window bar rows.
+
+    ``cloud_pinned`` marks the account that owns the claude.ai-side assets
+    (Remote Control sessions, Artifacts). It is independent of ``is_active``
+    — inference follows the active account while those stay pinned — so both
+    badges can appear, on different accounts or the same one.
+    """
     now = now if now is not None else time.time()
 
     text = Text()
@@ -180,6 +187,10 @@ def account_card_text(
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
     if acc.is_active:
         text.append("   ● active", style=f"bold {palette.accent}")
+    if cloud_pinned:
+        # Text-presentation U+2601 (no VS16): the emoji form is double-width
+        # in a terminal and shifts every column after it.
+        text.append("   ☁ cloud", style=f"bold {palette.sev_warn}")
     if acc.disabled:
         text.append("   (disabled)", style=palette.muted)
     age = data.format_age(acc.usage.age_s)
@@ -235,8 +246,24 @@ def account_card_text(
     return text
 
 
+def _cloud_pinned_email(app) -> str | None:
+    """Email of the cloud-pinned account, or None. Never raises: a missing or
+    malformed pin file must not blank the account panel."""
+    try:
+        from claude_swap.pin_proxy import load_pin
+
+        pin = load_pin(app.switcher.backup_dir)
+        return pin[0] if pin else None
+    except Exception:
+        return None
+
+
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
+    cloud_pinned: bool = False,
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -253,6 +280,8 @@ def mini_account_text(
     else:
         text.append(acc.email, style=palette.foreground)
     text.append(f"  [{acc.display_tag}]", style=palette.muted)
+    if cloud_pinned:
+        text.append("  ☁", style=f"bold {palette.sev_warn}")
     if acc.disabled:
         text.append("  (disabled)", style=palette.muted)
     text.append("   ")
@@ -329,17 +358,23 @@ class AccountsPanel(Static):
             )
         now = time.time()
         width = (self.size.width or 80) - 2
+        pinned_email = _cloud_pinned_email(app)
         blocks: list[Text] = []
         for acc in snap.accounts:
+            pinned = pinned_email is not None and acc.email == pinned_email
             if acc.is_active:
                 blocks.append(
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
-                        palette=palette,
+                        palette=palette, cloud_pinned=pinned,
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(
+                    mini_account_text(
+                        acc, now, palette=palette, cloud_pinned=pinned
+                    )
+                )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()
