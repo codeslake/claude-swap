@@ -297,7 +297,11 @@ Examples:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
-    from claude_swap.pin_proxy import apply_pin, load_pin
+    from claude_swap.pin_proxy import (
+        apply_pin,
+        live_remote_control_sessions,
+        load_pin,
+    )
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -324,7 +328,27 @@ Examples:
             f"Account-{account_num} ({email})"
         )
         if started:
-            print(dimmed("New sessions pick this up; restart a running one."))
+            # New sessions are wired at launch; a live one keeps the
+            # environment it started with, which is fine — the pin itself is
+            # re-read per request. The one thing a re-pin cannot move is an RC
+            # session that is ALREADY open: the server fixed its owner when it
+            # was created. Reconnecting inside it mints a new one under the new
+            # pin, so name the sessions where that applies instead of telling
+            # everyone to restart something.
+            open_rc = live_remote_control_sessions()
+            if open_rc:
+                which = ", ".join(open_rc[:3])
+                if len(open_rc) > 3:
+                    which += f", +{len(open_rc) - 3} more"
+                print(
+                    dimmed(
+                        f"Remote Control is open on: {which}. Those stay on the "
+                        "previous account until you reconnect them "
+                        "(/rc → Disconnect this session → /rc)."
+                    )
+                )
+            else:
+                print(dimmed("New sessions pick this up."))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

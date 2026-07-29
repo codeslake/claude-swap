@@ -164,7 +164,10 @@ class DashboardScreen(Screen):
             name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
             state = "  ☁ pinned" if pin and pin[0] == acc.email else ""
             entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
-        entries.append(("Clear cloud pin", "pin:clear"))
+        # Only offer the clear when there is something to clear — an inert row
+        # reads as "a pin exists" to anyone scanning the menu.
+        if pin:
+            entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
         return entries
 
@@ -234,7 +237,10 @@ class DashboardScreen(Screen):
         elif action_id == "pin-menu":
             await self._push_menu("cloud account", self._pin_entries())
         elif action_id.startswith("pin:"):
-            from claude_swap.pin_proxy import apply_pin
+            from claude_swap.pin_proxy import (
+                apply_pin,
+                live_remote_control_sessions,
+            )
 
             target = action_id.split(":", 1)[1]
             snap = app.snapshot
@@ -248,7 +254,17 @@ class DashboardScreen(Screen):
                 )
                 if acc is not None:
                     apply_pin(app.switcher, acc.email, acc.org_uuid)
-                    app.notify(f"Remote control pinned to {acc.email}")
+                    # An RC session that is already open keeps its old owner
+                    # (the server fixed it at creation); reconnecting inside it
+                    # is what moves it. Say so only when there is one.
+                    open_rc = live_remote_control_sessions()
+                    note = (
+                        "  Reconnect open Remote Control sessions to move them "
+                        "(/rc → Disconnect → /rc)."
+                        if open_rc
+                        else ""
+                    )
+                    app.notify(f"Remote control pinned to {acc.email}.{note}")
             await self._pop_menu()
         else:
             actions[action_id]()

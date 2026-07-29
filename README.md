@@ -155,6 +155,59 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 </details>
 
+### Keep Remote Control and artifacts on one account (cloud pin)
+
+Switching accounts moves *everything* to the new account — including the two
+things that are not inference and that you usually want to stay put:
+
+- **Remote Control** — a session's owner is fixed when it is created. After a
+  switch, the phone/web loses it and stale sessions pile up on the old account.
+- **Artifacts** — owned by whoever published them. After a switch, a republish
+  fails and the artifact "disappears" from the account you are logged into.
+
+Pin those to one account and they stop following the switch, while inference
+keeps billing whichever account is active:
+
+```bash
+cswap pin 2          # Remote Control / artifacts / ultrareview → account 2
+cswap pin            # show the current pin
+cswap pin --clear    # remove it
+```
+
+In the TUI, the pinned account is marked `☁` and the menu names it inline.
+
+Re-pinning takes effect immediately — no session restart, same as switching
+accounts. One thing does not move: a Remote Control session that is **already
+open** stays on the account that created it (the server fixes ownership at
+creation). To move it, reconnect inside that session — `/rc` → *Disconnect this
+session* → `/rc` — and it comes back under the new pin. Sessions started after
+the re-pin use it already.
+
+<details>
+<summary>How it works, and what it does not touch</summary>
+
+Claude Code resolves every one of these through the same credential, and
+offers no per-operation token selector, so cswap runs a small local proxy that
+swaps the `Authorization` bearer on exactly the routes whose ownership is
+decided by it (`/v1/code/sessions*`, `/v1/sessions/*`, `/api/frame/*`,
+`/v1/ultrareview/*`) and relays everything else — `/v1/messages` above all —
+untouched.
+
+- **Opt-in**: nothing runs until you set a pin, and it shuts down once the
+  sessions using it exit.
+- **Fail-open**: if the pin cannot be applied, the request goes out with the
+  session's own bearer instead of failing.
+- **Chains, never replaces**: it forwards through whatever `HTTPS_PROXY` you
+  already had (a corporate proxy, another local one) and merges its CA with
+  the one you already trusted rather than overwriting it.
+
+Sessions launched through cswap are wired automatically. A `claude` you start
+yourself is wired through the `env` block of `.claude.json` — the same file
+cswap already rewrites to switch accounts; Claude Code's own `settings.json` is
+never touched. Sessions already running keep the environment they started with.
+
+</details>
+
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
@@ -201,6 +254,8 @@ cswap alias 2 dev               # Give an account a short alias (usable anywhere
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
 cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap pin 2                     # Keep Remote Control/artifacts on account 2 (see above)
+cswap pin --clear               # Remove the cloud pin
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version
