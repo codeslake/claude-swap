@@ -290,7 +290,12 @@ Examples:
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
-    from claude_swap.pin_proxy import load_pin, save_pin
+    from claude_swap.pin_proxy import (
+        ensure_proxy,
+        load_pin,
+        save_pin,
+        wire_global_config,
+    )
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -298,6 +303,7 @@ Examples:
 
         if args.clear:
             save_pin(switcher.backup_dir, None, None)
+            wire_global_config(None, None)
             print(f"{accent('Unpinned')} the cloud account")
             return
         if args.account is None:
@@ -313,6 +319,11 @@ Examples:
             f"{accent('Pinned')} the cloud account (RC/artifacts) to "
             f"Account-{account_num} ({email})"
         )
+        # Start the proxy now; ensure_proxy also records it where Claude Code
+        # reads env at startup, so a `claude` the user launches by hand is
+        # pinned too — no settings.json edit, no shell rc, no shim on PATH.
+        if ensure_proxy(switcher):
+            print(dimmed("New sessions pick this up; restart a running one."))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
