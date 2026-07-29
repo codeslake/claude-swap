@@ -742,9 +742,11 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
-                    # Additive field (absent = legacy unconditional binding).
-                    if rec.struck_fp is not None:
-                        row["struckFingerprint"] = rec.struck_fp
+                    # Additive field (absent/None = legacy unconditional
+                    # binding). Always overwrite: a legacy writer's strike
+                    # must bind unconditionally, not inherit a stale
+                    # fingerprint from an earlier, already-healed strike.
+                    row["struckFingerprint"] = rec.struck_fp
 
         with self._lock():
             rows = self._read_rows()
@@ -811,6 +813,7 @@ class UsageStore:
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
+            row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0
             row["lastError"] = None
             row["backoffUntil"] = None
