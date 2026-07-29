@@ -557,7 +557,8 @@ class TestAdaptiveScheduler:
 
     @staticmethod
     def _counting_fetch(counts, usage_by_num, errors_by_num=None):
-        def fake(num, email, creds, is_active=False, persist_credentials=None):
+        def fake(num, email, creds, is_active=False, persist_credentials=None,
+                 **kwargs):
             counts[num] = counts.get(num, 0) + 1
             error = (errors_by_num or {}).get(num)
             if error:
@@ -2451,3 +2452,39 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestFreshenRoutesThroughGate:
+    """M2: autoswitch's freshen no longer POSTs a raw snapshot — it routes
+    through the switcher's consume gate (locked re-read + CAS persist)."""
+
+    def test_freshen_calls_consume_gate(self, temp_home, monkeypatch):
+        from claude_swap import oauth as oauth_mod
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
+        eng = harness.engine
+        gate_calls = {}
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-y", "refreshToken": "rt-y",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        def gate(num, email, snapshot):
+            gate_calls["args"] = (num, email, snapshot)
+            return oauth_mod.RefreshOutcome(fresh, None)
+
+        harness.switcher.consume_backup_grant = gate
+        direct = {}
+        def direct_post(*a, **k):
+            direct["called"] = True
+            return oauth_mod.RefreshOutcome(None, "transient")
+
+        monkeypatch.setattr(
+            oauth_mod, "try_refresh_oauth_credentials", direct_post
+        )
+        verdict = eng._freshen_target("2", "b@example.com")
+        assert verdict == "ok"
+        assert gate_calls["args"][0] == "2"
+        assert "called" not in direct, "freshen must not POST outside the gate"
