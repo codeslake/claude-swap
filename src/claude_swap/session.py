@@ -423,7 +423,7 @@ class SessionManager:
             pinned = pin_proxy.ensure_proxy(self.switcher)
             if pinned:
                 port, ca_path = pinned
-                env = pin_proxy.wire_env(env, port, ca_path, ca_path.parent)
+                env = pin_proxy.wire_env(env, port, ca_path)
         except Exception as e:  # noqa: BLE001 — never block the launch
             warning(f"remote-control pin disabled for this launch: {e}")
         argv = [claude_bin, *claude_args]
