@@ -135,6 +135,13 @@ class FakeSwitcher:
     def current_account_number(self) -> str | None:
         return self.active
 
+    def resolve_account(self, identifier: str) -> tuple[str, str, str]:
+        """Used by the pin path (apply_pin -> ensure_proxy)."""
+        for a in self._accounts:
+            if a.number == str(identifier) or a.email == identifier:
+                return a.number, a.email, getattr(a, "org_uuid", "") or ""
+        raise KeyError(identifier)
+
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict:
@@ -844,6 +851,7 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                "pin-menu",
                 "remove-menu",
                 "theme-menu",
                 "quit",
@@ -1766,3 +1774,206 @@ class TestAutoStartLive:
     def test_default_off(self, tmp_path):
         from claude_swap.settings import load_settings
         assert load_settings(tmp_path).auto_start_live is False
+
+
+class TestCloudPinBadge:
+    """The pinned account must be visible on the account list itself.
+
+    `● active` says where inference bills; `○ cloud` says where Remote
+    Control and Artifacts live. Without the badge the pin is invisible on
+    the screen the user actually looks at — they'd have to open a menu to
+    learn which account owns their RC sessions.
+
+    The marker mirrors `● active` deliberately: the two are sibling states
+    of one account, and a bare glyph read as decoration next to the usage
+    figures rather than as a label (measured on the real terminal).
+    """
+
+    def test_pinned_account_shows_cloud_badge(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        card = account_card_text(make_account(1), 80, cloud_pinned=True).plain
+        assert "○ cloud" in card
+        assert "☁" not in card, "the pin marker mirrors ● active, not a glyph"
+
+    def test_unpinned_account_has_no_badge(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        card = account_card_text(make_account(1), 80).plain
+        assert "cloud" not in card
+
+    def test_pin_marked_not_applying_when_the_account_cannot_authenticate(self):
+        """The pin is fail-open: an account that cannot mint a bearer sends RC
+        and Artifacts back to the active account, silently. The account's own
+        row already says "re-login needed", but the cloud marker looked healthy
+        right beside it — so the one line claiming "your claude.ai side lives
+        here" was the one line not admitting it no longer does."""
+        from claude_swap.json_output import (
+            USAGE_FOREIGN_CREDENTIAL,
+            USAGE_NO_CREDENTIALS,
+            USAGE_RELOGIN_REQUIRED,
+        )
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        for sentinel in (
+            USAGE_RELOGIN_REQUIRED,
+            USAGE_NO_CREDENTIALS,
+            USAGE_FOREIGN_CREDENTIAL,
+        ):
+            acc = make_account(1, entry=make_usage_at(time.time(), sentinel=sentinel))
+            card = account_card_text(acc, 80, cloud_pinned=True).plain
+            assert "○ cloud (not applying)" in card, sentinel
+            mini = mini_account_text(acc, time.time(), cloud_pinned=True).plain
+            assert "○ cloud (not applying)" in mini, sentinel
+
+    def test_pin_not_flagged_for_a_merely_expired_token(self):
+        """The proxy refreshes an expired token itself, and a keychain it could
+        not read is not evidence about the credential. Flagging either would
+        fire on the normal case and train people to ignore the warning."""
+        from claude_swap.json_output import (
+            USAGE_KEYCHAIN_UNAVAILABLE,
+            USAGE_TOKEN_EXPIRED,
+        )
+        from claude_swap.tui.widgets import account_card_text
+
+        for sentinel in (USAGE_TOKEN_EXPIRED, USAGE_KEYCHAIN_UNAVAILABLE, None):
+            acc = make_account(1, entry=make_usage_at(time.time(), sentinel=sentinel))
+            card = account_card_text(acc, 80, cloud_pinned=True).plain
+            assert "○ cloud" in card, sentinel
+            assert "not applying" not in card, sentinel
+
+    def test_account_card_widget_passes_the_pin_through(self, monkeypatch):
+        """The switch and watch screens render through AccountCard, not the
+        dashboard's panel. It used to drop cloud_pinned, so the badge showed
+        only on the dashboard — measured live: a pinned account looked
+        unpinned on both of the screens where you compare accounts."""
+        from claude_swap.tui import widgets
+
+        acc = make_account(1)
+        monkeypatch.setattr(widgets, "_cloud_pinned_email", lambda app: acc.email)
+
+        seen = {}
+
+        def spy(account, width, **kw):
+            seen.update(kw)
+            return widgets.Text("")
+
+        monkeypatch.setattr(widgets, "account_card_text", spy)
+
+        # size/app are read-only properties on the real widget.
+        monkeypatch.setattr(
+            widgets.AccountCard, "size",
+            property(lambda self: type("S", (), {"width": 80})()),
+        )
+        monkeypatch.setattr(
+            widgets.AccountCard, "app",
+            property(lambda self: type("A", (), {"current_theme": "dark"})()),
+        )
+        monkeypatch.setattr(widgets.Palette, "from_theme", staticmethod(
+            lambda theme: widgets.Palette.DARK
+        ))
+        widgets.AccountCard(acc).render()
+
+        assert seen.get("cloud_pinned") is True
+
+    def test_active_and_pinned_can_coexist(self):
+        from claude_swap.tui.widgets import account_card_text
+
+        card = account_card_text(
+            make_account(1, active=True), 80, cloud_pinned=True
+        ).plain
+        assert "● active" in card and "○ cloud" in card
+
+
+class TestCloudPinMenuLabel:
+    """The dashboard menu must name the pinned account without being opened.
+
+    'Pin remote control…' told the user a pin feature exists but not whether
+    one is set or where it points — they had to open the submenu to find out.
+    It also under-sells the scope: the pin steers Artifacts, triggers and the
+    rest of the claude.ai surface, not just RC.
+    """
+
+    def test_menu_row_names_the_pinned_account(self):
+        from claude_swap.tui.dashboard import cloud_menu_label
+
+        assert cloud_menu_label("codeslake@gmail.com") == (
+            "Cloud account (RC/artifacts)… — codeslake@gmail.com"
+        )
+
+    def test_menu_row_says_none_when_unpinned(self):
+        from claude_swap.tui.dashboard import cloud_menu_label
+
+        assert cloud_menu_label(None) == "Cloud account (RC/artifacts)… — none"
+
+    def test_root_menu_refreshes_when_the_pin_changes_outside(self, monkeypatch):
+        """The pin can change from another process (`cswap pin` over ssh).
+        Menu entries are built once and frozen into the stack, so the row went
+        stale while the account list — snapshot-driven — showed the new pin:
+        one screen disagreeing with itself. Reported on wmac."""
+        from claude_swap.tui import dashboard
+
+        pin = {"email": None}
+        monkeypatch.setattr(
+            dashboard, "_current_pin_email", lambda screen: pin["email"]
+        )
+
+        screen = dashboard.DashboardScreen()
+        rendered: list = []
+
+        async def fake_render():
+            rendered.append(list(screen._menu_stack[-1][1]))
+
+        screen._render_menu = fake_render
+        screen.query_one = lambda *a, **k: type(
+            "LV", (), {"index": 0, "focus": lambda s: None}
+        )()
+
+        screen._menu_stack = [("menu", screen._root_entries())]
+        assert any("— none" in label for label, _ in screen._menu_stack[0][1])
+
+        pin["email"] = "codeslake@gmail.com"
+        import asyncio
+        asyncio.run(screen._refresh_root_menu(None))
+
+        labels = [label for label, _ in screen._menu_stack[0][1]]
+        assert any("codeslake@gmail.com" in x for x in labels), labels
+        assert rendered, "the menu was not re-rendered"
+
+    def test_root_menu_not_rebuilt_inside_a_submenu(self, monkeypatch):
+        """Re-rendering while the user is inside a submenu would yank the list
+        out from under them."""
+        from claude_swap.tui import dashboard
+
+        monkeypatch.setattr(dashboard, "_current_pin_email", lambda s: "x@y.z")
+        screen = dashboard.DashboardScreen()
+        touched = []
+        async def fake_render():
+            touched.append(1)
+        screen._render_menu = fake_render
+        screen._menu_stack = [("menu", []), ("cloud account", [])]
+
+        import asyncio
+        asyncio.run(screen._refresh_root_menu(None))
+        assert not touched, "rebuilt the menu while a submenu was open"
+
+
+class TestCloudPinBadgeOnMiniLine:
+    """Inactive accounts render as one-line minis on the dashboard. The pin
+    usually sits on an INACTIVE account (that is the whole point — inference
+    elsewhere), so the badge has to show there too or it is invisible in the
+    common case."""
+
+    def test_mini_line_shows_cloud_badge(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        line = mini_account_text(
+            make_account(1), time.time(), cloud_pinned=True
+        ).plain
+        assert "○ cloud" in line
+
+    def test_mini_line_without_pin_has_no_badge(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        line = mini_account_text(make_account(1), time.time()).plain
+        assert "cloud" not in line

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 
 from claude_swap import __version__, paths, printer
@@ -209,6 +210,143 @@ Examples:
                 )
             )
         manager.exec_default(tail)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _pin_env_command(argv: list[str]) -> None:
+    """Handle `cswap pin-env` — emit shell exports to route this shell's Claude
+    through the pin proxy, for `eval "$(cswap pin-env)"` in a launcher.
+
+    This is the hook for people who DON'T launch via `cswap run` (they run
+    plain `claude`, often behind their own wrapper). `cswap run`/TUI wire the
+    proxy in-process; a plain `claude` needs its env set by the shell, so the
+    launcher evals this. Emits nothing when no pin is set, the pin is the
+    active account, or the pinned account is gone — so it's always safe to
+    eval unconditionally.
+    """
+    from claude_swap import pin_proxy
+
+    try:
+        switcher = ClaudeAccountSwitcher()
+        pinned = pin_proxy.ensure_proxy(switcher)
+    except ClaudeSwitchError:
+        return  # never break a shell startup over a pin problem
+    if not pinned:
+        return
+    port, ca_path = pinned
+    # Read os.environ so wire_env MERGES any ambient NODE_EXTRA_CA_CERTS (a
+    # corporate or local-MITM bundle) with our CA — the client still
+    # blind-tunnels to those hosts and must keep trusting their CAs.
+    # HTTPS_PROXY is replaced (the pin proxy chains onward to it).
+    # open_refcount=False: the SHELL opens the refcount fd (below), not this
+    # short-lived process.
+    env = pin_proxy.wire_env(dict(os.environ), port, ca_path, open_refcount=False)
+    # CSWAP_PIN_PORT rides along as the self-loop marker: without it, the next
+    # cswap invocation in this shell reads our own proxy as its ambient one and
+    # records the daemon as its own upstream, making it CONNECT to itself.
+    # Values are quoted — a backup dir under a home with a space would
+    # otherwise break the caller's eval.
+    for key in ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS", "CSWAP_PIN_PORT"):
+        print(f"export {key}={shlex.quote(env[key])}")
+    # Refcount holder: have the SHELL open a write fd on the FIFO (CCF's
+    # `exec {fd}<>fifo`). O_RDWR (<>) so the open never blocks; the fd is
+    # inherited by the claude the shell launches next and closes when that
+    # session ends, letting the daemon idle-teardown. A missing FIFO (daemon
+    # not up) is skipped without failing the eval.
+    fifo = env.get("CSWAP_PIN_FIFO")
+    if fifo and os.path.exists(fifo):
+        print(f"exec {{__cswap_pin_fd}}<>{shlex.quote(fifo)} 2>/dev/null || true")
+
+
+def _pin_command(argv: list[str]) -> None:
+    """Handle `cswap pin [NUM|EMAIL] [--clear]`.
+
+    Pins Remote Control and Artifacts to one account: sessions launched
+    through cswap route those routes' auth to the pinned account while
+    inference keeps following the active (swapped) account. With no
+    arguments, shows the current pin.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} pin",
+        description=(
+            "[EXPERIMENTAL] Pin Remote Control and Artifacts to one account. "
+            "Inference keeps following the active account; only sessions "
+            "launched via cswap (run/tui) are affected."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap pin 2                # pin RC/artifacts to account 2
+  cswap pin user@example.com
+  cswap pin                  # show the current pin
+  cswap pin --clear          # remove the pin
+        """,
+    )
+    parser.add_argument(
+        "account", nargs="?", metavar="NUM|EMAIL",
+        help="Account to pin (number or email). Omit to show the current pin.",
+    )
+    parser.add_argument("--clear", action="store_true", help="Remove the pin")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.pin_proxy import (
+        apply_pin,
+        live_remote_control_sessions,
+        load_pin,
+    )
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.clear:
+            apply_pin(switcher, None, None)
+            print(f"{accent('Unpinned')} the cloud account")
+            return
+        if args.account is None:
+            pin = load_pin(switcher.backup_dir)
+            if pin:
+                print(f"Cloud account (RC/artifacts): {pin[0]}")
+            else:
+                print(dimmed("No cloud account pinned"))
+            return
+        account_num, email, org_uuid = switcher.resolve_account(args.account)
+        # Saves the pin, starts the proxy, and records it where Claude Code
+        # reads env at startup — so a `claude` launched by hand is pinned too,
+        # with no settings.json edit, no shell rc, and no shim on PATH.
+        started = apply_pin(switcher, email, org_uuid)
+        print(
+            f"{accent('Pinned')} the cloud account (RC/artifacts) to "
+            f"Account-{account_num} ({email})"
+        )
+        if started:
+            # New sessions are wired at launch; a live one keeps the
+            # environment it started with, which is fine — the pin itself is
+            # re-read per request. The one thing a re-pin cannot move is an RC
+            # session that is ALREADY open: the server fixed its owner when it
+            # was created. Reconnecting inside it mints a new one under the new
+            # pin, so name the sessions where that applies instead of telling
+            # everyone to restart something.
+            open_rc = live_remote_control_sessions()
+            if open_rc:
+                which = ", ".join(open_rc[:3])
+                if len(open_rc) > 3:
+                    which += f", +{len(open_rc) - 3} more"
+                print(
+                    dimmed(
+                        f"Remote Control is open on: {which}. Those stay on the "
+                        "previous account until you reconnect them "
+                        "(/rc → Disconnect this session → /rc)."
+                    )
+                )
+            else:
+                print(dimmed("New sessions pick this up."))
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -890,6 +1028,12 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    if argv and argv[0] == "pin-env":
+        _pin_env_command(argv[1:])
+        return
+    if argv and argv[0] == "pin":
+        _pin_command(argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -928,6 +1072,7 @@ Commands:
   %(prog)s alias                      list all aliases
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
+  %(prog)s pin [<num|email>|--clear]  pin the cloud account (RC/artifacts, triggers)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts

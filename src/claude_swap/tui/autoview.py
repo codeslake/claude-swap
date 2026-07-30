@@ -213,6 +213,22 @@ class AutoScreen(Screen):
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
 
+    def _pinned_email(self) -> str | None:
+        """The cloud-pinned account's email, or None when nothing is pinned.
+
+        The badge rides on that account's own row rather than the summary line:
+        naming the pin separately makes you match an email against the list
+        directly below it instead of just reading the list, and the summary
+        line wrapped past 80 columns.
+        """
+        from claude_swap.pin_proxy import load_pin
+
+        try:
+            pin = load_pin(self.app.switcher.backup_dir)
+        except Exception:
+            return None
+        return pin[0] if pin else None
+
     # -- engine -------------------------------------------------------------
 
     def _start_engine(self, *, dry_run: bool) -> None:
@@ -324,6 +340,7 @@ class AutoScreen(Screen):
         models = parse_model_names(self._settings.model) if self._settings else ()
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
+        pinned_email = self._pinned_email()  # once, not per row
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -368,6 +385,12 @@ class AutoScreen(Screen):
                         f"  {pct:3.0f}% used", style=palette.severity(pct)
                     )
                 ranked.append((pct, acc.number))
+            # Outside the usage branches on purpose: an account whose usage is
+            # unknown still owns the claude.ai side, so the badge must not hang
+            # off whichever branch happened to run.
+            if pinned_email and acc.email == pinned_email:
+                entry.append("  · ", style=palette.muted)
+                entry.append("○ cloud", style=f"bold {palette.sev_warn}")
             lines[acc.number] = entry
 
         text = Text()

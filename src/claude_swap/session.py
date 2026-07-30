@@ -47,7 +47,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, pin_proxy
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
 from claude_swap.fsutil import replace_with_retry
@@ -412,7 +412,19 @@ class SessionManager:
         already released — an exec'd claude must never inherit a held flock).
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
+
+        Every launch path (run, its same-account fast path, exec_default)
+        funnels through here, so this is also where a remote-control pin
+        (see pin_proxy) routes the child through the pin proxy. A pin
+        failure must never block a launch — degrade to a plain exec.
         """
+        try:
+            pinned = pin_proxy.ensure_proxy(self.switcher)
+            if pinned:
+                port, ca_path = pinned
+                env = pin_proxy.wire_env(env, port, ca_path)
+        except Exception as e:  # noqa: BLE001 — never block the launch
+            warning(f"remote-control pin disabled for this launch: {e}")
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:

@@ -38,6 +38,29 @@ MenuEntries = list[tuple[str, str]]  # (label, action_id)
 _BACK = ("← back", "back")
 
 
+def _current_pin_email(screen) -> str | None:
+    """The pinned account's email, or None. Never raises — a broken pin file
+    must not take the whole menu down."""
+    try:
+        from claude_swap.pin_proxy import load_pin
+
+        pin = load_pin(screen.app.switcher.backup_dir)
+        return pin[0] if pin else None
+    except Exception:
+        return None
+
+
+def cloud_menu_label(pinned_email: str | None) -> str:
+    """Menu row for the cloud pin, naming the pinned account inline.
+
+    The row has to answer "is a pin set, and where does it point" without
+    being opened — that is the whole question a user has when they glance at
+    the menu. "RC/artifacts" names the scope, which is wider than Remote
+    Control alone (artifacts, triggers, marketplace sync all follow the pin).
+    """
+    return f"Cloud account (RC/artifacts)… — {pinned_email or 'none'}"
+
+
 class DashboardScreen(Screen):
     BINDINGS = [
         Binding("s", "open_switch", "Switch accounts"),
@@ -67,6 +90,32 @@ class DashboardScreen(Screen):
     async def on_mount(self) -> None:
         self.query_one("#menu", ListView).focus()
         await self._push_menu("menu", self._root_entries())
+        # The cloud row names the pinned account, and the pin can change from
+        # outside this process (`cswap pin` over ssh, another terminal). Menu
+        # entries are built once and frozen into the stack, so without this the
+        # account list would show the new pin while the row still read "none" —
+        # one screen disagreeing with itself. Re-read on the same beat the
+        # accounts panel refreshes on.
+        self.watch(self.app, "snapshot", self._refresh_root_menu)
+
+    async def _refresh_root_menu(self, _snap: AccountsSnapshot | None) -> None:
+        """Rebuild the root menu when a stale label would otherwise linger.
+
+        Only at the root, and only when a label actually changed: re-rendering
+        while the user is inside a submenu would yank the list out from under
+        them, and rebuilding unconditionally resets the cursor to the top on
+        every poll.
+        """
+        if len(self._menu_stack) != 1:
+            return
+        fresh = self._root_entries()
+        if fresh == self._menu_stack[0][1]:
+            return
+        self._menu_stack[0] = (self._menu_stack[0][0], fresh)
+        keep = self.query_one("#menu", ListView).index
+        await self._render_menu()
+        if keep is not None and keep < len(fresh):
+            self.query_one("#menu", ListView).index = keep
 
     # -- menu plumbing --------------------------------------------------------
 
@@ -79,6 +128,7 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            (cloud_menu_label(_current_pin_email(self)), "pin-menu"),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -126,6 +176,24 @@ class DashboardScreen(Screen):
             (f"{'●' if name == current else ' '} {name}", f"theme:{name}")
             for name in ("dark", "light", "auto")
         ]
+        entries.append(_BACK)
+        return entries
+
+    def _pin_entries(self) -> MenuEntries:
+        """One row per account (→ pin the claude.ai surface to it), plus clear."""
+        from claude_swap.pin_proxy import load_pin
+
+        pin = load_pin(self.app.switcher.backup_dir)
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            state = "  ○ cloud" if pin and pin[0] == acc.email else ""
+            entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
+        # Only offer the clear when there is something to clear — an inert row
+        # reads as "a pin exists" to anyone scanning the menu.
+        if pin:
+            entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
         return entries
 
@@ -191,6 +259,38 @@ class DashboardScreen(Screen):
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
+            await self._pop_menu()
+        elif action_id == "pin-menu":
+            await self._push_menu("cloud account", self._pin_entries())
+        elif action_id.startswith("pin:"):
+            from claude_swap.pin_proxy import (
+                apply_pin,
+                live_remote_control_sessions,
+            )
+
+            target = action_id.split(":", 1)[1]
+            snap = app.snapshot
+            if target == "clear":
+                apply_pin(app.switcher, None, None)
+                app.notify("Cloud pin cleared")
+            else:
+                acc = next(
+                    (a for a in (snap.accounts if snap else ()) if a.number == target),
+                    None,
+                )
+                if acc is not None:
+                    apply_pin(app.switcher, acc.email, acc.org_uuid)
+                    # An RC session that is already open keeps its old owner
+                    # (the server fixed it at creation); reconnecting inside it
+                    # is what moves it. Say so only when there is one.
+                    open_rc = live_remote_control_sessions()
+                    note = (
+                        "  Reconnect open Remote Control sessions to move them "
+                        "(/rc → Disconnect → /rc)."
+                        if open_rc
+                        else ""
+                    )
+                    app.notify(f"Remote control pinned to {acc.email}.{note}")
             await self._pop_menu()
         else:
             actions[action_id]()
