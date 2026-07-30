@@ -349,12 +349,45 @@ Examples:
                 )
             else:
                 print(dimmed("New sessions pick this up."))
+        _warn_severed_rc(switcher)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _warn_severed_rc(switcher: ClaudeAccountSwitcher) -> None:
+    """Say which RC sessions a daemon recycle cut off, once, then forget them.
+
+    A recycle keeps the port, so requests survive and every visible signal
+    stays green — heartbeat 200, presence 200, the pin still reads as applied.
+    What does NOT survive is the WebSocket Remote Control receives on, and
+    Claude Code never rebuilds it: the session goes on looking healthy while
+    nothing sent from claude.ai reaches it again. There is no failure to
+    observe, so the only honest fix is to name the sessions and the two
+    keystrokes that repair them.
+    """
+    from claude_swap.pin_proxy import take_severed_rc
+
+    try:
+        cut = take_severed_rc(switcher.backup_dir / "pin-proxy")
+    except Exception:
+        return
+    if not cut:
+        return
+    which = ", ".join(cut[:3])
+    if len(cut) > 3:
+        which += f", +{len(cut) - 3} more"
+    print(
+        dimmed(
+            f"The proxy restarted, which drops Remote Control's receive "
+            f"channel on: {which}. They still look connected but will not "
+            "receive from claude.ai until reconnected "
+            "(/rc → Disconnect this session → /rc)."
+        )
+    )
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1390,6 +1423,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 show_token_status=args.token_status,
                 json_output=args.json,
             )
+            # A proxy recycle happens on a LAUNCH, where no one is watching, so
+            # `cswap pin` is usually not the command that follows it. Report it
+            # from the one people do run. Never on --json: that output is parsed.
+            if not args.json:
+                _warn_severed_rc(switcher)
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
 
