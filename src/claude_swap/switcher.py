@@ -2010,10 +2010,29 @@ class ClaudeAccountSwitcher:
         if not cur_fp:
             return None
         for entry_id, meta in self._store._read_stash_manifest().items():
-            if (
-                meta.get("configSlot") != account_num
-                or meta.get("consumedFp") != cur_fp
-            ):
+            if meta.get("configSlot") != account_num:
+                continue
+            if meta.get("consumedFp") != cur_fp:
+                if meta.get("reason") == "consume-gate-cas-conflict":
+                    # A CAS-conflict entry can NEVER match: the conflict is by
+                    # definition "the store moved off the generation we
+                    # consumed", and the store only moves forward, so it never
+                    # returns. Left alone these accumulate one file per
+                    # conflict — the common outcome on a busy multi-surface
+                    # setup — each indistinguishable from an entry still
+                    # awaiting adoption. Retire it here, where the slot lock is
+                    # already held and the current generation is in hand.
+                    #
+                    # Retiring is safe: the gate adopted the store's newer
+                    # lineage in the same breath, so this successor branches
+                    # off a generation that lineage already superseded. It is
+                    # not the pending persist it looks like.
+                    self._store._remove_unclaimed_credential(entry_id)
+                    self._logger.info(
+                        "Retired account %s's CAS-conflict stash entry: its "
+                        "generation was superseded by the writer that won the "
+                        "race, so no pass can ever adopt it.", account_num,
+                    )
                 continue
             creds = self._store._read_unclaimed_credential(entry_id)
             if not creds:
