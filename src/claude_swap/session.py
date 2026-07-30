@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, NoReturn
 from claude_swap import macos_keychain, pin_proxy
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -1066,7 +1067,7 @@ class SessionManager:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
-            os.replace(tmp, manifest_path)
+            replace_with_retry(tmp, manifest_path)
         except OSError:
             try:
                 os.unlink(tmp)
