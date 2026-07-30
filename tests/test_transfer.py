@@ -1563,6 +1563,79 @@ class TestImportClearsDeadTokenQuarantine:
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_HEALED"
 
+    def test_import_heals_an_active_slot_struck_on_its_live_generation(
+        self, temp_home: Path, capsys
+    ):
+        """The heal must ask the same question the collectors ask.
+
+        _entry_token_dead treats an ACTIVE slot as having TWO stored sources:
+        the live credential and the backup. A strike holds while EITHER still
+        matches the struck generation, because _fetch_active_usage's recovery
+        branch legitimately POSTs the backup while ordinary passes POST the
+        live bytes.
+
+        The import heal compares only against the backup. So when the strike is
+        bound to the LIVE generation and the backup has since moved, the
+        collectors correctly read the slot as quarantined while the import
+        reads it as healthy and refuses to replace it — and `cswap import` is
+        exactly what the "re-login needed" message tells the user to run.
+        """
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 9999999999000}})
+        newer_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 9999999999000}})
+        # Slot 2 is ACTIVE and its live bytes are what got struck; the backup
+        # has since been rewritten to a different lineage.
+        # current_account_number() resolves the active slot from the LIVE
+        # login's identity in .claude.json, not from activeAccountNumber.
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "bob@example.com",
+            "accountUuid": "acct-2",
+            "organizationUuid": "",
+            "organizationName": "",
+        }})
+        s._store._write_active_credentials_file(live)
+        s._write_account_credentials("2", "bob@example.com", newer_backup)
+        s._usage_store.record(
+            {"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(live),
+            )},
+            ident,
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_HEALED"
+        out.write_text(json.dumps(env))
+
+        # Probe the verdict itself before the import, so a failure names
+        # which half is wrong.
+        assert s.current_account_number() == "2"
+        assert s._slot_token_dead("2", "bob@example.com"), (
+            "the strike is bound to the live generation and slot 2 is active, "
+            "so the collectors' rule says dead"
+        )
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "was quarantined: refresh token dead" in err, (
+            "the import compared the strike only against the backup, so an "
+            "active slot struck on its live generation is never healed"
+        )
+
     def test_plain_import_skips_healthy_slot(self, temp_home: Path, capsys):
         """The heal is scoped to token_dead() only: a healthy existing account
         keeps skipping exactly as before, creds untouched, no replaced count."""

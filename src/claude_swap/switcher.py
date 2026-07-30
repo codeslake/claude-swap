@@ -4094,6 +4094,37 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
         }
 
+    def _slot_token_dead(self, num: str, email: str) -> bool:
+        """Is this slot quarantined as refresh-token-dead, right now?
+
+        The same question :meth:`_entry_token_dead` answers for the collectors,
+        reachable from a caller that has only a slot number — `cswap import`'s
+        auto-heal, which must agree with them: the heal exists to release a
+        quarantine the collectors imposed, so a different verdict means the
+        remedy the "re-login needed" message names silently does nothing.
+
+        In particular the ACTIVE slot has two stored sources, and a strike may
+        be bound to either (see :meth:`_entry_token_dead`). Comparing only the
+        backup — as the import used to — leaves an active slot struck on its
+        live generation unhealable, and that is the slot most likely to be
+        quarantined in the first place.
+        """
+        ident = {num: (email, "")}
+        entry = self._usage_store.entries(ident).get(num)
+        if entry is None:
+            return False
+        is_active = num == self.current_account_number()
+        # info[5] mirrors _build_accounts_info: the LIVE credential for the
+        # active slot, the backup otherwise. _entry_token_dead reads the
+        # backup itself for the active case.
+        creds = (
+            (self._store._read_active_credentials().value or "")
+            if is_active
+            else (self._read_account_credentials(num, email) or "")
+        )
+        info_by_num = {num: (num, email, None, None, is_active, creds, None)}
+        return self._entry_token_dead(entry, num, info_by_num)
+
     def _entry_token_dead(
         self,
         entry: UsageEntry,
