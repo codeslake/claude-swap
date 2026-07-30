@@ -8257,6 +8257,37 @@ class TestDegradedReadProvenance:
     stale generation (CC rotates keychain-only on macOS), so they may be
     ADOPTED/served but never CONSUMED (their rt POSTed)."""
 
+    def test_an_empty_slot_under_pinned_file_mode_reads_as_empty(
+        self, temp_home: Path
+    ):
+        """"Nothing stored" and "could not look" must stay distinguishable.
+
+        ``keychain_unavailable`` exists so the UI can tell a slot whose
+        credential could not be READ from one that genuinely has none — the
+        first says "try again", the second says "re-add". Deriving it from
+        ``_use_keychain()`` alone collapsed them under a pinned file mode: the
+        empty slot reported keychain-unavailable, so the user was told not to
+        re-add the credential that was in fact missing, which is the one action
+        that fixes it.
+
+        Fixed by the same provenance split as the degraded flag; pinned
+        separately because it is a different consumer and a different remedy.
+        """
+        from claude_swap.credentials import Platform
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher.platform = Platform.MACOS
+        store = switcher._store
+        store._pin_file_mode()          # we chose file mode; nothing failed
+
+        got = store._read_active_credentials()
+        assert got.value == ""          # the premise: nothing stored
+        assert got.keychain_unavailable is False, (
+            "an empty slot reads as 'keychain unavailable', so the UI steers "
+            "the user away from the re-add that would fix it"
+        )
+
     def test_pinned_file_mode_is_not_a_degraded_read(self, temp_home: Path):
         """We wrote the file ourselves; it is the authority, not a stale copy.
 
