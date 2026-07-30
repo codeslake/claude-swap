@@ -94,17 +94,18 @@ class CswapApp(App):
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
-        elif self._start == "auto":
-            # `cswap tui --auto`: the flag itself is the go-live consent.
-            self.push_screen(AutoScreen(start_live=True))
         else:
-            # autoStartLive: the user went live and wants a restarted TUI to
-            # resume switching, not sit on a dashboard doing nothing.
+            # Two ways to have already consented: `cswap tui --auto` (the flag
+            # itself), or autoStartLive from a prior go-live — a restarted TUI
+            # resumes switching instead of sitting on a dashboard.
             try:
-                if load_settings(self.switcher.backup_dir).auto_start_live:
-                    self.push_screen(AutoScreen(start_live=True))
+                live = self._start == "auto" or load_settings(
+                    self.switcher.backup_dir
+                ).auto_start_live
             except Exception:
-                pass
+                live = self._start == "auto"
+            if live:
+                self.push_screen(AutoScreen(start_live=True))
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()

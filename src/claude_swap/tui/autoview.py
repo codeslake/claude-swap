@@ -340,28 +340,22 @@ class AutoScreen(Screen):
                 entry.append("  usage unknown", style=palette.muted)
                 ranked.append((999.0, acc.number))
             else:
-                # Per-window "5h(⟳53m):99%" chips: a saturated candidate's
-                # worth is WHEN it comes back, so the reset countdown sits
-                # inside each window's own reading (statusline format).
+                # Per-window chips, drawn by the same helper the dashboard
+                # uses — see data.window_chip_label.
                 now = time.time()
                 first = True
                 for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
                     wpct = data.window_pct(acc.usage.last_good, key)
                     if wpct is None:
                         continue
-                    rt = data.window_reset_text(acc.usage.last_good, key, now)
-                    dur = (
-                        rt.removeprefix("resets ").replace(" ", "")
-                        if rt else None
-                    )
                     entry.append("  " if first else " · ", style=palette.muted)
                     entry.append(
-                        f"{label}({chr(0x27F3)}{dur}):" if dur else f"{label}:",
+                        data.window_chip_label(
+                            acc.usage.last_good, key, label, now
+                        ),
                         style=palette.muted,
                     )
-                    entry.append(
-                        f"{wpct:.0f}%", style=palette.severity(wpct)
-                    )
+                    entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
                     first = False
                 if first:  # no window data at all — keep the old reading
                     entry.append(
