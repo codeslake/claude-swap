@@ -88,6 +88,18 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # it needs its own unit rather than a reused one.
 RECOVERY_HYSTERESIS_S = 300.0
 
+# Horizon past which "soonest recovery" stops being worth real headroom.
+# The escape above was measured on minutes-scale resets (#202: a peer back in
+# 8 minutes), where waiting is plainly better than burning the last of the
+# active account. Days-scale is the opposite trade: measured live at active
+# 91% / 109h against 98% / 50h, the engine moved from 9 points of headroom to
+# 2, and neither account returns within the session either way — so the 9
+# points were the only resource that could still do work. Past this bound,
+# ranking falls back to headroom, which is what decides whether work
+# continues when nobody comes back soon. 4h covers a 5-hour window's whole
+# cycle, so same-day resets keep the recovery ranking.
+RECOVERY_HORIZON_S = 4 * 3600.0
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -1174,6 +1186,17 @@ class AutoSwitchEngine:
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
+        # Past the horizon, "soonest" buys nothing real: keep the escape (the
+        # landing-health gate has no other answer when everything is above the
+        # line) but rank by headroom instead of recovery. An UNKNOWN recovery
+        # (inf) is not "past the horizon" — it is no evidence at all, and the
+        # pre-existing rule is that a candidate over the threshold must not be
+        # landed on without it. Treat it as the recovery axis so that gate
+        # keeps deciding. See RECOVERY_HORIZON_S.
+        recovery_useful = all_above and (
+            active_recovery_ts == float("inf")
+            or active_recovery_ts - now <= RECOVERY_HORIZON_S
+        )
         qualifying: list[tuple[tuple, str]] = []
         any_known = False
         for num in oauth_candidates:
@@ -1218,7 +1241,14 @@ class AutoSwitchEngine:
                     # prevent is still prevented: the target must come back
                     # meaningfully sooner than where we are, so the reverse move
                     # never qualifies.
-                    if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                    if (
+                        recovery_useful
+                        and recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
+                    ):
+                        continue
+                    if not recovery_useful and h <= (active_headroom or 0.0):
+                        # Headroom axis instead: only move to strictly more
+                        # quota than we hold, so this cannot flap either.
                         continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -1237,7 +1267,7 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if recovery_useful and trigger in ("proactive", "consume-first"):
                 # Soonest BINDING recovery first — the window actually holding
                 # this account back, not the weekly one. With everything in the
                 # 90s the only thing worth optimizing is how long until work can
