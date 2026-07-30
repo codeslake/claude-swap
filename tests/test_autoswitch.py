@@ -3296,6 +3296,69 @@ class TestEveryAccountAboveThreshold:
         assert sw.trigger == "at-limit"
 
 
+class TestRecoveryHorizon:
+    """The recovery escape must not spend real headroom on a distant reset.
+
+    #202 introduced "when everything is above the threshold, go where quota
+    returns first". Its evidence was minutes-scale — the measured case had a
+    peer whose 5-hour window reset in 8 minutes, and trading 9 points of
+    headroom for an 8-minute wait is obviously right.
+
+    The rule shipped with no horizon bound, so it applies identically when
+    every reset is DAYS away. Measured live: active 91% (7d resets in 109h),
+    peers 94%/80h and 98%/50h. The engine moved from 9 points of headroom to
+    2 — but nothing comes back today either way, so those 9 points were the
+    only resource that could still do work. The user switched back by hand.
+
+    Past HORIZON, ranking returns to headroom: when no candidate can resume
+    within a working session, "soonest" stops being a benefit worth paying
+    for and how much quota is left is what decides whether work continues.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def test_a_minutes_away_reset_still_wins(self, harness):
+        """The #202 design case is unchanged: an 8-minute wait is worth 9
+        points of headroom."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(91, self._at(harness, 7200)),   # active, 9 left, back in 2h
+            "2": _usage(94, self._at(harness, 1800)),
+            "3": _usage(98, self._at(harness, 480)),    # back in 8 minutes
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_a_days_away_reset_does_not_buy_headroom(self, harness):
+        """The measured live shape. Every reset is days out, so ranking falls
+        back to headroom and the account with 9 points left keeps the work."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(91, self._at(harness, 109 * 3600)),  # active, 9 left
+            "2": _usage(94, self._at(harness, 80 * 3600)),
+            "3": _usage(98, self._at(harness, 50 * 3600)),   # 2 left, soonest
+        })
+        assert harness.active_number() == 1, (
+            "traded 9 points of headroom for 2 on a reset nobody reaches today"
+        )
+
+    def test_a_peer_with_real_headroom_still_wins_past_the_horizon(self, harness):
+        """Falling back to headroom is not "never move": a peer holding
+        materially more quota is still the right landing, days-away or not."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(97, self._at(harness, 50 * 3600)),   # active, 3 left
+            "2": _usage(91, self._at(harness, 109 * 3600)),  # 9 left
+            "3": _usage(98, self._at(harness, 60 * 3600)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+
 class TestReviewFindings202:
     """Three defects found reviewing #202, each reproduced before fixing.
 
