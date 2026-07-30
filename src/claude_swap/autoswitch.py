@@ -601,12 +601,15 @@ class AutoSwitchEngine:
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
-        if outcome.error == "store-unmirrored":
-            # Deterministic env condition (CLAUDE_SECURESTORAGE_CONFIG_DIR),
-            # not network trouble: every candidate refuses identically and
-            # forever until the shell changes. Reported distinctly so the
-            # tick error names the remedy instead of "(network?)".
-            return "store-unmirrored"
+        if outcome.error in ("store-unmirrored", "invalid_client"):
+            # Deterministic conditions, not network trouble: every candidate
+            # refuses identically and keeps refusing until something outside
+            # this process changes — the shell for store-unmirrored (an
+            # inherited CLAUDE_SECURESTORAGE_CONFIG_DIR), our OAuth client
+            # registration for invalid_client. Reported distinctly so the tick
+            # error names the real cause instead of "(network?)", which would
+            # send the user to check a connection that is fine.
+            return outcome.error
         return "transient"
 
     def _note_token_identity(
@@ -999,7 +1002,7 @@ class AutoSwitchEngine:
 
         # -- freshen + switch ----------------------------------------------
         transient_failure = False
-        store_unmirrored = False
+        systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
             if trigger == "consume-first":
@@ -1039,20 +1042,23 @@ class AutoSwitchEngine:
             if status == "transient":
                 transient_failure = True
                 continue
-            if status == "store-unmirrored":
-                store_unmirrored = True
+            if status in ("store-unmirrored", "invalid_client"):
+                systemic = status
                 continue
             if status == "skip-live-session":
                 continue
             return self._perform(num, email, trigger)
 
-        if store_unmirrored or transient_failure:
+        if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
                     message=(
                         "could not freshen: CLAUDE_SECURESTORAGE_CONFIG_DIR "
                         "is set — unset it or run cswap from a normal shell"
-                        if store_unmirrored
+                        if systemic == "store-unmirrored"
+                        else "could not freshen: cswap's OAuth client was "
+                        "rejected — systemic, not this account"
+                        if systemic == "invalid_client"
                         else "could not freshen any candidate (network?)"
                     ),
                     transient=True,

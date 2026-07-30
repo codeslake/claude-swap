@@ -2458,6 +2458,60 @@ class TestFreshenRoutesThroughGate:
     """M2: autoswitch's freshen no longer POSTs a raw snapshot — it routes
     through the switcher's consume gate (locked re-read + CAS persist)."""
 
+    def test_invalid_client_is_not_reported_as_network_trouble(
+        self, temp_home
+    ):
+        """A rejected OAuth client must keep its own kind.
+
+        oauth.py splits ``invalid_client`` out from ``invalid_grant`` precisely
+        because it says nothing about any slot's refresh token — OUR client
+        credential was rejected, which is systemic and deterministic. But
+        _freshen_target maps every unrecognised kind to "transient", and a
+        transient freshen failure surfaces as "could not freshen any candidate
+        (network?)". A client_id rotation or block would then present as
+        intermittent network trouble on every machine at once, with nothing
+        naming the real cause — the same trap ``store-unmirrored`` was given
+        its own kind to escape.
+        """
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "invalid_client"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "invalid_client", (
+            f"got {status!r}: a systemic client rejection falls into the "
+            "transient bucket and reads as (network?)"
+        )
+
+    def test_store_unmirrored_keeps_its_own_kind(self, temp_home):
+        """The precedent this mirrors, pinned so the two stay symmetric."""
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "store-unmirrored"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "store-unmirrored"
+
+    def test_a_real_transient_still_reads_transient(self, temp_home):
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "transient"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "transient"
+
     def test_freshen_calls_consume_gate(self, temp_home, monkeypatch):
         from claude_swap import oauth as oauth_mod
         harness = EngineHarness(temp_home)
