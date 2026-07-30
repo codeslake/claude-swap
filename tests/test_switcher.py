@@ -9037,6 +9037,95 @@ class TestGateUltraReviewFixes:
             "the adoption condition, so every conflict leaks one file"
         )
 
+    def test_no_store_read_happens_before_the_consume_lock(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """Serialization is only real if nothing is read before the lock.
+
+        A review claimed the gate bootstraps by reading the store before
+        acquiring the per-slot consume lock, which would let two gates pick the
+        same one-time-use grant. It does not — but that ordering is exactly the
+        kind of thing a later refactor reintroduces without noticing, and the
+        symptom (a burned generation, invalid_grant on the loser) surfaces far
+        from the cause. Pin it.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        order: list[str] = []
+        real_lock = s._read_account_credentials
+
+        def watched_read(*a, **k):
+            order.append("read")
+            return real_lock(*a, **k)
+
+        from claude_swap.locking import FileLock as real_filelock
+
+        class WatchedLock:
+            def __init__(self, path, *a, **k):
+                self._name = str(path)
+                self._inner = real_filelock(path, *a, **k)
+            def acquire(self, *a, **k):
+                if ".consume-" in self._name:
+                    order.append("consume-lock")
+                return self._inner.acquire(*a, **k)
+            def release(self):
+                self._inner.release()
+            def __enter__(self):
+                return self._inner.__enter__()
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+        monkeypatch.setattr("claude_swap.switcher.FileLock", WatchedLock)
+        with patch.object(s, "_read_account_credentials", side_effect=watched_read), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert "consume-lock" in order, "the consume lock must be taken"
+        assert order.index("consume-lock") == 0, (
+            f"order was {order}: the store is read before the consume lock, so "
+            "two gates can select the same one-time-use grant"
+        )
+
+    def test_contention_reports_its_own_kind_not_transient(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """Losing the consume lock is local serialization, not a failure.
+
+        The loser used to return "transient", which autoswitch renders as
+        "could not freshen any candidate (network?)" — sending the user to
+        check a connection that is fine, for a condition no network change can
+        affect. On a machine where the collector and a manual `cswap switch`
+        overlap this is routine, not an edge.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        from claude_swap.locking import FileLock as real_filelock
+
+        class ConsumeLockBusy:
+            def __init__(self, path, *a, **k):
+                self._busy = ".consume-" in str(path)
+                self._inner = real_filelock(path, *a, **k)
+            def acquire(self, *a, **k):
+                return False if self._busy else self._inner.acquire(*a, **k)
+            def release(self):
+                if not self._busy:
+                    self._inner.release()
+            def __enter__(self):
+                return self._inner.__enter__()
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+        monkeypatch.setattr("claude_swap.switcher.FileLock", ConsumeLockBusy)
+        out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert out.error == "consume-busy", (
+            f"got {out.error!r}: contention reads as a transient failure and "
+            "surfaces as (network?)"
+        )
+
     # -- exception containment (findings: window-3 persist raise) --------
 
     def test_persist_oserror_after_post_stashes_and_never_raises(

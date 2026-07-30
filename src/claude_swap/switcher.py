@@ -1836,7 +1836,11 @@ class ClaudeAccountSwitcher:
                 "Another consume is in flight for account %s; deferring to "
                 "the next pass.", account_num,
             )
-            return oauth.RefreshOutcome(None, "transient")
+            # Distinct from "transient": nothing failed and nothing is remote.
+            # Another gate holds the slot and will finish; this pass simply
+            # yields. Reported as its own kind so the tick error does not
+            # blame the network for local serialization working as designed.
+            return oauth.RefreshOutcome(None, "consume-busy")
         try:
             return self._consume_backup_grant_locked(
                 account_num, email, snapshot

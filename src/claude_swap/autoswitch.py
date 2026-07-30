@@ -668,7 +668,9 @@ class AutoSwitchEngine:
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
-        if outcome.error in ("store-unmirrored", "invalid_client"):
+        if outcome.error in (
+            "store-unmirrored", "invalid_client", "consume-busy"
+        ):
             # Deterministic conditions, not network trouble: every candidate
             # refuses identically and keeps refusing until something outside
             # this process changes — the shell for store-unmirrored (an
@@ -1109,7 +1111,9 @@ class AutoSwitchEngine:
             if status == "transient":
                 transient_failure = True
                 continue
-            if status in ("store-unmirrored", "invalid_client"):
+            if status in (
+                "store-unmirrored", "invalid_client", "consume-busy"
+            ):
                 systemic = status
                 continue
             if status == "skip-live-session":
@@ -1126,6 +1130,9 @@ class AutoSwitchEngine:
                         else "could not freshen: cswap's OAuth client was "
                         "rejected — systemic, not this account"
                         if systemic == "invalid_client"
+                        else "could not freshen: another cswap surface holds "
+                        "the slot — retries next pass"
+                        if systemic == "consume-busy"
                         else "could not freshen any candidate (network?)"
                     ),
                     transient=True,
