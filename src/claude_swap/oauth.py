@@ -381,9 +381,13 @@ def _log_usage_failure(
     where = f" {context}" if context else ""
     cause = kind if retry_after_s is None else f"{kind}, retry-after {retry_after_s:.0f}s"
     if kind == "http-429":
-        # The endpoint budgets requests per access token (see poll_policy):
-        # cumulative polling across cswap surfaces can saturate it, and
-        # backoff plus the adaptive cadence are the recovery.
+        # The endpoint budgets requests per ACCOUNT, not per access token
+        # (measured: a freshly minted token was blocked 135s after issue).
+        # So re-authenticating does not clear a block, and two machines
+        # holding different tokens for one account still compete for one
+        # budget — cumulative polling across surfaces and machines can
+        # saturate it, and backoff plus the adaptive cadence are the
+        # recovery.
         cause += " (usage-endpoint budget reached; backing off)"
     _logger.warning("Usage fetch failed%s: %s", where, cause)
     _logger.debug("Usage fetch failure detail%s: %r", where, e)
