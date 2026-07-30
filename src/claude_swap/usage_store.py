@@ -157,23 +157,31 @@ BACKOFF_MAX_SHIFT = 32
 # and not re-armed.
 #
 # Proportional, not a flat 900s, because the evidence is entirely hour-scale:
-# 37 of those 39 blocks opened at exactly 3600. Short blocks were measured
-# separately (2026-07-06) as *accurate* — Retry-After 300 meant a 300s block —
-# so a flat margin would inflate a 300s block by 4x on no evidence, and would
-# also let a 90s server ask overtake our own saturated failure curve. A
-# fraction extends the hour-scale finding (0.25 × 3600 = the measured 900s)
-# without extrapolating it onto short blocks. 900s is the edge of the observed
-# band (last in-band re-block +716s, next +3853s), so a future re-block past
-# +900s means raising this fraction, not the cap below.
-RETRY_AFTER_MARGIN_FRAC = 0.25
-# Bounds Retry-After × (1 + MARGIN_FRAC), so a pathological header still cannot
-# park an account for hours. Sized to clear the measured shape exactly: every
-# observed block opens at 3600, and 3600 × 1.25 = this. Above that the cap
-# starts eating the margin (a 3700s ask keeps only +800s), which is deliberate
-# — an ask past the measured window is already outside the evidence, and
-# bounding it matters more there than preserving a margin derived from
-# hour-scale blocks. If real blocks ever open above 3600, raise this with the
-# shape rather than letting the cap silently shorten the margin.
+# 37 of those 39 blocks opened at exactly 3600. The margin is ABSOLUTE, not a
+# fraction of the ask, because Retry-After is a countdown to a fixed deadline:
+# what the server reports depends on WHEN we ask, and the budget is
+# account-scoped, so a second machine polling into a block another one opened
+# sees only the remainder. A fraction of the remainder shrinks toward zero as
+# the deadline nears — measured on the 0.25 fraction this replaces, a 3600s
+# block observed at t=3400 waited 250s and landed 50s past the deadline,
+# squarely inside the +2s..+716s re-block band. 35 of 72 observed 429s were
+# mid-block, so that was the common case, not an edge.
+#
+# 900s is the edge of the observed band (last in-band re-block +716s, next
+# +3853s). It costs a genuinely-short block (Retry-After 300, measured
+# 2026-07-06 as accurate) an extra ~825s of idling once, against a full hour
+# lost every time a mid-block observation retries into the band — roughly 2x
+# cheaper in expectation. A future re-block past +900s means raising this,
+# not the cap below.
+RETRY_AFTER_MARGIN_S = 900.0
+# Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
+# account for hours. Sized to clear the measured shape exactly: every observed
+# block opens at 3600, and 3600 + 900 = this. Above that the cap starts eating
+# the margin (a 3700s ask keeps only +800s), which is deliberate — an ask past
+# the measured window is already outside the evidence, and bounding it matters
+# more there than preserving a margin derived from hour-scale blocks. If real
+# blocks ever open above 3600, raise this with the shape rather than letting
+# the cap silently shorten the margin.
 RETRY_AFTER_FLOOR_CAP_S = 4500.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
@@ -460,10 +468,16 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
         return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
     # Burst rule: wait what the server asked plus a margin (up to the safety
     # cap); our own curve may wait longer. The margin is what keeps the retry
-    # off the deadline itself — see RETRY_AFTER_MARGIN_FRAC.
-    asked = min(
-        retry_after_s * (1.0 + RETRY_AFTER_MARGIN_FRAC), RETRY_AFTER_FLOOR_CAP_S
-    )
+    # off the deadline itself — see RETRY_AFTER_MARGIN_S.
+    # The margin applies only above our own saturated curve: below BACKOFF_CAP_S
+    # the curve already waits longer than the server asked, so adding to the ask
+    # would only overtake it (a 90s ask must not out-wait BACKOFF_CAP_S) and
+    # cannot land us on a deadline we were never going to hit. The boundary
+    # is strict: an ask OF exactly BACKOFF_CAP_S is what the saturated curve
+    # already waits, so it needs nothing added.
+    asked = retry_after_s
+    if retry_after_s > BACKOFF_CAP_S:
+        asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)
     return max(asked, computed)
 
 
