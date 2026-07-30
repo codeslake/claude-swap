@@ -3007,6 +3007,31 @@ class TestFreshenRoutesThroughGate:
     """M2: autoswitch's freshen no longer POSTs a raw snapshot — it routes
     through the switcher's consume gate (locked re-read + CAS persist)."""
 
+    def test_lock_contention_is_not_reported_as_network_trouble(
+        self, temp_home
+    ):
+        """Waiting on another gate is local, not a connection problem.
+
+        The consume lock serializes gates per slot; a loser defers. That is the
+        design working, and on a machine where the collector and a manual
+        `cswap switch` overlap it happens routinely. Reporting it as "could not
+        freshen any candidate (network?)" sends the user to check a connection
+        that is fine, for a condition no network change can affect.
+        """
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "consume-busy"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "consume-busy", (
+            f"got {status!r}: lock contention falls into the transient bucket "
+            "and reads as (network?)"
+        )
+
     def test_invalid_client_is_not_reported_as_network_trouble(
         self, temp_home
     ):
