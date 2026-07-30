@@ -148,17 +148,15 @@ BACKOFF_MAX_SHIFT = 32
 # deadline itself, and the server is not reliably ready there. Measured over
 # this machine's whole log (511 http-429 lines → 39 deadline blocks; of the 19
 # post-fix lapses that were followed by another 429): 10 re-blocked within 900s
-# of their own deadline — +2s, +3s, +3s, +71s, +79s, +101s, +337s, +346s,
-# +714s, +716s — and each earned a fresh full-hour penalty. The next one after
-# that is +3853s, so the distribution is bimodal with an empty band between:
+# of their own deadline (+2s .. +716s), each earning a fresh full-hour penalty.
+# The next one after that is +3853s, so the distribution is bimodal:
 # retry inside ~900s of an hour-scale deadline and it costs another hour, retry
 # past it and it is clean. The margin lands the retry in that empty band, and
 # costs one wait per block rather than per probe, since the deadline is fixed
 # and not re-armed.
 #
-# Proportional, not a flat 900s, because the evidence is entirely hour-scale:
-# 37 of those 39 blocks opened at exactly 3600. The margin is ABSOLUTE, not a
-# fraction of the ask, because Retry-After is a countdown to a fixed deadline:
+# The evidence is entirely hour-scale: 37 of those 39 blocks opened at exactly
+# 3600. The margin is ABSOLUTE, not a fraction of the ask, because Retry-After is a countdown to a fixed deadline:
 # what the server reports depends on WHEN we ask, and the budget is
 # account-scoped, so a second machine polling into a block another one opened
 # sees only the remainder. A fraction of the remainder shrinks toward zero as
@@ -466,34 +464,17 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     if retry_after_s == 0:
         # Saturated-budget edge: wait before probing again.
         return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
-    # Burst rule: wait what the server asked plus a margin (up to the safety
-    # cap); our own curve may wait longer. The margin is what keeps the retry
-    # off the deadline itself — see RETRY_AFTER_MARGIN_S.
-    # The margin applies only above our own saturated curve: below BACKOFF_CAP_S
-    # the curve already waits longer than the server asked, so adding to the ask
-    # would only overtake it (a 90s ask must not out-wait BACKOFF_CAP_S) and
-    # cannot land us on a deadline we were never going to hit. The boundary
-    # is strict: an ask OF exactly BACKOFF_CAP_S is what the saturated curve
-    # already waits, so it needs nothing added.
+    # Burst rule: the server's ask plus a margin (bounded by the cap); our own
+    # curve may still wait longer. Only above BACKOFF_CAP_S — below it the
+    # curve already out-waits the ask, so adding would only overtake it and
+    # cannot land us on a deadline we were never going to hit. Strict: an ask
+    # OF exactly BACKOFF_CAP_S is what the saturated curve already waits.
     #
-    # KNOWN RESIDUE, deliberate: an hour-scale block whose REMAINDER has fallen
-    # under BACKOFF_CAP_S — the block's last ~10 minutes — takes no margin and
-    # so still retries near its deadline. Nothing local separates that ask from
-    # a genuine short burst block: the measured burst rule sends Retry-After
-    # 300 for a real 300s block, `backoffUntil` is per-machine while the budget
-    # is per-account (so a second machine polling into someone else's block has
-    # no live backoff either), and `last429At` is recent in BOTH cases because
-    # a burst is by definition several rapid 429s. Only the server knows.
-    #
-    # Blanket-applying the margin was measured against the pinned contracts and
-    # breaks them: a 300s burst block would wait 1200s (4x a block measured as
-    # accurate) and a 10s ask would out-wait our own curve. Clamping to
-    # BACKOFF_CAP_S instead leaves an ask of exactly 600 with zero margin
-    # anyway and still perturbs short asks (10s -> 600s vs the curve's 480s).
-    # The residue is much narrower than the decay it replaced — that one shrank
-    # the margin at EVERY mid-block observation (35 of 72 measured 429s), this
-    # one only in a block's final minutes — so it is left open rather than
-    # closed by a guess. Closing it needs a server-side signal we do not have.
+    # KNOWN RESIDUE: an hour-scale block whose REMAINDER falls under
+    # BACKOFF_CAP_S takes no margin and still retries near its deadline.
+    # Nothing local separates that ask from a genuine short burst block (see
+    # RETRY_AFTER_MARGIN_S), and every way of closing it breaks a pinned
+    # contract, so it is left open rather than guessed at.
     asked = retry_after_s
     if retry_after_s > BACKOFF_CAP_S:
         asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)
