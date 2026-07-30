@@ -268,3 +268,50 @@ class TestConfigMisc:
             with pytest.raises(SystemExit):
                 cli.main()
         assert captured["settings"].threshold == 77.0
+
+
+class TestAtomicWriteThroughSymlink:
+    """A dotfiles-managed settings.json is a symlink into a git repo.
+
+    ``os.replace`` overwrites a directory entry and never follows a link, so
+    renaming onto the link itself detaches it: the write succeeds, the content
+    is right, and the repo quietly stops receiving changes until the next sync
+    overwrites the local copy and discards them. That is issue #192 (Claude
+    Code's own writer) reproduced inside cswap — measured on all three of my
+    machines, where a pin write detached the link and a later dotdrop install
+    restored a copy with no ``remoteControl``, leaving the proxy wired with no
+    pin to serve.
+    """
+
+    def test_write_follows_the_symlink_instead_of_replacing_it(self, tmp_path):
+        from claude_swap.settings import atomic_write_json
+
+        repo = tmp_path / "dotfiles"; repo.mkdir()
+        target = repo / "claude-swap-settings.json"
+        target.write_text('{"schemaVersion": 1}')
+        live = tmp_path / "backup" / "settings.json"
+        live.parent.mkdir()
+        live.symlink_to(target)
+
+        atomic_write_json(live, {"schemaVersion": 1, "remoteControl": {"x": 1}})
+
+        assert live.is_symlink(), "the write detached the dotfiles symlink"
+        assert json.loads(target.read_text())["remoteControl"] == {"x": 1}, (
+            "the tracked file never saw the write"
+        )
+
+    def test_plain_file_destination_still_works(self, tmp_path):
+        from claude_swap.settings import atomic_write_json
+
+        p = tmp_path / "settings.json"
+        atomic_write_json(p, {"a": 1})
+        assert json.loads(p.read_text()) == {"a": 1}
+        assert not p.is_symlink()
+
+    def test_broken_symlink_does_not_raise(self, tmp_path):
+        from claude_swap.settings import atomic_write_json
+
+        live = tmp_path / "settings.json"
+        live.symlink_to(tmp_path / "gone.json")
+        atomic_write_json(live, {"a": 1})
+        assert json.loads((tmp_path / "gone.json").read_text()) == {"a": 1}
