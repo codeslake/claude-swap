@@ -304,7 +304,7 @@ class TestFormatting:
         # active account, not that the user must re-login.
         assert (
             tui_data.sentinel_label(USAGE_TOKEN_EXPIRED)
-            == "token expired — refresh deferred this pass; retries automatically"
+            == "token expired — auto-refreshing on the next pass (≤1m); no action needed"
         )
         from claude_swap.switcher import SENTINEL_NOTES
 
@@ -325,7 +325,7 @@ class TestFormatting:
             age_s=720.0,
         )
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
-        assert "token expired — refresh deferred this pass; retries automatically" in card
+        assert "token expired — auto-refreshing on the next pass (≤1m); no action needed" in card
         assert "last seen 53% used" in card
 
         no_history = account_card_text(
@@ -662,6 +662,42 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "pace" not in mini_account_text(acc, now).plain
 
+    def test_window_reads_the_same_as_the_auto_views_chip(self):
+        """One account must not read two ways on two screens.
+
+        The dashboard rendered `5h 100% (resets 2h 28m)` while the auto view
+        rendered `5h(⟳2h28m):100%` for the same window in the same second.
+        Both now come from data.window_chip_label, so a change to one surface
+        cannot silently diverge from the other.
+        """
+        from claude_swap.tui import data
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        # +1s so the truncating duration format cannot land on 2h27m when the
+        # render happens a hair after _iso_in computed the deadline.
+        last_good = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_in(3600 * 2 + 1680 + 1)}
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        chip = data.window_chip_label(last_good, "five_hour", "5h", now)
+        assert chip == "5h(⟳2h28m):"
+        assert f"{chip}100%" in mini_account_text(acc, now).plain
+
+    def test_countdown_shows_below_100_too(self):
+        """A window's worth IS when it comes back, which is exactly what you
+        compare while picking an account — so it is not hidden until 100%."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 42.0, "resets_at": _iso_in(3600 + 1)}}
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
@@ -784,7 +820,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            assert "5h 92%" in mini_part
+            # The window reads as one chip now — "5h(⟳1h59m):92%" — built by
+            # the same helper the auto view uses. Assert the parts that carry
+            # the meaning (which window, what pct), not the spacing between
+            # them, so the two surfaces can keep sharing one format.
+            assert "5h(" in mini_part and ":92%" in mini_part
             assert "7d" not in mini_part
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
@@ -1599,7 +1639,7 @@ class TestBareInvocation:
 
         launched = {}
 
-        def fake_run(switcher):
+        def fake_run(switcher, start="dashboard"):
             launched["switcher"] = switcher
             return 0
 
@@ -1710,3 +1750,19 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestAutoStartLive:
+    """autoStartLive: a confirmed Go-live persists; a restarted TUI resumes
+    the auto view with the engine LIVE instead of re-asking."""
+
+    def test_setting_roundtrip(self, tmp_path):
+        from claude_swap.settings import load_settings, set_setting
+        set_setting(tmp_path, "autoswitch.autoStartLive", "true")
+        assert load_settings(tmp_path).auto_start_live is True
+        set_setting(tmp_path, "autoswitch.autoStartLive", "false")
+        assert load_settings(tmp_path).auto_start_live is False
+
+    def test_default_off(self, tmp_path):
+        from claude_swap.settings import load_settings
+        assert load_settings(tmp_path).auto_start_live is False

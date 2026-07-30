@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -74,10 +75,13 @@ class AutoScreen(Screen):
 
     app: "CswapApp"
 
-    def __init__(self) -> None:
+    def __init__(self, *, start_live: bool = False) -> None:
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
+        # Consent already given: `cswap tui --auto` or a persisted
+        # autoStartLive — the engine starts LIVE without the modal.
+        self._start_live = start_live
         # Session-only threshold adjustment (t, then arrows). Never written
         # to settings.json — same memory-only precedent as the dry-run
         # toggle. ``_configured_threshold`` is the mount-time file value the
@@ -111,7 +115,12 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        # Prior consent (constructor flag from --auto / app-launch resume,
+        # or the persisted setting when entered from the menu) starts LIVE
+        # without re-asking; otherwise the safe default, dry-run.
+        self._start_engine(
+            dry_run=not (self._start_live or self._settings.auto_start_live)
+        )
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -262,11 +271,25 @@ class AutoScreen(Screen):
                 self._on_live_confirm,
             )
         else:
+            self._persist_auto_start_live(False)
             self._restart_engine(dry_run=True)
 
     def _on_live_confirm(self, confirmed: bool | None) -> None:
         if confirmed:
+            self._persist_auto_start_live(True)
             self._restart_engine(dry_run=False)
+
+    def _persist_auto_start_live(self, live: bool) -> None:
+        """Remember the confirmed mode so a restarted TUI resumes it."""
+        from claude_swap.settings import set_setting
+        try:
+            set_setting(
+                self.app.switcher.backup_dir,
+                "autoswitch.autoStartLive", "true" if live else "false",
+            )
+            self._settings = replace(self._settings, auto_start_live=live)
+        except Exception:
+            pass  # a failed persist must never block the toggle itself
 
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
@@ -317,7 +340,33 @@ class AutoScreen(Screen):
                 entry.append("  usage unknown", style=palette.muted)
                 ranked.append((999.0, acc.number))
             else:
-                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # Per-window "5h(⟳53m):99%" chips: a saturated candidate's
+                # worth is WHEN it comes back, so the reset countdown sits
+                # inside each window's own reading (statusline format).
+                now = time.time()
+                first = True
+                for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
+                    wpct = data.window_pct(acc.usage.last_good, key)
+                    if wpct is None:
+                        continue
+                    rt = data.window_reset_text(acc.usage.last_good, key, now)
+                    dur = (
+                        rt.removeprefix("resets ").replace(" ", "")
+                        if rt else None
+                    )
+                    entry.append("  " if first else " · ", style=palette.muted)
+                    entry.append(
+                        f"{label}({chr(0x27F3)}{dur}):" if dur else f"{label}:",
+                        style=palette.muted,
+                    )
+                    entry.append(
+                        f"{wpct:.0f}%", style=palette.severity(wpct)
+                    )
+                    first = False
+                if first:  # no window data at all — keep the old reading
+                    entry.append(
+                        f"  {pct:3.0f}% used", style=palette.severity(pct)
+                    )
                 ranked.append((pct, acc.number))
             lines[acc.number] = entry
 
