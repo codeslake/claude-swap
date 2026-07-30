@@ -35,6 +35,33 @@ handled safely (no proxy rather than a wrong one), but the stale pin stays
 in `settings.json` and reads as "pinned" in the UI. Clearing it on removal
 is a small fix worth making.
 
+| # | Case | Behaviour | Recover without restart? |
+|---|---|---|---|
+| B5 | The pin RECORD itself is lost while the proxy keeps running | Provider reads no pin → returns None → every request leaves with the session's own bearer, and `.claude.json` still names a live proxy so nothing looks wrong | Yes — re-pin; but nothing detects it on its own |
+
+B5 is the only entry here that has actually happened, and it happened on
+all three machines at once, so it is worth the detail. Two independent bugs
+erased the `remoteControl` section from `settings.json` while the daemon
+and the wiring stayed healthy:
+
+- `settings._read_raw` degraded ANY read failure (OSError, torn concurrent
+  read, malformed JSON) to `{}`, and a read-modify-write starting from `{}`
+  is a whole-file REPLACEMENT — every section the writer does not know about
+  is dropped. Fixed by routing writers through `_read_raw_for_write`, which
+  raises instead of guessing.
+- `atomic_write_json` ended in `os.replace(tmp, path)`. That overwrites a
+  directory entry and never follows a symlink, so on a machine where
+  `<backup>/settings.json` is a dotfiles symlink the rename DETACHED the
+  link: writes kept succeeding against a now-local file while the tracked
+  copy went stale, and the next dotfiles install restored that copy — which
+  had never received a single pin write. Same shape as issue #192 (Claude
+  Code's own one-hop settings write). Fixed by resolving the link first.
+
+The lesson that generalises: the pin is fail-open, so anything that can
+silently drop its record produces a session that looks perfectly pinned and
+is not. Guard the WRITE path, and monitor the pin RECORD, not just the
+daemon and the wiring — those two were green throughout this incident.
+
 ## C. The proxy dies underneath a live session
 
 | # | Case | Behaviour | Recover without restart? |
@@ -65,8 +92,19 @@ Every case above is survivable; what makes them dangerous is that most are
 *quiet*. The mitigations that matter:
 
 1. Surface the pin in the UI — done (`○ cloud` marker, menu label).
-2. Report daemon health where the pin is shown, so C1/C3 are visible
+2. Say when a pin is set but cannot apply — done (`○ cloud (not applying)`
+   for B2/B3/B4, and `:pinned#N!` in the status line). The account's own row
+   already said "re-login needed"; the cloud marker beside it did not, which
+   made the one line claiming "your claude.ai side lives here" the one line
+   not admitting it no longer did.
+3. Report daemon health where the pin is shown, so C1/C3 are visible
    rather than inferred.
-3. Clear the pin when its account is removed (B4).
-4. Keep fail-open, but log once per condition when the pin does not apply —
+4. Clear the pin when its account is removed (B4).
+5. Keep fail-open, but log once per condition when the pin does not apply —
    a session that silently drops the pin is worse than one that says so.
+
+What B5 taught, and what the monitoring here now reflects: watching the
+daemon and the wiring is not enough, because both were green for hours
+while no request was pinned. The pin RECORD is the thing to watch, and it
+is watchable cheaply — a missing `remoteControl` next to live wiring is a
+contradiction no healthy state produces.
