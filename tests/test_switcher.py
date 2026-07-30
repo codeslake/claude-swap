@@ -8800,6 +8800,57 @@ class TestConsumeGateLockFailures:
         assert out.credentials == self._NEW
         assert s.list_unclaimed_credentials(), "successor must be stashed"
 
+    def test_a_stashed_successor_is_not_reported_as_freshened(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The stash leaves the CONSUMED grant in the store, so the slot is not
+        safe to activate — and the gate must say so.
+
+        autoswitch reads ``error is None`` as "the gate already persisted the
+        successor" and switches to the slot. After a stash it has not: the
+        backup still holds the generation whose refresh token was just spent,
+        so activating it puts the user on an expired access token that can
+        never refresh, and Claude Code logs the account out. Upstream raised
+        LockError here, which aborted the tick — safe by accident. Stashing is
+        the better behaviour; reporting it as success is not.
+        """
+        from claude_swap.exceptions import LockError as LE
+        from claude_swap.locking import FileLock as real_lock
+
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        calls = {"n": 0}
+
+        class SecondLockFails:
+            def __init__(self, *a, **k):
+                self._inner = real_lock(*a, **k)
+            def acquire(self, *a, **k):
+                return self._inner.acquire(*a, **k)
+            def release(self):
+                self._inner.release()
+            def __enter__(self):
+                calls["n"] += 1
+                if calls["n"] == 2:
+                    raise LE("held elsewhere")
+                return self._inner.__enter__()
+            def __exit__(self, *a):
+                return self._inner.__exit__(*a)
+
+        monkeypatch.setattr("claude_swap.switcher.FileLock", SecondLockFails)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)):
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        # The store still holds the spent generation — the premise of the bug.
+        assert s.read_account_credentials("1", "test@example.com") == self._OLD
+        # So the outcome must not read as a completed refresh.
+        assert out.error is not None, (
+            "a stashed successor reads as freshened; autoswitch will switch "
+            "onto the consumed generation still in the store"
+        )
+        # The successor is still preserved for the next pass to adopt.
+        assert s.list_unclaimed_credentials(), "successor must still be stashed"
+
 
 class TestHealedStrikeUnblocksFetching:
     """Review finding 5: a fingerprint-healed strike must also unblock
@@ -8888,7 +8939,11 @@ class TestGateUltraReviewFixes:
                    side_effect=mock_refresh):
             out = s.consume_backup_grant("1", "test@example.com", self._OLD)
 
-        assert out.error is None
+        # Never raises, never discards the successor — the two things this
+        # test exists for. It does NOT report success: the persist failed, so
+        # the slot still holds the consumed generation and activating it would
+        # install a token that can never refresh.
+        assert out.error == "transient"
         assert out.credentials == self._NEW      # survives in the outcome
         assert s.list_unclaimed_credentials(), "successor must be stashed"
 
