@@ -8257,6 +8257,42 @@ class TestDegradedReadProvenance:
     stale generation (CC rotates keychain-only on macOS), so they may be
     ADOPTED/served but never CONSUMED (their rt POSTed)."""
 
+    def test_pinned_file_mode_is_not_a_degraded_read(self, temp_home: Path):
+        """We wrote the file ourselves; it is the authority, not a stale copy.
+
+        ``degraded`` means "this file may be behind — Claude Code writes
+        rotations keychain-only, so a FAILED keychain read leaves us stale", and
+        consume paths refuse those bytes. After ``_pin_file_mode`` that premise
+        is inverted: nothing failed, we deliberately wrote the credential to the
+        file and deleted the keychain item, and the file is what CC reads too.
+
+        Deriving degraded from ``_use_keychain()`` conflates the two. Since
+        ``_pin_file_mode`` is permanent by design (a best-effort keychain delete
+        may have left a residual, so re-probing could resurrect the wrong
+        account), the conflation disables active-token refresh for the whole
+        process: one file-mode write and every later collect pass defers.
+        """
+        from claude_swap.credentials import Platform
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher.platform = Platform.MACOS      # the store reads this live
+        store = switcher._store
+        # Claude Code's own plaintext fallback, which is what we pinned onto.
+        creds = temp_home / ".claude" / ".credentials.json"
+        creds.parent.mkdir(parents=True, exist_ok=True)
+        creds.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live", "refreshToken": "rt-live",
+                "expiresAt": 9_999_999_999_000,
+            }
+        }))
+        store._pin_file_mode()
+        assert store._read_active_credentials().degraded is False, (
+            "a self-pinned file mode reads as a degraded keychain read, so "
+            "cswap stops refreshing the active token for this process"
+        )
+
     def _macos_switcher(self) -> ClaudeAccountSwitcher:
         s = ClaudeAccountSwitcher()
         s.platform = Platform.MACOS
