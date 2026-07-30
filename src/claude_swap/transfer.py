@@ -21,6 +21,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 
 if TYPE_CHECKING:
@@ -114,7 +115,7 @@ def _atomic_write_file(path: Path, content: str) -> None:
         os.write(fd, content.encode("utf-8"))
         os.close(fd)
         fd = -1
-        os.replace(tmp_path, str(path))
+        replace_with_retry(tmp_path, str(path))
         if sys.platform != "win32":
             os.chmod(str(path), 0o600)
     except BaseException:
