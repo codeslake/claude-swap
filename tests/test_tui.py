@@ -820,7 +820,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            assert "5h 92%" in mini_part
+            # The window reads as one chip now — "5h(⟳1h59m):92%" — built by
+            # the same helper the auto view uses. Assert the parts that carry
+            # the meaning (which window, what pct), not the spacing between
+            # them, so the two surfaces can keep sharing one format.
+            assert "5h(" in mini_part and ":92%" in mini_part
             assert "7d" not in mini_part
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
