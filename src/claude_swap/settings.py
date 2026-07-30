@@ -444,22 +444,7 @@ def atomic_write_json(path: Path, data: dict) -> None:
 
     Shared by settings.json and the autoswitch state file (and any future
     machine-local state files beside them).
-
-    A symlinked destination is written THROUGH: ``os.replace`` overwrites a
-    directory entry and never follows a link, so renaming onto the link itself
-    silently turns a dotfiles-managed file into a regular one — the write
-    succeeds, the content is right, and the repo quietly stops receiving
-    changes until the next sync overwrites the local copy and discards them.
-    That is issue #192 (Claude Code's own settings writer) happening inside
-    cswap: measured on all three of my machines, where a symlinked
-    ``<backup>/settings.json`` was detached by a write and a later dotfiles
-    install then restored a copy missing the section that had been written.
     """
-    if path.is_symlink():
-        try:
-            path = Path(os.path.realpath(path))
-        except OSError:
-            pass  # broken link: fall through and write where it points
     path.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
         os.chmod(path.parent, 0o700)
