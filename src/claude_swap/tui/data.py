@@ -155,16 +155,11 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
 def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
     """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
 
-    THE one place that decides how a window reads. Every compact surface —
-    the dashboard's inactive rows and the auto view's Next-best rows — draws
-    the same two facts (which window, when it comes back), and they used to
-    each spell it their own way: ``5h 100% (resets 2h 28m)`` on one screen and
-    ``5h(⟳2h28m):100%`` on the other, for the same account in the same
-    second. The caller appends the pct so it can colour it by severity.
-
-    The countdown shows whenever it is known, not only at 100%: a window's
-    worth IS when it comes back, and that is exactly what you want to compare
-    across accounts while picking one.
+    THE one place that decides how a window reads — the dashboard's inactive
+    rows and the auto view's Next-best rows both draw it, so one account
+    cannot read two ways on two screens. The caller appends the pct so it can
+    colour it by severity. The countdown shows whenever it is known, not only
+    at 100%: a saturated candidate's worth IS when it comes back.
     """
     reset = window_reset_text(last_good, key, now)
     if not reset:
