@@ -152,6 +152,26 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     return reset_text(last_good.get(key), now)
 
 
+def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
+    """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
+
+    THE one place that decides how a window reads. Every compact surface —
+    the dashboard's inactive rows and the auto view's Next-best rows — draws
+    the same two facts (which window, when it comes back), and they used to
+    each spell it their own way: ``5h 100% (resets 2h 28m)`` on one screen and
+    ``5h(⟳2h28m):100%`` on the other, for the same account in the same
+    second. The caller appends the pct so it can colour it by severity.
+
+    The countdown shows whenever it is known, not only at 100%: a window's
+    worth IS when it comes back, and that is exactly what you want to compare
+    across accounts while picking one.
+    """
+    reset = window_reset_text(last_good, key, now)
+    if not reset:
+        return f"{label}:"
+    return f"{label}({chr(0x27F3)}{reset.removeprefix('resets ').replace(' ', '')}):"
+
+
 def format_duration(seconds: float) -> str:
     """Compact duration: "45s", "12m", "2h 13m", "3d 4h"."""
     s = int(seconds)
