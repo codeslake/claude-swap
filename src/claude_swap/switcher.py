@@ -4457,6 +4457,7 @@ class ClaudeAccountSwitcher:
         active = self._read_active_credentials()
         creds = active.value or ""
         self._active_keychain_unavailable = active.keychain_unavailable
+        self._active_read_degraded = active.degraded
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
