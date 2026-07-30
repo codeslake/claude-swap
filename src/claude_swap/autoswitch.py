@@ -97,16 +97,12 @@ RECOVERY_HYSTERESIS_S = 300.0
 RECOVERY_HORIZON_S = 4 * 3600.0
 
 # Anti-flap margin for the headroom axis past RECOVERY_HORIZON_S, as a RATIO
-# rather than percentage points. The ordinary hysteresis_pct (10 points) is
-# unmeetable here by construction — everything is within a few points of its
-# limit — so requiring it would park the engine and let it ride into the wall.
-# Requiring strictly-more was the opposite error: one point is enough to move,
-# the target burns it back, and the engine ping-pongs (measured 2026-07-30,
-# four switches in 35 minutes, each buying one point and each costing a
-# credential rewrite). A ratio is the right unit in the endgame — with two
-# points left, what matters is how many TIMES more runway the target has — and
-# it makes the move one-way: the reverse leg would need the new active to fall
-# to a quarter of the headroom it just beat.
+# rather than percentage points. Requiring strictly-more is no margin at all:
+# one point is enough to move, the target burns it back, and the engine
+# ping-pongs (measured 2026-07-30: four switches in 35 minutes, each buying one
+# point and each costing a credential rewrite). A ratio makes the move one-way
+# — the reverse leg would need the new active to fall to a quarter of the
+# headroom it just beat.
 HORIZON_HEADROOM_RATIO = 2.0
 
 # Below this much headroom an account is spent for practical purposes, and
@@ -1190,19 +1186,13 @@ class AutoSwitchEngine:
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
-        # Past the horizon, rank by headroom instead (the escape itself stays:
-        # the landing-health gate has no other answer here). An UNKNOWN
-        # recovery is no evidence rather than a distant one, so it keeps the
-        # recovery axis and that gate keeps deciding. See RECOVERY_HORIZON_S.
-        # Everyone spent: headroom can no longer tell the candidates apart, so
-        # the reset is the only thing left worth ranking on (see
-        # SPENT_HEADROOM_PCT). Checked before the horizon, which is about
-        # whether a sooner reset is worth REAL headroom — a question that only
-        # arises while some real headroom exists.
+        # all_spent is checked first: the horizon asks whether a sooner reset
+        # is worth REAL headroom, which only arises while real headroom exists.
+        # An UNKNOWN recovery is no evidence rather than a distant one, so it
+        # keeps the recovery axis. See SPENT_HEADROOM_PCT, RECOVERY_HORIZON_S.
         all_spent = all_above and all(
-            (headroom.get(n) is not None and headroom[n] <= SPENT_HEADROOM_PCT)
-            for n in oauth_candidates
-        ) and (active_headroom is not None and active_headroom <= SPENT_HEADROOM_PCT)
+            h is not None and h <= SPENT_HEADROOM_PCT for h in headroom.values()
+        )
         recovery_useful = all_above and (
             all_spent
             or active_recovery_ts == float("inf")
