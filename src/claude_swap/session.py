@@ -54,7 +54,6 @@ from claude_swap.fsutil import replace_with_retry
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
-from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, list_sessions
@@ -463,6 +462,26 @@ class SessionManager:
             self._sync_sharing(session_dir, share, share_history)
             return session_dir, account_num, email
 
+        # One refresh so the profile starts with a fresh access token —
+        # BEFORE the bootstrap lock (the gate takes the same non-reentrant
+        # FileLock and POSTs over the network, which must never run under a
+        # held lock). The gate re-reads the freshest copy itself and
+        # persists via fingerprint CAS; _bootstrap then reads the rotated
+        # backup. Failure is non-fatal: the stored token may still be
+        # valid, and claude refreshes on its own at runtime. Setup-token
+        # accounts (--add-token) have no refresh token by design — skip
+        # silently instead of warning about a flow that can't happen.
+        pre_creds = self.switcher.read_account_credentials(account_num, email)
+        if pre_creds and self._has_refresh_token(pre_creds):
+            outcome = self.switcher.consume_backup_grant(
+                account_num, email, pre_creds
+            )
+            if not outcome.credentials:
+                warning(
+                    f"Could not refresh the token for Account-{account_num}; "
+                    "continuing with the stored credentials."
+                )
+
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
@@ -504,22 +523,10 @@ class SessionManager:
                 f"Re-add with: cswap --add-account --slot {account_num}"
             )
 
-        # One refresh so the profile starts with a fresh access token; persist
-        # a possibly-rotated refresh token back to backup so future switches
-        # and runs see the latest. Failure is non-fatal: the stored token may
-        # still be valid, and claude refreshes on its own at runtime.
-        # Setup-token accounts (--add-token) have no refresh token by design —
-        # skip silently instead of warning about a flow that can't happen.
-        if self._has_refresh_token(creds):
-            refreshed = refresh_oauth_credentials(creds)
-            if refreshed:
-                creds = refreshed
-                self.switcher.write_account_credentials(account_num, email, creds)
-            else:
-                warning(
-                    f"Could not refresh the token for Account-{account_num}; "
-                    "continuing with the stored credentials."
-                )
+        # The pre-lock refresh (see run(): the consume gate must not run
+        # under this lock — its POST is network and the FileLock is
+        # non-reentrant) may have already rotated the backup; the read
+        # above picked that successor up. No POST happens here.
 
         config_text = self.switcher.read_account_config(account_num, email)
         try:

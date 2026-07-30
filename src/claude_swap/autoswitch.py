@@ -649,14 +649,15 @@ class AutoSwitchEngine:
         )
         if not near_expiry:
             return "ok"
-        outcome = oauth.try_refresh_oauth_credentials(creds)
+        # The consume gate is the single place a backup rt may be POSTed:
+        # it re-reads under the slot lock (our snapshot may be superseded),
+        # consults the session profile for a newer generation, and persists
+        # via fingerprint CAS — so a freshen racing the collector (or a
+        # sibling surface) can no longer double-consume one grant.
+        outcome = self.switcher.consume_backup_grant(number, email, creds)
         if outcome.error is None and outcome.credentials:
-            # Persist first, unconditionally: the grant consumed a generation,
-            # and not writing the successor would kill the lineage regardless
-            # of whose it turns out to be.
-            self.switcher.persist_backup_credentials(
-                number, email, outcome.credentials
-            )
+            # The gate already persisted the successor (or adopted a racing
+            # writer's newer lineage) under its own lock.
             if self._note_token_identity(number, outcome.token_account):
                 # The slot's stored credential authenticates as a *different*
                 # account — activating it would put the user on the wrong
@@ -667,6 +668,12 @@ class AutoSwitchEngine:
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
+        if outcome.error == "store-unmirrored":
+            # Deterministic env condition (CLAUDE_SECURESTORAGE_CONFIG_DIR),
+            # not network trouble: every candidate refuses identically and
+            # forever until the shell changes. Reported distinctly so the
+            # tick error names the remedy instead of "(network?)".
+            return "store-unmirrored"
         return "transient"
 
     def _note_token_identity(
@@ -1059,6 +1066,7 @@ class AutoSwitchEngine:
 
         # -- freshen + switch ----------------------------------------------
         transient_failure = False
+        store_unmirrored = False
         for num in ordered:
             email = self.switcher.account_email(num)
             if trigger == "consume-first":
@@ -1098,14 +1106,22 @@ class AutoSwitchEngine:
             if status == "transient":
                 transient_failure = True
                 continue
+            if status == "store-unmirrored":
+                store_unmirrored = True
+                continue
             if status == "skip-live-session":
                 continue
             return self._perform(num, email, trigger)
 
-        if transient_failure:
+        if store_unmirrored or transient_failure:
             self._emit(
                 ErrorEvent(
-                    message="could not freshen any candidate (network?)",
+                    message=(
+                        "could not freshen: CLAUDE_SECURESTORAGE_CONFIG_DIR "
+                        "is set — unset it or run cswap from a normal shell"
+                        if store_unmirrored
+                        else "could not freshen any candidate (network?)"
+                    ),
                     transient=True,
                 )
             )

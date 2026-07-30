@@ -144,13 +144,20 @@ def auth_status_tracks_seed(monkeypatch):
 
 @pytest.fixture
 def refresh_rotates(monkeypatch):
+    """Track consume-gate calls; the gate persists ROTATED_CREDS like the
+    real one does (bootstrap re-reads the backup afterwards)."""
     calls: list[str] = []
 
-    def fake_refresh(creds: str) -> str:
-        calls.append(creds)
-        return ROTATED_CREDS
+    def fake_gate(self, account_num: str, email: str, snapshot: str):
+        from claude_swap import oauth as oauth_mod
+        calls.append(snapshot)
+        self._write_account_credentials(account_num, email, ROTATED_CREDS)
+        return oauth_mod.RefreshOutcome(ROTATED_CREDS, None)
 
-    monkeypatch.setattr(session_mod, "refresh_oauth_credentials", fake_refresh)
+    from claude_swap.switcher import ClaudeAccountSwitcher
+    monkeypatch.setattr(
+        ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
+    )
     return calls
 
 
@@ -347,7 +354,12 @@ class TestBootstrap:
     def test_refresh_failure_uses_stored_creds(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys
     ):
-        monkeypatch.setattr(session_mod, "refresh_oauth_credentials", lambda c: None)
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(
+                None, "transient"
+            ),
+        )
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
@@ -362,9 +374,9 @@ class TestBootstrap:
         seeded_switcher._write_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL, token_creds)
         refresh_calls = []
         monkeypatch.setattr(
-            session_mod,
-            "refresh_oauth_credentials",
-            lambda c: refresh_calls.append(c) or None,
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: refresh_calls.append(snap)
+            or oauth.RefreshOutcome(None, "transient"),
         )
 
         session_dir, _, _ = manager.setup_session("2", share=False)
@@ -1366,7 +1378,7 @@ class TestGuards:
         make_live(session_dir)
         seen: dict[str, bool] = {}
 
-        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None):
+        def fake_fetch(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
             seen[num] = is_active
             return oauth.UsageOutcome(None)
 
@@ -1651,3 +1663,69 @@ class TestReadSessionCredentials:
         )
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-seed" in creds
+
+
+class TestBootstrapRefreshRoutesThroughGate:
+    """M2: the session-profile bootstrap refresh consumes the backup rt via
+    the switcher's consume gate, not a direct POST of its own read."""
+
+    def test_bootstrap_uses_gate(self, temp_home, monkeypatch):
+        from claude_swap import oauth as oauth_mod
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._init_sequence_file()
+        expired = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-o", "refreshToken": "rt-o",
+                "expiresAt": 1000,
+            }
+        })
+        s._write_account_credentials("1", "a@example.com", expired)
+        s._write_account_config("1", "a@example.com", json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com"},
+        }))
+        data = s._get_sequence_data()
+        data["accounts"]["1"] = {"email": "a@example.com", "uuid": "u1",
+                                 "organizationUuid": "", "organizationName": ""}
+        data["sequence"] = [1]
+        s._write_json(s.sequence_file, data)
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-f", "refreshToken": "rt-f",
+                "expiresAt": 9999999999000,
+            }
+        })
+        gate = {}
+
+        def mock_gate(num, email, snapshot):
+            gate["args"] = (num, email)
+            return oauth_mod.RefreshOutcome(fresh, None)
+
+        monkeypatch.setattr(s, "consume_backup_grant", mock_gate)
+        direct = {}
+
+        def direct_post(credentials, **kw):
+            direct["called"] = True
+            return oauth_mod.RefreshOutcome(None, "transient")
+
+        # The bypass seam: session.py no longer imports any direct refresh
+        # helper, so a regression would have to call oauth's POST directly.
+        monkeypatch.setattr(
+            "claude_swap.oauth.try_refresh_oauth_credentials", direct_post
+        )
+        monkeypatch.setattr(
+            "claude_swap.oauth.refresh_oauth_credentials", direct_post
+        )
+        from claude_swap.session import SessionManager
+        mgr = SessionManager(s)
+        # setup_session is the seam: it must call the gate BEFORE the
+        # bootstrap lock (the gate takes the same non-reentrant FileLock).
+        # (run() itself needs a claude binary on PATH — absent on CI.)
+        try:
+            mgr.setup_session("1", share=False)
+        except Exception:
+            pass  # profile validation may fail in this stub env — the
+                  # assertion below is about the gate routing only
+        assert gate.get("args") == ("1", "a@example.com")
+        assert "called" not in direct
