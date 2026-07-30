@@ -2719,6 +2719,87 @@ class TestRecoveryHorizon:
         assert harness.active_number() == 2
 
 
+class TestHorizonAxisDoesNotFlap:
+    """Past the horizon the headroom axis needs its own anti-flap margin.
+
+    The first cut required only *strictly more* headroom, which is no margin
+    at all: one point is enough to move, and the account we move to burns that
+    point back within a poll or two. Measured live on 2026-07-30, four switches
+    in 35 minutes, each buying one point and each costing a credential rewrite:
+
+        17:28  acct 1 (5% left) -> acct 2 (6%)
+        17:49  acct 2 (4% left) -> acct 1 (5%)
+        17:54  acct 1           -> acct 2
+        18:03  acct 2 (2% left) -> acct 1 (3%)
+
+    The ordinary path uses ``hysteresis_pct`` (10 points), but that is
+    unmeetable here by construction — everything is within a few points of its
+    limit, so requiring ten would park the engine and let it ride into the
+    wall, which is the failure #202 exists to prevent.
+
+    A RATIO is the right unit in the endgame: with two points left, what
+    matters is how many times more runway the target has, not how many points.
+    Requiring the target to hold ``HORIZON_HEADROOM_RATIO`` times the active
+    account's headroom makes the move one-way by construction — the reverse
+    would need the new active to fall to a quarter of what it just beat.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def _days_out(self, harness, hours):
+        return self._at(harness, hours * 3600)
+
+    def test_one_point_of_headroom_does_not_move(self, harness):
+        """The measured flap: 95% active against a 94% peer, both days out."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(95, self._days_out(harness, 109)),   # active, 5 left
+            "2": _usage(94, self._days_out(harness, 80)),    # 6 left
+            "3": _usage(99, self._days_out(harness, 50)),
+        })
+        assert harness.active_number() == 1, (
+            "moved for one point of headroom; the target burns it back and the "
+            "engine ping-pongs (measured: 4 switches in 35 minutes)"
+        )
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_the_return_leg_is_blocked_too(self, harness):
+        """Same shape with the roles reversed — symmetric, so neither leg runs."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(96, self._days_out(harness, 109)),   # active, 4 left
+            "2": _usage(95, self._days_out(harness, 80)),    # 5 left
+            "3": _usage(99, self._days_out(harness, 50)),
+        })
+        assert harness.active_number() == 1
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_a_materially_better_peer_still_wins(self, harness):
+        """The escape must survive: 2 points left against 10 is a real move."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(98, self._days_out(harness, 109)),   # active, 2 left
+            "2": _usage(90, self._days_out(harness, 80)),    # 10 left — 5x
+            "3": _usage(99, self._days_out(harness, 50)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_a_minutes_away_reset_is_unaffected(self, harness):
+        """Inside the horizon the recovery axis still decides, ratio or not."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(91, self._at(harness, 7200)),
+            "2": _usage(94, self._at(harness, 1800)),
+            "3": _usage(98, self._at(harness, 480)),         # back in 8 min
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+
 class TestReviewFindings202:
     """Three defects found reviewing #202, each reproduced before fixing.
 
