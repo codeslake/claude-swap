@@ -358,7 +358,7 @@ class TestBackoff:
         # governs, and adding to a short ask would overtake it.
         assert entry.backoff_until == pytest.approx(clock.now + 90.0)
         assert entry.in_backoff(clock.now + 89)
-        assert not entry.in_backoff(clock.now + 114)
+        assert not entry.in_backoff(clock.now + 91)
 
     def test_own_curve_may_exceed_retry_after(self):
         assert usage_store._failure_backoff_s(5, 10.0) == pytest.approx(480.0)

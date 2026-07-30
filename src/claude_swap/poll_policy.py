@@ -30,7 +30,7 @@ Health invariant to watch in the logs: steady state shows zero http-429.
 A post-burst 429 does NOT reliably clear at its stated horizon — measured
 over one machine's full log, 10 of 19 lapsed blocks re-blocked within 900 s
 of their own deadline, each for a fresh full hour. That is why the wait is
-Retry-After scaled by ``usage_store.RETRY_AFTER_MARGIN_FRAC`` and not
+Retry-After plus ``usage_store.RETRY_AFTER_MARGIN_S`` and not
 Retry-After alone. What would mean this model needs revisiting is a 429
 episode at modest rates that outlasts an hour *past* that margin.
 
