@@ -8988,6 +8988,55 @@ class TestGateUltraReviewFixes:
         s._write_json(s.sequence_file, sample_sequence_data)
         return s
 
+    def test_a_cas_conflict_stash_does_not_accumulate_forever(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A CAS-conflict entry can never satisfy the adoption condition.
+
+        _adopt_stashed_successor adopts when ``consumedFp`` equals the
+        generation the slot currently stores. A CAS conflict is by definition
+        the case where they differ — another writer replaced the lineage while
+        our POST was in flight — and the store only moves forward, so it never
+        returns to the generation we consumed. Every conflict therefore leaves
+        a file that no path can consume or expire, and a busy multi-surface
+        setup produces exactly these.
+
+        The entry itself is worth keeping (it holds a real consumed successor
+        and `--json` surfaces it as unclaimedCredentials for hand recovery);
+        what must not happen is unbounded growth of entries indistinguishable
+        from ones still pending adoption.
+        """
+        THIRD = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-3rd", "refreshToken": "rt-3rd",
+                              "expiresAt": 9999999999000}})
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        # The gate's ONE store read happens after the POST, under the slot
+        # lock: a third party replaced the lineage while we were in flight.
+        with patch.object(s, "_read_account_credentials", return_value=THIRD), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)):
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        # The gate adopts the newer store lineage, as designed.
+        assert out.credentials == THIRD
+        stashed = s.list_unclaimed_credentials()
+        assert stashed, "the consumed successor must be preserved"
+
+        # Now the defect: a later pass must be able to retire it. Adoption
+        # runs against the store's CURRENT generation, which is THIRD.
+        adopted = s._adopt_stashed_successor("1", "test@example.com", THIRD)
+        assert adopted is None      # correctly not adopted (dead branch)
+        assert not [
+            e for e in s.list_unclaimed_credentials()
+            if s._store._read_stash_manifest().get(e, {}).get("reason")
+            == "consume-gate-cas-conflict"
+        ], (
+            "a CAS-conflict entry stays pending forever: it can never match "
+            "the adoption condition, so every conflict leaks one file"
+        )
+
     # -- exception containment (findings: window-3 persist raise) --------
 
     def test_persist_oserror_after_post_stashes_and_never_raises(
