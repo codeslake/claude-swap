@@ -353,10 +353,12 @@ class TestBackoff:
             {"1": FetchRecord(error="http-429", retry_after_s=90.0)}, IDENT
         )
         entry = store.entries(IDENT)["1"]
-        # First failure computes 30s, but the server asked for 90s.
-        assert entry.backoff_until == pytest.approx(clock.now + 90.0)
-        assert entry.in_backoff(clock.now + 89)
-        assert not entry.in_backoff(clock.now + 91)
+        # First failure computes 30s, but the server asked for 90s — honored as
+        # the floor, plus the proportional margin that keeps the retry off the
+        # deadline itself.
+        assert entry.backoff_until == pytest.approx(clock.now + 112.5)
+        assert entry.in_backoff(clock.now + 111)
+        assert not entry.in_backoff(clock.now + 114)
 
     def test_own_curve_may_exceed_retry_after(self):
         assert usage_store._failure_backoff_s(5, 10.0) == pytest.approx(480.0)
@@ -388,15 +390,35 @@ class TestBackoff:
         # server's Retry-After counts that down to a fixed deadline (measured;
         # probing does not re-arm it). Capping it to minutes just re-probes two
         # or three times inside a block that lasts the full window anyway —
-        # wasted requests — so an hour-scale Retry-After is honored whole, up to
-        # the (raised) safety cap.
-        assert usage_store._failure_backoff_s(1, 3600.0) == pytest.approx(3600.0)
-        assert usage_store.RETRY_AFTER_FLOOR_CAP_S >= 3600.0
+        # wasted requests — so an hour-scale Retry-After is honored whole, plus
+        # the margin, up to the safety cap.
+        assert usage_store._failure_backoff_s(1, 3600.0) == pytest.approx(4500.0)
+        assert usage_store.RETRY_AFTER_FLOOR_CAP_S >= 4500.0
 
-    def test_measured_burst_block_honored_exactly(self):
+    def test_hour_scale_margin_clears_the_measured_re_block_band(self):
+        # Honoring Retry-After *exactly* puts the retry on the deadline itself,
+        # where the server is not reliably ready: measured over this machine's
+        # log, 10 of 19 post-fix block lapses re-blocked within 900s of their
+        # own deadline (+2s … +716s) and each cost a fresh full hour, while the
+        # next one after that is +3853s. On the hour-scale block that produced
+        # that evidence, the margin must clear the whole 900s band.
+        assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 >= 900.0
+
+    def test_margin_is_proportional_not_flat(self):
+        # The re-block evidence is entirely hour-scale (37 of 39 blocks opened
+        # at exactly 3600), while short blocks were separately measured as
+        # accurate. A flat margin would inflate a short block on no evidence,
+        # so the margin scales with what the server asked.
+        assert usage_store._failure_backoff_s(1, 300.0) - 300.0 < 900.0
+        assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 == pytest.approx(
+            12.0 * (usage_store._failure_backoff_s(1, 300.0) - 300.0)
+        )
+
+    def test_measured_burst_block_honored_with_margin(self):
         # The real burst rule (measured 2026-07-06) sends Retry-After: 300 and
-        # the block is exactly that long — honor it as the floor, uncapped.
-        assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(300.0)
+        # the block is exactly that long — honored as the floor plus the
+        # proportional margin, uncapped.
+        assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(375.0)
 
 
 class TestIdentityGuard:
@@ -929,8 +951,12 @@ class TestRecent429AcrossHonoredBlock:
             {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
         )
         before = store.entries(IDENT)["1"]
-        # Well past both the backoff and any reasonable recency window.
-        clock.advance(7200)
+        # Well past both the backoff and the recency window that follows it.
+        # Derived from the honored backoff rather than hardcoded: the window is
+        # anchored on when the backoff LIFTS, so it moves with the margin.
+        clock.advance(
+            (before.backoff_until - clock.now) + usage_store.RECENT_429_WINDOW_S + 1
+        )
         assert self._recent_429(before, clock.now) is False
 
     def test_short_retry_after_recency_still_expires_normally(self, store, clock):
