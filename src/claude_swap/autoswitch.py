@@ -88,16 +88,12 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # it needs its own unit rather than a reused one.
 RECOVERY_HYSTERESIS_S = 300.0
 
-# Horizon past which "soonest recovery" stops being worth real headroom.
-# The escape above was measured on minutes-scale resets (#202: a peer back in
-# 8 minutes), where waiting is plainly better than burning the last of the
-# active account. Days-scale is the opposite trade: measured live at active
-# 91% / 109h against 98% / 50h, the engine moved from 9 points of headroom to
-# 2, and neither account returns within the session either way — so the 9
-# points were the only resource that could still do work. Past this bound,
-# ranking falls back to headroom, which is what decides whether work
-# continues when nobody comes back soon. 4h covers a 5-hour window's whole
-# cycle, so same-day resets keep the recovery ranking.
+# Horizon past which "soonest recovery" stops being worth real headroom. The
+# escape above was measured on minutes-scale resets (#202: a peer back in 8
+# minutes). Days-scale is the opposite trade — measured live, active 91% /
+# 109h lost to 98% / 50h, and neither returns within the session, so the 9
+# points were the only resource that could still work. 4h covers a whole
+# 5-hour cycle, so same-day resets keep the recovery ranking.
 RECOVERY_HORIZON_S = 4 * 3600.0
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
@@ -1170,13 +1166,10 @@ class AutoSwitchEngine:
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
-        # Past the horizon, "soonest" buys nothing real: keep the escape (the
-        # landing-health gate has no other answer when everything is above the
-        # line) but rank by headroom instead of recovery. An UNKNOWN recovery
-        # (inf) is not "past the horizon" — it is no evidence at all, and the
-        # pre-existing rule is that a candidate over the threshold must not be
-        # landed on without it. Treat it as the recovery axis so that gate
-        # keeps deciding. See RECOVERY_HORIZON_S.
+        # Past the horizon, rank by headroom instead (the escape itself stays:
+        # the landing-health gate has no other answer here). An UNKNOWN
+        # recovery is no evidence rather than a distant one, so it keeps the
+        # recovery axis and that gate keeps deciding. See RECOVERY_HORIZON_S.
         recovery_useful = all_above and (
             active_recovery_ts == float("inf")
             or active_recovery_ts - now <= RECOVERY_HORIZON_S
