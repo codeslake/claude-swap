@@ -2870,6 +2870,70 @@ class TestAllSpentGoesToTheSoonestReset:
         assert outcome is not TickOutcome.SWITCHED
 
 
+class TestEscapeBeforeTheLimitLands:
+    """At the brink the ordinary proactive path already leaves — verified.
+
+    I assumed ``at-limit`` firing only at exactly 0% meant an account rode to
+    100% before escaping, and set out to move the trigger a point earlier.
+    Measuring it refuted that: at 99% with a peer that has real headroom, the
+    engine switches on the ORDINARY proactive path, because 99% is above the
+    threshold and the peer clears the hysteresis margin easily.
+
+    What actually happened in the 18:50 observation that prompted this: the
+    only peers were 99% (one point) and 100% (never a target), so there was
+    nowhere better and holding was correct. `all_spent` already covers that
+    case by ranking on the soonest reset.
+
+    Kept as a regression pin: moving the at-limit trigger earlier looks
+    appealing and is wrong — it hijacks the recovery ranking (#202) and the
+    spent-band ranking, both of which belong to `proactive`.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def test_at_99_the_proactive_path_already_escapes(self, harness):
+        """No special trigger needed: 99% is over the threshold and a healthy
+        peer clears the margin."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 109 * 3600)),  # active, 1 left
+            "2": _usage(70, self._at(harness, 80 * 3600)),   # 30 left
+            "3": _usage(100, self._at(harness, 50 * 3600)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", (
+            "at-limit must stay bound to headroom <= 0: it skips the recovery "
+            "and spent-band rankings that proactive owns"
+        )
+
+    def test_at_99_with_only_spent_peers_it_holds(self, harness):
+        """The 18:50 shape: nowhere better, so staying is right. The spent-band
+        rule decides where to sit, not an early escape."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 109 * 3600)),
+            "2": _usage(100, self._at(harness, 80 * 3600)),
+            "3": _usage(100, self._at(harness, 50 * 3600)),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+
+    def test_below_the_brink_the_ordinary_rules_still_decide(self, harness):
+        """A comfortable account is untouched: the hysteresis margin applies."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(50, self._at(harness, 109 * 3600)),
+            "2": _usage(45, self._at(harness, 80 * 3600)),
+            "3": _usage(40, self._at(harness, 50 * 3600)),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+
+
 class TestReviewFindings202:
     """Three defects found reviewing #202, each reproduced before fixing.
 
