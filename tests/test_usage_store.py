@@ -354,10 +354,10 @@ class TestBackoff:
         )
         entry = store.entries(IDENT)["1"]
         # First failure computes 30s, but the server asked for 90s — honored as
-        # the floor, plus the proportional margin that keeps the retry off the
-        # deadline itself.
-        assert entry.backoff_until == pytest.approx(clock.now + 112.5)
-        assert entry.in_backoff(clock.now + 111)
+        # the floor. No margin below BACKOFF_CAP_S: there our own curve already
+        # governs, and adding to a short ask would overtake it.
+        assert entry.backoff_until == pytest.approx(clock.now + 90.0)
+        assert entry.in_backoff(clock.now + 89)
         assert not entry.in_backoff(clock.now + 114)
 
     def test_own_curve_may_exceed_retry_after(self):
@@ -404,21 +404,49 @@ class TestBackoff:
         # that evidence, the margin must clear the whole 900s band.
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 >= 900.0
 
-    def test_margin_is_proportional_not_flat(self):
+    def test_a_short_accurate_block_is_not_inflated(self):
         # The re-block evidence is entirely hour-scale (37 of 39 blocks opened
         # at exactly 3600), while short blocks were separately measured as
-        # accurate. A flat margin would inflate a short block on no evidence,
-        # so the margin scales with what the server asked.
-        assert usage_store._failure_backoff_s(1, 300.0) - 300.0 < 900.0
-        assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 == pytest.approx(
-            12.0 * (usage_store._failure_backoff_s(1, 300.0) - 300.0)
-        )
+        # accurate — Retry-After 300 meant a 300s block. Inflating those on no
+        # evidence is still wrong; the margin now stays off them by applying
+        # only at or above BACKOFF_CAP_S rather than by scaling with the ask.
+        assert usage_store._failure_backoff_s(1, 300.0) == 300.0
+        assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 == 900.0
 
-    def test_measured_burst_block_honored_with_margin(self):
+    def test_margin_survives_a_mid_block_observation(self):
+        # The margin exists to land past a FIXED deadline, and Retry-After is a
+        # countdown to it — so what the server reports depends on WHEN we ask.
+        # The budget is account-scoped, so a second machine polling into a block
+        # another one opened sees only the remainder: that is the normal case,
+        # not an edge (35 of 72 observed 429s were mid-block). A margin computed
+        # as a FRACTION of the remainder shrinks toward zero as the deadline
+        # nears — the 0.25 fraction this replaces made a 1800s remainder land
+        # +450s and a 900s remainder land +225s, both inside the measured
+        # +2s..+716s re-block band. An absolute margin does not decay.
+        for remaining in (3600.0, 1800.0, 900.0):
+            overshoot = usage_store._failure_backoff_s(1, remaining) - remaining
+            assert overshoot >= 900.0, (
+                f"Retry-After {remaining}s lands {overshoot:.0f}s past the "
+                "deadline, inside the measured re-block band"
+            )
+
+    def test_short_asks_stay_on_our_own_curve(self):
+        # Below BACKOFF_CAP_S the margin deliberately does not apply: our own
+        # saturated curve already waits longer than the server asked, so adding
+        # to the ask would only overtake it — test_own_curve_may_exceed_retry_after
+        # and test_huge_failure_count_does_not_overflow both pin that. A block
+        # whose REMAINDER has fallen under the cap therefore still retries near
+        # its deadline; distinguishing that from a genuine short burst block
+        # needs the row's own backoff state, not the ask, and is left to the
+        # caller rather than guessed at here.
+        assert usage_store._failure_backoff_s(1, 90.0) == 90.0
+        assert usage_store._failure_backoff_s(10_000, 90.0) == BACKOFF_CAP_S
+
+    def test_measured_burst_block_honored_exactly(self):
         # The real burst rule (measured 2026-07-06) sends Retry-After: 300 and
-        # the block is exactly that long — honored as the floor plus the
-        # proportional margin, uncapped.
-        assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(375.0)
+        # the block is exactly that long — honored as the floor, with no margin
+        # added: 300 is under BACKOFF_CAP_S, where our own curve governs.
+        assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(300.0)
 
 
 class TestIdentityGuard:
