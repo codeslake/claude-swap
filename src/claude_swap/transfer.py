@@ -476,19 +476,7 @@ def import_accounts(
         if existing_slot is not None:
             if force:
                 outcome = "overwrote"
-            elif (
-                switcher._usage_store.entries(
-                    {existing_slot: (entry["email"], entry["org_uuid"])}
-                )[existing_slot].token_dead(
-                    # Fingerprint-bound like the collectors — a stale strike
-                    # must not license replacing a newer credential.
-                    stored_fp=oauth.credential_fingerprint(
-                        switcher._read_account_credentials(
-                            existing_slot, entry["email"]
-                        )
-                    )
-                )
-            ):
+            elif switcher._slot_token_dead(existing_slot, entry["email"]):
                 # Narrow auto-heal (issue #136): a plain import replaces a
                 # slot iff its identity-matched usage row is quarantined as
                 # refresh-token-dead. The verdict normally postdates the
