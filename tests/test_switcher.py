@@ -8334,6 +8334,48 @@ class TestDegradedReadProvenance:
         assert result.error is None        # no strike-advancing error
 
 
+
+    def test_status_path_sets_the_degraded_flag_too(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        """`cswap --status` must arm the same guard the collect pass does.
+
+        _build_accounts_info copies BOTH active.keychain_unavailable and
+        active.degraded onto the switcher; _active_account_usage copies only
+        the first. The guard in _fetch_active_usage reads _active_read_degraded,
+        so on the status path it never fires and the stale rt is POSTed — the
+        exact field incident this branch exists to prevent, reachable from a
+        read-only command. Every test above sets the flag by hand ("as
+        _build_accounts_info would"), so none of them notices it is not set.
+        """
+        from claude_swap.credentials import ActiveCredentials
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        stale = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-stale", "refreshToken": "rt-stale",
+                "expiresAt": 1000,
+            }
+        })
+        monkeypatch.setattr(
+            s._store, "_read_active_credentials",
+            lambda: ActiveCredentials(stale, False, True),   # degraded=True
+        )
+        assert s._active_read_degraded is False              # default
+
+        with patch.object(s, "_read_account_credentials", return_value=stale), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
+            s._active_account_usage("1", "test@example.com", "")
+
+        assert s._active_read_degraded is True, (
+            "the status path leaves the degraded guard disarmed, so a stale "
+            "refresh token is POSTed and a live account can be quarantined"
+        )
+
 class TestBackupReadTriState:
     """M1: a backup read that failed at the Keychain (not rc-44 absent) must
     be distinguishable from a genuinely absent backup — 'unreadable' shows
