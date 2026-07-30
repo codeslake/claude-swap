@@ -109,6 +109,17 @@ RECOVERY_HORIZON_S = 4 * 3600.0
 # to a quarter of the headroom it just beat.
 HORIZON_HEADROOM_RATIO = 2.0
 
+# Below this much headroom an account is spent for practical purposes, and
+# comparing headroom between two spent accounts compares noise: at the burn
+# rates measured on 2026-07-30 a one-point edge is under ten minutes of work,
+# less than two poll intervals. When EVERY candidate is down here the ranking
+# has to fall back to the reset — sit where the quota returns first, so the
+# reset finds us already on it — no matter how far out that reset is. Without
+# this, three accounts at 99% left the engine with no qualifying candidate and
+# it parked on whichever it happened to hold, including the one resetting
+# 59 hours after a peer.
+SPENT_HEADROOM_PCT = 3.0
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -1183,8 +1194,18 @@ class AutoSwitchEngine:
         # the landing-health gate has no other answer here). An UNKNOWN
         # recovery is no evidence rather than a distant one, so it keeps the
         # recovery axis and that gate keeps deciding. See RECOVERY_HORIZON_S.
+        # Everyone spent: headroom can no longer tell the candidates apart, so
+        # the reset is the only thing left worth ranking on (see
+        # SPENT_HEADROOM_PCT). Checked before the horizon, which is about
+        # whether a sooner reset is worth REAL headroom — a question that only
+        # arises while some real headroom exists.
+        all_spent = all_above and all(
+            (headroom.get(n) is not None and headroom[n] <= SPENT_HEADROOM_PCT)
+            for n in oauth_candidates
+        ) and (active_headroom is not None and active_headroom <= SPENT_HEADROOM_PCT)
         recovery_useful = all_above and (
-            active_recovery_ts == float("inf")
+            all_spent
+            or active_recovery_ts == float("inf")
             or active_recovery_ts - now <= RECOVERY_HORIZON_S
         )
         qualifying: list[tuple[tuple, str]] = []
