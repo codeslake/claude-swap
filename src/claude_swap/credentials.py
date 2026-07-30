@@ -241,6 +241,11 @@ class CredentialStore:
         # re-probe the Keychain (see KEYCHAIN_RECHECK_COOLDOWN_S). 0.0 = no
         # pending re-probe (never failed, or forced to file mode deliberately).
         self._keychain_disabled_until: float = 0.0
+        # Whether file mode was CHOSEN by us (a write fell back and we
+        # deleted the Keychain item) rather than forced by a failed read. Both
+        # stick, but only the failure means the file may be behind Claude
+        # Code's own writes — see _read_active_credentials.
+        self._file_mode_is_ours: bool = False
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -306,6 +311,7 @@ class CredentialStore:
         """
         self._keychain_usable_cache = False
         self._keychain_disabled_until = 0.0
+        self._file_mode_is_ours = True
 
     def _read_credentials(self) -> str | None:
         """Read Claude Code's active credential — OAuth *or* managed API key (value).
@@ -370,10 +376,20 @@ class CredentialStore:
             val, keychain_failed = self._read_active_oauth_keychain()
             if val:
                 return ActiveCredentials(val, False)
-        elif self._host.platform == Platform.MACOS:
+        elif self._host.platform == Platform.MACOS and not self._file_mode_is_ours:
             # Keychain already known unusable this process (a prior op failed and the
             # capability cache stuck to file mode): if nothing is found below, that
             # absence is "keychain unavailable", not a genuinely empty slot.
+            #
+            # Excludes a file mode WE pinned. There the premise is inverted:
+            # nothing failed, we wrote the credential to the file deliberately
+            # and deleted the Keychain item, and that file is what Claude Code
+            # reads too — so it is the authority, not a copy that may be behind.
+            # Without this the two conditions share one flag, and because
+            # _pin_file_mode is permanent by design a single file-mode write
+            # would defer every active-token refresh for the rest of the
+            # process (measured: the guard in _fetch_active_usage fires on
+            # every subsequent collect pass).
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
