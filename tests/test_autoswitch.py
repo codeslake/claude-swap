@@ -3430,6 +3430,75 @@ class TestHorizonAxisDoesNotFlap:
         assert harness.active_number() == 3
 
 
+class TestAllSpentGoesToTheSoonestReset:
+    """When every account is spent, sit where the quota comes back first.
+
+    Headroom decides while there is headroom worth comparing. Once everyone is
+    down to a point or two, headroom says nothing — a one-point edge is under
+    ten minutes of work at the burn rates measured on 2026-07-30 — and the only
+    thing that still matters is who returns first, so the reset finds us
+    already on it.
+
+    The horizon rule alone got this wrong: past four hours it always ranked by
+    headroom, so three accounts at 99% had no qualifying candidate and the
+    engine parked on whichever one it happened to be on — including the one
+    resetting LAST, 109h out against a peer 50h out.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def test_all_spent_moves_to_the_soonest_reset(self, harness):
+        """The reported shape: 99/99/99, days out, active resets last."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 109 * 3600)),  # active, LAST
+            "2": _usage(99, self._at(harness, 80 * 3600)),
+            "3": _usage(99, self._at(harness, 50 * 3600)),   # SOONEST
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3, (
+            "parked on the account that returns last while a peer comes back "
+            "59h sooner"
+        )
+
+    def test_already_on_the_soonest_stays_put(self, harness):
+        """No move when we are already where the quota returns first."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 50 * 3600)),   # active, SOONEST
+            "2": _usage(99, self._at(harness, 80 * 3600)),
+            "3": _usage(99, self._at(harness, 109 * 3600)),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+        assert harness.active_number() == 1
+
+    def test_real_headroom_still_beats_a_sooner_reset(self, harness):
+        """Above the spent band the headroom axis still rules: a peer holding
+        ten points wins even though a spent one resets sooner."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(98, self._at(harness, 109 * 3600)),  # active, 2 left
+            "2": _usage(90, self._at(harness, 80 * 3600)),   # 10 left
+            "3": _usage(99, self._at(harness, 50 * 3600)),   # 1 left, soonest
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_the_flap_guard_survives_in_the_spent_band(self, harness):
+        """Ranking by reset must not reintroduce ping-pong: an account whose
+        reset is barely sooner does not qualify."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._at(harness, 50 * 3600)),        # active
+            "2": _usage(99, self._at(harness, 50 * 3600 - 60)),   # 60s sooner
+            "3": _usage(99, self._at(harness, 80 * 3600)),
+        })
+        assert outcome is not TickOutcome.SWITCHED
+
+
 class TestReviewFindings202:
     """Three defects found reviewing #202, each reproduced before fixing.
 
