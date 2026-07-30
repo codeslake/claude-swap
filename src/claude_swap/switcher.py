@@ -1884,6 +1884,8 @@ class ClaudeAccountSwitcher:
             # strike.
             return dataclasses.replace(result, consumed_fp=consumed_fp)
 
+        stashed_reason = ""
+
         def stash_successor(reason: str, note: str) -> None:
             # A consumed generation is never discarded: park the successor
             # where the next gate pass adopts it (see
@@ -1900,6 +1902,8 @@ class ClaudeAccountSwitcher:
                     ),
                 },
             )
+            nonlocal stashed_reason
+            stashed_reason = reason
             self._logger.warning(note, account_num)
 
         outcome_creds = result.credentials
@@ -1969,6 +1973,23 @@ class ClaudeAccountSwitcher:
                     "storage failure, then re-login and `cswap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
+        if stashed_reason and stashed_reason != "consume-gate-slot-removed":
+            # The successor is parked, not persisted: the slot still holds the
+            # generation whose grant we just spent. Callers read `error is
+            # None` as "the slot is freshened and safe to activate" — after a
+            # failed persist it is the opposite, and activating it installs an
+            # expired access token that can never refresh, so Claude Code logs
+            # the account out. Report transient so the caller defers; the next
+            # pass adopts the stash and succeeds normally. The credentials
+            # still ride along, so a caller that only needs a live token for
+            # THIS request keeps working.
+            #
+            # A REMOVED slot is excluded: there is nothing left to activate or
+            # retry, so deferring would only turn a completed user action into
+            # a recurring error.
+            return oauth.RefreshOutcome(
+                outcome_creds, "transient", result.token_account, consumed_fp
+            )
         return oauth.RefreshOutcome(
             outcome_creds, None, result.token_account, consumed_fp
         )
