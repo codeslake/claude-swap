@@ -96,6 +96,19 @@ RECOVERY_HYSTERESIS_S = 300.0
 # 5-hour cycle, so same-day resets keep the recovery ranking.
 RECOVERY_HORIZON_S = 4 * 3600.0
 
+# Anti-flap margin for the headroom axis past RECOVERY_HORIZON_S, as a RATIO
+# rather than percentage points. The ordinary hysteresis_pct (10 points) is
+# unmeetable here by construction — everything is within a few points of its
+# limit — so requiring it would park the engine and let it ride into the wall.
+# Requiring strictly-more was the opposite error: one point is enough to move,
+# the target burns it back, and the engine ping-pongs (measured 2026-07-30,
+# four switches in 35 minutes, each buying one point and each costing a
+# credential rewrite). A ratio is the right unit in the endgame — with two
+# points left, what matters is how many TIMES more runway the target has — and
+# it makes the move one-way: the reverse leg would need the new active to fall
+# to a quarter of the headroom it just beat.
+HORIZON_HEADROOM_RATIO = 2.0
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -1223,9 +1236,12 @@ class AutoSwitchEngine:
                         and recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
                     ):
                         continue
-                    if not recovery_useful and h <= (active_headroom or 0.0):
-                        # Headroom axis instead: only move to strictly more
-                        # quota than we hold, so this cannot flap either.
+                    if not recovery_useful and h < (
+                        (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO
+                    ):
+                        # Headroom axis instead, with its own anti-flap margin:
+                        # a target must hold HORIZON_HEADROOM_RATIO times what
+                        # we do, so the reverse move can never qualify.
                         continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
