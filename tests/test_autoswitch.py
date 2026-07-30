@@ -3299,20 +3299,10 @@ class TestEveryAccountAboveThreshold:
 class TestRecoveryHorizon:
     """The recovery escape must not spend real headroom on a distant reset.
 
-    #202 introduced "when everything is above the threshold, go where quota
-    returns first". Its evidence was minutes-scale — the measured case had a
-    peer whose 5-hour window reset in 8 minutes, and trading 9 points of
-    headroom for an 8-minute wait is obviously right.
-
-    The rule shipped with no horizon bound, so it applies identically when
-    every reset is DAYS away. Measured live: active 91% (7d resets in 109h),
-    peers 94%/80h and 98%/50h. The engine moved from 9 points of headroom to
-    2 — but nothing comes back today either way, so those 9 points were the
-    only resource that could still do work. The user switched back by hand.
-
-    Past HORIZON, ranking returns to headroom: when no candidate can resume
-    within a working session, "soonest" stops being a benefit worth paying
-    for and how much quota is left is what decides whether work continues.
+    #202's rule ("go where quota returns first") was measured on minutes-scale
+    resets and shipped with no upper bound, so it applied identically days
+    out — measured live, 9 points of headroom traded for 2 on a reset nobody
+    reaches today. Past the horizon, ranking returns to headroom.
     """
 
     def _at(self, harness, seconds: float) -> str:
