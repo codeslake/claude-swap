@@ -9454,10 +9454,10 @@ class TestActiveSlotStrikeParity:
                      struck_fp=oauth.credential_fingerprint(dead_backup))},
             identities,
         )
-        # active slot: info[5] is the LIVE credential (different lineage)
-        info_by_num = {"2": (2, "b@example.com", "", "", True, live, "")}
+        # active slot: the stored source is the LIVE credential (different
+        # lineage from the backup the strike is bound to)
         entry = s._usage_store.entries(identities, [])["2"]
-        assert s._entry_token_dead(entry, "2", info_by_num), (
+        assert s._entry_token_dead(entry, "2", "b@example.com", live, True), (
             "backup-bound strike must hold while the backup still stores "
             "the condemned generation"
         )
@@ -9482,9 +9482,10 @@ class TestActiveSlotStrikeParity:
             {"2": FR(error="invalid_grant", struck_fp="sha256:deadbeef")},
             identities,
         )
-        info_by_num = {"2": (2, "b@example.com", "", "", False, replaced, "")}
         entry = s._usage_store.entries(identities, [])["2"]
-        assert not s._entry_token_dead(entry, "2", info_by_num)
+        assert not s._entry_token_dead(
+            entry, "2", "b@example.com", replaced, False
+        )
 
     def test_active_path_refuses_consume_under_securestorage_env(
         self, temp_home: Path, mock_claude_config: Path,
