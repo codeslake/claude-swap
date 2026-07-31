@@ -56,6 +56,8 @@ from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+# Held for the lifetime of a LIVE engine; a second one starts dry-run.
+LIVE_LOCK_FILENAME = ".auto-live.lock"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -512,6 +514,25 @@ class AutoSwitchEngine:
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
+        # Only one LIVE engine per machine. Two of them race: the state lock
+        # in _perform serializes the *write*, but at-limit and failover skip
+        # the cooldown entirely, so both engines decide independently and the
+        # second switches away from what the first just chose. Demote the
+        # loser to dry-run rather than refuse to start — a second TUI must
+        # still show its dashboard, and a TUI that only errors teaches
+        # nothing about which instance owns the engine.
+        self._live_lock: FileLock | None = None
+        self.demoted_from_live = False
+        if not self.dry_run:
+            lock = FileLock(switcher.backup_dir / LIVE_LOCK_FILENAME, timeout=0)
+            if lock.acquire():
+                self._live_lock = lock
+            else:
+                # flock lives on the open file description, so a holder that
+                # dies (kill -9, crashed TUI) releases it with no stale-pid
+                # cleanup of ours.
+                self.dry_run = True
+                self.demoted_from_live = True
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
@@ -532,6 +553,28 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        self._demotion_announced = not self.demoted_from_live
+
+    def _announce_demotion(self) -> None:
+        """Say once, on the first tick, that this engine lost the LIVE lock.
+
+        Not from ``__init__``: the frontend installs its event sink after
+        construction (Textual also refuses a ``call_from_thread`` from the
+        thread that built the app), so a constructor emit reaches nobody.
+        On ``tick`` rather than ``run_loop`` because ``cswap auto --once``
+        never enters the loop — a cron tick that demoted itself must still
+        say so.
+        """
+        if self._demotion_announced:
+            return
+        self._demotion_announced = True
+        self._emit(
+            ConfigWarningEvent(
+                message="another LIVE auto-switch engine is already running "
+                        "on this machine — this one is watching only "
+                        "(dry-run)"
+            )
+        )
 
     # -- state file ---------------------------------------------------------
 
@@ -714,6 +757,7 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        self._announce_demotion()
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -1537,9 +1581,19 @@ class AutoSwitchEngine:
     def stop(self) -> None:
         """Ask ``run_loop`` to exit; wakes it from any sleep. Safe to call
         before the loop starts — the stop is never cleared, so the loop
-        exits immediately (engines are single-use)."""
+        exits immediately (engines are single-use).
+
+        Releases the LIVE lock here, not in ``run_loop``: the TUI's own
+        dry-run/LIVE toggle stops one engine and constructs the next in the
+        same call, and a lock freed only by the exiting worker thread would
+        still be held when the successor tries to claim it — this instance
+        would demote itself.
+        """
         self._stop.set()
         self._wake.set()
+        if self._live_lock is not None:
+            self._live_lock.release()
+            self._live_lock = None
 
     def wake(self) -> None:
         """Cut the current inter-tick sleep short and tick now."""

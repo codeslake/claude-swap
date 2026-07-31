@@ -223,6 +223,10 @@ class AutoScreen(Screen):
             dry_run=dry_run,
         )
         self._engine = engine
+        # A LIVE request the engine could not honor: another LIVE engine holds
+        # the machine's lock. Report what actually started, not what was asked
+        # for — the badge reads engine.dry_run, so it is already right.
+        dry_run = engine.dry_run
         self.run_worker(
             engine.run_loop,
             thread=True,
