@@ -1238,7 +1238,13 @@ class TestQuarantineLifecycle:
     def test_quarantine_persists_across_engine_instances(self, harness):
         harness.engine._quarantine("2", "b@example.com", "invalid_grant")
         harness.events.clear()
+        # "Across instances" means a restart: the old engine is gone before
+        # the new one exists. Stopping it releases the LIVE lock, so the
+        # successor comes up LIVE — a fresh engine that silently demoted
+        # itself would prove nothing about quarantine persistence.
+        harness.engine.stop()
         fresh_engine = harness._make_engine()
+        assert not fresh_engine.dry_run
         usage = {"1": _usage(95), "2": _usage(0), "3": _usage(50)}
         with patch.object(
             harness.switcher,
@@ -2161,9 +2167,20 @@ class TestConsumeFirstStrategy:
         loser engine through _perform with a stale pre-lock read and a usage
         view that ranks a different target, and assert it backs off instead of
         double-switching inside the cooldown window.
+
+        The LIVE lock makes a second *LIVE* engine impossible, so this
+        defends the layer under it: the state lock is what serializes a
+        winner against any engine that reached _perform on a stale read.
+        Construct the loser with the lock already released, then re-take it
+        for the winner — the two are concurrent from _perform's point of
+        view, which is the only view this test is about.
         """
         h = self._harness(temp_home)  # default cooldown 300s
+        h.engine.stop()               # free the LIVE lock for the loser
         loser = h._make_engine()
+        assert not loser.dry_run      # a demoted loser would never reach _perform
+        loser.stop()
+        h.engine = h._make_engine()   # winner retakes the lock
         # Winner: 1 -> 2 (soonest reset), records lastSwitchAt.
         h.tick_with_usage({
             "1": _usage7(20, 20, _R_LATER),
@@ -2451,3 +2468,95 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestLiveLock:
+    """Only one LIVE engine per machine.
+
+    The hazard this closes: `_perform`'s state lock serializes the *write*,
+    but the at-limit and failover triggers skip the cooldown check entirely
+    (see `_perform`: only proactive/consume-first consult `_in_cooldown`), so
+    two LIVE engines both decide to switch and the second undoes the first's
+    choice. Measured in the field with two TUIs on one machine.
+    """
+
+    def test_second_live_engine_demotes_to_dry_run(self, harness):
+        second = harness._make_engine()
+        assert second.dry_run is True
+        assert second.demoted_from_live is True
+        # The winner is untouched.
+        assert harness.engine.dry_run is False
+
+    def test_a_demoted_engine_does_not_switch(self, harness):
+        second = harness._make_engine()
+        events: list = []
+        second.on_event = events.append
+        with patch.object(
+            harness.switcher,
+            "usage_entries_by_account",
+            return_value={
+                num: _entry_for(value, harness.clock.now)
+                for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+            },
+        ):
+            outcome = second.tick()
+        assert outcome is TickOutcome.SWITCHED     # it *decided* to switch
+        assert harness.active_number() == 1        # but changed nothing
+        assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
+
+    def test_demotion_is_announced_once(self, harness):
+        second = harness._make_engine()
+        events: list = []
+        second.on_event = events.append
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in {"1": _usage(10), "2": _usage(10)}.items()
+        }
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            second.tick()
+            second.tick()
+        warnings = [e for e in events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1
+        assert "already running" in warnings[0].message
+
+    def test_an_explicit_dry_run_engine_never_takes_the_lock(self, temp_home):
+        """A dry-run engine must not lock out the LIVE one — otherwise a
+        watching TUI would demote the engine that does the work."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.engine.stop()
+        watcher = h._make_engine(dry_run=True)
+        assert watcher.dry_run is True
+        assert watcher.demoted_from_live is False
+        live = h._make_engine()
+        assert live.dry_run is False               # the lock was free
+
+    def test_stop_releases_the_lock_for_the_next_engine(self, harness):
+        """The TUI's LIVE/dry-run toggle stops one engine and builds the next
+        in the same call; a lock released only by the exiting worker thread
+        would make the TUI demote itself."""
+        harness.engine.stop()
+        successor = harness._make_engine()
+        assert successor.dry_run is False
+        assert successor.demoted_from_live is False
+
+    def test_the_lock_is_cross_process(self, harness, tmp_path):
+        """flock, not a pid file: the guard has to hold against a separate
+        process, which is the actual two-TUI shape."""
+        import subprocess
+        import sys
+        import textwrap
+
+        lock_path = harness.switcher.backup_dir / ".auto-live.lock"
+        assert lock_path.exists()                  # the winner holds it
+        code = textwrap.dedent(f"""
+            from pathlib import Path
+            from claude_swap.locking import FileLock
+            print(FileLock(Path({str(lock_path)!r}), timeout=0).acquire())
+        """)
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+        assert out.stdout.strip() == "False", out.stderr
