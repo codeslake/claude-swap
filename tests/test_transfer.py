@@ -1563,6 +1563,34 @@ class TestImportClearsDeadTokenQuarantine:
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_HEALED"
 
+    def test_the_heal_finds_the_row_of_an_org_scoped_account(
+        self, temp_home: Path, capsys
+    ):
+        """Every real account carries an organizationUuid.
+
+        _slot_token_dead looked its usage row up with ident={num: (email, "")}.
+        UsageStore._matches requires organizationUuid to be EQUAL, so for any
+        account whose row carries a real org — which is all of them, checked on
+        the live store: three slots, three non-empty uuids — the lookup returns
+        nothing, token_dead() is False, and the import auto-heal it feeds never
+        fires. The slot the user was told to fix with `cswap import` gets
+        "already exists, use --force" instead.
+
+        The previous shape passed entry["org_uuid"] straight through, so this
+        was introduced by routing the check through the shared helper.
+        """
+        s = _linux_switcher(temp_home)
+        ORG = "org-uuid-1234"
+        _seed_account(s, 2, "bob@example.com", org_uuid=ORG)
+        ident = {"2": ("bob@example.com", ORG)}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        assert s._slot_token_dead("2", "bob@example.com"), (
+            "the row lookup passes an empty organizationUuid, so an "
+            "org-scoped account's quarantine is invisible to the import heal"
+        )
+
     def test_import_heals_an_active_slot_struck_on_its_live_generation(
         self, temp_home: Path, capsys
     ):
