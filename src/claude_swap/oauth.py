@@ -175,13 +175,12 @@ def try_refresh_oauth_credentials(
                 err = json.loads(body).get("error")
             except (ValueError, AttributeError):
                 err = None
-            if err == "invalid_grant":
-                return RefreshOutcome(None, "invalid_grant")
-            if err == "invalid_client":
-                # OUR client credential is rejected — a systemic condition
-                # (client_id rotated/blocked), not evidence any slot's
-                # refresh token is dead. Distinct kind so no strike lands.
-                return RefreshOutcome(None, "invalid_client")
+            # invalid_grant: this slot's refresh lineage is dead.
+            # invalid_client: OUR client credential was rejected — systemic
+            # (client_id rotated/blocked), no evidence about any slot, so it
+            # keeps its own kind and lands no strike.
+            if err in ("invalid_grant", "invalid_client"):
+                return RefreshOutcome(None, err)
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
