@@ -1334,6 +1334,15 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
+            # A stopped engine must not act. stop() only asks the loop to
+            # exit — a tick already in flight runs to completion, and every
+            # caller (the TUI's LIVE/dry-run toggle, leaving the screen)
+            # constructs the successor right after. Checked under the lock,
+            # so the successor cannot switch between this test and ours.
+            if self._stop.is_set():
+                self._emit(NoSwitchEvent(reason="engine-stopped"))
+                return TickOutcome.NO_ACTION
+
             result = self.switcher.switch_to(number, json_output=True)
             if not result or not result.get("switched"):
                 self._emit(

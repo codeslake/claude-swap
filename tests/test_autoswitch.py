@@ -2560,3 +2560,41 @@ class TestLiveLock:
             [sys.executable, "-c", code], capture_output=True, text=True
         )
         assert out.stdout.strip() == "False", out.stderr
+
+
+class TestStoppedEngineDoesNotAct:
+    """A stopped engine must not switch, even mid-tick.
+
+    ``stop()`` only asks the loop to exit; a tick already in flight runs to
+    completion (Textual's ``run_worker`` is not exclusive, so the old worker
+    is never cancelled). Every ``stop()`` caller constructs the successor
+    immediately afterwards — ``_restart_engine`` and ``on_unmount`` +
+    ``on_mount`` — so without this the predecessor can switch while the
+    successor is LIVE, which is the two-engine race the lock exists to stop.
+    """
+
+    def test_a_stopped_engine_does_not_switch(self, harness):
+        harness.engine.stop()
+        outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(5)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+    def test_stopping_mid_tick_aborts_the_switch(self, harness):
+        """The real shape: the tick has already decided and is entering
+        _perform when the user toggles the mode or leaves the screen."""
+        real_lock = harness.engine._state_lock
+
+        def stop_then_lock(*a, **kw):
+            harness.engine.stop()          # the user toggles / leaves the screen
+            return real_lock(*a, **kw)
+
+        with patch.object(
+            harness.engine, "_state_lock", side_effect=stop_then_lock
+        ):
+            with patch.object(harness.switcher, "switch_to") as sw:
+                outcome = harness.tick_with_usage(
+                    {"1": _usage(95), "2": _usage(5)}
+                )
+        sw.assert_not_called()
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
