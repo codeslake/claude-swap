@@ -4018,7 +4018,8 @@ class ClaudeAccountSwitcher:
             if num in sentinels:
                 continue
             entry = entries[num]
-            if self._entry_token_dead(entry, num, info_by_num):
+            _i = info_by_num[num]
+            if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
@@ -4090,7 +4091,10 @@ class ClaudeAccountSwitcher:
             # so surface "re-login needed" in *this* pass instead of leaving the
             # slot looking merely refresh-failed until the next refresh notices.
             for num in accepted:
-                if self._entry_token_dead(entries[num], num, info_by_num):
+                _i = info_by_num[num]
+                if self._entry_token_dead(
+                    entries[num], num, _i[1], _i[5], _i[4]
+                ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
         return {
@@ -4118,22 +4122,22 @@ class ClaudeAccountSwitcher:
         if entry is None:
             return False
         is_active = num == self.current_account_number()
-        # info[5] mirrors _build_accounts_info: the LIVE credential for the
-        # active slot, the backup otherwise. _entry_token_dead reads the
-        # backup itself for the active case.
-        creds = (
+        # The stored source, as _build_accounts_info reports it: the LIVE
+        # credential for the active slot, the backup otherwise.
+        stored = (
             (self._store._read_active_credentials().value or "")
             if is_active
             else (self._read_account_credentials(num, email) or "")
         )
-        info_by_num = {num: (num, email, None, None, is_active, creds, None)}
-        return self._entry_token_dead(entry, num, info_by_num)
+        return self._entry_token_dead(entry, num, email, stored, is_active)
 
     def _entry_token_dead(
         self,
         entry: UsageEntry,
         num: str,
-        info_by_num: dict[str, tuple],
+        email: str,
+        stored: str,
+        is_active: bool,
     ) -> bool:
         """Fingerprint-bound dead verdict against EVERY stored source.
 
@@ -4146,14 +4150,11 @@ class ClaudeAccountSwitcher:
         loop that keeps a dead backup out of quarantine forever. The strike
         holds while ANY stored source still matches the struck generation.
         """
-        info = info_by_num[num]
-        if entry.token_dead(
-            stored_fp=oauth.credential_fingerprint(info[5])
-        ):
+        if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
             return True
-        if not info[4]:  # info[4] = is_active
+        if not is_active:
             return False
-        backup = self._read_account_credentials(num, info[1])
+        backup = self._read_account_credentials(num, email)
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )
