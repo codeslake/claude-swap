@@ -1775,6 +1775,48 @@ class TestAutoStartLive:
         from claude_swap.settings import load_settings
         assert load_settings(tmp_path).auto_start_live is False
 
+    def test_a_demoted_go_live_is_not_persisted_as_live(self, tmp_path):
+        """Consent records what the engine BECAME, not what was asked for.
+
+        Another LIVE engine holding the machine lock demotes this one to
+        dry-run. Persisting `true` anyway would make every later launch
+        auto-enter a "LIVE" the user never actually got.
+        """
+        from unittest.mock import MagicMock
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.autoview import AutoScreen
+
+        view = AutoScreen.__new__(AutoScreen)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        demoted = MagicMock()
+        demoted.dry_run = True                      # the lock was already held
+
+        def restart(*, dry_run):
+            view._engine = demoted
+
+        view._restart_engine = restart
+        AutoScreen._on_live_confirm(view, True)
+        assert persisted == [False]
+        assert load_settings(tmp_path).auto_start_live is False
+
+    def test_a_granted_go_live_is_persisted(self, tmp_path):
+        from unittest.mock import MagicMock
+        from claude_swap.tui.autoview import AutoScreen
+
+        view = AutoScreen.__new__(AutoScreen)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        live = MagicMock()
+        live.dry_run = False
+
+        def restart(*, dry_run):
+            view._engine = live
+
+        view._restart_engine = restart
+        AutoScreen._on_live_confirm(view, True)
+        assert persisted == [True]
+
 
 class TestCloudPinBadge:
     """The pinned account must be visible on the account list itself.
