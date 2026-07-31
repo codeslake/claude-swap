@@ -280,8 +280,14 @@ class AutoScreen(Screen):
 
     def _on_live_confirm(self, confirmed: bool | None) -> None:
         if confirmed:
-            self._persist_auto_start_live(True)
+            # Persist AFTER the engine reports what it actually became: a
+            # demotion (another LIVE holder) would otherwise record consent
+            # for a LIVE that never ran, and every later launch would
+            # auto-enter a "LIVE" the user never got.
             self._restart_engine(dry_run=False)
+            self._persist_auto_start_live(
+                self._engine is not None and not self._engine.dry_run
+            )
 
     def _persist_auto_start_live(self, live: bool) -> None:
         """Remember the confirmed mode so a restarted TUI resumes it."""
