@@ -4117,7 +4117,16 @@ class ClaudeAccountSwitcher:
         live generation unhealable, and that is the slot most likely to be
         quarantined in the first place.
         """
-        ident = {num: (email, "")}
+        # The org uuid is part of the row identity (UsageStore._matches
+        # compares it for EQUALITY), so an empty one silently matches nothing:
+        # every real account carries a non-empty org, and the lookup would
+        # return a blank entry whose token_dead() is always False.
+        data = self._get_sequence_data() or {}
+        org = (
+            (data.get("accounts", {}).get(num) or {})
+            .get("organizationUuid", "") or ""
+        )
+        ident = {num: (email, org)}
         entry = self._usage_store.entries(ident).get(num)
         if entry is None:
             return False
