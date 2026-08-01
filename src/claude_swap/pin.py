@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 from types import ModuleType
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -47,7 +46,6 @@ def _impl() -> ModuleType:
     when the real cause is, say, a missing ``cryptography``. A failure raised
     from inside a module that IS present propagates unchanged.
     """
-    import importlib
     import importlib.util
 
     try:
@@ -57,16 +55,6 @@ def _impl() -> ModuleType:
     if not found:
         raise ClaudeSwitchError(_INSTALL_HINT)
     return importlib.import_module("cswap_pin.proxy")
-
-
-def is_available() -> bool:
-    """Whether the pin can be used. For callers deciding whether to OFFER it
-    (a TUI row, a status line) rather than to use it."""
-    try:
-        _impl()
-    except ClaudeSwitchError:
-        return False
-    return True
 
 
 # -- launch integration ------------------------------------------------------
@@ -79,12 +67,21 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     installed, or when the proxy cannot be started: an optional feature must
     never be able to block a launch.
     """
+    # ONE guard around everything, including _impl(). A split try left the
+    # resolution step uncovered, so anything raised there — a broken
+    # cryptography, a corrupt install — propagated out of a launch. Measured:
+    # the launch died instead of starting unpinned.
     try:
         pin = _impl()
     except ClaudeSwitchError:
         # Not installed. A wiring a previous install left behind would
         # otherwise outlive it — see clear_wiring.
-        clear_wiring()
+        try:
+            clear_wiring()
+        except Exception:  # noqa: BLE001
+            pass
+        return env
+    except Exception:  # noqa: BLE001 — never block the launch
         return env
     try:
         pinned = pin.ensure_proxy(switcher)
@@ -160,20 +157,11 @@ def clear_wiring() -> bool:
         # ``primaryApiKey`` and inline MCP credentials, and a plain write takes
         # the umask (022 on a default install), which rename then publishes.
         tmp = path.with_suffix(".cswap-tmp")
-        mode = 0o600
-        try:
-            current = stat.S_IMODE(path.stat().st_mode)
-            if not current & 0o077:
-                mode = current  # already stricter — do not relax it
-        except OSError:
-            pass
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.write(fd, json.dumps(raw, indent=2).encode("utf-8"))
         finally:
             os.close(fd)
-        if mode != 0o600:
-            os.chmod(tmp, mode)
         os.replace(tmp, path)
     except OSError:
         return False
