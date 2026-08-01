@@ -109,24 +109,21 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         return env
     try:
         pinned = pin.ensure_proxy(switcher)
-        if not pinned:
-            # No pin this launch. Clear a wiring left pointing at a proxy that
-            # is no longer there, or the session dials a dead port.
-            pin.unwire_if_dead(switcher.backup_dir / "pin-proxy")
-            return env
-        port, ca_path = pinned
-        return pin.wire_env(env, port, ca_path)
+        if pinned:
+            port, ca_path = pinned
+            return pin.wire_env(env, port, ca_path)
     except Exception:  # noqa: BLE001 — never block the launch
-        # ensure_proxy RAISING (port bind failure, unwritable cert dir) left no
-        # cleanup, while ensure_proxy returning None got unwire_if_dead. Both
-        # mean no proxy this launch, and .claude.json's env block is applied at
-        # boot — so without this the child inherits a previous launch's wiring
-        # and dials the proxy that just failed to start.
-        try:
-            pin.unwire_if_dead(switcher.backup_dir / "pin-proxy")
-        except Exception:  # noqa: BLE001
-            pass
-        return env
+        pass
+    # No proxy this launch, whether ensure_proxy said so or died saying it.
+    # .claude.json's env block is applied at boot, so a wiring a previous
+    # launch left behind would send this child at a port nothing answers.
+    # ONE tail, not one per branch: duplicating it ran the unwire twice when
+    # the None path's own unwire raised.
+    try:
+        pin.unwire_if_dead(switcher.backup_dir / "pin-proxy")
+    except Exception:  # noqa: BLE001
+        pass
+    return env
 
 
 # -- wiring removal ----------------------------------------------------------
@@ -182,13 +179,10 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     if default != paths[0]:
         paths.append(default)
 
-    # ONE LOCK PER PATH, not one lock around both. claude_config_lock derives
-    # its lock directory from get_global_config_path(), so a single
-    # `with claude_config_lock()` around the loop guards the SESSION config
-    # while the default profile is rewritten unprotected — racing `cswap
-    # switch` and Claude Code, which is the whole-file clobber this lock
-    # exists to prevent. Measured: lock dir sess/.claude.json.lock, second
-    # path home/.claude.json.
+    # ONE LOCK PER PATH. The shared config lock derives its directory from
+    # get_global_config_path(), so a single lock around the loop guards one
+    # file and leaves the other rewritten unprotected — racing `cswap switch`
+    # and Claude Code, the whole-file clobber the lock exists to prevent.
     changed = False
     for path in paths:
         try:
