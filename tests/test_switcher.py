@@ -4994,10 +4994,15 @@ class TestSwitchSkipsBrokenSlots:
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 1
 
-    def test_switch_to_missing_credentials_actionable_error(self, temp_home: Path):
-        """switch_to a broken target raises with the new credentials message."""
-        from claude_swap.exceptions import SwitchError
+    def test_switch_to_credential_less_slot_lands_logged_out(self, temp_home: Path):
+        """An empty slot is a destination, not an error.
 
+        A roster import syncs the account LIST but never credentials, so the
+        slot you need to log into is exactly the one with nothing stored. The
+        old behaviour refused it and suggested `--add-account`, which cannot
+        help — there is nothing to add until a login exists. Now the switch
+        lands, logged out, so `/login` writes to this slot.
+        """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com", creds=False)
@@ -5016,13 +5021,52 @@ class TestSwitchSkipsBrokenSlots:
             },
         }))
 
-        with pytest.raises(SwitchError, match="has no stored credentials"):
-            s.switch_to("2")
+        result = s.switch_to("2", json_output=True)
 
-    def test_switch_to_missing_config_actionable_error(self, temp_home: Path):
-        """switch_to a target with creds but no config raises a distinct error."""
+        assert result["switched"] is True
+        assert result["needsLogin"] is True
+        assert any("logged out" in w for w in result["warnings"])
+        # The slot is now active, so a login lands here...
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+        # ...and the previous account's token is NOT still serving under it.
+        assert not (temp_home / ".claude" / ".credentials.json").exists()
+        # The login it replaced was captured first, so nothing was lost.
+        assert s._read_account_credentials("1", "a@example.com")
+
+    def test_locked_keychain_is_not_mistaken_for_an_empty_slot(
+        self, temp_home: Path
+    ):
+        """macOS: an unreadable Keychain reports "no credentials" too.
+
+        Landing logged-out on that guess would destroy a working login to
+        reach a slot whose backup was never actually missing — and on macOS
+        the live credential lives in the same Keychain, so it is not
+        recoverable from disk. Refuse instead, and keep the live login.
+        """
         from claude_swap.exceptions import SwitchError
 
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        live_creds = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live-1", "refreshToken": "rt-live-1"},
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(live_creds)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-1"},
+        }))
+
+        s.platform = Platform.MACOS
+        s._keychain_usable_cache = False        # locked / no GUI session
+        with pytest.raises(SwitchError, match="Keychain"):
+            s.switch_to("2")
+
+        # Nothing moved: still on 1, still logged in.
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        assert (temp_home / ".claude" / ".credentials.json").exists()
+
+    def test_switch_to_slot_missing_only_config_also_lands(self, temp_home: Path):
+        """Same rule when the config backup is the missing half."""
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com", config=False)
@@ -5041,8 +5085,11 @@ class TestSwitchSkipsBrokenSlots:
             },
         }))
 
-        with pytest.raises(SwitchError, match="has no stored config backup"):
-            s.switch_to("2")
+        result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is True
+        assert result["needsLogin"] is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
 
     def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
         """No live session — picks first switchable slot if the recorded

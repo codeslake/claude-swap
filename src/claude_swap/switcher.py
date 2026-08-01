@@ -4655,7 +4655,7 @@ class ClaudeAccountSwitcher:
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
             "from": from_ref,
@@ -4665,6 +4665,17 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if op.get("needsLogin"):
+            # Landing on a slot with no stored login leaves the machine logged
+            # out on purpose; callers (TUI, --json consumers) need to say so
+            # rather than report a plain success.
+            result["needsLogin"] = True
+            result["reason"] = "switched-needs-login"
+            result["message"] = (
+                f"Switched to Account-{to_ref['number']} ({to_ref['email']}) "
+                f"— no stored login; run /login"
+            )
+        return result
 
     def _switch_noop(
         self,
@@ -5538,6 +5549,64 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _switch_to_empty_slot(
+        self,
+        target_account: str,
+        target_email: str,
+        from_ref: dict | None,
+        to_ref: dict,
+        data: dict,
+    ) -> dict:
+        """Land on a slot that has no stored login, logged out.
+
+        An empty slot is a destination, not an error. It is what a roster
+        import leaves behind — the account LIST syncs across machines,
+        credentials deliberately do not — and the only way to fill one is to
+        be ON it and log in, because Claude Code writes a new login to
+        whichever account is active. Refusing made the one slot you needed to
+        reach the one slot you could not, and the `--add-account` the error
+        suggested cannot help either: there is nothing to add until a login
+        exists.
+
+        The live credential is cleared rather than left in place. Leaving it
+        would keep serving the PREVIOUS account's token while the active slot
+        number says otherwise — an active slot that lies about whose quota is
+        burning is worse than being logged out. The caller has already backed
+        that credential up, so nothing is lost.
+        """
+        self._store._clear_oauth_credential()
+        data["activeAccountNumber"] = int(target_account)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(
+            f"Switched to empty account {target_account} ({target_email}) — "
+            f"logged out, awaiting login"
+        )
+        return {
+            "switched": True,
+            "from": from_ref,
+            "to": to_ref,
+            "needsLogin": True,
+            "warnings": [
+                f"Account-{target_account} has no stored credentials — you "
+                f"are now logged out. Run /login in Claude Code, then "
+                f"`cswap add` to capture it into this slot."
+            ],
+        }
+
+    def _keychain_blind(self) -> bool:
+        """macOS cannot read the Keychain right now (locked / no GUI session).
+
+        Distinguishing this from a genuinely empty slot matters before any
+        logout: both report "no credentials", but here the backup is fine and
+        clearing the live login would log the user out of a working account
+        to reach one that was never actually empty.
+        """
+        return (
+            self.platform == Platform.MACOS
+            and self._store._keychain_usable_cache is False
+        )
+
     def _perform_switch(
         self,
         target_account: str,
@@ -5643,31 +5712,17 @@ class ClaudeAccountSwitcher:
                 target_creds = self._read_account_credentials(
                     target_account, target_email
                 )
-                backup_unreadable = (
-                    not target_creds
-                    and self.platform == Platform.MACOS
-                    and self._store._keychain_usable_cache is False
-                )
                 target_config = self._read_account_config(target_account, target_email)
-                if not target_creds:
-                    if backup_unreadable:
-                        # The backup may exist but the Keychain cannot be
-                        # read right now (locked / non-GUI session) — a
-                        # re-add would needlessly burn the stored grant.
-                        raise SwitchError(
-                            f"Account-{target_account}'s backup is in the "
-                            f"macOS Keychain but it is unreadable right now "
-                            f"(locked or no GUI session). Retry from a GUI "
-                            f"terminal; do not re-add."
-                        )
+                if (not target_creds or not target_config) and self._keychain_blind():
                     raise SwitchError(
-                        f"Account-{target_account} has no stored credentials. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
+                        f"Account-{target_account}'s backup is in the macOS "
+                        f"Keychain but it is unreadable right now (locked or "
+                        f"no GUI session). Retry from a GUI terminal; do not "
+                        f"re-add."
                     )
-                if not target_config:
-                    raise SwitchError(
-                        f"Account-{target_account} has no stored config backup. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
+                if not target_creds or not target_config:
+                    return self._switch_to_empty_slot(
+                        target_account, target_email, from_ref, to_ref, data
                     )
                 try:
                     target_config_data = json.loads(target_config)
@@ -5985,15 +6040,18 @@ class ClaudeAccountSwitcher:
                 )
                 target_config = self._read_account_config(target_account, target_email)
 
-                if not target_creds:
+                if (not target_creds or not target_config) and self._keychain_blind():
                     raise SwitchError(
-                        f"Account-{target_account} has no stored credentials. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
+                        f"Account-{target_account}'s backup is in the macOS "
+                        f"Keychain but it is unreadable right now (locked or "
+                        f"no GUI session). Retry from a GUI terminal; do not "
+                        f"re-add."
                     )
-                if not target_config:
-                    raise SwitchError(
-                        f"Account-{target_account} has no stored config backup. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
+                if not target_creds or not target_config:
+                    # Step 1 already backed the current login up, so clearing
+                    # it here loses nothing.
+                    return self._switch_to_empty_slot(
+                        target_account, target_email, from_ref, to_ref, data
                     )
 
                 # Step 3: Activate target account - credentials
