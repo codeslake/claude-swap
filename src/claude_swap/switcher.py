@@ -2038,13 +2038,10 @@ class ClaudeAccountSwitcher:
                     "successor stashed for the next pass.",
                 )
             except Exception:
-                # BOTH the persist and the stash failed. stash_successor sets
-                # stashed_reason AFTER its write, so a raising write left it
-                # empty, the guard below did not fire, and the gate returned
-                # error=None on a SPENT grant with nothing stashed —
-                # `_freshen_target` read that as "ok" and the engine switched
-                # onto a slot whose credential can never refresh. Measured:
-                # OUT error=None, STORE still OLD, STASH {}.
+                # Both the persist and the stash failed. stash_successor sets
+                # stashed_reason after its write, so a raising write left it
+                # empty and the guard below reported success on a spent grant
+                # with nothing stashed.
                 stashed_reason = "consume-gate-unpersisted"
                 self._logger.error(
                     "Account %s's consumed successor could not be persisted "
