@@ -181,9 +181,16 @@ class DashboardScreen(Screen):
 
     def _pin_entries(self) -> MenuEntries:
         """One row per account (→ pin the claude.ai surface to it), plus clear."""
-        from claude_swap.pin_proxy import load_pin
+        from claude_swap import pin_optional
 
-        pin = load_pin(self.app.switcher.backup_dir)
+        pin_proxy = pin_optional.load()
+        if pin_proxy is None:
+            # The pin ships as a separate package. Without it there is nothing
+            # to pin TO, and offering rows that cannot work is worse than
+            # saying so — the row is unselectable, not missing, so the feature
+            # stays discoverable.
+            return [("the pin package is not installed", "")]
+        pin = pin_proxy.load_pin(self.app.switcher.backup_dir)
         snap = self.app.snapshot
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
@@ -263,10 +270,15 @@ class DashboardScreen(Screen):
         elif action_id == "pin-menu":
             await self._push_menu("cloud account", self._pin_entries())
         elif action_id.startswith("pin:"):
-            from claude_swap.pin_proxy import (
-                apply_pin,
-                live_remote_control_sessions,
-            )
+            from claude_swap import pin_optional
+
+            pin_proxy = pin_optional.load()
+            if pin_proxy is None:
+                app.notify("The pin package is not installed")
+                await self._pop_menu()
+                return
+            apply_pin = pin_proxy.apply_pin
+            live_remote_control_sessions = pin_proxy.live_remote_control_sessions
 
             target = action_id.split(":", 1)[1]
             snap = app.snapshot

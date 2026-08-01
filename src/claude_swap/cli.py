@@ -229,8 +229,14 @@ def _pin_env_command(argv: list[str]) -> None:
     active account, or the pinned account is gone — so it's always safe to
     eval unconditionally.
     """
-    from claude_swap import pin_proxy
+    from claude_swap import pin_optional
 
+    # Emitting nothing is already this command's contract for "no pin", and an
+    # uninstalled pin package is exactly that case. A shell evals this on every
+    # startup, so it must never raise.
+    pin_proxy = pin_optional.load()
+    if pin_proxy is None:
+        return
     try:
         switcher = ClaudeAccountSwitcher()
         pinned = pin_proxy.ensure_proxy(switcher)
@@ -304,7 +310,10 @@ Examples:
         # safe to run constantly: it returns immediately when the pin is either
         # absent or already serving, and rebinds the RECORDED port so live
         # sessions reconnect where they already point — no session restart.
-        from claude_swap import pin_proxy
+        from claude_swap import pin_optional
+        pin_proxy = pin_optional.load()
+        if pin_proxy is None:
+            return  # nothing installed to heal; the status line must stay quiet
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         # Silent by design: the caller is a status line on a timer, and its
         # stdout is not a place for chatter. The restart is observable where it
@@ -312,11 +321,21 @@ Examples:
         pin_proxy.heal(switcher.backup_dir)
         return
 
-    from claude_swap.pin_proxy import (
-        apply_pin,
-        live_remote_control_sessions,
-        load_pin,
-    )
+    from claude_swap import pin_optional
+
+    # The one place that must SPEAK when the pin is missing: the user typed
+    # `cswap pin` on purpose. The others (pin-env, --heal) are automatic and
+    # stay silent.
+    _pin = pin_optional.load()
+    if _pin is None:
+        error(
+            "The cloud pin ships as a separate package. "
+            "Install it with: pip install 'claude-swap[pin]'"
+        )
+        sys.exit(1)
+    apply_pin = _pin.apply_pin
+    live_remote_control_sessions = _pin.live_remote_control_sessions
+    load_pin = _pin.load_pin
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -345,9 +364,9 @@ Examples:
         # neither identify the population nor answer who is actually routed
         # through the pin. A wrong number is worse than none — 211 reads as
         # catastrophic and would stop the fix from ever being applied.
-        from claude_swap.pin_proxy import proxy_secret_path
-
-        _will_arm = not proxy_secret_path(switcher.backup_dir / "pin-proxy").exists()
+        _will_arm = not _pin.proxy_secret_path(
+            switcher.backup_dir / "pin-proxy"
+        ).exists()
         # Saves the pin, starts the proxy, and records it where Claude Code
         # reads env at startup — so a `claude` launched by hand is pinned too,
         # with no settings.json edit, no shell rc, and no shim on PATH.

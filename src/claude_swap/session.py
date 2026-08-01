@@ -48,7 +48,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from claude_swap import macos_keychain, pin_proxy
+from claude_swap import macos_keychain, pin_optional
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import (
     ClaudeCodeLockTimeout,
@@ -470,14 +470,17 @@ class SessionManager:
         Every launch path (run, its same-account fast path, exec_default)
         funnels through here, so this is also where a remote-control pin
         (see pin_proxy) routes the child through the pin proxy. A pin
-        failure must never block a launch — degrade to a plain exec.
+        failure must never block a launch — degrade to a plain exec, which is
+        also what happens when the pin is not INSTALLED: it is an optional
+        package (see ``pin_optional``), and a launch must not depend on it.
         """
         try:
-            pinned = pin_proxy.ensure_proxy(self.switcher)
+            pin_proxy = pin_optional.load()
+            pinned = pin_proxy.ensure_proxy(self.switcher) if pin_proxy else None
             if pinned:
                 port, ca_path = pinned
                 env = pin_proxy.wire_env(env, port, ca_path)
-            else:
+            elif pin_proxy:
                 # No pin this launch. If a previous one left the global config
                 # pointing at a proxy that is no longer there, clear it now —
                 # Claude Code applies that env block at boot, so a stale entry
