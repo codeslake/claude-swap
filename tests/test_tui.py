@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import json
 import sys
+import types
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -2046,3 +2047,50 @@ class TestCloudPinBadgeOnMiniLine:
 
         line = mini_account_text(make_account(1), time.time()).plain
         assert "cloud" not in line
+
+class TestPinnedEmailImportGuard:
+    """A broken pin_proxy import must cost the BADGE, never the whole view.
+
+    pin_proxy imports `cryptography` at module scope, so an environment that
+    loses it raises at IMPORT time. Measured on work-mac: the package vanished
+    from the uv tool env and _on_snapshot -> _candidates_text -> _pinned_email
+    crashed the auto view outright with ModuleNotFoundError. The try/except was
+    already there; the import just sat above it, so it guarded the call and not
+    the thing the call depends on.
+    """
+
+    def _call(self):
+        """Invoke _pinned_email against a stub `self`.
+
+        AutoScreen.app is a read-only Textual property, so the method is called
+        unbound with a stand-in rather than by constructing a screen — this
+        tests the guard, which needs no Textual runtime.
+        """
+        from claude_swap.tui.autoview import AutoScreen
+        stub = types.SimpleNamespace(
+            app=types.SimpleNamespace(
+                switcher=types.SimpleNamespace(backup_dir="/nonexistent")
+            )
+        )
+        return AutoScreen._pinned_email(stub)
+
+    def test_import_failure_returns_none_instead_of_raising(self, monkeypatch):
+        import builtins
+        real = builtins.__import__
+
+        def boom(name, *a, **kw):
+            if name == "claude_swap.pin_proxy":
+                raise ModuleNotFoundError("No module named 'cryptography'")
+            return real(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", boom)
+        monkeypatch.delitem(sys.modules, "claude_swap.pin_proxy", raising=False)
+        # Must not raise: the badge degrades, the view survives.
+        assert self._call() is None
+
+    def test_a_working_pin_still_returns_the_email(self, monkeypatch):
+        # The guard must not swallow the happy path too.
+        import claude_swap.pin_proxy as pp
+        monkeypatch.setattr(pp, "load_pin", lambda d: ("pinned@example.com", 1))
+        assert self._call() == "pinned@example.com"
+

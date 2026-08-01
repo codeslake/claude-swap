@@ -221,9 +221,17 @@ class AutoScreen(Screen):
         directly below it instead of just reading the list, and the summary
         line wrapped past 80 columns.
         """
-        from claude_swap.pin_proxy import load_pin
-
+        # The import is INSIDE the guard, not above it. pin_proxy imports
+        # `cryptography` at module scope, so an environment missing it raises
+        # at IMPORT time, not at call time — and an import left outside this
+        # try takes the whole auto view down instead of dropping one badge.
+        # Measured on work-mac: cryptography vanished from the uv tool env,
+        # and _on_snapshot -> _candidates_text -> _pinned_email crashed the
+        # TUI with ModuleNotFoundError. The badge is decoration; the view is
+        # not. `_cloud_pinned_email` in widgets.py already had it this way.
         try:
+            from claude_swap.pin_proxy import load_pin
+
             pin = load_pin(self.app.switcher.backup_dir)
         except Exception:
             return None
