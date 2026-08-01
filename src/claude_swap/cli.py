@@ -97,6 +97,50 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
     return argv
 
 
+def _pin_command(argv: list[str]) -> None:
+    """Handle `cswap pin [NUM|EMAIL] [--clear]`.
+
+    Pre-dispatched like `run`/`auto`: a positional subcommand cannot coexist
+    with main()'s mutually-exclusive flag group, and `--clear` needs a parser
+    of its own. The work lives in claude_swap.pin, which is import-safe
+    without the extra — a missing 'cswap-pin' surfaces from run() as a
+    ClaudeSwitchError with the install hint, the same way menubar does.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} pin",
+        description=(
+            "Keep Remote Control and Artifacts on one account while inference "
+            "follows the account swap. Needs the 'pin' extra."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap pin 2          pin Remote Control / artifacts to account 2
+  cswap pin            show the current pin
+  cswap pin --clear    remove the pin
+        """,
+    )
+    parser.add_argument(
+        "account", nargs="?", metavar="NUM|EMAIL", help="Account to pin to"
+    )
+    parser.add_argument("--clear", action="store_true", help="Remove the pin")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.pin import run as pin_run
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        sys.exit(pin_run(switcher, args.account, clear=args.clear))
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _run_command(argv: list[str]) -> None:
     """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
 
@@ -866,6 +910,9 @@ def main() -> None:
         pass  # theme is cosmetic; never block the CLI on it
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
+    if argv and argv[0] == "pin":
+        _pin_command(argv[1:])
+        return
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked

@@ -33,6 +33,7 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
+pin = ["cswap-pin>=0.1"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
