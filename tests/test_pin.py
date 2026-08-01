@@ -270,7 +270,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         import time
 
         import claude_swap.paths as paths
-        from claude_swap import claude_locks, pin
+        from claude_swap import pin
 
         cfg = self._wired(tmp_path)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
@@ -279,10 +279,11 @@ class TestTheWiringCanAlwaysBeRemoved:
             pin, "_impl", lambda: (_ for _ in ()).throw(ClaudeSwitchError("absent"))
         )
 
-        # Derived here rather than via config_lock_dir() so the test does not
-        # depend on how that resolves the config path.
+        # The same name clear_wiring derives, held for real. Nothing is
+        # patched here: a monkeypatch of config_lock_dir used to sit in this
+        # test and was dead — clear_wiring stopped calling it, and the test
+        # stayed green with that function rigged to raise on call.
         held = cfg.parent / (cfg.name + ".lock")
-        monkeypatch.setattr(claude_locks, "config_lock_dir", lambda: held)
         # A live holder: fresh mtime, so the staleness takeover does not fire.
         held.mkdir()
         try:
