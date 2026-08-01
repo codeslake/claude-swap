@@ -292,8 +292,25 @@ Examples:
         help="Account to pin (number or email). Omit to show the current pin.",
     )
     parser.add_argument("--clear", action="store_true", help="Remove the pin")
+    parser.add_argument(
+        "--heal", action="store_true",
+        help="Restart the pin daemon if it is pinned but not serving (no-op otherwise)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+
+    if args.heal:
+        # Called on a timer by the status line, so it must be silent, fast and
+        # safe to run constantly: it returns immediately when the pin is either
+        # absent or already serving, and rebinds the RECORDED port so live
+        # sessions reconnect where they already point — no session restart.
+        from claude_swap import pin_proxy
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        # Silent by design: the caller is a status line on a timer, and its
+        # stdout is not a place for chatter. The restart is observable where it
+        # matters — the badge stops showing the pin as not-serving.
+        pin_proxy.heal(switcher.backup_dir)
+        return
 
     from claude_swap.pin_proxy import (
         apply_pin,
