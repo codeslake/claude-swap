@@ -96,19 +96,11 @@ class CswapApp(App):
             self.push_screen(WatchScreen())
         elif self._start == "auto":
             # ONLY the explicit `cswap tui --auto` opens on the auto view.
-            #
-            # autoStartLive used to be consulted here too, so a bare
-            # `cswap tui` could land straight in the auto view with the
-            # engine LIVE. That made the flag a lie — with the setting on,
-            # `--auto` and no flag did the same thing — and the setting is
-            # reachable from a single go-live confirmation, which on a
-            # machine whose settings.json is shared then applies everywhere.
-            # Opening a dashboard is recoverable; auto-switching accounts
-            # because of a checkbox someone ticked once is not.
-            #
-            # autoStartLive still does its own job: it decides whether the
-            # auto view starts LIVE or in dry-run once you are ON it (see
-            # AutoScreen.on_mount). It no longer decides that you go there.
+            # autoStartLive used to be consulted here too, which made the flag
+            # a lie and let one go-live confirmation auto-enter LIVE on every
+            # machine sharing settings.json. It still decides LIVE-vs-dry-run
+            # once you are ON the view (AutoScreen.on_mount) — not that you go
+            # there.
             self.push_screen(AutoScreen(start_live=True))
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
