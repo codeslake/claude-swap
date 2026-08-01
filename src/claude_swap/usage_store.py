@@ -457,10 +457,6 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     # RESIDUE: an hour-scale block whose REMAINDER falls under BACKOFF_CAP_S
     # takes no margin and still retries near its deadline. Nothing local
     # separates that ask from a genuine short burst block, so it is left open.
-    # It is worst on a machine's FIRST poll into another machine's block: at
-    # one failure the curve adds nothing, while at 6+ it carries the wait to
-    # BACKOFF_CAP_S and clears the deadline incidentally. Never retries EARLY,
-    # so the cost is a landing-on-the-deadline probe, not a lost hour.
     asked = retry_after_s
     if retry_after_s > BACKOFF_CAP_S:
         asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)
