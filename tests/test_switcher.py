@@ -1779,6 +1779,45 @@ class TestActiveAccountRefresh:
         assert result.sentinel is None
         write_live.assert_called_once_with(self._REFRESHED)
 
+    def test_a_held_consume_lock_defers_the_active_refresh(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The active path may POST the slot's BACKUP grant, so it owes the
+        consume lock.
+
+        refresh_input becomes `backup` when the live bytes moved or were
+        cleared, which makes this a second backup-token POST outside
+        consume_backup_grant. Measured before the fix: with .consume-N.lock
+        held by another process, this path still POSTed the shared grant —
+        one of the two POSTs wins, the loser gets invalid_grant, and the
+        strike lands on a live account.
+        """
+        from claude_swap.locking import FileLock
+
+        switcher = self._switcher(sample_sequence_data)
+        holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
+        assert holder.acquire(), "could not seed the contended lock"
+        try:
+            with patch.object(
+                switcher, "_read_credentials", return_value=self._EXPIRED
+            ), patch.object(
+                switcher, "_read_account_credentials", return_value=self._EXPIRED
+            ), patch(
+                "claude_swap.oauth.try_refresh_oauth_credentials"
+            ) as mock_refresh, patch(
+                "claude_swap.oauth.try_fetch_usage_for_account"
+            ):
+                result = switcher._fetch_active_usage(
+                    "1", "test@example.com", self._EXPIRED
+                )
+        finally:
+            holder.release()
+
+        mock_refresh.assert_not_called(), (
+            "POSTed a backup grant while another consume held its lock"
+        )
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+
     def test_filelock_contention_defers_instead_of_raising(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -9197,9 +9236,16 @@ class TestGateUltraReviewFixes:
     def test_persist_and_stash_both_failing_still_never_raises(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
-        """Worst case — persist AND stash writes fail (same-dir I/O error):
-        the gate logs loudly and returns the successor; no exception may
-        reach the never-raises collect pass."""
+        """Worst case — persist AND stash writes fail (same-dir I/O error).
+
+        No exception may reach the never-raises collect pass, AND the gate
+        must not report success: the grant is spent, the store still holds
+        the spent generation, and nothing was stashed. Reporting error=None
+        made `_freshen_target` answer "ok" and the engine switched onto a
+        slot whose credential can never refresh — the human-at-the-keyboard
+        failure this gate exists to prevent. The successor still rides along
+        so a caller that only needs a live token for THIS request works.
+        """
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         state = {"post_done": False}
@@ -9226,7 +9272,9 @@ class TestGateUltraReviewFixes:
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh):
             out = s.consume_backup_grant("1", "test@example.com", self._OLD)
-        assert out.error is None
+        assert out.error == "transient", (
+            "reported success on a spent grant with nothing stashed"
+        )
         assert out.credentials == self._NEW
 
     # -- consumed_fp on failure outcomes ---------------------------------
