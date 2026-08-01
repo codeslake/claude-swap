@@ -47,6 +47,19 @@ def _impl() -> ModuleType:
     from inside a module that IS present propagates unchanged.
     """
     import importlib.util
+    import sys
+
+    # POSIX only, the same way the menu bar is macOS only. The proxy holds its
+    # daemon lock with fcntl.flock and refcounts sessions through a FIFO
+    # (os.mkfifo); neither exists on Windows, so an install there would fail at
+    # first use with a ModuleNotFoundError from inside the dependency rather
+    # than a sentence the user can act on. cswap itself advertises Windows
+    # support (pyproject classifiers), so this has to be said, not assumed.
+    if sys.platform == "win32":
+        raise ClaudeSwitchError(
+            "The cloud pin is not available on Windows: it needs POSIX file "
+            "locks and FIFOs."
+        )
 
     try:
         found = importlib.util.find_spec("cswap_pin.proxy") is not None
@@ -82,6 +95,12 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
             pass
         return env
     except Exception:  # noqa: BLE001 — never block the launch
+        # Same reasoning as the branch above: whatever went wrong, this launch
+        # has no pin, so a wiring left naming a dead port must not survive it.
+        try:
+            clear_wiring()
+        except Exception:  # noqa: BLE001
+            pass
         return env
     try:
         pinned = pin.ensure_proxy(switcher)
@@ -123,10 +142,21 @@ def clear_wiring() -> bool:
     restored, so a proxy the user or their launcher set beforehand comes back
     rather than being lost with ours.
     """
+    from claude_swap.claude_locks import claude_config_lock
     from claude_swap.paths import get_global_config_path
 
+    # Under the same lock switcher.py takes for this file. `cswap switch`
+    # rewrites .claude.json too, so an unlocked read-modify-write here can
+    # land on top of a swap that happened between our read and our rename —
+    # losing the account change and leaving the config describing neither
+    # state.
+    with claude_config_lock():
+        return _clear_wiring_locked(get_global_config_path())
+
+
+def _clear_wiring_locked(path) -> bool:
+    """The read-modify-write of :func:`clear_wiring`, under its lock."""
     try:
-        path = get_global_config_path()
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
