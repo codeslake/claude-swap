@@ -1753,8 +1753,35 @@ class TestThemeWiring:
 
 
 class TestAutoStartLive:
-    """autoStartLive: a confirmed Go-live persists; a restarted TUI resumes
-    the auto view with the engine LIVE instead of re-asking."""
+    """autoStartLive decides whether the auto view starts LIVE or dry-run
+    once you are ON it. It does NOT decide that you go there — only the
+    explicit `cswap tui --auto` opens the auto view."""
+
+    def test_bare_tui_never_opens_the_auto_view(self, tmp_path):
+        """`cswap tui` must land on the dashboard even with autoStartLive on.
+
+        It used to consult the setting here, so a bare `cswap tui` could open
+        straight into the auto view with the engine LIVE — which made the
+        `--auto` flag meaningless (both did the same thing) and let one
+        go-live confirmation, on a machine whose settings.json is shared,
+        auto-switch accounts everywhere.
+        """
+        import inspect
+        from claude_swap.tui import app as app_mod
+
+        src = inspect.getsource(app_mod.CswapApp.on_mount)
+        auto_branch = src.split("elif self._start ==")[-1]
+        assert "auto_start_live" not in auto_branch, (
+            "the opening screen must depend only on --auto"
+        )
+        assert 'elif self._start == "auto"' in src
+
+    def test_auto_flag_still_opens_live(self, tmp_path):
+        import inspect
+        from claude_swap.tui import app as app_mod
+
+        src = inspect.getsource(app_mod.CswapApp.on_mount)
+        assert "AutoScreen(start_live=True)" in src
 
     def test_setting_roundtrip(self, tmp_path):
         from claude_swap.settings import load_settings, set_setting
