@@ -552,6 +552,37 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             dashboard.DashboardScreen.on_mount
         ), "nothing rebuilds the root menu after mount"
 
+    def test_opening_the_pin_submenu_lists_the_accounts(self, monkeypatch):
+        """The row existing is not the same as the row WORKING.
+
+        Every other guard here asserts the pin surface is present; none of
+        them called it. A stray `del impl` on the last line shipped an
+        UnboundLocalError into the one function the menu row opens — the
+        submenu raised on every successful call, and the whole suite was
+        green. Call it.
+        """
+        import types
+
+        from claude_swap.tui import dashboard
+
+        acc = types.SimpleNamespace(number="2", email="a@b.c", alias=None)
+        monkeypatch.setattr(dashboard.pin, "_impl", lambda: types.SimpleNamespace())
+        monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: "a@b.c")
+        monkeypatch.setattr(
+            dashboard.DashboardScreen,
+            "app",
+            property(lambda self: types.SimpleNamespace(
+                switcher=object(), snapshot=types.SimpleNamespace(accounts=[acc]))),
+            raising=False,
+        )
+        screen = object.__new__(dashboard.DashboardScreen)
+        entries = screen._pin_entries()
+        labels = [label for label, _a in entries]
+        actions = [a for _l, a in entries]
+        assert "pin:2" in actions, f"the account is not pinnable: {actions}"
+        assert any("○ cloud" in label for label in labels), "the pinned account is unmarked"
+        assert "pin:clear" in actions, "no way to unpin from the TUI"
+
     def test_the_badge_helper_is_reachable_and_fails_open(self, monkeypatch):
         """pinned_email answers the TUI's one question and never raises: no
         extra, no pin, and a malformed pin file all render as no badge."""

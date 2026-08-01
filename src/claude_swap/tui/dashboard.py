@@ -83,10 +83,7 @@ class DashboardScreen(Screen):
         # of our own: the pin row has to appear when the extra is installed
         # mid-session, and the label names the pinned account, which changes
         # from the CLI too.
-        self.watch(self.app, "snapshot", self._refresh_menu_on_snapshot)
-
-    async def _refresh_menu_on_snapshot(self, _snap) -> None:
-        await self.refresh_root_menu()
+        self.watch(self.app, "snapshot", lambda _s: self.refresh_root_menu())
 
     # -- menu plumbing --------------------------------------------------------
 
@@ -193,7 +190,6 @@ class DashboardScreen(Screen):
         if current:
             entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
-        del impl  # resolved only to prove the package is usable
         return entries
 
     async def _push_menu(self, title: str, entries: MenuEntries) -> None:
