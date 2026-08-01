@@ -104,13 +104,11 @@ EDGE_BACKOFF_S = 300.0
 POST_429_MIN_INTERVAL_S = 360.0
 RECENT_429_WINDOW_S = 3600.0
 
-# AIMD on a contended account. The usage endpoint's budget is shared across
-# every machine polling the same account — and, since the budget is scoped to
-# the account rather than the token (see the module docstring), a machine
-# holding its own separate token is no less a competitor. None of them can see
-# the others (there is no cross-machine coordination, and the endpoint exposes
-# no remaining-request count — only a Retry-After once already blocked). So
-# while 429s recur on an account, each successful poll multiplicatively grows the
+# AIMD on a contended account. The budget is shared across every machine
+# polling the same account (being account-scoped, a machine with its own token
+# is no less a competitor), none of them can see the others, and the endpoint
+# exposes no remaining-request count — only a Retry-After once already
+# blocked. So while 429s recur, each successful poll multiplicatively grows the
 # interval (×POST_429_BACKOFF_MULT) toward POST_429_MAX_INTERVAL_S — wider than
 # the normal candidate ceiling so several machines can each back off far enough
 # that their combined rate fits under the budget. Movement (a real success run

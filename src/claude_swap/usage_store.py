@@ -144,33 +144,14 @@ BACKOFF_MAX_SHIFT = 32
 # request per block instead. The cap still bounds a pathological header to one
 # window, never hours.
 #
-# Honoring it EXACTLY is not enough, though: the retry then lands on the
-# deadline itself, and the server is not reliably ready there. Measured over
-# this machine's whole log (511 http-429 lines → 39 deadline blocks; of the 19
-# post-fix lapses that were followed by another 429): 10 re-blocked within 900s
-# of their own deadline (+2s .. +716s), each earning a fresh full-hour penalty.
-# The next one after that is +3853s, so the distribution is bimodal:
-# retry inside ~900s of an hour-scale deadline and it costs another hour, retry
-# past it and it is clean. The margin lands the retry in that empty band, and
-# costs one wait per block rather than per probe, since the deadline is fixed
-# and not re-armed.
-#
-# The evidence is entirely hour-scale: 37 of those 39 blocks opened at exactly
-# 3600. The margin is ABSOLUTE, not a fraction of the ask, because Retry-After is a countdown to a fixed deadline:
-# what the server reports depends on WHEN we ask, and the budget is
-# account-scoped, so a second machine polling into a block another one opened
-# sees only the remainder. A fraction of the remainder shrinks toward zero as
-# the deadline nears — measured on the 0.25 fraction this replaces, a 3600s
-# block observed at t=3400 waited 250s and landed 50s past the deadline,
-# squarely inside the +2s..+716s re-block band. 35 of 72 observed 429s were
-# mid-block, so that was the common case, not an edge.
-#
-# 900s is the edge of the observed band (last in-band re-block +716s, next
-# +3853s). It costs a genuinely-short block (Retry-After 300, measured
-# 2026-07-06 as accurate) an extra ~825s of idling once, against a full hour
-# lost every time a mid-block observation retries into the band — roughly 2x
-# cheaper in expectation. A future re-block past +900s means raising this,
-# not the cap below.
+# Honoring it EXACTLY is not enough: the retry lands ON the deadline, where
+# the server is not reliably ready. Measured over this machine's whole log,
+# 10 of 19 lapses re-blocked within 900s of their own deadline (+2s..+716s),
+# each earning a fresh full hour; the next one is +3853s, so the distribution
+# is bimodal and 900s is the edge of the band. The margin is ABSOLUTE, not a
+# fraction of the ask: Retry-After counts down to a fixed deadline, so a
+# machine polling into a block another one opened sees only the remainder,
+# and a fraction of that shrinks toward zero exactly when it matters.
 RETRY_AFTER_MARGIN_S = 900.0
 # Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
 # account for hours. Sized to clear the measured shape exactly: every observed
@@ -470,11 +451,9 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     # cannot land us on a deadline we were never going to hit. Strict: an ask
     # OF exactly BACKOFF_CAP_S is what the saturated curve already waits.
     #
-    # KNOWN RESIDUE: an hour-scale block whose REMAINDER falls under
-    # BACKOFF_CAP_S takes no margin and still retries near its deadline.
-    # Nothing local separates that ask from a genuine short burst block (see
-    # RETRY_AFTER_MARGIN_S), and every way of closing it breaks a pinned
-    # contract, so it is left open rather than guessed at.
+    # RESIDUE: an hour-scale block whose REMAINDER falls under BACKOFF_CAP_S
+    # takes no margin and still retries near its deadline. Nothing local
+    # separates that ask from a genuine short burst block, so it is left open.
     asked = retry_after_s
     if retry_after_s > BACKOFF_CAP_S:
         asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)
