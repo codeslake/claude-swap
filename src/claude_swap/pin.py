@@ -23,10 +23,9 @@ dependency is imported lazily inside the entry points, exactly as
 from __future__ import annotations
 
 import json
-import os
 from types import ModuleType
 
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
 _INSTALL_HINT = (
     "The cloud pin requires 'cswap-pin'. "
@@ -91,7 +90,7 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         # and broken. A wiring a previous install left behind would otherwise
         # outlive it and point every session at a dead port — see clear_wiring.
         try:
-            clear_wiring(timeout=_LAUNCH_LOCK_BUDGET_S)
+            clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
         except Exception:  # noqa: BLE001
             pass
         return env
@@ -122,7 +121,7 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 _LAUNCH_LOCK_BUDGET_S = 0.5
 
 
-def clear_wiring(timeout: float | None = None) -> bool:
+def clear_wiring(switcher, timeout: float | None = None) -> bool:
     """Remove a pin wiring from the global config. True when it removed one.
 
     The pin writes its proxy address into ``.claude.json``'s env block and
@@ -167,10 +166,10 @@ def clear_wiring(timeout: float | None = None) -> bool:
     # losing the account change and leaving the config describing neither
     # state.
     with claude_config_lock(timeout=timeout):
-        return any([_clear_wiring_locked(p) for p in paths])
+        return any([_clear_wiring_locked(switcher, p) for p in paths])
 
 
-def _clear_wiring_locked(path) -> bool:
+def _clear_wiring_locked(switcher, path) -> bool:
     """The read-modify-write of :func:`clear_wiring`, under its lock."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
@@ -199,17 +198,13 @@ def _clear_wiring_locked(path) -> bool:
         raw.pop("env", None)
 
     try:
-        # 0600 from creation, never write-then-chmod: this file can hold
-        # ``primaryApiKey`` and inline MCP credentials, and a plain write takes
-        # the umask (022 on a default install), which rename then publishes.
-        tmp = path.with_suffix(".cswap-tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            os.write(fd, json.dumps(raw, indent=2).encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.replace(tmp, path)
-    except OSError:
+        # The switcher's own writer, not a second one: it already validates the
+        # JSON it produced and chmods the TEMP file so the rename is the atomic
+        # commit. This file can hold ``primaryApiKey`` and inline MCP
+        # credentials, so a hand-rolled write here would be a second place for
+        # that 0600 to drift out of agreement with switcher.py.
+        switcher._write_json(path, raw)
+    except (OSError, ConfigError):
         return False
     return True
 
@@ -234,7 +229,7 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         try:
             _impl().apply_pin(switcher, None, None)
         except Exception:  # noqa: BLE001
-            if not clear_wiring():
+            if not clear_wiring(switcher):
                 print(dimmed("No cloud account pinned"))
                 return 0
         print(f"{accent('Unpinned')} the cloud account")
