@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
+from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -360,7 +361,45 @@ class AutoScreen(Screen):
         lines: dict[str, Text] = {}
         pinned_email = self._pinned_email()  # once, not per row
         for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
+            if acc.number == active_number:
+                continue
+            # A slot with no stored login is still a place you can GO — that
+            # is now how you fill one (switch there, /login, cswap add). It
+            # used to be dropped from this list entirely, so on a machine
+            # that had imported the roster but not the credentials the auto
+            # view showed two accounts and the engine's own log showed five.
+            # A row that says why it cannot be picked beats a row that isn't
+            # there: an absent account reads as "not configured", which is a
+            # different problem with a different fix.
+            if not acc.switchable:
+                entry = Text()
+                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                entry.append(acc.email, style=palette.muted)
+                # Say what is actually missing. An API-key slot has no login
+                # to restore, so "re-login" would send the user after a fix
+                # that does not apply; the dashboard already calls that state
+                # "API key (no quota)" and both surfaces must agree.
+                # Both steps, not just the first: a /login with no `cswap add`
+                # leaves the slot exactly as empty as before. Same wording the
+                # USAGE_RELOGIN_REQUIRED sentinel already uses for the sibling
+                # case, so the two never drift apart.
+                note = (
+                    data.sentinel_label(USAGE_API_KEY)
+                    if acc.kind == "api_key"
+                    else ("no stored login — switch here, log in with Claude "
+                          "Code, then run: cswap add")
+                )
+                entry.append(f"  {note}", style=palette.sev_warn)
+                # The badge belongs on this row too, and that is only true
+                # once these two branches meet: the pinned account is exactly
+                # the one likely to be missing a login on a freshly synced
+                # machine (the roster travels, credentials do not), which is
+                # when seeing who owns the claude.ai side matters most.
+                if pinned_email and acc.email == pinned_email:
+                    entry.append("  · ", style=palette.muted)
+                    entry.append("○ cloud", style=f"bold {palette.sev_warn}")
+                lines[acc.number] = entry
+                ranked.append((1000.0, acc.number))   # last: never a target
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
@@ -408,7 +447,10 @@ class AutoScreen(Screen):
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
-            text.append("\n  no other switchable accounts", style=palette.muted)
+            # Reached only when this is the sole account. Slots that cannot be
+            # switched to are listed above with the reason, so "no other
+            # accounts" is now literal rather than a filter's side effect.
+            text.append("\n  no other accounts", style=palette.muted)
             return text
         for _pct, number in sorted(ranked):
             text.append(lines[number])
