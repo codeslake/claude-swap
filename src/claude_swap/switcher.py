@@ -166,6 +166,22 @@ SENTINEL_NOTES = {
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
+    # Every other sentinel here explains itself; this one rendered as the
+    # bare words "no credentials", which state the problem and omit the fix.
+    #
+    # The fix is: BE on the slot, then log in. `/login` writes to whichever
+    # account is active, so switching first is the part people miss. The
+    # backup then seeds itself — `_resync_rotated_backup` handles the
+    # empty-backup case by design (see its docstring) on the first usage
+    # poll that succeeds. Verified end to end on work-mac: switch, /login,
+    # and 99s later "Resynced account 4's backup", with no `cswap add`.
+    #
+    # `cswap add` is named as the fallback, not the step, because that
+    # seeding needs an active slot, a successful poll, a non-degraded read,
+    # and an ownership probe that reaches the network — so it does not
+    # happen offline, or with a locked keychain, and never on a slot you are
+    # not on.
+    USAGE_NO_CREDENTIALS: "no stored login — switch here, then log in with Claude Code (`cswap add` if it doesn't stick)",
 }
 
 
@@ -5072,8 +5088,10 @@ class ClaudeAccountSwitcher:
             "needsLogin": True,
             "warnings": [
                 f"Account-{target_account} has no stored credentials — you "
-                f"are now logged out. Run /login in Claude Code, then "
-                f"`cswap add` to capture it into this slot."
+                f"are now logged out. Run /login in Claude Code; the backup "
+                f"seeds itself on the next usage poll. (`cswap add` if it "
+                f"doesn't — seeding needs a reachable network and a "
+                f"non-degraded read.)"
             ],
         }
 

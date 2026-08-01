@@ -31,7 +31,7 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -354,15 +354,15 @@ class AutoScreen(Screen):
                 # to restore, so "re-login" would send the user after a fix
                 # that does not apply; the dashboard already calls that state
                 # "API key (no quota)" and both surfaces must agree.
-                # Both steps, not just the first: a /login with no `cswap add`
-                # leaves the slot exactly as empty as before. Same wording the
-                # USAGE_RELOGIN_REQUIRED sentinel already uses for the sibling
-                # case, so the two never drift apart.
-                note = (
-                    data.sentinel_label(USAGE_API_KEY)
-                    if acc.kind == "api_key"
-                    else ("no stored login — switch here, log in with Claude "
-                          "Code, then run: cswap add")
+                # Both notes come from SENTINEL_NOTES rather than being
+                # written here. The first draft spelled this one out inline
+                # and got it wrong — it demanded `cswap add`, which the
+                # backup seeding in _resync_rotated_backup makes unnecessary
+                # — and the switch screen, which reads the table, disagreed
+                # with this screen about the same slot. One definition.
+                note = data.sentinel_label(
+                    USAGE_API_KEY if acc.kind == "api_key"
+                    else USAGE_NO_CREDENTIALS
                 )
                 entry.append(f"  {note}", style=palette.sev_warn)
                 lines[acc.number] = entry
