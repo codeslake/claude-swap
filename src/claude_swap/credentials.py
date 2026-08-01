@@ -926,7 +926,13 @@ class CredentialStore:
         # "not found" answered cleanly and left it usable. A cache pinned
         # False (now or by an earlier op) means the Keychain cannot be
         # asked — the backup may exist unseen, so report unreadable.
-        if self._keychain_usable_cache is False:
+        # Excludes a file mode WE pinned, exactly as _read_active_credentials
+        # does: there nothing failed, we wrote the credential to the file
+        # deliberately, and that file is the authority. Sharing the raw flag
+        # made one deliberate file-mode write report every genuinely empty
+        # backup as unreadable for the rest of the process — and the consume
+        # gate answers "transient" for a slot that simply has no backup.
+        if self._keychain_usable_cache is False and not self._file_mode_is_ours:
             return "", True
         return "", False
 

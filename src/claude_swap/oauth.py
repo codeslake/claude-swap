@@ -580,6 +580,15 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
+# Refresh failures that will not resolve by retrying THIS pass, so the caller
+# must not fall through to the usage endpoint with the known-expired token.
+# `consume-busy` belongs here for a reason the other two make obvious only in
+# hindsight: the retry re-enters the same gate, finds it still held, and the
+# distinct kind arrives as generic "refresh-failed" — hiding it, and spending a
+# guaranteed 401 per pass to learn nothing.
+_DETERMINISTIC_REFRESH_ERRORS = ("store-unmirrored", "invalid_client", "consume-busy")
+
+
 def try_fetch_usage_for_account(
     account_num: str,
     email: str,
@@ -636,11 +645,12 @@ def try_fetch_usage_for_account(
                     or credential_fingerprint(working_credentials)
                 ),
             )
-        elif refresh.error in ("store-unmirrored", "invalid_client"):
+        elif refresh.error in _DETERMINISTIC_REFRESH_ERRORS:
             # Deterministic refusals (M4 parity guard; a systemic client_id
-            # rejection): hitting the usage endpoint with the known-expired
-            # token would 401 every pass. Surface the distinct kind instead
-            # — ERROR_NOTES renders the remedy for both.
+            # rejection; another process holding the consume gate): hitting the
+            # usage endpoint with the known-expired token would 401 every pass.
+            # Surface the distinct kind instead — ERROR_NOTES renders the
+            # remedy for each.
             return UsageOutcome(None, error=refresh.error)
         # A transient refresh failure falls through to try the (expired) token;
         # the 401 path below retries the refresh.
@@ -675,9 +685,7 @@ def try_fetch_usage_for_account(
             # them to "refresh-failed" would hide the ERROR_NOTES remedy
             # exactly on the 401 path (a not-yet-locally-expired token the
             # server already rotated past).
-            distinct = dead or refresh.error in (
-                "store-unmirrored", "invalid_client"
-            )
+            distinct = dead or refresh.error in _DETERMINISTIC_REFRESH_ERRORS
             return UsageOutcome(
                 None,
                 error=refresh.error if distinct else "refresh-failed",

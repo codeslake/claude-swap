@@ -2140,3 +2140,55 @@ class TestBootstrapRefreshRoutesThroughGate:
                   # assertion below is about the gate routing only
         assert gate.get("args") == ("1", "a@example.com")
         assert "called" not in direct
+
+
+class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
+    """A one-time grant consumed for THIS pass must reach the profile it was for.
+
+    The consume runs before the bootstrap lock (it POSTs, and must never hold
+    one). The under-lock re-check then returns early when another `cswap run`
+    bootstrapped while we waited — at which point this pass has already burned
+    a one-time refresh token whose successor nobody uses for the session it was
+    fetched for. The successor is persisted to the BACKUP, so nothing is lost;
+    what must hold is that the winning profile is seeded from that rotated
+    backup rather than from the generation we just spent.
+    """
+
+    def test_the_early_return_leaves_the_profile_on_the_rotated_generation(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        # The gate rotates the backup, exactly as the real one does.
+        def fake_gate(self, num, email, snapshot):
+            self._write_account_credentials(num, email, ROTATED_CREDS)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
+        )
+
+        # The pre-lock check must MISS (or we never reach the consume at all);
+        # the peer then bootstraps while we wait, so the under-lock re-check
+        # hits — on a profile seeded BEFORE our rotation.
+        calls = {"n": 0}
+
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False  # pre-lock: nothing there yet
+            sdir.mkdir(parents=True, exist_ok=True)
+            (sdir / ".credentials.json").write_text(CREDS)  # PRE-rotation
+            return True
+
+        monkeypatch.setattr(
+            SessionManager, "_is_session_valid", peer_bootstraps_while_we_wait
+        )
+
+        got, _, _ = manager.setup_session("2", share=False)
+
+        assert (got / ".credentials.json").read_text() == ROTATED_CREDS, (
+            "the profile kept a generation the consume already spent"
+        )

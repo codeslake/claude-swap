@@ -3863,10 +3863,17 @@ class ClaudeAccountSwitcher:
         if not creds or not oauth.extract_access_token(creds):
             if is_active and self._active_keychain_unavailable:
                 return USAGE_KEYCHAIN_UNAVAILABLE
-            if not is_active and self._store._keychain_usable_cache is False:
+            if (
+                not is_active
+                and self._store._keychain_usable_cache is False
+                and not self._store._file_mode_is_ours
+            ):
                 # The empty read happened with the Keychain pinned unusable:
                 # the backup may exist unseen. "keychain unavailable" — not
                 # "no credentials", which nudges an unnecessary re-add.
+                #
+                # A file mode WE pinned is excluded: nothing failed there, so
+                # an empty read means the slot really is empty.
                 return USAGE_KEYCHAIN_UNAVAILABLE
             return USAGE_NO_CREDENTIALS
         # An expired active token is no longer a static state: the fetch path
