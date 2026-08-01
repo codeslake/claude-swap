@@ -469,6 +469,167 @@ class TestClearReachesBothConfigsWithTheExtraINSTALLED:
         )
 
 
+class TestTheTuiSurfaceSurvivesTheSplit:
+    """The pin has a TUI half, and the split dropped it once already.
+
+    The old in-tree pin wired three files — dashboard.py (menu row + submenu +
+    action), widgets.py (the ○ cloud badge), autoview.py (the same badge on
+    the auto view). The first cut of this seam carried the CLI and launch
+    paths and none of that, and every check stayed green: the CLI probe
+    passed, the daemon answered, and the running TUIs were serving code they
+    had exec'd 16 hours before the cutover, so the badge was still on screen.
+    A human looking at the screen is what caught it.
+
+    These assert the surface exists at all. A check that exercises only one
+    surface reports the other as healthy.
+    """
+
+    def test_no_extra_means_no_pin_row(self, monkeypatch):
+        """A user who never asked for the pin must not see a row for it."""
+        import types
+
+        from claude_swap.tui import dashboard
+
+        monkeypatch.setattr(dashboard.pin, "is_available", lambda: False)
+        monkeypatch.setattr(
+            dashboard.DashboardScreen,
+            "app",
+            property(lambda self: types.SimpleNamespace(switcher=object(), snapshot=None)),
+            raising=False,
+        )
+        screen = object.__new__(dashboard.DashboardScreen)
+        ids = [a for _l, a in screen._root_entries()]
+        assert "pin-menu" not in ids, f"pin offered without the extra: {ids}"
+
+        monkeypatch.setattr(dashboard.pin, "is_available", lambda: True)
+        monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: None)
+        assert "pin-menu" in [a for _l, a in screen._root_entries()]
+
+    def test_installing_the_extra_is_seen_without_a_restart(self, tmp_path):
+        """A TUI open across an install must start offering the pin.
+
+        A long-lived process caches each sys.path directory by mtime, so a
+        package installed after start can stay invisible — measured, usually
+        visible but not when the install lands inside the same mtime tick.
+        That is the "I installed it and the menu is still missing" report,
+        and invalidate_caches is what closes it.
+        """
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        pkg = tmp_path / "late" / "cswap_pin"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "proxy.py").write_text("def load_pin(d):\n    return None\n")
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        code = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {src!r})
+            from claude_swap import pin
+            assert pin.is_available() is False, "saw a package that is not there"
+            # The install: a path entry that did not exist when we started.
+            sys.path.insert(0, {str(tmp_path / "late")!r})
+            assert pin.is_available() is True, "a restart should not be required"
+            sys.exit(0)
+            """
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-400:]
+
+    def test_the_menu_rebuilds_on_the_poll(self):
+        """The root menu was built once at mount, so a row that appears on
+        install could not appear until a restart."""
+        import inspect
+
+        from claude_swap.tui import dashboard
+
+        assert hasattr(dashboard.DashboardScreen, "refresh_root_menu")
+        assert "refresh_root_menu" in inspect.getsource(
+            dashboard.DashboardScreen.on_mount
+        ) or "_refresh_menu_on_snapshot" in inspect.getsource(
+            dashboard.DashboardScreen.on_mount
+        ), "nothing rebuilds the root menu after mount"
+
+    def test_the_badge_helper_is_reachable_and_fails_open(self, monkeypatch):
+        """pinned_email answers the TUI's one question and never raises: no
+        extra, no pin, and a malformed pin file all render as no badge."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(
+            pin, "_impl", lambda: (_ for _ in ()).throw(ClaudeSwitchError("absent"))
+        )
+        assert pin.pinned_email(object()) is None
+
+        monkeypatch.setattr(
+            pin, "_impl", lambda: (_ for _ in ()).throw(RuntimeError("broken"))
+        )
+        assert pin.pinned_email(object()) is None
+
+    def test_the_dashboard_root_menu_still_offers_the_pin(self, monkeypatch):
+        """The ROOT MENU ROW, not merely the handler behind it.
+
+        Grepping the module for "pin-menu" passes with the row deleted — the
+        action handler still contains the string — so the row can vanish while
+        the check stays green. Measured. Call _root_entries and look at the
+        ids it actually returns.
+        """
+        import types
+
+        from claude_swap.tui import dashboard
+
+        assert "none" in dashboard.cloud_menu_label(None)
+        assert "a@b.c" in dashboard.cloud_menu_label("a@b.c")
+
+        # `app` is a read-only Textual property, so patch it on the class.
+        monkeypatch.setattr(
+            dashboard.DashboardScreen,
+            "app",
+            property(lambda self: types.SimpleNamespace(switcher=object(), snapshot=None)),
+            raising=False,
+        )
+        # With the extra present — its absence hiding the row is the sibling
+        # test; this one is about the row existing at all when it should.
+        monkeypatch.setattr(dashboard.pin, "is_available", lambda: True)
+        monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: None)
+        screen = object.__new__(dashboard.DashboardScreen)
+        ids = [action for _label, action in screen._root_entries()]
+        assert "pin-menu" in ids, (
+            f"the cloud pin is unreachable from the dashboard menu: {ids}"
+        )
+        labels = [label for label, action in screen._root_entries()
+                  if action == "pin-menu"]
+        assert "Cloud account" in labels[0]
+
+    def test_both_account_renderers_take_the_badge(self):
+        """The badge rides on the account rows, and there are two renderers —
+        the full card and the minimised line. Losing it from one is the half
+        that reads as healthy."""
+        import inspect
+
+        from claude_swap.tui import widgets
+
+        for fn in (widgets.account_card_text, widgets.mini_account_text):
+            assert "cloud_pinned" in inspect.signature(fn).parameters, (
+                f"{fn.__name__} cannot render the cloud badge"
+            )
+        assert "○ cloud" in inspect.getsource(widgets)
+        assert "○ cloud" in inspect.getsource(
+            __import__("claude_swap.tui.autoview", fromlist=["x"])
+        ), "the auto-switch view lost the cloud badge"
+
+    def test_a_pinned_account_actually_renders_the_badge(self):
+        """Not just the parameter — the glyph has to reach the text."""
+        from claude_swap.tui.widgets import account_card_text
+        from tests.test_tui import make_account
+
+        acc = make_account(1, active=True)
+        plain = account_card_text(acc, 80, cloud_pinned=True).plain
+        assert "○ cloud" in plain
+        assert "○ cloud" not in account_card_text(acc, 80).plain
+
+
 class TestClearRunsWithTheExtraGone:
     """`cswap pin --clear` is priority 1 and the whole reason clear_wiring
     lives in cswap rather than the optional package.
