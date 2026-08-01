@@ -166,21 +166,13 @@ SENTINEL_NOTES = {
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
-    # Every other sentinel here explains itself; this one rendered as the
-    # bare words "no credentials", which state the problem and omit the fix.
-    #
-    # The fix is: BE on the slot, then log in. `/login` writes to whichever
-    # account is active, so switching first is the part people miss. The
-    # backup then seeds itself — `_resync_rotated_backup` handles the
-    # empty-backup case by design (see its docstring) on the first usage
-    # poll that succeeds. Verified end to end on work-mac: switch, /login,
-    # and 99s later "Resynced account 4's backup", with no `cswap add`.
-    #
-    # `cswap add` is named as the fallback, not the step, because that
-    # seeding needs an active slot, a successful poll, a non-degraded read,
-    # and an ownership probe that reaches the network — so it does not
-    # happen offline, or with a locked keychain, and never on a slot you are
-    # not on.
+    # This one used to render as the bare words "no credentials", which state
+    # the problem and omit the fix. The fix is: BE on the slot, then log in —
+    # `/login` writes to whichever account is active, so switching first is
+    # the part people miss. `_resync_rotated_backup` then seeds the backup on
+    # the first successful poll (see its docstring), so `cswap add` is the
+    # fallback rather than the step: that seeding needs an active slot, a
+    # reachable network and a non-degraded read.
     USAGE_NO_CREDENTIALS: "no stored login — switch here, then log in with Claude Code (`cswap add` if it doesn't stick)",
 }
 
@@ -5058,20 +5050,16 @@ class ClaudeAccountSwitcher:
     ) -> dict:
         """Land on a slot that has no stored login, logged out.
 
-        An empty slot is a destination, not an error. It is what a roster
-        import leaves behind — the account LIST syncs across machines,
-        credentials deliberately do not — and the only way to fill one is to
+        An empty slot is a destination, not an error: it is what a roster
+        import leaves behind (the account LIST syncs across machines,
+        credentials deliberately do not), and the only way to fill one is to
         be ON it and log in, because Claude Code writes a new login to
         whichever account is active. Refusing made the one slot you needed to
-        reach the one slot you could not, and the `--add-account` the error
-        suggested cannot help either: there is nothing to add until a login
-        exists.
+        reach the one slot you could not.
 
-        The live credential is cleared rather than left in place. Leaving it
-        would keep serving the PREVIOUS account's token while the active slot
-        number says otherwise — an active slot that lies about whose quota is
-        burning is worse than being logged out. The caller has already backed
-        that credential up, so nothing is lost.
+        The live credential is cleared rather than left in place: an active
+        slot that keeps serving the PREVIOUS account's token lies about whose
+        quota is burning. The caller has already backed it up.
         """
         self._store._clear_oauth_credential()
         data["activeAccountNumber"] = int(target_account)

@@ -339,27 +339,17 @@ class AutoScreen(Screen):
             if acc.number == active_number:
                 continue
             # A slot with no stored login is still a place you can GO — that
-            # is now how you fill one (switch there, /login, cswap add). It
-            # used to be dropped from this list entirely, so on a machine
-            # that had imported the roster but not the credentials the auto
-            # view showed two accounts and the engine's own log showed five.
-            # A row that says why it cannot be picked beats a row that isn't
-            # there: an absent account reads as "not configured", which is a
-            # different problem with a different fix.
+            # is now how you fill one. It used to be dropped from this list
+            # entirely, so a machine with the roster but not the credentials
+            # showed two accounts here and five in the engine's own log. A row
+            # that says why it cannot be picked beats a row that isn't there.
             if not acc.switchable:
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
                 entry.append(acc.email, style=palette.muted)
-                # Say what is actually missing. An API-key slot has no login
-                # to restore, so "re-login" would send the user after a fix
-                # that does not apply; the dashboard already calls that state
-                # "API key (no quota)" and both surfaces must agree.
-                # Both notes come from SENTINEL_NOTES rather than being
-                # written here. The first draft spelled this one out inline
-                # and got it wrong — it demanded `cswap add`, which the
-                # backup seeding in _resync_rotated_backup makes unnecessary
-                # — and the switch screen, which reads the table, disagreed
-                # with this screen about the same slot. One definition.
+                # From SENTINEL_NOTES, not written here: an API-key slot has no
+                # login to restore, and the switch screen reads the same table,
+                # so both surfaces must describe a slot identically.
                 note = data.sentinel_label(
                     USAGE_API_KEY if acc.kind == "api_key"
                     else USAGE_NO_CREDENTIALS
@@ -381,27 +371,23 @@ class AutoScreen(Screen):
                 entry.append("  usage unknown", style=palette.muted)
                 ranked.append((999.0, acc.number))
             else:
-                # Per-window chips, drawn by the same helper the dashboard
-                # uses — see data.window_chip_label.
+                # Per-window chips, from the same helper the dashboard uses
+                # (data.window_chip_label) so one account cannot read two ways.
                 now = time.time()
-                first = True
-                for label, key in (("5h", "five_hour"), ("7d", "seven_day")):
-                    wpct = data.window_pct(acc.usage.last_good, key)
-                    if wpct is None:
-                        continue
-                    entry.append("  " if first else " · ", style=palette.muted)
+                chips = [
+                    (key, label, data.window_pct(acc.usage.last_good, key))
+                    for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
+                ]
+                chips = [c for c in chips if c[2] is not None]
+                for i, (key, label, wpct) in enumerate(chips):
+                    entry.append("  " if i == 0 else " · ", style=palette.muted)
                     entry.append(
-                        data.window_chip_label(
-                            acc.usage.last_good, key, label, now
-                        ),
+                        data.window_chip_label(acc.usage.last_good, key, label, now),
                         style=palette.muted,
                     )
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
-                    first = False
-                if first:  # no window data at all — keep the old reading
-                    entry.append(
-                        f"  {pct:3.0f}% used", style=palette.severity(pct)
-                    )
+                if not chips:  # no window data at all — keep the old reading
+                    entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append((pct, acc.number))
             lines[acc.number] = entry
 
