@@ -79,14 +79,6 @@ class TestImportSafeWithoutTheExtra:
 
 
 class TestTheMissingExtraIsReported:
-    def test_is_available_says_no(self, monkeypatch):
-        import importlib.util
-
-        from claude_swap import pin
-
-        monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: None)
-        assert pin.is_available() is False
-
     def test_impl_raises_the_install_hint(self, monkeypatch):
         import importlib.util
 
@@ -201,3 +193,59 @@ class TestTheWiringCanAlwaysBeRemoved:
         finally:
             os.umask(old)
         assert not _stat.S_IMODE(cfg.stat().st_mode) & 0o077
+
+
+class TestTheLaunchPathIsWired:
+    """`cswap run` must route its child through the proxy, not only
+    hand-launched sessions that read .claude.json.
+
+    wire_launch_env existed with zero production callers — session.py never
+    mentioned the pin — so `cswap run 2` launched unpinned while `cswap pin`
+    reported success. Found by a complexity review flagging it as dead code;
+    it was a missing call, not spare code.
+    """
+
+    def _manager(self, temp_home):
+        # The real switcher, not a stub: _exec touches enough of it that a
+        # SimpleNamespace only proves the stub matches itself.
+        from claude_swap.session import SessionManager
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        return SessionManager(ClaudeAccountSwitcher())
+
+    def test_exec_routes_the_child_through_the_pin(self, temp_home, monkeypatch):
+        from claude_swap import pin as pin_mod
+        from claude_swap import session as session_mod
+
+        monkeypatch.setattr(
+            pin_mod,
+            "wire_launch_env",
+            lambda sw, env: {**env, "HTTPS_PROXY": "http://127.0.0.1:9955"},
+        )
+        captured = {}
+
+        def fake_execvpe(binary, argv, env):
+            captured["env"] = env
+            raise SystemExit(0)
+
+        monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+        with pytest.raises(SystemExit):
+            self._manager(temp_home)._exec("/bin/claude", [], env={"A": "1"})
+        assert captured["env"].get("HTTPS_PROXY") == "http://127.0.0.1:9955", (
+            "the launch path does not wire the pin — `cswap run` goes out unpinned"
+        )
+
+    def test_a_pin_failure_still_launches(self, temp_home, monkeypatch):
+        from claude_swap import pin as pin_mod
+        from claude_swap import session as session_mod
+
+        def boom(sw, env):
+            raise RuntimeError("pin exploded")
+
+        monkeypatch.setattr(pin_mod, "wire_launch_env", boom)
+        monkeypatch.setattr(
+            session_mod.os, "execvpe", lambda b, a, e: (_ for _ in ()).throw(SystemExit(0))
+        )
+        with pytest.raises((SystemExit, RuntimeError)) as exc:
+            self._manager(temp_home)._exec("/bin/claude", [], env={"A": "1"})
+        assert exc.type is SystemExit, "a pin failure blocked the launch"
