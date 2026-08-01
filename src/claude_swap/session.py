@@ -43,15 +43,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from claude_swap import macos_keychain, pin_proxy
 from claude_swap.claude_locks import proper_lockfile
-from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
+from claude_swap.exceptions import (
+    ClaudeCodeLockTimeout,
+    CredentialReadError,
+    SessionError,
+)
 from claude_swap.fsutil import replace_with_retry
-from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
@@ -161,14 +165,16 @@ def session_dir_for(backup_dir: Path, account_num: str, email: str) -> Path:
     return backup_dir / "sessions" / f"{account_num}-{slugify_email(email)}"
 
 
-def keychain_service_name(session_dir: Path) -> str:
+def keychain_service_name(config_dir: Path | str) -> str:
     """Keychain service name Claude Code derives for this config dir.
 
     Claude hashes the raw ``CLAUDE_CONFIG_DIR`` env var value, NFC-normalized
     and unresolved (claude src ``envUtils.ts``/``macOsKeychainHelpers.ts``).
     Hash exactly the string we export — never a resolved/realpath variant.
+    Accepts a ``str`` so a caller holding the raw env value can hash it without
+    a ``Path`` round-trip, which would drop a trailing slash or ``./``.
     """
-    normalized = unicodedata.normalize("NFC", str(session_dir))
+    normalized = unicodedata.normalize("NFC", str(config_dir))
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:8]
     return f"Claude Code-credentials-{digest}"
 
@@ -195,7 +201,7 @@ def delete_macos_keychain_entry(session_dir: Path) -> None:
         macos_keychain.delete_password(
             keychain_service_name(session_dir), _keychain_account_name()
         )
-    except KeychainError:
+    except macos_keychain.KEYCHAIN_ERRORS:
         pass  # best-effort; absent entry is already success (rc 44)
 
 
@@ -212,19 +218,67 @@ def read_session_credentials(session_dir: Path) -> str | None:
     writes the hashed entry). Returns ``None`` when the profile has no
     readable credential material.
     """
-    if not session_dir.is_dir():
+    return read_config_dir_credentials(str(session_dir))
+
+
+# Bounded retry for the strict capture read, mirroring the active store's
+# (credentials._ACTIVE_READ_ATTEMPTS / _ACTIVE_READ_RETRY_DELAY).
+_STRICT_KEYCHAIN_ATTEMPTS = 2
+_STRICT_KEYCHAIN_RETRY_DELAY = 0.3  # seconds between attempts
+
+
+def read_config_dir_credentials(
+    config_dir: str,
+    *,
+    strict_keychain: bool = False,
+    keychain_service: str | None = None,
+) -> str | None:
+    """Same read for an arbitrary ``CLAUDE_CONFIG_DIR`` value.
+
+    Takes the raw string rather than a ``Path``: claude derives the keychain
+    service name from the exported value verbatim, so a ``Path`` round-trip —
+    which drops a trailing slash or a leading ``./`` — would look up a service
+    name claude never wrote and fall back to the (possibly stale) plaintext
+    seed instead.
+
+    ``keychain_service`` overrides the derived hashed name for the one profile
+    whose item is *unsuffixed*: the default profile, which claude selects with
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` defined-but-empty.
+
+    ``strict_keychain`` is for capture (``add``): an *unreadable* keychain —
+    locked, denied, timed out — retries once and then raises
+    :class:`CredentialReadError` instead of falling back to the plaintext seed.
+    The seed may predate an in-profile ``/login``, and capturing it would file
+    one account's email against another's token — the very mismatch the capture
+    path exists to prevent. An *absent* entry (rc 44) still falls back either
+    way: absence is claude's own signal to read the file.
+    """
+    directory = Path(config_dir)
+    if not directory.is_dir():
         return None
     if Platform.detect() == Platform.MACOS:
-        try:
-            creds = macos_keychain.get_password(
-                keychain_service_name(session_dir), _keychain_account_name()
-            )
+        attempts = _STRICT_KEYCHAIN_ATTEMPTS if strict_keychain else 1
+        for attempt in range(attempts):
+            try:
+                creds = macos_keychain.get_password(
+                    keychain_service or keychain_service_name(config_dir),
+                    _keychain_account_name(),
+                )
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                if attempt + 1 < attempts:
+                    time.sleep(_STRICT_KEYCHAIN_RETRY_DELAY)
+                    continue
+                if strict_keychain:
+                    raise CredentialReadError(
+                        f"Keychain entry for profile {config_dir} is unreadable "
+                        f"(locked or busy) — unlock the keychain and retry: {e}"
+                    ) from e
+                break  # best-effort read: the plaintext seed is the next-best truth
             if creds:
                 return creds
-        except KeychainError:
-            pass  # locked/denied/timeout — the plaintext seed is the next-best truth
+            break  # entry absent (rc 44) — claude's own signal to read the file
     try:
-        return (session_dir / ".credentials.json").read_text(encoding="utf-8")
+        return (directory / ".credentials.json").read_text(encoding="utf-8")
     except (OSError, ValueError):
         # ValueError covers UnicodeDecodeError: a byte-corrupt file is "no
         # readable credential material", not an error to propagate.

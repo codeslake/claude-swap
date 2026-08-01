@@ -12,10 +12,18 @@ from types import SimpleNamespace
 
 import pytest
 
+from claude_swap import macos_keychain
 from claude_swap import oauth
 from claude_swap import session as session_mod
-from claude_swap.exceptions import AccountNotFoundError, SessionError
+from claude_swap.credentials import CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE
+from claude_swap.exceptions import (
+    AccountNotFoundError,
+    CredentialReadError,
+    SessionError,
+    ValidationError,
+)
 from claude_swap.models import Platform
+from claude_swap.paths import get_global_config_path
 from claude_swap.session import (
     MCP_DISPLACED_STASH,
     MCP_MIRROR_MARKER,
@@ -1664,6 +1672,409 @@ class TestReadSessionCredentials:
         creds = session_mod.read_session_credentials(session_dir)
         assert creds is not None and "sk-seed" in creds
 
+
+ACTIVE_TOKEN = "active-store-token"
+CONFIG_DIR_TOKEN = "config-dir-token"
+ACTIVE_CREDS = json.dumps({"claudeAiOauth": {"accessToken": ACTIVE_TOKEN}})
+CONFIG_DIR_CREDS = json.dumps({"claudeAiOauth": {"accessToken": CONFIG_DIR_TOKEN}})
+CONFIG_DIR_CONFIG = json.dumps(
+    {
+        "oauthAccount": {
+            "emailAddress": "elsewhere@example.com",
+            "accountUuid": "uuid-elsewhere",
+            "organizationUuid": "org-elsewhere",
+        }
+    }
+)
+API_KEY = "sk-ant-api03-" + "x" * 20
+
+
+class TestCaptureCredentials:
+    """``add_account`` under ``CLAUDE_CONFIG_DIR``.
+
+    The identity comes from the env-resolved ``.claude.json`` while the
+    credential came from the active store, whose macOS Keychain backend ignores
+    the env var — so a slot could hold one account's email and another's token.
+    """
+
+    @staticmethod
+    def _switcher(platform, monkeypatch) -> ClaudeAccountSwitcher:
+        monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: platform))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        return switcher
+
+    @staticmethod
+    def _config_dir(base: Path, *, credentials: str | None = CONFIG_DIR_CREDS) -> Path:
+        directory = base / "elsewhere"
+        directory.mkdir()
+        (directory / ".claude.json").write_text(CONFIG_DIR_CONFIG, encoding="utf-8")
+        if credentials is not None:
+            (directory / ".credentials.json").write_text(credentials, encoding="utf-8")
+        return directory
+
+    @staticmethod
+    def _stored(switcher: ClaudeAccountSwitcher) -> str:
+        return switcher._read_account_credentials("1", "elsewhere@example.com")
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_captures_config_dir_token(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        switcher = self._switcher(platform, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+
+        switcher.add_account()
+
+        assert CONFIG_DIR_TOKEN in self._stored(switcher)
+        assert ACTIVE_TOKEN not in self._stored(switcher)
+
+    def test_macos_prefers_hashed_keychain_entry(
+        self, temp_home: Path, tmp_path: Path, block_real_keychain, monkeypatch
+    ):
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        config_dir = self._config_dir(tmp_path)
+        block_real_keychain.set_password(
+            keychain_service_name(config_dir),
+            session_mod._keychain_account_name(),
+            json.dumps({"claudeAiOauth": {"accessToken": "rotated"}}),
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+        switcher.add_account()
+
+        assert "rotated" in self._stored(switcher)
+
+    def test_trailing_slash_still_finds_keychain_entry(
+        self, temp_home: Path, tmp_path: Path, block_real_keychain, monkeypatch
+    ):
+        """Claude hashes the exported string verbatim, so the service name has
+        to be derived from it and not from a normalized ``Path``."""
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        config_dir = self._config_dir(tmp_path)
+        exported = f"{config_dir}/"
+        block_real_keychain.set_password(
+            keychain_service_name(exported),
+            session_mod._keychain_account_name(),
+            json.dumps({"claudeAiOauth": {"accessToken": "rotated"}}),
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", exported)
+
+        switcher.add_account()
+
+        assert "rotated" in self._stored(switcher)
+        assert CONFIG_DIR_TOKEN not in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_default_config_dir_uses_active_store(
+        self, platform, temp_home: Path, monkeypatch
+    ):
+        """``CLAUDE_CONFIG_DIR=~/.claude`` names the default profile, whose
+        credential is the active store's."""
+        switcher = self._switcher(platform, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+        get_global_config_path().write_text(CONFIG_DIR_CONFIG, encoding="utf-8")
+
+        switcher.add_account()
+
+        assert ACTIVE_TOKEN in self._stored(switcher)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation is POSIX-only")
+    def test_symlinked_default_config_dir_uses_active_store(
+        self, temp_home: Path, tmp_path: Path, block_real_keychain, monkeypatch
+    ):
+        """A ``$HOME`` reached through a symlink spells the default profile a
+        second way; it is still the profile the active store belongs to."""
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        link = tmp_path / "home-link"
+        link.symlink_to(Path.home())
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(link / ".claude"))
+        get_global_config_path().write_text(CONFIG_DIR_CONFIG, encoding="utf-8")
+
+        switcher.add_account()
+
+        assert ACTIVE_TOKEN in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_api_key_login_still_reaches_guard(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """A managed key is not in any profile's OAuth store, but
+        ``_reject_live_api_key_capture`` still has to answer for it."""
+        switcher = self._switcher(platform, monkeypatch)
+        config_dir = self._config_dir(tmp_path, credentials=None)
+        (config_dir / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {"emailAddress": "elsewhere@example.com"},
+                    "primaryApiKey": API_KEY,
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+        with pytest.raises(ValidationError, match="API-key account"):
+            switcher.add_account()
+
+    def test_machine_managed_key_does_not_answer_for_config_dir(
+        self, temp_home: Path, tmp_path: Path, block_real_keychain, monkeypatch
+    ):
+        """The unsuffixed "Claude Code" Keychain item is the default profile's.
+        Reading it here would report an API-key login for an OAuth profile."""
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        block_real_keychain.set_password(
+            CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+            macos_keychain.keychain_account_name(),
+            API_KEY,
+        )
+        monkeypatch.setenv(
+            "CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path, credentials=None))
+        )
+
+        with pytest.raises(CredentialReadError):
+            switcher.add_account()
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_credentialless_config_dir_does_not_fall_back(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        switcher = self._switcher(platform, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        monkeypatch.setenv(
+            "CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path, credentials=None))
+        )
+
+        with pytest.raises(CredentialReadError):
+            switcher.add_account()
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_in_place_refresh_uses_same_source(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        switcher = self._switcher(platform, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        config_dir = self._config_dir(tmp_path)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+        switcher.add_account()
+
+        (config_dir / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "rotated"}}), encoding="utf-8"
+        )
+        switcher.add_account()
+
+        assert "rotated" in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_no_config_dir_uses_active_store(
+        self, value, platform, temp_home: Path, monkeypatch
+    ):
+        if value is None:
+            monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_CONFIG_DIR", value)
+        switcher = self._switcher(platform, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        get_global_config_path().write_text(CONFIG_DIR_CONFIG, encoding="utf-8")
+
+        switcher.add_account()
+
+        assert ACTIVE_TOKEN in self._stored(switcher)
+
+    @pytest.mark.parametrize(
+        "error",
+        [macos_keychain.KeychainError("keychain is locked"), OSError("no security binary")],
+        ids=["keychain-error", "os-error"],
+    )
+    def test_unreadable_keychain_fails_closed(
+        self, error, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """A locked/denied keychain must not silently capture the plaintext
+        seed — it may predate an in-profile ``/login`` and belong to another
+        account. One bounded retry, then the add fails. Covers the wrapper's
+        whole ``KEYCHAIN_ERRORS`` contract, not just ``KeychainError``."""
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setattr(session_mod, "_STRICT_KEYCHAIN_RETRY_DELAY", 0)
+        calls: list[str] = []
+        fake_store_read = macos_keychain.get_password
+
+        def locked(service: str, account: str) -> str | None:
+            if not service.startswith("Claude Code-credentials-"):
+                return fake_store_read(service, account)  # cswap's own backup store
+            calls.append(service)
+            raise error
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+
+        with pytest.raises(CredentialReadError, match="unreadable"):
+            switcher.add_account()
+
+        assert len(calls) == session_mod._STRICT_KEYCHAIN_ATTEMPTS
+        assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
+
+    def test_transient_keychain_error_retries(
+        self, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setattr(session_mod, "_STRICT_KEYCHAIN_RETRY_DELAY", 0)
+        outcomes = iter(["busy", json.dumps({"claudeAiOauth": {"accessToken": "rotated"}})])
+        fake_store_read = macos_keychain.get_password
+
+        def flaky(service: str, account: str) -> str | None:
+            if not service.startswith("Claude Code-credentials-"):
+                return fake_store_read(service, account)  # cswap's own backup store
+            outcome = next(outcomes)
+            if outcome == "busy":
+                raise macos_keychain.KeychainError("busy")
+            return outcome
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky)
+
+        switcher.add_account()
+
+        assert "rotated" in self._stored(switcher)
+
+    def test_session_read_still_falls_back_on_keychain_error(
+        self, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """``read_session_credentials`` stays best-effort: the sync paths
+        prefer a possibly-stale seed over aborting a listing on a locked
+        keychain. Only capture is strict."""
+        monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.MACOS))
+        session_dir = self._config_dir(tmp_path)
+
+        def locked(service: str, account: str) -> str | None:
+            raise macos_keychain.KeychainError("keychain is locked")
+
+        monkeypatch.setattr(macos_keychain, "get_password", locked)
+
+        creds = session_mod.read_session_credentials(session_dir)
+
+        assert creds is not None and CONFIG_DIR_TOKEN in creds
+
+    @staticmethod
+    def _secure_dir(base: Path, token: str = "secure-store-token") -> Path:
+        """A bare secure-storage dir: credentials only, no identity — claude's
+        ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` moves secure storage, not config."""
+        directory = base / "securestore"
+        directory.mkdir()
+        (directory / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": token}}), encoding="utf-8"
+        )
+        return directory
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_securestorage_dir_overrides_config_dir(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Claude sources secure storage from ``CLAUDE_SECURESTORAGE_CONFIG_DIR``
+        when it is defined, ``CLAUDE_CONFIG_DIR`` otherwise; identity stays on
+        ``CLAUDE_CONFIG_DIR``."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR", str(self._secure_dir(tmp_path))
+        )
+
+        switcher.add_account()
+
+        assert "secure-store-token" in self._stored(switcher)
+        assert CONFIG_DIR_TOKEN not in self._stored(switcher)
+
+    def test_securestorage_hashed_keychain_entry(
+        self, temp_home: Path, tmp_path: Path, block_real_keychain, monkeypatch
+    ):
+        """The hashed keychain service name derives from the securestorage
+        value when defined, not from ``CLAUDE_CONFIG_DIR``."""
+        switcher = self._switcher(Platform.MACOS, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        secure = self._secure_dir(tmp_path)
+        block_real_keychain.set_password(
+            keychain_service_name(str(secure)),
+            session_mod._keychain_account_name(),
+            json.dumps({"claudeAiOauth": {"accessToken": "rotated"}}),
+        )
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+
+        switcher.add_account()
+
+        assert "rotated" in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_empty_securestorage_dir_forces_default_store(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Defined-but-empty is claude's "force the default secure store":
+        unsuffixed keychain item and ``~/.claude/.credentials.json`` — even
+        though ``CLAUDE_CONFIG_DIR`` names a profile with its own seed."""
+        switcher = self._switcher(platform, monkeypatch)
+        switcher._write_credentials(ACTIVE_CREDS)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+        switcher.add_account()
+
+        assert ACTIVE_TOKEN in self._stored(switcher)
+        assert CONFIG_DIR_TOKEN not in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_securestorage_without_config_dir(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Securestorage alone moves only the credential read; identity still
+        resolves through the (default) config profile."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        get_global_config_path().write_text(CONFIG_DIR_CONFIG, encoding="utf-8")
+        monkeypatch.setenv(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR", str(self._secure_dir(tmp_path))
+        )
+
+        switcher.add_account()
+
+        assert "secure-store-token" in self._stored(switcher)
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_empty_selected_store_does_not_leak_config_profile(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """Defined-but-empty selects the default store; when that store is
+        credentialless, claude sees a logged-out environment — the config
+        profile's seed must not answer in its place."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+        with pytest.raises(CredentialReadError):
+            switcher.add_account()
+
+        assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
+
+    @pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
+    def test_credentialless_securestorage_default_dir_does_not_fall_back(
+        self, platform, temp_home: Path, tmp_path: Path, monkeypatch
+    ):
+        """A non-empty override naming ``~/.claude`` uses the *hashed* service
+        name (claude keys the suffix off env presence, not the path), so
+        neither the unsuffixed item nor the config profile's seed may answer."""
+        switcher = self._switcher(platform, monkeypatch)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(self._config_dir(tmp_path)))
+        monkeypatch.setenv(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR", str(Path.home() / ".claude")
+        )
+
+        with pytest.raises(CredentialReadError):
+            switcher.add_account()
+
+        assert "1" not in (switcher._get_sequence_data() or {}).get("accounts", {})
 
 class TestBootstrapRefreshRoutesThroughGate:
     """M2: the session-profile bootstrap refresh consumes the backup rt via

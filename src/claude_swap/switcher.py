@@ -75,6 +75,7 @@ from claude_swap.printer import (
 from claude_swap.paths import (
     get_backup_root,
     get_credentials_path,
+    get_default_claude_config_home,
     get_global_config_path,
     get_legacy_backup_root,
     migrate_legacy_backup_dir,
@@ -241,6 +242,20 @@ def _label_token_status(source: str, credentials: str) -> str | None:
     if status.startswith(prefix):
         return f"{source}: {status.removeprefix(prefix)}"
     return f"{source}: {status}"
+
+
+def _same_directory(left: Path, right: Path) -> bool:
+    """Whether two paths name the same directory, symlinks and ``..`` included.
+
+    Resolved rather than compared as strings: a ``$HOME`` reached through a
+    symlink spells the same directory two ways, and the caller is deciding
+    which profile a path belongs to — not deriving a keychain service name,
+    where claude hashes the raw value and resolving would be wrong.
+    """
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:  # unreadable mount / permission — compare as written
+        return left == right
 
 
 def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> None:
@@ -476,6 +491,77 @@ class ClaudeAccountSwitcher:
 
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
+
+    def _read_capture_credentials(self) -> str | None:
+        """Read the credential of the profile the environment points at.
+
+        ``add_account`` fills one slot from two reads: the identity out of
+        ``.claude.json`` and the credential out of the active store. The active
+        store's file backend follows ``CLAUDE_CONFIG_DIR`` (through
+        ``get_claude_config_home``), but its macOS Keychain backend is pinned to
+        the unsuffixed ``CLAUDE_CODE_KEYCHAIN_SERVICE``. So on macOS the two
+        reads land in different profiles and the slot ends up holding one
+        account's email against another account's token.
+
+        Read the OAuth credential the way claude resolves it for the same
+        environment, so the slot's email and token come from one profile.
+        Claude (2.1.220 ``getMacOsKeychainStorageServiceName``/storage-path
+        resolution) sources secure storage from ``CLAUDE_SECURESTORAGE_CONFIG_DIR``
+        when that is *defined*, else ``CLAUDE_CONFIG_DIR`` — with defined-but-empty
+        meaning the *default secure store* (unsuffixed Keychain item,
+        ``~/.claude/.credentials.json``). Not the active store: its file backend
+        follows ``CLAUDE_CONFIG_DIR``, which may point elsewhere. Identity stays
+        on ``CLAUDE_CONFIG_DIR`` either way; only the credential read moves.
+
+        Two fallbacks stay inside that profile. An env var naming the default
+        profile means the active store, since a user exporting
+        ``CLAUDE_CONFIG_DIR=~/.claude`` may only have the unsuffixed item.
+        A managed API key sits outside any OAuth store, and
+        :meth:`_reject_live_api_key_capture` still has to answer for one.
+
+        Strict on the keychain: an unreadable (not absent) entry raises
+        :class:`CredentialReadError` rather than silently capturing the
+        profile's possibly-stale plaintext seed — and rather than reaching the
+        fallbacks below, which belong to other stores entirely.
+
+        Read-only. cswap does not write claude's hashed keychain entry — see
+        the ``session`` module docstring for why.
+        """
+        from claude_swap.session import read_config_dir_credentials
+
+        secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+
+        if secure_env is not None:
+            # A defined override names the *only* store claude will read for
+            # this environment — defined-but-empty pins the default profile
+            # (unsuffixed keychain item, ``~/.claude/.credentials.json``). On
+            # a miss claude sees a logged-out environment, so no falling back
+            # into the active store: its file backend follows
+            # ``CLAUDE_CONFIG_DIR``, and with the two vars diverged that would
+            # capture a profile claude is not reading (cross-profile leak).
+            creds = read_config_dir_credentials(
+                secure_env or str(get_default_claude_config_home()),
+                strict_keychain=True,
+                keychain_service=CLAUDE_CODE_KEYCHAIN_SERVICE if not secure_env else None,
+            )
+            if creds:
+                return creds
+        elif not config_dir:
+            return self._read_credentials()
+        else:
+            creds = read_config_dir_credentials(config_dir, strict_keychain=True)
+            if creds:
+                return creds
+            if _same_directory(Path(config_dir), get_default_claude_config_home()):
+                # Safe only on this legacy path: the active store's env-following
+                # file backend and the default profile coincide here.
+                return self._read_credentials()
+        # Only this profile's own ``primaryApiKey`` — never the unsuffixed
+        # "Claude Code" Keychain item, which belongs to the default profile
+        # and would answer for a login that is not the one being added.
+        key = (self._read_json(get_global_config_path()) or {}).get("primaryApiKey")
+        return key if isinstance(key, str) else ""
 
     def _write_credentials(self, credentials: str) -> None:
         self._store._write_credentials(credentials)
@@ -2561,7 +2647,7 @@ class ClaudeAccountSwitcher:
                         f"Alias '{alias}' is already used by account {conflict}"
                     )
 
-            current_creds = self._read_credentials()
+            current_creds = self._read_capture_credentials()
             if current_creds is None:
                 raise CredentialReadError("Failed to read credentials for current account")
             if not current_creds:
@@ -2670,7 +2756,7 @@ class ClaudeAccountSwitcher:
                 )
 
         # Read new account credentials BEFORE any destructive operations
-        current_creds = self._read_credentials()
+        current_creds = self._read_capture_credentials()
         if current_creds is None:
             raise CredentialReadError("Failed to read credentials for current account")
         if not current_creds:
