@@ -545,6 +545,18 @@ class SessionManager:
                 self.switcher._invalidate_session_credentials(account_num, email)
                 (session_dir / STALE_MARKER).unlink(missing_ok=True)
             if self._is_session_valid(session_dir, email, org_uuid):
+                # Valid, but possibly not on the generation WE just paid for.
+                # The consume above runs outside this lock (it POSTs), so a
+                # peer `cswap run` can bootstrap while we wait — and its
+                # profile predates our rotation. Its refresh token is the one
+                # our gate consumed, so claude's own refresh would get
+                # invalid_grant on first use: a spent grant, silently.
+                # Validity is an identity check, not a generation check, so it
+                # cannot see this. Re-seed instead of returning early.
+                if not self._profile_matches_backup(
+                    session_dir, account_num, email
+                ):
+                    self._bootstrap(session_dir, account_num, email, org_uuid)
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
@@ -561,6 +573,29 @@ class SessionManager:
         # Lock released here, before any exec.
 
         return session_dir, account_num, email
+
+    def _profile_matches_backup(
+        self, session_dir: Path, account_num: str, email: str
+    ) -> bool:
+        """Is the profile on the same credential generation as the backup?
+
+        Compared by fingerprint, because that is what identifies a generation;
+        the identity (email/org) is the same across all of them, which is why
+        ``_is_session_valid`` cannot answer this.
+
+        Unknowable answers are TRUE — an unreadable backup or profile is not
+        evidence of a mismatch, and re-bootstrapping on one would throw away a
+        working profile over a read error.
+        """
+        from claude_swap import oauth as _oauth
+
+        profile = read_session_credentials(session_dir)
+        backup = self.switcher.read_account_credentials(account_num, email)
+        if not profile or not backup:
+            return True
+        return _oauth.credential_fingerprint(
+            profile
+        ) == _oauth.credential_fingerprint(backup)
 
     def _bootstrap(
         self, session_dir: Path, account_num: str, email: str, org_uuid: str
