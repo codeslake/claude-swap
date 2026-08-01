@@ -334,10 +334,38 @@ Examples:
                 print(dimmed("No cloud account pinned"))
             return
         account_num, email, org_uuid = switcher.resolve_account(args.account)
+        # Count BEFORE pinning: this is the last moment the old wiring is
+        # still what live sessions hold. Arming the proxy credential cuts off
+        # sessions that were launched without one — their HTTPS_PROXY is fixed
+        # at exec time — and an operator must hear that from the command that
+        # did it, not from a wave of unexplained failures later.
+        from claude_swap.pin_proxy import (
+            proxy_secret_path,
+            read_daemon_state,
+            sessions_wired_without_credential,
+        )
+
+        _certdir = switcher.backup_dir / "pin-proxy"
+        _will_arm = not proxy_secret_path(_certdir).exists()
+        _stranded = 0
+        if _will_arm:
+            _st = read_daemon_state(_certdir)
+            if _st and isinstance(_st.get("port"), int):
+                _stranded = sessions_wired_without_credential(_st["port"])
         # Saves the pin, starts the proxy, and records it where Claude Code
         # reads env at startup — so a `claude` launched by hand is pinned too,
         # with no settings.json edit, no shell rc, and no shim on PATH.
         started = apply_pin(switcher, email, org_uuid)
+        if _will_arm and _stranded:
+            print(
+                dimmed(
+                    f"The pin proxy now requires a credential. {_stranded} "
+                    "running session(s) were started before it and hold the "
+                    "old address; they cannot pick it up without a relaunch "
+                    "and will fail with 407 until then. `cc-update --apply "
+                    "--force` relaunches them in place."
+                )
+            )
         print(
             f"{accent('Pinned')} the cloud account (RC/artifacts) to "
             f"Account-{account_num} ({email})"
