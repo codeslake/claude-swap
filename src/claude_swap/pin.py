@@ -62,7 +62,20 @@ def _impl() -> ModuleType:
 
     try:
         found = importlib.util.find_spec("cswap_pin.proxy") is not None
-    except (ImportError, ValueError):
+    except ImportError as exc:
+        # find_spec has to IMPORT the parent package to read its __path__, so a
+        # cswap_pin/__init__.py that raises surfaces here rather than below —
+        # and swallowing it is what turns "your cryptography is broken" into
+        # "install the package you already have". Measured: a package root
+        # raising ImportError("No module named 'cryptography'") propagates out
+        # of find_spec, not out of import_module.
+        #
+        # e.name is what tells them apart: absent -> 'cswap_pin', broken root
+        # -> whatever the package failed to import.
+        if exc.name and not exc.name.startswith("cswap_pin"):
+            raise
+        found = False
+    except ValueError:
         found = False
     if not found:
         raise ClaudeSwitchError(_INSTALL_HINT)
@@ -104,6 +117,15 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         port, ca_path = pinned
         return pin.wire_env(env, port, ca_path)
     except Exception:  # noqa: BLE001 — never block the launch
+        # ensure_proxy RAISING (port bind failure, unwritable cert dir) left no
+        # cleanup, while ensure_proxy returning None got unwire_if_dead. Both
+        # mean no proxy this launch, and .claude.json's env block is applied at
+        # boot — so without this the child inherits a previous launch's wiring
+        # and dials the proxy that just failed to start.
+        try:
+            pin.unwire_if_dead(switcher.backup_dir / "pin-proxy")
+        except Exception:  # noqa: BLE001
+            pass
         return env
 
 
@@ -141,7 +163,7 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     restored, so a proxy the user or their launcher set beforehand comes back
     rather than being lost with ours.
     """
-    from claude_swap.claude_locks import claude_config_lock
+    from claude_swap.claude_locks import proper_lockfile
     from claude_swap.paths import (
         get_default_global_config_path,
         get_global_config_path,
@@ -160,13 +182,27 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     if default != paths[0]:
         paths.append(default)
 
-    # Under the same lock switcher.py takes for this file. `cswap switch`
-    # rewrites .claude.json too, so an unlocked read-modify-write here can
-    # land on top of a swap that happened between our read and our rename —
-    # losing the account change and leaving the config describing neither
-    # state.
-    with claude_config_lock(timeout=timeout):
-        return any([_clear_wiring_locked(switcher, p) for p in paths])
+    # ONE LOCK PER PATH, not one lock around both. claude_config_lock derives
+    # its lock directory from get_global_config_path(), so a single
+    # `with claude_config_lock()` around the loop guards the SESSION config
+    # while the default profile is rewritten unprotected — racing `cswap
+    # switch` and Claude Code, which is the whole-file clobber this lock
+    # exists to prevent. Measured: lock dir sess/.claude.json.lock, second
+    # path home/.claude.json.
+    changed = False
+    for path in paths:
+        try:
+            with proper_lockfile(
+                path.parent / (path.name + ".lock"), timeout=timeout
+            ):
+                if _clear_wiring_locked(switcher, path):
+                    changed = True
+        except Exception:  # noqa: BLE001
+            # A lock we cannot take is a reason to skip THIS file, not to
+            # abandon the other one — and on the launch path (sub-second
+            # budget) a contended config must not fail the clear outright.
+            continue
+    return changed
 
 
 def _clear_wiring_locked(switcher, path) -> bool:
@@ -226,12 +262,25 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # unusable" (a broken cryptography) is the other way a user ends up
         # here, and a traceback is the worst possible outcome for the one
         # command whose job is to work when the pin does not.
+        had_pin = False
         try:
-            _impl().apply_pin(switcher, None, None)
+            impl = _impl()
+            had_pin = impl.load_pin(switcher.backup_dir) is not None
+            impl.apply_pin(switcher, None, None)
         except Exception:  # noqa: BLE001
-            if not clear_wiring(switcher):
-                print(dimmed("No cloud account pinned"))
-                return 0
+            pass
+        # ALWAYS, not only when apply_pin failed. The package unwires through
+        # its own single-path resolver, so with the extra installed a --clear
+        # run from inside a session terminal cleared that session's config and
+        # left ~/.claude.json naming a dead port — while printing "Unpinned".
+        # The both-paths guarantee has to hold for the users who HAVE the pin,
+        # which is all of them at the moment they unpin.
+        #
+        # apply_pin cannot answer "was there anything to clear": it returns
+        # whether a proxy is now serving, which on this path is always False.
+        if not clear_wiring(switcher) and not had_pin:
+            print(dimmed("No cloud account pinned"))
+            return 0
         print(f"{accent('Unpinned')} the cloud account")
         return 0
 

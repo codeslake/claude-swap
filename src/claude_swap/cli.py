@@ -126,6 +126,10 @@ Examples:
     parser.add_argument("--clear", action="store_true", help="Remove the pin")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+    # `cswap pin 2 --clear` otherwise unpins and prints "Unpinned", giving no
+    # sign the 2 was discarded — indistinguishable from having pinned it.
+    if args.clear and args.account:
+        parser.error("--clear takes no account")
 
     from claude_swap.pin import run as pin_run
 

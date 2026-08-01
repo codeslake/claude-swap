@@ -88,6 +88,50 @@ class TestTheMissingExtraIsReported:
         with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[pin\]"):
             pin._impl()
 
+    def test_a_broken_package_ROOT_is_not_reported_as_missing(self, tmp_path):
+        """The breakage that actually happens is in the package ROOT, not the
+        submodule: cswap_pin/__init__.py imports cryptography.
+
+        find_spec has to IMPORT the parent to read its __path__, so that error
+        comes out of find_spec — not out of the import_module below it. The
+        sibling test stubs find_spec to succeed, so it proves nothing about
+        this path, and the bug it missed told users to install a package they
+        already had.
+
+        Real files, no stubs: stubbing find_spec is exactly what hid this.
+        """
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        pkg = tmp_path / "cswap_pin"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text(
+            "raise ImportError(\"No module named 'cryptography'\", "
+            "name='cryptography')"
+        )
+        (pkg / "proxy.py").write_text("")
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        code = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(tmp_path)!r})
+            sys.path.insert(0, {src!r})
+            from claude_swap import pin
+            from claude_swap.exceptions import ClaudeSwitchError
+            try:
+                pin._impl()
+            except ClaudeSwitchError as e:
+                sys.exit("told the user to install it: " + str(e))
+            except ImportError as e:
+                assert e.name == "cryptography", e.name
+                sys.exit(0)
+            sys.exit("no error at all")
+            """
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-400:] or r.stdout[-400:]
+
     def test_a_broken_dependency_is_not_reported_as_missing(self, monkeypatch):
         """The package is THERE and its own import fails (a missing
         cryptography). That must surface, not be rewritten into 'install the
@@ -334,6 +378,62 @@ class TestWindowsIsRejectedCleanly:
         monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: object())
         with pytest.raises(ClaudeSwitchError, match="Windows"):
             pin._impl()
+
+
+class TestClearReachesBothConfigsWithTheExtraINSTALLED:
+    """The two-path clear must hold for users who HAVE the pin.
+
+    clear_wiring only ran in the except branch, so on the happy path the
+    unwiring was done entirely by the package's own single-path resolver:
+    `cswap pin --clear` from inside a session terminal cleared that session's
+    config and left ~/.claude.json naming a dead port, while printing
+    "Unpinned". Everyone has the extra at the moment they unpin, so the
+    guarantee held for exactly nobody.
+    """
+
+    def test_the_default_profile_is_cleared_too(self, tmp_path, monkeypatch):
+        import types
+
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        def wired(where):
+            where.mkdir(parents=True, exist_ok=True)
+            cfg = where / ".claude.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "env": {"HTTPS_PROXY": "http://127.0.0.1:44444"},
+                        "_cswapPinWiredKeys": ["HTTPS_PROXY"],
+                    }
+                )
+            )
+            return cfg
+
+        session = wired(tmp_path / "session")
+        default = wired(tmp_path / "home")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
+
+        # The extra IS installed and apply_pin succeeds — the path that had no
+        # clear_wiring call at all. It unwires only what its own resolver sees.
+        def apply_pin(switcher, email, org):
+            session.write_text(json.dumps({"env": {}}))
+            return False
+
+        monkeypatch.setattr(
+            pin,
+            "_impl",
+            lambda: types.SimpleNamespace(
+                apply_pin=apply_pin, load_pin=lambda d: ("a@b.c", None)
+            ),
+        )
+        pin.run(ClaudeAccountSwitcher(), None, clear=True)
+        assert "_cswapPinWiredKeys" not in json.loads(default.read_text()), (
+            "the default profile stayed wired to a dead port while --clear "
+            "reported success"
+        )
 
 
 class TestClearRunsWithTheExtraGone:
