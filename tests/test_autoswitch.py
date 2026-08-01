@@ -558,7 +558,8 @@ class TestAdaptiveScheduler:
 
     @staticmethod
     def _counting_fetch(counts, usage_by_num, errors_by_num=None):
-        def fake(num, email, creds, is_active=False, persist_credentials=None):
+        def fake(num, email, creds, is_active=False, persist_credentials=None,
+                 **kwargs):
             counts[num] = counts.get(num, 0) + 1
             error = (errors_by_num or {}).get(num)
             if error:
@@ -2879,3 +2880,117 @@ class TestStoppedEngineDoesNotAct:
         sw.assert_not_called()
         assert outcome is TickOutcome.NO_ACTION
         assert harness.active_number() == 1
+
+class TestFreshenRoutesThroughGate:
+    """M2: autoswitch's freshen no longer POSTs a raw snapshot — it routes
+    through the switcher's consume gate (locked re-read + CAS persist)."""
+
+    def test_lock_contention_is_not_reported_as_network_trouble(
+        self, temp_home
+    ):
+        """Waiting on another gate is local, not a connection problem.
+
+        The consume lock serializes gates per slot; a loser defers. That is the
+        design working, and on a machine where the collector and a manual
+        `cswap switch` overlap it happens routinely. Reporting it as "could not
+        freshen any candidate (network?)" sends the user to check a connection
+        that is fine, for a condition no network change can affect.
+        """
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "consume-busy"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "consume-busy", (
+            f"got {status!r}: lock contention falls into the transient bucket "
+            "and reads as (network?)"
+        )
+
+    def test_invalid_client_is_not_reported_as_network_trouble(
+        self, temp_home
+    ):
+        """A rejected OAuth client must keep its own kind.
+
+        oauth.py splits ``invalid_client`` out from ``invalid_grant`` precisely
+        because it says nothing about any slot's refresh token — OUR client
+        credential was rejected, which is systemic and deterministic. But
+        _freshen_target maps every unrecognised kind to "transient", and a
+        transient freshen failure surfaces as "could not freshen any candidate
+        (network?)". A client_id rotation or block would then present as
+        intermittent network trouble on every machine at once, with nothing
+        naming the real cause — the same trap ``store-unmirrored`` was given
+        its own kind to escape.
+        """
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "invalid_client"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "invalid_client", (
+            f"got {status!r}: a systemic client rejection falls into the "
+            "transient bucket and reads as (network?)"
+        )
+
+    def test_store_unmirrored_keeps_its_own_kind(self, temp_home):
+        """The precedent this mirrors, pinned so the two stay symmetric."""
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "store-unmirrored"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "store-unmirrored"
+
+    def test_a_real_transient_still_reads_transient(self, temp_home):
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "transient"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "transient"
+
+    def test_freshen_calls_consume_gate(self, temp_home, monkeypatch):
+        from claude_swap import oauth as oauth_mod
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
+        eng = harness.engine
+        gate_calls = {}
+        fresh = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-y", "refreshToken": "rt-y",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        def gate(num, email, snapshot):
+            gate_calls["args"] = (num, email, snapshot)
+            return oauth_mod.RefreshOutcome(fresh, None)
+
+        harness.switcher.consume_backup_grant = gate
+        direct = {}
+        def direct_post(*a, **k):
+            direct["called"] = True
+            return oauth_mod.RefreshOutcome(None, "transient")
+
+        monkeypatch.setattr(
+            oauth_mod, "try_refresh_oauth_credentials", direct_post
+        )
+        verdict = eng._freshen_target("2", "b@example.com")
+        assert verdict == "ok"
+        assert gate_calls["args"][0] == "2"
+        assert "called" not in direct, "freshen must not POST outside the gate"

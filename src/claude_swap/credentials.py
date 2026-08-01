@@ -82,10 +82,17 @@ class ActiveCredentials(NamedTuple):
     (locked / denied / timeout) and nothing else covered it — letting callers
     distinguish a transiently unreadable Keychain from a genuinely empty slot,
     instead of collapsing both into a misleading "no credentials".
+    ``degraded`` is True whenever the OAuth Keychain read failed, even when a
+    fallback covered it: the bytes served may then be a stale generation (on
+    macOS Claude Code rotates keychain-only, so the plaintext file can lag).
+    A degraded credential may be adopted or served, but its refresh token
+    must never be consumed — POSTing a superseded one-time rt yields
+    invalid_grant and a false dead-token strike on a live account.
     """
 
     value: str | None
     keychain_unavailable: bool
+    degraded: bool = False
 
 
 def looks_like_api_key(credentials: str | None) -> bool:
@@ -234,6 +241,11 @@ class CredentialStore:
         # re-probe the Keychain (see KEYCHAIN_RECHECK_COOLDOWN_S). 0.0 = no
         # pending re-probe (never failed, or forced to file mode deliberately).
         self._keychain_disabled_until: float = 0.0
+        # Whether file mode was CHOSEN by us (a write fell back and we
+        # deleted the Keychain item) rather than forced by a failed read. Both
+        # stick, but only the failure means the file may be behind Claude
+        # Code's own writes — see _read_active_credentials.
+        self._file_mode_is_ours: bool = False
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -299,6 +311,7 @@ class CredentialStore:
         """
         self._keychain_usable_cache = False
         self._keychain_disabled_until = 0.0
+        self._file_mode_is_ours = True
 
     def _read_credentials(self) -> str | None:
         """Read Claude Code's active credential — OAuth *or* managed API key (value).
@@ -363,30 +376,43 @@ class CredentialStore:
             val, keychain_failed = self._read_active_oauth_keychain()
             if val:
                 return ActiveCredentials(val, False)
-        elif self._host.platform == Platform.MACOS:
+        elif self._host.platform == Platform.MACOS and not self._file_mode_is_ours:
             # Keychain already known unusable this process (a prior op failed and the
             # capability cache stuck to file mode): if nothing is found below, that
             # absence is "keychain unavailable", not a genuinely empty slot.
+            #
+            # Excludes a file mode WE pinned. There the premise is inverted:
+            # nothing failed, we wrote the credential to the file deliberately
+            # and deleted the Keychain item, and that file is what Claude Code
+            # reads too — so it is the authority, not a copy that may be behind.
+            # Without this the two conditions share one flag, and because
+            # _pin_file_mode is permanent by design a single file-mode write
+            # would defer every active-token refresh for the rest of the
+            # process (measured: the guard in _fetch_active_usage fires on
+            # every subsequent collect pass).
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
+        # After a FAILED keychain read this file may hold a stale generation
+        # (CC writes rotations keychain-only on macOS) — the flag travels as
+        # ``degraded`` so consume paths refuse these bytes.
         cred_file = get_credentials_path()
         if cred_file.exists():
             try:
                 text = cred_file.read_text(encoding="utf-8")
             except Exception as e:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
-                return ActiveCredentials(None, False)
+                return ActiveCredentials(None, False, keychain_failed)
             if text.strip():
-                return ActiveCredentials(text, False)
+                return ActiveCredentials(text, False, keychain_failed)
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
         if key:
-            return ActiveCredentials(key, False)
+            return ActiveCredentials(key, False, keychain_failed)
         # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
         # UI distinguishes it from a real empty slot.
-        return ActiveCredentials("", keychain_failed)
+        return ActiveCredentials("", keychain_failed, keychain_failed)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -877,6 +903,39 @@ class CredentialStore:
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
 
+    def _read_account_credentials_ex(
+        self, account_num: str, email: str
+    ) -> tuple[str, bool]:
+        """Backup read with an unreadable-vs-absent verdict.
+
+        Returns ``(value, unreadable)``. ``unreadable`` is True only when the
+        ``.enc`` had nothing AND the macOS Keychain read *raised* (locked /
+        denied / timeout) — the backup may exist but cannot be seen right
+        now. A genuinely absent backup (no .enc, keychain answered "not
+        found") reads as ``("", False)``. Callers use the distinction to say
+        "keychain unavailable — retry from a GUI session" instead of
+        nudging the user into an unnecessary re-add/re-login.
+        """
+        value = self._read_account_credentials(account_num, email)
+        if value:
+            return value, False
+        if self._host.platform != Platform.MACOS:
+            return "", False
+        # The read above already consulted the Keychain; a raising read
+        # flipped the capability cache to file mode, while an rc-44
+        # "not found" answered cleanly and left it usable. A cache pinned
+        # False (now or by an earlier op) means the Keychain cannot be
+        # asked — the backup may exist unseen, so report unreadable.
+        # Excludes a file mode WE pinned, exactly as _read_active_credentials
+        # does: there nothing failed, we wrote the credential to the file
+        # deliberately, and that file is the authority. Sharing the raw flag
+        # made one deliberate file-mode write report every genuinely empty
+        # backup as unreadable for the rest of the process — and the consume
+        # gate answers "transient" for a slot that simply has no backup.
+        if self._keychain_usable_cache is False and not self._file_mode_is_ours:
+            return "", True
+        return "", False
+
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> None:
@@ -1182,3 +1241,29 @@ class CredentialStore:
         except OSError:
             pass
         return entries
+
+    def _read_unclaimed_credential(self, entry_id: str) -> str:
+        """Decode one stashed credential's bytes; "" when unreadable/absent."""
+        try:
+            encoded = self._stash_entry_path(entry_id).read_text(
+                encoding="utf-8"
+            ).strip()
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
+        except Exception as e:
+            self._host._logger.warning(
+                f"Failed to read unclaimed credential {entry_id}: {e}"
+            )
+            return ""
+
+    def _remove_unclaimed_credential(self, entry_id: str) -> None:
+        """Delete a stash entry (bytes + manifest row) after it was adopted."""
+        try:
+            self._stash_entry_path(entry_id).unlink(missing_ok=True)
+        except OSError as e:
+            self._host._logger.warning(
+                f"Failed to remove unclaimed credential {entry_id}: {e}"
+            )
+        entries = self._read_stash_manifest()
+        if entry_id in entries:
+            del entries[entry_id]
+            self._write_stash_manifest(entries)

@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from claude_swap import __version__
+from claude_swap import __version__, oauth
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
@@ -476,11 +476,7 @@ def import_accounts(
         if existing_slot is not None:
             if force:
                 outcome = "overwrote"
-            elif (
-                switcher._usage_store.entries(
-                    {existing_slot: (entry["email"], entry["org_uuid"])}
-                )[existing_slot].token_dead()
-            ):
+            elif switcher._slot_token_dead(existing_slot, entry["email"]):
                 # Narrow auto-heal (issue #136): a plain import replaces a
                 # slot iff its identity-matched usage row is quarantined as
                 # refresh-token-dead. The verdict normally postdates the
