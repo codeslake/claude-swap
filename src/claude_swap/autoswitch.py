@@ -106,6 +106,72 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+def _recovery_is_useful(
+    candidate_recovery_ts: float,
+    active_recovery_ts: float,
+    active_headroom: float,
+    best_candidate_headroom: float,
+    threshold: float,
+    now: float,
+) -> bool:
+    """Rank THIS candidate by soonest reset, or by headroom?
+
+    One place, because four independent gates over two axes produce sixteen
+    combinations and a review found reachable holes in four of them. Each
+    clause below is a hole that was measured, not a hypothesis.
+
+    Reset wins when:
+
+    * **Everything is spent.** Below ``SPENT_HEADROOM_PCT`` a headroom edge is
+      under ten minutes of work — less than two poll intervals — so comparing
+      two spent accounts compares noise, and the only real question is which
+      returns first. Asked of the active and the BEST candidate — "is there
+      anything worth having?" — not of every account. Requiring EVERY account
+      to be spent made the answer non-monotone in headroom (2/2/3.0 took the
+      soonest reset; improving one peer to 3.5 flipped the axis and parked on
+      the account resetting 59h later) and let one unknown headroom — a
+      sentinel row, a locked keychain — veto the check for everybody, which
+      parked three accounts at 99% on the one resetting LAST. The maximum
+      answers both: an unknown is not a maximum, and a peer improving can only
+      move the answer toward "keep the headroom".
+    * **This candidate is back soon.** Asked per candidate, not once on the
+      active: an active bound by its WEEKLY window sits days out while a
+      peer's five-hour window returns in minutes, and asking the active
+      refused that peer — the #202 case this is supposed to preserve.
+
+    Past the horizon we rank by headroom and, when no candidate can meet the
+    ratio, nobody qualifies — deliberately. An active holding materially more
+    quota than any peer can offer SHOULD keep the work; that is the whole
+    finding this horizon encodes. The one thing that must not happen is the
+    engine parking while a peer holds meaningfully more, and the ratio cannot
+    produce that: it is unreachable only when the active already holds more
+    than half of what the threshold permits, i.e. more than any candidate.
+
+    KNOWN RESIDUE, deliberately left: inside the spent band the axis is the
+    reset, above it the ratio, and the step between them is not monotone —
+    2 / 2 / 3.0 switches to the soonest reset while 2 / 2 / 3.5 parks, because
+    3.5 leaves the spent band without meeting 2x. Every fix tried was worse:
+    ranking that band by reset re-armed the days-away trade for 9 / 10 / 10
+    and broke the return-leg flap guard. The band is 0.5 points wide at the
+    default constants and both outcomes keep a working account, so it is
+    recorded rather than papered over.
+
+    An UNKNOWN active recovery (``inf``, which also means "already elapsed")
+    deliberately does NOT keep the recovery axis. It used to, and that re-armed
+    the exact trade this horizon forbids: 9 points of headroom for a peer
+    resetting 50h out, whenever the active's ``resets_at`` was missing or
+    stale. No evidence a sooner reset helps is a reason to keep the headroom,
+    not to spend it.
+    """
+    if active_headroom <= SPENT_HEADROOM_PCT and best_candidate_headroom <= (
+        SPENT_HEADROOM_PCT
+    ):
+        return True
+    if candidate_recovery_ts - now <= RECOVERY_HORIZON_S:
+        return True
+    return False
+
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -1171,21 +1237,28 @@ class AutoSwitchEngine:
         all_above = _every_account_above_threshold(
             oauth_candidates, headroom, active_headroom, settings.threshold
         )
+        # The most headroom any candidate offers — "is there anything worth
+        # having?" Unknown headrooms are excluded rather than counted as zero:
+        # a row we cannot read is not evidence of an empty account.
+        best_candidate_headroom = max(
+            (h for h in (headroom.get(n) for n in oauth_candidates) if h is not None),
+            default=0.0,
+        )
         active_recovery_ts = (
             _binding_recovery_ts(usage.get(current), self._models, now)
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
-        # The horizon asks whether a sooner reset is worth REAL headroom, so
-        # it only applies while real headroom exists — hence the spent check
-        # first. An UNKNOWN recovery is no evidence rather than a distant one,
-        # so it keeps the recovery axis.
-        recovery_useful = all_above and (
-            all(h is not None and h <= SPENT_HEADROOM_PCT for h in headroom.values())
-            or active_recovery_ts == float("inf")
-            or active_recovery_ts - now <= RECOVERY_HORIZON_S
-        )
+        # The headrooms the ranking may actually choose between: the active,
+        # plus every candidate whose headroom is KNOWN. An unknown one is not
+        # evidence that somebody has quota left — the loop skips it a few
+        # lines down for exactly that reason — so it must not veto the spent
+        # check either. Measured: one sentinel row (expired token, locked
+        # keychain) made `all(...)` False forever, and three accounts at 99%
+        # days out left the engine parked on the one resetting LAST.
+
         qualifying: list[tuple[tuple, str]] = []
+        axis_recovery: dict[str, bool] = {}  # per candidate, set in the loop
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -1221,26 +1294,33 @@ class AutoSwitchEngine:
                     # binding recovery, two different axes, and left
                     # consume-first users with no anti-flap guard at all.)
                     #
-                    # Hysteresis measured on the axis we actually rank by. A
-                    # headroom margin is unmeetable here by construction —
-                    # everything is in the last few percent, so no candidate can
-                    # be 10 points better — and applying it would block the
-                    # escape rather than protect anything. The flap it exists to
-                    # prevent is still prevented: the target must come back
-                    # meaningfully sooner than where we are, so the reverse move
-                    # never qualifies.
-                    if (
-                        recovery_useful
-                        and recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S
-                    ):
-                        continue
-                    if not recovery_useful and h < (
-                        (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO
-                    ):
-                        # Headroom axis instead, with its own anti-flap margin:
-                        # a target must hold HORIZON_HEADROOM_RATIO times what
-                        # we do, so the reverse move can never qualify.
-                        continue
+                    # WHICH AXIS is decided per candidate, in one place — see
+                    # _recovery_is_useful for the four holes that came from
+                    # deciding it once, globally, from four scattered gates.
+                    by_recovery = _recovery_is_useful(
+                        recovery_ts,
+                        active_recovery_ts,
+                        active_headroom or 0.0,
+                        best_candidate_headroom,
+                        settings.threshold,
+                        now,
+                    )
+                    axis_recovery[num] = by_recovery
+                    if by_recovery:
+                        # Hysteresis on the axis we actually rank by. It bounds
+                        # the flap RATE rather than making a reverse move
+                        # impossible: the target must come back meaningfully
+                        # sooner than where we are.
+                        if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
+                            continue
+                    else:
+                        # Headroom axis, with a RATIO margin. Also a rate bound,
+                        # not impossibility — headroom moves, so a target that
+                        # burns down to a quarter of what it beat can qualify
+                        # in reverse. That takes a 4x relative burn instead of
+                        # the one point a strictly-greater test would need.
+                        if h < (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO:
+                            continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
@@ -1258,7 +1338,7 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if recovery_useful and trigger in ("proactive", "consume-first"):
+            if axis_recovery.get(num) and trigger in ("proactive", "consume-first"):
                 # Soonest BINDING recovery first — the window actually holding
                 # this account back, not the weekly one. With everything in the
                 # 90s the only thing worth optimizing is how long until work can
@@ -1269,7 +1349,23 @@ class AutoSwitchEngine:
                 # which skip that gate deliberately: there the account with the
                 # most headroom must win, because we are escaping a dead or
                 # blocked active account rather than optimising a return time.
-                key: tuple = (recovery_ts, -h)
+                #
+                # TIER 0. The axis is per candidate, so the key must stay
+                # comparable across both: a candidate that returns inside the
+                # horizon beats one that does not, whatever its headroom, and
+                # ties are broken by how soon. Without the tier the two key
+                # SHAPES were compared elementwise — a raw headroom against an
+                # epoch timestamp — and the headroom candidate always won on
+                # magnitude alone.
+                key: tuple = (0, recovery_ts, -h)
+            elif all_above and trigger in ("proactive", "consume-first"):
+                # TIER 1: ranked on HEADROOM, because that is what its gate
+                # decided on. Falling through to the consume-first weekly key
+                # split the filter and the sort across two axes — the same
+                # mismatch the comment above records as a prior bug — and
+                # picked the candidate with LESS headroom whenever its weekly
+                # reset happened to be sooner.
+                key = (1, 0.0, -h)
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
