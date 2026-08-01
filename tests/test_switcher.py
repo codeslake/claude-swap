@@ -1023,7 +1023,12 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "no credentials" in output
+        # The state, and what to do about it. It used to print the bare
+        # words "no credentials", which name the problem and stop there —
+        # and the fix people reach for (/login on whatever account is
+        # active) writes the login to the wrong slot.
+        assert "no stored login" in output
+        assert "switch here" in output
 
     def test_list_never_writes_live_while_claude_code_running(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict

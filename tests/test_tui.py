@@ -2133,14 +2133,17 @@ class TestUnswitchableRowsAreListed:
         with patch.object(AutoScreen, "app", property(lambda s: app)):
             return str(v._candidates_text(snap, active_number=active))
 
-    def test_a_credential_less_slot_is_shown_with_both_steps(self):
+    def test_a_credential_less_slot_is_shown_with_what_to_do(self):
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
             self._acct("4", "new@x.com", switchable=False),
         ), active="1")
         assert "new@x.com" in out, "the slot must not be hidden"
-        # /login alone leaves the slot empty; the row has to say both steps.
-        assert "cswap add" in out
+        # Naming the state is not enough — "no credentials" leaves the user
+        # to guess, and the obvious guess (/login right where you are) writes
+        # the login to whatever slot is active instead of this one.
+        assert "switch here" in out
+        assert "log in" in out
 
     def test_an_api_key_slot_says_api_key_not_re_login(self):
         out = self._render(self._snap(
