@@ -528,10 +528,26 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             import sys
             sys.path.insert(0, {src!r})
             from claude_swap import pin
-            assert pin.is_available() is False, "saw a package that is not there"
+            # _impl refuses on win32 BEFORE it looks for the package, so
+            # is_available is False there no matter what gets installed —
+            # a cross-platform claim cannot be tested through a
+            # platform-gated function. Assert on the resolution step, which
+            # is what invalidate_caches actually affects. (Measured: this is
+            # why the Windows runner failed while linux and macos passed.)
+            import importlib, importlib.util
+            def resolvable():
+                importlib.invalidate_caches()
+                try:
+                    return importlib.util.find_spec("cswap_pin.proxy") is not None
+                except ImportError:
+                    return False
+            assert resolvable() is False, "saw a package that is not there"
             # The install: a path entry that did not exist when we started.
             sys.path.insert(0, {str(tmp_path / "late")!r})
-            assert pin.is_available() is True, "a restart should not be required"
+            assert resolvable() is True, "a restart should not be required"
+            # And the seam honours it on any platform that has the pin at all.
+            if sys.platform != "win32":
+                assert pin.is_available() is True
             sys.exit(0)
             """
         )
