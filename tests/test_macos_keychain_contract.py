@@ -28,6 +28,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap.models import Platform
+from claude_swap.json_output import USAGE_NO_CREDENTIALS
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -281,3 +282,41 @@ def test_wrapper_roundtrip_real_keychain(tmp_keychain: str):
     assert macos_keychain.get_password("claude-swap-test", "acct-1") == "round-trip-token"
     macos_keychain.delete_password("claude-swap-test", "acct-1")
     assert macos_keychain.get_password("claude-swap-test", "acct-1") is None
+
+
+class TestOurOwnFileModeIsNotAKeychainFailure:
+    """A file mode WE pinned must not read as "the Keychain is unreadable".
+
+    ``_pin_file_mode`` sets the capability cache False deliberately and
+    permanently — nothing failed, we wrote the credential to the file, and that
+    file is what Claude Code reads too. ``_read_active_credentials`` already
+    excludes that case via ``_file_mode_is_ours``; two sibling sites read the
+    raw flag instead, so ONE deliberate file-mode write made every genuinely
+    empty backup report "keychain unavailable" for the rest of the process —
+    and made the consume gate answer ``transient`` for a slot with no backup
+    at all.
+    """
+
+    def test_an_empty_backup_stays_empty_after_our_own_file_mode_write(
+        self, macos_switcher
+    ):
+        store = macos_switcher._store
+        store._pin_file_mode()  # OUR write; nothing failed
+        _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
+        assert unreadable is False
+
+    def test_a_real_keychain_failure_still_reports_unreadable(self, macos_switcher):
+        store = macos_switcher._store
+        store._keychain_usable_cache = False  # a read FAILED
+        _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
+        assert unreadable is True
+
+    def test_a_missing_slot_is_no_credentials_not_keychain_unavailable(
+        self, macos_switcher
+    ):
+        """Same conflation on the display path."""
+        macos_switcher._store._pin_file_mode()
+        verdict = macos_switcher._static_usage_sentinel(
+            ("9", "x@e.com", None, None, False, "", None)
+        )
+        assert verdict == USAGE_NO_CREDENTIALS, verdict
