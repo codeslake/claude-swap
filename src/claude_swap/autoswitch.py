@@ -88,32 +88,22 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # it needs its own unit rather than a reused one.
 RECOVERY_HYSTERESIS_S = 300.0
 
-# Horizon past which "soonest recovery" stops being worth real headroom. The
-# escape above was measured on minutes-scale resets (#202: a peer back in 8
-# minutes). Days-scale is the opposite trade — measured live, active 91% /
-# 109h lost to 98% / 50h, and neither returns within the session, so the 9
-# points were the only resource that could still work. 4h covers a whole
-# 5-hour cycle, so same-day resets keep the recovery ranking.
+# Horizon past which a sooner reset stops being worth real headroom. The escape
+# above was measured on minutes-scale resets; days-scale is the opposite trade,
+# since neither account returns within the session. 4h covers a whole 5-hour
+# cycle, so same-day resets keep the recovery ranking.
 RECOVERY_HORIZON_S = 4 * 3600.0
 
-# Anti-flap margin for the headroom axis past RECOVERY_HORIZON_S, as a RATIO
-# rather than percentage points. Requiring strictly-more is no margin at all:
-# one point is enough to move, the target burns it back, and the engine
-# ping-pongs (measured 2026-07-30: four switches in 35 minutes, each buying one
-# point and each costing a credential rewrite). A ratio makes the move one-way
-# — the reverse leg would need the new active to fall to a quarter of the
-# headroom it just beat.
+# Anti-flap margin on the headroom axis, as a RATIO rather than percentage
+# points: strictly-more is no margin at all — one point moves the engine, the
+# target burns it back, and it ping-pongs. A ratio makes the move one-way.
 HORIZON_HEADROOM_RATIO = 2.0
 
-# Below this much headroom an account is spent for practical purposes, and
-# comparing headroom between two spent accounts compares noise: at the burn
-# rates measured on 2026-07-30 a one-point edge is under ten minutes of work,
-# less than two poll intervals. When EVERY candidate is down here the ranking
-# has to fall back to the reset — sit where the quota returns first, so the
-# reset finds us already on it — no matter how far out that reset is. Without
-# this, three accounts at 99% left the engine with no qualifying candidate and
-# it parked on whichever it happened to hold, including the one resetting
-# 59 hours after a peer.
+# Below this an account is spent, and headroom comparisons between two spent
+# accounts compare noise (a point is under ten minutes of work, less than two
+# poll intervals). When EVERY candidate is down here, rank by reset instead —
+# sit where quota returns first, however far out — rather than parking on
+# whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
@@ -1186,15 +1176,12 @@ class AutoSwitchEngine:
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
-        # all_spent is checked first: the horizon asks whether a sooner reset
-        # is worth REAL headroom, which only arises while real headroom exists.
-        # An UNKNOWN recovery is no evidence rather than a distant one, so it
-        # keeps the recovery axis. See SPENT_HEADROOM_PCT, RECOVERY_HORIZON_S.
-        all_spent = all_above and all(
-            h is not None and h <= SPENT_HEADROOM_PCT for h in headroom.values()
-        )
+        # The horizon asks whether a sooner reset is worth REAL headroom, so
+        # it only applies while real headroom exists — hence the spent check
+        # first. An UNKNOWN recovery is no evidence rather than a distant one,
+        # so it keeps the recovery axis.
         recovery_useful = all_above and (
-            all_spent
+            all(h is not None and h <= SPENT_HEADROOM_PCT for h in headroom.values())
             or active_recovery_ts == float("inf")
             or active_recovery_ts - now <= RECOVERY_HORIZON_S
         )
