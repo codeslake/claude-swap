@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.widgets import ListItem, Static
 
-from claude_swap import pace
+from claude_swap import pace, pin
 from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
@@ -277,18 +277,6 @@ def account_card_text(
     return text
 
 
-def _cloud_pinned_email(app) -> str | None:
-    """Email of the cloud-pinned account, or None.
-
-    Delegates to :func:`claude_swap.pin.pinned_email`, which never raises: a
-    missing extra, a missing pin and a malformed pin file all render as no
-    badge, because with no pin there is nothing for the badge to say.
-    """
-    from claude_swap import pin
-
-    return pin.pinned_email(app.switcher)
-
-
 def mini_account_text(
     acc: AccountSnapshot,
     now: float,
@@ -394,7 +382,7 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         blocks: list[Text] = []
-        pinned_email = _cloud_pinned_email(app)
+        pinned_email = pin.pinned_email(app.switcher)
         for acc in snap.accounts:
             pinned = bool(pinned_email and acc.email == pinned_email)
             if acc.is_active:
@@ -435,7 +423,7 @@ class AccountCard(Static):
         self.refresh(layout=True)
 
     def render(self) -> Text:
-        pinned_email = _cloud_pinned_email(self.app)
+        pinned_email = pin.pinned_email(self.app.switcher)
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),
