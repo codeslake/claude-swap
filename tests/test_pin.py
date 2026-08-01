@@ -78,8 +78,23 @@ class TestImportSafeWithoutTheExtra:
         assert r.returncode == 0, r.stderr[-900:]
 
 
+@pytest.fixture
+def posix(monkeypatch):
+    """Force the POSIX branch of _impl.
+
+    Everything in this class tests how the optional dependency is RESOLVED,
+    which is platform-independent — but on Windows _impl refuses before it
+    gets there, so the resolution logic would go untested on exactly one CI
+    runner. Pinning the platform tests the logic on all three rather than
+    skipping it where it happens not to run.
+    """
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "platform", "linux")
+
+
 class TestTheMissingExtraIsReported:
-    def test_impl_raises_the_install_hint(self, monkeypatch):
+    def test_impl_raises_the_install_hint(self, posix, monkeypatch):
         import importlib.util
 
         from claude_swap import pin
@@ -115,6 +130,7 @@ class TestTheMissingExtraIsReported:
         code = textwrap.dedent(
             f"""
             import sys
+            sys.platform = "linux"
             sys.path.insert(0, {str(tmp_path)!r})
             sys.path.insert(0, {src!r})
             from claude_swap import pin
@@ -132,7 +148,7 @@ class TestTheMissingExtraIsReported:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr[-400:] or r.stdout[-400:]
 
-    def test_a_broken_dependency_is_not_reported_as_missing(self, monkeypatch):
+    def test_a_broken_dependency_is_not_reported_as_missing(self, posix, monkeypatch):
         """The package is THERE and its own import fails (a missing
         cryptography). That must surface, not be rewritten into 'install the
         pin extra' — advice that would be wrong."""
@@ -280,6 +296,11 @@ class TestTheWiringCanAlwaysBeRemoved:
         assert env == {"A": "1"}
         assert waited < 3.0, f"a contended launch blocked for {waited:.2f}s"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="NTFS has no POSIX mode bits; switcher._write_json skips the "
+        "chmod on win32 for the same reason",
+    )
     def test_the_config_is_not_left_world_readable(self, tmp_path, monkeypatch):
         """It can hold primaryApiKey and inline MCP credentials; a plain write
         takes the umask and rename publishes that mode."""
@@ -334,9 +355,18 @@ class TestTheLaunchPathIsWired:
             captured["env"] = env
             raise SystemExit(0)
 
+        # _exec forks two ways — execvpe on POSIX, subprocess.run on Windows —
+        # and the pin has to be wired on BOTH. Stub whichever this platform
+        # actually takes, rather than skipping the Windows runner and leaving
+        # that branch unasserted.
         monkeypatch.setattr(session_mod.os, "execvpe", fake_execvpe)
+        monkeypatch.setattr(
+            session_mod.subprocess,
+            "run",
+            lambda argv, env=None, **kw: fake_execvpe(argv[0], argv, env),
+        )
         with pytest.raises(SystemExit):
-            self._manager(temp_home)._exec("/bin/claude", [], env={"A": "1"})
+            self._manager(temp_home)._exec("claude", [], env={"A": "1"})
         assert captured["env"].get("HTTPS_PROXY") == "http://127.0.0.1:9955", (
             "the launch path does not wire the pin — `cswap run` goes out unpinned"
         )
@@ -349,11 +379,14 @@ class TestTheLaunchPathIsWired:
             raise RuntimeError("pin exploded")
 
         monkeypatch.setattr(pin_mod, "wire_launch_env", boom)
-        monkeypatch.setattr(
-            session_mod.os, "execvpe", lambda b, a, e: (_ for _ in ()).throw(SystemExit(0))
-        )
+
+        def launched(*a, **kw):
+            raise SystemExit(0)
+
+        monkeypatch.setattr(session_mod.os, "execvpe", launched)
+        monkeypatch.setattr(session_mod.subprocess, "run", launched)
         with pytest.raises((SystemExit, RuntimeError)) as exc:
-            self._manager(temp_home)._exec("/bin/claude", [], env={"A": "1"})
+            self._manager(temp_home)._exec("claude", [], env={"A": "1"})
         assert exc.type is SystemExit, "a pin failure blocked the launch"
 
 
