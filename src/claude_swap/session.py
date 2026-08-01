@@ -424,6 +424,13 @@ class SessionManager:
             if pinned:
                 port, ca_path = pinned
                 env = pin_proxy.wire_env(env, port, ca_path)
+            else:
+                # No pin this launch. If a previous one left the global config
+                # pointing at a proxy that is no longer there, clear it now —
+                # Claude Code applies that env block at boot, so a stale entry
+                # would make this session dial a dead port and retry forever
+                # instead of simply running unpinned.
+                pin_proxy.unwire_if_dead(self.switcher.backup_dir / "pin-proxy")
         except Exception as e:  # noqa: BLE001 — never block the launch
             warning(f"remote-control pin disabled for this launch: {e}")
         argv = [claude_bin, *claude_args]
