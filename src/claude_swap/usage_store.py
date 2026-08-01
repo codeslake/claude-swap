@@ -154,8 +154,11 @@ BACKOFF_MAX_SHIFT = 32
 # and a fraction of that shrinks toward zero exactly when it matters.
 RETRY_AFTER_MARGIN_S = 900.0
 # Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
-# account for hours. Sized to clear the measured shape exactly: every observed
-# block opens at 3600, and 3600 + 900 = this. Above that the cap starts eating
+# account for hours. Sized to clear the measured shape: 37 of 39 observed
+# blocks opened at exactly 3600, and 3600 + 900 = this. At an ask of exactly
+# this value the margin is already fully eaten, and beyond it the wait is
+# SHORTER than the server asked — a guaranteed 429, costing one request rather
+# than a fresh hour (probing does not re-arm a block). Above 3600 the cap eats
 # the margin (a 3700s ask keeps only +800s), which is deliberate — an ask past
 # the measured window is already outside the evidence, and bounding it matters
 # more there than preserving a margin derived from hour-scale blocks. If real
@@ -454,6 +457,10 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     # RESIDUE: an hour-scale block whose REMAINDER falls under BACKOFF_CAP_S
     # takes no margin and still retries near its deadline. Nothing local
     # separates that ask from a genuine short burst block, so it is left open.
+    # It is worst on a machine's FIRST poll into another machine's block: at
+    # one failure the curve adds nothing, while at 6+ it carries the wait to
+    # BACKOFF_CAP_S and clears the deadline incidentally. Never retries EARLY,
+    # so the cost is a landing-on-the-deadline probe, not a lost hour.
     asked = retry_after_s
     if retry_after_s > BACKOFF_CAP_S:
         asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)

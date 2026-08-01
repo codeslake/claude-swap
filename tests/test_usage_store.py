@@ -409,9 +409,16 @@ class TestBackoff:
         # at exactly 3600), while short blocks were separately measured as
         # accurate — Retry-After 300 meant a 300s block. Inflating those on no
         # evidence is still wrong; the margin now stays off them by applying
-        # only at or above BACKOFF_CAP_S rather than by scaling with the ask.
+        # only ABOVE BACKOFF_CAP_S (strictly — an ask OF exactly that is what
+        # the saturated curve already waits) rather than by scaling with the ask.
         assert usage_store._failure_backoff_s(1, 300.0) == 300.0
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 == 900.0
+        # The boundary itself, both sides. Without this the > / >= mutation
+        # survives this whole file and only trips an unrelated scheduler test,
+        # whose failure message says nothing about backoff.
+        cap = usage_store.BACKOFF_CAP_S
+        assert usage_store._failure_backoff_s(1, cap) == cap
+        assert usage_store._failure_backoff_s(1, cap + 1.0) == cap + 1.0 + 900.0
 
     def test_margin_survives_a_mid_block_observation(self):
         # The margin exists to land past a FIXED deadline, and Retry-After is a
