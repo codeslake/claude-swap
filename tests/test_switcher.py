@@ -5061,8 +5061,16 @@ class TestSwitchSkipsBrokenSlots:
         assert s._get_sequence_data()["activeAccountNumber"] == 1
         assert (temp_home / ".claude" / ".credentials.json").exists()
 
-    def test_switch_to_slot_missing_only_config_also_lands(self, temp_home: Path):
-        """Same rule when the config backup is the missing half."""
+    def test_a_missing_config_backup_does_not_cost_the_login(
+        self, temp_home: Path
+    ):
+        """Credentials present, config backup missing — land LOGGED IN.
+
+        Treating this as an empty slot logged the user out and told them
+        "Account-2 has no stored credentials" while Account-2's credentials
+        sat right there. The config backup is only ``oauthAccount``, and
+        every field of it is in the sequence record, so it is rebuilt.
+        """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com", config=False)
@@ -5084,8 +5092,104 @@ class TestSwitchSkipsBrokenSlots:
         result = s.switch_to("2", json_output=True)
 
         assert result["switched"] is True
-        assert result["needsLogin"] is True
+        assert not result.get("needsLogin"), (
+            "logged the user out over a missing config backup, while the "
+            "slot's credentials were readable"
+        )
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+        live = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        assert live["claudeAiOauth"]["refreshToken"] == "rt-2", (
+            "landed on the slot without installing its credential"
+        )
+        cfg = json.loads((temp_home / ".claude.json").read_text())
+        assert cfg["oauthAccount"]["emailAddress"] == "b@example.com"
+
+    def test_an_unmanaged_live_login_survives_landing_on_an_empty_slot(
+        self, temp_home: Path
+    ):
+        """The direct-activation call site must preserve what it clears.
+
+        It returns BEFORE the rollback snapshot and before
+        _stash_live_credential, so trusting the caller destroyed the only
+        copy of a live refresh token — measured, nothing survived anywhere in
+        the home. Every other empty-slot test seeds a MANAGED live account,
+        which takes the other call site, so none of them could fail on this.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False, config=False)
+
+        # A live login cswap does not manage: ~/.claude.json names an account
+        # that is not in the roster, so current_account resolves to None and
+        # the switch takes the direct-activation path.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-UNMANAGED",
+                "refreshToken": "rt-UNMANAGED-PRECIOUS",
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "stranger@example.com",
+                "accountUuid": "uuid-stranger",
+            },
+        }))
+
+        result = s.switch_to("2", json_output=True)
+        assert result["needsLogin"] is True
+
+        entries = s._store._list_unclaimed_credentials()
+        assert entries, "cleared a live credential with nothing stashed"
+        import base64
+
+        bodies = [
+            base64.b64decode(
+                s._store._stash_entry_path(eid).read_text().strip()
+            ).decode()
+            for eid in entries
+        ]
+        assert any("rt-UNMANAGED-PRECIOUS" in b for b in bodies), (
+            "stashed an entry, but not the credential it was meant to save"
+        )
+
+    def test_landing_on_an_empty_slot_does_not_wedge_the_next_switch(
+        self, temp_home: Path
+    ):
+        """You must be able to get back OUT of an empty slot.
+
+        Clearing the credential while leaving ~/.claude.json naming the
+        account you left made the machine incoherent: sequence.json said one
+        slot, the config said another, and every later switch died on the
+        "empty read must not overwrite the departing backup" guard with a
+        misleading "Keychain unreadable?". A LIVE engine emitted that every
+        tick forever; the only escape was an undocumented --force.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False, config=False)
+        self._seed(s, 3, "c@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1", "refreshToken": "rt-live-1",
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com", "accountUuid": "uuid-1",
+            },
+        }))
+
+        assert s.switch_to("2", json_output=True)["needsLogin"] is True
+        assert s.current_account_number() is None, (
+            "still names the account we left; the next switch will fail on "
+            "its own write"
+        )
+
+        out = s.switch_to("3", json_output=True)
+        assert out["switched"] is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
 
     def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
         """No live session — picks first switchable slot if the recorded

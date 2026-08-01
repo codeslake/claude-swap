@@ -5059,9 +5059,36 @@ class ClaudeAccountSwitcher:
 
         The live credential is cleared rather than left in place: an active
         slot that keeps serving the PREVIOUS account's token lies about whose
-        quota is burning. The caller has already backed it up.
+        quota is burning.
+
+        It is STASHED first, here rather than in the caller. One of the two
+        call sites (direct activation: --force, an unmanaged live login, a
+        config-orphaned one) returns before its rollback snapshot, so trusting
+        the caller destroyed the only copy of a live refresh token — measured,
+        nothing survived anywhere in the home. ``_stash_live_credential``
+        raises on failure, and that raise is the license to clear.
+
+        ``oauthAccount`` goes too. Leaving it made the machine incoherent —
+        sequence.json said slot 2, ``~/.claude.json`` still said slot 1, and
+        every later switch died on the "empty read must not overwrite the
+        departing backup" guard with a misleading "Keychain unreadable?".
+        Measured: a LIVE engine emitted that every tick forever and the only
+        escape was an undocumented ``--force``.
         """
+        live = self._store._read_active_credentials().value
+        if live:
+            self._stash_live_credential(
+                live,
+                "displaced-by-empty-slot",
+                str((from_ref or {}).get("number") or "unmanaged"),
+                None,
+            )
         self._store._clear_oauth_credential()
+        config_path = get_global_config_path()
+        if config_path.exists():
+            existing = self._read_json(config_path)
+            if isinstance(existing, dict) and existing.pop("oauthAccount", None):
+                self._write_json(config_path, existing)
         data["activeAccountNumber"] = int(target_account)
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
@@ -5083,6 +5110,24 @@ class ClaudeAccountSwitcher:
             ],
         }
 
+    def _oauth_account_from_record(
+        self, data: dict, account_num: str, email: str
+    ) -> dict:
+        """Rebuild the ``oauthAccount`` block from the roster record.
+
+        A missing config backup is recoverable — the block is only identity,
+        and the sequence record carries every field of it. The credential
+        names the account either way, so throwing the login away over this
+        was strictly worse than reconstructing it.
+        """
+        rec = (data.get("accounts") or {}).get(account_num) or {}
+        return {
+            "emailAddress": rec.get("email") or email,
+            "accountUuid": rec.get("uuid", ""),
+            "organizationUuid": rec.get("organizationUuid") or None,
+            "organizationName": rec.get("organizationName") or None,
+        }
+
     def _keychain_blind(self) -> bool:
         """macOS cannot read the Keychain right now (locked / no GUI session).
 
@@ -5090,7 +5135,18 @@ class ClaudeAccountSwitcher:
         logout: both report "no credentials", but here the backup is fine and
         clearing the live login would log the user out of a working account
         to reach one that was never actually empty.
+
+        PROBES when the cache is unset rather than reading None as "fine".
+        The cache is only filled by a real ``security`` call, and the paths
+        that matter most never make one: ``--force`` skips the live-identity
+        prefetch entirely (measured: zero keychain calls before this guard),
+        and a read satisfied by an ``.enc`` file short-circuits before the
+        keychain. So a locked keychain was indistinguishable from a probed
+        one, and the guard let the logout through. Failing closed costs a
+        spurious refusal; failing open costs a login.
         """
+        if self.platform == Platform.MACOS and self._store._keychain_usable_cache is None:
+            self._store._read_active_credentials()  # fills the cache
         return (
             self.platform == Platform.MACOS
             and self._store._keychain_usable_cache is False
@@ -5208,10 +5264,22 @@ class ClaudeAccountSwitcher:
                         f"no GUI session). Retry from a GUI terminal; do not "
                         f"re-add."
                     )
-                if not target_creds or not target_config:
+                if not target_creds:
                     return self._switch_to_empty_slot(
                         target_account, target_email, from_ref, to_ref, data
                     )
+                if not target_config:
+                    # Credentials present, config backup missing. Logging out
+                    # here told the user "Account-N has no stored credentials"
+                    # while Account-N's credentials sat right there. The config
+                    # is only ``oauthAccount``, and every field of it lives in
+                    # the sequence record, so rebuild it rather than throw a
+                    # working login away.
+                    target_config = json.dumps({
+                        "oauthAccount": self._oauth_account_from_record(
+                            data, target_account, target_email
+                        )
+                    })
                 try:
                     target_config_data = json.loads(target_config)
                 except json.JSONDecodeError as exc:
@@ -5535,12 +5603,22 @@ class ClaudeAccountSwitcher:
                         f"no GUI session). Retry from a GUI terminal; do not "
                         f"re-add."
                     )
-                if not target_creds or not target_config:
-                    # Step 1 already backed the current login up, so clearing
-                    # it here loses nothing.
+                if not target_creds:
                     return self._switch_to_empty_slot(
                         target_account, target_email, from_ref, to_ref, data
                     )
+                if not target_config:
+                    # Credentials present, config backup missing. Logging out
+                    # here told the user "Account-N has no stored credentials"
+                    # while Account-N's credentials sat right there. The config
+                    # is only ``oauthAccount``, and every field of it lives in
+                    # the sequence record, so rebuild it rather than throw a
+                    # working login away.
+                    target_config = json.dumps({
+                        "oauthAccount": self._oauth_account_from_record(
+                            data, target_account, target_email
+                        )
+                    })
 
                 # Step 3: Activate target account - credentials
                 self._write_credentials(
