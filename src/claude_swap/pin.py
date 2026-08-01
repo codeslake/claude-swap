@@ -86,19 +86,12 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     # the launch died instead of starting unpinned.
     try:
         pin = _impl()
-    except ClaudeSwitchError:
-        # Not installed. A wiring a previous install left behind would
-        # otherwise outlive it — see clear_wiring.
-        try:
-            clear_wiring()
-        except Exception:  # noqa: BLE001
-            pass
-        return env
     except Exception:  # noqa: BLE001 — never block the launch
-        # Same reasoning as the branch above: whatever went wrong, this launch
-        # has no pin, so a wiring left naming a dead port must not survive it.
+        # No pin this launch, whatever the reason: not installed, or installed
+        # and broken. A wiring a previous install left behind would otherwise
+        # outlive it and point every session at a dead port — see clear_wiring.
         try:
-            clear_wiring()
+            clear_wiring(timeout=_LAUNCH_LOCK_BUDGET_S)
         except Exception:  # noqa: BLE001
             pass
         return env
@@ -121,8 +114,15 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
 
 _WIRE_MARK = "_cswapPinWiredKeys"
 
+# The launch path calls this on every `cswap run`, so its lock wait has to be
+# bounded by something far below the 9s default: a user who never installed
+# the pin must not wait on Claude Code's config lock at all, and one who did
+# must not wait long. Nothing is lost by giving up — an unremoved wiring is
+# retried on the next launch, and the caller fails open either way.
+_LAUNCH_LOCK_BUDGET_S = 0.5
 
-def clear_wiring() -> bool:
+
+def clear_wiring(timeout: float | None = None) -> bool:
     """Remove a pin wiring from the global config. True when it removed one.
 
     The pin writes its proxy address into ``.claude.json``'s env block and
@@ -143,15 +143,31 @@ def clear_wiring() -> bool:
     rather than being lost with ours.
     """
     from claude_swap.claude_locks import claude_config_lock
-    from claude_swap.paths import get_global_config_path
+    from claude_swap.paths import (
+        get_default_global_config_path,
+        get_global_config_path,
+    )
+
+    # BOTH configs, because the writing side resolves the same way this does:
+    # `CLAUDE_CONFIG_DIR` is set in the *child's* env dict, not the process's,
+    # so a `cswap run` from a normal terminal wires ~/.claude.json while one
+    # from inside a session terminal wires that session's copy. Clearing only
+    # the resolved path leaves the other wired, and `cswap pin --clear` then
+    # prints "No cloud account pinned" over a config that still names a dead
+    # port — the exact stranding this function exists to prevent. Measured:
+    # the two paths diverge as soon as CLAUDE_CONFIG_DIR is set.
+    paths = [get_global_config_path()]
+    default = get_default_global_config_path()
+    if default != paths[0]:
+        paths.append(default)
 
     # Under the same lock switcher.py takes for this file. `cswap switch`
     # rewrites .claude.json too, so an unlocked read-modify-write here can
     # land on top of a swap that happened between our read and our rename —
     # losing the account change and leaving the config describing neither
     # state.
-    with claude_config_lock():
-        return _clear_wiring_locked(get_global_config_path())
+    with claude_config_lock(timeout=timeout):
+        return any([_clear_wiring_locked(p) for p in paths])
 
 
 def _clear_wiring_locked(path) -> bool:
@@ -210,9 +226,14 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # Works WITHOUT the package on purpose: ``--clear`` is what a user
         # reaches for precisely when they have uninstalled the pin, and the
         # wiring is cswap's own record (see clear_wiring).
+        #
+        # Any failure falls back, not just a missing package: "installed but
+        # unusable" (a broken cryptography) is the other way a user ends up
+        # here, and a traceback is the worst possible outcome for the one
+        # command whose job is to work when the pin does not.
         try:
             _impl().apply_pin(switcher, None, None)
-        except ClaudeSwitchError:
+        except Exception:  # noqa: BLE001
             if not clear_wiring():
                 print(dimmed("No cloud account pinned"))
                 return 0
