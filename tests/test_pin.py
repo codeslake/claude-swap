@@ -113,7 +113,7 @@ class TestLaunchIsNeverBlocked:
 
         monkeypatch.setattr(pin, "_impl", lambda: (_ for _ in ()).throw(
             ClaudeSwitchError("nope")))
-        monkeypatch.setattr(pin, "clear_wiring", lambda: False)
+        monkeypatch.setattr(pin, "clear_wiring", lambda *a, **k: False)
         env = {"A": "1"}
         assert pin.wire_launch_env(object(), env) == env
 
@@ -157,10 +157,11 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_clear_wiring_works_without_the_extra(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
         from claude_swap.pin import clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
 
         cfg = self._wired(tmp_path)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        assert clear_wiring() is True
+        assert clear_wiring(ClaudeAccountSwitcher()) is True
         env = json.loads(cfg.read_text())["env"]
         assert "CSWAP_PIN_PORT" not in env
         assert env["UNRELATED"] == "keep me"
@@ -169,11 +170,12 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_clearing_an_unwired_config_is_a_no_op(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
         from claude_swap.pin import clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
 
         cfg = tmp_path / ".claude.json"
         cfg.write_text(json.dumps({"env": {"UNRELATED": "keep me"}}))
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        assert clear_wiring() is False
+        assert clear_wiring(ClaudeAccountSwitcher()) is False
         assert json.loads(cfg.read_text())["env"] == {"UNRELATED": "keep me"}
 
     def test_clear_also_reaches_the_default_profile_from_inside_a_session(
@@ -186,13 +188,14 @@ class TestTheWiringCanAlwaysBeRemoved:
         config that still names a dead port."""
         import claude_swap.paths as paths
         from claude_swap.pin import clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
 
         session = self._wired(tmp_path / "session")
         default = self._wired(tmp_path / "home")
         monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
 
-        assert clear_wiring() is True
+        assert clear_wiring(ClaudeAccountSwitcher()) is True
         for cfg in (session, default):
             assert "_cswapPinWiredKeys" not in json.loads(cfg.read_text()), (
                 f"{cfg.parent.name} left wired — its sessions still dial a dead port"
@@ -241,13 +244,14 @@ class TestTheWiringCanAlwaysBeRemoved:
 
         import claude_swap.paths as paths
         from claude_swap.pin import clear_wiring
+        from claude_swap.switcher import ClaudeAccountSwitcher
 
         cfg = self._wired(tmp_path)
         os.chmod(cfg, 0o644)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         old = os.umask(0o022)
         try:
-            assert clear_wiring() is True
+            assert clear_wiring(ClaudeAccountSwitcher()) is True
         finally:
             os.umask(old)
         assert not _stat.S_IMODE(cfg.stat().st_mode) & 0o077
@@ -389,7 +393,8 @@ class TestClearRunsWithTheExtraGone:
             paths.get_global_config_path = lambda: cfg
             paths.get_default_global_config_path = lambda: cfg
             from claude_swap import pin
-            sys.exit(pin.run(object(), None, clear=True))
+            from claude_swap.switcher import ClaudeAccountSwitcher
+            sys.exit(pin.run(ClaudeAccountSwitcher(), None, clear=True))
             """
         )
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
