@@ -1762,43 +1762,24 @@ class ClaudeAccountSwitcher:
 
         A refresh token is one-time-use, so the POST must consume the
         provably-freshest copy of the slot's grant — never a caller's
-        snapshot, which may be a superseded generation (rotation landed
-        between the caller's read and this call; a dead ``cswap run``
-        session rotated inside its profile — #96's shape). The whole
-        sequence runs under a per-slot *consume lock* (held across re-read →
-        POST → CAS) so two gates can never each POST the same grant; the
-        slot ``FileLock`` itself never covers the network call. Sequence:
+        snapshot, which may be a superseded generation. The whole sequence
+        runs under a per-slot *consume lock* (re-read → POST → CAS) so two
+        gates can never POST the same grant; the slot ``FileLock`` itself
+        never covers the network call.
 
-        1. Under the slot ``FileLock``: adopt a prior gate's stashed
-           successor if the store still holds the generation it superseded
-           (a failed persist completed late); re-read the backup — an
-           *unreadable* read (keychain locked) defers rather than falling
-           back to the snapshot; and consult the session profile when no
-           live session owns it and it is not marked stale — a profile
-           credential on a *different* lineage with a strictly newer
-           ``expiresAt`` supersedes the backup (the backup rt is the
-           consumed predecessor by construction), so it is resynced into
-           the backup and becomes the refresh input.
-        2. Outside the slot lock: POST the re-read bytes (network never
-           runs under locks others contend on; the refresh has its own
-           bounded timeout).
-        3. Reacquire the slot lock and compare-and-swap on the
-           refresh-token fingerprint: if the store still holds the lineage
-           we consumed, persist the successor. If a writer moved it
-           mid-flight — or emptied the slot (remove-account) — the
-           successor is stashed as an unclaimed credential (a consumed
-           generation is never discarded; the next gate pass adopts it).
-           A persist/stash I/O failure is contained here: the gate never
-           raises after the grant is consumed (callers run in the
-           never-raises collect pass).
+        The body below is the sequence: adopt a stashed successor and re-read
+        under the slot lock, POST outside it, then CAS on the refresh-token
+        fingerprint and either persist or stash. A consumed generation is
+        never discarded — a stash is adopted by the next pass — and the gate
+        never raises after the grant is consumed, since callers run in the
+        never-raises collect pass.
 
         Returns a ``RefreshOutcome``: ``credentials`` is the slot's
-        now-current credential on success (ours, or a racing writer's
-        adopted newer lineage); ``error`` carries the refresh failure
-        (``invalid_grant`` / ``no_refresh_token`` / transient) unchanged.
-        Every outcome — success or failure — carries ``consumed_fp``: strike
-        binding must follow the bytes the gate actually POSTed, which may
-        differ from the caller's snapshot.
+        now-current credential on success (ours, or a racing writer's adopted
+        newer lineage); ``error`` carries the refresh failure unchanged. Every
+        outcome carries ``consumed_fp`` — strike binding must follow the bytes
+        the gate actually POSTed, which may differ from the caller's snapshot.
+
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
         """
         # Store-resolution parity: CC ≥2.1.220 honors
