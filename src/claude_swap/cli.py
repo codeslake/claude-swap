@@ -982,6 +982,8 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s pin [num|email]            pin Remote Control/artifacts to one account
+  %(prog)s pin --clear                unpin
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 

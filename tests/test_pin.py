@@ -137,6 +137,7 @@ class TestTheWiringCanAlwaysBeRemoved:
     the pin would strand every launch dialling a dead port."""
 
     def _wired(self, tmp_path):
+        tmp_path.mkdir(parents=True, exist_ok=True)
         cfg = tmp_path / ".claude.json"
         cfg.write_text(
             json.dumps(
@@ -174,6 +175,63 @@ class TestTheWiringCanAlwaysBeRemoved:
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         assert clear_wiring() is False
         assert json.loads(cfg.read_text())["env"] == {"UNRELATED": "keep me"}
+
+    def test_clear_also_reaches_the_default_profile_from_inside_a_session(
+        self, tmp_path, monkeypatch
+    ):
+        """`cswap run` sets CLAUDE_CONFIG_DIR in the CHILD's env, so a launch
+        from a normal terminal wires ~/.claude.json while one from inside a
+        session terminal wires the session's copy. Resolving one path clears
+        whichever the caller happens to sit in and reports success over a
+        config that still names a dead port."""
+        import claude_swap.paths as paths
+        from claude_swap.pin import clear_wiring
+
+        session = self._wired(tmp_path / "session")
+        default = self._wired(tmp_path / "home")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
+
+        assert clear_wiring() is True
+        for cfg in (session, default):
+            assert "_cswapPinWiredKeys" not in json.loads(cfg.read_text()), (
+                f"{cfg.parent.name} left wired — its sessions still dial a dead port"
+            )
+
+    def test_the_launch_path_does_not_wait_on_the_config_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """clear_wiring takes Claude Code's config lock, whose default wait is
+        9s, and the launch path calls it on EVERY `cswap run` for users who
+        will never install the pin. Claude Code itself holds that lock while
+        refreshing credentials, so an unbounded wait stalls the launch."""
+        import time
+
+        import claude_swap.paths as paths
+        from claude_swap import claude_locks, pin
+
+        cfg = self._wired(tmp_path)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        monkeypatch.setattr(
+            pin, "_impl", lambda: (_ for _ in ()).throw(ClaudeSwitchError("absent"))
+        )
+
+        # Derived here rather than via config_lock_dir() so the test does not
+        # depend on how that resolves the config path.
+        held = cfg.parent / (cfg.name + ".lock")
+        monkeypatch.setattr(claude_locks, "config_lock_dir", lambda: held)
+        # A live holder: fresh mtime, so the staleness takeover does not fire.
+        held.mkdir()
+        try:
+            start = time.monotonic()
+            env = pin.wire_launch_env(object(), {"A": "1"})
+            waited = time.monotonic() - start
+        finally:
+            held.rmdir()
+
+        assert env == {"A": "1"}
+        assert waited < 3.0, f"a contended launch blocked for {waited:.2f}s"
 
     def test_the_config_is_not_left_world_readable(self, tmp_path, monkeypatch):
         """It can hold primaryApiKey and inline MCP credentials; a plain write
@@ -272,3 +330,70 @@ class TestWindowsIsRejectedCleanly:
         monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: object())
         with pytest.raises(ClaudeSwitchError, match="Windows"):
             pin._impl()
+
+
+class TestClearRunsWithTheExtraGone:
+    """`cswap pin --clear` is priority 1 and the whole reason clear_wiring
+    lives in cswap rather than the optional package.
+
+    An AST scan proves nothing about it: a review defeated the import-time
+    guards by adding a runtime `from cswap_pin.proxy import ...` inside
+    pin.run(), and every test stayed green while `--clear` died with a
+    ModuleNotFoundError. Drive the real command with cswap_pin blocked at
+    sys.meta_path — the one form that also stops importlib.import_module.
+    """
+
+    def test_the_marker_still_matches_the_package_that_writes_it(self):
+        """cswap READS a key cswap-pin WRITES, and the two version
+        independently. Agreeing on a magic string by convention is this seam's
+        one silent-drift risk: rename it there and `--clear` stops finding
+        wirings while still reporting 'No cloud account pinned'.
+
+        Skipped without the extra because there is nothing to compare against
+        — the assertion is about two installed packages agreeing.
+        """
+        proxy = pytest.importorskip("cswap_pin.proxy")
+
+        from claude_swap.pin import _WIRE_MARK
+
+        assert proxy._WIRE_MARK == _WIRE_MARK
+
+    def test_clear_removes_the_wiring_with_cswap_pin_blocked(self, tmp_path):
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {"HTTPS_PROXY": "http://127.0.0.1:36301", "K": "v"},
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY"],
+                }
+            )
+        )
+        code = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {src!r})
+            class Block:
+                def find_spec(self, name, path=None, target=None):
+                    if name.split(".")[0] == "cswap_pin":
+                        raise ImportError("blocked", name=name)
+                    return None
+            sys.meta_path.insert(0, Block())
+            from pathlib import Path
+            import claude_swap.paths as paths
+            cfg = Path({str(cfg)!r})
+            paths.get_global_config_path = lambda: cfg
+            paths.get_default_global_config_path = lambda: cfg
+            from claude_swap import pin
+            sys.exit(pin.run(object(), None, clear=True))
+            """
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-900:]
+        raw = json.loads(cfg.read_text())
+        assert "_cswapPinWiredKeys" not in raw
+        assert raw["env"] == {"K": "v"}, "the wiring outlived the uninstall"
