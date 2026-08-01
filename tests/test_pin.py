@@ -103,7 +103,9 @@ class TestTheMissingExtraIsReported:
         with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[pin\]"):
             pin._impl()
 
-    def test_a_broken_package_ROOT_is_not_reported_as_missing(self, tmp_path):
+    def test_a_broken_package_ROOT_is_not_reported_as_missing(
+        self, posix, tmp_path, monkeypatch
+    ):
         """The breakage that actually happens is in the package ROOT, not the
         submodule: cswap_pin/__init__.py imports cryptography.
 
@@ -114,10 +116,14 @@ class TestTheMissingExtraIsReported:
         already had.
 
         Real files, no stubs: stubbing find_spec is exactly what hid this.
+
+        In-process, not a subprocess: a subprocess would have to fake the
+        platform to get past the Windows refusal, and faking it before the
+        imports run makes claude_swap.locking pick the POSIX branch and die
+        on `import fcntl`. The `posix` fixture reaches _impl without that.
         """
-        import subprocess
-        import textwrap
-        from pathlib import Path
+        import importlib
+        import importlib.util
 
         pkg = tmp_path / "cswap_pin"
         pkg.mkdir()
@@ -126,27 +132,20 @@ class TestTheMissingExtraIsReported:
             "name='cryptography')"
         )
         (pkg / "proxy.py").write_text("")
-        src = str(Path(__file__).resolve().parent.parent / "src")
-        code = textwrap.dedent(
-            f"""
-            import sys
-            sys.platform = "linux"
-            sys.path.insert(0, {str(tmp_path)!r})
-            sys.path.insert(0, {src!r})
-            from claude_swap import pin
-            from claude_swap.exceptions import ClaudeSwitchError
-            try:
-                pin._impl()
-            except ClaudeSwitchError as e:
-                sys.exit("told the user to install it: " + str(e))
-            except ImportError as e:
-                assert e.name == "cryptography", e.name
-                sys.exit(0)
-            sys.exit("no error at all")
-            """
+
+        from claude_swap import pin
+
+        monkeypatch.syspath_prepend(str(tmp_path))
+        for name in [m for m in sys.modules if m.split(".")[0] == "cswap_pin"]:
+            monkeypatch.delitem(sys.modules, name)
+        importlib.invalidate_caches()
+
+        with pytest.raises(ImportError) as exc:
+            pin._impl()
+        assert exc.value.name == "cryptography", (
+            f"reported as {exc.value!r} — a broken package root must not be "
+            "rewritten into 'install the extra'"
         )
-        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr[-400:] or r.stdout[-400:]
 
     def test_a_broken_dependency_is_not_reported_as_missing(self, posix, monkeypatch):
         """The package is THERE and its own import fails (a missing
