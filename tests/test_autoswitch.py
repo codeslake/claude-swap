@@ -2880,7 +2880,7 @@ class TestEscapeBeforeTheLimitLands:
 
     What actually happened in the 18:50 observation that prompted this: the
     only peers were 99% (one point) and 100% (never a target), so there was
-    nowhere better and holding was correct. `all_spent` already covers that
+    nowhere better and holding was correct. The spent check already covers that
     case by ranking on the soonest reset.
 
     Kept as a regression pin: moving the at-limit trigger earlier looks
