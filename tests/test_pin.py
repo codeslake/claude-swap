@@ -249,3 +249,26 @@ class TestTheLaunchPathIsWired:
         with pytest.raises((SystemExit, RuntimeError)) as exc:
             self._manager(temp_home)._exec("/bin/claude", [], env={"A": "1"})
         assert exc.type is SystemExit, "a pin failure blocked the launch"
+
+
+class TestWindowsIsRejectedCleanly:
+    """cswap advertises Windows support; the pin cannot honour it.
+
+    The proxy takes its daemon lock with fcntl.flock and refcounts sessions
+    through os.mkfifo. Without this guard a Windows user gets a
+    ModuleNotFoundError from inside the dependency instead of a sentence they
+    can act on — and only at first use, after `pip install claude-swap[pin]`
+    appeared to succeed.
+    """
+
+    def test_it_says_so_rather_than_failing_inside_the_dependency(self, monkeypatch):
+        import importlib.util
+        import sys as _sys
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(_sys, "platform", "win32")
+        # Even with the package apparently installed, it must refuse.
+        monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: object())
+        with pytest.raises(ClaudeSwitchError, match="Windows"):
+            pin._impl()
