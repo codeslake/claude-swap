@@ -2038,6 +2038,14 @@ class ClaudeAccountSwitcher:
                     "successor stashed for the next pass.",
                 )
             except Exception:
+                # BOTH the persist and the stash failed. stash_successor sets
+                # stashed_reason AFTER its write, so a raising write left it
+                # empty, the guard below did not fire, and the gate returned
+                # error=None on a SPENT grant with nothing stashed —
+                # `_freshen_target` read that as "ok" and the engine switched
+                # onto a slot whose credential can never refresh. Measured:
+                # OUT error=None, STORE still OLD, STASH {}.
+                stashed_reason = "consume-gate-unpersisted"
                 self._logger.error(
                     "Account %s's consumed successor could not be persisted "
                     "or stashed — it survives only for this pass. Fix the "
@@ -3200,6 +3208,19 @@ class ClaudeAccountSwitcher:
         def _defer(record: "FetchRecord | None") -> "FetchRecord":
             return record or FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
 
+        # The CONSUME LOCK, taken in the gate's own order (consume -> global).
+        # This path can POST the slot's BACKUP refresh token — refresh_input
+        # becomes `backup` when the live bytes moved or were cleared — so it
+        # is a second backup-token POST outside consume_backup_grant, and the
+        # gate's mutual exclusion was not total. Measured: with
+        # .consume-N.lock held by another process, this still POSTed.
+        #
+        # The interleaving it closes: is_active is decided once per collect
+        # pass, so a pass that started before a `cswap switch` routes slot N
+        # through the gate while a later pass treats N as active and arrives
+        # here. The gate releases the global lock across its POST by design,
+        # so this path could take it, read the same lineage and POST it too —
+        # one wins, the loser gets invalid_grant and strikes a live account.
         force_refresh: FetchRecord | None = None
         if not oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             outcome = oauth.try_fetch_usage_for_account(
@@ -3339,6 +3360,7 @@ class ClaudeAccountSwitcher:
             # config save's retries. It is narrowed to the live-store write
             # below (the one step that can touch ~/.claude.json).
             with (
+                FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
