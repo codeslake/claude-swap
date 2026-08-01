@@ -82,52 +82,48 @@ def _impl() -> ModuleType:
     return importlib.import_module("cswap_pin.proxy")
 
 
-def is_available() -> bool:
-    """Whether the pin can be used right now. Never raises.
+def _live_impl() -> ModuleType | None:
+    """The implementation if it is usable RIGHT NOW, else None. Never raises.
 
-    Callers that decide whether to SHOW a pin surface use this; callers that
-    act on the pin use :func:`_impl` and report its error. The TUI must offer
-    nothing when the extra is absent, and must start offering it the moment
-    it is installed — without a restart.
+    Both display helpers below need the same thing: resolve the package, and
+    treat every failure as "no pin" rather than an error. Callers that ACT on
+    the pin use :func:`_impl` instead and report what it raises — hiding a
+    broken install is right for a badge and wrong for a command.
 
-    ``invalidate_caches`` is why that works: a long-lived process caches each
-    sys.path directory by mtime, so a package installed after start can stay
-    invisible. Measured — usually visible immediately, but an install landing
-    within the same mtime granularity is not, which is exactly the "I just
-    installed it and the menu is still missing" report.
+    ``invalidate_caches`` because a long-lived process caches each sys.path
+    directory by mtime, so a package installed after start can stay invisible.
+    Measured: usually visible immediately, but an install landing inside the
+    same mtime tick is not — which is exactly the "I installed it and the menu
+    is still missing" report.
     """
     import importlib
 
     importlib.invalidate_caches()
     try:
-        _impl()
+        return _impl()
     except Exception:  # noqa: BLE001
-        return False
-    return True
+        return None
+
+
+def is_available() -> bool:
+    """Whether a pin surface should be shown at all."""
+    return _live_impl() is not None
 
 
 def pinned_email(switcher) -> str | None:
-    """The pinned account's email, or None. Never raises.
+    """The pinned account's email, or None.
 
     The TUI's one question about the pin is "which account is it on", and
-    None is the honest answer in every failure: no extra installed, no pin
-    set, a malformed pin file. Rendering nothing is correct for all three —
-    with no extra there IS no pin, so a notice would be a permanent banner on
-    machines that deliberately run without it, and an always-on warning is one
-    people stop reading.
-
-    Catches the failure rather than probing for the package: ``find_spec``
-    cannot separate "not installed" from "installed but broken" (see
-    :func:`_impl`), so a presence check would blank the badge for a broken
-    install while ``cswap pin`` raises a real error about it.
+    None is the honest answer in every failure: no extra, no pin, a malformed
+    pin file. With no extra there IS no pin, so a notice would be a permanent
+    banner on machines that deliberately run without it, and an always-on
+    warning is one people stop reading.
     """
-    import importlib
-
-    # Same reason as is_available: a TUI open across an install must start
-    # showing the badge without a restart, and nothing here is cached.
-    importlib.invalidate_caches()
+    impl = _live_impl()
+    if impl is None:
+        return None
     try:
-        pin = _impl().load_pin(switcher.backup_dir)
+        pin = impl.load_pin(switcher.backup_dir)
     except Exception:  # noqa: BLE001 — a badge must not take the view down
         return None
     return pin[0] if pin else None
