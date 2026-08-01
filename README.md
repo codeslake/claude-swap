@@ -241,6 +241,37 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 
 </details>
 
+## Cloud pin (Remote Control / Artifacts)
+
+<details>
+<summary>Keep Remote Control and Artifacts on one account while inference follows the swap</summary>
+
+Needs the `pin` extra:
+
+```bash
+uv tool install 'claude-swap[pin]'   # or: pipx install 'claude-swap[pin]'
+cswap pin 2
+```
+
+Swapping accounts moves *everything*, including two things that are not inference:
+
+- **Remote Control** — a session's owner is fixed at creation by whichever bearer created it, so after a swap the phone/web loses the session and ghosts pile up on the old account.
+- **Artifacts** — owned by the publishing bearer, so a republish 403s and the artifact "disappears" from the account you are logged into.
+
+The pin keeps those on one account of your choosing while `cswap switch` / [`cswap auto`](#automatic-switching) keep steering inference. `/v1/messages` is never touched, so usage still bills the account you swapped onto.
+
+```bash
+cswap pin 2          # Remote Control / artifacts → account 2
+cswap pin            # show the current pin
+cswap pin --clear    # remove it
+```
+
+The pinned account is re-read per request, so re-pinning takes effect without restarting anything. The one thing a re-pin cannot move is a Remote Control session that is **already open** — the server fixed its owner when the session was created, so reconnecting inside it (`/rc` → Disconnect → `/rc`) is what moves it.
+
+Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin), which the extra pulls in.
+
+</details>
+
 ## Advanced
 
 ### Configuration
