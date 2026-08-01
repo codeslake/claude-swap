@@ -3337,6 +3337,80 @@ class TestRecoveryHorizon:
             "traded 9 points of headroom for 2 on a reset nobody reaches today"
         )
 
+    def test_an_unreadable_peer_does_not_veto_the_spent_check(
+        self, temp_home
+    ):
+        """The spent check ranks the CANDIDATES, not every account in `usage`.
+
+        `headroom` is keyed off `usage`, which carries a row for accounts the
+        loop can never pick — a sentinel (unreadable credential, keychain
+        locked) yields `None` headroom. Testing `headroom.values()` let one
+        such row make `all(...)` False forever, so the spent escape could not
+        fire: measured, three accounts at 99% days out and the engine parked
+        on the one resetting LAST. That is the bug SPENT_HEADROOM_PCT exists
+        to prevent, reintroduced through the iteration set.
+        """
+        h = EngineHarness(temp_home)
+        for n, e in ((1, "a@example.com"), (2, "b@example.com"),
+                     (3, "c@example.com"), (4, "d@example.com")):
+            h.seed(n, e)
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(99, self._at(h, 109 * 3600)),  # active, resets LAST
+            "2": _usage(99, self._at(h, 80 * 3600)),
+            "3": _usage(99, self._at(h, 50 * 3600)),   # soonest
+            "4": USAGE_TOKEN_EXPIRED,                  # sentinel: headroom None
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "an unreadable peer vetoed the spent check and parked the engine "
+            "on the account resetting last"
+        )
+
+    def test_a_weekly_bound_active_does_not_refuse_a_peer_back_in_minutes(
+        self, harness
+    ):
+        """The horizon is asked PER CANDIDATE, not once on the active.
+
+        An active bound by its WEEKLY window sits days out while a peer's
+        five-hour window returns in minutes. Asking the active refused that
+        peer — the #202 case this horizon is supposed to preserve. The
+        existing tests never caught it because they populate only a 5h
+        window, so the active's reset and the candidates' always moved
+        together.
+        """
+        outcome = harness.tick_with_usage({
+            # active: 5h fine, WEEKLY at 96% resetting 109h out — days.
+            "1": _usage7(10, 96, self._at(harness, 109 * 3600)),
+            # peer: binding 5h window back in 8 minutes.
+            "2": _usage(98, self._at(harness, 480)),
+            "3": _usage(99, self._at(harness, 90 * 3600)),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            "refused a peer returning in 8 minutes because the ACTIVE was "
+            "weekly-bound"
+        )
+
+    def test_an_unknown_active_reset_keeps_the_headroom(self, harness):
+        """`inf` means unknown OR already elapsed — not 'rank by reset'.
+
+        It used to keep the recovery axis, which re-armed the exact trade the
+        horizon forbids: measured, an active with 9 points and no `resets_at`
+        moved to a peer with 1 point resetting 50h out. No evidence that a
+        sooner reset helps is a reason to keep the headroom, not spend it.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(91),                                # active, no reset
+            "2": _usage(98, self._at(harness, 80 * 3600)),
+            "3": _usage(99, self._at(harness, 50 * 3600)),  # soonest, 1 left
+        })
+        assert harness.active_number() == 1, (
+            "traded 9 points for 1 because the active's reset was unknown"
+        )
+        assert outcome is not TickOutcome.SWITCHED
+
     def test_a_peer_with_real_headroom_still_wins_past_the_horizon(self, harness):
         """Falling back to headroom is not "never move": a peer holding
         materially more quota is still the right landing, days-away or not."""
