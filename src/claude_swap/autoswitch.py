@@ -545,8 +545,15 @@ class AutoSwitchEngine:
         # Set except while `_perform` is inside `switch_to`. `stop()` waits on
         # it before freeing the LIVE lock, so a successor cannot start acting
         # while the predecessor's switch is still running.
-        self._switch_in_flight = threading.Event()
-        self._switch_in_flight.set()
+        self._tick_in_flight = threading.Event()
+        self._tick_in_flight.set()
+        # `stop()` is a SIGTERM handler (cli.py) and a TUI callback, so it can
+        # arrive on top of itself. Non-reentrant it double-released the lock:
+        # measured, `AttributeError: 'NoneType' object has no attribute
+        # 'release'` propagating into `_perform` inside the state lock, past
+        # `atomic_write_json` — the account switched and `lastSwitchAt` was
+        # never written, so the next engine saw no cooldown.
+        self._stop_lock = threading.RLock()
         self._unhealthy_ticks = 0
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
@@ -780,6 +787,14 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         self._announce_demotion()
+        # In flight for the WHOLE tick, not just the switch. Every mutation
+        # below — quarantine writes, usage rows, poll plans, and
+        # `_freshen_target`'s one-time refresh POST — belongs to the engine
+        # that started the tick. Bracketing only `switch_to` let `stop()`
+        # return instantly and free LIVE while the predecessor was still
+        # freshening: measured, the stopped engine went on to consume grants
+        # for accounts ['2', '3'] the successor already owned.
+        self._tick_in_flight.clear()
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -790,6 +805,8 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             return TickOutcome.ERROR
+        finally:
+            self._tick_in_flight.set()
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
@@ -1518,11 +1535,7 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="engine-stopped"))
                 return TickOutcome.NO_ACTION
 
-            self._switch_in_flight.clear()
-            try:
-                result = self.switcher.switch_to(number, json_output=True)
-            finally:
-                self._switch_in_flight.set()
+            result = self.switcher.switch_to(number, json_output=True)
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -1667,16 +1680,31 @@ class AutoSwitchEngine:
         """
         self._stop.set()
         self._wake.set()
-        if self._live_lock is not None:
+        with self._stop_lock:
+            if self._live_lock is None:
+                return          # already released; idempotent and reentrant
             # Not while a switch is running. `_perform` tested `_stop` under
             # the state lock and is now inside `switch_to`; freeing LIVE here
             # lets a successor claim it and act, and the at-limit escape skips
             # the cooldown by design, so the second undoes the first's choice
             # inside one window — the failure the lock exists to prevent,
             # reached through the handover rather than two TUIs.
-            self._switch_in_flight.wait(_STOP_SWITCH_WAIT_S)
-            self._live_lock.release()
-            self._live_lock = None
+            lock, self._live_lock = self._live_lock, None
+            if not self._tick_in_flight.wait(_STOP_SWITCH_WAIT_S):
+                # The ceiling is a deliberate trade — blocking a TUI toggle or
+                # a SIGTERM forever is worse than the race — but a silent one
+                # leaves an operator with two engines and no explanation.
+                self._emit(
+                    ErrorEvent(
+                        message=(
+                            f"a tick did not finish within "
+                            f"{_STOP_SWITCH_WAIT_S:.0f}s of stop(); releasing "
+                            "the LIVE lock anyway, so two engines may act once"
+                        ),
+                        transient=True,
+                    )
+                )
+            lock.release()
 
     def wake(self) -> None:
         """Cut the current inter-tick sleep short and tick now."""

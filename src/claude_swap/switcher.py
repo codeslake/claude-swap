@@ -5734,7 +5734,9 @@ class ClaudeAccountSwitcher:
         # serving the previous account's credential lies about whose quota is
         # burning, and a key bills per token while it lies.
         residual_gone = self._store._clear_oauth_credential()
-        self._store._clear_managed_key()
+        # BOTH axes report. The managed item shadows `primaryApiKey` the way
+        # the OAuth item shadows the file, and Claude Code reads it first.
+        residual_gone = self._store._clear_managed_key() and residual_gone
         # RE-READ, do not trust the calls. Both clears are best-effort by design
         # — a down Keychain or a missing file warns and continues — so neither
         # tells us whether the live store is actually empty. The `oauthAccount`
