@@ -259,6 +259,12 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        # The engine can PROMOTE itself mid-run: a demotion is a contention
+        # answer, and the holder eventually exits. Nothing else re-reads
+        # `dry_run` after mount, so the badge would keep saying DRY-RUN over a
+        # live engine — worse than the stuck-dry-run it fixes, because now the
+        # display disagrees with what is actually switching accounts.
+        self._update_badge()
         if event.kind == "switch":
             self.app.request_refresh()
 

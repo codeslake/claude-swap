@@ -13,6 +13,7 @@ import pytest
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
+    LIVE_LOCK_FILENAME,
     NO_RESET_FALLBACK_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
@@ -2862,6 +2863,45 @@ class TestLiveLock:
         assert errors == [], f"concurrent stop() raised {errors}"
         engine.stop()          # and again, serially
         assert engine._live_lock is None
+
+    def test_a_demoted_engine_takes_live_once_the_holder_releases_it(
+        self, harness
+    ):
+        """The demotion is decided in `__init__` and never revisited.
+
+        A second TUI demotes to dry-run because the first holds the LIVE lock.
+        That is right at the time. But when the first exits, the lock is free
+        and nothing re-checks: `demoted_from_live` stays True, `_live_lock`
+        stays None, and the dashboard reads DRY-RUN forever with no indication
+        it will never change. The user's intent was LIVE — the demotion was a
+        contention answer, not a preference.
+
+        Asserts on the ENGINE's own state after a tick, not on the badge: the
+        badge renders `dry_run` correctly either way, which is what made this
+        invisible.
+        """
+        from claude_swap.locking import FileLock
+
+        # The harness engine already holds LIVE — it IS the first TUI.
+        assert harness.engine._live_lock is not None, "premise: harness is LIVE"
+
+        second = harness._make_engine(dry_run=False)
+        assert second.demoted_from_live and second.dry_run, (
+            "premise: the second engine demoted"
+        )
+
+        harness.engine.stop()    # the first TUI exits, releasing LIVE
+
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value={}
+        ):
+            second.tick()
+
+        assert not second.dry_run, (
+            "the holder is gone and LIVE is free, but the engine is still in "
+            "dry-run — nothing re-checks, so it can never come back"
+        )
+        second.stop()
 
     def test_a_sigterm_inside_the_switch_does_not_free_live_mid_switch(
         self, harness

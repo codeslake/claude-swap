@@ -802,9 +802,35 @@ class AutoSwitchEngine:
 
     # -- tick -----------------------------------------------------------------
 
+    def _retry_live_promotion(self) -> None:
+        """A demotion is a contention answer, not a preference.
+
+        `__init__` decides it once and nothing revisited it, so when the
+        holder exited the loser stayed dry-run forever — badge reading
+        DRY-RUN with no indication it would never change. The user asked for
+        LIVE; the lock said "not now", and now is over.
+
+        `timeout=0`, so a still-held lock costs one failed flock per tick.
+        """
+        if not self.demoted_from_live or self._stop.is_set():
+            return
+        lock = FileLock(self.switcher.backup_dir / LIVE_LOCK_FILENAME, timeout=0)
+        if not lock.acquire():
+            return
+        self._live_lock = lock
+        self.dry_run = False
+        self.demoted_from_live = False
+        self._emit(
+            ConfigWarningEvent(
+                message="the LIVE holder released the lock — this engine is "
+                        "now LIVE"
+            )
+        )
+
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         self._announce_demotion()
+        self._retry_live_promotion()
         # The WHOLE tick, not just the switch: every mutation below belongs to
         # the engine that started it. Bracketing only `switch_to` let `stop()`
         # return instantly and free LIVE mid-freshen — measured, the stopped

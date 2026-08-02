@@ -702,8 +702,16 @@ Defaults live in settings.json in the backup root; flags override them.
         if args.once:
             sys.exit(engine.tick().value)
 
-        # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
+        # Loop mode: SIGTERM (systemd stop) and SIGINT (the Ctrl-C the banner
+        # below promises) both exit the loop cleanly. Without the SIGINT
+        # handler, KeyboardInterrupt is a BaseException — neither `except
+        # ClaudeSwitchError` nor `except Exception` in `tick()` catches it — so
+        # it propagated out of `_perform` between `switch_to` and the state
+        # write: the account switched, `lastSwitchAt` was never recorded, and
+        # the LIVE lock stayed held. The next engine then saw no cooldown and
+        # could switch again immediately.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        signal.signal(signal.SIGINT, lambda *_: engine.stop())
         if not args.json:
             print(
                 dimmed(

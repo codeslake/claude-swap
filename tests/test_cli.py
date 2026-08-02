@@ -965,6 +965,55 @@ class TestAutoCommand:
                 cli.main()
         assert excinfo.value.code == 2
 
+    def test_ctrl_c_stops_the_engine_the_way_the_banner_promises(
+        self, temp_home
+    ):
+        """The banner says "Ctrl-C to stop"; only SIGTERM was wired.
+
+        `KeyboardInterrupt` is a `BaseException`, so neither `except
+        ClaudeSwitchError` nor `except Exception` in `tick()` catches it. It
+        propagates out of `_perform` between `switch_to` and the state write:
+        the account IS switched, `lastSwitchAt` is not recorded, and the LIVE
+        lock is still held. The next engine sees no cooldown and can switch
+        again immediately — the same half-written state the RLock fix closed,
+        through a door nobody wired shut.
+
+        Asserts the HANDLER is installed rather than simulating delivery:
+        installing it is the fix, and `stop()`'s own behaviour under a signal
+        is covered on the engine side.
+        """
+        import signal as signal_mod
+
+        installed = {}
+
+        def record(sig, handler):
+            installed[sig] = handler
+
+        stopped = []
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                stopped.append(True)
+
+            def run_loop(self):
+                return 0
+
+        with patch.object(signal_mod, "signal", record), \
+                patch("claude_swap.autoswitch.AutoSwitchEngine",
+                      return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        assert signal_mod.SIGINT in installed, (
+            f"handlers installed for {sorted(s.name for s in installed)} — the "
+            "banner tells the user Ctrl-C stops it and nothing handles SIGINT"
+        )
+        installed[signal_mod.SIGINT]()
+        assert stopped == [True], "the SIGINT handler does not stop the engine"
+
     def test_auto_help(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
             with pytest.raises(SystemExit) as excinfo:
