@@ -579,10 +579,10 @@ def _failure_backoff_s(
         # Measured (--model Fable, scoped window binding, ask 3600), mean blind
         # seconds under the PR's own re-block model:
         #
-        #     scoped reset   base    before-trim   with the trim
-        #     +3700          4042        800           4095
-        #     +4000          3885        500           4095
-        #     +4400          3675        100           4095
+        #     scoped reset   base    unconfined trim   confined (here)
+        #     +3700          4042         4095             800
+        #     +4000          3885         4095             500
+        #     +4400          3675         4095             100
         #
         # Buying <=900s of trust for a full extra hour of blindness is the wrong
         # trade, and it is worse than base. So the trim fires only when the

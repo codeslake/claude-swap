@@ -437,6 +437,52 @@ class TestBackoff:
                 "deadline, inside the measured re-block band"
             )
 
+    def test_the_trim_is_confined_to_trust_expiring_BEFORE_the_deadline(self):
+        """`<` is load-bearing, and `<=` gives away the margin where it costs most.
+
+        The trim exists for the case nothing can be salvaged by waiting: the
+        trust is gone before the server's deadline, so the extra 900s buys
+        blindness and no freshness. At `trust == ask` the trust survives to the
+        deadline exactly, and the margin is worth its full price.
+
+        Measured, the difference is total at that one point, and it is the
+        worst point to lose: sweeping `trust_expires_in_s` at 1 ms across
+        3000..5000, the maximum blindness the margin introduces over base is
+        exactly 900.000s, attained precisely at `trust == 3600.000`.
+
+            trust 3599.999 -> 3600.0   (trimmed; the trust is already gone)
+            trust 3600.000 -> 4500.0   (kept; the trust reaches the deadline)
+
+        Mutating `<` to `<=` left the whole suite green.
+        """
+        ask = 3600.0
+        assert usage_store._failure_backoff_s(
+            1, ask, rate_limited=True, trust_expires_in_s=ask
+        ) == ask + usage_store.RETRY_AFTER_MARGIN_S, (
+            "the trim fired at trust == ask, where the trust survives to the "
+            "deadline and the margin is worth paying for"
+        )
+        assert usage_store._failure_backoff_s(
+            1, ask, rate_limited=True, trust_expires_in_s=ask - 0.001
+        ) == ask, "the trim did not fire where the trust expires first"
+
+    def test_the_trim_never_lifts_the_floor_cap(self):
+        """`min(retry_after_s, asked)` — both operands matter.
+
+        `asked` carries `RETRY_AFTER_FLOOR_CAP_S`, which bounds how long a
+        server ask can park us. Dropping the `min` and trimming straight to
+        `retry_after_s` defeats it entirely: an 86400s ask would produce an
+        86400s wait. Measured, that mutation left the suite green.
+        """
+        huge = 86_400.0
+        wait = usage_store._failure_backoff_s(
+            1, huge, rate_limited=True, trust_expires_in_s=1.0
+        )
+        assert wait <= usage_store.RETRY_AFTER_FLOOR_CAP_S, (
+            f"a {huge:.0f}s ask produced a {wait:.0f}s wait — the trim wrote "
+            "the ask straight through the cap that bounds it"
+        )
+
     def test_short_asks_stay_on_our_own_curve(self):
         # Below BACKOFF_CAP_S the margin deliberately does not apply: our own
         # saturated curve already waits longer than the server asked, so adding
