@@ -246,6 +246,12 @@ class CredentialStore:
         # stick, but only the failure means the file may be behind Claude
         # Code's own writes — see _read_active_credentials.
         self._file_mode_is_ours: bool = False
+        # Set by the backup read when THIS read could not reach the Keychain,
+        # consumed by _read_account_credentials_ex. Per-read, not a capability:
+        # whether a particular backup was readable is a fact about that read,
+        # and the process-wide flag it used to consult answers a different
+        # question and is overwritten by unrelated events (see _ex).
+        self._backup_read_failed: bool = False
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -922,6 +928,11 @@ class CredentialStore:
             try:
                 return self._kc_read_backup(account_num, email)
             except macos_keychain.KEYCHAIN_ERRORS as e:
+                # Record the observation for _read_account_credentials_ex. THIS
+                # read is the only thing that knows whether THIS backup could be
+                # reached; a process-wide capability flag answers a different
+                # question and gets overwritten by unrelated events.
+                self._backup_read_failed = True
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
 
@@ -938,17 +949,39 @@ class CredentialStore:
         "keychain unavailable — retry from a GUI session" instead of
         nudging the user into an unnecessary re-add/re-login.
         """
+        self._backup_read_failed = False
         value = self._read_account_credentials(account_num, email)
         if value:
             return value, False
         if self._host.platform != Platform.MACOS:
             return "", False
-        # The read above already consulted the Keychain; a raising read
-        # flipped the capability cache to file mode, while an rc-44
-        # "not found" answered cleanly and left it usable.
-        if self._keychain_unreadable:
-            return "", True
-        return "", False
+        # Whether THIS read reached the Keychain, observed at the read itself.
+        #
+        # This used to ask `_keychain_unreadable`, which answers a different
+        # question: has any Keychain op failed and not been superseded. It gets
+        # overwritten by an unrelated event. `_pin_file_mode` sets
+        # `_file_mode_is_ours` and clears the re-probe deadline, and on macOS it
+        # is only reachable THROUGH a Keychain op that just failed — both call
+        # sites are in the fallback branch of a write that raised. So one
+        # active-credential write fallback flipped this answer for the rest of
+        # the process while the Keychain stayed locked:
+        #
+        #     state A   _read_account_credentials_ex('3') -> ('', True)
+        #     ...one fallback write...
+        #     state B   _read_account_credentials_ex('3') -> ('', False)
+        #
+        # The pin's premise ("we wrote the credential to the file, that file is
+        # the authority") holds for the ACTIVE credential and says nothing about
+        # the BACKUP, which is Keychain-only by design —
+        # `_reconcile_enc_after_keychain_write` deletes the `.enc` after a
+        # successful Keychain write. So the consume gate read "genuinely empty",
+        # POSTed the caller's possibly-superseded snapshot, took invalid_grant,
+        # and quarantined a slot whose live refresh token was sitting unread.
+        #
+        # Cleared above rather than trusted from a previous call: a caller that
+        # substitutes `_read_account_credentials` never reaches the setter, and
+        # a stale True there would defer forever.
+        return "", self._backup_read_failed
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str

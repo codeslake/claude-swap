@@ -306,11 +306,130 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
         assert unreadable is False
 
-    def test_a_real_keychain_failure_still_reports_unreadable(self, macos_switcher):
+    def test_a_write_fallback_does_not_certify_an_unread_backup(
+        self, macos_switcher, monkeypatch
+    ):
+        """The pin says the ACTIVE credential is in the file. Not the backup.
+
+        On macOS the pin is only reachable THROUGH a Keychain op that just
+        failed — both call sites sit in the fallback branch of a write that
+        raised. So it arrives carrying the opposite of what it asserts: it
+        clears the failure verdict AND the re-probe deadline, and every guard
+        keyed on ``_keychain_unreadable`` goes quiet for the rest of the
+        process while the Keychain is still locked.
+
+        The backup is the part that is not covered. It lives Keychain-only by
+        design (``_reconcile_enc_after_keychain_write`` deletes the ``.enc``
+        after a successful Keychain write), so a write fallback for the ACTIVE
+        credential says nothing about whether that backup could be read — and
+        an empty read of it still proves nothing.
+
+        Measured before the fix, identical world, one fallback write apart::
+
+            state A   _read_account_credentials_ex('3') -> ('', True)
+            state B   _read_account_credentials_ex('3') -> ('', False)
+
+        The consume gate reads that second answer as "the slot is genuinely
+        empty", POSTs the caller's possibly-superseded snapshot, takes
+        ``invalid_grant``, and quarantines a slot whose live refresh token is
+        sitting unread in the Keychain.
+        """
+        from claude_swap import macos_keychain as _kc
+
         store = macos_switcher._store
-        store._keychain_usable_cache = False  # a read FAILED
+        store._keychain_usable_cache = True
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        for fn in ("set_password", "get_password", "delete_password"):
+            monkeypatch.setattr(_kc, fn, locked)
+
+        assert store._read_account_credentials_ex("3", "c@e.com") == ("", True), (
+            "premise: a locked Keychain makes an empty backup read unprovable"
+        )
+
+        # One active-credential write falls back to the file and pins.
+        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "sk-fb"}}')
+        assert store._file_mode_is_ours is True, "premise: the write pinned"
+
+        _value, unreadable = store._read_account_credentials_ex("3", "c@e.com")
+        assert unreadable is True, (
+            "the Keychain is still locked and the backup still unread — a "
+            "write fallback for the ACTIVE credential does not certify it empty"
+        )
+
+    def test_a_real_keychain_failure_still_reports_unreadable(
+        self, macos_switcher, monkeypatch
+    ):
+        """A Keychain that actually raises. Not a leftover flag.
+
+        This used to set ``_keychain_usable_cache = False`` and call that "a
+        read FAILED" — but that flag is a record of some EARLIER op, and the
+        backup read does not consult it (``_kc_read_backup`` goes straight
+        through ``_kc_call``). So the setup described a stale flag over a
+        working Keychain, and the assertion passed because the answer was
+        reconstructed from the flag instead of from the read.
+
+        The read is now the witness, so the failure has to be real for the
+        verdict to be real — which is the guarantee the name claims.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        monkeypatch.setattr(_kc, "get_password", locked)
         _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
         assert unreadable is True
+
+    def test_a_stale_failure_flag_does_not_condemn_a_working_read(
+        self, macos_switcher
+    ):
+        """The other half: a flag from an earlier op must not outvote the read.
+
+        An op failed a moment ago and the Keychain has since recovered. The
+        backup read reaches it and answers cleanly that slot 9 has no backup.
+        Reporting "unreadable" there sends the user to the one remedy that
+        cannot work ("retry from a GUI terminal; do not re-add") and hides the
+        one that can.
+        """
+        store = macos_switcher._store
+        store._keychain_usable_cache = False  # an earlier op failed
+        _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
+        assert unreadable is False
+
+    def test_a_recovered_keychain_is_not_condemned_by_the_previous_read(
+        self, macos_switcher, monkeypatch
+    ):
+        """The verdict is per-read, so it must be CLEARED per read.
+
+        Two reads in one process: the first cannot reach the Keychain, the
+        second can. Without the reset the first read's True is still set when
+        the second returns, so a recovered Keychain keeps reporting
+        "unreadable" and the consume gate defers forever.
+
+        This is reachable in ordinary use, not only across a recovery: many
+        tests and callers substitute ``_read_account_credentials``, which never
+        reaches the line that sets the flag — so whatever the last real read
+        left behind would be reported as if it were this read's answer.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        real_get = _kc.get_password
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        monkeypatch.setattr(_kc, "get_password", locked)
+        assert store._read_account_credentials_ex("9", "x@e.com") == ("", True)
+
+        monkeypatch.setattr(_kc, "get_password", real_get)   # recovered
+        _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
+        assert unreadable is False, "the previous read's failure outlived it"
 
     def test_a_lapsed_cooldown_clears_the_unreadable_verdict(self, macos_switcher):
         """One transient failure must not be permanent for the process.
