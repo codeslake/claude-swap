@@ -2792,6 +2792,85 @@ class TestLiveLock:
         assert harness.active_number() == 1        # but changed nothing
         assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
 
+    def test_the_LIVE_lock_is_not_freed_while_a_switch_is_in_flight(
+        self, harness
+    ):
+        """`stop()` sets the flag AFTER releasing the lock, so the check is stale.
+
+        `_perform` tests `_stop` under the state lock and then calls
+        `switch_to` still holding it, which is correct against a successor
+        that respects the state lock. But `stop()` releases the LIVE lock
+        first, so a successor constructed in the same call — every caller does
+        — claims LIVE while the predecessor's switch is still running. Both
+        then act, and the at-limit escape skips the cooldown by design, so the
+        second undoes the first's choice inside one cooldown window.
+
+        That is the failure the LIVE lock exists to prevent, reached through
+        the handover rather than through two TUIs.
+
+        Setting the flag BEFORE the release closes it: any `_perform` that has
+        not yet passed its check refuses, and one that has is already inside
+        `switch_to` with the successor unable to hold LIVE yet.
+        """
+        import threading
+
+        engine = harness.engine
+        entered = threading.Event()
+        release = threading.Event()
+        real_switch = harness.switcher.switch_to
+
+        def blocking_switch(number, **kw):
+            entered.set()
+            release.wait(5)
+            return real_switch(number, **kw)
+
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in {"1": _usage(100), "2": _usage(5)}.items()
+        }
+        outcome: list = []
+
+        def run():
+            with patch.object(harness.switcher, "switch_to", blocking_switch), \
+                    patch.object(
+                        harness.switcher, "usage_entries_by_account",
+                        return_value=entries,
+                    ):
+                outcome.append(engine.tick())
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        assert entered.wait(5), "premise: a switch is in flight"
+
+        import time
+
+        stopped = threading.Event()
+
+        def do_stop():
+            engine.stop()
+            stopped.set()
+
+        stopper = threading.Thread(target=do_stop)
+        stopper.start()
+        time.sleep(0.2)
+        assert not stopped.is_set(), (
+            "stop() returned while a switch was in flight — it freed the LIVE "
+            "lock without waiting for the state lock the switch holds"
+        )
+        # A successor built DURING the switch must not hold LIVE. Built after
+        # it, taking LIVE is correct — the handover is complete.
+        mid = harness._make_engine()
+        assert mid.dry_run is True, (
+            "a successor constructed while the predecessor's switch was still "
+            "running took LIVE — two engines acting, which is what the lock "
+            "prevents"
+        )
+        mid.stop()
+
+        release.set()
+        stopper.join(10)
+        worker.join(10)
+
     def test_a_stopped_engine_writes_no_state_at_all(self, harness):
         """The gate has to precede the mutators, not sit among them.
 
