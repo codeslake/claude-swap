@@ -5688,7 +5688,19 @@ class ClaudeAccountSwitcher:
                 str((from_ref or {}).get("number") or "unmanaged"),
                 None,
             )
+        # BOTH axes. `_read_active_credentials` answers for OAuth *and* a
+        # managed API key, so the stash above runs for either — but clearing
+        # only the OAuth one left a `primaryApiKey` behind and Claude Code kept
+        # authenticating as the account it belongs to, right after we announced
+        # "logged out". Measured: landing on an empty slot from an API-key
+        # account left `sk-ant-api03-...` live, `_build_accounts_info` marked
+        # the empty slot ACTIVE carrying it, and `--list` then raised a
+        # collision warning claiming a backup had been overwritten — which
+        # never happened. Same invariant as the docstring above: an active slot
+        # serving the previous account's credential lies about whose quota is
+        # burning, and a key bills per token while it lies.
         self._store._clear_oauth_credential()
+        self._store._clear_managed_key()
         config_path = get_global_config_path()
         if config_path.exists():
             existing = self._read_json(config_path)
