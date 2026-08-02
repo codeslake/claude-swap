@@ -550,6 +550,14 @@ class ClaudeAccountSwitcher:
             )
             if creds:
                 return creds
+            # The tail below is not a continuation of this branch: it reads
+            # ``primaryApiKey`` through ``get_global_config_path()``, which
+            # follows ``CLAUDE_CONFIG_DIR``. With the two vars diverged that
+            # is the cross-profile capture this branch just refused — and it
+            # cannot be reached by the secure profile's OWN key either, since
+            # ``read_config_dir_credentials`` is OAuth-only and never looks at
+            # ``primaryApiKey``. A miss here is what claude sees: logged out.
+            return ""
         elif not config_dir:
             return self._read_credentials()
         else:
