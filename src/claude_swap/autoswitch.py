@@ -99,43 +99,19 @@ RECOVERY_HORIZON_S = 4 * 3600.0
 # target burns it back, and it ping-pongs. A ratio makes the move one-way.
 HORIZON_HEADROOM_RATIO = 2.0
 
-# "Is anything worth having?" — a DIFFERENT question from the anti-flap margin
-# above, and lower, because it is weaker: not "is this peer enough better to
-# justify a move?" but "does this peer have anything at all?"
+# The two anti-flap thresholds are both anchored to `active_headroom`, which
+# leaves a band where a peer is VISIBLE (the spent clause goes false, so the
+# reset axis switches off) yet UNCHOOSABLE (it misses the margin). Measured,
+# active 3.00 pts took a 0.10-pt peer over a 5.99-pt one, discarding 60x the
+# runway; and inside the band monotonicity inverts, so adding headroom flips a
+# move into a refusal.
 #
-# BOTH ARE ANCHORED TO `active_headroom`, and that is the defect neither number
-# can fix. They leave a gap where a peer is VISIBLE (the spent clause goes
-# false, so the reset axis switches off) yet UNCHOOSABLE (it misses the larger
-# margin) — and either end of the gap is a real misbehaviour. Below it, an
-# empty `max(..., default=0.0)` reads as "nothing is worth having" and ranking
-# falls to soonest reset: measured, active 3.00 pts took a 0.10-pt peer over a
-# 5.99-pt one, discarding 60x the runway. Inside it, monotonicity inverts —
-# adding headroom flips a move into a refusal. Measured, active 3.00 pts / 500h
-# against ONE peer better on BOTH axes:
-#
-#     peer pts   3.88   3.90   4.50   5.99   6.00
-#     base       move   move   move   move   move
-#     0457cb0    REF    REF    REF    REF    move
-#     db25990    move   move   move   move   move
-#     before     move   REF    REF    REF    move
-#     here       move   move   move   move   move
-#
-# The two bands trade against each other and their widths sum to a constant
-# (`active x HORIZON_HEADROOM_RATIO - SPENT_HEADROOM_PCT`), so no value of this
-# ratio removes both: 1.0 empties this band and re-arms the veto the filter
-# exists to stop, 2.0 does the reverse. Measured, not argued.
-#
-# That bounds the CONSTANT, not the ranking. The fix is elsewhere: drop the
-# floor from `best_candidate_headroom` and re-admit margin failures through a
-# one-way fallback used only when nothing else qualifies. Sweep across
-# [3.00, 10.00] at 0.05: 42 refusals before, 0 now.
-#
-# Two other fixes measured worse. An absolute floor (`> SPENT_HEADROOM_PCT`)
-# refuses 4 of the 5 sampled points and breaks
-# `test_an_unchoosable_peer_does_not_veto_the_reset_ranking`. Dropping the
-# filter with NO fallback gives `0457cb0`'s row, re-arming that veto — the
-# fallback is what separates the working fix from that one.
-WORTH_HAVING_RATIO = 1.3
+# No single constant removes both ends — the two band widths sum to
+# `active x HORIZON_HEADROOM_RATIO - SPENT_HEADROOM_PCT`, so shrinking one
+# grows the other. Measured, not argued. The fix is in the ranking instead:
+# `best_candidate_headroom` carries no floor, and margin failures are
+# re-admitted through a one-way fallback used only when nothing else
+# qualifies.
 
 # Below this an account is spent, and headroom comparisons between two spent
 # accounts compare noise (a point is under ten minutes of work, less than two
@@ -204,8 +180,11 @@ def _recovery_is_useful(
     so it only ever observed the outbound leg.
 
     The step between the two axes used to be non-monotone. That was a property
-    of `best_candidate_headroom`'s ratio floor, not of this predicate — the
-    floor is gone and the sweep now refuses nowhere. See WORTH_HAVING_RATIO.
+    of `best_candidate_headroom`'s ratio floor, not of this predicate. Swept
+    directly over the predicate — active 1..12 pts against a peer walked
+    0.5..40 at 0.05, four reset shapes — a strictly-improving peer never flips
+    a move into a refusal: 0 inversions. The one refusal left in
+    [3.00, 10.00] is at peer == active exactly, where the tie is the answer.
     """
     if (
         active_headroom <= SPENT_HEADROOM_PCT
@@ -1366,9 +1345,9 @@ class AutoSwitchEngine:
         # Every candidate whose headroom is KNOWN, unfiltered. An unknown one
         # is not evidence that somebody has quota left — measured, one
         # sentinel row (expired token, locked keychain) made `all(...)` False
-        # forever and parked the engine on the account resetting LAST. A
-        # WORTH_HAVING_RATIO floor used to sit here too and inverted
-        # monotonicity; the fallback below is what lets it go.
+        # forever and parked the engine on the account resetting LAST. A ratio
+        # floor used to sit here too and inverted monotonicity; the fallback
+        # below is what lets it go.
         best_candidate_headroom = max(
             (
                 h
