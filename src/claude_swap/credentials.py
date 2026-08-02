@@ -246,6 +246,11 @@ class CredentialStore:
         # stick, but only the failure means the file may be behind Claude
         # Code's own writes — see _read_active_credentials.
         self._file_mode_is_ours: bool = False
+        # Set by the MANAGED-KEY read when THAT read could not reach the
+        # Keychain. The two credential axes fail asymmetrically — an API-key
+        # account has no OAuth item to deny, so the OAuth flag cannot stand in
+        # for this one. Cleared at the top of each active read.
+        self._managed_read_failed: bool = False
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -391,6 +396,7 @@ class CredentialStore:
         otherwise nudge the user into an unnecessary re-login.
         """
         keychain_failed = False
+        self._managed_read_failed = False
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         if self._use_keychain():
             val, keychain_failed = self._read_active_oauth_keychain()
@@ -420,9 +426,12 @@ class CredentialStore:
         key = self._read_managed_key()
         if key:
             return ActiveCredentials(key, False, keychain_failed)
-        # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
-        # UI distinguishes it from a real empty slot.
-        return ActiveCredentials("", keychain_failed, keychain_failed)
+        # Nothing anywhere — but "nothing" from a DENIED read is not the same
+        # claim as "nothing" from a clean one, on EITHER axis. Folding the
+        # managed read's own failure in is what stops an API-key account's live
+        # key reading as a genuinely empty slot.
+        unreachable = keychain_failed or self._managed_read_failed
+        return ActiveCredentials("", unreachable, unreachable)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -439,6 +448,14 @@ class CredentialStore:
                     macos_keychain.keychain_account_name(),
                 )
             except macos_keychain.KEYCHAIN_ERRORS as e:
+                # The caller needs this, not just the log. An API-key
+                # account has NO OAuth Keychain item, so the OAuth read
+                # answers rc-44 without decrypting and never raises —
+                # only this one is denied. Swallowing it made
+                # `_read_active_credentials` return ('', False, False),
+                # indistinguishable from an empty slot, while the key kept
+                # authenticating and billing per token.
+                self._managed_read_failed = True
                 self._host._logger.warning(f"Managed-key Keychain read failed: {e}")
                 val = None
             if val:

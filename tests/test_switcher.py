@@ -5377,6 +5377,60 @@ class TestSwitchSkipsBrokenSlots:
                 s._get_sequence_data(),
             )
 
+    def test_a_managed_key_keychain_failure_is_not_read_as_an_empty_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """`keychain_unavailable` must cover BOTH credential axes.
+
+        `_read_active_credentials` sets `keychain_failed` only from the OAuth
+        Keychain read. `_read_managed_key` catches `KEYCHAIN_ERRORS` itself,
+        warns, and falls through to `primaryApiKey` — so the failure never
+        reaches the tuple and the guard sees `('', False, False)`, which is
+        indistinguishable from a genuinely empty slot.
+
+        The two axes fail ASYMMETRICALLY with no race, which is why this is not
+        covered by the OAuth-side residual test. On an API-key account there is
+        no OAuth Keychain item at all, so `find-generic-password` answers rc-44
+        WITHOUT decrypting and does not raise; only the managed item exists,
+        and its `-w` read must decrypt, so only that one is denied.
+
+        Measured through `switch_to`: slot 3 an API-key account, slot 2
+        roster-imported empty, the login keychain locking at the delete —
+
+            [2] ActiveCredentials(value='', keychain_unavailable=False, ...)
+            guard verdict: PROCEED
+            activeAccountNumber = 2
+            KEYCHAIN STILL HOLDS: sk-ant-api03-SECRETKEY
+
+        The user is told "logged out" while account 3's key keeps
+        authenticating and billing per token. Same defect the API-key fix
+        closed on the config half, still open on the Keychain half.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        s = self._setup(temp_home)
+        s.platform = Platform.MACOS
+        store = s._store
+        store._keychain_usable_cache = True
+        real_get = _kc.get_password
+
+        def only_the_managed_item_is_denied(service, account):
+            if service == "Claude Code":
+                raise _kc.KeychainError("errSecAuthFailed")
+            return real_get(service, account)
+
+        _kc.set_password(
+            "Claude Code", _kc.keychain_account_name(), "sk-ant-api03-SECRETKEY"
+        )
+        monkeypatch.setattr(_kc, "get_password", only_the_managed_item_is_denied)
+
+        active = store._read_active_credentials()
+        assert active.value == "", "premise: the read cannot see the key"
+        assert active.keychain_unavailable, (
+            "a denied managed-key Keychain read reported a healthy Keychain — "
+            "the landing proceeds over a live billing key"
+        )
+
     def test_an_api_key_does_not_survive_the_empty_slot_landing(
         self, temp_home: Path
     ):
