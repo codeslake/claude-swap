@@ -108,6 +108,7 @@ SPENT_HEADROOM_PCT = 3.0
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
+    active_recovery_ts: float,
     active_headroom: float,
     best_candidate_headroom: float,
     now: float,
@@ -132,15 +133,51 @@ def _recovery_is_useful(
     nobody qualifies — an active holding more quota than any peer can offer
     should keep the work.
 
+    THE AXIS IS A PROPERTY OF THE PAIR, not of the candidate alone, and that
+    is what stops the two guards leaking into each other. Each anti-flap gate
+    is one-way on its OWN axis — hysteresis on recovery, a ratio on headroom —
+    but a switch swaps which account is "active". Keying the choice on the
+    candidate alone flipped the axis with it, so a pair straddling the horizon
+    took one gate going out and the OTHER coming back, and neither guard ever
+    saw both legs:
+
+        acct 1   8 points, reset 109h out      acct 2   3 points, reset 3.5h out
+        active=1 -> candidate inside  -> recovery: 3.5h < 109h      moves
+        active=2 -> candidate outside -> headroom: 8 >= 3*2         moves back
+
+    Measured: 47 credential rewrites over 3.9h on frozen inputs, ending only
+    when the sooner reset landed. ``either side inside`` is symmetric under
+    that swap, so the axis survives the move and the gate that permitted the
+    outbound leg is the one asked about the return — where hysteresis refuses
+    it, because the account we just left is now the distant one.
+
+    Why EITHER and not BOTH: requiring both would refuse the #202 case this
+    horizon exists to preserve — a weekly-bound active sitting days out while
+    a peer's five-hour window returns in eight minutes. Measured across
+    multiple ticks, both rules were checked against both shapes:
+
+        rule    oscillating pair        #202 pair
+        cand    moves, moves back       moves, moves back   (the bug)
+        both    never moves             never moves         (breaks #202)
+        either  moves, then holds       moves, then holds   (wanted)
+
+    The #202 case oscillated on the original code too — its test ticks once,
+    so it only ever observed the outbound leg.
+
     KNOWN RESIDUE: the step between the two axes is not monotone (2/2/3.0 takes
     the soonest reset, 2/2/3.5 parks). The band is 0.5 points wide at the
     default constants and both outcomes keep a working account. Every fix tried
     re-armed the days-away trade this horizon exists to forbid.
     """
-    return (
+    if (
         active_headroom <= SPENT_HEADROOM_PCT
         and best_candidate_headroom <= SPENT_HEADROOM_PCT
-    ) or candidate_recovery_ts - now <= RECOVERY_HORIZON_S
+    ):
+        return True
+    return (
+        candidate_recovery_ts - now <= RECOVERY_HORIZON_S
+        or active_recovery_ts - now <= RECOVERY_HORIZON_S
+    )
 
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
@@ -1271,6 +1308,7 @@ class AutoSwitchEngine:
                     # condition, so it is always assigned before the key below.
                     by_recovery = _recovery_is_useful(
                         recovery_ts,
+                        active_recovery_ts,
                         active_headroom or 0.0,
                         best_candidate_headroom,
                         now,

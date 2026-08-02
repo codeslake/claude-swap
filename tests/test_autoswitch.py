@@ -3483,6 +3483,39 @@ class TestHorizonAxisDoesNotFlap:
         assert harness.active_number() == 1
         assert outcome is not TickOutcome.SWITCHED
 
+    def test_a_pair_straddling_the_horizon_does_not_ping_pong(self, harness):
+        """Each guard is one-way on ITS OWN axis — but the axis itself flips.
+
+        ``_recovery_is_useful`` reads the ACTIVE account's headroom and the
+        CANDIDATE's reset, and a switch swaps both operands. So a pair that
+        straddles the horizon takes the recovery gate going out and the
+        headroom gate coming back, and neither guard ever sees the other leg:
+
+            acct 1   8 points, reset 109h out   (past the horizon)
+            acct 2   3 points, reset 3.5h out   (inside it)
+
+            active=1 -> candidate 2 is inside  -> recovery axis  -> 3.5h < 109h
+            active=2 -> candidate 1 is outside -> headroom axis  -> 8 >= 3*2
+
+        Both legs qualify on frozen inputs, so the engine rewrites credentials
+        every cooldown until the sooner reset actually lands. Every other test
+        in this class ticks ONCE, which is why the pair went unseen.
+        """
+        r_far = self._days_out(harness, 109)
+        r_near = self._days_out(harness, 3.5)
+        seen = []
+        for _ in range(6):
+            harness.tick_with_usage({
+                "1": _usage(92, r_far),    # 8 points, returns days out
+                "2": _usage(97, r_near),   # 3 points, returns inside 4h
+            })
+            seen.append(harness.active_number())
+            harness.clock.advance(301.0)   # past the 300s cooldown
+        assert len(set(seen)) == 1, (
+            f"cross-axis oscillation: active trace {seen} — each leg passes "
+            "the guard belonging to the OTHER leg's axis"
+        )
+
     def test_a_materially_better_peer_still_wins(self, harness):
         """The escape must survive: 2 points left against 10 is a real move."""
         outcome = harness.tick_with_usage({
