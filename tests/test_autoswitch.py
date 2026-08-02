@@ -2864,6 +2864,81 @@ class TestLiveLock:
         engine.stop()          # and again, serially
         assert engine._live_lock is None
 
+    def test_the_switch_flag_is_armed_before_the_stop_gate(self, harness):
+        """The deferral had a two-statement hole at its own entrance.
+
+        `_perform` tested `_stop` and THEN armed `_switch_in_flight`. A signal
+        handler runs inside the frame it interrupts, so a SIGTERM between them
+        found `own_tick=True, _switch_in_flight=False`, and `stop()` took the
+        immediate-release path: measured, the switch ran to completion with
+        LIVE already released and claimable by a successor.
+
+        Asserts the ORDER directly. Driving a signal into that window needs
+        `_stop.is_set` stubbed, and `stop()` calls it too — measured, the stub
+        changes `stop()`'s own behaviour, so the test then reports a release
+        on the FIXED code as well. A test whose instrument perturbs the thing
+        it measures answers a different question; the order is the property,
+        and it is observable without touching the runtime.
+        """
+        import inspect
+
+        src = inspect.getsource(harness.engine._perform)
+        arm = src.index("self._switch_in_flight = True")
+        gate = src.index("if self._stop.is_set():", arm - 400)
+        assert arm < gate, (
+            "`_switch_in_flight` is armed after the `_stop` gate; a signal "
+            "between them takes stop()'s immediate-release path"
+        )
+
+    def test_a_stopped_engine_does_not_fetch_usage(self, harness):
+        """`stop()` returns while a worker is parked in an emit — by design.
+
+        The exemption keeps the TUI from deadlocking, but the worker then
+        WAKES and keeps going. Between `_tick_inner`'s entry gate and the
+        freshen loop sits the usage collection, which POSTs one-time refresh
+        grants. Measured before the fix: `usage fetches AFTER LIVE was
+        released: [['2']]` — a stopped engine consuming grants for a
+        successor that already owns the lock.
+
+        Asserts on the FETCH, not on the outcome: a tick that returns
+        NO_ACTION after fetching has already spent the grant.
+        """
+        engine = harness.engine
+        fetched: list = []
+
+        # Stopped DURING the tick, not before it. `_tick_inner`'s entry gate
+        # already covers an engine stopped beforehand — measured, driving it
+        # that way never reaches the collection at all, so the test passed
+        # with the checkpoint removed. The real shape is a `stop()` landing
+        # after the tick began, which is every TUI toggle and every SIGTERM.
+        # Stopped on the FIRST no-network read, which is `_collect_scheduled
+        # _usage`'s own `fetch=set()` probe — the last point before the three
+        # network fetches. That is where a `stop()` released by the emit
+        # exemption actually lands relative to them; hooking a later emit put
+        # the stop AFTER the collection and the test passed with every guard
+        # removed.
+        calls = {"n": 0}
+        real_entries = harness.switcher.usage_entries_by_account
+
+        def record(*a, **kw):
+            calls["n"] += 1
+            if kw.get("fetch") or (a and a[0]):
+                import traceback
+                fr = [f for f in traceback.extract_stack()
+                      if f.filename.endswith("/claude_swap/autoswitch.py")]
+                fetched.append(fr[-1].lineno if fr else None)
+            if calls["n"] == 1:
+                engine._stop.set()      # the stop lands here
+            return real_entries(*a, **kw)
+
+        with patch.object(harness.switcher, "usage_entries_by_account", record):
+            engine.tick()
+
+        assert fetched == [], (
+            f"a stopped engine ran {len(fetched)} usage fetch(es); the grants "
+            "belong to whoever holds LIVE now"
+        )
+
     def test_a_demoted_engine_takes_live_once_the_holder_releases_it(
         self, harness
     ):
