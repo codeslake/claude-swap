@@ -266,6 +266,12 @@ class CredentialStore:
         # and the process-wide flag it used to consult answers a different
         # question and is overwritten by unrelated events (see _ex).
         self._backup_read_failed: bool = False
+        # What _pin_file_mode OBSERVED about the residual active Keychain item.
+        # None: never pinned. True: the delete returned, so nothing can shadow
+        # the file. False: the delete could not run, so the file may be the
+        # superseded generation. A fact about THIS item, which is why neither
+        # flag above can stand in for it.
+        self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
 
     def _kc_call(self, fn, *args):
@@ -339,7 +345,7 @@ class CredentialStore:
             self._keychain_disabled_until = 0.0
         return self._keychain_usable_cache is not False
 
-    def _pin_file_mode(self) -> None:
+    def _pin_file_mode(self, *, residual_cleared: bool) -> None:
         """Pin file mode for the rest of the process — no Keychain re-probe.
 
         A read timeout is safe to recover from (re-probe on cooldown), but an
@@ -349,10 +355,30 @@ class CredentialStore:
         account, so once a write falls back we never re-probe onto a Keychain we
         could not verify-clear. Clears any re-probe deadline a prior read
         scheduled, which could otherwise still be pending.
+
+        ``residual_cleared`` is the caller's OBSERVATION of that delete, not a
+        guess. True: nothing can shadow the file, so it genuinely is the
+        authority and a stale ``degraded`` from before the fallback is over.
+        False: a residual may survive, and that stays true however many
+        unrelated Keychain items answer afterwards. Required, with no default:
+        every call site has just run the delete, and a default is exactly how
+        an observation gets dropped in favour of the flags below.
+
+        This settles the verdict permanently and deliberately. The pin zeroes
+        the deadline, so ``_use_keychain()`` is False for the life of the
+        process and the branch in ``_read_active_credentials`` that records a
+        fresh read verdict is unreachable from here on. Deriving ``degraded``
+        from a flag that could no longer change left ``cswap add`` refused and
+        the usage sentinel stuck at "keychain unavailable" forever on a machine
+        where nothing was wrong; deriving it from a flag any later success
+        cleared let one idle slot's readable backup disarm the consume gate.
+        The delete is the one observation about THIS item, so it is the one
+        that answers.
         """
         self._keychain_usable_cache = False
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
+        self._residual_verdict = residual_cleared
 
     @property
     def _keychain_unreadable(self) -> bool:
@@ -479,10 +505,19 @@ class CredentialStore:
             self._active_read_failed = keychain_failed
             if val:
                 return ActiveCredentials(val, False)
-        elif self._active_read_failed or self._keychain_unreadable:
+        elif self._residual_verdict is False or (
+            self._residual_verdict is None
+            and (self._active_read_failed or self._keychain_unreadable)
+        ):
             # Keychain already known unusable this process (a prior op failed and the
             # capability cache stuck to file mode): if nothing is found below, that
             # absence is "keychain unavailable", not a genuinely empty slot.
+            #
+            # Unless the pin VERIFIED the active item is gone. Then nothing can
+            # shadow the file and the two flags below are answering about a
+            # world that no longer exists — one of them unclearable (no read
+            # can run after a pin), the other erasable by any unrelated item's
+            # success. The delete is the observation about THIS item.
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
@@ -600,22 +635,28 @@ class CredentialStore:
                 pass
             raise
 
-    def _delete_active_keychain_entry(self) -> None:
+    def _delete_active_keychain_entry(self) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
 
         Claude Code reads the Keychain before the plaintext file, so once we fall
         back to the file we must clear any stale Keychain entry or Claude Code would
         resurrect it (#30337). Best-effort: when the Keychain is down the delete
         can't run, which is the documented recovery residual.
+
+        Returns whether no active item can shadow the file. ``delete_password``
+        returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
+        a return is proof — which is the fact ``_pin_file_mode`` needs and used
+        to discard. Off macOS there is no Keychain item, hence ``True``.
         """
         if self._host.platform != Platform.MACOS:
-            return
+            return True
         try:
             macos_keychain.delete_password(
                 CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
             )
         except Exception:
-            pass  # best-effort; a down Keychain can't be cleaned now
+            return False  # best-effort; a down Keychain can't be cleaned now
+        return True
 
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
@@ -704,7 +745,12 @@ class CredentialStore:
             # Keychain item may remain, and managed-key reads check the Keychain
             # before ``primaryApiKey``. Pin file mode so a cooldown re-probe can't
             # read that residual over the fresh fallback value.
-            self._pin_file_mode()
+            #
+            # ``residual_cleared=False``: the item that would shadow here is the
+            # MANAGED one, and nothing deleted it — ``_clear_oauth_credential``
+            # above removes the OAuth item, a different service. Unverified, so
+            # the conservative verdict is the true one.
+            self._pin_file_mode(residual_cleared=False)
         self._last_active_credentials_backend = (
             "keychain" if wrote_to_keychain else "file"
         )
@@ -799,12 +845,14 @@ class CredentialStore:
             self._write_active_credentials_file(credentials)
         except Exception as e:
             raise CredentialWriteError(f"Failed to write credentials: {e}")
-        self._delete_active_keychain_entry()
+        cleared = self._delete_active_keychain_entry()
         if self._host.platform == Platform.MACOS:
             # The delete above is best-effort; a stale Keychain item may remain.
             # Pin file mode so a later read-timeout cooldown can't re-probe onto
             # that residual and resurrect the wrong account (see _pin_file_mode).
-            self._pin_file_mode()
+            # Its outcome is also the answer to whether the file is now the
+            # authority, so hand it over rather than re-deriving it from flags.
+            self._pin_file_mode(residual_cleared=cleared)
         self._last_active_credentials_backend = "file"
 
     def _refresh_stale_credentials_file(self, credentials: str) -> None:
