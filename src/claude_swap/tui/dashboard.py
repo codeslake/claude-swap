@@ -149,12 +149,19 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
-            # Only when the extra is installed. A user who never asked for the
+            # Only when the extra is installed — OR when a wiring it left
+            # behind is still in .claude.json. A user who never asked for the
             # pin should not see a row for it; one who installs it while the
             # TUI is open sees the row appear (see refresh_root_menu).
+            #
+            # The second half is what makes the pin removable from here at
+            # all: uninstalling the extra is exactly when `--clear` is needed,
+            # and the CLI is deliberately able to do it without the package.
+            # Gating the row on is_available() alone left a TUI-first user
+            # with a wired config and no visible way out.
             *(
                 [(cloud_menu_label(pin.pinned_email(self.app.switcher)), "pin-menu")]
-                if pin.is_available()
+                if pin.is_available() or pin._wiring_present(self.app.switcher)
                 else []
             ),
             ("Remove account…", "remove-menu"),
@@ -260,12 +267,19 @@ class DashboardScreen(Screen):
         try:
             pin._impl()  # resolved only to prove the package is usable
         except Exception as exc:  # noqa: BLE001
-            # Reachable only if the extra disappears between the root menu
-            # being drawn and this row being opened — the row is not offered
-            # otherwise. Name the real reason rather than showing empty rows.
-            # Scrubbed: this text comes from an optional package and
-            # lands in a MENU LABEL (see pin._safe).
-            return [(pin._safe(exc), ""), _BACK]
+            # The package is gone or broken, but the row was offered because a
+            # WIRING it left behind is still in .claude.json. Removing that is
+            # the one pin operation this repo can do on its own (see
+            # pin.clear_wiring), and it is exactly what a user reaches for at
+            # this moment — so offer it rather than dead-ending on the reason.
+            #
+            # Scrubbed: the text comes from an optional package and lands in a
+            # MENU LABEL (see pin._safe).
+            rows: MenuEntries = [(pin._safe(exc), "")]
+            if pin._wiring_present(self.app.switcher):
+                rows.append(("Remove the leftover pin wiring", "pin:clear"))
+            rows.append(_BACK)
+            return rows
         current = pin.pinned_email(self.app.switcher)
         snap = self.app.snapshot
         entries: MenuEntries = []
@@ -359,16 +373,23 @@ class DashboardScreen(Screen):
         elif action_id == "pin-menu":
             await self._push_menu("cloud account", self._pin_entries())
         elif action_id.startswith("pin:"):
-            try:
-                impl = pin._impl()
-            except Exception as exc:  # noqa: BLE001
-                # Names the real reason, which _impl already distinguishes:
-                # "install the extra" for a missing package, the underlying
-                # error for one that is present and broken.
-                app.notify(pin._safe(exc))
-                await self._pop_menu()
-                return
             target = action_id.split(":", 1)[1]
+            # CLEAR does not need the package, and must not: uninstalling the
+            # extra is precisely when a leftover wiring has to come out, and
+            # clear_pin is written to work without it (see pin.clear_wiring).
+            # Resolving _impl() for every pin: action made the TUI refuse the
+            # one operation still available to it.
+            impl = None
+            if target != "clear":
+                try:
+                    impl = pin._impl()
+                except Exception as exc:  # noqa: BLE001
+                    # Names the real reason, which _impl already distinguishes:
+                    # "install the extra" for a missing package, the underlying
+                    # error for one that is present and broken.
+                    app.notify(pin._safe(exc))
+                    await self._pop_menu()
+                    return
             snap = app.snapshot
             # THE VERDICT COMES FROM pin.py, not from a second copy here.
             # Three review rounds found the same shape: a fix landed on the CLI

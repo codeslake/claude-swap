@@ -358,3 +358,77 @@ class TestThePinBadgeDoesNotOverstate:
             kind="oauth", usage=types.SimpleNamespace(sentinel=None)
         )
         assert not pin_is_broken(acc), "a healthy account was flagged — cries wolf"
+
+
+@pytest.mark.asyncio
+class TestTheStrandedWiringIsRemovableFromTheTui:
+    """`--clear` is what a user reaches for precisely when they have
+    UNINSTALLED the extra, and the CLI is deliberately able to do it without
+    the package. The TUI was not: the row was gated on is_available() and the
+    dispatcher resolved _impl() before every pin: action, so a TUI-first user
+    who uninstalled the extra had a wired config and no visible way out.
+    """
+
+    async def test_the_row_appears_when_only_a_wiring_remains(self, tmp_path):
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        real = (pin.is_available, pin._wiring_present, pin.pinned_email)
+        pin.is_available = lambda: False          # the extra is gone
+        pin._wiring_present = lambda _sw: True    # its wiring is not
+        pin.pinned_email = lambda _sw: None
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                ids = [aid for _label, aid in app.screen._root_entries()]
+                assert "pin-menu" in ids, (
+                    "no way to remove a wiring the uninstalled extra left behind"
+                )
+        finally:
+            pin.is_available, pin._wiring_present, pin.pinned_email = real
+
+    async def test_the_row_stays_hidden_when_nothing_is_wired(self, tmp_path):
+        """...and a user who never asked for the pin still sees nothing."""
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        real = (pin.is_available, pin._wiring_present)
+        pin.is_available = lambda: False
+        pin._wiring_present = lambda _sw: False
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                ids = [aid for _label, aid in app.screen._root_entries()]
+                assert "pin-menu" not in ids
+        finally:
+            pin.is_available, pin._wiring_present = real
+
+    async def test_clear_reaches_pin_py_without_the_package(self, tmp_path):
+        """The dispatcher resolved _impl() for EVERY pin: action, so the one
+        operation still available was the one it refused."""
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        started, cleared = [], []
+        real = (pin._impl, pin.clear_pin)
+        pin._impl = lambda: (_ for _ in ()).throw(
+            ClaudeSwitchError("The cloud pin requires 'cswap-pin'")
+        )
+        pin.clear_pin = lambda sw: cleared.append(sw) or (True, "Unpinned")
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                app._start_action = lambda label, fn: (
+                    started.append(label), fn()
+                )[0]
+                await app.screen._dispatch("pin:clear")
+            assert cleared, (
+                "clear never reached pin.clear_pin — the TUI refused the only "
+                "pin operation that works without the package"
+            )
+            assert started == ["clear cloud pin"]
+        finally:
+            pin._impl, pin.clear_pin = real
