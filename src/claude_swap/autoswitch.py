@@ -547,6 +547,15 @@ class AutoSwitchEngine:
         # while the predecessor's switch is still running.
         self._tick_in_flight = threading.Event()
         self._tick_in_flight.set()
+        # WHICH thread is running the tick, so `stop()` can tell "wait for the
+        # worker" from "I am the worker". `stop()` reaches this class from the
+        # TUI's UI thread and from a SIGTERM handler on `run_loop`'s own
+        # thread, and in both cases the tick it would wait for is blocked on
+        # the caller: `_emit_from_thread` is `app.call_from_thread`, and a
+        # signal handler runs inside the frame it interrupts. Measured, 30s
+        # freeze on the shipped ceiling in the TUI and a self-deadlocked
+        # SIGTERM in `cswap auto`.
+        self._tick_thread_id: int | None = None
         # `stop()` is a SIGTERM handler (cli.py) and a TUI callback, so it can
         # arrive on top of itself. Non-reentrant it double-released the lock,
         # and the AttributeError propagated into `_perform` past
@@ -790,6 +799,7 @@ class AutoSwitchEngine:
         # return instantly and free LIVE mid-freshen — measured, the stopped
         # engine consumed one-time grants for accounts ['2', '3'].
         self._tick_in_flight.clear()
+        self._tick_thread_id = threading.get_ident()
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -801,6 +811,7 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
         finally:
+            self._tick_thread_id = None
             self._tick_in_flight.set()
 
     def _tick_inner(self) -> TickOutcome:
@@ -1685,7 +1696,11 @@ class AutoSwitchEngine:
             # inside one window — the failure the lock exists to prevent,
             # reached through the handover rather than two TUIs.
             lock, self._live_lock = self._live_lock, None
-            if not self._tick_in_flight.wait(_STOP_SWITCH_WAIT_S):
+            # Only when someone ELSE is running it. Called from the tick's own
+            # thread the wait can never be satisfied — the flag is set by the
+            # frame this call is standing on.
+            own_tick = self._tick_thread_id == threading.get_ident()
+            if not own_tick and not self._tick_in_flight.wait(_STOP_SWITCH_WAIT_S):
                 # The ceiling is a deliberate trade — blocking a TUI toggle or
                 # a SIGTERM forever is worse than the race — but a silent one
                 # leaves an operator with two engines and no explanation.

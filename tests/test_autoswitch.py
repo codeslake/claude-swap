@@ -2863,6 +2863,62 @@ class TestLiveLock:
         engine.stop()          # and again, serially
         assert engine._live_lock is None
 
+    def test_stop_does_not_wait_on_a_tick_that_is_waiting_on_it(
+        self, harness
+    ):
+        """The waiter must not be the thread the tick depends on.
+
+        `_tick_in_flight` was widened from `switch_to` to the whole tick, and
+        the whole tick includes `_emit`. In the TUI, `_emit_from_thread` is
+        `app.call_from_thread`, which blocks the WORKER until the UI thread
+        runs the callback — and `stop()` is called ON that UI thread
+        (`_restart_engine`, `on_unmount`). Worker waits for UI, UI waits for
+        worker.
+
+        Measured on the shipped 30s ceiling: every `l` toggle or screen exit
+        landing mid-emit froze the whole TUI for 30s, then logged "a tick did
+        not finish".
+
+        The same shape hangs `cswap auto`: `cli.py` installs `stop()` as the
+        SIGTERM handler while `run_loop` is on the main thread, so the handler
+        runs INSIDE the tick it interrupts and waits on a flag only that
+        thread can set (measured 3.000s against a 3s ceiling).
+
+        A wait whose own thread owns the work is not a wait, it is a
+        deadlock — so `stop()` returns immediately when called from the thread
+        running the tick.
+        """
+        import threading
+        import time
+
+        engine = harness.engine
+        entered = threading.Event()
+        elapsed: list[float] = []
+
+        def emit_then_stop(event):
+            if entered.is_set():
+                return
+            entered.set()
+            t0 = time.monotonic()
+            engine.stop()          # the UI thread, mid-emit
+            elapsed.append(time.monotonic() - t0)
+
+        engine.on_event = emit_then_stop
+        with patch.object(
+            harness.switcher, "usage_entries_by_account",
+            return_value={
+                num: _entry_for(value, harness.clock.now)
+                for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+            },
+        ):
+            engine.tick()
+
+        assert elapsed, "premise: stop() ran from inside the tick"
+        assert elapsed[0] < 1.0, (
+            f"stop() blocked {elapsed[0]:.2f}s waiting on the very tick whose "
+            "thread called it — the TUI freezes and SIGTERM self-deadlocks"
+        )
+
     def test_a_stopped_engine_does_not_finish_freshening(self, harness):
         """`_tick_in_flight` guarded only `switch_to`.
 

@@ -675,6 +675,21 @@ class CredentialStore:
             except Exception:
                 cleared = False  # best-effort; a down Keychain can't be cleaned
         cfg = self._read_global_config()
+        if cfg is None and get_global_config_path().exists():
+            # UNREADABLE, not absent — the same distinction this branch keeps
+            # having to make. `_read_global_config` answers None for both, so
+            # a truncated or unreadable `~/.claude.json` skipped the drop AND
+            # reported a cleared key. The re-read is no help: `_read_managed_key`
+            # reads the same file through the same reader and answers "", so
+            # every refusal term passed over a live `primaryApiKey` and the
+            # landing announced "logged out" while the key kept authenticating.
+            #
+            # An ABSENT config has nothing to clear and is a genuine success.
+            self._host._logger.warning(
+                "Cannot confirm the managed key was cleared: "
+                f"{get_global_config_path()} is unreadable"
+            )
+            return False
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
                 c.pop("primaryApiKey", None)
