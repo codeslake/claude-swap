@@ -209,8 +209,16 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         # No pin this launch, whatever the reason: not installed, or installed
         # and broken. A wiring a previous install left behind would otherwise
         # outlive it and point every session at a dead port — see clear_wiring.
+        #
+        # ASK FIRST, LOCK ONLY IF THERE IS WORK. The budget is per PATH and
+        # clear_wiring takes one lock per config, so a user who never installed
+        # the pin — the case this budget exists for — paid it twice: measured
+        # 1.37-1.64s with Claude Code holding the lock, against a documented
+        # cap of 0.5s. _wiring_present is lock-free and answers in ~1.5ms, and
+        # for that user the answer is always "nothing to remove".
         try:
-            clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
+            if _wiring_present(switcher):
+                clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
         except Exception:  # noqa: BLE001
             pass
         return env
@@ -303,11 +311,26 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # get_global_config_path(), so a single lock around the loop guards one
     # file and leaves the other rewritten unprotected — racing `cswap switch`
     # and Claude Code, the whole-file clobber the lock exists to prevent.
+    #
+    # ``timeout`` is a TOTAL, not a per-file allowance. Passing it to each
+    # acquisition made the real worst case a multiple of the number of
+    # configs, so the launch path's sub-second cap silently became ~2x that
+    # (measured: 1.37-1.64s against a documented 0.5s). The second file gets
+    # whatever the first left.
+    import time as _time
+
+    deadline = None if timeout is None else _time.monotonic() + timeout
     changed = False
     for path in paths:
+        if deadline is not None:
+            left = deadline - _time.monotonic()
+            if left <= 0:
+                continue  # budget spent; the next launch heals what is left
+        else:
+            left = None
         try:
             with proper_lockfile(
-                path.parent / (path.name + ".lock"), timeout=timeout
+                path.parent / (path.name + ".lock"), timeout=left
             ):
                 if _clear_wiring_locked(switcher, path):
                     changed = True
@@ -355,6 +378,38 @@ def _pinned_email_now(switcher) -> tuple[str, str] | None:
     if not email:
         return None
     return email, section.get("pinnedOrganizationUuid")
+
+
+def _safe(exc: object) -> str:
+    """An exception rendered for display, with URL userinfo removed.
+
+    Every failure renderer here interpolates ``str(exc)`` — into CLI output,
+    into a TUI modal, into a MENU LABEL — and the text comes out of an
+    optional third-party package the seam does not control. A proxy URL
+    carrying ``user:secret@host`` in a message would reach the screen
+    verbatim. No path in this PR builds one; the scrub is here because the
+    seam has no way to promise none ever will.
+    """
+    import re
+
+    # scheme://userinfo@host  ->  scheme://***@host. Anchored on "://" so an
+    # ordinary email address in a message is left alone.
+    return re.sub(r"(?<=://)[^/\s@]+@", "***@", str(exc))
+
+
+def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
+    """Put the record back the way ``before`` had it. True when it IS back.
+
+    The verdict is MEASURED, never inferred from the restore call: when
+    ``_impl()`` itself is what raised, ``apply_pin`` never ran and the record
+    was never touched, so a message claiming "may still name <email>" was
+    telling the user to go check a state the code could already disprove.
+    """
+    try:
+        _impl().apply_pin(switcher, *(before or (None, None)))
+    except Exception:  # noqa: BLE001 — the re-read below is the verdict
+        pass
+    return _pinned_email_now(switcher) == before
 
 
 def _clear_pin_record(switcher) -> None:
@@ -500,12 +555,21 @@ def clear_pin(switcher) -> tuple[bool, str]:
     return True, "Unpinned the cloud account"
 
 
-def set_pin(switcher, email: str, org_uuid: str | None) -> tuple[bool, str]:
+def set_pin(
+    switcher, email: str, org_uuid: str | None, num: str | None = None
+) -> tuple[bool, str]:
     """Pin the cloud surface to ``email``. ``(ok, message)``.
 
     A failure ROLLS THE RECORD BACK: ``apply_pin`` writes ``remoteControl``
     before it starts the proxy, so reporting the failure while leaving it makes
     every read-back — ``cswap pin``, the TUI badge — contradict the message.
+
+    ``num`` is the slot both call sites ALREADY resolved. Re-deriving it from
+    the email here was a real bypass, not a tidiness point: cswap's own
+    documented personal+org pattern gives one address two slots, so
+    ``resolve_account(email)`` raises ``ConfigError`` and the API-key refusal
+    below was skipped entirely — accepting exactly the account it exists to
+    reject.
     """
     # REFUSED HERE, not at the call sites. An API-key account can never be
     # pinned — `sk-ant-api…` is not OAuth JSON, so the provider returns None
@@ -515,34 +579,62 @@ def set_pin(switcher, email: str, org_uuid: str | None) -> tuple[bool, str]:
     # submenu is never rebuilt while the snapshot keeps updating, and a row
     # that was OAuth when the menu was drawn pins an API-key account when it
     # is selected.
-    try:
-        num, _e, _o = switcher.resolve_account(email)
-        if switcher._account_kind(num) == "api_key":
+    #
+    # A kind we cannot READ is not permission to proceed. Swallowing the
+    # lookup turned an unreadable sequence.json into a silent skip of the
+    # refusal — the failure mode is identical to having no refusal at all,
+    # and it is invisible. Refuse loudly instead; the user can fix the store.
+    if num is None:
+        try:
+            num = switcher.resolve_account(email)[0]
+        except Exception as exc:  # noqa: BLE001
             return False, (
-                f"{email} is an API-key account, which the cloud pin cannot "
-                "use: Remote Control and Artifacts need an OAuth bearer"
+                f"Could not resolve {email} to one account ({_safe(exc)}), so the "
+                "cloud pin cannot check it is not an API-key account"
             )
-    except Exception:  # noqa: BLE001 — an unresolvable kind is not a refusal
-        pass
+    try:
+        kind = switcher._account_kind(num)
+    except Exception as exc:  # noqa: BLE001
+        return False, (
+            f"Could not read what kind of account {email} is ({_safe(exc)}); the "
+            "cloud pin needs an OAuth account and will not guess"
+        )
+    if kind == "api_key":
+        return False, (
+            f"{email} is an API-key account, which the cloud pin cannot "
+            "use: Remote Control and Artifacts need an OAuth bearer"
+        )
     before = _pinned_email_now(switcher)
     try:
         started = _impl().apply_pin(switcher, email, org_uuid)
     except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
-        try:
-            _impl().apply_pin(switcher, *(before or (None, None)))
-        except Exception:  # noqa: BLE001
-            return False, (
-                f"Could not pin the cloud account: {exc} — the record may still "
-                f"name {email}, check with `cswap pin`"
-            )
+        rolled = _restore_pin(switcher, before)
         return False, (
-            f"Could not pin the cloud account: {exc} — "
-            + ("the previous pin is unchanged" if before else "nothing is pinned")
+            f"Could not pin the cloud account: {_safe(exc)} — "
+            + (
+                ("the previous pin is unchanged" if before else "nothing is pinned")
+                if rolled
+                else f"and the record may still name {email}, "
+                "check with `cswap pin`"
+            )
         )
     if not started:
+        # SAME DEFECT AS THE RAISE PATH, sibling branch. apply_pin writes the
+        # record before starting the proxy, so leaving it here made the two
+        # commands contradict each other: `cswap pin 2` said "nothing is
+        # pinned yet" and exited 1 while `cswap pin` then printed the address
+        # and exited 0, with the ○ cloud badge lit. Roll back to whatever was
+        # pinned before, exactly as a raise does.
+        rolled = _restore_pin(switcher, before)
         return False, (
-            f"Cloud pin recorded for {email}, but no proxy is running — "
-            "nothing is pinned yet"
+            f"Could not pin the cloud account to {email}: no proxy is running, "
+            "so nothing is pinned yet — "
+            + (
+                ("the previous pin is unchanged" if before else "nothing is pinned")
+                if rolled
+                else f"and the record may still name {email}, "
+                "check with `cswap pin`"
+            )
         )
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
@@ -588,7 +680,9 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
     # THE SAME set_pin THE TUI CALLS. This branch carried its own copy of the
     # refusal, the rollback and the no-proxy verdict — and the API-key refusal
     # is the divergence that survived in it after the shared pair was added.
-    ok, msg = set_pin(switcher, email, org_uuid)
+    # num is passed, not re-derived: a duplicate email resolves ambiguously
+    # and would skip the API-key refusal (see set_pin).
+    ok, msg = set_pin(switcher, email, org_uuid, num=account_num)
     if not ok:
         warning(msg)
         if "no proxy is running" in msg:
