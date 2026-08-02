@@ -1660,16 +1660,7 @@ class AutoSwitchEngine:
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
             # WHERE we came from, so the next tick can refuse to undo this.
-            # Each anti-flap gate is one-way on its own axis, but burn moves a
-            # pair across `SPENT_HEADROOM_PCT` and the axis changes with it —
-            # measured, both resets past the horizon, only the active burning:
-            #
-            #     t8   1->2  headroom axis   active 4.0 / best 8.0
-            #     t20  2->1  headroom axis   active 2.0 / best 4.0
-            #     t22  1->2  recovery axis   active 3.0 / best 2.0
-            #
-            # so the move sequence was [1, 2, 1, 2] where base makes one move.
-            # Nothing bounded how many times the pair could cross.
+            # See the filter in `_tick_inner` for why.
             state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
             atomic_write_json(self.state_path, state)
 
