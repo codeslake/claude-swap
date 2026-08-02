@@ -5303,7 +5303,7 @@ class TestSwitchSkipsBrokenSlots:
             return real_unlink(self, *a, **kw)
 
         with patch.object(type(cred), "unlink", refuse):
-            with pytest.raises(SwitchError):
+            with pytest.raises(ClaudeSwitchError):
                 s._switch_to_empty_slot(
                     "2", "b@example.com", {"number": 1}, {"number": 2},
                     s._get_sequence_data(),
@@ -5384,7 +5384,7 @@ class TestSwitchSkipsBrokenSlots:
 
         with patch.object(type(cred), "unlink", refuse_unlink), \
                 patch.object(type(cred), "read_text", read_after_clear):
-            with pytest.raises(SwitchError):
+            with pytest.raises(ClaudeSwitchError):
                 s._switch_to_empty_slot(
                     "2", "b@example.com", {"number": 1}, {"number": 2},
                     s._get_sequence_data(),
@@ -5741,7 +5741,7 @@ class TestSwitchSkipsBrokenSlots:
         monkeypatch.setattr(_kc, "set_password", real_set)
         assert s._store._use_keychain() is False, "premise: file mode is pinned"
 
-        with pytest.raises(SwitchError):
+        with pytest.raises(ClaudeSwitchError):
             s._switch_to_empty_slot(
                 "2", "b@example.com", {"number": 1}, {"number": 2},
                 s._get_sequence_data(),

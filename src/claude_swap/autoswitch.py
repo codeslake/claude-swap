@@ -930,6 +930,18 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        # RE-CHECK BEFORE THE FETCH. `_tick_inner`'s gate fires at tick START;
+        # the next one is the freshen loop, and between them sits the usage
+        # collection — the path that POSTs one-time refresh grants. A worker
+        # parked in an earlier `_emit` (the unquarantine notices above) is
+        # exempt from `stop()`'s wait by design, so `stop()` returns, LIVE is
+        # released, and the worker then wakes and fetches for a successor that
+        # already owns the lock. Measured: `usage fetches AFTER LIVE was
+        # released: [['2']]`.
+        if self._stop.is_set():
+            self._emit(NoSwitchEvent(reason="engine-stopped"))
+            return TickOutcome.NO_ACTION
+
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
@@ -1115,6 +1127,9 @@ class AutoSwitchEngine:
             # deliberately NOT re-classified if the fresh active crossed the
             # threshold: a still-qualifying sooner target switches anyway,
             # and otherwise the next tick escalates normally and escapes.
+            if self._stop.is_set():
+                self._emit(NoSwitchEvent(reason="engine-stopped"))
+                return TickOutcome.NO_ACTION
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
@@ -1521,6 +1536,19 @@ class AutoSwitchEngine:
             pick = due_candidate(candidates, pre, now)
             if pick is not None:
                 plan.add(pick)
+        # A STOPPED ENGINE ISSUES NO FETCHES. Not just the entry gate: `stop()`
+        # returns while a worker is parked in an emit (the exemption that keeps
+        # the TUI from deadlocking), and the worker then WAKES and keeps going.
+        # Measured before this: 3 network fetches after LIVE was released, one
+        # of them the path that POSTs one-time refresh grants — spent for a
+        # successor that already owns the lock.
+        #
+        # Here rather than at the caller: `_collect_scheduled_usage` has three
+        # fetch sites (plan, escalation, and the at-limit refresh) and guarding
+        # only its entrance left the other two live. The `fetch=set()` reads at
+        # :1494 and :1924 touch no network and stay.
+        if self._stop.is_set():
+            return {}, {}, {}
         entries = self.switcher.usage_entries_by_account(
             fetch=plan,
             # A candidate-style plan on the active slot is deliberately
@@ -1567,6 +1595,8 @@ class AutoSwitchEngine:
                     and planned_headroom <= 0
                 ):
                     escalation_fetch.remove(num)
+            if self._stop.is_set():
+                return {}, {}, {}      # see the note above the plan fetch
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
@@ -1606,12 +1636,21 @@ class AutoSwitchEngine:
             # caller (the TUI's LIVE/dry-run toggle, leaving the screen)
             # constructs the successor right after. Checked under the lock,
             # so the successor cannot switch between this test and ours.
-            if self._stop.is_set():
-                self._emit(NoSwitchEvent(reason="engine-stopped"))
-                return TickOutcome.NO_ACTION
-
+            # ARMED BEFORE THE `_stop` TEST, not after. These are separate
+            # statements and a signal handler runs inside the frame it
+            # interrupts, so a SIGTERM landing between them found
+            # `own_tick=True, _switch_in_flight=False` and took `stop()`'s
+            # IMMEDIATE-release path — measured, fired from this very frame:
+            # the switch ran to completion with LIVE already released and
+            # claimable by a successor. Arming first makes the window
+            # "flagged but not yet switching", where a deferral is harmless:
+            # the `finally` below runs either way.
             self._switch_in_flight = True
             try:
+                if self._stop.is_set():
+                    self._emit(NoSwitchEvent(reason="engine-stopped"))
+                    return TickOutcome.NO_ACTION
+
                 result = self.switcher.switch_to(number, json_output=True)
             finally:
                 self._switch_in_flight = False
@@ -1751,10 +1790,16 @@ class AutoSwitchEngine:
         # arrived either, because Textual refuses `call_from_thread` from the
         # app's own thread and `autoview` swallows the RuntimeError. It goes to
         # the logger instead, which has no thread affinity.
-        if self._stop.is_set():
-            return
+        # FLAG FIRST, GATE SECOND. Setting it after the `_stop` check left two
+        # bytecodes in which a worker about to enter the consumer's callback
+        # looked idle to `stop()` — measured, `stop()` blocked the full ceiling
+        # and logged the release warning. Setting it first can only make
+        # `stop()` skip a wait it did not need, which is the safe direction:
+        # the `finally` clears it whether or not the gate returns.
         self._emit_in_flight.set()
         try:
+            if self._stop.is_set():
+                return
             self.on_event(event)
         finally:
             self._emit_in_flight.clear()
