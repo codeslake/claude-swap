@@ -1057,13 +1057,39 @@ class AutoSwitchEngine:
         # anti-flap gates by design. Unscoped this stranded a 2-account fleet
         # on an exhausted active with the peer at 0%, "no-candidates" every
         # tick, with nothing able to release it.
+        #
+        # AND IT NEEDS A RELEASE CONDITION. Identity alone has none: on a
+        # 2-account fleet the filter removes the only candidate, and
+        # `lastSwitchFrom` is rewritten ONLY by a successful switch — the very
+        # switch it prevents. Measured, reached by one ordinary proactive move
+        # and no seeded state: the peer resets to 0%, the active burns to 97%,
+        # and 20 ticks / 10h answer "no-candidates". Persisted, so it survives
+        # a restart and a week of wall clock. The engine then escapes only at a
+        # hard 100% — the proactive feature off, on the fleet size that has
+        # nowhere else to go.
+        #
+        # Released by the SAME ratio the anti-flap margin uses. The filter
+        # exists to stop a flip undoing the move before it; a peer that now
+        # beats us by 2x is not that flip, it is a move the outbound leg would
+        # have made on its own merits. One-way stays one-way: the margin is
+        # what makes it so, and re-using it keeps the release from becoming a
+        # second, looser threshold that has to be reasoned about separately.
         came_from = state.get("lastSwitchFrom")
         if (
             trigger in ("proactive", "consume-first")
             and came_from is not None
             and str(came_from) in oauth_candidates
         ):
-            oauth_candidates = [n for n in oauth_candidates if n != str(came_from)]
+            left_headroom = headroom.get(str(came_from))
+            released = (
+                left_headroom is not None
+                and active_headroom is not None
+                and left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO
+            )
+            if not released:
+                oauth_candidates = [
+                    n for n in oauth_candidates if n != str(came_from)
+                ]
         api_key_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
