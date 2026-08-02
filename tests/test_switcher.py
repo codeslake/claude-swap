@@ -17,6 +17,7 @@ from claude_swap import oauth
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     SwitchError,
@@ -5578,10 +5579,18 @@ class TestSwitchSkipsBrokenSlots:
 
         Alongside #196 a second witness also fires here — that PR records
         `_keychain_op_failed` at the same write, so `keychain_unavailable`
-        becomes True too. Measured in the merged tree, both fire. This test
-        asserts the REFUSAL, which is the contract either way; on this branch
-        `residual_gone` is the only witness, and dropping it from the guard
-        turns exactly this test red.
+        becomes True and with it `degraded`. Measured in the merged tree the
+        DEGRADED guard wins and raises `CredentialReadError` before the
+        post-clear check is reached; alone on this branch it is `SwitchError`
+        from that check. Two refusals for one state, from two branches that
+        closed it independently.
+
+        So this asserts `ClaudeSwitchError` — the REFUSAL, which is the
+        contract either way. Naming the narrower `SwitchError` made both green
+        branches fail on merge with nothing actually wrong: measured, 1959
+        passed and this one red purely on the exception class. Dropping
+        `residual_gone` from the guard still turns it red on this branch,
+        where that is the only witness.
         """
         from claude_swap import macos_keychain as _kc
 
@@ -5623,7 +5632,7 @@ class TestSwitchSkipsBrokenSlots:
         assert s._store._use_keychain() is False, "premise: file mode is pinned"
         assert get_password(*item) is not None, "premise: the residual survived"
 
-        with pytest.raises(SwitchError):
+        with pytest.raises(ClaudeSwitchError):
             s._switch_to_empty_slot(
                 "2", "b@example.com", {"number": 1}, {"number": 2},
                 s._get_sequence_data(),
