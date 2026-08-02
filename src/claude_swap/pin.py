@@ -357,6 +357,24 @@ def _pinned_email_now(switcher) -> tuple[str, str] | None:
     return email, section.get("pinnedOrganizationUuid")
 
 
+def _clear_pin_record(switcher) -> None:
+    """Drop ``remoteControl`` from settings.json. Never raises.
+
+    Only for the path where the package cannot do it — normally ``apply_pin``
+    owns this file's pin section, and going around it would race the daemon's
+    own writes. Here there IS no package, so nothing else can.
+    """
+    from claude_swap import settings as _s
+
+    try:
+        path = _s.settings_path(switcher.backup_dir)
+        raw = _s._read_raw_for_write(path)
+        if raw.pop("remoteControl", None) is not None:
+            _s.atomic_write_json(path, raw)
+    except Exception:  # noqa: BLE001 — the caller re-reads and reports
+        pass
+
+
 def _wiring_present(switcher) -> bool:
     """Does either config still carry a pin wiring?
 
@@ -457,7 +475,18 @@ def clear_pin(switcher) -> tuple[bool, str]:
         impl = _impl()
         impl.apply_pin(switcher, None, None)
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
-        pass
+        # THE RECORD IS CSWAP'S OWN FILE, so clear it here rather than
+        # reporting that the package could not. With the extra uninstalled,
+        # leaving it meant `--clear` failed, told the user to REINSTALL the
+        # package they had just removed (advice that inverts their intent and
+        # never converges — run 2 is identical), and then re-pinned the old
+        # account the moment anything reinstalled it, live, with no user
+        # action. Same for a too-old or broken-root package.
+        #
+        # This is the stranding clear_wiring was moved into this repo to
+        # prevent, one level up: the wiring is cswap's file and gets cleared,
+        # and settings.json -> remoteControl is equally cswap's file.
+        _clear_pin_record(switcher)
     cleared = clear_wiring(switcher)
     still_pinned = _pinned_email_now(switcher) is not None
     still_wired = _wiring_present(switcher)
@@ -478,6 +507,23 @@ def set_pin(switcher, email: str, org_uuid: str | None) -> tuple[bool, str]:
     before it starts the proxy, so reporting the failure while leaving it makes
     every read-back — ``cswap pin``, the TUI badge — contradict the message.
     """
+    # REFUSED HERE, not at the call sites. An API-key account can never be
+    # pinned — `sk-ant-api…` is not OAuth JSON, so the provider returns None
+    # for every request and each one fails open: daemon spawned, badge lit,
+    # nothing pinned, ever. The TUI's row filter is a courtesy, not the
+    # enforcement: refresh_root_menu returns early below depth 1, so an open
+    # submenu is never rebuilt while the snapshot keeps updating, and a row
+    # that was OAuth when the menu was drawn pins an API-key account when it
+    # is selected.
+    try:
+        num, _e, _o = switcher.resolve_account(email)
+        if switcher._account_kind(num) == "api_key":
+            return False, (
+                f"{email} is an API-key account, which the cloud pin cannot "
+                "use: Remote Control and Artifacts need an OAuth bearer"
+            )
+    except Exception:  # noqa: BLE001 — an unresolvable kind is not a refusal
+        pass
     before = _pinned_email_now(switcher)
     try:
         started = _impl().apply_pin(switcher, email, org_uuid)
@@ -517,73 +563,15 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # command whose job is to work when the pin does not.
         # READ THE RECORD OURSELVES, not through the package.
         #
-        # An earlier fix re-read the pin AFTER apply_pin, which covered
-        # "apply_pin raises" and missed the case its own comment names.
-        # A broken `cryptography` does not make apply_pin raise: cswap_pin's
-        # __init__ imports nothing from proxy, so find_spec succeeds and it is
-        # `import_module("cswap_pin.proxy")` inside _impl() that raises —
-        # one line EARLIER than that guard. `had_pin` was then never measured,
-        # the except set it False, and "Unpinned" printed over a live pin.
-        #
-        # The pin record is cswap's OWN file (settings.json -> remoteControl),
-        # so the one command whose job is to work when the pin does not should
-        # not need the pin to answer "is it still there".
-        try:
-            had_pin = _pinned_email_now(switcher) is not None
-        except Exception:  # noqa: BLE001 — an unreadable file is not a pin
-            had_pin = False
-        still_pinned = had_pin
-        try:
-            impl = _impl()
-            impl.apply_pin(switcher, None, None)
-        except Exception:  # noqa: BLE001
-            pass
-        # Re-read either way. The success message was gated on clear_wiring(),
-        # which reports on the .claude.json wiring and never on the pin itself,
-        # so every way of failing above printed "Unpinned" over a live pin.
-        # Reading here covers all of them at once — a raising _impl(), a
-        # raising apply_pin, and an apply_pin that returns having done nothing.
-        try:
-            still_pinned = _pinned_email_now(switcher) is not None
-        except Exception:  # noqa: BLE001
-            still_pinned = had_pin
-        # ALWAYS, not only when apply_pin failed. The package unwires through
-        # its own single-path resolver, so with the extra installed a --clear
-        # run from inside a session terminal cleared that session's config and
-        # left ~/.claude.json naming a dead port — while printing "Unpinned".
-        # The both-paths guarantee has to hold for the users who HAVE the pin,
-        # which is all of them at the moment they unpin.
-        #
-        # apply_pin cannot answer "was there anything to clear": it returns
-        # whether a proxy is now serving, which on this path is always False.
-        cleared_wiring = clear_wiring(switcher)
-        # RE-READ THE WIRING TOO, for the reason the pin is re-read: a return
-        # value cannot separate "nothing to clear" from "could not clear".
-        # clear_wiring skips a path whose lock it cannot take (deliberate — the
-        # launch path must not fail over a contended config) and returns False
-        # either way, so a read-only ~ or Claude Code holding
-        # .claude.json.lock past the wait printed "Unpinned" while the wiring
-        # stayed. The daemon then idles out and every hand-launched claude
-        # dials a dead port — the exact stranding clear_wiring was moved into
-        # this repo to prevent, reported as success.
-        still_wired = _wiring_present(switcher)
-        if still_pinned or still_wired:
-            warning("Could not remove the cloud pin")
-            if still_pinned:
-                print(dimmed("  the pin package is installed but not usable here"))
-                print(dimmed(f"  reinstall it:  {_install_how()}"))
-            if still_wired:
-                print(
-                    dimmed(
-                        "  the proxy wiring is still in .claude.json (locked or "
-                        "read-only) — re-run `cswap pin --clear` once it frees up"
-                    )
-                )
+        # THE SAME clear_pin THE TUI CALLS. This branch used to carry its own
+        # copy of the logic, which is how the API-key refusal ended up in one
+        # front end and not the other for three review rounds. One decision,
+        # one implementation, two renderings.
+        ok, msg = clear_pin(switcher)
+        if not ok:
+            warning(msg)
             return 1
-        if not cleared_wiring and not had_pin:
-            print(dimmed("No cloud account pinned"))
-            return 0
-        print(f"{accent('Unpinned')} the cloud account")
+        print(msg if msg.startswith("No ") else f"{accent('Unpinned')} the cloud account")
         return 0
 
     pin = _impl()  # raises ClaudeSwitchError with the install hint
@@ -597,78 +585,19 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         return 0
 
     account_num, email, org_uuid = switcher.resolve_account(account)
-
-    # REFUSE AN API-KEY ACCOUNT. `sk-ant-api...` is not OAuth JSON, so the
-    # proxy's credential provider returns None for every request and each one
-    # fails open — the pin is accepted, the daemon spawns, the badge shows
-    # `○ cloud`, and nothing is ever pinned. session.py:_ensure_not_api_key
-    # already refuses these for `cswap run` for the same reason; refusing here
-    # is the same call at the same level, rather than teaching the badge a new
-    # broken state after the fact.
-    try:
-        is_api_key = switcher._account_kind(account_num) == "api_key"
-    except Exception:  # noqa: BLE001 — an unreadable kind is not a refusal
-        is_api_key = False
-    if is_api_key:
-        raise ClaudeSwitchError(
-            f"Account-{account_num} ({email}) is an API-key account, which the "
-            "cloud pin cannot use: Remote Control and Artifacts need an OAuth "
-            "bearer. Pin an account added with `cswap add` after /login."
-        )
-    # The SET path needs the same honesty the clear path was given, and for the
-    # same reason: apply_pin writes the record BEFORE it starts the proxy, so
-    # a failure here leaves a pin that `cswap pin` and the TUI badge both
-    # report as live while nothing serves it.
-    #
-    # _pin_command catches ClaudeSwitchError only, and the failures that reach
-    # here are not that: with <backup>/pin-proxy a plain file (a leftover, a
-    # restore-from-backup), ensure_proxy's certdir.mkdir raises FileExistsError
-    # and the user gets a traceback plus a recorded pin.
-    had_pin_before = _pinned_email_now(switcher)
-    try:
-        started = pin.apply_pin(switcher, email, org_uuid)
-    except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
-        # ROLL THE RECORD BACK. Reporting the failure is not enough while
-        # apply_pin has already written remoteControl: `cswap pin` then reads
-        # it back and prints the account as pinned, the TUI badge shows
-        # ○ cloud, and the command that failed has handed the user a command
-        # that contradicts it. Restore whatever was pinned before — including
-        # nothing, which is the common case.
-        rolled_back = True
-        try:
-            pin.apply_pin(switcher, *(had_pin_before or (None, None)))
-        except Exception:  # noqa: BLE001
-            rolled_back = False
-        warning(f"Could not pin the cloud account: {exc}")
-        if rolled_back:
-            print(
-                dimmed(
-                    "  nothing is wired and the previous pin is unchanged"
-                    if had_pin_before
-                    else "  nothing is wired and nothing is pinned"
-                )
-            )
-        else:
-            print(
-                dimmed(
-                    "  WARNING: the record may still name "
-                    f"{email} — check with `cswap pin`"
-                )
-            )
+    # THE SAME set_pin THE TUI CALLS. This branch carried its own copy of the
+    # refusal, the rollback and the no-proxy verdict — and the API-key refusal
+    # is the divergence that survived in it after the shared pair was added.
+    ok, msg = set_pin(switcher, email, org_uuid)
+    if not ok:
+        warning(msg)
+        if "no proxy is running" in msg:
+            print(dimmed("  the daemon log says why: <backup>/pin-proxy/daemon.log"))
         return 1
     print(
         f"{accent('Pinned')} the cloud account (RC/artifacts) to "
         f"Account-{account_num} ({email})"
     )
-
-    if not started:
-        # False means NO PROXY IS SERVING. The record is written, so the pin
-        # takes effect on the next launch that can start one — but nothing is
-        # pinned right now, and "Pinned" alone reads as if it were. Suppressing
-        # the follow-up note was the only signal this failure had.
-        print(dimmed("  but no proxy is running, so nothing is pinned yet"))
-        print(dimmed("  the daemon log says why: <backup>/pin-proxy/daemon.log"))
-        return 1
 
     # A re-pin takes effect under the live proxy: the pinned account is re-read
     # per request, so nothing has to restart. The one thing it cannot move is a

@@ -800,30 +800,32 @@ class TestAFailedClearIsNotReportedAsSuccess:
             [sys.executable, "-c", code], capture_output=True, text=True
         )
 
-    def test_a_broken_package_cannot_report_success(self, tmp_path):
-        """_impl() ITSELF raising is the case the guard has to cover.
+    def test_an_unusable_package_still_clears_the_record(self, tmp_path):
+        """`--clear` must CONVERGE when the package cannot help.
 
-        A broken `cryptography` does not make apply_pin raise -- cswap_pin's
-        __init__ imports nothing from proxy, so find_spec succeeds and
-        import_module("cswap_pin.proxy") is what raises, one line before
-        apply_pin is ever reached.
+        The record is cswap's own file (settings.json -> remoteControl), so an
+        unusable package is no reason to leave it. Leaving it made --clear fail,
+        tell the user to REINSTALL the package they had just removed, never
+        converge on a re-run, and re-pin the old account live the moment
+        anything reinstalled it.
         """
         impl = (
             "def _impl_factory():\n"
             "    raise ImportError('cryptography')\n"
         )
         r = self._run(tmp_path, impl)
-        assert "Unpinned" not in r.stdout, (
-            "reported success while the pin survived -- the user stops looking"
-        )
-        assert "Could not remove" in r.stdout, r.stdout + r.stderr[-400:]
-        assert r.returncode == 1, "a failed clear must not exit 0"
+        assert "Unpinned" in r.stdout, r.stdout + r.stderr[-400:]
+        assert r.returncode == 0, "a clear that converged must not exit 1"
 
-    def test_a_failing_apply_pin_cannot_report_success(self, tmp_path):
+    def test_a_clear_that_leaves_the_record_is_a_failure(self, tmp_path):
+        """The control: when the record genuinely survives, say so."""
         impl = (
             "class _I:\n"
             "    def apply_pin(self, *a): raise OSError('disk full')\n"
             "def _impl_factory(): return _I()\n"
+            # the record cannot be cleared either
+            "import claude_swap.pin as _p\n"
+            "_p._clear_pin_record = lambda *a: None\n"
         )
         r = self._run(tmp_path, impl)
         assert "Unpinned" not in r.stdout
@@ -1129,11 +1131,8 @@ class TestARound2Regressions:
                         return (3, "key@example.com", "org")
                     def _account_kind(self, n):
                         return "api_key"
-                try:
-                    pin.run(_SW(), "3")
-                    print("ACCEPTED")
-                except ClaudeSwitchError as e:
-                    print("REFUSED:", e)
+                rc = pin.run(_SW(), "3")
+                print("ACCEPTED" if rc == 0 else "REFUSED")
                 """
             )
         )
@@ -1335,3 +1334,71 @@ class TestTheUncoveredRound2Fixes:
         monkeypatch.setattr(pin, "_config_lock_is_free", lambda b: True)
         pin.wire_launch_env(sw, {"A": "1"})
         assert calls == ["unwired"], "the unwire never runs, even when free"
+
+
+class TestTheVerdictHasExactlyOneImplementation:
+    """The invariant an earlier commit CLAIMED and did not have.
+
+    `clear_pin`/`set_pin` were added so a fix could not land on one front end
+    and miss the other — but `run()` kept its own inline copy, so the API-key
+    refusal lived in the CLI and not in the shared pair, and the TUI pinned an
+    API-key account through a stale submenu row. Asserting the structure is
+    what makes the claim true.
+    """
+
+    def _pin_src(self):
+        from pathlib import Path
+
+        return (
+            Path(__file__).resolve().parent.parent / "src" / "claude_swap" / "pin.py"
+        ).read_text(encoding="utf-8")
+
+    def test_run_delegates_to_the_shared_pair(self):
+        import ast
+
+        tree = ast.parse(self._pin_src())
+        run = next(
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run"
+        )
+        called = {
+            n.func.id
+            for n in ast.walk(run)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        assert {"clear_pin", "set_pin"} <= called, (
+            "run() does not go through the shared verdict — it is the second "
+            f"copy the pair exists to eliminate (calls: {sorted(called)})"
+        )
+        # And it must not re-derive the outcome: apply_pin belongs to the pair.
+        attrs = {
+            n.func.attr
+            for n in ast.walk(run)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+        }
+        assert "apply_pin" not in attrs, (
+            "run() calls apply_pin directly again — the verdict is back in two places"
+        )
+
+    def test_set_pin_refuses_an_api_key_account(self, tmp_path):
+        """The refusal must be IN set_pin, not only at a call site.
+
+        The TUI's row filter is a courtesy: refresh_root_menu returns early
+        below depth 1, so an open submenu is never rebuilt while the snapshot
+        keeps updating — a row that was OAuth when drawn pins an API-key
+        account when selected.
+        """
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text("{}")
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            resolve_account=lambda a: (3, "key@example.com", "org"),
+            _account_kind=lambda n: "api_key",
+        )
+        ok, msg = pin.set_pin(sw, "key@example.com", "org")
+        assert not ok, msg
+        assert "API-key account" in msg, msg
