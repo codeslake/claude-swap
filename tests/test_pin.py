@@ -748,12 +748,14 @@ class TestClearRunsWithTheExtraGone:
 class TestAFailedClearIsNotReportedAsSuccess:
     """`--clear` must not say "Unpinned" while the pin survives.
 
-    The failure is silent by construction: the bare `except` swallows an
-    apply_pin failure, and the success message was gated on clear_wiring(),
-    which reports only on the .claude.json wiring — never on the pin itself.
-    So "installed but unusable" (the case the code's own comments anticipate)
-    printed "Unpinned" with exit 0 while settings.json kept remoteControl, and
-    RC/Artifacts returned to the old account the moment the import worked.
+    The failure is silent by construction: the success message was gated on
+    clear_wiring(), which reports on the .claude.json wiring and never on the
+    pin itself, so every way of failing printed "Unpinned" over a live pin.
+
+    The pin record is cswap's OWN file, so these drive it through that file
+    rather than through a stubbed package. That is the point of the fix: an
+    earlier version asked the package "is it still pinned", which cannot answer
+    when the package is the thing that is broken.
     """
 
     def _run(self, tmp_path, impl_src):
@@ -764,8 +766,12 @@ class TestAFailedClearIsNotReportedAsSuccess:
         src = str(Path(__file__).resolve().parent.parent / "src")
         cfg = tmp_path / ".claude.json"
         cfg.write_text(json.dumps({"env": {}}))
-        # NOT dedent-with-interpolation: impl_src carries its own indentation,
-        # and dedent would mangle it into an IndentationError.
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        # A real pin record, written the way cswap writes one.
+        (backup / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": "cloud@example.com"}}, indent=2)
+        )
         code = (
             textwrap.dedent(
                 f"""
@@ -781,10 +787,12 @@ class TestAFailedClearIsNotReportedAsSuccess:
             )
             + impl_src
             + textwrap.dedent(
-                """
-                pin._impl = lambda: _Impl()
+                f"""
+                pin._impl = _impl_factory
                 from claude_swap.switcher import ClaudeAccountSwitcher
-                sys.exit(pin.run(ClaudeAccountSwitcher(), None, clear=True))
+                sw = ClaudeAccountSwitcher()
+                sw.backup_dir = Path({str(backup)!r})
+                sys.exit(pin.run(sw, None, clear=True))
                 """
             )
         )
@@ -792,29 +800,169 @@ class TestAFailedClearIsNotReportedAsSuccess:
             [sys.executable, "-c", code], capture_output=True, text=True
         )
 
-    def test_a_pin_that_survives_is_reported_as_a_failure(self, tmp_path):
-        # apply_pin raises; load_pin keeps answering "still pinned".
+    def test_a_broken_package_cannot_report_success(self, tmp_path):
+        """_impl() ITSELF raising is the case the guard has to cover.
+
+        A broken `cryptography` does not make apply_pin raise -- cswap_pin's
+        __init__ imports nothing from proxy, so find_spec succeeds and
+        import_module("cswap_pin.proxy") is what raises, one line before
+        apply_pin is ever reached.
+        """
         impl = (
-            "class _Impl:\n"
-            "    def load_pin(self, d): return {'email': 'cloud@example.com'}\n"
-            "    def apply_pin(self, *a): raise ImportError('cryptography')\n"
+            "def _impl_factory():\n"
+            "    raise ImportError('cryptography')\n"
         )
         r = self._run(tmp_path, impl)
         assert "Unpinned" not in r.stdout, (
-            "reported success while the pin survived — the user stops looking"
+            "reported success while the pin survived -- the user stops looking"
         )
-        assert "Could not remove" in r.stdout
+        assert "Could not remove" in r.stdout, r.stdout + r.stderr[-400:]
         assert r.returncode == 1, "a failed clear must not exit 0"
 
-    def test_a_real_clear_still_reports_success(self, tmp_path):
-        # The control: the message must be right exactly when it worked.
+    def test_a_failing_apply_pin_cannot_report_success(self, tmp_path):
         impl = (
-            "class _Impl:\n"
-            "    _gone = False\n"
-            "    def load_pin(self, d):\n"
-            "        return None if _Impl._gone else {'email': 'cloud@example.com'}\n"
-            "    def apply_pin(self, *a): _Impl._gone = True\n"
+            "class _I:\n"
+            "    def apply_pin(self, *a): raise OSError('disk full')\n"
+            "def _impl_factory(): return _I()\n"
+        )
+        r = self._run(tmp_path, impl)
+        assert "Unpinned" not in r.stdout
+        assert "Could not remove" in r.stdout, r.stdout + r.stderr[-400:]
+        assert r.returncode == 1
+
+    def test_a_real_clear_still_reports_success(self, tmp_path):
+        """The control: the message must be right exactly when it worked."""
+        impl = (
+            "import json as _j\n"
+            "class _I:\n"
+            "    def apply_pin(self, sw, *a):\n"
+            "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
+            "def _impl_factory(): return _I()\n"
         )
         r = self._run(tmp_path, impl)
         assert "Unpinned" in r.stdout, r.stdout + r.stderr[-400:]
         assert r.returncode == 0
+
+
+class TestTheSetPathIsAsHonestAsTheClearPath:
+    """`cswap pin NUM` must not report a pin that is not in effect.
+
+    apply_pin writes the record BEFORE it starts the proxy, so both failures
+    here leave a pin that `cswap pin` and the TUI badge report as live while
+    nothing serves it.
+    """
+
+    def _run(self, tmp_path, impl_src):
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        code = (
+            textwrap.dedent(
+                f"""
+                import sys
+                sys.path.insert(0, {src!r})
+                from pathlib import Path
+                from claude_swap import pin
+                """
+            )
+            + impl_src
+            + textwrap.dedent(
+                f"""
+                pin._impl = _impl_factory
+                class _SW:
+                    backup_dir = Path({str(backup)!r})
+                    def resolve_account(self, a):
+                        return (2, "user2@example.com", "org-uuid")
+                sys.exit(pin.run(_SW(), "2"))
+                """
+            )
+        )
+        return subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+
+    def test_a_raising_apply_pin_is_not_a_traceback(self, tmp_path):
+        # Real trigger, no injection: <backup>/pin-proxy as a plain FILE makes
+        # ensure_proxy's certdir.mkdir raise FileExistsError, which is not a
+        # ClaudeSwitchError and so reached the user as a traceback.
+        impl = (
+            "class _I:\n"
+            "    def apply_pin(self, *a): raise FileExistsError('pin-proxy')\n"
+            "def _impl_factory(): return _I()\n"
+        )
+        r = self._run(tmp_path, impl)
+        assert "Traceback" not in r.stderr, r.stderr[-400:]
+        assert "Pinned" not in r.stdout, "reported a pin that did not happen"
+        assert "Could not pin" in r.stdout, r.stdout + r.stderr[-300:]
+        assert r.returncode == 1
+
+    def test_no_proxy_serving_is_not_unqualified_success(self, tmp_path):
+        # apply_pin returning False means no proxy is serving. Suppressing the
+        # follow-up note was the only signal; the word "Pinned" still went out.
+        impl = (
+            "class _I:\n"
+            "    def apply_pin(self, *a): return False\n"
+            "def _impl_factory(): return _I()\n"
+        )
+        r = self._run(tmp_path, impl)
+        assert "nothing is pinned yet" in r.stdout, r.stdout + r.stderr[-300:]
+        assert r.returncode == 1, "a pin nothing serves must not exit 0"
+
+
+class TestTheRuntimeVersionFloor:
+    """pyproject's floor binds a fresh resolve only.
+
+    Anyone who installed cswap-pin before 0.1.1 and later upgrades claude-swap
+    WITHOUT the extra keeps 0.1.0 — the release where a refused swap is handed
+    to the client and ends that process's Remote Control.
+    """
+
+    def _probe(self, version_literal):
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        code = textwrap.dedent(
+            f"""
+            import sys, types
+            sys.path.insert(0, {src!r})
+            pkg = types.ModuleType("cswap_pin")
+            pkg.__path__ = []
+            {version_literal}
+            proxy = types.ModuleType("cswap_pin.proxy")
+            sys.modules["cswap_pin"] = pkg
+            sys.modules["cswap_pin.proxy"] = proxy
+            import importlib.util
+            real = importlib.util.find_spec
+            importlib.util.find_spec = lambda n, *a, **k: (
+                object() if n.startswith("cswap_pin") else real(n, *a, **k))
+            import importlib
+            importlib.import_module = lambda n, *a, **k: sys.modules[n]
+            from claude_swap import pin
+            try:
+                pin._impl()
+                print("ACCEPTED")
+            except Exception as e:
+                print("REFUSED:", e)
+            """
+        )
+        return subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        ).stdout
+
+    def test_an_old_pin_is_refused_by_version(self):
+        out = self._probe('pkg.__version__ = "0.1.0"')
+        assert "REFUSED" in out, f"0.1.0 was accepted at runtime: {out}"
+        assert "0.1.0 is too old" in out, out
+
+    def test_the_current_version_is_accepted(self):
+        assert "ACCEPTED" in self._probe('pkg.__version__ = "0.1.1"')
+
+    def test_an_absent_version_is_not_treated_as_old(self):
+        # A dev checkout must not be refused over a guess.
+        assert "ACCEPTED" in self._probe("pass")
