@@ -251,6 +251,15 @@ class CredentialStore:
         # which _pin_file_mode sets deliberately: a routing choice must not
         # erase an observation. See _keychain_unreadable.
         self._keychain_op_failed: bool = False
+        # Set by the ACTIVE OAuth read when THAT read could not reach the
+        # Keychain. Per-item, not per-process: `_kc_call` clears
+        # `_keychain_op_failed` on any success, and a backup read for an idle
+        # slot goes straight through it — so one readable backup erased the
+        # verdict recorded when the active read failed, and `degraded` flipped
+        # False while the plaintext file still held the superseded generation.
+        # "The Keychain answers" and "this active read succeeded" are different
+        # facts; `degraded` needs the second.
+        self._active_read_failed: bool = False
         # Set by the backup read when THIS read could not reach the Keychain,
         # consumed by _read_account_credentials_ex. Per-read, not a capability:
         # whether a particular backup was readable is a fact about that read,
@@ -464,9 +473,13 @@ class CredentialStore:
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         if self._use_keychain():
             val, keychain_failed = self._read_active_oauth_keychain()
+            # THIS read's own verdict, kept so a later success on some OTHER
+            # item cannot erase it. Sticky until this read succeeds again,
+            # which is what makes it self-heal without being erasable.
+            self._active_read_failed = keychain_failed
             if val:
                 return ActiveCredentials(val, False)
-        elif self._keychain_unreadable:
+        elif self._active_read_failed or self._keychain_unreadable:
             # Keychain already known unusable this process (a prior op failed and the
             # capability cache stuck to file mode): if nothing is found below, that
             # absence is "keychain unavailable", not a genuinely empty slot.
@@ -1033,6 +1046,19 @@ class CredentialStore:
         # Cleared above rather than trusted from a previous call: a caller that
         # substitutes `_read_account_credentials` never reaches the setter, and
         # a stale True there would defer forever.
+        #
+        # NO TEST SEPARATES THIS FROM `_keychain_unreadable` today, and that is
+        # worth stating: `_kc_read_backup` routes through `_kc_call`, so a
+        # FAILING backup read sets both flags and a SUCCEEDING one clears the
+        # process flag before this line reads it. The two therefore agree on
+        # every state currently reachable, and swapping this for
+        # `_keychain_unreadable` leaves the suite green (measured, 1787
+        # passed). The per-read flag is still the correct one — it answers
+        # about THIS read rather than about the process — and it is what will
+        # keep answering correctly if `_kc_call`'s clearing ever narrows. Kept
+        # as the right shape rather than removed for being currently
+        # indistinguishable, and recorded so nobody re-derives that as a
+        # finding.
         return "", self._backup_read_failed
 
     def _write_account_credentials(
