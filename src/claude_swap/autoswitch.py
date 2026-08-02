@@ -1034,6 +1034,28 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
+        # NEVER UNDO THE PREVIOUS MOVE. Each anti-flap gate is one-way on its
+        # own axis, but the axis is a property of the pair's STATE and burn
+        # changes that state: the ratio gate is relative (`h >= active x 2`)
+        # and the spent gate absolute (`active <= 3.0`), so a burning pair
+        # crosses the boundary repeatedly and each crossing re-opens a move.
+        # Measured, both resets past the horizon, only the active burning:
+        #
+        #     t8   1->2  headroom axis   active 4.0 / best 8.0
+        #     t20  2->1  headroom axis   active 2.0 / best 4.0
+        #     t22  1->2  recovery axis   active 3.0 / best 2.0
+        #
+        # move sequence [1, 2, 1, 2] where base makes one move. Nothing
+        # bounded how many crossings could happen.
+        #
+        # Only the account we left LAST, and only until we move again — so a
+        # three-account fleet still reaches every peer, and any later move
+        # releases the previous one. This bounds the direction, not the rate:
+        # the cooldown already bounds the rate, and it had lapsed at every one
+        # of the moves above (301s ticks against a 300s cooldown).
+        came_from = state.get("lastSwitchFrom")
+        if came_from is not None and str(came_from) in oauth_candidates:
+            oauth_candidates = [n for n in oauth_candidates if n != str(came_from)]
         api_key_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
@@ -1637,6 +1659,18 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
+            # WHERE we came from, so the next tick can refuse to undo this.
+            # Each anti-flap gate is one-way on its own axis, but burn moves a
+            # pair across `SPENT_HEADROOM_PCT` and the axis changes with it —
+            # measured, both resets past the horizon, only the active burning:
+            #
+            #     t8   1->2  headroom axis   active 4.0 / best 8.0
+            #     t20  2->1  headroom axis   active 2.0 / best 4.0
+            #     t22  1->2  recovery axis   active 3.0 / best 2.0
+            #
+            # so the move sequence was [1, 2, 1, 2] where base makes one move.
+            # Nothing bounded how many times the pair could cross.
+            state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
             atomic_write_json(self.state_path, state)
 
         self._emit(
