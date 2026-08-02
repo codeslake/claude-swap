@@ -431,6 +431,76 @@ def _clear_wiring_locked(switcher, path) -> bool:
 # -- command -----------------------------------------------------------------
 
 
+# -- the operations, shared by the CLI and the TUI ---------------------------
+#
+# THE VERDICT LIVES HERE, NOT AT EACH CALL SITE. Three review rounds found the
+# same shape: a fix landed on the CLI and its sibling in tui/dashboard.py kept
+# the old behaviour — first the missing clear_wiring, then the discarded
+# apply_pin return, then the rollback and the API-key refusal. Each was a
+# separate bug report for one decision implemented twice.
+#
+# So these return a (ok, message) the caller only has to render. A fourth
+# divergence now needs someone to write a second copy of the logic rather than
+# to forget a line.
+
+
+def clear_pin(switcher) -> tuple[bool, str]:
+    """Remove the pin AND its wiring. ``(ok, message)``.
+
+    Both halves are re-read afterwards rather than inferred: ``apply_pin``
+    cannot report on the wiring, and ``clear_wiring``'s bool is False both for
+    "nothing to remove" and for "the lock was contended so this path was
+    skipped" — only the second is a failure, and the skip is deliberate.
+    """
+    had_pin = _pinned_email_now(switcher) is not None
+    try:
+        impl = _impl()
+        impl.apply_pin(switcher, None, None)
+    except Exception:  # noqa: BLE001 — this command must work when the pin does not
+        pass
+    cleared = clear_wiring(switcher)
+    still_pinned = _pinned_email_now(switcher) is not None
+    still_wired = _wiring_present(switcher)
+    if still_pinned or still_wired:
+        what = " and ".join(
+            w for w, on in (("the pin", still_pinned), ("the wiring", still_wired)) if on
+        )
+        return False, f"Could not remove {what} — re-run once it frees up"
+    if not cleared and not had_pin:
+        return True, "No cloud account pinned"
+    return True, "Unpinned the cloud account"
+
+
+def set_pin(switcher, email: str, org_uuid: str | None) -> tuple[bool, str]:
+    """Pin the cloud surface to ``email``. ``(ok, message)``.
+
+    A failure ROLLS THE RECORD BACK: ``apply_pin`` writes ``remoteControl``
+    before it starts the proxy, so reporting the failure while leaving it makes
+    every read-back — ``cswap pin``, the TUI badge — contradict the message.
+    """
+    before = _pinned_email_now(switcher)
+    try:
+        started = _impl().apply_pin(switcher, email, org_uuid)
+    except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
+        try:
+            _impl().apply_pin(switcher, *(before or (None, None)))
+        except Exception:  # noqa: BLE001
+            return False, (
+                f"Could not pin the cloud account: {exc} — the record may still "
+                f"name {email}, check with `cswap pin`"
+            )
+        return False, (
+            f"Could not pin the cloud account: {exc} — "
+            + ("the previous pin is unchanged" if before else "nothing is pinned")
+        )
+    if not started:
+        return False, (
+            f"Cloud pin recorded for {email}, but no proxy is running — "
+            "nothing is pinned yet"
+        )
+    return True, f"Pinned the cloud account (RC/artifacts) to {email}"
+
+
 def run(switcher, account: str | None, clear: bool = False) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""

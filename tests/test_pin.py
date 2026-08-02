@@ -1189,3 +1189,149 @@ class TestARound2Regressions:
             f"install command literal outside _install_how() at line(s) {offenders} "
             "— two places decide it, and they diverged on pipx once already"
         )
+
+
+class TestTheVerdictIsSharedNotDuplicated:
+    """clear_pin/set_pin are the one place the outcome is decided.
+
+    Three review rounds found the same shape: a fix landed on the CLI and the
+    TUI's sibling call site kept the old behaviour. These assert the shared
+    functions themselves, so a future divergence needs someone to write a
+    second copy rather than to forget a line.
+    """
+
+    def _sw(self, tmp_path, pinned="cloud@example.com", wired=True):
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": pinned}} if pinned else {})
+        )
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {"env": {"HTTPS_PROXY": "x"}, "_cswapPinWiredKeys": ["HTTPS_PROXY"]}
+                if wired
+                else {"env": {}}
+            )
+        )
+        return types.SimpleNamespace(backup_dir=backup), cfg
+
+    def test_clear_pin_fails_when_the_wiring_survives(self, tmp_path, monkeypatch):
+        import claude_swap.paths as paths
+
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        class _I:
+            def apply_pin(self, s, *a):
+                (s.backup_dir / "settings.json").write_text("{}")
+
+        monkeypatch.setattr(pin, "_impl", lambda: _I())
+        # The lock is contended, so clear_wiring skips the path and returns
+        # False — indistinguishable from "nothing to remove" by its return.
+        monkeypatch.setattr(pin, "clear_wiring", lambda *a, **k: False)
+        ok, msg = pin.clear_pin(sw)
+        assert not ok, msg
+        assert "wiring" in msg, msg
+
+    def test_clear_pin_succeeds_when_both_are_gone(self, tmp_path, monkeypatch):
+        import claude_swap.paths as paths
+
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path, wired=False)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        class _I:
+            def apply_pin(self, s, *a):
+                (s.backup_dir / "settings.json").write_text("{}")
+
+        monkeypatch.setattr(pin, "_impl", lambda: _I())
+        ok, msg = pin.clear_pin(sw)
+        assert ok and "Unpinned" in msg, msg
+
+    def test_set_pin_rolls_back_on_failure(self, tmp_path, monkeypatch):
+        from claude_swap import pin
+
+        sw, _ = self._sw(tmp_path, pinned=None)
+
+        class _I:
+            n = 0
+
+            def apply_pin(self, s, email, org):
+                _I.n += 1
+                if _I.n == 1:
+                    (s.backup_dir / "settings.json").write_text(
+                        json.dumps({"remoteControl": {"pinnedEmail": email}})
+                    )
+                    raise FileExistsError("pin-proxy")
+                (s.backup_dir / "settings.json").write_text("{}")
+
+        monkeypatch.setattr(pin, "_impl", lambda: _I())
+        ok, msg = pin.set_pin(sw, "user2@example.com", "org")
+        assert not ok, msg
+        assert pin._pinned_email_now(sw) is None, (
+            "the failed pin stayed recorded; every read-back would call it live"
+        )
+
+
+class TestTheUncoveredRound2Fixes:
+    """Two round-2 fixes survived reversion green. A guard nothing asserts is
+    a guard someone deletes."""
+
+    def test_the_cli_renders_a_broken_package_instead_of_a_traceback(self, tmp_path):
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        code = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {src!r})
+            from claude_swap import pin
+            # A broken package ROOT: _impl re-raises the underlying ImportError
+            # on purpose, and nothing between there and the shell rendered it.
+            pin.run = lambda *a, **k: (_ for _ in ()).throw(
+                ImportError("No module named 'cryptography'", name="cryptography"))
+            from claude_swap import cli
+            sys.argv = ["cswap", "pin", "2"]
+            try:
+                cli._pin_command(["2"])
+            except SystemExit as e:
+                print("EXIT", e.code)
+            """
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        combined = r.stdout + r.stderr
+        assert "Traceback" not in combined, combined[-500:]
+        assert "not usable" in combined, combined[-500:]
+        assert "EXIT 1" in combined, combined[-300:]
+
+    def test_the_launch_unwire_is_bounded_by_the_budget(self, monkeypatch):
+        """The unwire took the package's own 5s lock, unbounded by the budget
+        the no-package branch gets. Assert the PROBE gates it."""
+        import types
+
+        from claude_swap import pin
+
+        calls = []
+        impl = types.SimpleNamespace(
+            ensure_proxy=lambda sw: None,
+            unwire_if_dead=lambda p: calls.append("unwired"),
+        )
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+        monkeypatch.setattr(pin, "_config_lock_is_free", lambda b: False)
+        sw = types.SimpleNamespace(backup_dir=__import__("pathlib").Path("/tmp"))
+        assert pin.wire_launch_env(sw, {"A": "1"}) == {"A": "1"}
+        assert calls == [], "the unwire ran while the lock was held"
+
+        monkeypatch.setattr(pin, "_config_lock_is_free", lambda b: True)
+        pin.wire_launch_env(sw, {"A": "1"})
+        assert calls == ["unwired"], "the unwire never runs, even when free"

@@ -974,34 +974,107 @@ class TestDashboard:
             pin.is_available, pin._impl, pin.clear_wiring, pin.pinned_email = real
 
     async def test_the_tui_does_not_report_a_pin_no_proxy_serves(self, tmp_path):
-        """apply_pin's return was discarded, so False read as success."""
+        """apply_pin returning False must not read as success.
+
+        Asserted on `_run_pin_op`, the seam between pin.py's verdict and the
+        TUI's reporting: it prints the message (which `run_action` captures and
+        `_action_done` toasts) and RAISES on failure, which is what routes a
+        failure to the modal instead of a toast the user can miss. Driving the
+        worker instead would assert on Textual's scheduling rather than on the
+        contract.
+        """
+        import contextlib
+        import io
+
         from claude_swap import pin
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
-        notes = []
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            screen = app.screen
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), pytest.raises(RuntimeError):
+                screen._run_pin_op(lambda: (False, "no proxy is running"))
+            assert "no proxy is running" in buf.getvalue()
+
+            # And the success path stays a plain toast, no raise.
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                screen._run_pin_op(lambda: (True, "Pinned the cloud account"))
+            assert "Pinned" in buf.getvalue()
+            assert app.is_running
+
+    async def test_the_tui_pin_verdict_comes_from_pin_py(self, tmp_path):
+        """The TUI must not re-implement the verdict.
+
+        Three review rounds found a fix on the CLI whose sibling here kept the
+        old behaviour. `_apply_pin` therefore delegates to `pin.set_pin` and
+        only adds the note it alone can produce.
+        """
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        seen = []
 
         class _Impl:
-            def apply_pin(self, *_a):
-                return False          # no proxy serving
-
             def live_remote_control_sessions(self):
-                return []
+                return ["sess-1"]
 
-        real = (pin.is_available, pin._impl)
-        pin.is_available = lambda: True
-        pin._impl = lambda: _Impl()
+        real = pin.set_pin
+        pin.set_pin = lambda sw, email, org: seen.append(email) or (True, f"Pinned {email}")
         try:
             async with app.run_test(size=(100, 32)) as pilot:
                 await settle(pilot)
-                app.notify = lambda msg, **k: notes.append(msg)
-                await app.screen._dispatch("pin:1")
-                await pilot.pause()
-                joined = " ".join(notes)
-                assert "nothing is pinned yet" in joined, joined
-                assert app.is_running
+                acc = app.snapshot.accounts[0]
+                ok, msg = app.screen._apply_pin(acc, _Impl())
+            assert seen == [acc.email], "the TUI did not go through pin.set_pin"
+            assert ok and "Pinned" in msg
+            assert "Reconnect open Remote Control" in msg, (
+                "the RC note only this side can produce was dropped"
+            )
         finally:
-            pin.is_available, pin._impl = real
+            pin.set_pin = real
+
+    async def test_an_api_key_row_is_filtered_by_kind_not_sentinel(self, tmp_path):
+        """The TUI filter must read the SAME fact the CLI refuses on.
+
+        The CLI refuses on switcher._account_kind(n) == "api_key"; this filtered
+        on acc.usage.sentinel == USAGE_API_KEY, and those diverge — the sentinel
+        reads USAGE_NO_CREDENTIALS for an unreadable backup blob and
+        USAGE_KEYCHAIN_UNAVAILABLE for an API-key slot behind a locked macOS
+        keychain. Either one offered the row, and the pin went through.
+        """
+        from claude_swap import pin
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
+
+        acc = make_account(1, active=True)
+        fake = FakeSwitcher([acc], tmp_path)
+        app = make_app(fake)
+        # _live_impl is what is_available() calls; stubbing both keeps this
+        # off the real resolution path, which invalidates importlib caches and
+        # cost 15s per run.
+        real = (pin.is_available, pin._impl, pin.pinned_email)
+        pin.is_available = lambda: True
+        pin._impl = lambda: object()
+        pin.pinned_email = lambda _sw: None
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                snap_acc = app.snapshot.accounts[0]
+                # kind says api_key while the sentinel says something else —
+                # exactly the divergence that let the row through.
+                object.__setattr__(snap_acc, "kind", "api_key")
+                object.__setattr__(
+                    snap_acc.usage, "sentinel", USAGE_NO_CREDENTIALS
+                )
+                ids = [aid for _label, aid in app.screen._pin_entries()]
+                assert f"pin:{snap_acc.number}" not in ids, (
+                    "an API-key account was offered for pinning"
+                )
+        finally:
+            pin.is_available, pin._impl, pin.pinned_email = real
 
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
