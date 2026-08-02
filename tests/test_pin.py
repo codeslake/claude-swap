@@ -988,3 +988,204 @@ class TestTheRuntimeVersionFloor:
         # And never for the version, on either platform: "too old" here would
         # mean an absent version was read as 0.
         assert "too old" not in out, out
+
+
+class TestARound2Regressions:
+    """The seven from review round 2. Each drives the seam, not a stub.
+
+    The shape they share: an action reported as done while the state it claims
+    to have changed is unchanged. A return value cannot carry that — "nothing
+    to do" and "could not do it" collapse into the same False — so each of
+    these re-reads the thing it just claimed.
+    """
+
+    def _cli(self, tmp_path, impl_src, argv_account=None, clear=False, wired=True):
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {"HTTPS_PROXY": "http://127.0.0.1:36301"},
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY"],
+                }
+                if wired
+                else {"env": {}}
+            )
+        )
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        (backup / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": "cloud@example.com"}}, indent=2)
+        )
+        code = (
+            textwrap.dedent(
+                f"""
+                import sys
+                sys.path.insert(0, {src!r})
+                from pathlib import Path
+                import claude_swap.paths as paths
+                cfg = Path({str(cfg)!r})
+                paths.get_global_config_path = lambda: cfg
+                paths.get_default_global_config_path = lambda: cfg
+                from claude_swap import pin
+                """
+            )
+            + impl_src
+            + textwrap.dedent(
+                f"""
+                pin._impl = _impl_factory
+                class _SW:
+                    backup_dir = Path({str(backup)!r})
+                    def resolve_account(self, a):
+                        return (2, "user2@example.com", "org-uuid")
+                    def _account_kind(self, n):
+                        return "oauth"
+                sys.exit(pin.run(_SW(), {argv_account!r}, clear={clear!r}))
+                """
+            )
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        return r, cfg, backup
+
+    def test_a_clear_that_cannot_remove_the_wiring_is_a_failure(self, tmp_path):
+        # apply_pin succeeds (the pin goes), but the wiring cannot be removed.
+        # Reported as success, the daemon idles out and every hand-launched
+        # claude dials a dead port — the stranding clear_wiring exists to stop.
+        impl = (
+            "import json as _j\n"
+            "class _I:\n"
+            "    def apply_pin(self, sw, *a):\n"
+            "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
+            "def _impl_factory(): return _I()\n"
+        )
+        # Make clear_wiring a no-op so the wiring survives, as a held lock does.
+        impl += "pin.clear_wiring = lambda *a, **k: False\n"
+        r, cfg, _ = self._cli(tmp_path, impl, clear=True)
+        assert "Unpinned" not in r.stdout, r.stdout
+        assert "Could not remove" in r.stdout, r.stdout + r.stderr[-300:]
+        assert r.returncode == 1
+        assert "_cswapPinWiredKeys" in cfg.read_text(), "fixture no longer valid"
+
+    def test_a_failed_set_rolls_the_record_back(self, tmp_path):
+        # apply_pin writes the record before starting the proxy, so reporting
+        # the failure is not enough: `cswap pin` reads it back and calls it
+        # live, and the TUI badge agrees.
+        impl = (
+            "import json as _j\n"
+            "class _I:\n"
+            "    calls = []\n"
+            "    def apply_pin(self, sw, email, org):\n"
+            "        _I.calls.append(email)\n"
+            "        if email is not None and len(_I.calls) == 1:\n"
+            "            (sw.backup_dir / 'settings.json').write_text(\n"
+            "                _j.dumps({'remoteControl': {'pinnedEmail': email}}))\n"
+            "            raise FileExistsError('pin-proxy')\n"
+            "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
+            "def _impl_factory(): return _I()\n"
+        )
+        r, _, backup = self._cli(tmp_path, impl, argv_account="2")
+        assert "Could not pin" in r.stdout, r.stdout + r.stderr[-300:]
+        assert r.returncode == 1
+        raw = json.loads((backup / "settings.json").read_text())
+        assert not raw.get("remoteControl", {}).get("pinnedEmail"), (
+            "the failed pin stayed in the record; `cswap pin` would call it live"
+        )
+
+    def test_an_api_key_account_is_refused(self, tmp_path):
+        impl = (
+            "class _I:\n"
+            "    def apply_pin(self, *a): raise AssertionError('must not be reached')\n"
+            "def _impl_factory(): return _I()\n"
+        )
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text("{}")
+        code = (
+            textwrap.dedent(
+                f"""
+                import sys
+                sys.path.insert(0, {src!r})
+                from pathlib import Path
+                from claude_swap import pin
+                from claude_swap.exceptions import ClaudeSwitchError
+                """
+            )
+            + impl
+            + textwrap.dedent(
+                f"""
+                pin._impl = _impl_factory
+                class _SW:
+                    backup_dir = Path({str(backup)!r})
+                    def resolve_account(self, a):
+                        return (3, "key@example.com", "org")
+                    def _account_kind(self, n):
+                        return "api_key"
+                try:
+                    pin.run(_SW(), "3")
+                    print("ACCEPTED")
+                except ClaudeSwitchError as e:
+                    print("REFUSED:", e)
+                """
+            )
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        ).stdout
+        assert "REFUSED" in out, f"an API-key account was pinned: {out}"
+        assert "API-key account" in out, out
+
+    def test_one_place_decides_the_install_command(self):
+        """A second hardcoded hint diverged from the derived one on pipx."""
+        from pathlib import Path
+
+        import ast
+
+        src = Path(
+            str(Path(__file__).resolve().parent.parent / "src")
+        ).joinpath("claude_swap/pin.py")
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+
+        # STRING CONSTANTS ONLY. The prose in docstrings names these commands
+        # while explaining why there is one decider, so counting raw text
+        # would forbid documenting the rule. What must not repeat is a literal
+        # the code can PRINT.
+        allowed = set()
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "_install_how":
+                allowed = {id(n) for n in ast.walk(node)}
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if id(node) in allowed or ast.get_docstring(tree) == node.value:
+                continue
+            if any(
+                f in node.value
+                for f in ("uv tool install", "pipx install", "pip install")
+            ):
+                # A docstring is prose, not something the code emits.
+                offenders.append(node.lineno)
+        # Drop the lines that ARE docstrings.
+        docs = {
+            n.body[0].lineno
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module))
+            and n.body
+            and isinstance(n.body[0], ast.Expr)
+            and isinstance(n.body[0].value, ast.Constant)
+            and isinstance(n.body[0].value.value, str)
+        }
+        offenders = [ln for ln in offenders if ln not in docs]
+        assert not offenders, (
+            f"install command literal outside _install_how() at line(s) {offenders} "
+            "— two places decide it, and they diverged on pipx once already"
+        )

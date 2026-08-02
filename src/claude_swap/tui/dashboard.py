@@ -27,6 +27,7 @@ from textual.widgets import Footer, ListView, Static
 
 from claude_swap import pin
 from claude_swap.models import AccountsSnapshot
+from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -221,6 +222,13 @@ class DashboardScreen(Screen):
         for acc in (snap.accounts if snap else ()):
             name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
             state = "  ○ cloud" if current == acc.email else ""
+            # An API-key account can never be pinned: sk-ant-api… is not OAuth
+            # JSON, so every pinned request fails open. The CLI refuses it; the
+            # menu says so instead of offering a row that reports success and
+            # pins nothing. No action id — an informational row (see _dispatch).
+            if getattr(getattr(acc, "usage", None), "sentinel", None) == USAGE_API_KEY:
+                entries.append((f"{acc.number}  {name}  · api key, cannot pin", ""))
+                continue
             entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
         # Only offer the clear when there is something to clear — an inert row
         # reads as "a pin exists" to anyone scanning the menu.
@@ -316,7 +324,17 @@ class DashboardScreen(Screen):
             try:
                 if target == "clear":
                     impl.apply_pin(app.switcher, None, None)
-                    app.notify("Cloud pin cleared")
+                    # clear_wiring TOO, exactly as the CLI does. The package
+                    # unwires through its own single-path resolver, so from a
+                    # `cswap run` terminal (CLAUDE_CONFIG_DIR set) this clears
+                    # the session's config and leaves ~/.claude.json naming a
+                    # dead port — the stranding clear_wiring lives in cswap to
+                    # prevent, and the CLI in the identical state clears both.
+                    pin.clear_wiring(app.switcher)
+                    if pin.pinned_email(app.switcher):
+                        app.notify("Cloud pin NOT cleared — it is still set")
+                    else:
+                        app.notify("Cloud pin cleared")
                 else:
                     acc = next(
                         (
@@ -327,18 +345,32 @@ class DashboardScreen(Screen):
                         None,
                     )
                     if acc is not None:
-                        impl.apply_pin(app.switcher, acc.email, acc.org_uuid)
-                        # An RC session that is already open keeps its old owner
-                        # (the server fixed it at creation); reconnecting inside
-                        # it is what moves it. Say so only when there is one.
-                        open_rc = impl.live_remote_control_sessions()
-                        note = (
-                            "  Reconnect open Remote Control sessions to move "
-                            "them (/rc → Disconnect → /rc)."
-                            if open_rc
-                            else ""
+                        # The RETURN matters: False means no proxy is serving,
+                        # and reporting "Cloud pin → …" for that is the same
+                        # unqualified success the CLI was fixed for. Discarding
+                        # it made the badge and this toast agree on a pin that
+                        # nothing was applying.
+                        started = impl.apply_pin(
+                            app.switcher, acc.email, acc.org_uuid
                         )
-                        app.notify(f"Cloud pin → {acc.email}.{note}")
+                        if not started:
+                            app.notify(
+                                f"Cloud pin recorded for {acc.email}, but no "
+                                "proxy is running — nothing is pinned yet"
+                            )
+                        else:
+                            # An RC session that is already open keeps its old
+                            # owner (the server fixed it at creation);
+                            # reconnecting inside it is what moves it. Say so
+                            # only when there is one.
+                            open_rc = impl.live_remote_control_sessions()
+                            note = (
+                                "  Reconnect open Remote Control sessions to "
+                                "move them (/rc → Disconnect → /rc)."
+                                if open_rc
+                                else ""
+                            )
+                            app.notify(f"Cloud pin → {acc.email}.{note}")
             except Exception as exc:  # noqa: BLE001
                 app.notify(f"Cloud pin failed: {exc}")
             await self._pop_menu()
