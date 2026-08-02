@@ -5144,8 +5144,26 @@ class TestSwitchSkipsBrokenSlots:
         cred.write_text(json.dumps({
             "claudeAiOauth": {"refreshToken": "ONLY-COPY-REFRESH"},
         }))
-        os.chmod(cred, 0o000)
-        try:
+
+        # The READ fails, however the platform arranges that. Mode 000 is the
+        # POSIX shape and was the original repro, but Windows ignores it (the
+        # file reads fine there and the premise assert flipped on CI), so the
+        # failure is injected at the read instead. What is under test is the
+        # branch taken when the value is None with the file still present, not
+        # any particular way of getting there.
+        # Only the READ is refused; `unlink` is left alone deliberately, because
+        # the whole defect is that unlink SUCCEEDS where read cannot — it needs
+        # a writable directory, not a readable file. Patching both would make
+        # the file survive for the wrong reason and the test would pass with
+        # the guard removed (measured: it did).
+        real_read_text = type(cred).read_text
+
+        def refuse_read(self, *a, **kw):
+            if self.name == ".credentials.json":
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(self, *a, **kw)
+
+        with patch.object(type(cred), "read_text", refuse_read):
             assert s._store._read_active_credentials().value is None, (
                 "premise: unreadable reads as None, not empty"
             )
@@ -5159,8 +5177,6 @@ class TestSwitchSkipsBrokenSlots:
             assert cred.exists(), (
                 "the only copy of a live refresh token was deleted unstashed"
             )
-        finally:
-            os.chmod(cred, 0o600)
 
     def test_a_failed_clear_does_not_hand_the_slot_a_live_credential(
         self, temp_home: Path
