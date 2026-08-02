@@ -287,12 +287,9 @@ class AutoScreen(Screen):
             # for a LIVE that never ran, and every later launch would
             # auto-enter a "LIVE" the user never got.
             #
-            # A DEMOTION writes nothing. `autoStartLive` is one shared
-            # setting, so `false` here does not merely decline to record
-            # consent — it revokes the LIVE holder's. Measured: TUI#1 goes
-            # live (true), TUI#2 presses `l`, is demoted, persists false, and
-            # the next launch starts dry-run for a user who never asked. The
-            # demotion is about the lock, not about consent.
+            # A DEMOTION writes nothing: `autoStartLive` is one shared setting,
+            # so `false` here revokes the LIVE holder's consent rather than
+            # declining to record ours. The demotion is about the lock.
             self._restart_engine(dry_run=False)
             engine = self._engine
             if engine is not None and getattr(engine, "demoted_from_live", False):

@@ -684,11 +684,8 @@ class CredentialStore:
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
 
-        Returns the Keychain half's own verdict — whether an item can still
-        shadow the file — for callers that must VERIFY the clear rather than
-        merely attempt it. A post-clear READ cannot answer that under a pinned
-        file mode: nothing asks the Keychain there, so a surviving item is
-        invisible to the check written to catch it.
+        Returns the Keychain half's own verdict — see
+        :meth:`_delete_active_keychain_entry` for why a caller needs it.
         """
         cleared = self._delete_active_keychain_entry()
         cred_file = get_credentials_path()

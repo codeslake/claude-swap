@@ -1142,14 +1142,10 @@ class AutoSwitchEngine:
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger)
             if self._stop.is_set():
-                # Same reason dry-run stops here, and the same reason
-                # `_perform` checks: freshening is a MUTATION. `stop()`
-                # releases the LIVE lock synchronously and no caller joins the
-                # worker, so the successor may already own LIVE while this tick
-                # runs on. `_perform`'s check blocks the switch; without one
-                # here the departing engine still POSTs a one-time refresh
-                # grant, or writes a quarantine, for accounts it has handed
-                # over.
+                # Freshening is a MUTATION, same as dry-run stops for. `stop()`
+                # frees the LIVE lock but no caller joins the worker, so
+                # without this the departing engine POSTs a one-time refresh
+                # grant for accounts its successor already owns.
                 self._emit(NoSwitchEvent(reason="engine-stopped"))
                 return TickOutcome.NO_ACTION
             status = self._freshen_target(num, email)
