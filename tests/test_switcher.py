@@ -5110,6 +5110,51 @@ class TestSwitchSkipsBrokenSlots:
             f"roster says slot 2 is active, _build_accounts_info says {active}"
         )
 
+    def test_an_unmanaged_live_login_does_not_steal_the_active_mark(
+        self, temp_home: Path
+    ):
+        """A live login the roster has never seen belongs to NO slot.
+
+        ``_find_account_slot`` answers ``None`` for two different reasons: no
+        live identity at all (the landed-empty case the fallback exists for),
+        and a live identity that is not in the roster — someone ran ``/login``
+        with an account never ``cswap add``ed. Keying the fallback on the
+        RESULT rather than on the CAUSE conflated them, so the roster's slot
+        was marked active and handed the stranger's live credential.
+
+        Measured on the first cut: roster active = 2, live login
+        ``stranger@example.com``, and ``_build_accounts_info`` reported slot 2
+        (``b@example.com``) active carrying ``STRANGER-TOKEN``. The TUI then
+        shows the stranger's usage under b@'s name, and with the ownership
+        oracle unreachable that foreign utilization is recorded into the usage
+        store keyed to slot 2, where it outlives the condition.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        s.sequence_file.write_text(json.dumps(data))
+        # /login with an account that is in no slot.
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "stranger@example.com",
+                             "accountUuid": "uuid-stranger"},
+        }))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "STRANGER-TOKEN",
+                              "refreshToken": "STRANGER-REFRESH"},
+        }))
+
+        info = s._build_accounts_info()
+        active = [num for num, _e, _o, _u, is_active, *_r in info if is_active]
+        assert active == [], (
+            f"a login in no slot marked {active} active on the roster's word"
+        )
+        for num, _e, _o, _u, _a, creds, _al in info:
+            assert "STRANGER" not in str(creds), (
+                f"slot {num} was served the unmanaged login's credential"
+            )
+
     def test_a_login_after_landing_empty_clears_relogin_required(
         self, temp_home: Path
     ):
