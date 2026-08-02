@@ -65,7 +65,16 @@ _logger = logging.getLogger("claude-swap")
 # needing a human hides behind one that clears itself. store-unmirrored and
 # invalid_client stay until somebody unsets an env var or fixes a client
 # registration; consume-busy is gone by the next pass.
-_SYSTEMIC_STATUSES = ("store-unmirrored", "invalid_client", "consume-busy")
+_SYSTEMIC_MESSAGES = {
+    "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
+                        "run cswap from a normal shell",
+    "invalid_client": "cswap's OAuth client was rejected — systemic, not this "
+                      "account",
+    "consume-busy": "another cswap surface holds the slot — retries next pass",
+}
+# Insertion order IS the precedence order, so the remedy and its rank cannot
+# drift apart.
+_SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
 
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
@@ -1138,18 +1147,9 @@ class AutoSwitchEngine:
         if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
-                    message=(
-                        "could not freshen: CLAUDE_SECURESTORAGE_CONFIG_DIR "
-                        "is set — unset it or run cswap from a normal shell"
-                        if systemic == "store-unmirrored"
-                        else "could not freshen: cswap's OAuth client was "
-                        "rejected — systemic, not this account"
-                        if systemic == "invalid_client"
-                        else "could not freshen: another cswap surface holds "
-                        "the slot — retries next pass"
-                        if systemic == "consume-busy"
-                        else "could not freshen any candidate (network?)"
-                    ),
+                    message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
+                    if systemic
+                    else "could not freshen any candidate (network?)",
                     transient=True,
                 )
             )

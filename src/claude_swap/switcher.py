@@ -163,6 +163,17 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
 # the user must re-login).
 # Friendly text for error KINDS that deserve an explanation beyond their
 # identifier (rendered in the "usage unavailable (…)" detail line).
+# Stash reasons that mean the slot was NOT freshened, so `error is None`
+# would lie to the caller. The other two are excluded deliberately: a REMOVED
+# slot has nothing left to activate, and a CAS CONFLICT left the slot holding
+# a racing writer's newer valid lineage — freshened, which is the opposite of
+# what this demotion denies.
+_DEMOTING_STASH_REASONS = (
+    "consume-gate-persist-failed",
+    "consume-gate-persist-lock-failed",
+    "consume-gate-unpersisted",
+)
+
 ERROR_NOTES = {
     "store-unmirrored": (
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
@@ -2090,9 +2101,7 @@ class ClaudeAccountSwitcher:
                     "storage failure, then re-login and `cswap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
-        if stashed_reason not in (
-            None, "", "consume-gate-slot-removed", "consume-gate-cas-conflict",
-        ):
+        if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
             # generation whose grant we just spent. Callers read `error is
             # None` as "the slot is freshened and safe to activate" — after a
