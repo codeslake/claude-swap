@@ -312,6 +312,27 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
         assert unreadable is True
 
+    def test_a_lapsed_cooldown_clears_the_unreadable_verdict(self, macos_switcher):
+        """One transient failure must not be permanent for the process.
+
+        The cooldown re-probe lives in ``_use_keychain``, and the BACKUP read
+        path never calls it — ``_read_account_credentials`` goes straight to
+        ``_kc_read_backup``. Reading the cache raw therefore made a single
+        hiccup stick: a genuinely empty slot kept answering "unreadable, do
+        not re-add" (advice with no remedy) and the consume gate kept
+        deferring long after the Keychain answered again.
+        """
+        import time
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        with pytest.raises(_kc.KeychainError):
+            store._kc_call(lambda: (_ for _ in ()).throw(_kc.KeychainError("denied")))
+        assert store._keychain_unreadable is True, "inside the cooldown"
+
+        store._keychain_disabled_until = time.monotonic() - 1
+        assert store._keychain_unreadable is False, "cooldown lapsed — re-probe"
+
     def test_off_macos_there_is_no_keychain_to_be_unreadable(self, temp_home: Path):
         """The predicate carries its own platform check.
 

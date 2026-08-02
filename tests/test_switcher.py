@@ -9089,6 +9089,41 @@ class TestGateUltraReviewFixes:
         s._write_json(s.sequence_file, sample_sequence_data)
         return s
 
+    def test_a_cas_conflict_is_not_reported_as_a_failed_freshen(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A racing writer's win leaves the slot FRESHENED, not broken.
+
+        The transient demotion exists for the failed-persist case, where the
+        slot still holds the generation whose grant was spent. A CAS conflict
+        is the opposite: the winner already wrote a newer valid credential, so
+        the slot is exactly what the caller wanted. Reporting it as an error
+        makes ``_freshen_target`` skip a perfectly fresh candidate and the tick
+        emit "could not freshen any candidate (network?)" — on every
+        multi-surface race, which is the contention this gate exists for.
+        """
+        racer = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-rac", "refreshToken": "rt-rac",
+                              "expiresAt": 8888888888000}})
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        def refresh_then_lose_the_race(credentials, **kw):
+            s._store._write_account_credentials("1", "test@example.com", racer)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=refresh_then_lose_the_race):
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert s._read_account_credentials("1", "test@example.com") == racer, (
+            "premise: the store holds the racer's newer lineage"
+        )
+        assert out.credentials == racer
+        assert out.error is None, (
+            "a freshened slot reported as a failure: the caller skips it"
+        )
+
     def test_a_cas_conflict_stash_does_not_accumulate_forever(
         self, temp_home: Path, sample_sequence_data: dict
     ):

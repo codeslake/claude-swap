@@ -561,9 +561,21 @@ class SessionManager:
                 # invalid_grant on first use: a spent grant, silently.
                 # Validity is an identity check, not a generation check, so it
                 # cannot see this. Re-seed instead of returning early.
+                #
+                # NEVER under a live claude. _bootstrap deletes the profile's
+                # Keychain entry and overwrites .credentials.json, and the peer
+                # that bootstrapped ahead of us has already exec'd into that
+                # profile — rewriting it beneath a running instance is the
+                # failure every other invalidation site in this file guards
+                # against (the STALE_MARKER branch above, and
+                # _post_backup_write's). This branch fires precisely when the
+                # profile is VALID, which is the live case, so it needed the
+                # guard most and had it least. Deferring costs the peer a
+                # generation it can still refresh from; rewriting costs it the
+                # session.
                 if not self._profile_matches_backup(
                     session_dir, account_num, email
-                ):
+                ) and not live_sessions_for(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email

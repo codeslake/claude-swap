@@ -328,10 +328,22 @@ class CredentialStore:
         platform check belongs here for the same reason — off macOS there is no
         Keychain to be unreadable, and only every call path being macOS-gated
         keeps the cache at ``None`` there today.
+
+        Asks through :meth:`_use_keychain` rather than the raw cache, because
+        the cooldown re-probe lives there and the BACKUP read path never calls
+        it: ``_read_account_credentials`` goes straight to ``_kc_read_backup``.
+        Reading the flag raw made a single transient failure permanent for the
+        process on exactly the paths that matter — a genuinely empty slot kept
+        reporting "unreadable, do not re-add" (a dead end) and the consume gate
+        kept deferring ``transient`` long after the Keychain answered again.
+        A pinned file mode is unaffected: its deadline is 0.0, so
+        ``_use_keychain`` never re-probes it.
         """
         if self._host.platform != Platform.MACOS:
             return False
-        return self._keychain_usable_cache is False and not self._file_mode_is_ours
+        if self._use_keychain():          # may clear a lapsed cooldown
+            return False
+        return not self._file_mode_is_ours
 
     def _read_credentials(self) -> str | None:
         """Read Claude Code's active credential — OAuth *or* managed API key (value).
