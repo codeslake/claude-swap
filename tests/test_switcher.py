@@ -5077,6 +5077,88 @@ class TestSwitchSkipsBrokenSlots:
         # The login it replaced was captured first, so nothing was lost.
         assert s._read_account_credentials("1", "a@example.com")
 
+    def test_a_landed_empty_slot_still_reads_as_active(self, temp_home: Path):
+        """Landing logged-out must not make the slot invisible.
+
+        ``_build_accounts_info`` derives the active slot from the LIVE
+        credential's identity, which is exactly what an empty-slot landing
+        clears. So the roster records slot 2 as active while every account
+        reports ``is_active=False`` — the TUI shows no active mark anywhere,
+        on the one slot the user just deliberately moved to.
+
+        The roster is the authority on WHICH slot is active; the live store is
+        the authority on what that slot is holding. Conflating them made the
+        second answer erase the first.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+        }))
+
+        s.switch_to("2", json_output=True)
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2, "premise"
+        info = s._build_accounts_info()
+        active = [num for num, _e, _o, _u, is_active, *_r in info if is_active]
+        assert active == [2], (
+            f"roster says slot 2 is active, _build_accounts_info says {active}"
+        )
+
+    def test_a_login_after_landing_empty_clears_relogin_required(
+        self, temp_home: Path
+    ):
+        """`/login` writes the LIVE store — the slot must read from there.
+
+        A slot quarantined as refresh-token-dead keeps that verdict while its
+        BACKUP holds the condemned generation. `/login` does not touch the
+        backup, so the strike survived a real re-login and the TUI kept saying
+        "re-login needed" — until the user switched away and back, which
+        copies live into the backup.
+
+        The same defect as the test above: the slot is not recognised as
+        active, so its credentials are read from the stale backup instead of
+        the live store the login just wrote.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+        }))
+        s.switch_to("2", json_output=True)
+
+        # The user runs /login: Claude Code writes the LIVE store only.
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-fresh",
+                              "refreshToken": "rt-fresh"},
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(fresh)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "b@example.com",
+                             "accountUuid": "uuid-2"},
+        }))
+
+        info = s._build_accounts_info()
+        creds_for_2 = next(
+            c for num, _e, _o, _u, _a, c, _al in info if num == 2
+        )
+        assert creds_for_2 == fresh, (
+            "slot 2 served a stale backup after a real login wrote the live "
+            "store; the re-login verdict outlives the re-login"
+        )
+
     def test_locked_keychain_is_not_mistaken_for_an_empty_slot(
         self, temp_home: Path
     ):

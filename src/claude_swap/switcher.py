@@ -3138,6 +3138,24 @@ class ClaudeAccountSwitcher:
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
+        if active_num is None:
+            # No live identity — but the ROSTER still knows which slot we are
+            # on. Landing on a credential-less slot clears the live store by
+            # design (an active slot serving the previous account's token lies
+            # about whose quota is burning), and that made every account report
+            # is_active=False: no active mark anywhere, on the very slot the
+            # user had just moved to, until they logged in.
+            #
+            # The two stores answer different questions. The roster is the
+            # authority on WHICH slot is active; the live store is the
+            # authority on what that slot currently holds. Deriving the first
+            # from the second let an empty answer to the second erase the
+            # first. Only consulted as a fallback, so a live identity still
+            # wins whenever there is one — an out-of-band `/login` or a switch
+            # by another surface must not be overruled by a stale roster.
+            roster_active = data.get("activeAccountNumber")
+            if roster_active is not None:
+                active_num = str(roster_active)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
