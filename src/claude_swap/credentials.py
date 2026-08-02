@@ -357,19 +357,33 @@ class CredentialStore:
         scheduled, which could otherwise still be pending.
 
         ``residual_cleared`` is the caller's OBSERVATION of that delete. True:
-        nothing can shadow the file, so it genuinely is the authority. False: a
-        residual may survive, and that stays true however many unrelated
-        Keychain items answer afterwards. Required, with no default — every
-        call site has just run the delete, and a default is how an observation
-        gets dropped in favour of a flag.
+        nothing can shadow the file, so it genuinely is the authority, and the
+        two failure flags are settled — whatever failed before cannot bear on a
+        file nothing can shadow. False: a residual may survive, and that stays
+        true however many unrelated Keychain items answer afterwards. Required,
+        with no default — every call site has just run the delete, and a default
+        is how an observation gets dropped in favour of a flag.
 
-        It settles the verdict permanently: the pin zeroes the deadline, so no
-        later read can record a fresh one.
+        A True verdict settles the PAST, not the future. `_kc_call` re-arms the
+        cooldown on any failure with no pin check, and backup reads reach it
+        without consulting `_use_keychain`, so the active read is reachable
+        again after a pin and its own verdict must win.
         """
         self._keychain_usable_cache = False
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
         self._residual_verdict = residual_cleared
+        if residual_cleared:
+            # SETTLE what happened before, do not outrank what happens after.
+            # Nothing that failed up to here still bears on the file: no
+            # Keychain item can shadow it. Later failures are the flags'
+            # question again — `_kc_call` re-arms the cooldown on any failure,
+            # including a backup read that never consults `_use_keychain`, so
+            # the active read IS reachable after a pin and its verdict must
+            # win. Measured: a stored True made a genuine later failure read
+            # degraded=False and disarmed the capture guard.
+            self._keychain_op_failed = False
+            self._active_read_failed = False
 
     @property
     def _keychain_unreadable(self) -> bool:
@@ -497,15 +511,14 @@ class CredentialStore:
             if val:
                 return ActiveCredentials(val, False)
         elif self._residual_verdict is False or (
-            self._residual_verdict is None
-            and (self._active_read_failed or self._keychain_unreadable)
+            self._active_read_failed or self._keychain_unreadable
         ):
             # Keychain already known unusable this process: if nothing is found
             # below, that absence is "keychain unavailable", not an empty slot.
-            # Unless the pin VERIFIED the active item is gone — then nothing
-            # can shadow the file, and the two flags are answering about a
-            # world that no longer exists (one unclearable after a pin, the
-            # other erasable by any unrelated item's success).
+            # An UNVERIFIED clear says so on its own — no later success on some
+            # other item speaks for this one. A verified clear does not appear
+            # here at all: it settled the flags at the pin, so anything they
+            # say now happened AFTER it.
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
