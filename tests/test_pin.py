@@ -879,6 +879,8 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
                     backup_dir = Path({str(backup)!r})
                     def resolve_account(self, a):
                         return (2, "user2@example.com", "org-uuid")
+                    def _account_kind(self, n):
+                        return "oauth"
                 sys.exit(pin.run(_SW(), "2"))
                 """
             )
@@ -913,6 +915,47 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
         r = self._run(tmp_path, impl)
         assert "nothing is pinned yet" in r.stdout, r.stdout + r.stderr[-300:]
         assert r.returncode == 1, "a pin nothing serves must not exit 0"
+
+    def test_no_proxy_serving_ROLLS_BACK_the_record(self, tmp_path):
+        """`started == False` must undo the record, like the raise path does.
+
+        apply_pin writes ``remoteControl`` BEFORE it starts the proxy, so
+        leaving it made the two commands contradict each other: `cswap pin 2`
+        said "nothing is pinned yet" and exited 1, then `cswap pin` printed
+        the address and exited 0 with the ○ cloud badge lit.
+
+        The stub writes the record for real — a stub that only returns False
+        cannot show the bug at all.
+        """
+        impl = (
+            "import json\n"
+            "from pathlib import Path as _P\n"
+            "class _I:\n"
+            "    def apply_pin(self, sw, email, org):\n"
+            "        p = _P(sw.backup_dir) / 'settings.json'\n"
+            "        raw = json.loads(p.read_text()) if p.exists() else {}\n"
+            "        if email:\n"
+            "            raw['remoteControl'] = {'pinnedEmail': email,\n"
+            "                                    'pinnedOrganizationUuid': org or ''}\n"
+            "        else:\n"
+            "            raw.pop('remoteControl', None)\n"
+            "        p.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        p.write_text(json.dumps(raw))\n"
+            "        return False\n"
+            "    def load_pin(self, *a): return None\n"
+            "def _impl_factory(): return _I()\n"
+        )
+        r = self._run(tmp_path, impl)
+        assert r.returncode == 1, r.stdout + r.stderr[-300:]
+
+        import json as _json
+
+        settings = tmp_path / "backup" / "settings.json"
+        raw = _json.loads(settings.read_text()) if settings.exists() else {}
+        assert "remoteControl" not in raw, (
+            "the failed pin left a record the badge and `cswap pin` both read "
+            f"as live: {raw.get('remoteControl')!r}"
+        )
 
 
 class TestTheRuntimeVersionFloor:
@@ -1402,3 +1445,80 @@ class TestTheVerdictHasExactlyOneImplementation:
         ok, msg = pin.set_pin(sw, "key@example.com", "org")
         assert not ok, msg
         assert "API-key account" in msg, msg
+
+    def test_a_duplicate_email_cannot_bypass_the_api_key_refusal(self, tmp_path):
+        """The slot is PASSED, not re-derived from the email.
+
+        cswap's own documented personal+org pattern gives one address two
+        slots, so `resolve_account(email)` raises ConfigError — and swallowing
+        that skipped `_account_kind` entirely, accepting the exact account the
+        refusal exists to reject. Reproduced from the plain CLI: ok=True with
+        apply_pin called.
+        """
+        import types
+
+        from claude_swap import pin
+        from claude_swap.exceptions import ConfigError
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text("{}")
+        applied = []
+        real_impl = pin._impl
+
+        def _resolve(a):
+            if "@" in str(a):  # ambiguous BY EMAIL, fine by number
+                raise ConfigError("multiple accounts match dup@example.com")
+            return (a, "dup@example.com", "org")
+
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            resolve_account=_resolve,
+            _account_kind=lambda n: "api_key",
+        )
+        pin._impl = lambda: types.SimpleNamespace(
+            apply_pin=lambda *a: applied.append(a[1:]) or True
+        )
+        try:
+            ok, msg = pin.set_pin(sw, "dup@example.com", "org", num="2")
+            assert not ok, "a duplicate email got past the API-key refusal"
+            assert "API-key account" in msg, msg
+            assert applied == [], "apply_pin ran for an API-key account"
+        finally:
+            pin._impl = real_impl
+
+    def test_an_unreadable_kind_refuses_rather_than_proceeding(self, tmp_path):
+        """A kind we cannot READ is not permission to pin.
+
+        Swallowing the lookup turned an unreadable sequence.json into a silent
+        skip of the refusal — indistinguishable, in effect, from having no
+        refusal at all, and invisible.
+        """
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text("{}")
+        applied = []
+        real_impl = pin._impl
+
+        def _boom(n):
+            raise OSError("sequence.json is unreadable")
+
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            resolve_account=lambda a: ("2", "who@example.com", "org"),
+            _account_kind=_boom,
+        )
+        pin._impl = lambda: types.SimpleNamespace(
+            apply_pin=lambda *a: applied.append(a[1:]) or True
+        )
+        try:
+            ok, msg = pin.set_pin(sw, "who@example.com", "org", num="2")
+            assert not ok, "pinned an account whose kind could not be read"
+            assert "will not guess" in msg, msg
+            assert applied == [], "apply_pin ran without knowing the kind"
+        finally:
+            pin._impl = real_impl

@@ -222,9 +222,11 @@ class DashboardScreen(Screen):
         prefix.
         """
         ok, msg = op()
-        print(msg)
         if not ok:
+            # RAISE ONLY. run_action prints "Error: {e}" for a ClaudeSwitchError,
+            # so printing first put the same sentence in the modal twice.
             raise ClaudeSwitchError(msg)
+        print(msg)
 
     def _apply_pin(self, acc, impl) -> tuple[bool, str]:
         """Pin to ``acc`` and add the note only this side can produce.
@@ -233,7 +235,12 @@ class DashboardScreen(Screen):
         can spawn a daemon, and the CLI is a fresh process while this one has a
         UI to keep responsive.
         """
-        ok, msg = pin.set_pin(self.app.switcher, acc.email, acc.org_uuid)
+        # Pass the slot we ALREADY have. set_pin re-deriving it from the
+        # email made a duplicate address (cswap's own personal+org pattern)
+        # raise inside the API-key refusal, skipping it entirely.
+        ok, msg = pin.set_pin(
+            self.app.switcher, acc.email, acc.org_uuid, num=acc.number
+        )
         if ok:
             # An RC session that is already open keeps its old owner (the
             # server fixed it at creation); reconnecting inside it is what
@@ -256,7 +263,9 @@ class DashboardScreen(Screen):
             # Reachable only if the extra disappears between the root menu
             # being drawn and this row being opened — the row is not offered
             # otherwise. Name the real reason rather than showing empty rows.
-            return [(str(exc), ""), _BACK]
+            # Scrubbed: this text comes from an optional package and
+            # lands in a MENU LABEL (see pin._safe).
+            return [(pin._safe(exc), ""), _BACK]
         current = pin.pinned_email(self.app.switcher)
         snap = self.app.snapshot
         entries: MenuEntries = []
@@ -356,7 +365,7 @@ class DashboardScreen(Screen):
                 # Names the real reason, which _impl already distinguishes:
                 # "install the extra" for a missing package, the underlying
                 # error for one that is present and broken.
-                app.notify(str(exc))
+                app.notify(pin._safe(exc))
                 await self._pop_menu()
                 return
             target = action_id.split(":", 1)[1]
@@ -386,6 +395,16 @@ class DashboardScreen(Screen):
                     app._start_action(
                         f"pin cloud → {acc.email}",
                         partial(self._run_pin_op, partial(self._apply_pin, acc, impl)),
+                    )
+                else:
+                    # The row outlived its account: an open submenu is not
+                    # rebuilt while the snapshot updates (refresh_root_menu
+                    # returns early below depth 1), so `cswap remove` mid-menu
+                    # leaves a row that resolves to nothing. Silently popping
+                    # reads as "pinned" — say what happened instead.
+                    app.notify(
+                        f"Account {target} is no longer in the list — "
+                        "nothing was pinned"
                     )
             await self._pop_menu()
         elif action_id in actions:
