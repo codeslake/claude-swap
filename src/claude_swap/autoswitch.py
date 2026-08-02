@@ -548,11 +548,9 @@ class AutoSwitchEngine:
         self._tick_in_flight = threading.Event()
         self._tick_in_flight.set()
         # `stop()` is a SIGTERM handler (cli.py) and a TUI callback, so it can
-        # arrive on top of itself. Non-reentrant it double-released the lock:
-        # measured, `AttributeError: 'NoneType' object has no attribute
-        # 'release'` propagating into `_perform` inside the state lock, past
-        # `atomic_write_json` — the account switched and `lastSwitchAt` was
-        # never written, so the next engine saw no cooldown.
+        # arrive on top of itself. Non-reentrant it double-released the lock,
+        # and the AttributeError propagated into `_perform` past
+        # `atomic_write_json`: the account switched, `lastSwitchAt` did not.
         self._stop_lock = threading.RLock()
         self._unhealthy_ticks = 0
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
@@ -787,13 +785,10 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         self._announce_demotion()
-        # In flight for the WHOLE tick, not just the switch. Every mutation
-        # below — quarantine writes, usage rows, poll plans, and
-        # `_freshen_target`'s one-time refresh POST — belongs to the engine
-        # that started the tick. Bracketing only `switch_to` let `stop()`
-        # return instantly and free LIVE while the predecessor was still
-        # freshening: measured, the stopped engine went on to consume grants
-        # for accounts ['2', '3'] the successor already owned.
+        # The WHOLE tick, not just the switch: every mutation below belongs to
+        # the engine that started it. Bracketing only `switch_to` let `stop()`
+        # return instantly and free LIVE mid-freshen — measured, the stopped
+        # engine consumed one-time grants for accounts ['2', '3'].
         self._tick_in_flight.clear()
         try:
             return self._tick_inner()
