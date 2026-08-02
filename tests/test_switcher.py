@@ -27,6 +27,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.paths import get_global_config_path
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
@@ -5525,6 +5526,40 @@ class TestSwitchSkipsBrokenSlots:
                 "2", "b@example.com", {"number": 1}, {"number": 2},
                 s._get_sequence_data(),
             )
+
+    def test_an_unreadable_config_is_not_a_cleared_managed_key(
+        self, temp_home: Path
+    ):
+        """`_read_global_config` answers None on ANY failure, and None skipped
+        the drop while leaving the verdict True.
+
+        The re-read is not independent: `_read_active_credentials` reaches
+        `_read_managed_key`, which reads the SAME file through the SAME
+        swallowing reader and answers `""`. So all three refusal terms pass
+        over a live `primaryApiKey`.
+
+        Reproduced through the public `switch_to` with a truncated
+        `~/.claude.json` (an interrupted write, a full disk):
+
+            switch_to -> switched=True  needsLogin=True
+            primaryApiKey survived = True
+            activeAccountNumber = 2
+
+        The landing announces "you are now logged out" while
+        `sk-ant-api03-...` keeps authenticating and billing. The OAuth half
+        fails loudly; only the managed half was blind.
+        """
+        s = self._setup(temp_home)
+        s.platform = Platform.LINUX          # no Keychain: the config is all
+        cfg = get_global_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('{"primaryApiKey": "sk-ant-api03-SURVIVOR"')  # truncated
+
+        assert s._store._read_global_config() is None, "premise: unreadable"
+        assert s._store._clear_managed_key() is False, (
+            "an unreadable config reported a cleared managed key — the drop "
+            "never ran and a live API key survives the landing"
+        )
 
     def test_a_surviving_managed_key_is_not_read_as_a_cleared_slot(
         self, temp_home: Path, monkeypatch
