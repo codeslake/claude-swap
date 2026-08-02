@@ -2919,6 +2919,52 @@ class TestLiveLock:
             "thread called it — the TUI freezes and SIGTERM self-deadlocks"
         )
 
+    def test_the_freshen_loop_stops_between_candidates(self, harness):
+        """The ceiling is a backstop; the loop must not need it.
+
+        `_STOP_SWITCH_WAIT_S` is 30s, and ONE candidate's freshen can serially
+        take a consume-lock acquire (10s) + the slot FileLock (10s) + a
+        refresh POST (10s). The loop iterates over EVERY candidate, so the
+        ceiling sits below a single candidate's worst case, not above a
+        tick's. Measured on the shipped ceiling:
+
+            stop() gave up after 30.0s
+            successor dry_run=False; predecessor tick still running=True
+            predecessor freshened so far ['2'], in total ['2', '3']
+
+        The successor holds LIVE while the predecessor keeps consuming
+        one-time grants. Checking `_stop` between candidates bounds it by the
+        work rather than by a number.
+        """
+        import threading
+
+        engine = harness.engine
+        entered = threading.Event()
+        freshened: list[str] = []
+        def spy(number, email):
+            freshened.append(number)
+            if not entered.is_set():
+                entered.set()
+                engine.stop()      # the handover happens here
+            return "transient"     # keeps the loop moving to the next one
+
+        engine._freshen_target = spy
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in {
+                "1": _usage(99), "2": _usage(5), "3": _usage(4),
+            }.items()
+        }
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            engine.tick()
+
+        assert len(freshened) == 1, (
+            f"freshened {freshened} after stop() — the loop kept POSTing "
+            "one-time grants for accounts the successor already owns"
+        )
+
     def test_a_stopped_engine_does_not_finish_freshening(self, harness):
         """`_tick_in_flight` guarded only `switch_to`.
 
