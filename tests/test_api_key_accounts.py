@@ -22,6 +22,7 @@ from claude_swap.credentials import (
     looks_like_api_key,
 )
 from claude_swap.exceptions import (
+    ClaudeSwitchError,
     CredentialWriteError,
     SessionError,
     ValidationError,
@@ -431,6 +432,78 @@ class TestAnUnreadableGlobalConfigIsNotAnEmptyOne:
             lambda d: d.__setitem__("primaryApiKey", API_KEY)
         )
         assert json.loads(cfg.read_text(encoding="utf-8"))["primaryApiKey"] == API_KEY
+
+
+class TestATornConfigSurvivesAnOrdinarySwitch:
+    """The write path was guarded; the READ path one function over was not.
+
+    `_update_global_config` now refuses on an unreadable config. The switch
+    itself reads `~/.claude.json` through `_read_json`, which answers None for
+    ABSENT and for TORN alike — so the `if existing_config:` splice falls to
+    its else branch and writes the 1-key backup config over the user's whole
+    file, reporting `switched: True`.
+
+    Strictly worse than the bug the refusal closed: it needs no API-key slot,
+    it is what a plain `cswap switch` does, and the success line is what makes
+    it invisible.
+    """
+
+    def test_a_plain_switch_does_not_flatten_a_torn_config(
+        self, temp_home: Path
+    ):
+        """Asserts on the KEYS the user keeps, not on the exception.
+
+        A refusal that still truncated the file would satisfy `pytest.raises`;
+        only the surviving keys answer the question the user cares about.
+        """
+        s = _linux_switcher()
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_config(str(num), email, json.dumps({
+                "oauthAccount": {"emailAddress": email,
+                                 "accountUuid": f"uuid-{num}"}}))
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            data["accounts"][str(num)] = {
+                "email": email, "uuid": f"uuid-{num}",
+                "organizationUuid": "", "organizationName": "",
+                "added": "2024-01-01T00:00:00Z",
+            }
+            if num not in data["sequence"]:
+                data["sequence"].append(num)
+        data["sequence"].sort()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        cfg = get_global_config_path()
+        real = {
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+            "projects": {"/work": {"allowedTools": []}},
+            "mcpServers": {"x": {"command": "y"}},
+            "userID": "uid-123",
+        }
+        cfg.write_text(json.dumps(real, indent=2)[:-14], encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(cfg.read_text(encoding="utf-8"))
+
+        torn_bytes = cfg.read_text(encoding="utf-8")
+        s.switch_to("2", json_output=True)
+
+        # The switch lands — upstream replaces a malformed config here on
+        # purpose. What must not happen is the bytes being GONE.
+        salvage = [
+            p for p in cfg.parent.iterdir()
+            if p.name.startswith(f"{cfg.name}.unreadable-")
+        ]
+        assert len(salvage) == 1, (
+            f"no salvage copy beside {cfg}; the torn config was replaced and "
+            "projects/mcpServers/userID are unrecoverable"
+        )
+        assert salvage[0].read_text(encoding="utf-8") == torn_bytes
 
 
 class TestADeniedKeychainSurvivesAnUnreadableFallbackFile:
