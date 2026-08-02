@@ -560,6 +560,13 @@ class AutoSwitchEngine:
         # `stop()`. Not covered by `_tick_thread_id`: that answers WHO runs the
         # tick, and here the answer is correctly "someone else".
         self._emit_in_flight = threading.Event()
+        # Set when `stop()` could not release LIVE safely because the SWITCH is
+        # on the calling thread. The tick's own exit path does it instead.
+        self._release_pending = False
+        # True only while `switch_to` is rewriting credentials. Narrower than
+        # `_tick_in_flight` on purpose: that brackets the whole tick, and the
+        # thing a successor must not interleave with is the REWRITE.
+        self._switch_in_flight = False
         # `stop()` is a SIGTERM handler (cli.py) and a TUI callback, so it can
         # arrive on top of itself. Non-reentrant it double-released the lock,
         # and the AttributeError propagated into `_perform` past
@@ -1562,7 +1569,18 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="engine-stopped"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            self._switch_in_flight = True
+            try:
+                result = self.switcher.switch_to(number, json_output=True)
+            finally:
+                self._switch_in_flight = False
+                if self._release_pending:
+                    # A `stop()` arrived on this thread mid-switch and deferred
+                    # its release to here. Same thread, so no lock needed.
+                    self._release_pending = False
+                    lock, self._live_lock = self._live_lock, None
+                    if lock is not None:
+                        lock.release()
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -1745,6 +1763,20 @@ class AutoSwitchEngine:
             # thread the wait can never be satisfied — the flag is set by the
             # frame this call is standing on.
             own_tick = self._tick_thread_id == threading.get_ident()
+            # `own_tick` says the wait would deadlock. It does NOT say the
+            # release is safe: a SIGTERM handler runs inside the frame it
+            # interrupts, so `own_tick` is True in the middle of `switch_to`
+            # too, and freeing LIVE there lets a successor (systemd
+            # stop/start, a relaunched `cswap auto`) claim it and switch again
+            # inside one window. Measured: `stop()` returned in 5.001s with no
+            # wait, and the successor held LIVE while the rewrite ran.
+            #
+            # Deferred rather than waited: the tick's exit path is on this
+            # same thread and runs a few statements later.
+            if own_tick and self._switch_in_flight:
+                self._live_lock = lock
+                self._release_pending = True
+                return
             # A tick parked in `on_event` is not a tick doing work, and in the
             # TUI it is parked on THIS thread. Waiting there is the same
             # circular wait `own_tick` closes for SIGTERM, one thread over.
