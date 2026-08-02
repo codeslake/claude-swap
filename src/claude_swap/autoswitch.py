@@ -1053,14 +1053,10 @@ class AutoSwitchEngine:
         # releases the previous one. This bounds the direction, not the rate:
         # the cooldown already bounds the rate, and it had lapsed at every one
         # of the moves above (301s ticks against a 300s cooldown).
-        # SCOPED like every sibling gate. `at-limit` and `failover` skip the
-        # anti-flap gates by design — there we are escaping a dead account, not
-        # optimising a return time. Unscoped this stranded a 2-account fleet on
-        # an exhausted active with the peer at 0% quota, emitting
-        # "no-candidates" every tick with nothing to release it (the field is
-        # rewritten only by a successful switch, and the field is what prevents
-        # the switch), and on 3 accounts it raised a false AllExhaustedEvent
-        # that reaches the user as a notification and a critical TUI row.
+        # SCOPED like every sibling gate: `at-limit` and `failover` skip the
+        # anti-flap gates by design. Unscoped this stranded a 2-account fleet
+        # on an exhausted active with the peer at 0%, "no-candidates" every
+        # tick, with nothing able to release it.
         came_from = state.get("lastSwitchFrom")
         if (
             trigger in ("proactive", "consume-first")
