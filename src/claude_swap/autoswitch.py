@@ -1160,6 +1160,17 @@ class AutoSwitchEngine:
         transient_failure = False
         systemic = ""
         for num in ordered:
+            if self._stop.is_set():
+                # BETWEEN CANDIDATES, so the loop is bounded by the work
+                # rather than by `_STOP_SWITCH_WAIT_S`. One candidate's
+                # freshen can serially take a consume-lock acquire, the slot
+                # FileLock and a refresh POST — 30s at their timeouts — so the
+                # ceiling sits below a SINGLE candidate's worst case while the
+                # loop iterates over every one. Measured: `stop()` gave up
+                # after 30s, the successor took LIVE, and the predecessor went
+                # on to freshen the rest.
+                self._emit(NoSwitchEvent(reason="engine-stopped"))
+                return TickOutcome.NO_ACTION
             email = self.switcher.account_email(num)
             if trigger == "consume-first":
                 # The phase-2 refetch is best-effort: the collector refuses
