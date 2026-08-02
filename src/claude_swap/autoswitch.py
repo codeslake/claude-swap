@@ -1141,6 +1141,17 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger)
+            if self._stop.is_set():
+                # Same reason dry-run stops here, and the same reason
+                # `_perform` checks: freshening is a MUTATION. `stop()`
+                # releases the LIVE lock synchronously and no caller joins the
+                # worker, so the successor may already own LIVE while this tick
+                # runs on. `_perform`'s check blocks the switch; without one
+                # here the departing engine still POSTs a one-time refresh
+                # grant, or writes a quarantine, for accounts it has handed
+                # over.
+                self._emit(NoSwitchEvent(reason="engine-stopped"))
+                return TickOutcome.NO_ACTION
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
