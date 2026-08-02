@@ -430,15 +430,60 @@ class ClaudeAccountSwitcher:
             if sys.platform != "win32":
                 os.chmod(directory, 0o700)
 
-    def _read_json(self, path: Path) -> dict | None:
-        """Read and parse JSON file."""
+    def _read_json(self, path: Path, *, strict: bool = False) -> dict | None:
+        """Read and parse a JSON file. None when the file is ABSENT.
+
+        With ``strict=True``, raises ``ConfigError`` when the file is THERE
+        but unreadable — the distinction ``_read_global_config``'s callers
+        keep having to make, and the one ~25 ``or {}`` call sites here were
+        silently collapsing. Default False so the reader stays a reader:
+        upstream's import path DELIBERATELY replaces a malformed config it is
+        about to seed (`test_clean_switch_fallback_when_local_config_malformed`),
+        and a blanket refusal would flip that intent.
+
+        Measured on the plain switch path: a torn ``~/.claude.json`` read as
+        None, fell to the `else` branch at :5954, and the 1-key backup config
+        was written over the user's whole file — `projects`, `mcpServers`,
+        `userID` gone, `switched: True` returned. Absent is a genuine empty
+        start; unreadable is a file we must not overwrite unread.
+
+        Also rejects a non-dict payload. ``json.loads`` happily returns a str
+        or an int for a file holding `"hello"` or `123`, and every caller then
+        fails on `.get` with a raw AttributeError that escapes
+        ``ClaudeSwitchError``. ``_read_global_config`` already ends with the
+        same isinstance check; the two readers of the same file disagreed.
+        """
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self._logger.warning(f"Invalid JSON in {path}")
+            if strict:
+                raise ConfigError(
+                    f"{path} exists but could not be parsed ({e}). Repair or "
+                    "move it, then retry — refusing to overwrite it unread."
+                ) from e
             return None
+        except OSError as e:
+            self._logger.warning(f"Could not read {path}: {e}")
+            if strict:
+                raise ConfigError(
+                    f"{path} exists but could not be read ({e}). Fix what is "
+                    "blocking the read, then retry."
+                ) from e
+            return None
+        if not isinstance(data, dict):
+            self._logger.warning(
+                f"{path} holds {type(data).__name__}, not a JSON object"
+            )
+            if strict:
+                raise ConfigError(
+                    f"{path} holds {type(data).__name__}, not a JSON object. "
+                    "Repair or move it, then retry."
+                )
+            return None
+        return data
 
     def _write_json(self, path: Path, data: dict) -> None:
         """Write JSON file with validation."""
@@ -5944,6 +5989,23 @@ class ClaudeAccountSwitcher:
                     # settings/projects when ~/.claude.json already exists, only
                     # swapping in oauthAccount. Fall back to the full imported
                     # config when no usable local config exists.
+                    # `_read_json` answers None for ABSENT and for TORN alike,
+                    # so a torn ~/.claude.json fell to the else branch and the
+                    # 1-key backup config was written over the user's whole
+                    # file — measured through the public `switch_to`:
+                    # `switched: True` returned with `projects`, `mcpServers`
+                    # and `userID` gone.
+                    #
+                    # Back it up before replacing it, rather than refusing.
+                    # Upstream REPLACES a malformed config here on purpose
+                    # (`test_clean_switch_fallback_when_local_config_malformed`
+                    # — a machine being seeded by import, where the leftover
+                    # file is noise), and nothing in scope separates that from
+                    # a working install whose config just tore: measured, both
+                    # reach this line with `current_account` set and
+                    # `_get_current_account()` None. So keep upstream's
+                    # behaviour and stop it being LOSSY: the bytes survive next
+                    # to the config, named, and the switch still lands.
                     existing_config = (
                         self._read_json(config_path) if config_path.exists() else None
                     )
@@ -5951,6 +6013,27 @@ class ClaudeAccountSwitcher:
                         existing_config["oauthAccount"] = target_oauth
                         self._write_json(config_path, existing_config)
                     else:
+                        if config_path.exists():
+                            salvage = config_path.with_name(
+                                f"{config_path.name}.unreadable-{get_timestamp()}"
+                            )
+                            try:
+                                shutil.copy2(config_path, salvage)
+                                self._logger.warning(
+                                    f"{config_path} could not be parsed; a copy "
+                                    f"was kept at {salvage} before it was "
+                                    "replaced"
+                                )
+                                warnings_out.append(
+                                    f"{config_path.name} could not be parsed — "
+                                    f"a copy was kept at {salvage.name}"
+                                )
+                            except OSError as e:  # pragma: no cover - defensive
+                                raise SwitchError(
+                                    f"{config_path} could not be parsed and the "
+                                    f"salvage copy failed ({e}); aborting "
+                                    "rather than destroying it"
+                                )
                         self._write_json(config_path, target_config_data)
                     config_written = True
 
