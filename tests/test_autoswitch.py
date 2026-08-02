@@ -3331,6 +3331,160 @@ class TestHorizonAxisDoesNotFlap:
             "disproves it"
         )
 
+    def test_the_bar_does_not_hide_the_account_from_the_census(
+        self, temp_home
+    ):
+        """Barring a candidate must not make it cease to EXIST.
+
+        Removing it from `oauth_candidates` fed eight consumers a list with a
+        healthy account missing. `truly_exhausted` is the loudest: measured,
+        peer 1 holding 15 points while the engine emitted AllExhaustedEvent —
+        a macOS notification and a critical TUI row — because `all()` over the
+        shortened list was vacuously true.
+
+        DRIVES THE BARRED BRANCH, which is the part the previous tests missed.
+        Peer 15 pts against active 10 pts does NOT satisfy `left >= active x
+        2`, so the release does not fire and the bar is genuinely in effect.
+        Both earlier tests used a 0% peer against a 97% active, where the
+        release always fired — measured, disabling the filter outright left
+        the whole suite green.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+            "3": _usage(100, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(301.0)
+
+        h.events.clear()
+        h.tick_with_usage({
+            "1": _usage(85, self._days_out(h, 400)),   # left; 15 pts, BARRED
+            "2": _usage(90, self._days_out(h, 500)),   # active; 10 pts
+            "3": _usage(100, self._days_out(h, 300)),  # genuinely spent
+        })
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events), (
+            f"events {[type(e).__name__ for e in h.events]} — account 1 holds "
+            "15 points; barring it from the CHOICE must not erase it from the "
+            "fleet"
+        )
+
+    def test_the_bar_lifts_when_it_would_leave_nothing(self, temp_home):
+        """Identity has no release of its own, and the ratio cannot cover it.
+
+        `lastSwitchFrom` is rewritten only by a successful switch — the one
+        the bar prevents — so on two accounts it was permanent. The ratio
+        release does not reach it either: `left >= active x 2` is unsatisfiable
+        for any active headroom above 50, and consume-first fires exactly
+        there. Measured before this: active 70 pts against a peer at 100 pts,
+        20 ticks answering below-threshold, still locked after seven days.
+
+        A bar that leaves the engine nothing to choose is a stall, not
+        anti-flap.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage7(95, 95, self._days_out(h, 500)),
+            "2": _usage7(5, 5, self._days_out(h, 400)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(301.0)
+
+        outcomes = []
+        for _ in range(20):
+            outcomes.append(h.tick_with_usage({
+                # left; weekly window resets SOONEST, which is what
+                # consume-first ranks on
+                "1": _usage7(0, 0, self._days_out(h, 10)),
+                "2": _usage7(30, 30, self._days_out(h, 500)),   # active, 70 pts
+            }))
+            h.clock.advance(1801.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"20 ticks of {[o.name for o in outcomes]} — the only peer was "
+            "barred with no way to lift it, so consume-first is off for good"
+        )
+
+    def test_the_bar_never_applies_to_an_escape(self, harness):
+        """`at-limit` and `failover` skip every anti-flap gate by design.
+
+        There we are escaping a dead or unreadable active, not optimising a
+        return time — and the account we left may be the only place to go.
+        Measured: dropping the trigger check left the full suite green, so
+        nothing pinned it. The at-limit half is defended for the wrong reason
+        (at-limit implies `active_headroom <= 0`, so the ratio release fires
+        anyway); failover has no such accident, because an unreadable active
+        gives `active_headroom is None` and the release cannot fire.
+
+        Asserts on the BAR, not on a tick outcome: the ratio release makes the
+        at-limit case pass either way, which is what hid this.
+        """
+        state = {"lastSwitchFrom": 1}
+        # 15 pts against an active on 10: does NOT clear `left >= active x 2`,
+        # so the ratio release cannot fire and only the trigger check can
+        # answer. A peer far ahead would pass for the wrong reason.
+        headroom = {"1": 15.0, "2": 10.0, "3": 1.0}
+        for trigger in ("at-limit", "failover"):
+            for active in (10.0, None):
+                assert harness.engine._no_return_account(
+                    trigger, state, headroom, active, ["1", "3"]
+                ) is None, (
+                    f"trigger={trigger} active_headroom={active} barred the "
+                    "account we left; an escape must reach every candidate"
+                )
+        # The control: the SAME state bars on a proactive tick.
+        assert harness.engine._no_return_account(
+            "proactive", state, headroom, 10.0, ["1", "3"]
+        ) == "1", "premise: these inputs are barred when the trigger allows it"
+
+    def test_the_bar_actually_removes_the_account_from_the_ranking(
+        self, harness
+    ):
+        """The bar has to BAR something, and nothing pinned that.
+
+        Measured: disabling it outright — `if num == no_return` -> `if False`
+        — left the whole suite green, this class included. Both sibling tests
+        assert what happens when the bar is LIFTED (the census stays intact,
+        the lockout ends), so neither notices when it never engages.
+
+        Drives `_rank_candidates` directly. Through `tick()` the cooldown and
+        the hysteresis gates decide these inputs first, so the same pair moves
+        identically with the bar on and off — measured across 12 peer/active
+        combinations, every one identical. The ranking is the only place the
+        bar's effect is observable in isolation.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        args = dict(
+            trigger="proactive",
+            consume_first=False,
+            oauth_candidates=["1", "3"],
+            usage={"1": _usage(40), "2": _usage(96), "3": _usage(99)},
+            headroom={"1": 60.0, "2": 4.0, "3": 1.0},
+            current="2",
+            active_headroom=4.0,
+            settings=AutoSwitchSettings(),
+            now=harness.clock.now,
+        )
+        unbarred, _, _ = harness.engine._rank_candidates(no_return=None, **args)
+        barred, _, _ = harness.engine._rank_candidates(no_return="1", **args)
+
+        assert list(unbarred) == ["1"], (
+            f"premise: account 1 holds 60 points against an active on 4 and "
+            f"is the pick when nothing bars it — got {list(unbarred)}"
+        )
+        assert list(barred) == [], (
+            f"the bar did not remove account 1 from the ranking: {list(barred)}"
+        )
+
     def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
         """It runs only when nothing else qualifies, and the key is why.
 
