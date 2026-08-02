@@ -90,9 +90,11 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # it needs its own unit rather than a reused one.
 RECOVERY_HYSTERESIS_S = 300.0
 
-# How long `stop()` waits for an in-flight switch before freeing the LIVE lock.
-# A switch is a handful of local file writes; anything past this is a hung
-# filesystem, and blocking the TUI's toggle forever is worse than the race.
+# How long `stop()` waits for an in-flight TICK before freeing the LIVE lock.
+# The switch itself is a handful of local file writes, but `_tick_in_flight`
+# brackets the whole tick — including refresh POSTs — so this budget covers
+# network time, not just the filesystem. Blocking the TUI's toggle forever is
+# still worse than the race, hence a ceiling rather than an unbounded wait.
 _STOP_SWITCH_WAIT_S = 30.0
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
