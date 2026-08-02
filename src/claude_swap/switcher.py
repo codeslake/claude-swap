@@ -5742,7 +5742,25 @@ class ClaudeAccountSwitcher:
         # account, which is recoverable; popping the identity over a credential
         # that is still live is the silent disagreement this method exists to
         # prevent. The stash already ran, so nothing is lost by stopping.
-        if self._store._read_active_credentials().value:
+        # `!= ""`, not truthiness. `None` means a credential is PRESENT and
+        # unreadable, which is precisely "the clear did not succeed" — and it
+        # is falsy, so `if ...value:` let it through, collapsing the very
+        # distinction the refusal twenty lines above spends its length
+        # establishing. Reachable with nothing failing on the Keychain: the
+        # pre-clear read short-circuits there and never touches the
+        # `.credentials.json` shadow file (#86), so the earlier refusal cannot
+        # see it; the delete succeeds, the unlink fails, and the re-read
+        # reaches the file for the first time.
+        #
+        # `keychain_unavailable` too. `_delete_active_keychain_entry` calls
+        # `delete_password` directly and swallows every exception, so a failed
+        # delete does not flip the routing cache — but the re-read's own
+        # Keychain attempt DOES fail, and after its retries it falls through to
+        # the (now-cleared) file and returns `("", True, True)`. Empty and
+        # falsy, over a Keychain that still holds the departed token, which
+        # Claude Code reads BEFORE the file. The flag is the only witness.
+        post = self._store._read_active_credentials()
+        if post.value != "" or post.keychain_unavailable:
             raise SwitchError(
                 "The live credential could not be cleared, so landing on an "
                 "empty slot would leave the previous account's login active "

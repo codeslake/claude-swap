@@ -5254,6 +5254,129 @@ class TestSwitchSkipsBrokenSlots:
             "the roster and the live store now name different accounts"
         )
 
+    def test_the_post_clear_check_does_not_re_collapse_none_and_empty(
+        self, temp_home: Path
+    ):
+        """The re-read must use the distinction the refusal above establishes.
+
+        `if ...value:` is falsy for BOTH `""` (nothing there, the clear worked)
+        and `None` (a credential is present and unreadable, i.e. the clear did
+        NOT work). Twenty lines are spent above establishing that those differ,
+        and this line collapsed them again at the one point that acts on the
+        answer.
+
+        Reachable with no race and nothing failing on the Keychain: the live
+        credential is in the Keychain, and `_write_oauth_credentials` also
+        keeps a `.credentials.json` shadow file (#86, so running sessions
+        hot-reload). The PRE-clear read short-circuits at the Keychain and
+        never touches that file, so the earlier refusal never sees `None`. The
+        Keychain delete then succeeds, the file unlink fails, and the re-read
+        reaches the file for the first time — `None`, falsy, guard passes. The
+        landing completes while `.credentials.json` still holds the departed
+        account's token, which is exactly what Claude Code falls back to.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s.sequence_file.write_text(json.dumps(data))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+        }))
+
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text(json.dumps({
+            "claudeAiOauth": {"refreshToken": "A-LIVE-REFRESH"},
+        }))
+
+        # The clear runs, but the file survives AND becomes unreadable — so the
+        # re-read sees `None`, not `""`.
+        real_unlink = type(cred).unlink
+        real_read = type(cred).read_text
+        state = {"cleared": False}
+
+        def refuse_unlink(self, *a, **kw):
+            if self.name == ".credentials.json":
+                state["cleared"] = True
+                raise OSError(30, "Read-only file system")
+            return real_unlink(self, *a, **kw)
+
+        def read_after_clear(self, *a, **kw):
+            if self.name == ".credentials.json" and state["cleared"]:
+                raise PermissionError(13, "Permission denied")
+            return real_read(self, *a, **kw)
+
+        with patch.object(type(cred), "unlink", refuse_unlink), \
+                patch.object(type(cred), "read_text", read_after_clear):
+            with pytest.raises(SwitchError):
+                s._switch_to_empty_slot(
+                    "2", "b@example.com", {"number": 1}, {"number": 2},
+                    s._get_sequence_data(),
+                )
+
+        assert cred.exists(), "premise: the credential survived the clear"
+
+    def test_a_keychain_residual_is_not_read_as_a_successful_clear(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A Keychain that goes unreadable mid-clear leaves the token behind.
+
+        `_delete_active_keychain_entry` calls `delete_password` DIRECTLY and
+        swallows every exception, so a failed delete does not flip the routing
+        cache. The re-read's own Keychain attempt does fail, and after its
+        retries it falls through to the (already-cleared) file and returns
+        `("", keychain_unavailable=True)`. Empty and falsy — while the Keychain
+        still holds the departed account's token, which Claude Code reads
+        BEFORE the file.
+
+        No race required beyond the login keychain auto-locking between the
+        pre-switch probe and the clear, which is the ordinary macOS posture:
+        the backup is Keychain-only there, since
+        `_reconcile_enc_after_keychain_write` deletes the `.enc`.
+
+        `keychain_unavailable` is the only witness — the value is `""` either
+        way, so the guard must read the flag.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        s = self._setup(temp_home)
+        s.platform = Platform.MACOS
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s.sequence_file.write_text(json.dumps(data))
+
+        # The keychain answers for the pre-clear read, then locks.
+        state = {"locked": False}
+        stash: dict = {}
+
+        def get_password(service, account):
+            if state["locked"]:
+                raise _kc.KeychainError("locked")
+            return stash.get((service, account))
+
+        def delete_password(service, account):
+            state["locked"] = True          # locks DURING the clear
+            raise _kc.KeychainError("locked")
+
+        stash[("Claude Code-credentials", _kc.keychain_account_name())] = (
+            json.dumps({"claudeAiOauth": {"refreshToken": "DEPARTED-REFRESH"}})
+        )
+        monkeypatch.setattr(_kc, "get_password", get_password)
+        monkeypatch.setattr(_kc, "delete_password", delete_password)
+        monkeypatch.setattr(_kc, "set_password", lambda *a, **k: None)
+        s._store._keychain_usable_cache = True
+
+        with pytest.raises(SwitchError):
+            s._switch_to_empty_slot(
+                "2", "b@example.com", {"number": 1}, {"number": 2},
+                s._get_sequence_data(),
+            )
+
     def test_an_api_key_does_not_survive_the_empty_slot_landing(
         self, temp_home: Path
     ):
