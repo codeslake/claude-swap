@@ -90,6 +90,11 @@ IDLE_HOLD_MAX_S = 30 * 60.0
 # it needs its own unit rather than a reused one.
 RECOVERY_HYSTERESIS_S = 300.0
 
+# How long `stop()` waits for an in-flight switch before freeing the LIVE lock.
+# A switch is a handful of local file writes; anything past this is a hung
+# filesystem, and blocking the TUI's toggle forever is worse than the race.
+_STOP_SWITCH_WAIT_S = 30.0
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -537,6 +542,11 @@ class AutoSwitchEngine:
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
+        # Set except while `_perform` is inside `switch_to`. `stop()` waits on
+        # it before freeing the LIVE lock, so a successor cannot start acting
+        # while the predecessor's switch is still running.
+        self._switch_in_flight = threading.Event()
+        self._switch_in_flight.set()
         self._unhealthy_ticks = 0
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
@@ -1508,7 +1518,11 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="engine-stopped"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            self._switch_in_flight.clear()
+            try:
+                result = self.switcher.switch_to(number, json_output=True)
+            finally:
+                self._switch_in_flight.set()
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -1636,10 +1650,31 @@ class AutoSwitchEngine:
         same call, and a lock freed only by the exiting worker thread would
         still be held when the successor tries to claim it — this instance
         would demote itself.
+
+        But not while a switch is in flight. `_perform` tests ``_stop`` under
+        the STATE lock and then calls ``switch_to`` still holding it, which is
+        correct against a successor that respects that lock — and a successor
+        that already owns LIVE reaches `_perform` on its own schedule. Freeing
+        LIVE first let both act, and the at-limit escape skips the cooldown by
+        design, so the second undid the first's choice inside one window. That
+        is the failure the lock exists to prevent, reached through the handover
+        rather than through two TUIs.
+
+        `_switch_in_flight` closes it: the release waits for the switch to
+        finish rather than taking the state lock (which `_perform` already
+        holds, and which callers reach through this method — re-entering it
+        here recurses).
         """
         self._stop.set()
         self._wake.set()
         if self._live_lock is not None:
+            # Not while a switch is running. `_perform` tested `_stop` under
+            # the state lock and is now inside `switch_to`; freeing LIVE here
+            # lets a successor claim it and act, and the at-limit escape skips
+            # the cooldown by design, so the second undoes the first's choice
+            # inside one window — the failure the lock exists to prevent,
+            # reached through the handover rather than two TUIs.
+            self._switch_in_flight.wait(_STOP_SWITCH_WAIT_S)
             self._live_lock.release()
             self._live_lock = None
 
