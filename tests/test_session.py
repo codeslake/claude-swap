@@ -2192,3 +2192,41 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert (got / ".credentials.json").read_text() == ROTATED_CREDS, (
             "the profile kept a generation the consume already spent"
         )
+
+    def test_a_failed_persist_warns_rather_than_seeding_a_spent_grant(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
+    ):
+        """A failed persist returns credentials AND an error — both matter.
+
+        The gate consumes the grant, fails to write the successor, and reports
+        ``transient`` while the BACKUP still holds the spent generation. Its
+        own comment says callers read ``error is None`` as "safe to activate",
+        and after a failed persist it is the opposite. Branching on
+        ``not outcome.credentials`` misses it: the successor rides along in
+        the return value, so the warning never fires and ``_bootstrap`` seeds
+        the profile from the backup — the spent generation. Claude's first
+        refresh then gets invalid_grant.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        def gate_consumes_then_fails_to_persist(self, num, email, snapshot):
+            # Grant spent; successor NOT written to the backup, which still
+            # holds CREDS. Exactly the shape switcher.py returns when the
+            # persist fails and the successor is stashed.
+            return oauth.RefreshOutcome(ROTATED_CREDS, "transient")
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher,
+            "consume_backup_grant",
+            gate_consumes_then_fails_to_persist,
+        )
+
+        manager.setup_session("2", share=False)
+
+        assert seeded_switcher.read_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL
+        ) == CREDS, "test premise: the backup still holds the spent generation"
+        assert "Could not refresh the token" in capsys.readouterr().out
