@@ -514,12 +514,30 @@ def _failure_backoff_s(
         # constant that governs some rows. `None` means the caller could not
         # see one; the constant bounds above still apply.
         #
-        # No clamp at zero: an already-expired reset makes this negative, and
-        # `max(asked, computed)` below floors every result at the exponential
-        # curve anyway (measured: -500 in still yields 30s out). Clamping would
-        # read as protection while changing no reachable outcome, which is the
-        # unfalsifiable-guard shape this PR removed from its own fixture.
-        asked = min(asked, trust_expires_in_s)
+        # FLOORED AT THE ASK. The bound may take back the MARGIN we added; it
+        # may not take back the server's deadline. Applied as a bare `min` it
+        # did both, and a reset sooner than the block made the wait SHORTER
+        # than Retry-After:
+        #
+        #     reset      wait   asked   short by
+        #     +2400      2400    3600     1200
+        #     +1200      1200    3600     2400
+        #     +10          30    3600     3570
+        #     -50          30    3600     3570   <- bare exponential curve
+        #
+        # And it compounds: Retry-After counts down to a fixed deadline, so
+        # each early retry draws a fresh 429 with a smaller ask, which the
+        # bound shortens again. Measured through the real reserve()/record()
+        # path: 8 granted fetches inside one block against base's 1, and 11
+        # with a reset already past — 30-40% of the documented hourly request
+        # budget spent on an account we know is blocked.
+        #
+        # A reset sooner than the block means the data goes obsolete before the
+        # server will talk to us again. That is a reason to DISTRUST the row,
+        # not a licence to hammer a server that told us to wait: the blind
+        # window is the lesser cost, and probing does not shorten it. So the
+        # bound only ever removes margin we chose to add.
+        asked = max(min(asked, trust_expires_in_s), min(retry_after_s, asked))
     return max(asked, computed)
 
 
@@ -797,16 +815,49 @@ class UsageStore:
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
                     row["last429At"] = now
-                # How long THIS row's last_good stays decision-trusted, from
-                # the reset it carries — so the backoff cannot outlast it. Only
-                # for 429s: every other failure is already bounded by
-                # TRUST_MAX_AGE_S inside the helper, and a timeout is no
-                # evidence the stored windows still describe reality.
+                # How long THIS row's last_good stays decision-trusted — so the
+                # backoff cannot outlast it. Only for 429s: every other failure
+                # is already bounded by TRUST_MAX_AGE_S inside the helper, and a
+                # timeout is no evidence the stored windows still describe
+                # reality.
+                #
+                # BOTH HALVES of what `_rate_limited_trust_ok` computes, which
+                # is `now < min(soonest reset, age ceiling)`. Only the reset half
+                # was bounded, and `age_s` runs from `fetchedAt` — which a
+                # FAILURE never advances. So consecutive blocks walked the
+                # ceiling down while the backoff stayed at the cap:
+                #
+                #     block  now      backoff    trust ends   blind
+                #       0     +0       +4500       +7200         0
+                #       1   +4500      +9000       +7200      1800
+                #       2   +9000     +13500       +7200      6300
+                #
+                # The PR body documents 10 of 19 lapses re-blocking, so this is
+                # the measured shape rather than a corner.
+                #
+                # The `http-429` scoping here is BELT-AND-BRACES and no test
+                # kills it: `_failure_backoff_s` already clamps every non-429 to
+                # TRUST_MAX_AGE_S on its own branch, so widening this condition
+                # to `if True:` changes nothing observable — measured across 20
+                # (reset x ask) combinations on the 503 path, byte-identical
+                # waits. Kept because the two paths answer to different
+                # ceilings and a reader should not have to re-derive that the
+                # inner clamp saves them; recorded as unfalsifiable rather than
+                # dressed up with a test that passes either way.
                 trust_left: float | None = None
                 if rec.error == "http-429":
-                    soonest = _earliest_reset(row.get("lastGood"))
+                    stored = row.get("lastGood")
+                    fetched_at = row.get("fetchedAt")
+                    bounds = []
+                    soonest = _earliest_reset(stored)
                     if soonest is not None:
-                        trust_left = soonest - now
+                        bounds.append(soonest - now)
+                    if isinstance(fetched_at, (int, float)):
+                        bounds.append(
+                            fetched_at + RATE_LIMIT_TRUST_MAX_AGE_S - now
+                        )
+                    if bounds:
+                        trust_left = min(bounds)
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures,
                     rec.retry_after_s,

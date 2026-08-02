@@ -920,6 +920,145 @@ class TestAdaptiveScheduler:
             "the reset arrived and the row still cannot be re-polled"
         )
 
+    def test_the_trust_bound_never_shortens_the_wait_below_the_ask(
+        self, temp_home
+    ):
+        """The bound may only take back the MARGIN, never the server's deadline.
+
+        `trust_expires_in_s` was applied as a hard `min` with no floor at the
+        ask, so a reset sooner than the block made the wait shorter than
+        Retry-After — and each short wait draws another 429 whose smaller ask
+        the bound shortens again. Measured through the real reserve()/record()
+        path: 8 granted fetches inside one block against base's 1, and 11 with
+        a reset already past.
+
+            reset      wait   asked   short by
+            absent     4500    3600     0
+            +18000     4500    3600     0
+            +3660      3660    3600     0
+            +2400      2400    3600   1200
+            +1200      1200    3600   2400
+            +10          30    3600   3570
+            -50          30    3600   3570   <- collapses to the bare curve
+
+        A reset sooner than the block means the data goes obsolete before the
+        server will talk to us. That is a reason to distrust the row, not a
+        licence to hammer a server that told us to wait — the blind window is
+        the lesser cost, and probing does not shorten it.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        for reset_off in (2400, 1200, 10, -50):
+            h = EngineHarness(temp_home)
+            h.seed(1, "a@example.com")
+            st = h.switcher._usage_store
+            t0 = h.clock.now
+            ident = {"1": ("a@example.com", "")}
+            st.record({"1": FetchRecord(usage={
+                "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + reset_off)},
+                "seven_day": {"pct": 0.0},
+            })}, ident)
+            st.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
+            )
+            wait = st.entries(ident)["1"].backoff_until - t0
+            assert wait >= 3600.0, (
+                f"reset at t0{reset_off:+d}: waited {wait:.0f}s against a 3600s "
+                f"Retry-After — {3600 - wait:.0f}s early, so the next request "
+                f"draws another 429"
+            )
+
+    def test_the_backoff_bound_sees_the_same_scoped_windows_trust_does(
+        self, temp_home
+    ):
+        """`record()` passed `models=()`, so a scoped reset bounded trust only.
+
+        `entries()` takes the configured model names and `_rate_limited_trust_ok`
+        honours their per-model window resets. `record()` called
+        `_earliest_reset` with the default `()`, so the window that actually
+        ends the trust was invisible to the backoff — and the margin then made
+        the blind span WORSE than base for scoped-model users.
+
+        Measured, 5h at +14400, 7d at +400000, scoped Fable at +1800:
+
+            head   backoff +4500, Fable trust dies +1800  -> blind 2700s
+            base   backoff +3600                          -> blind 1800s
+        """
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
+
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 14400)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 400000)},
+            "scoped": [{"model": "Fable", "pct": 60.0,
+                        "resets_at": _iso_at(t0 + 1800)}],
+        })}, ident)
+        st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
+
+        entry = st.entries(ident, models=("Fable",))["1"]
+        assert entry.backoff_until - t0 <= 3600.0 + RETRY_AFTER_MARGIN_S, (
+            "premise"
+        )
+        h.clock.now = t0 + 1800
+        e = st.entries(ident, models=("Fable",))["1"]
+        assert not (e.decision_value() is None and e.in_backoff(h.clock.now)), (
+            "the scoped window ended the trust while the row was still in "
+            "backoff — un-pollable AND unknown, which the backoff bound was "
+            "supposed to prevent"
+        )
+
+    def test_consecutive_blocks_do_not_walk_the_row_into_blindness(
+        self, temp_home
+    ):
+        """The trust is `min(soonest reset, AGE ceiling)` — bound BOTH halves.
+
+        `record()` computed only the reset half. `age_s` runs from `fetchedAt`,
+        which a failure never advances, so consecutive blocks walk the ceiling
+        down while the backoff stays at the cap. Measured, far reset so only
+        the ceiling binds, three 3600s blocks back to back:
+
+            block  now      backoff      trust ends    blind
+              0     +0       +4500         +7200          0
+              1   +4500      +9000         +7200       1800
+              2   +9000     +13500         +7200       6300
+
+        The PR body documents 10 of 19 lapses re-blocking, so consecutive
+        blocks are the measured shape rather than a corner. Blindness is what
+        the unhealthy-tick counter converts into a failover off a healthy
+        account, which is the failure this whole bound exists to prevent.
+        """
+        from claude_swap.usage_store import (
+            RATE_LIMIT_TRUST_MAX_AGE_S,
+            FetchRecord,
+        )
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 16000)},
+            "seven_day": {"pct": 0.0},
+        })}, ident)
+
+        for block in range(3):
+            st.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
+            )
+            e = st.entries(ident)["1"]
+            trust_ends = e.fetched_at + RATE_LIMIT_TRUST_MAX_AGE_S
+            assert e.backoff_until <= max(trust_ends, h.clock.now + 3600.0), (
+                f"block {block}: backoff to t0+{e.backoff_until - t0:.0f}s but "
+                f"trust ends t0+{trust_ends - t0:.0f}s — "
+                f"{e.backoff_until - trust_ends:.0f}s un-pollable AND unknown"
+            )
+            h.clock.now = e.backoff_until
+
     def test_a_non_429_recorded_through_record_does_not_take_the_margin(
         self, temp_home
     ):
@@ -970,7 +1109,12 @@ class TestAdaptiveScheduler:
         st = h.switcher._usage_store
         t0 = h.clock.now
         ident = {"1": ("a@example.com", "")}
-        soonest, latest = t0 + 1800, t0 + 90_000
+        # Both resets sit AFTER the ask, so the floor at Retry-After is not in
+        # play and the only question is which reset the bound reads. A window
+        # sooner than the ask is a different case entirely — see
+        # test_the_trust_bound_never_shortens_the_wait_below_the_ask, which
+        # pins that the deadline wins there.
+        soonest, latest = t0 + 3900, t0 + 90_000
 
         st.record({"1": FetchRecord(usage={
             "five_hour": {"pct": 50.0, "resets_at": _iso_at(soonest)},
