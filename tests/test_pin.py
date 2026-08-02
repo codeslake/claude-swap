@@ -801,6 +801,74 @@ class TestPurgeDoesNotStrandTheWiring:
     a dead port with nothing remaining that knows how to remove it: the exact
     stranding clear_wiring lives in this repo to prevent."""
 
+    def _purge_with(self, tmp_path, monkeypatch, clear_wiring):
+        """Drive a real purge with ``clear_wiring`` replaced. Returns stdout."""
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:36301"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY"],
+            "_cswapPinWiredKeysSaved": {},
+        }))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        # switcher.py imports the name at module scope, so patching the
+        # module it came FROM does not reach it.
+        import claude_swap.switcher as _sw_mod
+
+        monkeypatch.setattr(_sw_mod, "get_global_config_path", lambda: cfg)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(pin, "clear_wiring", clear_wiring)
+
+        sw = ClaudeAccountSwitcher()
+        sw.backup_dir.mkdir(parents=True, exist_ok=True)
+        buf = io.StringIO()
+        with patch("builtins.input", return_value="y"), redirect_stdout(buf):
+            sw.purge()
+        return buf.getvalue(), cfg
+
+    def test_a_FAILED_unwire_tells_the_user_instead_of_saying_complete(
+        self, tmp_path, monkeypatch
+    ):
+        """"Absent" and "failed" are different, and only one is silent.
+
+        A bare `except Exception` could not tell them apart, so a read-only
+        home (or a contended lock, or an unreadable config) printed "Purge
+        complete." over a config that still carried the wiring — and with
+        LESS recourse than before, since the record, cert dir and daemon
+        state a later `cswap pin --clear` could have keyed off are now gone.
+        Hand-editing was the only cure and nothing said so.
+        """
+        def _raise(sw, timeout=None):
+            raise OSError(30, "Read-only file system")
+
+        out, cfg = self._purge_with(tmp_path, monkeypatch, _raise)
+
+        assert "Read-only file system" in out, (
+            "the purge reported success over a wiring it failed to remove"
+        )
+        # The path the code resolves, not where this test happened to write:
+        # a session-scoped isolated_home fixture also sets HOME.
+        assert str(cfg) in out, "the message does not name the file to edit"
+        assert "_cswapPinWiredKeys" in out, "it does not name what to delete"
+
+    def test_an_ABSENT_extra_says_nothing(self, tmp_path, monkeypatch):
+        """...and the silent case must stay silent: no extra, nothing wired,
+        nothing to report."""
+        def _absent(sw, timeout=None):
+            raise ImportError("no cswap_pin", name="cswap_pin")
+
+        out, _cfg = self._purge_with(tmp_path, monkeypatch, _absent)
+        assert "cloud pin wiring" not in out.lower(), out
+
     def test_purge_unwires_before_it_deletes(self, tmp_path, monkeypatch):
         import json as _json
         from unittest.mock import patch
