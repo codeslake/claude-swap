@@ -2192,6 +2192,23 @@ class ClaudeAccountSwitcher:
         """Record THIS thread's active-read verdict (see `_active_verdict_tls`)."""
         self._active_verdict_tls.value = active
 
+    def _with_active_verdict(self, fn):
+        """Wrap `fn` so a worker thread inherits THIS thread's verdict.
+
+        The verdict is thread-local so two TUI lanes cannot erase each
+        other's, but `_fetch_active_usage` always runs on a pool worker that
+        never read. Without this the worker saw the clean default and the
+        consume gate never fired — measured 30/30 verdicts lost, a false
+        NEGATIVE where the race it replaced only lost the verdict sometimes.
+        """
+        verdict = self._active_verdict()
+
+        def _inherit(*args, **kwargs):
+            self._record_active_verdict(verdict)
+            return fn(*args, **kwargs)
+
+        return _inherit
+
     def _active_verdict(self):
         """This thread's active-read verdict; a clean one if it never read."""
         from claude_swap.credentials import ActiveCredentials
@@ -4061,7 +4078,9 @@ class ClaudeAccountSwitcher:
             return str(info[0]), self._fetch_account_usage(info)
 
         with ThreadPoolExecutor() as executor:
-            return dict(executor.map(fetch_one, enumerate(infos)))
+            return dict(
+                executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
+            )
 
     def _collect_usage_entries(
         self,

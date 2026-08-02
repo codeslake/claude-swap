@@ -34,6 +34,7 @@ from claude_swap.json_output import (
     USAGE_NO_CREDENTIALS,
 )
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.usage_store import FetchRecord
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -686,6 +687,51 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "that is the latch, not the contract"
         )
         assert store._read_active_credentials().degraded is False
+
+    def test_the_active_verdict_crosses_the_fetch_pool(
+        self, macos_switcher
+    ):
+        """Thread-local must not mean invisible to the thread that consumes it.
+
+        `_build_accounts_info` writes the verdict on the MAIN thread; the
+        consumer `_fetch_active_usage` always runs on a `ThreadPoolExecutor`
+        worker (`_run_usage_fetches`). A worker that never read has no
+        verdict, so `_active_verdict()` returns the clean default and the
+        consume gate never fires.
+
+        Measured before the fix, through the real collect pass:
+
+            [--list] worker=ThreadPoolExecutor-0_0  degraded=False
+                     refresh_POSTed=True  sentinel=None
+            verdict lost at the gate: 30/30
+
+        The race this replaced lost the verdict SOMETIMES, under a hostile
+        sibling. This lost it every time, with no second lane involved — a
+        false negative, which is worse: the gate POSTs a possibly-spent grant
+        and AUTH_DEAD_STRIKES = 1 quarantines a live account.
+
+        The submitting thread's verdict travels into each worker, so
+        thread-local stays right for isolation without being blind.
+        """
+        from unittest.mock import patch
+
+        s = macos_switcher
+        s._record_active_verdict(ActiveCredentials("", True, True))
+
+        seen: dict = {}
+
+        def spy(info):
+            seen["degraded"] = s._active_verdict().degraded
+            return FetchRecord(error="timeout")
+
+        info = (2, "b@example.com", "", "", False, "", "")
+        with patch.object(s, "_fetch_account_usage", spy):
+            s._run_usage_fetches([info])   # the real pool boundary
+
+        assert seen["degraded"] is True, (
+            "a pool worker saw a clean verdict where the build recorded a "
+            "degraded one — the consume gate POSTs a possibly-spent grant"
+        )
 
     def test_the_active_verdict_is_not_shared_across_TUI_lanes(
         self, macos_switcher, monkeypatch
