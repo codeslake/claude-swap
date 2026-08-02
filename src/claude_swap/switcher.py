@@ -5760,19 +5760,11 @@ class ClaudeAccountSwitcher:
         # falsy, over a Keychain that still holds the departed token, which
         # Claude Code reads BEFORE the file. The flag is the only witness.
         # `residual_gone` because a READ cannot answer under a pinned file
-        # mode. `_pin_file_mode` is reachable only from a write whose delete
-        # may have failed, and it sets the routing cache False with nothing
-        # having failed — so `_use_keychain()` is False, `_keychain_unreadable`
-        # is False, and the re-read never asks the Keychain at all. A surviving
-        # item is then invisible to the check written to catch it. Measured,
-        # one process, reads succeeding throughout:
-        #
-        #     post-clear read   value=''  unavailable=False  -> passed
-        #     Keychain residual still present: True
-        #
-        # The delete is the observation; `_clear_oauth_credential` passes it up
-        # rather than leaving the check to infer it from a backend it is not
-        # using.
+        # mode: nothing asks the Keychain there, so a surviving item is
+        # invisible to the check written to catch it. Measured, reads
+        # succeeding throughout — post-clear read `value='' unavailable=False`
+        # passed with the residual still present. The delete is the
+        # observation.
         post = self._store._read_active_credentials()
         if post.value != "" or post.keychain_unavailable or not residual_gone:
             raise SwitchError(
