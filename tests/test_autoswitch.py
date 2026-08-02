@@ -2792,6 +2792,145 @@ class TestLiveLock:
         assert harness.active_number() == 1        # but changed nothing
         assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
 
+    def test_stop_is_idempotent_and_reentrant(self, harness):
+        """`cli.py` installs `stop()` as the SIGTERM handler on the MAIN thread.
+
+        Python delivers signals on the main thread, interrupting whatever
+        frame is running — including `_perform`, which owns the in-flight
+        flag. So `stop()` can run ON TOP of the frame that would clear it,
+        and a second SIGTERM (an impatient operator, systemd's retry) runs a
+        second handler nested on the same thread.
+
+        Measured before the guard: both frames reached
+        `self._live_lock.release()` and the inner one raised
+
+            AttributeError: 'NoneType' object has no attribute 'release'
+
+        which propagated into `_perform` INSIDE `with self._state_lock():`,
+        past `atomic_write_json` — the account switched but `lastSwitchAt` was
+        never written, so the next engine saw no cooldown. Eight concurrent
+        `stop()` calls produced `ValueError: I/O operation on closed file`
+        from `FileLock.release()` double-closing.
+        """
+        import threading
+
+        engine = harness.engine
+        errors: list = []
+
+        def call_stop():
+            try:
+                engine.stop()
+            except Exception as e:  # noqa: BLE001 - the point of the test
+                errors.append(f"{type(e).__name__}: {e}")
+
+        # NESTED, the signal shape: stop() runs on top of a stop() that is
+        # inside its own wait. A plain barrier cannot model this — the second
+        # frame must start while the first is blocked, on the SAME thread.
+        engine._tick_in_flight.clear()
+        depth = {"max": 0, "cur": 0}
+        real_wait = engine._tick_in_flight.wait
+
+        def reentrant_wait(timeout=None):
+            depth["cur"] += 1
+            depth["max"] = max(depth["max"], depth["cur"])
+            try:
+                if depth["cur"] == 1:
+                    # The second SIGTERM, delivered on the same thread while
+                    # the first handler is inside its wait. It must not touch
+                    # the lock the outer frame is about to release.
+                    call_stop()
+                return True
+            finally:
+                depth["cur"] -= 1
+
+        engine._tick_in_flight.wait = reentrant_wait
+        try:
+            call_stop()
+        finally:
+            engine._tick_in_flight.wait = real_wait
+            engine._tick_in_flight.set()
+
+        assert depth["max"] >= 1, "premise: the wait was reached"
+        assert errors == [], f"a nested stop() raised {errors}"
+
+        threads = [threading.Thread(target=call_stop) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+
+        assert errors == [], f"concurrent stop() raised {errors}"
+        engine.stop()          # and again, serially
+        assert engine._live_lock is None
+
+    def test_a_stopped_engine_does_not_finish_freshening(self, harness):
+        """`_tick_in_flight` guarded only `switch_to`.
+
+        Every other mutation in the tick left the flag SET, so `stop()`
+        returned instantly and freed LIVE while the predecessor was still
+        inside `_freshen_target` — which POSTs a ONE-TIME refresh grant.
+        Measured before the fix:
+
+            stop() returned in 0.000s; successor LIVE=True
+            grants the STOPPED engine consumed after handover: ['2', '3']
+
+        `test_a_stopped_engine_stops_MUTATING_not_just_switching` covers a
+        tick that STARTS after `stop()`. This covers one already in flight,
+        which is the common case: the TUI's `_restart_engine` stops and
+        reconstructs in the same call while the worker is mid-tick.
+        """
+        import threading
+
+        engine = harness.engine
+        entered = threading.Event()
+        release = threading.Event()
+        freshened: list[str] = []
+        real = engine._freshen_target
+
+        def blocking_freshen(number, email):
+            freshened.append(number)
+            entered.set()
+            release.wait(5)
+            return real(number, email)
+
+        engine._freshen_target = blocking_freshen
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+        }
+
+        def run():
+            with patch.object(
+                harness.switcher, "usage_entries_by_account", return_value=entries
+            ):
+                engine.tick()
+
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            assert entered.wait(5), "premise: a freshen is in flight"
+
+            stopped = threading.Event()
+
+            def do_stop():
+                engine.stop()
+                stopped.set()
+
+            stopper = threading.Thread(target=do_stop)
+            stopper.start()
+            import time
+
+            time.sleep(0.2)
+            assert not stopped.is_set(), (
+                "stop() returned while a freshen was in flight — it freed the "
+                "LIVE lock and the predecessor went on to POST a one-time "
+                "refresh grant for an account the successor now owns"
+            )
+        finally:
+            release.set()
+            worker.join(10)
+            stopper.join(10)
+
     def test_the_LIVE_lock_is_not_freed_while_a_switch_is_in_flight(
         self, harness
     ):

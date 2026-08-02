@@ -650,7 +650,7 @@ class CredentialStore:
             "keychain" if wrote_to_keychain else "file"
         )
 
-    def _clear_managed_key(self) -> None:
+    def _clear_managed_key(self) -> bool:
         """Clear any active managed API key (Claude Code ``removeApiKey`` semantics).
 
         Deletes the macOS Keychain "Claude Code" item (best-effort) and drops
@@ -658,7 +658,14 @@ class CredentialStore:
         ``customApiKeyResponses.approved`` untouched — ``removeApiKey`` doesn't clear
         it either, and removing it would force recovering ``key[-20:]`` from the
         Keychain for no benefit. A no-op (no config rewrite) when no key is present.
+
+        Returns whether no managed item can still shadow the config, the same
+        verdict :meth:`_delete_active_keychain_entry` reports for OAuth. Claude
+        Code reads the "Claude Code" Keychain item BEFORE ``primaryApiKey``, so
+        a survivor keeps authenticating; and under a pinned file mode a
+        post-clear READ never asks the Keychain, so nothing else can see it.
         """
+        cleared = True
         if self._host.platform == Platform.MACOS:
             try:
                 macos_keychain.delete_password(
@@ -666,7 +673,7 @@ class CredentialStore:
                     macos_keychain.keychain_account_name(),
                 )
             except Exception:
-                pass  # best-effort; a down Keychain can't be cleaned now
+                cleared = False  # best-effort; a down Keychain can't be cleaned
         cfg = self._read_global_config()
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
@@ -676,6 +683,8 @@ class CredentialStore:
                 self._update_global_config(_drop)
             except Exception as e:
                 self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
+                cleared = False
+        return cleared
 
     def _clear_oauth_credential(self) -> bool:
         """Clear the active OAuth credential — Keychain item and plaintext file.

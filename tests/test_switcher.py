@@ -5526,6 +5526,83 @@ class TestSwitchSkipsBrokenSlots:
                 s._get_sequence_data(),
             )
 
+    def test_a_surviving_managed_key_is_not_read_as_a_cleared_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The managed axis was blind exactly the way OAuth was.
+
+        `_clear_oauth_credential` reports whether an item can still shadow the
+        file; `_clear_managed_key` swallowed its delete in a bare
+        `except Exception: pass` and returned nothing. Under a pinned file
+        mode the post-clear read never asks the Keychain, so a surviving
+        managed item is invisible to both the pre-clear refusal and the
+        post-clear check — and Claude Code reads the "Claude Code" Keychain
+        item BEFORE `primaryApiKey`, so the survivor wins.
+
+        Measured through the production write path, nothing hand-set: a
+        managed write falls back (per-item ACL denies the write), pinning file
+        mode, and the earlier key survives because the fallback path never
+        deletes the item.
+
+            PRE-clear   value_fp=<new>  unavail=False  degraded=False
+            LANDED      switched=True  needsLogin=True  active=2
+            KEYCHAIN    survivor present=True
+
+        The user is told "you are now logged out" while the surviving key
+        keeps authenticating and billing per token.
+
+        The existing test one below covers the READ half (a denied `-w`).
+        This is the CLEAR half.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        s = self._setup(temp_home)
+        s.platform = Platform.MACOS
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s.sequence_file.write_text(json.dumps(data))
+
+        managed = ("Claude Code", _kc.keychain_account_name())
+        store = {managed: "sk-ant-api03-SURVIVOR"}
+
+        def get_password(service, account):
+            return store.get((service, account))
+
+        def delete_password(service, account):
+            if service == "Claude Code":
+                raise _kc.KeychainError("denied")   # the managed item SURVIVES
+            store.pop((service, account), None)
+            return None
+
+        monkeypatch.setattr(_kc, "get_password", get_password)
+        monkeypatch.setattr(_kc, "delete_password", delete_password)
+        monkeypatch.setattr(_kc, "set_password", lambda *a, **k: None)
+        s._store._keychain_usable_cache = True
+        # File mode through the production path (an OAuth write whose Keychain
+        # write fails), so this holds on either branch's `_pin_file_mode`
+        # signature.
+        real_set = _kc.set_password
+
+        def set_denied(*_a, **_kw):
+            raise _kc.KeychainError("write denied")
+
+        monkeypatch.setattr(_kc, "set_password", set_denied)
+        s._store._write_oauth_credentials(
+            json.dumps({"claudeAiOauth": {"refreshToken": "LIVE"}})
+        )
+        monkeypatch.setattr(_kc, "set_password", real_set)
+        assert s._store._use_keychain() is False, "premise: file mode is pinned"
+
+        with pytest.raises(SwitchError):
+            s._switch_to_empty_slot(
+                "2", "b@example.com", {"number": 1}, {"number": 2},
+                s._get_sequence_data(),
+            )
+
+        assert store.get(managed) is not None, "premise: the key survived"
+
     def test_a_managed_key_keychain_failure_is_not_read_as_an_empty_slot(
         self, temp_home: Path, monkeypatch
     ):
