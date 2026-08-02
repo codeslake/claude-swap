@@ -5391,6 +5391,72 @@ class TestSwitchSkipsBrokenSlots:
 
         assert cred.exists(), "premise: the credential survived the clear"
 
+    def test_a_degraded_read_is_not_a_licence_to_clear(
+        self, temp_home: Path, monkeypatch
+    ):
+        """`degraded` is the third axis, and this method never read it.
+
+        The guard tests `value is None` and `value == "" and
+        keychain_unavailable`. A DEGRADED read passes both: the value is real
+        bytes, so it is neither. But `degraded` means those bytes came from the
+        plaintext file AFTER the Keychain read failed, and on macOS Claude Code
+        writes rotations Keychain-only — so the file can be a superseded
+        generation while the current one is in the Keychain we could not read.
+
+        The clear then deletes the Keychain item, because `delete-generic-
+        password` is attribute-only and does not decrypt: the same asymmetry
+        this method's own docstring states for the `""` case. What lands in the
+        stash is the stale generation, and the live one exists nowhere.
+
+        Asserts the CURRENT generation survives, not the exception type: a
+        refusal that still deleted the Keychain item would satisfy a
+        `pytest.raises` and lose the token anyway.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s.sequence_file.write_text(json.dumps(data))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+        }))
+
+        # The file holds the SUPERSEDED generation; the Keychain holds the
+        # current one and cannot be read. That is what `degraded` reports.
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text(json.dumps({
+            "claudeAiOauth": {"refreshToken": "STALE-GEN-7"},
+        }))
+        keychain = {"current": "CURRENT-GEN-9"}
+
+        stale = cred.read_text()
+        monkeypatch.setattr(
+            s._store,
+            "_read_active_credentials",
+            lambda: ActiveCredentials(
+                stale, keychain_unavailable=False, degraded=True
+            ),
+        )
+        monkeypatch.setattr(
+            s._store,
+            "_delete_active_keychain_entry",
+            lambda: (keychain.pop("current", None), True)[1],
+        )
+
+        with pytest.raises((CredentialReadError, SwitchError)):
+            s._switch_to_empty_slot(
+                "2", "b@example.com", {"number": 1}, {"number": 2},
+                s._get_sequence_data(),
+            )
+
+        assert keychain.get("current") == "CURRENT-GEN-9", (
+            "the current generation was deleted from the Keychain on a read "
+            "we already knew was degraded; only the stale one is preserved"
+        )
+
     def test_a_keychain_residual_is_not_read_as_a_successful_clear(
         self, temp_home: Path, monkeypatch
     ):
