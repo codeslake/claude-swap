@@ -5680,8 +5680,9 @@ class ClaudeAccountSwitcher:
         ``~/.claude.json`` name different slots, and every later switch fails
         the "empty read must not overwrite the departing backup" guard.
         """
-        live = self._store._read_active_credentials().value
-        if live is None:
+        active = self._store._read_active_credentials()
+        live = active.value
+        if live is None or (live == "" and active.keychain_unavailable):
             # PRESENT BUT UNREADABLE — not the same as absent, and the two used
             # to take the same branch because both are falsy. `""` means nothing
             # is there and clearing costs nothing; `None` means a credential
@@ -5695,13 +5696,24 @@ class ClaudeAccountSwitcher:
             # method is reached from the direct-activation path BEFORE its
             # rollback snapshot, so nothing downstream can put it back.
             #
+            # `keychain_unavailable` is the SAME fact wearing the Keychain's
+            # spelling. A failed OAuth read that nothing else covers returns
+            # `("", True)`, not `None` — and `""` is falsy, so the stash was
+            # skipped while the clear went ahead. The delete is not the read:
+            # `-w` decrypts, `delete-generic-password` is attribute-only and
+            # runs outside `_use_keychain`, so a read that times out under the
+            # statusline contention this module names, then a delete that
+            # succeeds once it clears, is ordinary. Measured, unmanaged login:
+            # SwitchError promising a stash, keychain item gone, stash empty.
+            #
             # Refusing is the same contract the stash already states: a
             # successful stash is the license to overwrite, and there is none.
             raise CredentialReadError(
-                "The live credential exists but cannot be read, so it cannot be "
-                "preserved before this slot's logged-out landing clears it — "
-                "and it may be the only copy. Fix its permissions "
-                f"({get_credentials_path()}) and retry."
+                "The live credential may exist but cannot be read, so it "
+                "cannot be preserved before this slot's logged-out landing "
+                "clears it — and it may be the only copy. Fix what is blocking "
+                f"the read (a locked Keychain, permissions on "
+                f"{get_credentials_path()}) and retry."
             )
         if live:
             self._stash_live_credential(
