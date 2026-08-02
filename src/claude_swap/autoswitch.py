@@ -99,6 +99,19 @@ RECOVERY_HORIZON_S = 4 * 3600.0
 # target burns it back, and it ping-pongs. A ratio makes the move one-way.
 HORIZON_HEADROOM_RATIO = 2.0
 
+# "Is anything worth having?" — a DIFFERENT question from the anti-flap margin
+# above, and it needs its own number. Reusing HORIZON_HEADROOM_RATIO for both
+# excluded peers that plainly have quota: at 2x-minus-epsilon a peer is very
+# much worth having, it merely fails this tick's margin. With every candidate
+# below that floor `max(..., default=0.0)` yields 0.0, which SATISFIES the
+# spent clause — so the clause fired for everybody and ranking fell to soonest
+# reset regardless of headroom. Measured: active 3.00 pts, peerA 5.99, peerB
+# 0.10 -> took peerB, discarding 60x the runway.
+#
+# Lower than the margin because it answers a weaker question: not "is this peer
+# enough better to justify a move?" but "does this peer have anything at all?"
+WORTH_HAVING_RATIO = 1.3
+
 # Below this an account is spent, and headroom comparisons between two spent
 # accounts compare noise (a point is under ten minutes of work, less than two
 # poll intervals). When EVERY candidate is down here, rank by reset instead —
@@ -1260,9 +1273,11 @@ class AutoSwitchEngine:
         # blocked. The band is (SPENT_HEADROOM_PCT, active x RATIO], up to 3
         # points wide at the defaults.
         #
-        # A candidate below the ratio cannot win the headroom axis, so counting
-        # it here only ever suppresses the OTHER axis on its behalf.
-        _ratio_floor = (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO
+        # Scoped by WORTH_HAVING_RATIO, not the anti-flap margin. Using the
+        # margin here excluded peers that plainly have quota and emptied the
+        # max, and an empty max reads as "nothing is worth having" — the exact
+        # opposite of what a 5.99-point peer means. See the constant.
+        _ratio_floor = (active_headroom or 0.0) * WORTH_HAVING_RATIO
         best_candidate_headroom = max(
             (
                 h
