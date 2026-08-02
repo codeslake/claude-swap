@@ -1796,30 +1796,45 @@ class TestAutoStartLive:
         from claude_swap.settings import load_settings
         assert load_settings(tmp_path).auto_start_live is False
 
-    def test_a_demoted_go_live_is_not_persisted_as_live(self, tmp_path):
-        """Consent records what the engine BECAME, not what was asked for.
+    def test_a_demotion_writes_no_consent_at_all(self, tmp_path):
+        """A demotion says nothing about what the user consented to.
 
-        Another LIVE engine holding the machine lock demotes this one to
-        dry-run. Persisting `true` anyway would make every later launch
-        auto-enter a "LIVE" the user never actually got.
+        `autoStartLive` is one shared setting, so writing `false` here is not
+        neutral — it revokes the LIVE holder's own consent. Measured, two
+        TUIs on one machine:
+
+            TUI#1 goes live        auto_start_live=True
+            TUI#2 presses `l`      demoted (the lock is held)
+            TUI#2 persists False   auto_start_live=False
+
+        so opening a second TUI and pressing one key silently makes the NEXT
+        launch start dry-run. Recording what the engine BECAME is right for a
+        granted go-live and wrong for a refused one: the refusal is about the
+        lock, not about consent, so the answer is to write nothing.
         """
         from unittest.mock import MagicMock
-        from claude_swap.settings import load_settings
+        from claude_swap.settings import load_settings, set_setting
         from claude_swap.tui.autoview import AutoScreen
+
+        set_setting(tmp_path, "autoswitch.autoStartLive", "true")  # the holder's
 
         view = AutoScreen.__new__(AutoScreen)
         persisted: list[bool] = []
         view._persist_auto_start_live = persisted.append
         demoted = MagicMock()
         demoted.dry_run = True                      # the lock was already held
+        demoted.demoted_from_live = True
 
         def restart(*, dry_run):
             view._engine = demoted
 
         view._restart_engine = restart
         AutoScreen._on_live_confirm(view, True)
-        assert persisted == [False]
-        assert load_settings(tmp_path).auto_start_live is False
+        assert persisted == [], (
+            f"persisted {persisted} — a demoted TUI wrote over the LIVE "
+            "holder's consent, so the next launch starts dry-run"
+        )
+        assert load_settings(tmp_path).auto_start_live is True
 
     def test_a_granted_go_live_is_persisted(self, tmp_path):
         from unittest.mock import MagicMock
@@ -1830,6 +1845,7 @@ class TestAutoStartLive:
         view._persist_auto_start_live = persisted.append
         live = MagicMock()
         live.dry_run = False
+        live.demoted_from_live = False   # it actually got LIVE
 
         def restart(*, dry_run):
             view._engine = live

@@ -2243,7 +2243,13 @@ class TestConsumeFirstStrategy:
         h.engine.stop()               # free the LIVE lock for the loser
         loser = h._make_engine()
         assert not loser.dry_run      # a demoted loser would never reach _perform
-        loser.stop()
+        # Release the loser's LIVE lock so the winner can take it, WITHOUT
+        # setting `_stop` — a stopped engine now refuses at the freshen gate,
+        # which is a different layer than the one under test here. This test is
+        # about the state lock serializing two engines that both believe they
+        # are running.
+        loser._live_lock.release()
+        loser._live_lock = None
         h.engine = h._make_engine()   # winner retakes the lock
         # Winner: 1 -> 2 (soonest reset), records lastSwitchAt.
         h.tick_with_usage({
@@ -2785,6 +2791,49 @@ class TestLiveLock:
         assert outcome is TickOutcome.SWITCHED     # it *decided* to switch
         assert harness.active_number() == 1        # but changed nothing
         assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
+
+    def test_a_stopped_engine_stops_MUTATING_not_just_switching(self, harness):
+        """`stop()` releases the LIVE lock synchronously; the tick does not stop.
+
+        No caller joins the worker thread, so an in-flight tick runs to
+        completion while its successor legitimately owns LIVE. `_perform`
+        checks `_stop` under the state lock and correctly blocks the SWITCH,
+        but the tick mutates well before reaching it:
+
+            _freshen_target consults _stop? False   # POSTs a refresh grant
+            _quarantine     consults _stop? False   # writes quarantine state
+            _perform        consults _stop? True
+
+        So the predecessor can consume a one-time refresh grant, or quarantine
+        a slot, on behalf of an engine that has already handed over. The same
+        reasoning that put a check in `_perform` applies here — the freshen is
+        a mutation, which is why dry-run stops short of it too.
+        """
+        engine = harness.engine
+        freshened: list[str] = []
+        real = engine._freshen_target
+
+        def spy(number, email):
+            freshened.append(number)
+            return real(number, email)
+
+        engine._freshen_target = spy
+        engine.stop()          # the successor may now claim LIVE
+
+        with patch.object(
+            harness.switcher,
+            "usage_entries_by_account",
+            return_value={
+                num: _entry_for(value, harness.clock.now)
+                for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+            },
+        ):
+            engine.tick()
+
+        assert freshened == [], (
+            f"a stopped engine freshened {freshened} — it POSTed a one-time "
+            "refresh grant for an account its successor now owns"
+        )
 
     def test_demotion_is_announced_once(self, harness):
         second = harness._make_engine()
