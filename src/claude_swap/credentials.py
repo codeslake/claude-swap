@@ -1033,14 +1033,11 @@ class CredentialStore:
             try:
                 return self._kc_read_backup(account_num, email)
             except macos_keychain.KEYCHAIN_ERRORS as e:
-                # THIS read is the only thing that knows whether THIS backup
-                # could be reached. Reported through the caller's list rather
-                # than an instance flag: the flag was shared by every thread
-                # on the store, and the window between clearing it and reading
-                # it back spans a ~10-50ms `security` subprocess. Measured with
-                # one sibling reader, slot 2 genuinely denied: 2 of 60 reads
-                # came back "readable", and the consume gate then POSTs a
-                # possibly-spent grant.
+                # Reported through the caller's list, not an instance flag:
+                # that flag was shared by every thread and its window spans a
+                # ~10-50ms `security` subprocess. Measured with one sibling
+                # reader, slot 2 genuinely denied: 2 of 60 reads came back
+                # "readable", and the consume gate then POSTs a spent grant.
                 if failed is not None:
                     failed.append(True)
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
