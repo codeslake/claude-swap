@@ -25,6 +25,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
+from claude_swap import pin
 from claude_swap.models import AccountsSnapshot
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
@@ -36,6 +37,17 @@ FLASH_S = 1.5  # how long a just-refreshed row stays highlighted
 MenuEntries = list[tuple[str, str]]  # (label, action_id)
 
 _BACK = ("← back", "back")
+
+
+def cloud_menu_label(pinned_email: str | None) -> str:
+    """Menu row for the cloud pin, naming the pinned account inline.
+
+    The row has to answer "is a pin set, and where does it point" without
+    being opened — that is the whole question a user has when they glance at
+    the menu. "RC/artifacts" names the scope, which is wider than Remote
+    Control alone (artifacts, triggers, marketplace sync all follow the pin).
+    """
+    return f"Cloud account (RC/artifacts)… — {pinned_email or 'none'}"
 
 
 class DashboardScreen(Screen):
@@ -67,8 +79,28 @@ class DashboardScreen(Screen):
     async def on_mount(self) -> None:
         self.query_one("#menu", ListView).focus()
         await self._push_menu("menu", self._root_entries())
+        # Rebuild on the poll the app already runs, rather than adding a timer
+        # of our own: the pin row has to appear when the extra is installed
+        # mid-session, and the label names the pinned account, which changes
+        # from the CLI too.
+        self.watch(self.app, "snapshot", lambda _s: self.refresh_root_menu())
 
     # -- menu plumbing --------------------------------------------------------
+
+    async def refresh_root_menu(self) -> None:
+        """Rebuild the root menu in place, if that is where the user is.
+
+        The pin row appears only when the extra is installed, and installing
+        it is something a user does WHILE the TUI is open. Building the menu
+        once at mount meant the row could not appear until a restart — and a
+        feature that needs a restart to become visible reads as broken.
+
+        Only when the root is on top: rebuilding under an open submenu would
+        yank the rows out from under the cursor.
+        """
+        if len(self._menu_stack) == 1:
+            self._menu_stack[0] = ("menu", self._root_entries())
+            await self._render_menu()
 
     def _root_entries(self) -> MenuEntries:
         # No "Refresh" entry: every view auto-refreshes, so a menu item would
@@ -79,6 +111,14 @@ class DashboardScreen(Screen):
             ("Auto-switch view", "auto"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
+            # Only when the extra is installed. A user who never asked for the
+            # pin should not see a row for it; one who installs it while the
+            # TUI is open sees the row appear (see refresh_root_menu).
+            *(
+                [(cloud_menu_label(pin.pinned_email(self.app.switcher)), "pin-menu")]
+                if pin.is_available()
+                else []
+            ),
             ("Remove account…", "remove-menu"),
             ("Theme…", "theme-menu"),
             ("Quit", "quit"),
@@ -126,6 +166,29 @@ class DashboardScreen(Screen):
             (f"{'●' if name == current else ' '} {name}", f"theme:{name}")
             for name in ("dark", "light", "auto")
         ]
+        entries.append(_BACK)
+        return entries
+
+    def _pin_entries(self) -> MenuEntries:
+        """One row per account (→ pin the claude.ai surface to it), plus clear."""
+        try:
+            pin._impl()  # resolved only to prove the package is usable
+        except Exception as exc:  # noqa: BLE001
+            # Reachable only if the extra disappears between the root menu
+            # being drawn and this row being opened — the row is not offered
+            # otherwise. Name the real reason rather than showing empty rows.
+            return [(str(exc), ""), _BACK]
+        current = pin.pinned_email(self.app.switcher)
+        snap = self.app.snapshot
+        entries: MenuEntries = []
+        for acc in (snap.accounts if snap else ()):
+            name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
+            state = "  ○ cloud" if current == acc.email else ""
+            entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
+        # Only offer the clear when there is something to clear — an inert row
+        # reads as "a pin exists" to anyone scanning the menu.
+        if current:
+            entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
         return entries
 
@@ -191,6 +254,42 @@ class DashboardScreen(Screen):
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
             app.do_toggle_disabled(number)
+            await self._pop_menu()
+        elif action_id == "pin-menu":
+            await self._push_menu("cloud account", self._pin_entries())
+        elif action_id.startswith("pin:"):
+            try:
+                impl = pin._impl()
+            except Exception as exc:  # noqa: BLE001
+                # Names the real reason, which _impl already distinguishes:
+                # "install the extra" for a missing package, the underlying
+                # error for one that is present and broken.
+                app.notify(str(exc))
+                await self._pop_menu()
+                return
+            target = action_id.split(":", 1)[1]
+            snap = app.snapshot
+            if target == "clear":
+                impl.apply_pin(app.switcher, None, None)
+                app.notify("Cloud pin cleared")
+            else:
+                acc = next(
+                    (a for a in (snap.accounts if snap else ()) if a.number == target),
+                    None,
+                )
+                if acc is not None:
+                    impl.apply_pin(app.switcher, acc.email, acc.org_uuid)
+                    # An RC session that is already open keeps its old owner
+                    # (the server fixed it at creation); reconnecting inside it
+                    # is what moves it. Say so only when there is one.
+                    open_rc = impl.live_remote_control_sessions()
+                    note = (
+                        "  Reconnect open Remote Control sessions to move them "
+                        "(/rc → Disconnect → /rc)."
+                        if open_rc
+                        else ""
+                    )
+                    app.notify(f"Cloud pin → {acc.email}.{note}")
             await self._pop_menu()
         else:
             actions[action_id]()
