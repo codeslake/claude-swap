@@ -3215,8 +3215,17 @@ class TestHorizonAxisDoesNotFlap:
         stops only because both accounts hit the 99.95 burn cap, so the fourth
         move is not a transient.
 
-        Refusing the account we most recently left bounds it: the axis may
-        still flip, but a flip cannot undo the move before it.
+        Refusing the account we most recently left bounds it — but identity
+        alone has no release, and on a 2-account fleet that is a permanent
+        proactive lockout (see the sibling test). Released by the same ratio
+        the anti-flap margin uses, the walk is still BOUNDED: measured over
+        24 / 120 / 400 ticks, [1,2,1] then [1,2,1,2] and no further, because
+        each return has to clear 2x and burn makes that harder every time.
+
+        So this asserts a BOUND, not zero returns. Zero was a property of the
+        release-less filter, and that property is what made the lockout
+        permanent. A walk that ends is the real requirement; the live incident
+        this class documents was four moves in 35 minutes and still climbing.
         """
         pct = {"1": 92.0, "2": 92.0}
         seen = []
@@ -3231,13 +3240,95 @@ class TestHorizonAxisDoesNotFlap:
             harness.clock.advance(301.0)
 
         moves = [n for i, n in enumerate(seen) if i == 0 or n != seen[i - 1]]
-        returns = [
-            moves[i + 1] for i in range(len(moves) - 1)
-            if moves[i + 1] in moves[:i + 1]
-        ]
-        assert returns == [], (
-            f"move sequence {moves} — the walk returned to an account it had "
-            "already left, so the axis flip undid the move before it"
+        assert len(moves) <= 4, (
+            f"move sequence {moves} — the walk did not settle. Without the "
+            "ratio release it is unbounded; with it, 120 and 400 ticks both "
+            "measure the same four moves."
+        )
+
+    def test_a_proactive_move_does_not_lock_out_the_next_one(self, harness):
+        """The no-return filter has no release condition on a 2-account fleet.
+
+        `lastSwitchFrom` is written only by a SUCCESSFUL switch, and on two
+        accounts the filter removes the only candidate — so the switch that
+        would rewrite it can never happen. Self-perpetuating, and persisted:
+        it survives a restart and a week of wall clock.
+
+        Reached by ONE ordinary proactive move, no seeded state. After it, the
+        peer resets to full and the active keeps burning; every proactive tick
+        answers "no-candidates" while a 0% account sits there. The engine
+        escapes only at a hard 100%, which is the feature turned off — the
+        user hits the limit they were supposed to be switched away from.
+
+        Asserts on the SWITCH, not on the state field: the field being clear
+        proves nothing about whether a move can happen, and the scoped filter
+        deliberately leaves the field set on the at-limit path.
+        """
+        assert harness.tick_with_usage({
+            "1": _usage(92, self._days_out(harness, 500)),
+            "2": _usage(10, self._days_out(harness, 400)),
+        }) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        harness.clock.advance(301.0)
+
+        # The account we left is now fully reset; the new active burns on.
+        outcomes = []
+        for _ in range(20):
+            outcomes.append(harness.tick_with_usage({
+                "1": _usage(0, self._days_out(harness, 400)),
+                "2": _usage(97, self._days_out(harness, 500)),
+            }))
+            harness.clock.advance(1801.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"20 ticks / 10h of outcomes {[o.name for o in outcomes]} — the "
+            "peer was at 0% the whole time and the active burned to 97%. The "
+            "one proactive move disabled proactive switching permanently."
+        )
+
+    def test_a_filtered_candidate_does_not_forge_an_all_exhausted_claim(
+        self, temp_home
+    ):
+        """The filter runs BEFORE `truly_exhausted`, so it hides the evidence.
+
+        A healthy peer removed from `oauth_candidates` cannot make the `all()`
+        False, and the engine then claims every account is exhausted. The user
+        gets a macOS notification and a critical TUI row while that peer sits
+        at 0%, and `_blocked_wait_long` stretches the poll interval, so the
+        recovery it is wrong about arrives slower too.
+
+        Needs a genuinely spent THIRD account: with only the filtered peer the
+        list goes empty and the tick exits at `no-candidates` first — measured,
+        3 ticks of `no-candidates` and no event. The false claim needs the
+        remaining candidates to be real and all spent, which is the shape a
+        user on three accounts actually hits.
+
+        Reached on the proactive path, which the at-limit escape test does not
+        cover. Asserts on the EVENT the user sees, not on the candidate list.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+            "3": _usage(100, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(301.0)
+
+        h.events.clear()
+        h.tick_with_usage({
+            "1": _usage(0, self._days_out(h, 400)),    # the one we left: FULL
+            "2": _usage(97, self._days_out(h, 500)),
+            "3": _usage(100, self._days_out(h, 300)),  # genuinely spent
+        })
+        assert not any(isinstance(e, AllExhaustedEvent) for e in h.events), (
+            f"events {[type(e).__name__ for e in h.events]} — account 1 is at "
+            "0%; the fleet is not exhausted, the filter hid the one peer that "
+            "disproves it"
         )
 
     def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
@@ -3518,3 +3609,5 @@ class TestReviewFindings202:
         )
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
