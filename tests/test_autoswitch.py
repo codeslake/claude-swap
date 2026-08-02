@@ -890,7 +890,7 @@ class TestAdaptiveScheduler:
         reset, so this is a regression the margin introduced, not a pre-existing
         shape.
         """
-        from claude_swap.usage_store import FetchRecord
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
 
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -905,19 +905,21 @@ class TestAdaptiveScheduler:
         })}, ident)
         st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
 
+        # Bounded by the DEADLINE + MARGIN, not by the reset. A reset sooner
+        # than the block cannot shorten a wait the server named, and trimming
+        # into (deadline, deadline + MARGIN) lands in the re-block band the
+        # margin exists to clear — measured, that costs a fresh hour of
+        # blindness to buy back at most 900s of trust. The blind span here is
+        # the price of the deadline, not a bound this code can remove.
         entry = st.entries(ident)["1"]
-        assert entry.backoff_until <= reset_at, (
-            f"backoff lifts at t0+{entry.backoff_until - t0:.0f}s but the window "
-            f"resets at t0+{reset_at - t0:.0f}s — "
-            f"{entry.backoff_until - reset_at:.0f}s un-pollable AND unknown"
+        waited = entry.backoff_until - t0
+        assert waited <= 3600.0 + RETRY_AFTER_MARGIN_S, (
+            f"waited {waited:.0f}s — past the deadline plus its margin, so the "
+            f"reset it can see never bounded it at all"
         )
-
-        # And the row is genuinely usable again the moment its data goes stale.
-        h.clock.now = reset_at
-        entry = st.entries(ident)["1"]
-        assert entry.decision_value() is None, "premise: the window rolled over"
-        assert not entry.in_backoff(h.clock.now), (
-            "the reset arrived and the row still cannot be re-polled"
+        assert waited >= 3600.0, (
+            f"waited {waited:.0f}s against a 3600s Retry-After — early, so the "
+            f"next request draws another 429"
         )
 
     def test_the_trust_bound_never_shortens_the_wait_below_the_ask(
@@ -946,7 +948,7 @@ class TestAdaptiveScheduler:
         licence to hammer a server that told us to wait — the blind window is
         the lesser cost, and probing does not shorten it.
         """
-        from claude_swap.usage_store import FetchRecord
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
 
         for reset_off in (2400, 1200, 10, -50):
             h = EngineHarness(temp_home)
@@ -1019,6 +1021,53 @@ class TestAdaptiveScheduler:
             f"waited {waited:.0f}s — took the full margin past a scoped window "
             f"that ends the trust at +1800, so the bound never saw it"
         )
+
+    def test_the_trim_never_lands_inside_the_re_block_band(self, temp_home):
+        """A wait past the deadline but short of the margin re-blocks.
+
+        RETRY_AFTER_MARGIN_S is 900 because 10 of 19 measured lapses re-blocked
+        at +2s..+716s past their own deadline, each earning a fresh hour. So
+        `(deadline, deadline + MARGIN)` is the one interval a 429 wait must not
+        land in — and the trust bound, applied unconditionally, put it there:
+        below the deadline the floor holds anyway, so the expression returned
+        `trust_expires_in_s` whenever it sat inside that window.
+
+        Measured with a scoped window binding (--model Fable, ask 3600), mean
+        blind seconds under the PR's own re-block model:
+
+            scoped reset   base    unconfined trim   confined
+            +3700          4042        4095            800
+            +4000          3885        4095            500
+            +4400          3675        4095            100
+
+        The unconfined trim is worse than BASE. Buying at most 900s of trust
+        for a full extra hour of blindness is the wrong trade, so the trim
+        fires only where it can actually reach the ask.
+        """
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
+
+        for scoped in (3700, 4000, 4400):
+            h = EngineHarness(temp_home / f"s{scoped}", model="Fable")
+            h.seed(1, "a@example.com")
+            st = h.switcher._usage_store
+            t0 = h.clock.now
+            ident = {"1": ("a@example.com", "")}
+            st.record({"1": FetchRecord(usage={
+                "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 7200)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 30 * 86400)},
+                "scoped": [{"name": "Fable", "pct": 60.0,
+                            "resets_at": _iso_at(t0 + scoped)}],
+            })}, ident, models=("Fable",))
+            st.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)},
+                ident, models=("Fable",),
+            )
+            waited = st.entries(ident, models=("Fable",))["1"].backoff_until - t0
+            assert not (3600.0 < waited < 3600.0 + RETRY_AFTER_MARGIN_S), (
+                f"scoped reset +{scoped}: waited {waited:.0f}s, which is "
+                f"{waited - 3600:.0f}s past the deadline and short of the "
+                f"margin — inside the measured re-block band"
+            )
 
     def test_consecutive_blocks_do_not_walk_the_row_into_blindness(
         self, temp_home
@@ -1111,7 +1160,7 @@ class TestAdaptiveScheduler:
         this bound exists to remove. Mutation-checked: `max(resets)` here
         leaves every other test green.
         """
-        from claude_swap.usage_store import FetchRecord
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
 
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -1131,11 +1180,15 @@ class TestAdaptiveScheduler:
         })}, ident)
         st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
 
+        # The bound reads the SOONEST reset, which is what decides whether it
+        # fires at all. Both sit after the ask here, so neither trims — what is
+        # pinned is that the 7d window does not somehow extend the wait past
+        # deadline + margin, which reading `max(resets)` would allow.
         entry = st.entries(ident)["1"]
-        assert entry.backoff_until <= soonest, (
-            f"backoff lifts at t0+{entry.backoff_until - t0:.0f}s, past the "
-            f"5h window's reset at t0+{soonest - t0:.0f}s — bounded by the "
-            f"7d window instead"
+        waited = entry.backoff_until - t0
+        assert waited <= 3600.0 + RETRY_AFTER_MARGIN_S, (
+            f"waited {waited:.0f}s — bounded by the 7d window instead of the 5h "
+            f"one, or by nothing at all"
         )
 
     def test_all_exhausted_escalation_preserves_wider_plan(
@@ -1293,7 +1346,7 @@ class TestAdaptiveScheduler:
         """Finding-2 regression: the owned+expired sentinel must not be hidden
         by the active row's failure backoff (e.g. a Retry-After window), or
         the engine would count unhealthy ticks toward a spurious failover."""
-        from claude_swap.usage_store import FetchRecord
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
 
         h = self._harness(temp_home, monkeypatch)
         # Active token locally expired while an owner is present.

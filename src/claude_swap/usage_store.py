@@ -568,7 +568,31 @@ def _failure_backoff_s(
         # than trading a measured regression for an unmeasured one; if real
         # blocks ever open at hour-plus scale, this is the second thing to fix
         # after raising the cap.
-        asked = max(min(asked, trust_expires_in_s), min(retry_after_s, asked))
+        # THE TRIM APPLIES ONLY WHERE IT CAN REACH THE ASK. Below the deadline
+        # the floor holds anyway, so `max(min(asked, trust), floor)` returned
+        # `trust` — a value strictly inside (deadline, deadline + MARGIN), which
+        # is the re-block band this margin exists to clear. RETRY_AFTER_MARGIN_S
+        # is 900 because 10 of 19 measured lapses re-blocked at +2s..+716s past
+        # their own deadline, each earning a fresh hour; landing at +100 or +800
+        # walks straight back in.
+        #
+        # Measured (--model Fable, scoped window binding, ask 3600), mean blind
+        # seconds under the PR's own re-block model:
+        #
+        #     scoped reset   base    before-trim   with the trim
+        #     +3700          4042        800           4095
+        #     +4000          3885        500           4095
+        #     +4400          3675        100           4095
+        #
+        # Buying <=900s of trust for a full extra hour of blindness is the wrong
+        # trade, and it is worse than base. So the trim fires only when the
+        # trust genuinely expires BEFORE the deadline — the case it was added
+        # for, where nothing can be salvaged by waiting longer.
+        #
+        # The floor is untouched, so the wait is still never below the ask and
+        # the early-retry train stays fixed.
+        if trust_expires_in_s < retry_after_s:
+            asked = min(retry_after_s, asked)
     return max(asked, computed)
 
 
