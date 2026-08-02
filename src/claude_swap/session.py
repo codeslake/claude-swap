@@ -541,7 +541,15 @@ class SessionManager:
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
-            if not outcome.credentials:
+            if outcome.error is not None:
+                # `error is None` is the gate's own "the slot is freshened
+                # and safe to activate" signal, and it is NOT implied by
+                # credentials being present: a failed persist returns the
+                # successor AND `transient`, with the backup still holding
+                # the generation whose grant was just spent. Branching on the
+                # credentials alone stayed silent exactly there, and
+                # _bootstrap then seeded the profile from that spent
+                # generation — claude's first refresh gets invalid_grant.
                 warning(
                     f"Could not refresh the token for Account-{account_num}; "
                     "continuing with the stored credentials."
