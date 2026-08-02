@@ -547,14 +547,11 @@ class AutoSwitchEngine:
         # while the predecessor's switch is still running.
         self._tick_in_flight = threading.Event()
         self._tick_in_flight.set()
-        # WHICH thread is running the tick, so `stop()` can tell "wait for the
-        # worker" from "I am the worker". `stop()` reaches this class from the
-        # TUI's UI thread and from a SIGTERM handler on `run_loop`'s own
-        # thread, and in both cases the tick it would wait for is blocked on
-        # the caller: `_emit_from_thread` is `app.call_from_thread`, and a
-        # signal handler runs inside the frame it interrupts. Measured, 30s
-        # freeze on the shipped ceiling in the TUI and a self-deadlocked
-        # SIGTERM in `cswap auto`.
+        # WHICH thread runs the tick, so `stop()` can tell "wait for the
+        # worker" from "I am the worker". Both real callers are the second
+        # case (the TUI's UI thread, and a SIGTERM handler on run_loop's own
+        # thread), and waiting there froze the TUI 30s and self-deadlocked
+        # `cswap auto`.
         self._tick_thread_id: int | None = None
         # `stop()` is a SIGTERM handler (cli.py) and a TUI callback, so it can
         # arrive on top of itself. Non-reentrant it double-released the lock,
@@ -1161,14 +1158,11 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             if self._stop.is_set():
-                # BETWEEN CANDIDATES, so the loop is bounded by the work
-                # rather than by `_STOP_SWITCH_WAIT_S`. One candidate's
-                # freshen can serially take a consume-lock acquire, the slot
-                # FileLock and a refresh POST — 30s at their timeouts — so the
-                # ceiling sits below a SINGLE candidate's worst case while the
-                # loop iterates over every one. Measured: `stop()` gave up
-                # after 30s, the successor took LIVE, and the predecessor went
-                # on to freshen the rest.
+                # BETWEEN CANDIDATES, so the loop is bounded by the work and
+                # not by `_STOP_SWITCH_WAIT_S` — which sits below ONE
+                # candidate's worst case (consume lock + slot FileLock +
+                # refresh POST) while the loop runs over every one. Measured:
+                # stop() gave up at 30s and the predecessor freshened on.
                 self._emit(NoSwitchEvent(reason="engine-stopped"))
                 return TickOutcome.NO_ACTION
             email = self.switcher.account_email(num)
