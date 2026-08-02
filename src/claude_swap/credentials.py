@@ -364,23 +364,18 @@ class CredentialStore:
         with no default — every call site has just run the delete, and a default
         is how an observation gets dropped in favour of a flag.
 
-        A True verdict settles the PAST, not the future. `_kc_call` re-arms the
-        cooldown on any failure with no pin check, and backup reads reach it
-        without consulting `_use_keychain`, so the active read is reachable
-        again after a pin and its own verdict must win.
+        A True verdict settles the PAST, not the future.
         """
         self._keychain_usable_cache = False
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
         self._residual_verdict = residual_cleared
         if residual_cleared:
-            # SETTLE what happened before, do not outrank what happens after.
-            # Nothing that failed up to here still bears on the file: no
-            # Keychain item can shadow it. Later failures are the flags'
-            # question again — `_kc_call` re-arms the cooldown on any failure,
-            # including a backup read that never consults `_use_keychain`, so
-            # the active read IS reachable after a pin and its verdict must
-            # win. Measured: a stored True made a genuine later failure read
+            # Settle what happened before; later failures are the flags'
+            # question again. `_kc_call` re-arms the cooldown on any failure
+            # with no pin check, and backup reads reach it without consulting
+            # `_use_keychain`, so the active read IS reachable after a pin.
+            # Measured: a stored True made a genuine later failure read
             # degraded=False and disarmed the capture guard.
             self._keychain_op_failed = False
             self._active_read_failed = False
