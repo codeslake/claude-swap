@@ -820,6 +820,68 @@ class TestDashboard:
             ids = [item.action_id for item in menu.query(MenuItem)]
             assert ids[0] == "switch"
 
+    async def test_poll_does_not_move_the_root_menu_cursor(self, tmp_path):
+        """A background poll must not steal the cursor from the user.
+
+        The root menu is rebuilt on every snapshot so the pin row can appear
+        when the extra is installed mid-session. `_render_menu` ends with
+        `menu.index = 0`, which is right for opening or popping a menu and
+        wrong for refreshing the one the user is already reading: the cursor
+        jumped home every POLL_INTERVAL_S (3s), so anyone slower than one poll
+        could not finish choosing.
+        """
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            menu = app.screen.query_one("#menu", ListView)
+            await pilot.press("down", "down")
+            await pilot.pause()
+            assert menu.index == 2
+
+            await app.screen.refresh_root_menu()
+            await pilot.pause()
+            assert menu.index == 2, "a poll moved the cursor"
+
+    async def test_root_menu_rebuild_keeps_the_cursor_on_its_action(self, tmp_path):
+        """When the rows DO change, follow the action, not the row number.
+
+        Installing the extra inserts `pin-menu` above `remove-menu`, so a
+        remembered integer lands on a different action than the one the user
+        was pointing at. The identity to preserve is the action id.
+        """
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView
+
+            from claude_swap.tui.widgets import MenuItem
+
+            menu = app.screen.query_one("#menu", ListView)
+            items = list(menu.query(MenuItem))
+            target = next(
+                i for i, it in enumerate(items) if it.action_id == "remove-menu"
+            )
+            menu.index = target
+            await pilot.pause()
+
+            # The extra becomes available: a row is inserted ABOVE the cursor.
+            from claude_swap import pin
+
+            monkey = pin.is_available
+            pin.is_available = lambda: True
+            try:
+                await app.screen.refresh_root_menu()
+                await pilot.pause()
+                items = list(menu.query(MenuItem))
+                assert "pin-menu" in [it.action_id for it in items]
+                assert items[menu.index].action_id == "remove-menu"
+            finally:
+                pin.is_available = monkey
+
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
             [

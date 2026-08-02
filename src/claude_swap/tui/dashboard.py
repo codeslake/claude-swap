@@ -97,10 +97,47 @@ class DashboardScreen(Screen):
 
         Only when the root is on top: rebuilding under an open submenu would
         yank the rows out from under the cursor.
+
+        THE ROOT MENU NEEDS THE SAME PROTECTION, and for a subtler reason.
+        `_render_menu` ends with `menu.index = 0`, which is correct for what
+        upstream calls it for — opening a menu, or popping back to one. This
+        is the only caller that re-renders a menu the user is already reading,
+        so the reset became a side effect of the poll: the cursor jumped home
+        every POLL_INTERVAL_S (3s) and nobody slower than one cycle could
+        finish choosing.
+
+        Fixed here rather than in `_render_menu`, whose `index = 0` the
+        open/pop paths want.
+
+        Two parts, because the entries changing and not changing need
+        different handling:
+
+          - Unchanged (the overwhelmingly common case — whether the extra is
+            installed changes ~never during a session): skip the rebuild
+            entirely. No rebuild, no reset, and no work.
+          - Changed: restore by ACTION ID, not by index. Installing the extra
+            inserts a row above `remove-menu`, so a remembered integer points
+            at a different action than the one the user had selected.
         """
-        if len(self._menu_stack) == 1:
-            self._menu_stack[0] = ("menu", self._root_entries())
-            await self._render_menu()
+        if len(self._menu_stack) != 1:
+            return
+        entries = self._root_entries()
+        if entries == self._menu_stack[0][1]:
+            return
+        menu = self.query_one("#menu", ListView)
+        items = list(menu.query(MenuItem))
+        selected = (
+            items[menu.index].action_id
+            if menu.index is not None and 0 <= menu.index < len(items)
+            else None
+        )
+        self._menu_stack[0] = ("menu", entries)
+        await self._render_menu()
+        if selected is not None:
+            for i, (_label, action_id) in enumerate(entries):
+                if action_id == selected:
+                    menu.index = i
+                    break
 
     def _root_entries(self) -> MenuEntries:
         # No "Refresh" entry: every view auto-refreshes, so a menu item would
