@@ -5391,6 +5391,42 @@ class TestSwitchSkipsBrokenSlots:
 
         assert cred.exists(), "premise: the credential survived the clear"
 
+    def test_a_genuinely_logged_out_machine_can_still_land(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The guard must PERMIT the one case it is written around.
+
+        `value == ""` with `keychain_unavailable=False` is a real logged-out
+        machine: nothing is there and clearing costs nothing. Measured,
+        replacing the whole condition with `if not live:` — which subsumes both
+        refusal cases — leaves 430/430 green, because no test lands on an empty
+        slot from a logged-out machine. The same over-reach class as treating
+        `cfg is None` as failure.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s.sequence_file.write_text(json.dumps(data))
+        (temp_home / ".claude.json").write_text(json.dumps({}))
+
+        monkeypatch.setattr(
+            s._store,
+            "_read_active_credentials",
+            lambda: ActiveCredentials("", keychain_unavailable=False,
+                                      degraded=False),
+        )
+
+        s._switch_to_empty_slot(
+            "2", "b@example.com", {"number": 1}, {"number": 2},
+            s._get_sequence_data(),
+        )
+        assert str(s._get_sequence_data()["activeAccountNumber"]) == "2", (
+            "a logged-out machine could not land on an empty slot; the guard "
+            "refuses the case it exists to permit"
+        )
+
     def test_a_degraded_read_is_not_a_licence_to_clear(
         self, temp_home: Path, monkeypatch
     ):
