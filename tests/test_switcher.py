@@ -5110,6 +5110,60 @@ class TestSwitchSkipsBrokenSlots:
             f"roster says slot 2 is active, _build_accounts_info says {active}"
         )
 
+    def test_an_api_key_does_not_survive_the_empty_slot_landing(
+        self, temp_home: Path
+    ):
+        """Landing logged-out must clear BOTH credential axes, not just OAuth.
+
+        `_read_active_credentials()` answers for OAuth *and* a managed API key,
+        so the stash branch is entered for either — but only
+        `_clear_oauth_credential()` ran. A managed key therefore survived the
+        landing that just announced "you are now logged out", and Claude Code
+        kept authenticating as the account that key belongs to.
+
+        Measured: slot 3 an API-key account, slot 2 roster-imported with no
+        credentials. After landing on 2, `primaryApiKey` is still in
+        `~/.claude.json` and `_build_accounts_info` marks slot 2 active
+        carrying `sk-ant-api03-...`. `_static_usage_sentinel` then stamps a
+        slot with no credentials at all as a working `api key` account, and
+        `cswap --list` raises its own collision warning claiming a backup was
+        overwritten — which never happened.
+
+        This violates the method's own stated invariant: an active slot that
+        keeps serving the previous account's credential lies about whose quota
+        is burning.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 2, "b@example.com", creds=False)
+        self._seed(s, 3, "api-key-3@token.local", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 3
+        s.sequence_file.write_text(json.dumps(data))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "primaryApiKey": "sk-ant-api03-SECRETKEY",
+            "oauthAccount": {"emailAddress": "api-key-3@token.local",
+                             "accountUuid": "uuid-3"},
+        }))
+        assert s._store._read_active_credentials().value, "premise: a key is live"
+
+        s._switch_to_empty_slot(
+            "2", "b@example.com", {"number": 3}, {"number": 2},
+            s._get_sequence_data(),
+        )
+
+        # The stash is the license to clear, and it ran — so the clear must too.
+        stash = sorted(s._store._host.credentials_dir.glob(".unclaimed-*.enc"))
+        assert stash, "premise: the live credential was preserved first"
+
+        assert not s._store._read_active_credentials().value, (
+            "an API key survived a landing that announced logged-out"
+        )
+        info = s._build_accounts_info()
+        for num, _e, _o, _u, _a, creds, _al in info:
+            assert "sk-ant-api03" not in str(creds), (
+                f"slot {num} was handed the departed account's API key"
+            )
+
     def test_an_unmanaged_live_login_does_not_steal_the_active_mark(
         self, temp_home: Path
     ):
