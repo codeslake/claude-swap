@@ -110,6 +110,34 @@ HORIZON_HEADROOM_RATIO = 2.0
 #
 # Lower than the margin because it answers a weaker question: not "is this peer
 # enough better to justify a move?" but "does this peer have anything at all?"
+#
+# KNOWN RESIDUE, and it is structural rather than a bad constant. This floor and
+# HORIZON_HEADROOM_RATIO are both anchored to `active_headroom`, so they leave a
+# gap: a peer between them is VISIBLE (the spent clause goes false, the reset
+# axis switches off) yet UNCHOOSABLE (it misses the larger margin). Monotonicity
+# inverts there — adding headroom flips a move into a refusal. Measured, active
+# 3.00 pts / 500h against ONE peer better on BOTH axes:
+#
+#     peer pts   3.88   3.90   4.50   5.99   6.00
+#     base       move   move   move   move   move
+#     0457cb0    REF    REF    REF    REF    move
+#     db25990    move   move   move   move   move
+#     here       move   REF    REF    REF    move
+#
+# The two bands trade against each other and their widths sum to a constant
+# (`active x HORIZON_HEADROOM_RATIO - SPENT_HEADROOM_PCT`), so no value of this
+# ratio removes both: 1.0 empties this band and re-arms the veto the filter
+# exists to stop, 2.0 does the reverse. Measured, not argued.
+#
+# Two fixes were tried and BOTH measured worse than shipping the residue.
+# Making the floor absolute (`> SPENT_HEADROOM_PCT`, fleet-wide rather than
+# relative) leaves the band at 2 of 5 points AND breaks
+# `test_an_unchoosable_peer_does_not_veto_the_reset_ranking`. Dropping the
+# filter entirely returns to `db25990`, which is the veto this PR fixed.
+#
+# The real fix decouples the two axes rather than retuning a constant, and that
+# is a redesign of the ranking rather than a bound on it. Recorded here so the
+# next reader starts from the measurement instead of the constant.
 WORTH_HAVING_RATIO = 1.3
 
 # Below this an account is spent, and headroom comparisons between two spent
