@@ -469,6 +469,44 @@ class TestBackoff:
                 f"ask {ask} -> wait {wait}, expected {expected}"
             )
 
+    def test_the_cap_sits_inside_the_trust_it_relies_on(self):
+        """The cap has a floor test and no ceiling; the ceiling is the invariant.
+
+        `RETRY_AFTER_FLOOR_CAP_S`'s own comment justifies the 429-only margin
+        with "a 4500s wait sits comfortably inside its own trust"
+        (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured, the
+        suite admits `[4500, 50900]` — 4499 fails 8 tests, 50900 passes, and
+        the upper edge comes from `test_retry_after_floor_is_capped` asserting
+        `_failure_backoff_s(1, 50000) == cap`.
+
+        Blind windows through `record()` at the admitted extremes:
+
+            cap     ask     reset   wait    trust ends   blind
+            4500    3600    +3600   4500    3600           900
+            7199    7000    +3600   7199    3600          3599
+            50900   86400   none    50900   7200         43700
+
+        At the top a single header parks a row 43700s past even the fallback
+        ceiling — un-pollable AND unknown, the state
+        `test_backoff_never_outlasts_the_trust_it_relies_on` exists to prevent
+        on the other path. The same bound neutralises `Retry-After: inf`,
+        which reaches `min(inf + 900, cap)` and is finite only because of it.
+        """
+        assert (
+            usage_store.RETRY_AFTER_FLOOR_CAP_S
+            <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S
+        ), (
+            f"cap {usage_store.RETRY_AFTER_FLOOR_CAP_S} exceeds the 429 trust "
+            f"ceiling {usage_store.RATE_LIMIT_TRUST_MAX_AGE_S}, so a single "
+            "header can park a row past the moment its own data goes unknown"
+        )
+        # And the wait it produces stays inside that ceiling for any ask.
+        for ask in (3600.0, 4500.0, 50_000.0, 86_400.0, float("inf")):
+            wait = usage_store._failure_backoff_s(1, ask, rate_limited=True)
+            assert wait <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S, (
+                f"ask {ask} produced a {wait}s wait, past the trust ceiling"
+            )
+
     def test_the_margin_never_lifts_the_floor_cap(self):
         """`RETRY_AFTER_FLOOR_CAP_S` bounds how long a server ask can park us.
 
