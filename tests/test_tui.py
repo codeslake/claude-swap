@@ -994,7 +994,12 @@ class TestDashboard:
             await settle(pilot)
             screen = app.screen
             buf = io.StringIO()
-            with contextlib.redirect_stdout(buf), pytest.raises(RuntimeError):
+            # ClaudeSwitchError specifically: run_action catches only that and
+            # EOFError, so a RuntimeError escaped to the worker handler and
+            # became a toast — the modal this raise exists to open never opened.
+            from claude_swap.exceptions import ClaudeSwitchError
+
+            with contextlib.redirect_stdout(buf), pytest.raises(ClaudeSwitchError):
                 screen._run_pin_op(lambda: (False, "no proxy is running"))
             assert "no proxy is running" in buf.getvalue()
 
@@ -1073,6 +1078,38 @@ class TestDashboard:
                 assert f"pin:{snap_acc.number}" not in ids, (
                     "an API-key account was offered for pinning"
                 )
+        finally:
+            pin.is_available, pin._impl, pin.pinned_email = real
+
+    async def test_pin_actions_run_off_the_event_loop(self, tmp_path):
+        """clear_wiring takes a 9s lock; inline it froze the dashboard.
+
+        Measured before the fix: 9.31s frozen, no toast, no keystrokes, while
+        Claude Code held .claude.json.lock — routine during a credential
+        refresh. Every sibling action in this file goes through
+        app._start_action; these two did not, and nothing asserted it, so the
+        next edit would reintroduce the freeze silently.
+        """
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        started = []
+        real = (pin.is_available, pin._impl, pin.pinned_email)
+        pin.is_available = lambda: True
+        pin._impl = lambda: object()
+        pin.pinned_email = lambda _sw: "cloud@example.com"
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                app._start_action = lambda label, fn, **k: started.append(label)
+                await app.screen._dispatch("pin:clear")
+                await pilot.pause()
+                assert started, "pin:clear ran on the event loop"
+                started.clear()
+                await app.screen._dispatch("pin:1")
+                await pilot.pause()
+                assert started, "pin:<n> ran on the event loop"
         finally:
             pin.is_available, pin._impl, pin.pinned_email = real
 
@@ -1968,3 +2005,32 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestThePinBadgeDoesNotOverstate:
+    def test_an_api_key_account_reads_as_broken_to_pin(self):
+        """The badge must not paint ○ cloud with no qualifier for an account
+        the pin can never use — the record can be written (a stale submenu row,
+        an older cswap) while nothing is ever pinned."""
+        import types
+
+        from claude_swap.json_output import USAGE_KEYCHAIN_UNAVAILABLE
+        from claude_swap.tui.widgets import pin_is_broken
+
+        # kind says api_key while the sentinel says something innocuous —
+        # exactly the divergence that let this through.
+        acc = types.SimpleNamespace(
+            kind="api_key",
+            usage=types.SimpleNamespace(sentinel=USAGE_KEYCHAIN_UNAVAILABLE),
+        )
+        assert pin_is_broken(acc), "an API-key account read as pinnable"
+
+    def test_a_healthy_oauth_account_is_not_flagged(self):
+        import types
+
+        from claude_swap.tui.widgets import pin_is_broken
+
+        acc = types.SimpleNamespace(
+            kind="oauth", usage=types.SimpleNamespace(sentinel=None)
+        )
+        assert not pin_is_broken(acc), "a healthy account was flagged — cries wolf"
