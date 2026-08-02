@@ -785,6 +785,16 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        if self._stop.is_set():
+            # BEFORE the mutators, not among them. `stop()` releases the LIVE
+            # lock synchronously and no caller joins the worker, so the
+            # successor may already own LIVE while this tick runs on. Below
+            # this line the tick releases quarantines, fetches live, POSTs
+            # one-time refresh grants and writes usage rows and poll plans —
+            # all for accounts it has handed over. A gate further down stops
+            # the last of those and none of the earlier ones.
+            self._emit(NoSwitchEvent(reason="engine-stopped"))
+            return TickOutcome.NO_ACTION
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -1141,13 +1151,6 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger)
-            if self._stop.is_set():
-                # Freshening is a MUTATION, same as dry-run stops for. `stop()`
-                # frees the LIVE lock but no caller joins the worker, so
-                # without this the departing engine POSTs a one-time refresh
-                # grant for accounts its successor already owns.
-                self._emit(NoSwitchEvent(reason="engine-stopped"))
-                return TickOutcome.NO_ACTION
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different

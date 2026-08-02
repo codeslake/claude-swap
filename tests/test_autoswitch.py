@@ -2792,6 +2792,49 @@ class TestLiveLock:
         assert harness.active_number() == 1        # but changed nothing
         assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
 
+    def test_a_stopped_engine_writes_no_state_at_all(self, harness):
+        """The gate has to precede the mutators, not sit among them.
+
+        `_tick_inner` releases recovered quarantines and runs the scheduled
+        usage collection — live fetches, refresh POSTs, usage-store and
+        poll-plan writes — hundreds of lines before the candidate loop. A gate
+        inside that loop stops the last mutation and none of the earlier ones.
+
+        Measured, `stop()` then one `tick()`, with the gate at the loop:
+
+            _release_recovered_quarantines   {"2": {...}} -> {}
+            _collect_scheduled_usage         fetched ['1','2','3']
+                                             consumed ['2']   (a one-time grant)
+            usage store / poll plans         absent -> full rows
+
+        Same harm the loop gate names, reached earlier: a departing engine
+        acting for accounts its successor already owns.
+        """
+        engine = harness.engine
+        released: list[str] = []
+        collected: list[str] = []
+        real_release = engine._release_recovered_quarantines
+        real_collect = engine._collect_scheduled_usage
+
+        def spy_release(state):
+            released.append("called")
+            return real_release(state)
+
+        def spy_collect(*a, **kw):
+            collected.append("called")
+            return real_collect(*a, **kw)
+
+        engine._release_recovered_quarantines = spy_release
+        engine._collect_scheduled_usage = spy_collect
+        engine.stop()
+        engine.tick()
+
+        assert released == [], "a stopped engine released quarantines"
+        assert collected == [], (
+            "a stopped engine ran the usage collection — live fetches, refresh "
+            "POSTs and store writes for accounts its successor now owns"
+        )
+
     def test_a_stopped_engine_stops_MUTATING_not_just_switching(self, harness):
         """`stop()` releases the LIVE lock synchronously; the tick does not stop.
 
