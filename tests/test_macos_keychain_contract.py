@@ -29,7 +29,10 @@ import pytest
 from claude_swap import macos_keychain
 from claude_swap.exceptions import SwitchError
 from claude_swap.models import Platform
-from claude_swap.json_output import USAGE_NO_CREDENTIALS
+from claude_swap.json_output import (
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_NO_CREDENTIALS,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -358,6 +361,96 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "the Keychain is still locked and the backup still unread — a "
             "write fallback for the ACTIVE credential does not certify it empty"
         )
+
+    def test_a_write_fallback_does_not_certify_the_ACTIVE_read_either(
+        self, macos_switcher, monkeypatch
+    ):
+        """The same argument, at the two sites the backup fix scoped out.
+
+        `_read_active_credentials` asks `_keychain_unreadable` only on the
+        `_use_keychain()` False branch — where it never attempted a read, so
+        it has to reconstruct the verdict. `_pin_file_mode` clears exactly
+        that verdict, and on macOS it is reachable ONLY through a Keychain op
+        that just failed. So one active-credential write fallback flips both:
+
+            state A   degraded=True   sentinel='keychain unavailable'
+            state B   degraded=False  sentinel='no credentials'
+
+        `degraded=False` disarms `_refuse_degraded_capture`, and the sentinel
+        sends the user to `cswap --add-account`, the one remedy that cannot
+        work while the real credential sits unread in the Keychain. The pin's
+        best-effort `_delete_active_keychain_entry()` also failed, so a
+        residual survives and Claude Code reads Keychain-first — our file is
+        the superseded generation, POSTed with the guard disarmed.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        for fn in ("set_password", "get_password", "delete_password"):
+            monkeypatch.setattr(_kc, fn, locked)
+
+        assert store._read_active_credentials().degraded is True, "premise"
+        store._write_oauth_credentials('{"claudeAiOauth": {"accessToken": "x"}}')
+        assert store._file_mode_is_ours is True, "premise: the write pinned"
+
+        assert store._read_active_credentials().degraded is True, (
+            "the Keychain is still locked; a write fallback for the active "
+            "credential does not prove the slot is genuinely empty"
+        )
+        verdict = macos_switcher._static_usage_sentinel(
+            ("2", "b@example.com", None, None, False, "", None)
+        )
+        assert verdict == USAGE_KEYCHAIN_UNAVAILABLE, (
+            f"sentinel says {verdict!r} — sends the user to re-add a slot "
+            f"whose backup is alive but unread"
+        )
+
+    def test_the_default_capture_path_refuses_a_degraded_read(
+        self, macos_switcher, monkeypatch
+    ):
+        """`_refuse_degraded_capture` on the path that actually reaches it.
+
+        Mutation-checked: neutering the guard left all 1783 green. Every other
+        test of this area drives the two env-var branches, which pass
+        `strict_keychain=True` and raise inside `read_config_dir_credentials`
+        instead — so the guard the PR body calls the fix for "the most-used
+        path" had nothing pinning it.
+
+        With the Keychain locked, the only readable credential is the plaintext
+        fallback, which on macOS may be the consumed predecessor because Claude
+        Code rotates keychain-only. Capturing it files a spent refresh token
+        against the slot and `add_account` then clears the dead-token strike.
+        """
+        import json
+
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.exceptions import CredentialReadError
+        from claude_swap.paths import get_credentials_path
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        for fn in ("get_password", "set_password", "delete_password"):
+            monkeypatch.setattr(_kc, fn, locked)
+
+        # A plaintext fallback exists and is readable — the trap.
+        get_credentials_path().parent.mkdir(parents=True, exist_ok=True)
+        get_credentials_path().write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-maybe-spent"}})
+        )
+
+        with pytest.raises(CredentialReadError) as exc:
+            macos_switcher._read_capture_credentials()
+        assert "superseded generation" in str(exc.value), exc.value
 
     def test_a_real_keychain_failure_still_reports_unreadable(
         self, macos_switcher, monkeypatch

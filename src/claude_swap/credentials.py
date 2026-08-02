@@ -246,6 +246,11 @@ class CredentialStore:
         # stick, but only the failure means the file may be behind Claude
         # Code's own writes — see _read_active_credentials.
         self._file_mode_is_ours: bool = False
+        # Whether any Keychain op has actually FAILED this process. Distinct
+        # from _keychain_usable_cache, which is where ops should be ROUTED and
+        # which _pin_file_mode sets deliberately: a routing choice must not
+        # erase an observation. See _keychain_unreadable.
+        self._keychain_op_failed: bool = False
         # Set by the backup read when THIS read could not reach the Keychain,
         # consumed by _read_account_credentials_ex. Per-read, not a capability:
         # whether a particular backup was readable is a fact about that read,
@@ -271,6 +276,12 @@ class CredentialStore:
         try:
             result = fn(*args)
         except macos_keychain.KEYCHAIN_ERRORS:
+            # A Keychain op FAILED. Recorded separately from the capability
+            # cache because that cache is a routing decision others overwrite —
+            # `_pin_file_mode` clears it deliberately — while this is an
+            # observation, and an observation cannot be undone by a later
+            # choice. See `_keychain_unreadable`.
+            self._keychain_op_failed = True
             self._keychain_usable_cache = False
             # Monotonic so a wall-clock jump can't expire the cooldown early/late.
             self._keychain_disabled_until = (
@@ -349,7 +360,26 @@ class CredentialStore:
             return False
         if self._use_keychain():          # may clear a lapsed cooldown
             return False
-        return not self._file_mode_is_ours
+        # A pinned file mode is NOT evidence the Keychain is fine. On macOS the
+        # pin is reachable only THROUGH a Keychain op that just failed — both
+        # `_pin_file_mode` call sites are in the fallback branch of a write that
+        # raised — so reading it as "nothing failed" inverted the fact.
+        # Measured, identical world, one fallback write apart:
+        #
+        #     state A   degraded=True   sentinel='keychain unavailable'
+        #     state B   degraded=False  sentinel='no credentials'
+        #
+        # `degraded=False` disarms `_refuse_degraded_capture`, and the sentinel
+        # sends the user to re-add a slot whose backup is alive but unread. The
+        # pin's own best-effort `_delete_active_keychain_entry()` failed too, so
+        # a residual survives and Claude Code reads Keychain-first: our file is
+        # the superseded generation, POSTed with the guard off.
+        #
+        # So the question is whether an op FAILED, which no later routing choice
+        # can undo. `_file_mode_is_ours` still answers its own question — why we
+        # are in file mode — for the deliberate non-macOS/API-key paths where
+        # nothing failed and the file really is the authority.
+        return self._keychain_op_failed or not self._file_mode_is_ours
 
     def _read_credentials(self) -> str | None:
         """Read Claude Code's active credential — OAuth *or* managed API key (value).
