@@ -171,6 +171,9 @@ ERROR_NOTES = {
     "invalid_client": (
         "cswap's OAuth client was rejected — systemic, not this account"
     ),
+    "consume-busy": (
+        "another cswap surface holds the slot — retries next pass"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -3871,17 +3874,10 @@ class ClaudeAccountSwitcher:
         if not creds or not oauth.extract_access_token(creds):
             if is_active and self._active_keychain_unavailable:
                 return USAGE_KEYCHAIN_UNAVAILABLE
-            if (
-                not is_active
-                and self._store._keychain_usable_cache is False
-                and not self._store._file_mode_is_ours
-            ):
+            if not is_active and self._store._keychain_unreadable:
                 # The empty read happened with the Keychain pinned unusable:
                 # the backup may exist unseen. "keychain unavailable" — not
                 # "no credentials", which nudges an unnecessary re-add.
-                #
-                # A file mode WE pinned is excluded: nothing failed there, so
-                # an empty read means the slot really is empty.
                 return USAGE_KEYCHAIN_UNAVAILABLE
             return USAGE_NO_CREDENTIALS
         # An expired active token is no longer a static state: the fetch path
@@ -5724,13 +5720,17 @@ class ClaudeAccountSwitcher:
         keychain. So a locked keychain was indistinguishable from a probed
         one, and the guard let the logout through. Failing closed costs a
         spurious refusal; failing open costs a login.
+
+        Answers through ``_keychain_unreadable``, never the raw cache: a file
+        mode WE pinned also sets it False, and nothing failed there — the
+        credential went to the file deliberately, so an empty read means the
+        slot really is empty. Reading the flag raw sent a user switching to a
+        genuinely empty slot to "retry from a GUI terminal; do not re-add",
+        the one remedy that cannot work.
         """
         if self.platform == Platform.MACOS and self._store._keychain_usable_cache is None:
             self._store._read_active_credentials()  # fills the cache
-        return (
-            self.platform == Platform.MACOS
-            and self._store._keychain_usable_cache is False
-        )
+        return self._store._keychain_unreadable
 
     def _refuse_session_shell(self) -> None:
         """Refuse live-store mutation from inside a ``cswap run`` shell.

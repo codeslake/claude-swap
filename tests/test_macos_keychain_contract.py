@@ -311,6 +311,20 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
         assert unreadable is True
 
+    def test_off_macos_there_is_no_keychain_to_be_unreadable(self, temp_home: Path):
+        """The predicate carries its own platform check.
+
+        Every path that can flip the cache is macOS-gated today, so the cache
+        stays ``None`` off macOS — but that is an invariant the CALLERS hold,
+        not this predicate. It is the single source of truth for three sites
+        now; it keeps the check itself.
+        """
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        store = s._store
+        store._keychain_usable_cache = False
+        assert store._keychain_unreadable is False
+
     def test_a_missing_slot_is_no_credentials_not_keychain_unavailable(
         self, macos_switcher
     ):
@@ -320,3 +334,41 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             ("9", "x@e.com", None, None, False, "", None)
         )
         assert verdict == USAGE_NO_CREDENTIALS, verdict
+
+    def test_switch_to_an_empty_slot_lands_after_our_file_mode_write(
+        self, macos_switcher, temp_home: Path
+    ):
+        """The third sibling: the guard in front of ``_perform_switch``.
+
+        Reading the raw flag there refuses the switch with "retry from a GUI
+        terminal; do not re-add" — advice that cannot work for a slot with no
+        backup at all, and which blocks the one thing that fills it: being ON
+        the slot to log in. An empty slot is a destination, so the switch must
+        LAND rather than raise.
+        """
+        s = macos_switcher
+        s._setup_directories()
+        s._init_sequence_file()
+        s._write_json(
+            s.sequence_file,
+            {
+                "activeAccountNumber": None,
+                "lastUpdated": "",
+                "sequence": [2],
+                "accounts": {
+                    "2": {
+                        "email": "b@example.com",
+                        "uuid": "uuid-2",
+                        "organizationUuid": "",
+                        "organizationName": "",
+                        "added": "2024-01-01T00:00:00Z",
+                    }
+                },
+            },
+        )
+        s._store._pin_file_mode()  # OUR write; nothing failed
+
+        out = s._perform_switch("2", emit_output=False, force_activate=True)
+
+        assert out["switched"] is True, out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
