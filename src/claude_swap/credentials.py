@@ -520,7 +520,11 @@ class CredentialStore:
                 text = cred_file.read_text(encoding="utf-8")
             except Exception as e:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
-                return ActiveCredentials(None, False, keychain_failed)
+                # `keychain_unavailable` is NOT False here. Keychain denied AND
+                # the fallback file unreadable is the most unreadable state
+                # there is; hardcoding False made it render as "no credentials"
+                # and sent the user to a re-login that cannot help.
+                return ActiveCredentials(None, keychain_failed, keychain_failed)
             if text.strip():
                 return ActiveCredentials(text, False, keychain_failed)
 
@@ -580,9 +584,22 @@ class CredentialStore:
         """
         path = get_global_config_path()
         try:
-            data = self._read_global_config() or {}
+            data = self._read_global_config()
         except Exception as e:  # pragma: no cover - defensive
             raise CredentialWriteError(f"Failed to read global config for update: {e}")
+        if data is None and path.exists():
+            # UNREADABLE, not absent — the same distinction `_clear_managed_key`
+            # makes, on the file carrying the user's whole Claude Code state.
+            # `or {}` collapsed the two and the atomic replace then wrote that
+            # `{}` over a file it had never read. Measured against a torn config
+            # (valid prefix, truncated tail — what a crash mid-write leaves):
+            # `oauthAccount`, `projects` and `mcpServers` were gone.
+            # An ABSENT config has nothing to preserve and is a genuine start.
+            raise CredentialWriteError(
+                f"{path} exists but could not be read — refusing to overwrite "
+                "it. Move or repair the file, then retry."
+            )
+        data = data or {}
         mutator(data)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")

@@ -21,7 +21,11 @@ from claude_swap.credentials import (
     approved_form,
     looks_like_api_key,
 )
-from claude_swap.exceptions import SessionError, ValidationError
+from claude_swap.exceptions import (
+    CredentialWriteError,
+    SessionError,
+    ValidationError,
+)
 from claude_swap.json_output import USAGE_API_KEY, usage_fields
 from claude_swap.models import Platform
 from claude_swap.paths import get_credentials_path, get_global_config_path
@@ -368,3 +372,100 @@ class _patched_home:
         for p in reversed(self._patches):
             p.stop()
         return False
+
+
+class TestAnUnreadableGlobalConfigIsNotAnEmptyOne:
+    """``~/.claude.json`` carries the user's whole Claude Code state.
+
+    ``_read_global_config`` answers ``None`` for two different facts — the file
+    is ABSENT, and the file is THERE but cannot be parsed. ``or {}`` at the
+    write collapses them, and the atomic replace then writes that ``{}`` over
+    a file it never read. Absent is a genuine empty start; unreadable is the
+    same value/None conflation this branch exists to close, on the highest-
+    value file in the install.
+    """
+
+    def test_a_torn_config_is_not_overwritten_with_an_empty_one(
+        self, temp_home: Path
+    ):
+        """A crash mid-write leaves valid-prefix JSON. It must not be erased.
+
+        No keychain and no patched reader — a truncated file is what the OS
+        leaves behind, and it is the whole premise. Asserts on the keys the
+        user would LOSE rather than on the exception type: the point is the
+        data, and a refusal that still wrote ``{}`` would pass a type check.
+        """
+        s = _linux_switcher()
+        cfg = get_global_config_path()
+        real = {
+            "oauthAccount": {"emailAddress": "me@example.com"},
+            "projects": {"/a": {"allowedTools": []}},
+            "mcpServers": {"x": {"command": "y"}},
+        }
+        cfg.write_text(json.dumps(real, indent=2)[:-12], encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(cfg.read_text(encoding="utf-8"))
+
+        with pytest.raises(CredentialWriteError):
+            s._store._update_global_config(
+                lambda d: d.__setitem__("primaryApiKey", API_KEY)
+            )
+
+        assert cfg.read_text(encoding="utf-8") == json.dumps(real, indent=2)[:-12], (
+            "the torn file was rewritten; the user's config is gone"
+        )
+
+    def test_an_absent_config_still_writes(self, temp_home: Path):
+        """The other half of the same predicate: absent is a real empty start.
+
+        Without this, the refusal above would be indistinguishable from
+        breaking first-run: a box with no ``~/.claude.json`` must still be
+        able to record a key.
+        """
+        s = _linux_switcher()
+        cfg = get_global_config_path()
+        if cfg.exists():
+            cfg.unlink()
+
+        s._store._update_global_config(
+            lambda d: d.__setitem__("primaryApiKey", API_KEY)
+        )
+        assert json.loads(cfg.read_text(encoding="utf-8"))["primaryApiKey"] == API_KEY
+
+
+class TestADeniedKeychainSurvivesAnUnreadableFallbackFile:
+    """Keychain denied AND the fallback file unreadable is the MOST unreadable
+    state there is, and it reported as a clean slot.
+
+    ``_read_active_credentials`` returns ``ActiveCredentials(None, False,
+    keychain_failed)`` on that path — ``degraded`` travels, but
+    ``keychain_unavailable`` is hardcoded ``False``, so the sentinel says "no
+    credentials" instead of "keychain unavailable" and the user is pointed at
+    a re-login that cannot help.
+    """
+
+    def test_the_keychain_verdict_is_not_dropped_by_an_unreadable_file(
+        self, temp_home: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        s = _macos_switcher()
+        store = s._store
+        cred_file = get_credentials_path()
+        cred_file.write_text(OAUTH_JSON, encoding="utf-8")
+
+        monkeypatch.setattr(store, "_use_keychain", lambda: True)
+        monkeypatch.setattr(
+            store, "_read_active_oauth_keychain", lambda: (None, True)
+        )
+        monkeypatch.setattr(store, "_read_managed_key", lambda: "")
+
+        def _boom(*a, **k):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "read_text", _boom)
+
+        ac = store._read_active_credentials()
+        assert ac.value is None
+        assert ac.degraded is True
+        assert ac.keychain_unavailable is True, (
+            "the keychain WAS denied; an unreadable fallback cannot clear that"
+        )
