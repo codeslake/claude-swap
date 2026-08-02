@@ -125,26 +125,16 @@ HORIZON_HEADROOM_RATIO = 2.0
 # ratio removes both: 1.0 empties this band and re-arms the veto the filter
 # exists to stop, 2.0 does the reverse. Measured, not argued.
 #
-# THAT ALGEBRA BOUNDS THE CONSTANT, NOT THE RANKING, and an earlier version of
-# this comment confused the two — it told the next reader the residue needed a
-# redesign. It did not. The fix is the fallback in `_rank_candidates`: drop the
-# floor from `best_candidate_headroom` so the worth-having question stops
-# keying on the active account's own headroom, and re-admit margin failures
-# through a one-way list used only when nothing else qualifies. Measured, same
-# scenario, 0.05 steps across [3.00, 10.00]:
+# That bounds the CONSTANT, not the ranking. The fix is elsewhere: drop the
+# floor from `best_candidate_headroom` and re-admit margin failures through a
+# one-way fallback used only when nothing else qualifies. Sweep across
+# [3.00, 10.00] at 0.05: 42 refusals before, 0 now.
 #
-#     here, before   42 refusals of 141, band [3.90, 5.95]
-#     here, now       0 refusals of 141
-#
-# with the suite at 1717 passed and every horizon protection intact.
-#
-# Two OTHER fixes were tried and both measured worse. Making the floor absolute
-# (`> SPENT_HEADROOM_PCT`, fleet-wide rather than relative) refuses 4 of the 5
-# sampled points — no narrower than the band it replaces — AND breaks
+# Two other fixes measured worse. An absolute floor (`> SPENT_HEADROOM_PCT`)
+# refuses 4 of the 5 sampled points and breaks
 # `test_an_unchoosable_peer_does_not_veto_the_reset_ranking`. Dropping the
-# filter with no fallback gives `0457cb0`'s row (REF REF REF REF move), which
-# re-arms that veto. The fallback is exactly what separates the working fix
-# from that one.
+# filter with NO fallback gives `0457cb0`'s row, re-arming that veto — the
+# fallback is what separates the working fix from that one.
 WORTH_HAVING_RATIO = 1.3
 
 # Below this an account is spent, and headroom comparisons between two spent
@@ -213,11 +203,9 @@ def _recovery_is_useful(
     The #202 case oscillated on the original code too — its test ticks once,
     so it only ever observed the outbound leg.
 
-    The step between the two axes used to be non-monotone — adding headroom to
-    a peer flipped a move into a refusal, 42 refusals across a 0.05-step sweep.
-    That was a property of `best_candidate_headroom`'s ratio floor, not of this
-    predicate: the floor is gone and margin failures are re-admitted through a
-    one-way fallback, so the sweep now refuses nowhere. See WORTH_HAVING_RATIO.
+    The step between the two axes used to be non-monotone. That was a property
+    of `best_candidate_headroom`'s ratio floor, not of this predicate — the
+    floor is gone and the sweep now refuses nowhere. See WORTH_HAVING_RATIO.
     """
     if (
         active_headroom <= SPENT_HEADROOM_PCT
@@ -1310,18 +1298,12 @@ class AutoSwitchEngine:
         # blocked. The band is (SPENT_HEADROOM_PCT, active x RATIO], up to 3
         # points wide at the defaults.
         #
-        # The headrooms the ranking may actually choose between: every
-        # candidate whose headroom is KNOWN. An unknown one is not evidence
-        # that somebody has quota left — the loop skips it a few lines down
-        # for exactly that reason — so it must not veto the spent check
-        # either. Measured: one sentinel row (expired token, locked keychain)
-        # made `all(...)` False forever, and three accounts at 99% days out
-        # left the engine parked on the one resetting LAST.
-        #
-        # Unfiltered. A floor scoped by WORTH_HAVING_RATIO used to sit here,
-        # which made the worth-having question key on the ACTIVE account's own
-        # headroom and inverted monotonicity across a 2-point band. The
-        # margin-failure fallback below is what lets it go. See the constant.
+        # Every candidate whose headroom is KNOWN, unfiltered. An unknown one
+        # is not evidence that somebody has quota left — measured, one
+        # sentinel row (expired token, locked keychain) made `all(...)` False
+        # forever and parked the engine on the account resetting LAST. A
+        # WORTH_HAVING_RATIO floor used to sit here too and inverted
+        # monotonicity; the fallback below is what lets it go.
         best_candidate_headroom = max(
             (
                 h
@@ -1405,9 +1387,7 @@ class AutoSwitchEngine:
                                 and recovery_ts
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
-                                fallback.append(
-                                    ((0, recovery_ts, -h), num)
-                                )
+                                fallback.append(((0, recovery_ts, -h), num))
                             continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -1459,8 +1439,7 @@ class AutoSwitchEngine:
                 key = (-h,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
-        if not qualifying and fallback:
-            qualifying = fallback
+        qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         return [num for _, num in qualifying], any_known, active_reset_ts
 
