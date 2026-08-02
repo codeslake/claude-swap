@@ -33,6 +33,7 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
 )
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -685,6 +686,64 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "that is the latch, not the contract"
         )
         assert store._read_active_credentials().degraded is False
+
+    def test_the_active_verdict_is_not_shared_across_TUI_lanes(
+        self, macos_switcher, monkeypatch
+    ):
+        """`_active_read_degraded` is a per-READ fact on a shared switcher.
+
+        `_build_accounts_info` resets both active flags at the top of every
+        build and sets them from the active slot's own read; the consume gate
+        (`_fetch_active_usage`) and the resync read them later. The in-code
+        comment says "main thread writes it here before the fetch pool starts
+        -> no data race", which is true of the fetch POOL and false of the
+        TUI: `tui/app.py` starts a STORE lane while a normal lane is in
+        flight — separate guards, two threads, one switcher.
+
+        Measured, a sibling doing what a second lane's build does, against a
+        4ms window (`_FETCH_STAGGER_S` is 250ms, so the real window is far
+        wider — 501ms at 3 accounts, 1001ms at 10):
+
+            lane A's degraded verdict lost 60/60 times
+
+        A lost `degraded=True` disarms the refusal at `_fetch_active_usage`
+        and the gate POSTs a possibly-spent grant. `invalid_grant` is
+        PERMANENT with AUTH_DEAD_STRIKES = 1, so a live account is
+        quarantined.
+
+        The verdict travels with the row it describes, the same shape the
+        backup read uses.
+        """
+        import threading
+        import time
+
+        s = macos_switcher
+        lost = 0
+        stop = threading.Event()
+
+        def sibling():
+            while not stop.is_set():
+                s._record_active_verdict(None)
+                time.sleep(0.0005)
+
+        worker = threading.Thread(target=sibling)
+        worker.start()
+        try:
+            for _ in range(60):
+                s._record_active_verdict(
+                    ActiveCredentials("", True, True)
+                )
+                time.sleep(0.004)
+                if not s._active_verdict().degraded:
+                    lost += 1
+        finally:
+            stop.set()
+            worker.join()
+
+        assert lost == 0, (
+            f"{lost} of 60 active verdicts were erased by a second TUI lane — "
+            "the consume gate then POSTs a possibly-spent grant"
+        )
 
     def test_two_concurrent_backup_reads_keep_their_own_verdicts(
         self, macos_switcher, monkeypatch

@@ -8428,7 +8428,8 @@ class TestDegradedReadProvenance:
             switcher._store, "_read_active_credentials",
             lambda: ActiveCredentials(stale, False, True),
         )
-        switcher._active_read_degraded = True  # as _build_accounts_info would
+        # as _build_accounts_info would, through the per-thread seam
+        switcher._record_active_verdict(ActiveCredentials("", False, True))
         with patch.object(
                  switcher, "_read_account_credentials", return_value=stale
              ), \
@@ -9638,7 +9639,7 @@ class TestActiveSlotStrikeParity:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "sk-a", "refreshToken": "rt-a",
                               "expiresAt": 9999999999000}})
-        s._active_read_degraded = True
+        s._record_active_verdict(ActiveCredentials("", False, True))
         resync = MagicMock()
         monkeypatch.setattr(s, "_resync_rotated_backup", resync)
         with patch(
@@ -9759,7 +9760,7 @@ class TestUltraReviewCoverageGaps:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "sk-f", "refreshToken": "rt-f",
                               "expiresAt": 9999999999000}})
-        s._active_read_degraded = True
+        s._record_active_verdict(ActiveCredentials("", False, True))
         with patch(
             "claude_swap.oauth.try_fetch_usage_for_account",
             return_value=UsageOutcome(None, error="http-401"),
