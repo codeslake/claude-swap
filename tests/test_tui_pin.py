@@ -203,9 +203,16 @@ class TestThePinTuiSurface:
             # became a toast — the modal this raise exists to open never opened.
             from claude_swap.exceptions import ClaudeSwitchError
 
-            with contextlib.redirect_stdout(buf), pytest.raises(ClaudeSwitchError):
+            with contextlib.redirect_stdout(buf), pytest.raises(
+                ClaudeSwitchError, match="no proxy is running"
+            ):
                 screen._run_pin_op(lambda: (False, "no proxy is running"))
-            assert "no proxy is running" in buf.getvalue()
+            # Carried by the RAISE, not by a print: run_action renders a
+            # ClaudeSwitchError as "Error: {e}", so printing it here too put
+            # the same sentence in the modal twice.
+            assert buf.getvalue() == "", (
+                f"the message was printed as well as raised: {buf.getvalue()!r}"
+            )
 
             # And the success path stays a plain toast, no raise.
             buf = io.StringIO()
@@ -232,13 +239,19 @@ class TestThePinTuiSurface:
                 return ["sess-1"]
 
         real = pin.set_pin
-        pin.set_pin = lambda sw, email, org: seen.append(email) or (True, f"Pinned {email}")
+        # num is asserted too: passing the slot the TUI already has is what
+        # keeps a duplicate email from bypassing the API-key refusal.
+        pin.set_pin = lambda sw, email, org, num=None: (
+            seen.append((email, num)) or (True, f"Pinned {email}")
+        )
         try:
             async with app.run_test(size=(100, 32)) as pilot:
                 await settle(pilot)
                 acc = app.snapshot.accounts[0]
                 ok, msg = app.screen._apply_pin(acc, _Impl())
-            assert seen == [acc.email], "the TUI did not go through pin.set_pin"
+            assert seen == [(acc.email, acc.number)], (
+                "the TUI did not go through pin.set_pin with its resolved slot"
+            )
             assert ok and "Pinned" in msg
             assert "Reconnect open Remote Control" in msg, (
                 "the RC note only this side can produce was dropped"
