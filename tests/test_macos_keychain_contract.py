@@ -686,6 +686,70 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         )
         assert store._read_active_credentials().degraded is False
 
+    def test_two_concurrent_backup_reads_keep_their_own_verdicts(
+        self, macos_switcher, monkeypatch
+    ):
+        """The verdict is a fact about ONE read; an instance flag is shared.
+
+        `_read_account_credentials_ex` clears `_backup_read_failed`, runs a
+        ~10-50ms `security` subprocess, then reads the flag back. Any other
+        read on the same store in that window overwrites it. The consume gate
+        holds a per-slot FileLock, but the usage sentinel calls the same seam
+        with no lock at all, and the TUI runs three worker threads on one
+        switcher.
+
+        Measured, realistic 4ms `security` latency, slot 2 genuinely denied
+        while a sibling loop reads an empty slot 9:
+
+            slot 2 reported READABLE 2 of 60 times
+
+        Both directions corrupt. The gate's decision is
+        `refresh_input = current or snapshot`, so a lost `unreadable=True`
+        POSTs a possibly-spent grant — and `invalid_grant` is PERMANENT with
+        AUTH_DEAD_STRIKES = 1, quarantining a live account.
+        """
+        import threading
+        import time
+
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        def get_password(service, account):
+            time.sleep(0.004)                    # a `security` subprocess
+            if "account-2-" in (account or ""):
+                raise _kc.KeychainError("denied")
+            return None
+
+        monkeypatch.setattr(_kc, "get_password", get_password)
+
+        stop = threading.Event()
+
+        def sibling():
+            while not stop.is_set():
+                macos_switcher._read_account_credentials_ex("9", "i@e.com")
+
+        worker = threading.Thread(target=sibling)
+        worker.start()
+        try:
+            lost = 0
+            for _ in range(60):
+                _value, unreadable = macos_switcher._read_account_credentials_ex(
+                    "2", "b@e.com"
+                )
+                if not unreadable:
+                    lost += 1
+        finally:
+            stop.set()
+            worker.join()
+
+        assert lost == 0, (
+            f"{lost} of 60 reads lost their own unreadable verdict to a "
+            "concurrent read on another slot — the consume gate then POSTs a "
+            "possibly-spent grant"
+        )
+
     def test_a_verified_clear_ends_the_degraded_verdict(
         self, macos_switcher, monkeypatch
     ):
