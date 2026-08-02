@@ -919,7 +919,20 @@ class TestTheRuntimeVersionFloor:
     Anyone who installed cswap-pin before 0.1.1 and later upgrades claude-swap
     WITHOUT the extra keeps 0.1.0 — the release where a refused swap is handed
     to the client and ends that process's Remote Control.
+
+    WINDOWS REFUSES BEFORE ANY VERSION IS READ. `_impl` raises on win32 first
+    (POSIX locks and FIFOs), so on Windows every assertion below about the
+    version is unreachable — and the failure that taught this was the quiet
+    kind: `test_an_old_pin_is_refused_by_version` PASSED its `"REFUSED" in out`
+    line there, for the platform, not for the version. A version check that did
+    nothing at all would have passed it too.
+
+    So Windows is not skipped, it is asserted separately: the platform refusal
+    is itself a property worth holding, and a bare skip would leave the OS
+    where the seam is most likely to drift with no coverage of it.
     """
+
+    WIN = sys.platform == "win32"
 
     def _probe(self, version_literal):
         import subprocess
@@ -957,12 +970,21 @@ class TestTheRuntimeVersionFloor:
 
     def test_an_old_pin_is_refused_by_version(self):
         out = self._probe('pkg.__version__ = "0.1.0"')
-        assert "REFUSED" in out, f"0.1.0 was accepted at runtime: {out}"
-        assert "0.1.0 is too old" in out, out
+        if self.WIN:
+            assert "not available on Windows" in out, out
+            return
+        # Never a bare `"REFUSED" in out`: that is what passed on Windows for
+        # the wrong reason. The MESSAGE is the assertion.
+        assert "0.1.0 is too old" in out, f"0.1.0 was accepted at runtime: {out}"
 
     def test_the_current_version_is_accepted(self):
-        assert "ACCEPTED" in self._probe('pkg.__version__ = "0.1.1"')
+        out = self._probe('pkg.__version__ = "0.1.1"')
+        assert ("not available on Windows" if self.WIN else "ACCEPTED") in out, out
 
     def test_an_absent_version_is_not_treated_as_old(self):
         # A dev checkout must not be refused over a guess.
-        assert "ACCEPTED" in self._probe("pass")
+        out = self._probe("pass")
+        assert ("not available on Windows" if self.WIN else "ACCEPTED") in out, out
+        # And never for the version, on either platform: "too old" here would
+        # mean an absent version was read as 0.
+        assert "too old" not in out, out
