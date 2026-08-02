@@ -534,22 +534,29 @@ class CredentialStore:
                 pass
             raise
 
-    def _delete_active_keychain_entry(self) -> None:
+    def _delete_active_keychain_entry(self) -> bool:
         """Best-effort removal of the active-credential Keychain item (macOS only).
 
         Claude Code reads the Keychain before the plaintext file, so once we fall
         back to the file we must clear any stale Keychain entry or Claude Code would
         resurrect it (#30337). Best-effort: when the Keychain is down the delete
         can't run, which is the documented recovery residual.
+
+        Returns whether no item can still shadow the file. ``delete_password``
+        returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
+        a return is proof. Callers that must VERIFY a clear need this: a read
+        cannot answer for them once file mode is pinned, because then nothing
+        asks the Keychain at all. Off macOS there is no item, hence ``True``.
         """
         if self._host.platform != Platform.MACOS:
-            return
+            return True
         try:
             macos_keychain.delete_password(
                 CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
             )
         except Exception:
-            pass  # best-effort; a down Keychain can't be cleaned now
+            return False  # best-effort; a down Keychain can't be cleaned now
+        return True
 
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.
@@ -670,20 +677,27 @@ class CredentialStore:
             except Exception as e:
                 self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
 
-    def _clear_oauth_credential(self) -> None:
+    def _clear_oauth_credential(self) -> bool:
         """Clear the active OAuth credential — Keychain item and plaintext file.
 
         Best-effort: a down Keychain or missing file is fine. Removing
         ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
         login over the just-activated API key.
+
+        Returns the Keychain half's own verdict — whether an item can still
+        shadow the file — for callers that must VERIFY the clear rather than
+        merely attempt it. A post-clear READ cannot answer that under a pinned
+        file mode: nothing asks the Keychain there, so a surviving item is
+        invisible to the check written to catch it.
         """
-        self._delete_active_keychain_entry()
+        cleared = self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
         try:
             if cred_file.exists():
                 cred_file.unlink()
         except OSError as e:
             self._host._logger.warning(f"Failed to remove credentials file: {e}")
+        return cleared
 
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.
