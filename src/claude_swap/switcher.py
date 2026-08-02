@@ -2195,11 +2195,9 @@ class ClaudeAccountSwitcher:
     def _with_active_verdict(self, fn):
         """Wrap `fn` so a worker thread inherits THIS thread's verdict.
 
-        The verdict is thread-local so two TUI lanes cannot erase each
-        other's, but `_fetch_active_usage` always runs on a pool worker that
-        never read. Without this the worker saw the clean default and the
-        consume gate never fired — measured 30/30 verdicts lost, a false
-        NEGATIVE where the race it replaced only lost the verdict sometimes.
+        Thread-local keeps two TUI lanes from erasing each other's, but
+        `_fetch_active_usage` always runs on a pool worker that never read —
+        measured 30/30 verdicts lost, and the consume gate never fired.
         """
         verdict = self._active_verdict()
 
