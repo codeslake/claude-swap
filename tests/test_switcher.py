@@ -5178,6 +5178,77 @@ class TestSwitchSkipsBrokenSlots:
                 "the only copy of a live refresh token was deleted unstashed"
             )
 
+    def test_an_unreadable_keychain_is_not_read_as_an_empty_live_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """`""` from a FAILED read is not `""` from an empty store.
+
+        The refusal above reads `.value` alone, so it catches `None` (a file
+        present but unreadable) and misses the Keychain's shape: when the OAuth
+        read fails and nothing else covers it,
+        `_read_active_credentials` returns `("", keychain_unavailable=True)`.
+        Both spellings mean "a credential may be live and we could not see
+        it"; only one was refused.
+
+        The delete is not the read. `find-generic-password -w` DECRYPTS;
+        `delete-generic-password` is attribute-only, and
+        `_delete_active_keychain_entry` calls it directly rather than through
+        `_use_keychain`. So a read that times out under the statusline
+        contention this module documents by name, followed by a delete that
+        succeeds once the contention clears, is an ordinary sequence.
+
+        Measured end to end through `_switch_to_empty_slot`, unmanaged live
+        login, Keychain read raising and delete succeeding:
+
+            RAISED SwitchError "...The credential is preserved in the stash..."
+            keychain item survived: False
+            stash entries: []
+
+        The refresh token was the only copy. `if live:` skipped the stash
+        because `""` is falsy, the clear then removed the item, and the raise
+        told the user it was preserved.
+        """
+        from claude_swap import macos_keychain as _kc
+        from claude_swap.exceptions import CredentialReadError
+
+        s = self._setup(temp_home)
+        s.platform = Platform.MACOS
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s.sequence_file.write_text(json.dumps(data))
+
+        item = ("Claude Code-credentials", _kc.keychain_account_name())
+        store = {
+            item: json.dumps({"claudeAiOauth": {"refreshToken": "ONLY-COPY"}})
+        }
+
+        def get_password(service, account):
+            if "credentials" in service:
+                raise _kc.KeychainError("timed out")     # statusline contention
+            return None
+
+        def delete_password(service, account):
+            store.pop((service, account), None)          # the delete SUCCEEDS
+            return None
+
+        monkeypatch.setattr(_kc, "get_password", get_password)
+        monkeypatch.setattr(_kc, "delete_password", delete_password)
+        monkeypatch.setattr(_kc, "set_password", lambda *a, **k: None)
+        s._store._keychain_usable_cache = True
+
+        with pytest.raises(CredentialReadError):
+            s._switch_to_empty_slot(
+                "2", "b@example.com", {"number": 1}, {"number": 2},
+                s._get_sequence_data(),
+            )
+
+        assert store.get(item) is not None, (
+            "the live credential was deleted after a read that could not see "
+            "it — the stash never ran and there is no other copy"
+        )
+
     def test_a_failed_clear_does_not_hand_the_slot_a_live_credential(
         self, temp_home: Path
     ):
