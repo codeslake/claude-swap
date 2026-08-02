@@ -3463,6 +3463,47 @@ class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
             "equal headroom, and the 5h reset lost to the 500h one on slot order"
         )
 
+    def test_a_peer_worth_having_is_not_filtered_out_of_the_worth_having_check(
+        self, harness
+    ):
+        """The floor must not exclude a peer that plainly has quota.
+
+        `best_candidate_headroom` was scoped by
+        `active_headroom x HORIZON_HEADROOM_RATIO` — but that constant is an
+        ANTI-FLAP MARGIN, not a "worth having" cutoff. A peer at
+        2x-minus-epsilon the active's headroom is very much worth having; it
+        merely fails this tick's margin.
+
+        With every candidate below the floor, `default=0.0` makes
+        `best_candidate_headroom` 0.0, which SATISFIES the spent clause — so
+        the clause fires for everybody, the horizon check is never reached, and
+        ranking falls to soonest reset regardless of headroom. The engine then
+        takes a nearly-empty account over one holding 60x more:
+
+            active   3.00 pts, 500h     peerA 5.99 pts, 400h
+            peerB    0.10 pts, 200h  <- chosen
+
+        Three-way: base 9f35426 also lands on peerB, but 0457cb0 (this PR
+        before the veto-scope fix) holds the active. So the fix reintroduced
+        base's answer in a band the commit before it had already made safe.
+
+        Asserted as "does not take the nearly-empty account". Whether it takes
+        peerA or holds is the ANTI-FLAP margin's call, and at 5.99 against a
+        6.00 margin holding is correct — that is a separate question from
+        whether peerA counts as quota existing, which is what this pins.
+        """
+        out = harness.tick_with_usage({
+            "1": _usage(97.00, self._at(harness, 500 * 3600)),  # active, 3.00
+            "2": _usage(94.01, self._at(harness, 400 * 3600)),  # 5.99
+            "3": _usage(99.90, self._at(harness, 200 * 3600)),  # 0.10
+        })
+        assert harness.active_number() != 3, (
+            "took the 0.10-point account over one holding 5.99 — the floor "
+            "excluded the peer that made the spent clause false, and an empty "
+            "max reads as 'nothing is worth having'"
+        )
+        assert out is not TickOutcome.SWITCHED or harness.active_number() == 2
+
     def test_an_unchoosable_peer_does_not_veto_the_reset_ranking(self, harness):
         """``best_candidate_headroom`` counted a candidate the ranking cannot pick.
 
