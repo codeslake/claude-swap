@@ -1053,22 +1053,25 @@ class AutoSwitchEngine:
         # have made on its own merits. One-way stays one-way: the margin is
         # what makes it so, and re-using it keeps the release from becoming a
         # second, looser threshold that has to be reasoned about separately.
-        came_from = state.get("lastSwitchFrom")
-        if (
-            trigger in ("proactive", "consume-first")
-            and came_from is not None
-            and str(came_from) in oauth_candidates
-        ):
-            left_headroom = headroom.get(str(came_from))
-            released = (
-                left_headroom is not None
-                and active_headroom is not None
-                and left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO
-            )
-            if not released:
-                oauth_candidates = [
-                    n for n in oauth_candidates if n != str(came_from)
-                ]
+        # NOT REMOVED FROM THE LIST — barred from being CHOSEN. Removing it
+        # made eight downstream consumers believe the account does not exist:
+        # `truly_exhausted` (a peer holding 15 points produced
+        # AllExhaustedEvent, a macOS notification and a critical TUI row),
+        # `not oauth_candidates` -> "no candidates at all" with a stretched
+        # poll interval, `_every_account_above_threshold` (a hidden
+        # below-threshold peer flipped `all_above` and switched the whole
+        # ranking axis), `best_candidate_headroom`, and `any_known` ->
+        # "no candidate has readable usage", which was false.
+        #
+        # The filter's job is "do not go back to the account we just left".
+        # That is a statement about the CHOICE, and it belongs where the
+        # choice is made — `_rank_candidates` — not in the census of what
+        # exists. Measured before this move: disabling the filter entirely
+        # left the full suite green, because both its tests only exercised
+        # the released branch.
+        no_return = self._no_return_account(
+            trigger, state, headroom, active_headroom, oauth_candidates
+        )
         api_key_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
@@ -1109,6 +1112,7 @@ class AutoSwitchEngine:
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
+            no_return=no_return,
             usage=usage,
             headroom=headroom,
             current=current,
@@ -1139,6 +1143,7 @@ class AutoSwitchEngine:
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
+                no_return=no_return,
                 usage=usage,
                 headroom=headroom,
                 current=current,
@@ -1287,12 +1292,67 @@ class AutoSwitchEngine:
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
 
+    def _no_return_account(
+        self,
+        trigger: str,
+        state: dict,
+        headroom: dict[str, float | None],
+        active_headroom: float | None,
+        oauth_candidates: list[str],
+    ) -> str | None:
+        """The account this engine most recently left, while it is still barred.
+
+        NEVER UNDO THE PREVIOUS MOVE. Each anti-flap gate is one-way on its own
+        axis, but the axis is a property of the pair's STATE and burn changes
+        that state: the ratio gate is relative (`h >= active x 2`) and the
+        spent gate absolute (`active <= 3.0`), so a burning pair crosses the
+        boundary repeatedly and each crossing re-opens a move. Measured, both
+        resets past the horizon, only the active burning: `[1, 2, 1, 2]` where
+        base makes one move.
+
+        SCOPED like every sibling gate — `at-limit` and `failover` skip the
+        anti-flap gates by design. Unscoped this stranded a 2-account fleet on
+        an exhausted active with the peer at 0%.
+
+        RELEASED when the account we left now beats us by the same ratio the
+        anti-flap margin uses: that is not the flip this bars, it is a move the
+        outbound leg would have made on its own merits.
+
+        And released when the bar would leave NOTHING to choose. Identity has
+        no release condition of its own — `lastSwitchFrom` is rewritten only by
+        a successful switch, the one it prevents — so on a 2-account fleet it
+        was permanent: measured, one ordinary proactive move then 20 ticks of
+        `no-candidates` with the peer at 0%, surviving a restart. The ratio
+        release does not cover it, because `left >= active x 2` is
+        unsatisfiable for any active headroom above 50 and consume-first fires
+        exactly there: measured, active 70 pts against a peer at 100 pts,
+        locked out for 10h and still locked after seven days of wall clock.
+        A bar that leaves the engine nothing is not anti-flap, it is a stall.
+        """
+        came_from = state.get("lastSwitchFrom")
+        if trigger not in ("proactive", "consume-first") or came_from is None:
+            return None
+        barred = str(came_from)
+        if barred not in oauth_candidates:
+            return None
+        left_headroom = headroom.get(barred)
+        if (
+            left_headroom is not None
+            and active_headroom is not None
+            and left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO
+        ):
+            return None                      # beats us outright; not a flip
+        if all(n == barred for n in oauth_candidates):
+            return None                      # barring it leaves nothing
+        return barred
+
     def _rank_candidates(
         self,
         *,
         trigger: str,
         consume_first: bool,
         oauth_candidates: list[str],
+        no_return: str | None,
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
         current: str,
@@ -1369,9 +1429,11 @@ class AutoSwitchEngine:
             h = headroom.get(num)
             if h is None:
                 continue
-            any_known = True
+            any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
+            if num == no_return:
+                continue  # the account we just left; see _no_return_account
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
