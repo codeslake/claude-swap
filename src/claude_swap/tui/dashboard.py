@@ -26,6 +26,7 @@ from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
 from claude_swap import pin
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountsSnapshot
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
@@ -210,14 +211,20 @@ class DashboardScreen(Screen):
         """Adapt a ``(ok, message)`` operation to what _start_action expects.
 
         `run_action` captures stdout and `_action_done` toasts its first line
-        or, on a raised error, opens the failure modal. So a failure PRINTS and
+        or, on a failed ActionResult, opens the modal. So a failure PRINTS and
         raises — the raise is what routes it to the modal rather than to a
         toast the user may miss — and a success just prints.
+
+        ClaudeSwitchError specifically: run_action catches only that and
+        EOFError. A RuntimeError escaped to on_worker_state_changed and became
+        a `notify(severity="error")` — measured, MODALS [] — so the modal this
+        raise exists to open never opened and the message wore a doubled
+        prefix.
         """
         ok, msg = op()
         print(msg)
         if not ok:
-            raise RuntimeError(msg)
+            raise ClaudeSwitchError(msg)
 
     def _apply_pin(self, acc, impl) -> tuple[bool, str]:
         """Pin to ``acc`` and add the note only this side can produce.
