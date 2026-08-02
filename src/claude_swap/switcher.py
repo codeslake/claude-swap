@@ -5682,7 +5682,9 @@ class ClaudeAccountSwitcher:
         """
         active = self._store._read_active_credentials()
         live = active.value
-        if live is None or (live == "" and active.keychain_unavailable):
+        if live is None or active.degraded or (
+            live == "" and active.keychain_unavailable
+        ):
             # PRESENT BUT UNREADABLE — not the same as absent, and the two used
             # to take the same branch because both are falsy. `""` means nothing
             # is there and clearing costs nothing; `None` means a credential
@@ -5705,6 +5707,18 @@ class ClaudeAccountSwitcher:
             # statusline contention this module names, then a delete that
             # succeeds once it clears, is ordinary. Measured, unmanaged login:
             # SwitchError promising a stash, keychain item gone, stash empty.
+            #
+            # `degraded` is the THIRD axis, and it is neither of the two above:
+            # the value is real bytes, so it is not `None` and not `""`. It
+            # means the Keychain read failed and the plaintext file covered
+            # it — and Claude Code writes rotations Keychain-only on macOS, so
+            # those bytes can be a SUPERSEDED generation while the current one
+            # sits in the item we could not read. The clear then deletes that
+            # item (attribute-only, see above), and the stash holds the stale
+            # copy. Measured: stash carries STALE-GEN-7, `CURRENT-GEN-9` exists
+            # nowhere. `ActiveCredentials.degraded` says these bytes must not
+            # be trusted; deleting the original on their word is the strongest
+            # possible way to trust them.
             #
             # Refusing is the same contract the stash already states: a
             # successful stash is the license to overwrite, and there is none.
