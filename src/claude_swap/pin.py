@@ -397,6 +397,16 @@ def _safe(exc: object) -> str:
     return re.sub(r"(?<=://)[^/\s@]+@", "***@", str(exc))
 
 
+def _rollback_tail(rolled: bool, before, email: str) -> str:
+    """How a failed set_pin ended, in the record's own terms.
+
+    Both failure branches say the same three things and said them twice.
+    """
+    if not rolled:
+        return f"and the record may still name {email}, check with `cswap pin`"
+    return "the previous pin is unchanged" if before else "nothing is pinned"
+
+
 def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
     """Put the record back the way ``before`` had it. True when it IS back.
 
@@ -611,12 +621,7 @@ def set_pin(
         rolled = _restore_pin(switcher, before)
         return False, (
             f"Could not pin the cloud account: {_safe(exc)} — "
-            + (
-                ("the previous pin is unchanged" if before else "nothing is pinned")
-                if rolled
-                else f"and the record may still name {email}, "
-                "check with `cswap pin`"
-            )
+            + _rollback_tail(rolled, before, email)
         )
     if not started:
         # SAME DEFECT AS THE RAISE PATH, sibling branch. apply_pin writes the
@@ -628,13 +633,7 @@ def set_pin(
         rolled = _restore_pin(switcher, before)
         return False, (
             f"Could not pin the cloud account to {email}: no proxy is running, "
-            "so nothing is pinned yet — "
-            + (
-                ("the previous pin is unchanged" if before else "nothing is pinned")
-                if rolled
-                else f"and the record may still name {email}, "
-                "check with `cswap pin`"
-            )
+            "so nothing is pinned yet — " + _rollback_tail(rolled, before, email)
         )
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
