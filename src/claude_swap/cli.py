@@ -143,6 +143,16 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+    except Exception as e:  # noqa: BLE001
+        # A BROKEN PACKAGE ROOT is not a ClaudeSwitchError. `_impl` deliberately
+        # re-raises the underlying ImportError so "installed but unusable" is
+        # not conflated with "not installed" — but nothing between there and
+        # the shell rendered it, so a missing `cryptography` reached the user
+        # as a 6-frame traceback. Measured on work-mac, and this command is the
+        # one that has to stay usable when the pin does not.
+        error(f"Error: the cloud pin is installed but not usable: {e}")
+        error("  `cswap pin --clear` still works and removes the wiring.")
+        sys.exit(1)
 
 
 def _run_command(argv: list[str]) -> None:
