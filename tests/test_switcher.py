@@ -5403,7 +5403,7 @@ class TestSwitchSkipsBrokenSlots:
         )
 
     def test_locked_keychain_is_not_mistaken_for_an_empty_slot(
-        self, temp_home: Path
+        self, temp_home: Path, monkeypatch
     ):
         """macOS: an unreadable Keychain reports "no credentials" too.
 
@@ -5426,7 +5426,20 @@ class TestSwitchSkipsBrokenSlots:
         }))
 
         s.platform = Platform.MACOS
-        s._keychain_usable_cache = False        # locked / no GUI session
+        # A Keychain that ACTUALLY raises, not a routing flag standing in for
+        # one. `_keychain_usable_cache` is where ops should be ROUTED, and
+        # `_pin_file_mode` sets it deliberately with nothing having failed — so
+        # #196 split the observation ("an op raised") out of the routing
+        # decision, and a test that sets only the routing flag no longer
+        # describes a failure. It passed here in isolation and failed on the
+        # merged tree, which is exactly what the merged-suite gate is for.
+        from claude_swap import macos_keychain as _kc
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        for fn in ("get_password", "set_password", "delete_password"):
+            monkeypatch.setattr(_kc, fn, locked)
         with pytest.raises(SwitchError, match="Keychain"):
             s.switch_to("2")
 
