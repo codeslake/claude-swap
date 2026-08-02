@@ -5625,13 +5625,31 @@ class ClaudeAccountSwitcher:
         # nothing remaining that knows how to remove it: exactly the stranding
         # clear_wiring lives in this repo to prevent. Before the rmtree, while
         # there is still something to unwire with.
+        #
+        # ABSENT and FAILED are not the same, and a bare `except Exception`
+        # cannot tell them apart. Measured with clear_wiring raising OSError
+        # 30 (a read-only home; a contended lock and an unreadable config
+        # reach the same handler): "Purge complete." printed over a config
+        # that still carried the wiring — and with LESS recourse than before,
+        # since the record, cert dir and daemon state a later
+        # `cswap pin --clear` could have keyed off are now gone. Hand-editing
+        # .claude.json was the only cure and nothing on screen said so.
         try:
             from claude_swap import pin as _pin
 
             if _pin.clear_wiring(self):
                 removed_items.append("Cloud pin wiring in .claude.json")
-        except Exception:  # noqa: BLE001 — an optional feature must not block purge
-            pass
+        except ImportError:
+            pass  # no extra installed: nothing was ever wired
+        except Exception as exc:  # noqa: BLE001 — never block the purge itself
+            # The wiring may have survived, and after this the user is the
+            # only one who can remove it. `clear_wiring` returning False is
+            # the silent case (nothing there); raising is not.
+            warning(
+                f"Could not remove the cloud pin wiring: {exc} — edit "
+                f"{get_global_config_path()} by hand and delete the "
+                f'"_cswapPinWiredKeys" entry and the proxy vars it names.'
+            )
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
         # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
