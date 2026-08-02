@@ -1245,11 +1245,30 @@ class AutoSwitchEngine:
         all_above = _every_account_above_threshold(
             oauth_candidates, headroom, active_headroom, settings.threshold
         )
-        # The most headroom any candidate offers — "is there anything worth
-        # having?" Unknown headrooms are excluded rather than counted as zero:
-        # a row we cannot read is not evidence of an empty account.
+        # The most headroom any candidate the ranking could ACTUALLY CHOOSE
+        # offers — "is there anything worth having?" Unknown headrooms are
+        # excluded rather than counted as zero: a row we cannot read is not
+        # evidence of an empty account.
+        #
+        # Scoped to choosable candidates, not all of them. A peer 0.05 points
+        # above SPENT_HEADROOM_PCT answers "yes, something is worth having" and
+        # so turns the spent check off for EVERYBODY — while being unchoosable
+        # itself, because it does not meet HORIZON_HEADROOM_RATIO against the
+        # active. Nothing then qualifies and the engine parks on the account
+        # that returns LAST. Measured: active 3.00 pts/200h, peer 3.00 pts/10h,
+        # vetoer 3.05 pts/500h -> base switches to the 10h peer, this branch
+        # blocked. The band is (SPENT_HEADROOM_PCT, active x RATIO], up to 3
+        # points wide at the defaults.
+        #
+        # A candidate below the ratio cannot win the headroom axis, so counting
+        # it here only ever suppresses the OTHER axis on its behalf.
+        _ratio_floor = (active_headroom or 0.0) * HORIZON_HEADROOM_RATIO
         best_candidate_headroom = max(
-            (h for h in (headroom.get(n) for n in oauth_candidates) if h is not None),
+            (
+                h
+                for h in (headroom.get(n) for n in oauth_candidates)
+                if h is not None and h >= _ratio_floor
+            ),
             default=0.0,
         )
         active_recovery_ts = (
@@ -1358,7 +1377,18 @@ class AutoSwitchEngine:
                 # Scoped to the SAME triggers as the gate above: at-limit and
                 # failover skip that gate deliberately, because there we are
                 # escaping a dead account rather than optimising a return time.
-                key: tuple = (0, recovery_ts, -h) if by_recovery else (1, 0.0, -h)
+                # `recovery_ts` in BOTH tiers. Tier 1 hard-coded 0.0 there,
+                # which threw away a fact already in hand: two peers with equal
+                # headroom past the horizon then tied, and the tie fell through
+                # to sequence order. Measured — active 4 pts/300h, two peers
+                # 8 pts each, one returning in 5h and one in 500h: base picks
+                # the 5h account whichever slot it occupies, this branch picked
+                # whichever came first in the list. Headroom still decides
+                # first within the tier; the reset only breaks its ties, where
+                # sooner is plainly better than lower slot number.
+                key: tuple = (
+                    (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+                )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
