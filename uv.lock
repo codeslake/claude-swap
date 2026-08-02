@@ -113,7 +113,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cswap-pin", marker = "extra == 'pin'", specifier = ">=0.1" },
+    { name = "cswap-pin", marker = "extra == 'pin'", specifier = ">=0.1.1" },
     { name = "keyring", marker = "sys_platform == 'win32'", specifier = ">=25.0.0" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
     { name = "textual", specifier = ">=8.2.8,<9" },
@@ -188,14 +188,14 @@ wheels = [
 
 [[package]]
 name = "cswap-pin"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/ca/4ec0f407ee9b1aee7441555e06886586f6584ac939f8b748eda5c5e43245/cswap_pin-0.1.0.tar.gz", hash = "sha256:92082616d2cf4c8bef401de4f0496446f0c2f441682245db8b2d164d3d936f8a", size = 81489, upload-time = "2026-08-01T21:03:40.861Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/73/c4/1535ee1c47391626ebeec55b66ad595f56292d40ff1359ed297d9e48e3cf/cswap_pin-0.1.1.tar.gz", hash = "sha256:9d77c53aa50f0a30b4cf434ff2ec48b540411d24aa09156f4a5e0abb4f23017b", size = 91870, upload-time = "2026-08-02T04:32:07.561Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/71/c1/3f41d73509079a89a0d5d9c54a36e249b9447de0796e74275324bc80b9a1/cswap_pin-0.1.0-py3-none-any.whl", hash = "sha256:c52ed46ac55e97382958343e4e0edec28e73bcd2fc151c8b85e2f35e276035de", size = 44411, upload-time = "2026-08-01T21:03:39.366Z" },
+    { url = "https://files.pythonhosted.org/packages/f2/f8/3f5ee753a7a5c0d6ab0bc6c1f5b7cccdebb01c74679c1b362137e6c261b8/cswap_pin-0.1.1-py3-none-any.whl", hash = "sha256:4ff707482e29aebab6c157651af44d47dc9725f1e168fd5a5dab46bc4d7be4f3", size = 48754, upload-time = "2026-08-02T04:32:06.065Z" },
 ]
 
 [[package]]
