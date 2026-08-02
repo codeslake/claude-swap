@@ -2863,6 +2863,126 @@ class TestLiveLock:
         engine.stop()          # and again, serially
         assert engine._live_lock is None
 
+    def test_the_release_warning_survives_a_consumer_that_cannot_take_it(
+        self, harness, caplog
+    ):
+        """The one message that matters is the one that could not be delivered.
+
+        When the ceiling expires, `stop()` releases LIVE anyway and warns that
+        two engines may act once. It sent that through `_emit` — which in the
+        TUI is `call_from_thread`, refused by Textual from the app's own
+        thread, and `autoview._emit_from_thread` swallows the RuntimeError. So
+        on the one surface where the timeout actually fires, the warning went
+        nowhere.
+
+        Stands the refusal in for Textual's: any consumer that raises. The
+        logger has no thread affinity, which is the whole point — a warning
+        routed through the UI thread cannot describe a UI thread that is stuck.
+        """
+        import logging
+
+        engine = harness.engine
+        engine.on_event = lambda e: (_ for _ in ()).throw(
+            RuntimeError("must run in a different thread")
+        )
+        released: list[bool] = []
+
+        class _Lock:
+            def release(self):
+                released.append(True)
+
+        engine._live_lock = _Lock()
+        engine._tick_thread_id = -1          # someone else's tick, not ours
+        engine._tick_in_flight.clear()
+
+        from claude_swap import autoswitch as autoswitch_mod
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with patch.object(autoswitch_mod, "_STOP_SWITCH_WAIT_S", 0.05):
+                engine.stop()
+
+        assert released == [True], "premise: the lock was released anyway"
+
+        assert any(
+            "two engines may act once" in r.getMessage() for r in caplog.records
+        ), (
+            f"log records {[r.getMessage() for r in caplog.records]} — the "
+            "release warning was swallowed with the consumer's exception, so "
+            "an operator has two engines and no explanation"
+        )
+
+    def test_stop_on_the_ui_thread_does_not_block_on_the_worker(self, harness):
+        """`own_tick` covers ONE thread. The TUI has two, and it is the shape.
+
+        The sibling test drives emit and `stop()` on the SAME thread, which is
+        the SIGTERM shape: the handler runs inside the frame it interrupts, so
+        `own_tick` is True and the wait is skipped. In the TUI the tick runs on
+        a Textual worker and `stop()` is called from `on_unmount` /
+        `_restart_engine` on the UI thread — `_tick_thread_id` is the worker's,
+        `own_tick` is False, and `stop()` waits.
+
+        Meanwhile the worker is inside `_emit` → `call_from_thread`, which
+        blocks it until the UI thread runs the callback. The UI thread is in
+        `stop()`. Neither can move, so the wait always runs to the ceiling:
+        30s of frozen dashboard on every `l` toggle or screen exit that lands
+        mid-emit.
+
+        Not a race — the `_stop` checks added for the freshen loop GUARANTEE an
+        emit at the next checkpoint once `_stop` is set, which is the first
+        thing `stop()` does.
+
+        Bounds the assertion well under the ceiling: the point is that the UI
+        thread does not wait for a worker that is waiting for it, not the exact
+        duration. A real `call_from_thread` is stood in for by a barrier with
+        the same dependency, so the test needs no Textual app.
+        """
+        import threading
+        import time
+
+        engine = harness.engine
+        emitted = threading.Event()
+        ui_ran_callback = threading.Event()
+        worker_released: list[bool] = []
+
+        def emit_blocks_until_ui_runs_it(event):
+            # What `call_from_thread` does: park the worker until the UI
+            # thread executes the callback.
+            emitted.set()
+            ui_ran_callback.wait(10.0)
+            worker_released.append(True)
+
+        engine.on_event = emit_blocks_until_ui_runs_it
+
+        def worker():
+            with patch.object(
+                harness.switcher, "usage_entries_by_account",
+                return_value={
+                    num: _entry_for(value, harness.clock.now)
+                    for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+                },
+            ):
+                engine.tick()
+
+        w = threading.Thread(target=worker, daemon=True)
+        w.start()
+        assert emitted.wait(10.0), "premise: the worker reached an emit"
+        assert engine._tick_thread_id not in (None, threading.get_ident()), (
+            "premise: the tick is on the OTHER thread, so own_tick is False"
+        )
+
+        t0 = time.monotonic()
+        engine.stop()                       # the UI thread
+        blocked = time.monotonic() - t0
+
+        ui_ran_callback.set()               # the UI thread gets back to work
+        w.join(10.0)
+
+        assert blocked < 1.0, (
+            f"stop() held the UI thread {blocked:.2f}s while the worker was "
+            "waiting on that same thread to run its callback — the dashboard "
+            "is frozen for the whole ceiling"
+        )
+
     def test_stop_does_not_wait_on_a_tick_that_is_waiting_on_it(
         self, harness
     ):
