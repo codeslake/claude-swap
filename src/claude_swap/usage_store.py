@@ -779,35 +779,6 @@ class UsageStore:
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
                     row["last429At"] = now
-                # How long THIS row's last_good stays decision-trusted — so the
-                # backoff cannot outlast it. Only for 429s: every other failure
-                # is already bounded by TRUST_MAX_AGE_S inside the helper, and a
-                # timeout is no evidence the stored windows still describe
-                # reality.
-                #
-                # BOTH HALVES of what `_rate_limited_trust_ok` computes, which
-                # is `now < min(soonest reset, age ceiling)`. Only the reset half
-                # was bounded, and `age_s` runs from `fetchedAt` — which a
-                # FAILURE never advances. So consecutive blocks walked the
-                # ceiling down while the backoff stayed at the cap:
-                #
-                #     block  now      backoff    trust ends   blind
-                #       0     +0       +4500       +7200         0
-                #       1   +4500      +9000       +7200      1800
-                #       2   +9000     +13500       +7200      6300
-                #
-                # The PR body documents 10 of 19 lapses re-blocking, so this is
-                # the measured shape rather than a corner.
-                #
-                # The `http-429` scoping here is BELT-AND-BRACES and no test
-                # kills it: `_failure_backoff_s` already clamps every non-429 to
-                # TRUST_MAX_AGE_S on its own branch, so widening this condition
-                # to `if True:` changes nothing observable — measured across 20
-                # (reset x ask) combinations on the 503 path, byte-identical
-                # waits. Kept because the two paths answer to different
-                # ceilings and a reader should not have to re-derive that the
-                # inner clamp saves them; recorded as unfalsifiable rather than
-                # dressed up with a test that passes either way.
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures,
                     rec.retry_after_s,
