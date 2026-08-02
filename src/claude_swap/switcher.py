@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -329,14 +330,24 @@ class ClaudeAccountSwitcher:
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
 
-        # Set by _build_accounts_info: True when the active account's OAuth
-        # credential could not be read because the macOS Keychain was unavailable
-        # (locked / denied / timeout) with no fallback — so the usage row shows
-        # "keychain unavailable" instead of a misleading "no credentials".
-        self._active_keychain_unavailable = False
-        # Same lifecycle for the degraded-read flag (keychain failed but a
-        # fallback covered it): consumption is banned while it is True.
-        self._active_read_degraded = False
+        # The active read's verdict, PER THREAD. Set by _build_accounts_info
+        # from the active slot's own read; consumed later by the usage
+        # sentinel, the rotation resync and the consume gate.
+        #
+        # Thread-local because it is a fact about one READ, not about the
+        # process, and the TUI runs two lanes on one switcher: `tui/app.py`
+        # starts a store refresh while a normal refresh is in flight, each
+        # guarded separately. A build's unconditional reset at the top then
+        # erased the other lane's verdict. Measured against a 4ms window
+        # (`_FETCH_STAGGER_S` is 250ms, so the real window is 501ms at 3
+        # accounts and 1001ms at 10): 60 of 60 verdicts lost, after which the
+        # consume gate POSTs a possibly-spent grant and AUTH_DEAD_STRIKES = 1
+        # quarantines a live account.
+        #
+        # An earlier comment here claimed "main thread writes it before the
+        # fetch pool starts -> no data race". True of the pool, false of the
+        # TUI.
+        self._active_verdict_tls = threading.local()
 
         # Accounts already warned about a provenance problem with the active
         # credential — each condition persists across collect passes and
@@ -2185,6 +2196,26 @@ class ClaudeAccountSwitcher:
             return creds
         return None
 
+    def _record_active_verdict(self, active) -> None:
+        """Record THIS thread's active-read verdict (see `_active_verdict_tls`)."""
+        self._active_verdict_tls.value = active
+
+    def _active_verdict(self):
+        """This thread's active-read verdict; a clean one if it never read."""
+        from claude_swap.credentials import ActiveCredentials
+
+        return getattr(self._active_verdict_tls, "value", None) or ActiveCredentials(
+            "", False, False
+        )
+
+    @property
+    def _active_keychain_unavailable(self) -> bool:
+        return self._active_verdict().keychain_unavailable
+
+    @property
+    def _active_read_degraded(self) -> bool:
+        return self._active_verdict().degraded
+
     def _read_account_credentials_ex(
         self, account_num: str, email: str
     ) -> tuple[str, bool]:
@@ -3194,8 +3225,7 @@ class ClaudeAccountSwitcher:
         # Reset each build; set below only when the active slot's OAuth Keychain
         # read failed with no fallback. Read by _static_usage_sentinel (main
         # thread writes it here before the fetch pool starts → no data race).
-        self._active_keychain_unavailable = False
-        self._active_read_degraded = False
+        self._record_active_verdict(None)
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -3207,8 +3237,7 @@ class ClaudeAccountSwitcher:
             if is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
-                self._active_keychain_unavailable = active.keychain_unavailable
-                self._active_read_degraded = active.degraded
+                self._record_active_verdict(active)
             else:
                 creds = self._read_account_credentials(str(num), email)
 
@@ -4676,8 +4705,7 @@ class ClaudeAccountSwitcher:
         """
         active = self._read_active_credentials()
         creds = active.value or ""
-        self._active_keychain_unavailable = active.keychain_unavailable
-        self._active_read_degraded = active.degraded
+        self._record_active_verdict(active)
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
