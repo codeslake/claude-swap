@@ -3102,12 +3102,64 @@ class TestHorizonAxisDoesNotFlap:
             harness.clock.advance(301.0)
 
         moves = [n for i, n in enumerate(seen) if i == 0 or n != seen[i - 1]]
-        assert len(moves) <= 3, (
+        assert len(moves) <= 2, (
             f"move sequence {moves} — a burn walk that keeps moving is a flap, "
             "whatever axis each leg took"
         )
         assert seen[-4:] == [seen[-1]] * 4, (
             f"active trace {seen} — the walk never settled"
+        )
+
+    def test_a_burn_walk_never_returns_to_what_it_left(self, harness):
+        """The axis can flip more than once, and nothing bounded how often.
+
+        A previous round measured A-B-A under burn and dismissed it: each leg
+        IS legitimate on the axis its own state selects, and base shows 0 only
+        because it refuses the outbound leg too. That reasoning holds. The
+        conclusion did not — it rested on the walk settling in at most three
+        moves, which is a property of the one shape that was measured.
+
+        Measured, only the active burning at 0.5 pts/tick, both resets past
+        the horizon, 24 ticks:
+
+            pcts (96,92) resets (20h, 80h)    moves [2, 1]        settles
+            pcts (92,92) resets (500h,400h)   moves [1, 2, 1, 2]  does not
+
+        Base on both: a single move. Traced at each leg of the second shape —
+
+            t8   1->2  headroom axis   active 4.0 / best 8.0
+            t20  2->1  headroom axis   active 2.0 / best 4.0
+            t22  1->2  recovery axis   active 3.0 / best 2.0
+
+        The ratio gate is RELATIVE (`h >= active x 2`) and the spent gate
+        ABSOLUTE (`active <= 3.0`), so burn walks the pair across the boundary
+        repeatedly and each crossing re-opens a move. Extending to 120 ticks
+        stops only because both accounts hit the 99.95 burn cap, so the fourth
+        move is not a transient.
+
+        Refusing the account we most recently left bounds it: the axis may
+        still flip, but a flip cannot undo the move before it.
+        """
+        pct = {"1": 92.0, "2": 92.0}
+        seen = []
+        for _ in range(24):
+            harness.tick_with_usage({
+                "1": _usage(pct["1"], self._days_out(harness, 500)),
+                "2": _usage(pct["2"], self._days_out(harness, 400)),
+            })
+            active = harness.active_number()
+            seen.append(active)
+            pct[str(active)] = min(99.95, pct[str(active)] + 0.5)
+            harness.clock.advance(301.0)
+
+        moves = [n for i, n in enumerate(seen) if i == 0 or n != seen[i - 1]]
+        returns = [
+            moves[i + 1] for i in range(len(moves) - 1)
+            if moves[i + 1] in moves[:i + 1]
+        ]
+        assert returns == [], (
+            f"move sequence {moves} — the walk returned to an account it had "
+            "already left, so the axis flip undid the move before it"
         )
 
     def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
