@@ -5618,6 +5618,21 @@ class ClaudeAccountSwitcher:
 
         removed_items = []
 
+        # UNWIRE FIRST. purge deletes backup_dir, taking the pin record, the
+        # cert dir and the daemon state with it — but .claude.json's env block
+        # is not in there, and Claude Code applies it at boot. Left behind, it
+        # points every hand-launched `claude` at a port nothing serves, with
+        # nothing remaining that knows how to remove it: exactly the stranding
+        # clear_wiring lives in this repo to prevent. Before the rmtree, while
+        # there is still something to unwire with.
+        try:
+            from claude_swap import pin as _pin
+
+            if _pin.clear_wiring(self):
+                removed_items.append("Cloud pin wiring in .claude.json")
+        except Exception:  # noqa: BLE001 — an optional feature must not block purge
+            pass
+
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc
         # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
         data = self._get_sequence_data()
