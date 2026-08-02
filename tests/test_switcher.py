@@ -5391,12 +5391,21 @@ class TestSwitchSkipsBrokenSlots:
         the check that exists to catch it. Claude Code reads it first.
 
         `_pin_file_mode`'s own docstring names this residual: it is entered
-        only from a write whose best-effort delete may have failed. Measured,
-        one process, no hand-set state:
+        from a write that fell back, and its best-effort delete may have
+        failed. Measured, one process, no hand-set state:
 
-            after the write   use_kc=False  unreadable=False  file_ours=True
+            after the pin     use_kc=False  unreadable=False  file_ours=True
             post-clear read   value=''      unavailable=False -> GUARD PASSES
             Keychain residual still present: True
+
+        The pin is driven directly here rather than through a FAILED write.
+        Both reach the same state, but only this one survives alongside #196,
+        which records a separate `_keychain_op_failed` — after that a failed
+        write leaves a different witness, so a test written on the failure
+        path would pass in the merged tree for a reason that is not this
+        guard. The blind state is reachable with nothing having failed at all
+        (the managed-key path pins after a write that succeeded), so that is
+        the premise worth pinning.
 
         The delete already knows. It returns whether an item can still shadow
         the file, and the clear passes that up rather than the check trying to
@@ -5424,19 +5433,18 @@ class TestSwitchSkipsBrokenSlots:
         def delete_password(service, account):
             raise _kc.KeychainError("delete denied")   # the residual SURVIVES
 
-        def set_password(service, account, value):
-            raise _kc.KeychainError("write denied")    # forces the pin
-
         monkeypatch.setattr(_kc, "get_password", get_password)
         monkeypatch.setattr(_kc, "delete_password", delete_password)
-        monkeypatch.setattr(_kc, "set_password", set_password)
+        monkeypatch.setattr(_kc, "set_password", lambda *a, **k: None)
         s._store._keychain_usable_cache = True
 
-        # A write falls back to the file and pins — the state the guard is
-        # blind in. Reads still SUCCEED throughout.
-        s._store._write_oauth_credentials(
+        # File mode pinned with NOTHING having failed — the state the guard is
+        # blind in, and the one no failure flag can stand in for. Reads
+        # SUCCEED throughout.
+        s._store._write_active_credentials_file(
             json.dumps({"claudeAiOauth": {"refreshToken": "A-LIVE-REFRESH"}})
         )
+        s._store._pin_file_mode()
         assert s._store._use_keychain() is False, "premise: file mode is pinned"
         assert s._store._keychain_unreadable is False, "premise: nothing failed"
         assert get_password(*item) is not None, "premise: the residual survived"
