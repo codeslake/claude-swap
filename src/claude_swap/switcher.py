@@ -3571,7 +3571,9 @@ class ClaudeAccountSwitcher:
                 [info_by_num[num] for num in claims]
             )
             plans = self._plans_after_fetch(records, pre, info_by_num)
-            accepted = store.record(records, identities, claims, plans)
+            accepted = store.record(
+                records, identities, claims, plans, models=models
+            )
             accepted_records = {
                 num: record for num, record in records.items() if num in accepted
             }

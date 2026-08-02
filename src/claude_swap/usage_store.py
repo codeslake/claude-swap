@@ -537,6 +537,37 @@ def _failure_backoff_s(
         # not a licence to hammer a server that told us to wait: the blind
         # window is the lesser cost, and probing does not shorten it. So the
         # bound only ever removes margin we chose to add.
+        # `min(retry_after_s, asked)` and not `retry_after_s`: above
+        # RETRY_AFTER_FLOOR_CAP_S the cap has ALREADY made the wait shorter than
+        # the ask, so flooring at the raw ask would undo the cap. Using the
+        # capped value keeps the cap and lets the trust bound bite there — which
+        # it otherwise could not, because floor == asked == cap makes the whole
+        # expression inert for every trust value. Measured before: ask 4500 with
+        # a 5h reset at +600 waited the full 4500 and went blind 3900s, worse
+        # than base's 3600. The deadline is already being violated above the cap
+        # by design, so honouring the trust there costs nothing this bound
+        # claims to protect.
+        # KNOWN INERT AT AND ABOVE THE CAP, and left that way deliberately.
+        # When `retry_after_s >= RETRY_AFTER_FLOOR_CAP_S` the clip makes
+        # `asked == floor == cap`, so `max(min(cap, t), cap)` is `cap` for every
+        # `t` and the trust bound cannot bite — measured, ask 4500 with the
+        # trust ending at +600 waits the full 4500 and is blind 3900s, against
+        # base's 3600.
+        #
+        # Every alternative measured worse. Dropping the floor there (`if
+        # retry_after_s < asked`) sends that same case to 600s — 3900s EARLIER
+        # than the server's deadline, drawing a fresh 429 and the probe train
+        # regression (a) exists to prevent. Flooring at `cap - 1` yields 4499,
+        # which is an arbitrary constant that still ignores the trust.
+        #
+        # The band is outside this code's evidence: 37 of 39 observed blocks
+        # opened at exactly 3600, and RETRY_AFTER_FLOOR_CAP_S is sized as
+        # 3600 + MARGIN precisely so the measured shape never reaches it. Above
+        # it the constant's own docstring already accepts one guaranteed 429 as
+        # the price of bounding a pathological header. Recording the gap rather
+        # than trading a measured regression for an unmeasured one; if real
+        # blocks ever open at hour-plus scale, this is the second thing to fix
+        # after raising the cap.
         asked = max(min(asked, trust_expires_in_s), min(retry_after_s, asked))
     return max(asked, computed)
 
@@ -770,6 +801,7 @@ class UsageStore:
         identities: dict[str, Identity],
         claims: dict[str, str] | None = None,
         plans: dict[str, tuple[float | None, float | None]] | None = None,
+        models: tuple[str, ...] = (),
     ) -> set[str]:
         """Merge outcomes fenced by the leases that produced them.
 
@@ -849,7 +881,16 @@ class UsageStore:
                     stored = row.get("lastGood")
                     fetched_at = row.get("fetchedAt")
                     bounds = []
-                    soonest = _earliest_reset(stored)
+                    # `models` matters: `entries()` honours the configured
+                    # per-model windows when it bounds trust, so a scoped
+                    # window that ENDS the trust must be visible here too.
+                    # Defaulting to () made it invisible, and the margin then
+                    # overshot exactly the window that had already killed the
+                    # data — measured with --model Fable, 5h at +7200 and Fable
+                    # at +3700: base 3600s wait and 0 blind, head 4500s and 800
+                    # blind. 384 scoped cases blind-worse than base, 147 newly
+                    # blind.
+                    soonest = _earliest_reset(stored, models)
                     if soonest is not None:
                         bounds.append(soonest - now)
                     if isinstance(fetched_at, (int, float)):

@@ -994,21 +994,30 @@ class TestAdaptiveScheduler:
         st.record({"1": FetchRecord(usage={
             "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 14400)},
             "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 400000)},
-            "scoped": [{"model": "Fable", "pct": 60.0,
+            "scoped": [{"name": "Fable", "pct": 60.0,
                         "resets_at": _iso_at(t0 + 1800)}],
         })}, ident)
-        st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
-
-        entry = st.entries(ident, models=("Fable",))["1"]
-        assert entry.backoff_until - t0 <= 3600.0 + RETRY_AFTER_MARGIN_S, (
-            "premise"
+        # `models` exactly as `_collect_usage_entries` passes it — the only
+        # path production reaches. Omitting it here is what let the typo'd
+        # scoped key hide: the window was invisible to BOTH sides, so the
+        # assertion held for the wrong reason.
+        st.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)},
+            ident,
+            models=("Fable",),
         )
-        h.clock.now = t0 + 1800
-        e = st.entries(ident, models=("Fable",))["1"]
-        assert not (e.decision_value() is None and e.in_backoff(h.clock.now)), (
-            "the scoped window ended the trust while the row was still in "
-            "backoff — un-pollable AND unknown, which the backoff bound was "
-            "supposed to prevent"
+
+        # No MARGIN past the scoped window. The deadline itself still stands —
+        # a reset sooner than the block cannot shorten a wait the server named,
+        # and the resulting blind span is the lesser cost (see
+        # test_the_trust_bound_never_shortens_the_wait_below_the_ask). What
+        # must not happen is the row parking 900s PAST the ask on the strength
+        # of a 5h window whose scoped sibling died first.
+        entry = st.entries(ident, models=("Fable",))["1"]
+        waited = entry.backoff_until - t0
+        assert waited <= 3600.0, (
+            f"waited {waited:.0f}s — took the full margin past a scoped window "
+            f"that ends the trust at +1800, so the bound never saw it"
         )
 
     def test_consecutive_blocks_do_not_walk_the_row_into_blindness(
