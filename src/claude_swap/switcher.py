@@ -5733,9 +5733,7 @@ class ClaudeAccountSwitcher:
                     target_account, target_email
                 )
                 backup_unreadable = (
-                    not target_creds
-                    and self.platform == Platform.MACOS
-                    and self._store._keychain_unreadable
+                    not target_creds and self._store._keychain_unreadable
                 )
                 target_config = self._read_account_config(target_account, target_email)
                 if not target_creds:
