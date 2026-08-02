@@ -8870,6 +8870,37 @@ class TestStoreResolutionParity:
             result = s.consume_backup_grant("1", "test@example.com", creds)
         assert result.credentials == fresh
 
+    def test_a_secure_store_miss_does_not_capture_the_other_profiles_key(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The API-key tail must stay inside the profile claude is reading.
+
+        The secure-store branch refuses to fall back into the active store,
+        because with the two vars diverged that captures a profile claude is
+        not reading. The shared tail below it does exactly that: it reads
+        ``primaryApiKey`` through ``get_global_config_path()``, which follows
+        ``CLAUDE_CONFIG_DIR``. So a miss in the secure store — which claude
+        sees as a logged-out environment — captures the OTHER profile's key.
+
+        The tail cannot be reached by the secure profile's own key either:
+        ``read_config_dir_credentials`` is OAuth-only (keychain +
+        ``.credentials.json``) and never looks at ``primaryApiKey``.
+        """
+        active = temp_home / "profileA"
+        secure = temp_home / "profileB"
+        active.mkdir()
+        secure.mkdir()
+        (active / ".claude.json").write_text(
+            json.dumps({"primaryApiKey": "sk-ant-api-PROFILE-A"})
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(active))
+        monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(secure))
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+
+        assert s._read_capture_credentials() != "sk-ant-api-PROFILE-A"
+
 
 class TestConsumeGateLockFailures:
     """Review findings 1+2: LockError before the POST is a clean transient;
