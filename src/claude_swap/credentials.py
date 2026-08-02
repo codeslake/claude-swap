@@ -313,6 +313,26 @@ class CredentialStore:
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
 
+    @property
+    def _keychain_unreadable(self) -> bool:
+        """The Keychain cannot be asked — so an empty read proves nothing.
+
+        True only when a Keychain op FAILED. A file mode :meth:`_pin_file_mode`
+        chose is excluded: nothing failed there, we wrote the credential to the
+        file deliberately, and that file is the authority — an empty read means
+        the slot really is empty.
+
+        One predicate, because the two facts have been conflated once per site
+        that spelled them out separately: every caller that means "unreadable"
+        must ask here rather than read ``_keychain_usable_cache`` raw. The
+        platform check belongs here for the same reason — off macOS there is no
+        Keychain to be unreadable, and only every call path being macOS-gated
+        keeps the cache at ``None`` there today.
+        """
+        if self._host.platform != Platform.MACOS:
+            return False
+        return self._keychain_usable_cache is False and not self._file_mode_is_ours
+
     def _read_credentials(self) -> str | None:
         """Read Claude Code's active credential — OAuth *or* managed API key (value).
 
@@ -376,20 +396,10 @@ class CredentialStore:
             val, keychain_failed = self._read_active_oauth_keychain()
             if val:
                 return ActiveCredentials(val, False)
-        elif self._host.platform == Platform.MACOS and not self._file_mode_is_ours:
+        elif self._keychain_unreadable:
             # Keychain already known unusable this process (a prior op failed and the
             # capability cache stuck to file mode): if nothing is found below, that
             # absence is "keychain unavailable", not a genuinely empty slot.
-            #
-            # Excludes a file mode WE pinned. There the premise is inverted:
-            # nothing failed, we wrote the credential to the file deliberately
-            # and deleted the Keychain item, and that file is what Claude Code
-            # reads too — so it is the authority, not a copy that may be behind.
-            # Without this the two conditions share one flag, and because
-            # _pin_file_mode is permanent by design a single file-mode write
-            # would defer every active-token refresh for the rest of the
-            # process (measured: the guard in _fetch_active_usage fires on
-            # every subsequent collect pass).
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
@@ -923,16 +933,8 @@ class CredentialStore:
             return "", False
         # The read above already consulted the Keychain; a raising read
         # flipped the capability cache to file mode, while an rc-44
-        # "not found" answered cleanly and left it usable. A cache pinned
-        # False (now or by an earlier op) means the Keychain cannot be
-        # asked — the backup may exist unseen, so report unreadable.
-        # Excludes a file mode WE pinned, exactly as _read_active_credentials
-        # does: there nothing failed, we wrote the credential to the file
-        # deliberately, and that file is the authority. Sharing the raw flag
-        # made one deliberate file-mode write report every genuinely empty
-        # backup as unreadable for the rest of the process — and the consume
-        # gate answers "transient" for a slot that simply has no backup.
-        if self._keychain_usable_cache is False and not self._file_mode_is_ours:
+        # "not found" answered cleanly and left it usable.
+        if self._keychain_unreadable:
             return "", True
         return "", False
 
