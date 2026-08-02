@@ -2863,6 +2863,63 @@ class TestLiveLock:
         engine.stop()          # and again, serially
         assert engine._live_lock is None
 
+    def test_a_sigterm_inside_the_switch_does_not_free_live_mid_switch(
+        self, harness
+    ):
+        """`own_tick` skips the wait — it must not also skip the protection.
+
+        A signal handler runs on the main thread inside the frame it
+        interrupts, so a SIGTERM delivered while `_perform` is inside
+        `switch_to` has `own_tick` True. Waiting there would deadlock, which is
+        why the check exists. But returning immediately releases LIVE in the
+        middle of a credential rewrite, and a successor — systemd
+        `stop`/`start`, or a relaunched `cswap auto` — claims it and acts. That
+        is the exact race the lock exists to prevent, reached through the
+        handover instead of two TUIs.
+
+        The shipped `own_tick` test only asserts `stop()` was FAST, which this
+        satisfies while losing the lock.
+
+        Asserts on the LOCK during the switch, not on `stop()`'s duration: a
+        release deferred to the end of the tick is both fast and safe, and only
+        a lock check can tell the two apart.
+        """
+        engine = harness.engine
+        held_during_switch: list[bool] = []
+        released: list[bool] = []
+
+        class _Lock:
+            def release(self):
+                released.append(True)
+
+        engine._live_lock = _Lock()
+
+        real_switch = harness.switcher.switch_to
+
+        def switch_then_sigterm(number, **kw):
+            engine.stop()          # the handler, on this very thread
+            held_during_switch.append(engine._live_lock is not None)
+            return real_switch(number, **kw)
+
+        with patch.object(
+            harness.switcher, "switch_to", switch_then_sigterm
+        ), patch.object(
+            harness.switcher, "usage_entries_by_account",
+            return_value={
+                num: _entry_for(value, harness.clock.now)
+                for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+            },
+        ):
+            engine.tick()
+
+        assert held_during_switch == [True], (
+            "LIVE was released while switch_to was still running; a successor "
+            "can claim it and switch again inside one window"
+        )
+        assert released == [True], (
+            "the deferred release never ran — the lock outlives the engine"
+        )
+
     def test_the_release_warning_survives_a_consumer_that_cannot_take_it(
         self, harness, caplog
     ):
