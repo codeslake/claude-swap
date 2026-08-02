@@ -260,12 +260,6 @@ class CredentialStore:
         # "The Keychain answers" and "this active read succeeded" are different
         # facts; `degraded` needs the second.
         self._active_read_failed: bool = False
-        # Set by the backup read when THIS read could not reach the Keychain,
-        # consumed by _read_account_credentials_ex. Per-read, not a capability:
-        # whether a particular backup was readable is a fact about that read,
-        # and the process-wide flag it used to consult answers a different
-        # question and is overwritten by unrelated events (see _ex).
-        self._backup_read_failed: bool = False
         # What _pin_file_mode OBSERVED about the residual active Keychain item.
         # None: never pinned. True: the delete returned, so nothing can shadow
         # the file. False: the delete could not run, so the file may be the
@@ -1001,7 +995,9 @@ class CredentialStore:
             )
         self._write_backup_enc(account_num, email, credentials)
 
-    def _read_account_credentials(self, account_num: str, email: str) -> str:
+    def _read_account_credentials(
+        self, account_num: str, email: str, failed: list | None = None
+    ) -> str:
         """Read account credentials from backup. ``""`` when missing.
 
         macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
@@ -1037,11 +1033,16 @@ class CredentialStore:
             try:
                 return self._kc_read_backup(account_num, email)
             except macos_keychain.KEYCHAIN_ERRORS as e:
-                # Record the observation for _read_account_credentials_ex. THIS
-                # read is the only thing that knows whether THIS backup could be
-                # reached; a process-wide capability flag answers a different
-                # question and gets overwritten by unrelated events.
-                self._backup_read_failed = True
+                # THIS read is the only thing that knows whether THIS backup
+                # could be reached. Reported through the caller's list rather
+                # than an instance flag: the flag was shared by every thread
+                # on the store, and the window between clearing it and reading
+                # it back spans a ~10-50ms `security` subprocess. Measured with
+                # one sibling reader, slot 2 genuinely denied: 2 of 60 reads
+                # came back "readable", and the consume gate then POSTs a
+                # possibly-spent grant.
+                if failed is not None:
+                    failed.append(True)
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
 
@@ -1058,8 +1059,8 @@ class CredentialStore:
         "keychain unavailable — retry from a GUI session" instead of
         nudging the user into an unnecessary re-add/re-login.
         """
-        self._backup_read_failed = False
-        value = self._read_account_credentials(account_num, email)
+        failed: list = []
+        value = self._read_account_credentials(account_num, email, failed)
         if value:
             return value, False
         if self._host.platform != Platform.MACOS:
@@ -1092,18 +1093,13 @@ class CredentialStore:
         # a stale True there would defer forever.
         #
         # NO TEST SEPARATES THIS FROM `_keychain_unreadable` today, and that is
-        # worth stating: `_kc_read_backup` routes through `_kc_call`, so a
-        # FAILING backup read sets both flags and a SUCCEEDING one clears the
-        # process flag before this line reads it. The two therefore agree on
-        # every state currently reachable, and swapping this for
-        # `_keychain_unreadable` leaves the suite green (measured, 1787
-        # passed). The per-read flag is still the correct one — it answers
-        # about THIS read rather than about the process — and it is what will
-        # keep answering correctly if `_kc_call`'s clearing ever narrows. Kept
-        # as the right shape rather than removed for being currently
-        # indistinguishable, and recorded so nobody re-derives that as a
-        # finding.
-        return "", self._backup_read_failed
+        # worth stating: `_kc_read_backup` routes through `_kc_call`, so the
+        # process flag agrees on every state a SINGLE thread can reach, and
+        # swapping this for `_keychain_unreadable` leaves the suite green on
+        # one thread. Concurrently it does not: the sentinel calls this seam
+        # unlocked while the consume gate holds a per-slot lock, and the TUI
+        # runs three workers on one store.
+        return "", bool(failed)
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
