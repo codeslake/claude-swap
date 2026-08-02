@@ -3664,6 +3664,35 @@ class TestHorizonAxisDoesNotFlap:
         )
         assert outcome is not TickOutcome.SWITCHED
 
+    def test_past_the_horizon_headroom_decides_before_the_reset(self, harness):
+        """Tier 1 is `(1, -h, recovery_ts)` — headroom leads, reset breaks ties.
+
+        Past the horizon the reset is days out either way, so it cannot be the
+        thing that decides; the headroom is the only resource that still does
+        work this session. The reset stays in the key so two equal-headroom
+        peers do not tie into sequence order.
+
+        Nothing pinned the ORDER: swapping to `(1, recovery_ts, -h)` left the
+        whole suite green. The one test that touches the tier uses EQUAL
+        headroom (92/92), where both orderings agree — it kills the
+        hard-coded-`0.0` mutant and not this one.
+
+        Sweep over 23328 three-account shapes: 2040 change answer. The shape
+        below is one, and the trade the reset-first key makes is 2 points of
+        headroom for a reset 10 hours sooner, on a pair that both return
+        within a day.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._days_out(harness, 20)),     # active, 1 left
+            "2": _usage(98, self._days_out(harness, 10)),     # 2 left, sooner
+            "3": _usage(96, self._days_out(harness, 20)),     # 4 left
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3, (
+            f"landed on {harness.active_number()} — the reset outranked twice "
+            "the headroom, past a horizon where neither reset is near"
+        )
+
     def test_a_burn_walk_settles_instead_of_oscillating(self, harness):
         """A-B-A under burn is the fleet changing regime, not a gate leaking.
 
