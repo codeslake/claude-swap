@@ -449,7 +449,6 @@ def _failure_backoff_s(
     retry_after_s: float | None,
     *,
     rate_limited: bool = True,
-    trust_expires_in_s: float | None = None,
 ) -> float:
     computed = min(
         BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
@@ -494,105 +493,25 @@ def _failure_backoff_s(
         # past TRUST_MAX_AGE_S as the margin would have. The bound belongs to
         # the path, not to the margin.
         asked = min(asked, TRUST_MAX_AGE_S)
-    if trust_expires_in_s is not None:
-        # THE 429 CEILING IS NOT A CONSTANT. `_rate_limited_trust_ok` returns
-        # `now < min(earliest future reset, ceiling)`, and a 5-hour window
-        # routinely resets sooner than RETRY_AFTER_FLOOR_CAP_S. Bounding the
-        # margin by the 7200s FALLBACK therefore bounded it by a number that
-        # usually does not apply, and the row was parked past the moment its
-        # own data went obsolete — un-pollable (still in backoff) AND untrusted
-        # (window rolled over), which the unhealthy-tick counter converts into
-        # a failover away from a healthy account.
-        #
-        # Measured: one success carrying a 5h reset at t0+3660, then a 429 with
-        # Retry-After 3600 -> backoff to t0+4500, blind from 3660 to 4500 =
-        # 840s. Base 9f35426 waits the 3600 it was asked and is pollable AT the
-        # reset, so the margin introduced this rather than inheriting it.
-        #
-        # The caller passes what it already knows from the stored row, so the
-        # bound is the trust that actually governs THIS row rather than a
-        # constant that governs some rows. `None` means the caller could not
-        # see one; the constant bounds above still apply.
-        #
-        # FLOORED AT THE ASK. The bound may take back the MARGIN we added; it
-        # may not take back the server's deadline. Applied as a bare `min` it
-        # did both, and a reset sooner than the block made the wait SHORTER
-        # than Retry-After:
-        #
-        #     reset      wait   asked   short by
-        #     +2400      2400    3600     1200
-        #     +1200      1200    3600     2400
-        #     +10          30    3600     3570
-        #     -50          30    3600     3570   <- bare exponential curve
-        #
-        # And it compounds: Retry-After counts down to a fixed deadline, so
-        # each early retry draws a fresh 429 with a smaller ask, which the
-        # bound shortens again. Measured through the real reserve()/record()
-        # path: 8 granted fetches inside one block against base's 1, and 11
-        # with a reset already past — 30-40% of the documented hourly request
-        # budget spent on an account we know is blocked.
-        #
-        # A reset sooner than the block means the data goes obsolete before the
-        # server will talk to us again. That is a reason to DISTRUST the row,
-        # not a licence to hammer a server that told us to wait: the blind
-        # window is the lesser cost, and probing does not shorten it. So the
-        # bound only ever removes margin we chose to add.
-        # `min(retry_after_s, asked)` and not `retry_after_s`: above
-        # RETRY_AFTER_FLOOR_CAP_S the cap has ALREADY made the wait shorter than
-        # the ask, so flooring at the raw ask would undo the cap. Using the
-        # capped value keeps the cap and lets the trust bound bite there — which
-        # it otherwise could not, because floor == asked == cap makes the whole
-        # expression inert for every trust value. Measured before: ask 4500 with
-        # a 5h reset at +600 waited the full 4500 and went blind 3900s, worse
-        # than base's 3600. The deadline is already being violated above the cap
-        # by design, so honouring the trust there costs nothing this bound
-        # claims to protect.
-        # KNOWN INERT AT AND ABOVE THE CAP, and left that way deliberately.
-        # When `retry_after_s >= RETRY_AFTER_FLOOR_CAP_S` the clip makes
-        # `asked == floor == cap`, so `max(min(cap, t), cap)` is `cap` for every
-        # `t` and the trust bound cannot bite — measured, ask 4500 with the
-        # trust ending at +600 waits the full 4500 and is blind 3900s, against
-        # base's 3600.
-        #
-        # Every alternative measured worse. Dropping the floor there (`if
-        # retry_after_s < asked`) sends that same case to 600s — 3900s EARLIER
-        # than the server's deadline, drawing a fresh 429 and the probe train
-        # regression (a) exists to prevent. Flooring at `cap - 1` yields 4499,
-        # which is an arbitrary constant that still ignores the trust.
-        #
-        # The band is outside this code's evidence: 37 of 39 observed blocks
-        # opened at exactly 3600, and RETRY_AFTER_FLOOR_CAP_S is sized as
-        # 3600 + MARGIN precisely so the measured shape never reaches it. Above
-        # it the constant's own docstring already accepts one guaranteed 429 as
-        # the price of bounding a pathological header. Recording the gap rather
-        # than trading a measured regression for an unmeasured one; if real
-        # blocks ever open at hour-plus scale, this is the second thing to fix
-        # after raising the cap.
-        # THE TRIM APPLIES ONLY WHERE IT CAN REACH THE ASK. Below the deadline
-        # the floor holds anyway, so `max(min(asked, trust), floor)` returned
-        # `trust` — a value strictly inside (deadline, deadline + MARGIN), which
-        # is the re-block band this margin exists to clear. RETRY_AFTER_MARGIN_S
-        # is 900 because 10 of 19 measured lapses re-blocked at +2s..+716s past
-        # their own deadline, each earning a fresh hour; landing at +100 or +800
-        # walks straight back in.
-        #
-        # Measured (--model Fable, scoped window binding, ask 3600), mean blind
-        # seconds under the PR's own re-block model:
-        #
-        #     scoped reset   base    unconfined trim   confined (here)
-        #     +3700          4042         4095             800
-        #     +4000          3885         4095             500
-        #     +4400          3675         4095             100
-        #
-        # Buying <=900s of trust for a full extra hour of blindness is the wrong
-        # trade, and it is worse than base. So the trim fires only when the
-        # trust genuinely expires BEFORE the deadline — the case it was added
-        # for, where nothing can be salvaged by waiting longer.
-        #
-        # The floor is untouched, so the wait is still never below the ask and
-        # the early-retry train stays fixed.
-        if trust_expires_in_s < retry_after_s:
-            asked = min(retry_after_s, asked)
+    # NO TRUST TRIM. Shortening a 429 wait when the stored trust expires
+    # before the server's deadline was measured wrong and removed.
+    #
+    # It cannot salvage the trust it is named for: the precondition is
+    # `trust < ask` and the floor keeps `wait >= ask`, so the row is untrusted
+    # at release either way. Measured over 180 reachable reset offsets: fired
+    # 35 times, salvaged trust 0 times, both waits releasing with the row
+    # unknown at every one.
+    #
+    # Its only effect was to drop the wait onto the deadline, which is where
+    # this PR's evidence says we re-block 10 of 19 times for a fresh hour.
+    # Episode model on that number, 3600 runs:
+    #
+    #     with the trim    blind 1148s   requests 1.21
+    #     without it       blind  550s   requests 1.00
+    #
+    # Most it could save was RETRY_AFTER_MARGIN_S (900s); expected cost of a
+    # firing is 0.526 x 3600 = 1895s, compounding because each re-block leaves
+    # the trust further expired.
     return max(asked, computed)
 
 
@@ -825,7 +744,6 @@ class UsageStore:
         identities: dict[str, Identity],
         claims: dict[str, str] | None = None,
         plans: dict[str, tuple[float | None, float | None]] | None = None,
-        models: tuple[str, ...] = (),
     ) -> set[str]:
         """Merge outcomes fenced by the leases that produced them.
 
@@ -900,34 +818,10 @@ class UsageStore:
                 # ceilings and a reader should not have to re-derive that the
                 # inner clamp saves them; recorded as unfalsifiable rather than
                 # dressed up with a test that passes either way.
-                trust_left: float | None = None
-                if rec.error == "http-429":
-                    stored = row.get("lastGood")
-                    fetched_at = row.get("fetchedAt")
-                    bounds = []
-                    # `models` matters: `entries()` honours the configured
-                    # per-model windows when it bounds trust, so a scoped
-                    # window that ENDS the trust must be visible here too.
-                    # Defaulting to () made it invisible, and the margin then
-                    # overshot exactly the window that had already killed the
-                    # data — measured with --model Fable, 5h at +7200 and Fable
-                    # at +3700: base 3600s wait and 0 blind, head 4500s and 800
-                    # blind. 384 scoped cases blind-worse than base, 147 newly
-                    # blind.
-                    soonest = _earliest_reset(stored, models)
-                    if soonest is not None:
-                        bounds.append(soonest - now)
-                    if isinstance(fetched_at, (int, float)):
-                        bounds.append(
-                            fetched_at + RATE_LIMIT_TRUST_MAX_AGE_S - now
-                        )
-                    if bounds:
-                        trust_left = min(bounds)
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures,
                     rec.retry_after_s,
                     rate_limited=rec.error == "http-429",
-                    trust_expires_in_s=trust_left,
                 )
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no

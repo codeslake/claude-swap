@@ -3844,9 +3844,9 @@ class TestDeadTokenQuarantine:
         """`models=models` at the record call site, not the default `()`.
 
         `entries()` honours the configured per-model windows when it bounds
-        429 trust, so a scoped window that ENDS the trust must be visible to
-        the BACKOFF too. Defaulted to `()` the window is invisible and the
-        margin overshoots exactly the data it had already killed.
+        429 trust, so a scoped window that ENDS the trust must be visible
+        wherever that trust is computed. Defaulted to `()` the window is
+        invisible and the row keeps serving data its own reset already killed.
 
         Store-level tests pass `models=` themselves, so they hold with the
         wiring cut. Measured: mutating this call site to `models=()` left the
@@ -3854,8 +3854,10 @@ class TestDeadTokenQuarantine:
         production reaches.
 
         Unscoped windows sit far out; the Fable window resets in 30 minutes.
-        Trust ends there, well before the 3600s ask, so the trim fires and the
-        wait must be the bare deadline rather than deadline + margin.
+        Asserted on what the row SERVES, not on the wait: the wait is the
+        server's deadline plus the margin either way. An earlier revision
+        trimmed it back to the deadline when the trust expired first, which was
+        measured wrong — see `test_the_trust_bound_never_shortens_a_429_wait`.
         """
         from datetime import datetime, timezone
 
@@ -3899,13 +3901,24 @@ class TestDeadTokenQuarantine:
             switcher._collect_usage_entries(info, fetch={"2"})
         run.assert_called_once()   # premise: the 429 actually went through record()
 
+        assert store.entries(ident, ("Fable",))["2"].backoff_until is not None, (
+            "premise: a backoff was recorded"
+        )
+        # Move the scoped window's reset into the PAST — the state a real
+        # clock reaches 30 minutes later — while the unscoped windows stay far
+        # ahead. Only a bound that sees the configured models ends the trust.
+        with store.path.open() as fh:
+            table = json.load(fh)
+        row = table["accounts"]["2"]
+        row["lastGood"]["scoped"][0]["resets_at"] = iso(-60.0 / 3600.0)
+        row["fetchedAt"] -= 1860.0
+        store.path.write_text(json.dumps(table))
+
         entry = store.entries(ident, ("Fable",))["2"]
-        assert entry.backoff_until is not None, "premise: a backoff was recorded"
-        waited = entry.backoff_until - time.time()
-        assert waited <= 3600.0 + 5.0, (
-            f"waited {waited:.0f}s — took the margin past a scoped window that "
-            "ends the trust at +1800s, so the collector never handed its "
-            "configured models to the bound"
+        assert entry.decision_value() is None, (
+            f"the row still serves last_good (trust_extended="
+            f"{entry.trust_extended}) although its scoped window has reset — "
+            "the collector never handed its configured models to the bound"
         )
 
     def test_readd_clears_quarantine(self, temp_home):

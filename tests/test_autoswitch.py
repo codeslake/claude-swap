@@ -970,25 +970,23 @@ class TestAdaptiveScheduler:
                 f"draws another 429"
             )
 
-    def test_the_backoff_bound_sees_the_same_scoped_windows_trust_does(
-        self, temp_home
-    ):
-        """`record()` passed `models=()`, so a scoped reset bounded trust only.
+    def test_the_margin_is_not_traded_away_for_a_dead_scoped_window(self, temp_home):
+        """A scoped window that already ended the trust does not shorten the wait.
 
-        `entries()` takes the configured model names and `_rate_limited_trust_ok`
-        honours their per-model window resets. `record()` called
-        `_earliest_reset` with the default `()`, so the window that actually
-        ends the trust was invisible to the backoff — and the margin then made
-        the blind span WORSE than base for scoped-model users.
+        An earlier revision trimmed the ask back to the deadline here, on the
+        reasoning that parking past a dead trust bought blindness for nothing.
+        Measured, the trim never salvaged the trust — the row is unknown at
+        release either way (see
+        `test_a_429_wait_is_the_deadline_plus_the_margin`) — while landing on
+        the deadline re-blocks 10 of 19 times for a fresh hour.
 
-        Measured, 5h at +14400, 7d at +400000, scoped Fable at +1800:
-
-            head   backoff +4500, Fable trust dies +1800  -> blind 2700s
-            base   backoff +3600                          -> blind 1800s
+        So the wait stays deadline + margin whatever the scoped window says.
+        What the scoped window still decides is whether the row SERVES its
+        last_good, which `entries(models=...)` answers.
         """
-        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
+        from claude_swap.usage_store import FetchRecord
 
-        h = EngineHarness(temp_home, model="Fable")
+        h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
         st = h.switcher._usage_store
         t0 = h.clock.now
@@ -999,27 +997,11 @@ class TestAdaptiveScheduler:
             "scoped": [{"name": "Fable", "pct": 60.0,
                         "resets_at": _iso_at(t0 + 1800)}],
         })}, ident)
-        # `models` exactly as `_collect_usage_entries` passes it — the only
-        # path production reaches. Omitting it here is what let the typo'd
-        # scoped key hide: the window was invisible to BOTH sides, so the
-        # assertion held for the wrong reason.
-        st.record(
-            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)},
-            ident,
-            models=("Fable",),
-        )
-
-        # No MARGIN past the scoped window. The deadline itself still stands —
-        # a reset sooner than the block cannot shorten a wait the server named,
-        # and the resulting blind span is the lesser cost (see
-        # test_the_trust_bound_never_shortens_the_wait_below_the_ask). What
-        # must not happen is the row parking 900s PAST the ask on the strength
-        # of a 5h window whose scoped sibling died first.
-        entry = st.entries(ident, models=("Fable",))["1"]
-        waited = entry.backoff_until - t0
-        assert waited <= 3600.0, (
-            f"waited {waited:.0f}s — took the full margin past a scoped window "
-            f"that ends the trust at +1800, so the bound never saw it"
+        st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
+        waited = st.entries(ident, models=("Fable",))["1"].backoff_until - t0
+        assert waited == 4500.0, (
+            f"waited {waited:.0f}s — the wait is the server's deadline plus "
+            "the margin, and a dead scoped window does not buy it back"
         )
 
     def test_the_trim_never_lands_inside_the_re_block_band(self, temp_home):
@@ -1057,10 +1039,9 @@ class TestAdaptiveScheduler:
                 "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 30 * 86400)},
                 "scoped": [{"name": "Fable", "pct": 60.0,
                             "resets_at": _iso_at(t0 + scoped)}],
-            })}, ident, models=("Fable",))
+            })}, ident)
             st.record(
-                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)},
-                ident, models=("Fable",),
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
             )
             waited = st.entries(ident, models=("Fable",))["1"].backoff_until - t0
             assert not (3600.0 < waited < 3600.0 + RETRY_AFTER_MARGIN_S), (
@@ -1069,30 +1050,16 @@ class TestAdaptiveScheduler:
                 f"margin — inside the measured re-block band"
             )
 
-    def test_consecutive_blocks_do_not_walk_the_row_into_blindness(
-        self, temp_home
-    ):
-        """The trust is `min(soonest reset, AGE ceiling)` — bound BOTH halves.
+    def test_a_re_block_chain_does_not_shorten_its_own_waits(self, temp_home):
+        """Every block in a chain waits the deadline plus the margin.
 
-        `record()` computed only the reset half. `age_s` runs from `fetchedAt`,
-        which a failure never advances, so consecutive blocks walk the ceiling
-        down while the backoff stays at the cap. Measured, far reset so only
-        the ceiling binds, three 3600s blocks back to back:
-
-            block  now      backoff      trust ends    blind
-              0     +0       +4500         +7200          0
-              1   +4500      +9000         +7200       1800
-              2   +9000     +13500         +7200       6300
-
-        The PR body documents 10 of 19 lapses re-blocking, so consecutive
-        blocks are the measured shape rather than a corner. Blindness is what
-        the unhealthy-tick counter converts into a failover off a healthy
-        account, which is the failure this whole bound exists to prevent.
+        The chain is the measured shape — 10 of 19 lapses re-blocked — and it
+        is exactly where landing on the deadline costs a fresh hour each time.
+        An earlier revision shortened later blocks because `fetchedAt` never
+        advances on failure, so the computed trust shrank by each previous
+        wait; that is the trim this PR removed.
         """
-        from claude_swap.usage_store import (
-            RATE_LIMIT_TRUST_MAX_AGE_S,
-            FetchRecord,
-        )
+        from claude_swap.usage_store import FetchRecord
 
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -1104,18 +1071,18 @@ class TestAdaptiveScheduler:
             "seven_day": {"pct": 0.0},
         })}, ident)
 
-        for block in range(3):
+        for block in range(4):
             st.record(
                 {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
             )
             e = st.entries(ident)["1"]
-            trust_ends = e.fetched_at + RATE_LIMIT_TRUST_MAX_AGE_S
-            assert e.backoff_until <= max(trust_ends, h.clock.now + 3600.0), (
-                f"block {block}: backoff to t0+{e.backoff_until - t0:.0f}s but "
-                f"trust ends t0+{trust_ends - t0:.0f}s — "
-                f"{e.backoff_until - trust_ends:.0f}s un-pollable AND unknown"
+            waited = e.backoff_until - h.clock.now
+            assert waited == 4500.0, (
+                f"block {block}: waited {waited:.0f}s — a later block took a "
+                "shorter wait than the first, which lands on the deadline the "
+                "margin exists to clear"
             )
-            h.clock.now = e.backoff_until
+            h.clock.advance(waited)
 
     def test_a_non_429_recorded_through_record_does_not_take_the_margin(
         self, temp_home
