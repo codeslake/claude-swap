@@ -677,6 +677,160 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         assert "○ cloud" not in account_card_text(acc, 80).plain
 
 
+class TestTheRollbackVerdictIsNotFooledByShape:
+    """The seam's reader and the package's writer must agree on shape.
+
+    ``_pinned_email_now`` returned the org uuid raw (None when the key is
+    absent) while ``cswap_pin.save_pin`` always writes ``org_uuid or ""``. So
+    restoring a record that had no org key produced ``(email, "")`` against a
+    ``before`` of ``(email, None)`` — unequal — and a SUCCESSFUL rollback
+    reported itself as a failure, sending the user to check a state the code
+    could already disprove. Exactly what _restore_pin was written to stop.
+    """
+
+    def test_a_record_with_no_org_key_rolls_back_cleanly(self, tmp_path):
+        import json as _json
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        settings = backup / "settings.json"
+        # No org key at all — what an older writer or a hand-edit leaves.
+        settings.write_text(_json.dumps({"remoteControl": {"pinnedEmail": "old@e.com"}}))
+
+        def _apply(sw, email, org):
+            # Faithful to the package: it always writes `org_uuid or ""`.
+            raw = _json.loads(settings.read_text())
+            if email:
+                raw["remoteControl"] = {
+                    "pinnedEmail": email, "pinnedOrganizationUuid": org or "",
+                }
+            else:
+                raw.pop("remoteControl", None)
+            settings.write_text(_json.dumps(raw))
+            raise RuntimeError("pin-proxy")
+
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            resolve_account=lambda a: ("2", "new@e.com", "org"),
+            _account_kind=lambda n: "oauth",
+        )
+        real = pin._impl
+        pin._impl = lambda: types.SimpleNamespace(apply_pin=_apply)
+        try:
+            ok, msg = pin.set_pin(sw, "new@e.com", "org", num="2")
+        finally:
+            pin._impl = real
+
+        assert not ok
+        assert pin._pinned_email_now(sw)[0] == "old@e.com", "the rollback failed"
+        # The verdict must MATCH the record it just re-read.
+        assert "may still name" not in msg, (
+            "a successful rollback was reported as a failure — the reader and "
+            f"the writer disagree on shape: {msg}"
+        )
+        assert "the previous pin is unchanged" in msg, msg
+
+
+class TestTheTwoWiringPredicatesAgree:
+    """"Is it wired" is asked in two places, and they must not disagree.
+
+    ``_wiring_present`` gates the launch path and the TUI row;
+    ``_clear_wiring_locked`` decides whether there is anything to remove. One
+    accepted any truthy marker, the other required a non-empty list — so a
+    malformed marker satisfied the first and not the second, and `--clear`
+    reported "could not remove the wiring, re-run once it frees up" forever:
+    nothing contended, nothing converging.
+    """
+
+    def _cfg(self, tmp_path, monkeypatch, mark):
+        import json as _json
+
+        import claude_swap.paths as paths
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({"env": {"HTTPS_PROXY": "x"}, "_cswapPinWiredKeys": mark}))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        return cfg
+
+    @pytest.mark.parametrize(
+        "mark", ["NOT-A-LIST", [], {}, 7], ids=["str", "empty", "dict", "int"]
+    )
+    def test_a_malformed_marker_is_not_wired_to_either(
+        self, tmp_path, monkeypatch, mark
+    ):
+        import types
+
+        from claude_swap import pin
+
+        self._cfg(tmp_path, monkeypatch, mark)
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+        assert pin._wiring_present(sw) is False, (
+            f"{mark!r} reads as wired, but clear_wiring cannot remove it — "
+            "the clear never converges"
+        )
+        assert pin.clear_wiring(sw) is False
+
+    def test_a_real_marker_is_wired_to_both(self, tmp_path, monkeypatch):
+        import types
+
+        from claude_swap import pin
+
+        self._cfg(tmp_path, monkeypatch, ["HTTPS_PROXY"])
+        # _write_json is what the REAL switcher writes through; a stub
+        # without it makes clear_wiring return False for a reason that has
+        # nothing to do with the marker (the loop swallows the AttributeError).
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda path, data: path.write_text(
+                __import__("json").dumps(data), encoding="utf-8"
+            ),
+        )
+        assert pin._wiring_present(sw) is True
+        assert pin.clear_wiring(sw) is True
+        assert pin._wiring_present(sw) is False, "the clear did not converge"
+
+
+class TestPurgeDoesNotStrandTheWiring:
+    """purge deletes backup_dir — the pin record, the cert dir, the daemon
+    state — but .claude.json's env block is not in there, and Claude Code
+    applies it at boot. Left behind it points every hand-launched `claude` at
+    a dead port with nothing remaining that knows how to remove it: the exact
+    stranding clear_wiring lives in this repo to prevent."""
+
+    def test_purge_unwires_before_it_deletes(self, tmp_path, monkeypatch):
+        import json as _json
+        from unittest.mock import patch
+
+        import claude_swap.paths as paths
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(_json.dumps({
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:36301", "CSWAP_PIN_PORT": "36301"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            "_cswapPinWiredKeysSaved": {},
+        }))
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        sw = ClaudeAccountSwitcher()
+        sw.backup_dir.mkdir(parents=True, exist_ok=True)
+        with patch("builtins.input", return_value="y"):
+            sw.purge()
+
+        raw = _json.loads(cfg.read_text())
+        assert "_cswapPinWiredKeys" not in raw, (
+            "purge left the pin wiring behind: every hand-launched claude "
+            "now dials a port nothing serves"
+        )
+        assert "HTTPS_PROXY" not in raw.get("env", {})
+
+
 class TestClearRunsWithTheExtraGone:
     """`cswap pin --clear` is priority 1 and the whole reason clear_wiring
     lives in cswap rather than the optional package.
@@ -1258,7 +1412,16 @@ class TestTheVerdictIsSharedNotDuplicated:
                 else {"env": {}}
             )
         )
-        return types.SimpleNamespace(backup_dir=backup), cfg
+        # resolve_account/_account_kind are what the REAL switcher offers, and
+        # set_pin now checks the account kind before it touches the pin. A
+        # stub without them made set_pin bail at the first line, so the
+        # rollback tests below passed with apply_pin never called — green with
+        # nothing behind them (confirmed: they survived deleting _restore_pin).
+        return types.SimpleNamespace(
+            backup_dir=backup,
+            resolve_account=lambda a: ("2", "user2@example.com", "org"),
+            _account_kind=lambda n: "oauth",
+        ), cfg
 
     def test_clear_pin_fails_when_the_wiring_survives(self, tmp_path, monkeypatch):
         import claude_swap.paths as paths
