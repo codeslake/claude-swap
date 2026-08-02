@@ -741,6 +741,61 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "shadow it — yet the verdict stayed degraded with no way back"
         )
 
+    def test_a_verified_clear_does_not_mask_a_LATER_failure(
+        self, macos_switcher, monkeypatch
+    ):
+        """A fact about one moment must not answer for every moment after it.
+
+        The verified verdict short-circuited both observation flags, and its
+        docstring justified that with a premise that is false: `_kc_call`'s
+        except branch re-arms `_keychain_disabled_until` unconditionally, with
+        no pin check, and backup reads reach it without consulting
+        `_use_keychain`. So one failing backup read after a pin resurrects the
+        cooldown, the "unreachable" active-read branch runs again, and a
+        genuine failure lands on a verdict that outranks it.
+
+        Measured, production routes only:
+
+            t0  write falls back, delete SUCCEEDS   verdict=True
+            t1  a backup read fails                 deadline re-armed
+            t2  cooldown lapses, ACTIVE read fails  degraded=True   (correct)
+            t3  the next read                       degraded=False  (wrong)
+
+        with `_active_read_failed` and `_keychain_op_failed` both True at t3.
+        That disarms `_refuse_degraded_capture` and serves a possibly-spent
+        generation as clean — the harm 1383f54 was written to prevent.
+
+        The delete's outcome belongs where it is true: at the pin, SETTLING
+        the flags rather than outranking them forever. A verified clear means
+        nothing that failed before it still matters, so it clears them; what
+        happens after is the flags' question again.
+        """
+        import time
+
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        monkeypatch.setattr(_kc, "delete_password", lambda *_a, **_kw: None)
+        store._pin_file_mode(residual_cleared=store._delete_active_keychain_entry())
+        assert store._read_active_credentials().degraded is False, "premise"
+
+        monkeypatch.setattr(_kc, "get_password", locked)
+        macos_switcher._read_account_credentials("9", "i@e.com")   # re-arms
+        store._keychain_disabled_until = time.monotonic() - 1
+        assert store._read_active_credentials().degraded is True, (
+            "premise: the active read ran again and failed"
+        )
+
+        assert store._read_active_credentials().degraded is True, (
+            "a verdict recorded before the failure outranked it — the capture "
+            "guard is disarmed and the file may be the superseded generation"
+        )
+
     def test_a_failed_clear_survives_an_unrelated_success(
         self, macos_switcher, monkeypatch
     ):
