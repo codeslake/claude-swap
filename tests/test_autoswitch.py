@@ -44,6 +44,17 @@ class FakeClock:
         self.now += seconds
 
 
+def _iso_at(epoch: float) -> str:
+    """An absolute epoch as the ISO-Z string a window's ``resets_at`` carries."""
+    from datetime import datetime, timezone
+
+    return (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 def _usage(pct: float, resets_at: str | None = None) -> dict:
     window: dict = {"pct": pct}
     if resets_at:
@@ -827,7 +838,7 @@ class TestAdaptiveScheduler:
         trace, because the invariant is what must hold.
         """
         from claude_swap.usage_store import (
-            RATE_LIMIT_TRUST_MAX_AGE_S,
+            RETRY_AFTER_FLOOR_CAP_S,
             TRUST_MAX_AGE_S,
             _failure_backoff_s,
         )
@@ -839,15 +850,139 @@ class TestAdaptiveScheduler:
                 f"last_good stays trusted only {TRUST_MAX_AGE_S:.0f}s — "
                 f"{other - TRUST_MAX_AGE_S:.0f}s un-pollable AND unknown"
             )
+            # NOT `rl <= RATE_LIMIT_TRUST_MAX_AGE_S`. That was here, and it is
+            # true for every possible input: the 429 path is already bounded by
+            # RETRY_AFTER_FLOOR_CAP_S = 4500 and the ceiling it compared against
+            # is 7200, so it could not fail even with the cap raised to 7199 —
+            # which would make the blind window 3599s worse. It also names the
+            # wrong bound: 7200 is only the FALLBACK for rows carrying no
+            # resets_at. When one is present, and it usually is, the real bound
+            # is min(earliest reset, ceiling) — see the reset-driven test below.
             rl = _failure_backoff_s(1, ask, rate_limited=True)
-            assert rl <= RATE_LIMIT_TRUST_MAX_AGE_S, (
-                f"429 ask={ask:.0f} backs off {rl:.0f}s past its own "
-                f"{RATE_LIMIT_TRUST_MAX_AGE_S:.0f}s fallback ceiling"
+            assert rl <= RETRY_AFTER_FLOOR_CAP_S, (
+                f"429 ask={ask:.0f} backs off {rl:.0f}s past the cap that is "
+                f"supposed to bound it"
             )
 
         # The margin still does its job where it was measured.
         assert _failure_backoff_s(1, 3600.0, rate_limited=True) == 4500.0, (
             "the hour-scale 429 margin was lost"
+        )
+
+    def test_the_429_backoff_respects_a_reset_it_can_see(self, temp_home):
+        """The 429 trust bound is reset-driven, so the backoff must be too.
+
+        `_rate_limited_trust_ok` returns `now < min(earliest future reset,
+        ceiling)`. The 5-hour window routinely resets sooner than 4500s, and
+        the margin then parks the row past the moment its own data went
+        obsolete: un-pollable (still in backoff) AND un-trusted (window rolled
+        over). The unhealthy-tick counter reads that blindness as a failing
+        account.
+
+        Measured before the fix, one successful fetch then a 429 with
+        Retry-After 3600, 5h window resetting at t0+3660::
+
+            t0+3660  decision=no   in_backoff=True    <- blind
+            t0+4400  decision=no   in_backoff=True
+            t0+4500  decision=no   in_backoff=False   <- 840s later
+
+        Base 9f35426 waits exactly the 3600 it was asked and is pollable AT the
+        reset, so this is a regression the margin introduced, not a pre-existing
+        shape.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        reset_at = t0 + 3660
+
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(reset_at)},
+            "seven_day": {"pct": 0.0},
+        })}, ident)
+        st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
+
+        entry = st.entries(ident)["1"]
+        assert entry.backoff_until <= reset_at, (
+            f"backoff lifts at t0+{entry.backoff_until - t0:.0f}s but the window "
+            f"resets at t0+{reset_at - t0:.0f}s — "
+            f"{entry.backoff_until - reset_at:.0f}s un-pollable AND unknown"
+        )
+
+        # And the row is genuinely usable again the moment its data goes stale.
+        h.clock.now = reset_at
+        entry = st.entries(ident)["1"]
+        assert entry.decision_value() is None, "premise: the window rolled over"
+        assert not entry.in_backoff(h.clock.now), (
+            "the reset arrived and the row still cannot be re-polled"
+        )
+
+    def test_a_non_429_recorded_through_record_does_not_take_the_margin(
+        self, temp_home
+    ):
+        """The call-site wiring, not just the helper.
+
+        Every other test of the `rate_limited` guard calls
+        `_failure_backoff_s` directly with an explicit keyword. Mutation-checked:
+        deleting `rate_limited=` from `record()` — so every 503/504 falls back
+        to the `True` default and takes the 429-only margin again — left the
+        whole suite green. `record()` is the only path production reaches, so
+        the guard was untested where it runs.
+
+        `_classify_usage_error` parses Retry-After for ANY HTTPError code, so a
+        503 carrying `Retry-After: 3600` is the reachable shape.
+        """
+        from claude_swap.usage_store import TRUST_MAX_AGE_S, FetchRecord
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+
+        st.record({"1": FetchRecord(error="http-503", retry_after_s=3600.0)}, ident)
+        entry = st.entries(ident)["1"]
+        waited = entry.backoff_until - t0
+        assert waited <= TRUST_MAX_AGE_S, (
+            f"a non-429 backed off {waited:.0f}s while its last_good stays "
+            f"trusted only {TRUST_MAX_AGE_S:.0f}s — it took the 429 margin"
+        )
+
+    def test_the_backoff_bound_follows_the_soonest_window_to_roll_over(
+        self, temp_home
+    ):
+        """Earliest reset, not latest — the same rule the trust check uses.
+
+        `_rate_limited_trust_ok` bounds trust by `min(resets)`: once the
+        SOONEST window rolls over the snapshot is obsolete, and a later
+        window's reset cannot rescue it. A backoff bounded by the latest would
+        park the row past the moment its own data died, which is the defect
+        this bound exists to remove. Mutation-checked: `max(resets)` here
+        leaves every other test green.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        soonest, latest = t0 + 1800, t0 + 90_000
+
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(soonest)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_at(latest)},
+        })}, ident)
+        st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
+
+        entry = st.entries(ident)["1"]
+        assert entry.backoff_until <= soonest, (
+            f"backoff lifts at t0+{entry.backoff_until - t0:.0f}s, past the "
+            f"5h window's reset at t0+{soonest - t0:.0f}s — bounded by the "
+            f"7d window instead"
         )
 
     def test_all_exhausted_escalation_preserves_wider_plan(

@@ -443,6 +443,7 @@ def _failure_backoff_s(
     retry_after_s: float | None,
     *,
     rate_limited: bool = True,
+    trust_expires_in_s: float | None = None,
 ) -> float:
     computed = min(
         BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
@@ -487,6 +488,32 @@ def _failure_backoff_s(
         # past TRUST_MAX_AGE_S as the margin would have. The bound belongs to
         # the path, not to the margin.
         asked = min(asked, TRUST_MAX_AGE_S)
+    if trust_expires_in_s is not None:
+        # THE 429 CEILING IS NOT A CONSTANT. `_rate_limited_trust_ok` returns
+        # `now < min(earliest future reset, ceiling)`, and a 5-hour window
+        # routinely resets sooner than RETRY_AFTER_FLOOR_CAP_S. Bounding the
+        # margin by the 7200s FALLBACK therefore bounded it by a number that
+        # usually does not apply, and the row was parked past the moment its
+        # own data went obsolete — un-pollable (still in backoff) AND untrusted
+        # (window rolled over), which the unhealthy-tick counter converts into
+        # a failover away from a healthy account.
+        #
+        # Measured: one success carrying a 5h reset at t0+3660, then a 429 with
+        # Retry-After 3600 -> backoff to t0+4500, blind from 3660 to 4500 =
+        # 840s. Base 9f35426 waits the 3600 it was asked and is pollable AT the
+        # reset, so the margin introduced this rather than inheriting it.
+        #
+        # The caller passes what it already knows from the stored row, so the
+        # bound is the trust that actually governs THIS row rather than a
+        # constant that governs some rows. `None` means the caller could not
+        # see one; the constant bounds above still apply.
+        #
+        # No clamp at zero: an already-expired reset makes this negative, and
+        # `max(asked, computed)` below floors every result at the exponential
+        # curve anyway (measured: -500 in still yields 30s out). Clamping would
+        # read as protection while changing no reachable outcome, which is the
+        # unfalsifiable-guard shape this PR removed from its own fixture.
+        asked = min(asked, trust_expires_in_s)
     return max(asked, computed)
 
 
@@ -764,10 +791,27 @@ class UsageStore:
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
                     row["last429At"] = now
+                # How long THIS row's last_good stays decision-trusted, from
+                # the reset it carries — so the backoff cannot outlast it. Only
+                # for 429s: every other failure is already bounded by
+                # TRUST_MAX_AGE_S inside the helper, and a timeout is no
+                # evidence the stored windows still describe reality.
+                trust_left: float | None = None
+                if rec.error == "http-429":
+                    stored = row.get("lastGood")
+                    if isinstance(stored, dict):
+                        resets = [
+                            ts
+                            for _, _, ra in oauth.relevant_windows(stored, ())
+                            if (ts := parse_reset_ts(ra)) is not None
+                        ]
+                        if resets:
+                            trust_left = min(resets) - now
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures,
                     rec.retry_after_s,
                     rate_limited=rec.error == "http-429",
+                    trust_expires_in_s=trust_left,
                 )
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no
