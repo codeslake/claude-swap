@@ -495,6 +495,34 @@ class ClaudeAccountSwitcher:
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
 
+    def _refuse_degraded_capture(self) -> None:
+        """Refuse to CAPTURE bytes a degraded read produced.
+
+        Both env-var branches of :meth:`_read_capture_credentials` pass
+        ``strict_keychain=True`` — an unreadable (not absent) Keychain raises
+        rather than silently capturing the plaintext seed, which on macOS may
+        be the consumed predecessor because Claude Code rotates keychain-only.
+
+        The DEFAULT path is the most-used one and had no such guard: it reads
+        through ``_read_credentials``, which is ``_read_active_credentials()``
+        with ``degraded`` discarded. So a locked-keychain ``cswap add``
+        captured the possibly-spent fallback into the slot backup, and
+        ``add_account`` then cleared the dead-token strike — re-creating on the
+        common path exactly the stale-consume this PR exists to prevent.
+
+        Kept as a separate guard rather than a replacement reader so
+        ``_read_credentials`` stays the single seam every caller (and test)
+        already binds to.
+        """
+        if self._read_active_credentials().degraded:
+            raise CredentialReadError(
+                "The macOS Keychain is unreadable right now (locked or no GUI "
+                "session), so the only readable credential is a plaintext "
+                "fallback that may be a superseded generation — capturing it "
+                "would file a spent refresh token against this slot. Retry "
+                "from a GUI terminal."
+            )
+
     def _read_capture_credentials(self) -> str | None:
         """Read the credential of the profile the environment points at.
 
@@ -559,6 +587,7 @@ class ClaudeAccountSwitcher:
             # ``primaryApiKey``. A miss here is what claude sees: logged out.
             return ""
         elif not config_dir:
+            self._refuse_degraded_capture()
             return self._read_credentials()
         else:
             creds = read_config_dir_credentials(config_dir, strict_keychain=True)
@@ -567,6 +596,7 @@ class ClaudeAccountSwitcher:
             if _same_directory(Path(config_dir), get_default_claude_config_home()):
                 # Safe only on this legacy path: the active store's env-following
                 # file backend and the default profile coincide here.
+                self._refuse_degraded_capture()
                 return self._read_credentials()
         # Only this profile's own ``primaryApiKey`` — never the unsuffixed
         # "Claude Code" Keychain item, which belongs to the default profile
@@ -2060,7 +2090,9 @@ class ClaudeAccountSwitcher:
                     "storage failure, then re-login and `cswap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
-        if stashed_reason and stashed_reason != "consume-gate-slot-removed":
+        if stashed_reason not in (
+            None, "", "consume-gate-slot-removed", "consume-gate-cas-conflict",
+        ):
             # The successor is parked, not persisted: the slot still holds the
             # generation whose grant we just spent. Callers read `error is
             # None` as "the slot is freshened and safe to activate" — after a
@@ -2071,9 +2103,19 @@ class ClaudeAccountSwitcher:
             # still ride along, so a caller that only needs a live token for
             # THIS request keeps working.
             #
-            # A REMOVED slot is excluded: there is nothing left to activate or
-            # retry, so deferring would only turn a completed user action into
-            # a recurring error.
+            # Two stash reasons are excluded, for opposite reasons.
+            #
+            # A REMOVED slot: there is nothing left to activate or retry, so
+            # deferring would only turn a completed user action into a
+            # recurring error.
+            #
+            # A CAS CONFLICT: the slot is FRESHENED, which is the condition
+            # this demotion exists to deny. A racing writer won and wrote a
+            # newer valid lineage; we adopted it and it is what the caller
+            # asked for. Reporting it as an error made `_freshen_target` skip
+            # a healthy candidate and the tick emit "could not freshen any
+            # candidate (network?)" on every multi-surface race — the exact
+            # contention this gate was built for, turned into a false alarm.
             return oauth.RefreshOutcome(
                 outcome_creds, "transient", result.token_account, consumed_fp
             )
