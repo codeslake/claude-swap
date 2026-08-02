@@ -5110,6 +5110,134 @@ class TestSwitchSkipsBrokenSlots:
             f"roster says slot 2 is active, _build_accounts_info says {active}"
         )
 
+    def test_an_unreadable_live_credential_is_not_deleted_unstashed(
+        self, temp_home: Path
+    ):
+        """The stash is the license to clear, so no-stash must mean no-clear.
+
+        `_read_active_credentials().value` is `None` — not `""` — when the file
+        EXISTS but cannot be read (mode 000, root-owned after a sudo/container
+        run, an ACL). `if live:` is False for both, so the stash is skipped;
+        but `_clear_oauth_credential()` unlinks anyway, and unlink needs only a
+        writable directory, not a readable file.
+
+        The two states are not the same and must not take the same branch:
+
+            ""    nothing anywhere        -> nothing to preserve, clear freely
+            None  present but unreadable  -> the only copy, and we cannot read it
+
+        Measured on a real 0-mode file: the credential is gone and the stash
+        directory is empty. That refresh token existed nowhere else — the slot
+        was roster-imported, so there is no backup either.
+
+        Reached through the direct-activation path, which calls this method
+        BEFORE its rollback snapshot, so nothing downstream can put it back.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = None
+        s.sequence_file.write_text(json.dumps(data))
+
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text(json.dumps({
+            "claudeAiOauth": {"refreshToken": "ONLY-COPY-REFRESH"},
+        }))
+        os.chmod(cred, 0o000)
+        try:
+            assert s._store._read_active_credentials().value is None, (
+                "premise: unreadable reads as None, not empty"
+            )
+
+            with pytest.raises(CredentialReadError):
+                s._switch_to_empty_slot(
+                    "2", "b@example.com", None, {"number": 2},
+                    s._get_sequence_data(),
+                )
+
+            assert cred.exists(), (
+                "the only copy of a live refresh token was deleted unstashed"
+            )
+        finally:
+            os.chmod(cred, 0o600)
+
+    def test_a_failed_clear_does_not_hand_the_slot_a_live_credential(
+        self, temp_home: Path
+    ):
+        """A clear that did not clear must not be followed by the identity pop.
+
+        Both clears are best-effort by design (a down Keychain, a missing file
+        — warn and continue), but the ``oauthAccount`` pop three lines later
+        was unconditional. So a failed clear produced exactly the state the
+        landed-empty fallback is built to trust: no live identity, roster says
+        slot N. The fallback then marks slot N active, and slot N reads the
+        LIVE store — which still holds the DEPARTED account's token.
+
+        Measured with the unlink failing (read-only mount / immutable bit)::
+
+            live still='{"claudeAiOauth": {"refreshToken": "DEPARTED-REFRESH"}}'
+            identity=None
+            SLOT 2 b@example.com creds='...DEPARTED-REFRESH' <== ACTIVE
+
+        The likelier shape is the macOS one: `_delete_active_keychain_entry`
+        swallows every exception, and that path already documents a residual.
+
+        Re-read rather than trusted, for the same reason the `--clear` verdict
+        elsewhere is re-read: `had_pin` measured before the action answers what
+        was true a moment ago. A clear that failed is reported as a failure,
+        and the identity stays put so the roster and the live store keep naming
+        the SAME account rather than disagreeing silently.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s.sequence_file.write_text(json.dumps(data))
+
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text(json.dumps({
+            "claudeAiOauth": {"refreshToken": "DEPARTED-REFRESH"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+        }))
+
+        real_unlink = type(cred).unlink
+
+        def refuse(self, *a, **kw):
+            if self.name == ".credentials.json":
+                raise OSError(30, "Read-only file system")
+            return real_unlink(self, *a, **kw)
+
+        with patch.object(type(cred), "unlink", refuse):
+            with pytest.raises(SwitchError):
+                s._switch_to_empty_slot(
+                    "2", "b@example.com", {"number": 1}, {"number": 2},
+                    s._get_sequence_data(),
+                )
+
+        # Slot 1 legitimately holds it — it is that account's own. What must
+        # not happen is slot 2 wearing the active mark over it, which is what
+        # the unconditional identity pop produced.
+        for num, _e, _o, _u, is_active, creds, _al in s._build_accounts_info():
+            if num == "2":
+                assert "DEPARTED-REFRESH" not in str(creds), (
+                    "the landed slot was handed the departed account's live "
+                    "credential"
+                )
+            assert not (is_active and num == "2"), (
+                "the landed slot is marked active while the previous account's "
+                "login is still live"
+            )
+        assert s._get_current_account() is not None, (
+            "the identity was popped over a credential that is still live, so "
+            "the roster and the live store now name different accounts"
+        )
+
     def test_an_api_key_does_not_survive_the_empty_slot_landing(
         self, temp_home: Path
     ):

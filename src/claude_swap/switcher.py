@@ -5681,6 +5681,28 @@ class ClaudeAccountSwitcher:
         the "empty read must not overwrite the departing backup" guard.
         """
         live = self._store._read_active_credentials().value
+        if live is None:
+            # PRESENT BUT UNREADABLE — not the same as absent, and the two used
+            # to take the same branch because both are falsy. `""` means nothing
+            # is there and clearing costs nothing; `None` means a credential
+            # exists and we could not read it, so the stash cannot run and the
+            # clear below would delete the only copy. Measured on a real 0-mode
+            # file: the token was gone and the stash directory was empty, on a
+            # roster-imported slot with no backup either.
+            #
+            # `unlink` needs a writable DIRECTORY, not a readable file, so the
+            # clear succeeds precisely where the preservation cannot — and this
+            # method is reached from the direct-activation path BEFORE its
+            # rollback snapshot, so nothing downstream can put it back.
+            #
+            # Refusing is the same contract the stash already states: a
+            # successful stash is the license to overwrite, and there is none.
+            raise CredentialReadError(
+                "The live credential exists but cannot be read, so it cannot be "
+                "preserved before this slot's logged-out landing clears it — "
+                "and it may be the only copy. Fix its permissions "
+                f"({get_credentials_path()}) and retry."
+            )
         if live:
             self._stash_live_credential(
                 live,
@@ -5701,6 +5723,33 @@ class ClaudeAccountSwitcher:
         # burning, and a key bills per token while it lies.
         self._store._clear_oauth_credential()
         self._store._clear_managed_key()
+        # RE-READ, do not trust the calls. Both clears are best-effort by design
+        # — a down Keychain or a missing file warns and continues — so neither
+        # tells us whether the live store is actually empty. The `oauthAccount`
+        # pop below was unconditional, and a failed clear therefore produced
+        # exactly the state the landed-empty fallback is built to TRUST: no
+        # live identity, roster says slot N. The fallback marked slot N active
+        # and slot N read the live store, which still held the DEPARTED
+        # account's token.
+        #
+        # Measured with the unlink failing (read-only mount, immutable bit):
+        # slot 2 active carrying DEPARTED-REFRESH while the switch reported
+        # "logged out". The macOS shape is likelier —
+        # `_delete_active_keychain_entry` swallows every exception and that
+        # path already documents a residual.
+        #
+        # Refusing here leaves the roster and the live store naming the SAME
+        # account, which is recoverable; popping the identity over a credential
+        # that is still live is the silent disagreement this method exists to
+        # prevent. The stash already ran, so nothing is lost by stopping.
+        if self._store._read_active_credentials().value:
+            raise SwitchError(
+                "The live credential could not be cleared, so landing on an "
+                "empty slot would leave the previous account's login active "
+                "under this slot's name. The credential is preserved in the "
+                "stash; resolve what is holding it (a locked Keychain, a "
+                "read-only home) and retry."
+            )
         config_path = get_global_config_path()
         if config_path.exists():
             existing = self._read_json(config_path)
