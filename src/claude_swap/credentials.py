@@ -356,24 +356,15 @@ class CredentialStore:
         could not verify-clear. Clears any re-probe deadline a prior read
         scheduled, which could otherwise still be pending.
 
-        ``residual_cleared`` is the caller's OBSERVATION of that delete, not a
-        guess. True: nothing can shadow the file, so it genuinely is the
-        authority and a stale ``degraded`` from before the fallback is over.
-        False: a residual may survive, and that stays true however many
-        unrelated Keychain items answer afterwards. Required, with no default:
-        every call site has just run the delete, and a default is exactly how
-        an observation gets dropped in favour of the flags below.
+        ``residual_cleared`` is the caller's OBSERVATION of that delete. True:
+        nothing can shadow the file, so it genuinely is the authority. False: a
+        residual may survive, and that stays true however many unrelated
+        Keychain items answer afterwards. Required, with no default — every
+        call site has just run the delete, and a default is how an observation
+        gets dropped in favour of a flag.
 
-        This settles the verdict permanently and deliberately. The pin zeroes
-        the deadline, so ``_use_keychain()`` is False for the life of the
-        process and the branch in ``_read_active_credentials`` that records a
-        fresh read verdict is unreachable from here on. Deriving ``degraded``
-        from a flag that could no longer change left ``cswap add`` refused and
-        the usage sentinel stuck at "keychain unavailable" forever on a machine
-        where nothing was wrong; deriving it from a flag any later success
-        cleared let one idle slot's readable backup disarm the consume gate.
-        The delete is the one observation about THIS item, so it is the one
-        that answers.
+        It settles the verdict permanently: the pin zeroes the deadline, so no
+        later read can record a fresh one.
         """
         self._keychain_usable_cache = False
         self._keychain_disabled_until = 0.0
@@ -509,15 +500,12 @@ class CredentialStore:
             self._residual_verdict is None
             and (self._active_read_failed or self._keychain_unreadable)
         ):
-            # Keychain already known unusable this process (a prior op failed and the
-            # capability cache stuck to file mode): if nothing is found below, that
-            # absence is "keychain unavailable", not a genuinely empty slot.
-            #
-            # Unless the pin VERIFIED the active item is gone. Then nothing can
-            # shadow the file and the two flags below are answering about a
-            # world that no longer exists — one of them unclearable (no read
-            # can run after a pin), the other erasable by any unrelated item's
-            # success. The delete is the observation about THIS item.
+            # Keychain already known unusable this process: if nothing is found
+            # below, that absence is "keychain unavailable", not an empty slot.
+            # Unless the pin VERIFIED the active item is gone — then nothing
+            # can shadow the file, and the two flags are answering about a
+            # world that no longer exists (one unclearable after a pin, the
+            # other erasable by any unrelated item's success).
             keychain_failed = True
 
         # 2. OAuth plaintext file (Claude Code's own fallback; every platform).

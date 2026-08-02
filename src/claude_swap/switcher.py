@@ -3928,12 +3928,8 @@ class ClaudeAccountSwitcher:
             if not is_active and self._read_account_credentials_ex(
                 str(num), email
             )[1]:
-                # THIS slot's own read, not the process flag. The flag answers
-                # "has any op failed and not since succeeded", and `_kc_call`
-                # clears it on every success — including an rc-44 miss, which
-                # decrypts nothing and succeeds on a fully locked Keychain. So
-                # one empty slot read cleanly made every other slot report "no
-                # credentials" while their backups sat unread. Measured with
+                # THIS slot's own read, not the process flag — which one
+                # slot's clean read erased for every other slot. Measured with
                 # every read denied and a real backup on slot 2:
                 #
                 #     before   slot2='no credentials'   slot9='no credentials'
@@ -3941,10 +3937,6 @@ class ClaudeAccountSwitcher:
                 #
                 # "no credentials" sends the user to re-add a slot that has one
                 # — the dead end 41313b9 removed from three other sites.
-                #
-                # The re-read is cheap and already the authority: `_ex` clears
-                # its per-read flag on entry and sets it at the read, so it
-                # answers about this slot and nothing else.
                 return USAGE_KEYCHAIN_UNAVAILABLE
             return USAGE_NO_CREDENTIALS
         # An expired active token is no longer a static state: the fetch path
