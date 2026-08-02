@@ -5721,7 +5721,7 @@ class ClaudeAccountSwitcher:
         # never happened. Same invariant as the docstring above: an active slot
         # serving the previous account's credential lies about whose quota is
         # burning, and a key bills per token while it lies.
-        self._store._clear_oauth_credential()
+        residual_gone = self._store._clear_oauth_credential()
         self._store._clear_managed_key()
         # RE-READ, do not trust the calls. Both clears are best-effort by design
         # — a down Keychain or a missing file warns and continues — so neither
@@ -5759,8 +5759,22 @@ class ClaudeAccountSwitcher:
         # the (now-cleared) file and returns `("", True, True)`. Empty and
         # falsy, over a Keychain that still holds the departed token, which
         # Claude Code reads BEFORE the file. The flag is the only witness.
+        # `residual_gone` because a READ cannot answer under a pinned file
+        # mode. `_pin_file_mode` is reachable only from a write whose delete
+        # may have failed, and it sets the routing cache False with nothing
+        # having failed — so `_use_keychain()` is False, `_keychain_unreadable`
+        # is False, and the re-read never asks the Keychain at all. A surviving
+        # item is then invisible to the check written to catch it. Measured,
+        # one process, reads succeeding throughout:
+        #
+        #     post-clear read   value=''  unavailable=False  -> passed
+        #     Keychain residual still present: True
+        #
+        # The delete is the observation; `_clear_oauth_credential` passes it up
+        # rather than leaving the check to infer it from a backend it is not
+        # using.
         post = self._store._read_active_credentials()
-        if post.value != "" or post.keychain_unavailable:
+        if post.value != "" or post.keychain_unavailable or not residual_gone:
             raise SwitchError(
                 "The live credential could not be cleared, so landing on an "
                 "empty slot would leave the previous account's login active "
