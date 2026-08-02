@@ -27,7 +27,6 @@ from textual.widgets import Footer, ListView, Static
 
 from claude_swap import pin
 from claude_swap.models import AccountsSnapshot
-from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -207,6 +206,41 @@ class DashboardScreen(Screen):
         entries.append(_BACK)
         return entries
 
+    def _run_pin_op(self, op) -> None:
+        """Adapt a ``(ok, message)`` operation to what _start_action expects.
+
+        `run_action` captures stdout and `_action_done` toasts its first line
+        or, on a raised error, opens the failure modal. So a failure PRINTS and
+        raises — the raise is what routes it to the modal rather than to a
+        toast the user may miss — and a success just prints.
+        """
+        ok, msg = op()
+        print(msg)
+        if not ok:
+            raise RuntimeError(msg)
+
+    def _apply_pin(self, acc, impl) -> tuple[bool, str]:
+        """Pin to ``acc`` and add the note only this side can produce.
+
+        Runs on a worker thread (see the dispatch): pin.set_pin takes locks and
+        can spawn a daemon, and the CLI is a fresh process while this one has a
+        UI to keep responsive.
+        """
+        ok, msg = pin.set_pin(self.app.switcher, acc.email, acc.org_uuid)
+        if ok:
+            # An RC session that is already open keeps its old owner (the
+            # server fixed it at creation); reconnecting inside it is what
+            # moves it. Say so only when there is one.
+            try:
+                if impl.live_remote_control_sessions():
+                    msg += (
+                        "  Reconnect open Remote Control sessions to move them "
+                        "(/rc → Disconnect → /rc)."
+                    )
+            except Exception:  # noqa: BLE001 — a note must not fail the action
+                pass
+        return ok, msg
+
     def _pin_entries(self) -> MenuEntries:
         """One row per account (→ pin the claude.ai surface to it), plus clear."""
         try:
@@ -226,7 +260,13 @@ class DashboardScreen(Screen):
             # JSON, so every pinned request fails open. The CLI refuses it; the
             # menu says so instead of offering a row that reports success and
             # pins nothing. No action id — an informational row (see _dispatch).
-            if getattr(getattr(acc, "usage", None), "sentinel", None) == USAGE_API_KEY:
+            # `acc.kind` — the SAME fact the CLI refuses on
+            # (switcher._account_kind). The sentinel is derived and diverges:
+            # it reads USAGE_NO_CREDENTIALS for an unreadable backup blob and
+            # USAGE_KEYCHAIN_UNAVAILABLE for an API-key slot behind a locked
+            # macOS keychain, so filtering on it offered the row and the pin
+            # went through — the state the CLI refusal exists to prevent.
+            if getattr(acc, "kind", None) == "api_key":
                 entries.append((f"{acc.number}  {name}  · api key, cannot pin", ""))
                 continue
             entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
@@ -314,65 +354,32 @@ class DashboardScreen(Screen):
                 return
             target = action_id.split(":", 1)[1]
             snap = app.snapshot
-            # The guard above catches _impl() but stopped one line short of the
-            # call that does the work, so a failing apply_pin propagated out of
-            # on_list_view_selected and KILLED the dashboard. Every sibling
-            # action in this file goes through app._start_action, which catches
-            # and reports; these two did not. A real trigger needs no injection:
-            # a plain FILE where <backup>/pin-proxy should be a directory makes
-            # ensure_proxy's mkdir raise FileExistsError.
-            try:
-                if target == "clear":
-                    impl.apply_pin(app.switcher, None, None)
-                    # clear_wiring TOO, exactly as the CLI does. The package
-                    # unwires through its own single-path resolver, so from a
-                    # `cswap run` terminal (CLAUDE_CONFIG_DIR set) this clears
-                    # the session's config and leaves ~/.claude.json naming a
-                    # dead port — the stranding clear_wiring lives in cswap to
-                    # prevent, and the CLI in the identical state clears both.
-                    pin.clear_wiring(app.switcher)
-                    if pin.pinned_email(app.switcher):
-                        app.notify("Cloud pin NOT cleared — it is still set")
-                    else:
-                        app.notify("Cloud pin cleared")
-                else:
-                    acc = next(
-                        (
-                            a
-                            for a in (snap.accounts if snap else ())
-                            if a.number == target
-                        ),
-                        None,
+            # THE VERDICT COMES FROM pin.py, not from a second copy here.
+            # Three review rounds found the same shape: a fix landed on the CLI
+            # and this branch kept the old behaviour — the missing clear_wiring,
+            # the discarded apply_pin return, the rollback, the API-key refusal.
+            # Each was one decision implemented twice, so it is implemented once
+            # now and both sides render the result.
+            #
+            # THROUGH _start_action, like every sibling action in this file.
+            # clear_wiring takes a 9s lock; run inline it froze the dashboard
+            # for 9.31s with no toast and no keystrokes while Claude Code held
+            # .claude.json.lock — routine during a credential refresh.
+            if target == "clear":
+                app._start_action(
+                    "clear cloud pin",
+                    partial(self._run_pin_op, partial(pin.clear_pin, app.switcher)),
+                )
+            else:
+                acc = next(
+                    (a for a in (snap.accounts if snap else ()) if a.number == target),
+                    None,
+                )
+                if acc is not None:
+                    app._start_action(
+                        f"pin cloud → {acc.email}",
+                        partial(self._run_pin_op, partial(self._apply_pin, acc, impl)),
                     )
-                    if acc is not None:
-                        # The RETURN matters: False means no proxy is serving,
-                        # and reporting "Cloud pin → …" for that is the same
-                        # unqualified success the CLI was fixed for. Discarding
-                        # it made the badge and this toast agree on a pin that
-                        # nothing was applying.
-                        started = impl.apply_pin(
-                            app.switcher, acc.email, acc.org_uuid
-                        )
-                        if not started:
-                            app.notify(
-                                f"Cloud pin recorded for {acc.email}, but no "
-                                "proxy is running — nothing is pinned yet"
-                            )
-                        else:
-                            # An RC session that is already open keeps its old
-                            # owner (the server fixed it at creation);
-                            # reconnecting inside it is what moves it. Say so
-                            # only when there is one.
-                            open_rc = impl.live_remote_control_sessions()
-                            note = (
-                                "  Reconnect open Remote Control sessions to "
-                                "move them (/rc → Disconnect → /rc)."
-                                if open_rc
-                                else ""
-                            )
-                            app.notify(f"Cloud pin → {acc.email}.{note}")
-            except Exception as exc:  # noqa: BLE001
-                app.notify(f"Cloud pin failed: {exc}")
             await self._pop_menu()
         elif action_id in actions:
             actions[action_id]()
