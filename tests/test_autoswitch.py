@@ -3034,6 +3034,53 @@ class TestHorizonAxisDoesNotFlap:
         )
         assert outcome is not TickOutcome.SWITCHED
 
+    def test_a_burn_walk_settles_instead_of_oscillating(self, harness):
+        """A-B-A under burn is the fleet changing regime, not a gate leaking.
+
+        The reviewed concern was that the outbound gate is RELATIVE
+        (`h >= active x HORIZON_HEADROOM_RATIO`) while the fallback's is
+        ABSOLUTE (`active <= SPENT_HEADROOM_PCT`), so a pair could take one
+        gate out and the other back. Measured at the moment of each move,
+        only the active burning, both resets past the horizon:
+
+            out    active 2.0 / peer 4.0   headroom axis, 4.0 >= 2.0x2
+            back   active 3.0 / peer 2.0   recovery  axis, 10h vs 80h
+
+        Both legs are legitimate on the axis their own state selects: at the
+        first the fleet still held real headroom, by the second every account
+        is spent, which is the regime the reset axis exists for. 21 of 576
+        burn walks make that transition; base makes 0 because it refuses the
+        outbound leg too.
+
+        Two candidate constraints were measured and BOTH changed the count by
+        zero — requiring the fallback's candidate to be spent, and taking
+        `max`/`min` over the pair in `_recovery_is_useful`. The transition is
+        in the data, not in the gates, so neither is shipped.
+
+        What must hold is that a walk SETTLES. This one does: two moves in 24
+        ticks, then stationary.
+        """
+        seen = []
+        pct = {"1": 96.0, "2": 92.0}          # 4.0 and 8.0 points
+        for _ in range(24):
+            harness.tick_with_usage({
+                "1": _usage(pct["1"], self._days_out(harness, 20)),
+                "2": _usage(pct["2"], self._days_out(harness, 80)),
+            })
+            active = harness.active_number()
+            seen.append(active)
+            pct[str(active)] = min(99.95, pct[str(active)] + 0.25)   # burn
+            harness.clock.advance(301.0)
+
+        moves = [n for i, n in enumerate(seen) if i == 0 or n != seen[i - 1]]
+        assert len(moves) <= 3, (
+            f"move sequence {moves} — a burn walk that keeps moving is a flap, "
+            "whatever axis each leg took"
+        )
+        assert seen[-4:] == [seen[-1]] * 4, (
+            f"active trace {seen} — the walk never settled"
+        )
+
     def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
         """It runs only when nothing else qualifies, and the key is why.
 
