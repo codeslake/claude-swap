@@ -626,6 +626,66 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "failure — the consume gate now POSTs a possibly-spent generation"
         )
 
+    def test_the_active_verdict_survives_a_pin_only_when_it_is_true(
+        self, macos_switcher, monkeypatch
+    ):
+        """`_active_read_failed` is sticky, and that is the pin contract — not
+        the latch `5928119` fixed.
+
+        The distinction is worth pinning because the two look identical from
+        outside: a flag that stays True across a `_pin_file_mode`. What made
+        the old one a bug was that a STALE failure survived with nothing having
+        failed since — the cooldown had already re-probed and cleared it, and
+        the pin then resurrected it by zeroing the deadline.
+
+        This flag is set from the read's OWN outcome, so a pin cannot resurrect
+        anything:
+
+            no failure ever, then a pin      -> False, degraded False
+            failure, cooldown healed it,
+              then a pin                     -> False, degraded False
+            failure, then a pin              -> True,  degraded True
+
+        The third is correct rather than latched. `_pin_file_mode`'s own
+        docstring says why: it is only reachable from a write whose best-effort
+        Keychain delete may have failed, so re-probing could read a residual
+        and name the wrong account. "No re-probe after a pin" is the contract;
+        reporting the last real verdict is what honouring it looks like.
+        """
+        import time
+
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        healthy = _kc.get_password
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        # 1. nothing ever failed
+        store._keychain_usable_cache = True
+        store._read_active_credentials()
+        store._pin_file_mode()
+        assert store._active_read_failed is False
+        assert store._read_active_credentials().degraded is False
+
+        # 2. a failure the cooldown healed
+        store._keychain_usable_cache = True
+        store._active_read_failed = False
+        monkeypatch.setattr(_kc, "get_password", locked)
+        store._read_active_credentials()
+        assert store._active_read_failed is True, "premise: it failed"
+        monkeypatch.setattr(_kc, "get_password", healthy)
+        store._keychain_disabled_until = time.monotonic() - 1
+        store._read_active_credentials()          # re-probe succeeds
+        assert store._active_read_failed is False, "premise: healed"
+        store._pin_file_mode()
+        assert store._active_read_failed is False, (
+            "a pin resurrected a verdict the cooldown had already cleared — "
+            "that is the latch, not the contract"
+        )
+        assert store._read_active_credentials().degraded is False
+
     def test_a_lapsed_cooldown_clears_the_unreadable_verdict(self, macos_switcher):
         """One transient failure must not be permanent for the process.
 
