@@ -3423,6 +3423,79 @@ class TestRecoveryHorizon:
         assert harness.active_number() == 2
 
 
+class TestTheHorizonDoesNotDiscardWhatItAlreadyKnows:
+    """Two regressions from carrying the horizon into the ranking.
+
+    Both are cases where the PR had the right answer in hand and dropped it —
+    base 9f35426 gets them right, so neither is inherited.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def test_equal_headroom_past_the_horizon_takes_the_sooner_reset(self, harness):
+        """The tier-1 key hard-coded ``0.0`` where ``recovery_ts`` belongs.
+
+        Two peers with IDENTICAL headroom, both past the horizon, one returning
+        in 5h and one in 500h. With the second slot zeroed the tie falls
+        through to sequence order, so which account is chosen depends on which
+        slot number it happens to occupy:
+
+            near is acct 3  ->  base picks 3 (5h),  head picked 2 (500h)
+
+        `recovery_ts` is already computed at that point and is strictly better
+        than list order at zero cost. Headroom still outranks it — the tier
+        byte separates the two axes, and `-h` still comes first within tier 1.
+        """
+        out = harness.tick_with_usage({
+            "1": _usage(96, self._at(harness, 300 * 3600)),   # active, 4 pts
+            "2": _usage(92, self._at(harness, 500 * 3600)),   # 8 pts, LAST
+            "3": _usage(92, self._at(harness, 5 * 3600)),     # 8 pts, soonest
+        })
+        assert out is TickOutcome.SWITCHED
+        assert harness.active_number() == 3, (
+            "equal headroom, and the 5h reset lost to the 500h one on slot order"
+        )
+
+    def test_an_unchoosable_peer_does_not_veto_the_reset_ranking(self, harness):
+        """``best_candidate_headroom`` counted a candidate the ranking cannot pick.
+
+        The spent check asks "is anything worth having?" of the BEST candidate.
+        A peer holding 3.05 points is above ``SPENT_HEADROOM_PCT``, so the
+        answer is no for everybody — yet that peer cannot itself be chosen,
+        because 3.05 < 3.0 x HORIZON_HEADROOM_RATIO fails the ratio gate.
+        Nothing qualifies, and the engine parks on the account that returns
+        LAST:
+
+            active   3.00 pts, resets in 200h   <- stays here
+            peer     3.00 pts, resets in  10h   <- 190h sooner, refused
+            vetoer   3.05 pts, resets in 500h   <- unchoosable, decides
+
+        Measured against base: base switches at 3.05 and this branch blocks.
+        The veto band is (SPENT_HEADROOM_PCT, active x RATIO], up to 3 points
+        wide, so it is not an edge case in the endgame this code is for.
+
+        ``test_an_unreadable_peer_does_not_veto_the_spent_check`` pins the same
+        shape for an UNREADABLE peer; a readable one 0.05 points over the line
+        does the same damage.
+        """
+        out = harness.tick_with_usage({
+            "1": _usage(97.0, self._at(harness, 200 * 3600)),   # active, 3 pts
+            "2": _usage(97.0, self._at(harness, 10 * 3600)),    # 3 pts, sooner
+            "3": _usage(96.95, self._at(harness, 500 * 3600)),  # 3.05 pts
+        })
+        assert out is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            "a peer that cannot be chosen vetoed the ranking for everyone"
+        )
+
+
 class TestHorizonAxisDoesNotFlap:
     """Past the horizon the headroom axis needs its own anti-flap margin.
 
