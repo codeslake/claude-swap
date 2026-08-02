@@ -3138,13 +3138,25 @@ class ClaudeAccountSwitcher:
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
-        if active_num is None:
-            # No live identity — but the ROSTER still knows which slot we are
+        if current_identity is None:
+            # NO LIVE IDENTITY — but the ROSTER still knows which slot we are
             # on. Landing on a credential-less slot clears the live store by
             # design (an active slot serving the previous account's token lies
             # about whose quota is burning), and that made every account report
             # is_active=False: no active mark anywhere, on the very slot the
             # user had just moved to, until they logged in.
+            #
+            # Keyed on the CAUSE, not on `active_num is None`. That result has
+            # two causes and only this one licenses the roster's answer: a live
+            # identity that resolves to no slot means someone ran `/login` with
+            # an account never `cswap add`ed, and it belongs to NO slot.
+            # Falling back there marked the roster's slot active and handed it
+            # the stranger's live credential — measured: roster active = 2,
+            # live login stranger@, slot 2 (b@) reported active carrying
+            # STRANGER-TOKEN. The TUI then shows the stranger's usage under
+            # b@'s name, and with the ownership oracle unreachable that foreign
+            # utilization is recorded into the usage store keyed to slot 2,
+            # where it outlives the condition.
             #
             # The two stores answer different questions. The roster is the
             # authority on WHICH slot is active; the live store is the
