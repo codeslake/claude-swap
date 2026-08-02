@@ -3664,6 +3664,63 @@ class TestHorizonAxisDoesNotFlap:
         )
         assert outcome is not TickOutcome.SWITCHED
 
+    def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
+        """It runs only when nothing else qualifies, and the key is why.
+
+        The fallback's key is tier 0; every ordinary candidate is tier 1. So
+        if a fallback entry ever reached the same list as a qualifier it would
+        sort FIRST regardless of headroom. `qualifying or fallback` is the
+        only thing preventing that, and nothing tested it — measured,
+        replacing it with `qualifying + fallback` left the suite green while
+        flipping this scenario 0/3 -> 3/3 in the fallback's favour.
+
+        Active is spent (3 pts). One peer qualifies outright on headroom; one
+        margin-failure peer resets sooner. The qualifier must win.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(97, self._days_out(harness, 500)),   # active, 3 left
+            "2": _usage(94, self._days_out(harness, 400)),   # 6 left: qualifies
+            "3": _usage(96.4, self._days_out(harness, 100)), # 3.6 left, sooner
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            f"landed on {harness.active_number()} — the tier-0 fallback key "
+            "outranked a candidate with twice the headroom"
+        )
+
+    def test_the_fallback_ranks_by_reset_not_by_headroom(self, harness):
+        """`(0, recovery_ts, -h)` — the reset leads, and that is deliberate.
+
+        Every account in the fallback is spent, and below SPENT_HEADROOM_PCT a
+        headroom edge is under two poll intervals of work. The only real
+        question is which account can work again first, which is the same
+        judgement `_recovery_is_useful` makes one gate earlier.
+
+        Nothing tested it: swapping to `(0, -h, recovery_ts)` left the suite
+        green. Exhaustive sweep over 42336 three-account shapes, 558 change
+        answer, all this shape —
+
+            active 2.0 pts / 300h
+            acct 2  2.0 pts /  10h   (spent, back soonest)
+            acct 3  3.1 pts /  50h   (a point more, back 40h later)
+
+            reset key      -> 2 first
+            headroom key   -> 3 first
+
+        Taking acct 3 buys 1.1 points, worth minutes, at the cost of 40 hours
+        of waiting.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(98, self._days_out(harness, 300)),    # active, 2 left
+            "2": _usage(98, self._days_out(harness, 10)),     # 2 left, soonest
+            "3": _usage(96.9, self._days_out(harness, 50)),   # 3.1 left, later
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            f"landed on {harness.active_number()} — took a point of spent "
+            "headroom over a reset 40 hours sooner"
+        )
+
     def test_a_materially_better_peer_still_wins(self, harness):
         """The escape must survive: 2 points left against 10 is a real move."""
         outcome = harness.tick_with_usage({
