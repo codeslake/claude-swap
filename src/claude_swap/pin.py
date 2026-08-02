@@ -292,7 +292,7 @@ def _clear_wiring_locked(switcher, path) -> bool:
 def run(switcher, account: str | None, clear: bool = False) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
-    from claude_swap.printer import accent, dimmed
+    from claude_swap.printer import accent, dimmed, warning
 
     if clear:
         # Works WITHOUT the package on purpose: ``--clear`` is what a user
@@ -341,6 +341,22 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         f"{accent('Pinned')} the cloud account (RC/artifacts) to "
         f"Account-{account_num} ({email})"
     )
+
+    # THE ONE-WAY DOOR, said out loud. The first pin on a machine mints the
+    # proxy credential, and that instantly rejects every session already
+    # talking to the proxy: their HTTPS_PROXY was fixed at exec and carries no
+    # credential, so they 407 on the next request and only a relaunch fixes
+    # them. The code called this "unavoidable, pair it with a relaunch" and
+    # then never said it had happened — measured: 313 processes, including the
+    # session that ran the command, died with `API Error: 407` and no way to
+    # learn why. Advice nobody is told is not advice.
+    cut = getattr(pin, "last_arm_cutoff", lambda: None)()
+    if cut:
+        warning(
+            f"Armed the proxy credential: {cut} running session(s) are now "
+            "unauthorized and will fail with 407. Their proxy setting is "
+            "fixed at launch — restart them."
+        )
     if not started:
         return 0
 
