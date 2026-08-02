@@ -3914,11 +3914,16 @@ class TestDeadTokenQuarantine:
         row["fetchedAt"] -= 1860.0
         store.path.write_text(json.dumps(table))
 
-        entry = store.entries(ident, ("Fable",))["2"]
-        assert entry.decision_value() is None, (
-            f"the row still serves last_good (trust_extended="
-            f"{entry.trust_extended}) although its scoped window has reset — "
-            "the collector never handed its configured models to the bound"
+        # THE COLLECTOR'S OWN RETURN VALUE. Calling `store.entries(ident,
+        # ("Fable",))` here re-supplies the models this test exists to check
+        # were passed — measured, stripping `models` from BOTH call sites left
+        # this test green while the wiring was gone.
+        returned = switcher._collect_usage_entries(info, fetch=set())["2"]
+        assert returned.decision_value() is None, (
+            f"the collector RETURNED a row still serving last_good "
+            f"(trust_extended={returned.trust_extended}) although its scoped "
+            "window has reset — it never handed its configured models to the "
+            "bound"
         )
 
     def test_readd_clears_quarantine(self, temp_home):

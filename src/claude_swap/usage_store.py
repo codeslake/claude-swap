@@ -460,10 +460,12 @@ def _failure_backoff_s(
         # Saturated-budget edge: wait before probing again.
         return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
     # Burst rule: the server's ask plus a margin (bounded by the cap); our own
-    # curve may still wait longer. Only above BACKOFF_CAP_S — below it the
-    # curve already out-waits the ask, so adding would only overtake it and
-    # cannot land us on a deadline we were never going to hit. Strict: an ask
-    # OF exactly BACKOFF_CAP_S is what the saturated curve already waits.
+    # curve may still wait longer. Only above BACKOFF_CAP_S, because a short
+    # ask was separately measured as ACCURATE — not because the curve
+    # out-waits it. It does not: at `failures=1` computed is 30s, so a 300s ask
+    # lands exactly on the server's deadline, and the claim only becomes true
+    # at `failures=6` where computed reaches the cap. Strict: an ask OF exactly
+    # BACKOFF_CAP_S is what the saturated curve already waits.
     #
     # RESIDUE: an hour-scale block whose REMAINDER falls under BACKOFF_CAP_S
     # takes no margin and still retries near its deadline. Nothing local
