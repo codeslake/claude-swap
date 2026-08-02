@@ -292,7 +292,7 @@ def _clear_wiring_locked(switcher, path) -> bool:
 def run(switcher, account: str | None, clear: bool = False) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
-    from claude_swap.printer import accent, dimmed
+    from claude_swap.printer import accent, dimmed, warning
 
     if clear:
         # Works WITHOUT the package on purpose: ``--clear`` is what a user
@@ -304,12 +304,23 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # here, and a traceback is the worst possible outcome for the one
         # command whose job is to work when the pin does not.
         had_pin = False
+        still_pinned = False
         try:
             impl = _impl()
             had_pin = impl.load_pin(switcher.backup_dir) is not None
             impl.apply_pin(switcher, None, None)
+            # RE-READ, do not infer. `had_pin` was measured BEFORE apply_pin;
+            # reporting on it says what was true a moment ago, not what is
+            # true now. The failure that matters is silent by construction:
+            # the except below swallows it, and the success message was gated
+            # on clear_wiring(), which only ever reports on the .claude.json
+            # wiring -- never on the pin itself. So a broken cryptography made
+            # apply_pin raise, settings.json kept remoteControl, and the user
+            # was told "Unpinned" while RC/Artifacts silently returned to the
+            # old account the moment the import worked again.
+            still_pinned = impl.load_pin(switcher.backup_dir) is not None
         except Exception:  # noqa: BLE001
-            pass
+            still_pinned = had_pin
         # ALWAYS, not only when apply_pin failed. The package unwires through
         # its own single-path resolver, so with the extra installed a --clear
         # run from inside a session terminal cleared that session's config and
@@ -319,7 +330,16 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         #
         # apply_pin cannot answer "was there anything to clear": it returns
         # whether a proxy is now serving, which on this path is always False.
-        if not clear_wiring(switcher) and not had_pin:
+        cleared_wiring = clear_wiring(switcher)
+        if still_pinned:
+            # The wiring may well be gone; the PIN is not. Saying "Unpinned"
+            # here is the failure, not the pin surviving: a user who is told
+            # they are unpinned stops looking.
+            warning("Could not remove the cloud pin")
+            print(dimmed("  the pin package is installed but not usable here"))
+            print(dimmed("  reinstall it:  uv tool install 'claude-swap[pin]'"))
+            return 1
+        if not cleared_wiring and not had_pin:
             print(dimmed("No cloud account pinned"))
             return 0
         print(f"{accent('Unpinned')} the cloud account")

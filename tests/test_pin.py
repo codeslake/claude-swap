@@ -743,3 +743,78 @@ class TestClearRunsWithTheExtraGone:
         raw = json.loads(cfg.read_text())
         assert "_cswapPinWiredKeys" not in raw
         assert raw["env"] == {"K": "v"}, "the wiring outlived the uninstall"
+
+
+class TestAFailedClearIsNotReportedAsSuccess:
+    """`--clear` must not say "Unpinned" while the pin survives.
+
+    The failure is silent by construction: the bare `except` swallows an
+    apply_pin failure, and the success message was gated on clear_wiring(),
+    which reports only on the .claude.json wiring — never on the pin itself.
+    So "installed but unusable" (the case the code's own comments anticipate)
+    printed "Unpinned" with exit 0 while settings.json kept remoteControl, and
+    RC/Artifacts returned to the old account the moment the import worked.
+    """
+
+    def _run(self, tmp_path, impl_src):
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {}}))
+        # NOT dedent-with-interpolation: impl_src carries its own indentation,
+        # and dedent would mangle it into an IndentationError.
+        code = (
+            textwrap.dedent(
+                f"""
+                import sys
+                sys.path.insert(0, {src!r})
+                from pathlib import Path
+                import claude_swap.paths as paths
+                cfg = Path({str(cfg)!r})
+                paths.get_global_config_path = lambda: cfg
+                paths.get_default_global_config_path = lambda: cfg
+                from claude_swap import pin
+                """
+            )
+            + impl_src
+            + textwrap.dedent(
+                """
+                pin._impl = lambda: _Impl()
+                from claude_swap.switcher import ClaudeAccountSwitcher
+                sys.exit(pin.run(ClaudeAccountSwitcher(), None, clear=True))
+                """
+            )
+        )
+        return subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True
+        )
+
+    def test_a_pin_that_survives_is_reported_as_a_failure(self, tmp_path):
+        # apply_pin raises; load_pin keeps answering "still pinned".
+        impl = (
+            "class _Impl:\n"
+            "    def load_pin(self, d): return {'email': 'cloud@example.com'}\n"
+            "    def apply_pin(self, *a): raise ImportError('cryptography')\n"
+        )
+        r = self._run(tmp_path, impl)
+        assert "Unpinned" not in r.stdout, (
+            "reported success while the pin survived — the user stops looking"
+        )
+        assert "Could not remove" in r.stdout
+        assert r.returncode == 1, "a failed clear must not exit 0"
+
+    def test_a_real_clear_still_reports_success(self, tmp_path):
+        # The control: the message must be right exactly when it worked.
+        impl = (
+            "class _Impl:\n"
+            "    _gone = False\n"
+            "    def load_pin(self, d):\n"
+            "        return None if _Impl._gone else {'email': 'cloud@example.com'}\n"
+            "    def apply_pin(self, *a): _Impl._gone = True\n"
+        )
+        r = self._run(tmp_path, impl)
+        assert "Unpinned" in r.stdout, r.stdout + r.stderr[-400:]
+        assert r.returncode == 0
