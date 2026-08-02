@@ -387,6 +387,23 @@ def due_candidate(
     return due[0][2]
 
 
+def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> float | None:
+    """Epoch of the soonest relevant window to roll over, or None if unknown.
+
+    The soonest one is what matters: once it resets, usage there is zeroed and
+    the whole snapshot is obsolete, so a later window cannot rescue it. Windows
+    carrying no ``resets_at`` contribute nothing rather than a guess.
+    """
+    if not isinstance(last_good, dict):
+        return None
+    resets = [
+        ts
+        for _, _, resets_at in oauth.relevant_windows(last_good, models)
+        if (ts := parse_reset_ts(resets_at)) is not None
+    ]
+    return min(resets) if resets else None
+
+
 def _rate_limited_trust_ok(
     last_good: dict | None,
     age_s: float | None,
@@ -421,21 +438,10 @@ def _rate_limited_trust_ok(
     if age_s is None:
         return False
     ceiling = now + (RATE_LIMIT_TRUST_MAX_AGE_S - age_s)
-    windows = (
-        oauth.relevant_windows(last_good, models)
-        if last_good is not None
-        else []
-    )
-    resets = [
-        ts
-        for _, _, resets_at in windows
-        if (ts := parse_reset_ts(resets_at)) is not None
-    ]
-    if resets:
-        # The soonest window to roll over invalidates the snapshot; never trust
-        # past it, and never past the client-side ceiling.
-        return now < min(min(resets), ceiling)
-    return now < ceiling
+    soonest = _earliest_reset(last_good, models)
+    # The soonest window to roll over invalidates the snapshot; never trust past
+    # it, and never past the client-side ceiling.
+    return now < (min(soonest, ceiling) if soonest is not None else ceiling)
 
 
 def _failure_backoff_s(
@@ -798,15 +804,9 @@ class UsageStore:
                 # evidence the stored windows still describe reality.
                 trust_left: float | None = None
                 if rec.error == "http-429":
-                    stored = row.get("lastGood")
-                    if isinstance(stored, dict):
-                        resets = [
-                            ts
-                            for _, _, ra in oauth.relevant_windows(stored, ())
-                            if (ts := parse_reset_ts(ra)) is not None
-                        ]
-                        if resets:
-                            trust_left = min(resets) - now
+                    soonest = _earliest_reset(row.get("lastGood"))
+                    if soonest is not None:
+                        trust_left = soonest - now
                 row["backoffUntil"] = now + _failure_backoff_s(
                     failures,
                     rec.retry_after_s,
