@@ -553,6 +553,13 @@ class AutoSwitchEngine:
         # thread), and waiting there froze the TUI 30s and self-deadlocked
         # `cswap auto`.
         self._tick_thread_id: int | None = None
+        # Set while the worker is INSIDE `on_event`. The tick flag says "work
+        # is running"; this says "the work is currently parked in the
+        # consumer's callback", which is the one state `stop()` must not wait
+        # on — in the TUI that callback runs on the very thread calling
+        # `stop()`. Not covered by `_tick_thread_id`: that answers WHO runs the
+        # tick, and here the answer is correctly "someone else".
+        self._emit_in_flight = threading.Event()
         # `stop()` is a SIGTERM handler (cli.py) and a TUI callback, so it can
         # arrive on top of itself. Non-reentrant it double-released the lock,
         # and the AttributeError propagated into `_perform` past
@@ -795,8 +802,15 @@ class AutoSwitchEngine:
         # the engine that started it. Bracketing only `switch_to` let `stop()`
         # return instantly and free LIVE mid-freshen — measured, the stopped
         # engine consumed one-time grants for accounts ['2', '3'].
-        self._tick_in_flight.clear()
+        # ID FIRST, THEN CLEAR. These are two statements, and a signal handler
+        # runs on the main thread inside the frame it interrupts — so a SIGTERM
+        # between them saw `_tick_thread_id is None`, made `own_tick` False,
+        # and waited the full ceiling on a flag only this thread could set.
+        # Measured, 5.00s on run_loop's own thread. In this order the window
+        # is a stale id with the flag still set, which `stop()` reads as "no
+        # tick running" — the same answer it gets when none is.
         self._tick_thread_id = threading.get_ident()
+        self._tick_in_flight.clear()
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -808,8 +822,10 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
         finally:
-            self._tick_thread_id = None
+            # And the mirror on the way out: SET first, so the window is again
+            # "flag set, id stale" rather than "flag clear, id gone".
             self._tick_in_flight.set()
+            self._tick_thread_id = None
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
@@ -1660,7 +1676,31 @@ class AutoSwitchEngine:
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
-        self.on_event(event)
+        # NOTHING AFTER `stop()` GOES BACK TO THE CONSUMER. In the TUI
+        # `on_event` is `call_from_thread`, which parks the worker until the UI
+        # thread runs it — and `stop()` is called ON that thread, from
+        # `on_unmount` / `_restart_engine`, where it then waits for this tick.
+        # Worker waits for UI, UI waits for worker; measured, the dashboard
+        # froze for the whole 30s ceiling on any toggle landing mid-emit.
+        #
+        # Not a race. The `_stop` checkpoints emit `engine-stopped` at the next
+        # opportunity once `_stop` is set, and setting it is the FIRST thing
+        # `stop()` does — so the guards that bound the wait "by the work" are
+        # what guaranteed it ran to the ceiling.
+        #
+        # Dropping these events loses nothing a user acts on: they narrate a
+        # tick that is being abandoned, into a log that is being torn down.
+        # The one that DOES matter — stop()'s own timeout warning — never
+        # arrived either, because Textual refuses `call_from_thread` from the
+        # app's own thread and `autoview` swallows the RuntimeError. It goes to
+        # the logger instead, which has no thread affinity.
+        if self._stop.is_set():
+            return
+        self._emit_in_flight.set()
+        try:
+            self.on_event(event)
+        finally:
+            self._emit_in_flight.clear()
 
     # -- loop -------------------------------------------------------------------
 
@@ -1705,20 +1745,34 @@ class AutoSwitchEngine:
             # thread the wait can never be satisfied — the flag is set by the
             # frame this call is standing on.
             own_tick = self._tick_thread_id == threading.get_ident()
-            if not own_tick and not self._tick_in_flight.wait(_STOP_SWITCH_WAIT_S):
+            # A tick parked in `on_event` is not a tick doing work, and in the
+            # TUI it is parked on THIS thread. Waiting there is the same
+            # circular wait `own_tick` closes for SIGTERM, one thread over.
+            # The emit gate above stops the next one, but the worker already
+            # inside a callback got past it.
+            if (
+                not own_tick
+                and not self._emit_in_flight.is_set()
+                and not self._tick_in_flight.wait(_STOP_SWITCH_WAIT_S)
+            ):
                 # The ceiling is a deliberate trade — blocking a TUI toggle or
                 # a SIGTERM forever is worse than the race — but a silent one
                 # leaves an operator with two engines and no explanation.
-                self._emit(
-                    ErrorEvent(
-                        message=(
-                            f"a tick did not finish within "
-                            f"{_STOP_SWITCH_WAIT_S:.0f}s of stop(); releasing "
-                            "the LIVE lock anyway, so two engines may act once"
-                        ),
-                        transient=True,
-                    )
+                #
+                # THE LOG, NOT `_emit`. The one surface where this fires is the
+                # TUI, and there `on_event` is `call_from_thread`, which
+                # Textual refuses from the app's own thread —
+                # `autoview._emit_from_thread` then swallows the RuntimeError,
+                # so the message describing a stuck UI thread was delivered
+                # through that same thread and vanished. The logger has no
+                # thread affinity and no consumer that can refuse it.
+                message = (
+                    f"a tick did not finish within "
+                    f"{_STOP_SWITCH_WAIT_S:.0f}s of stop(); releasing the LIVE "
+                    "lock anyway, so two engines may act once"
                 )
+                _logger.warning(message)
+                self._emit(ErrorEvent(message=message, transient=True))
             lock.release()
 
     def wake(self) -> None:
