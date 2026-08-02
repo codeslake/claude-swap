@@ -524,6 +524,63 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
         assert unreadable is False, "the previous read's failure outlived it"
 
+    def test_a_recovered_keychain_does_not_latch_through_a_later_pin(
+        self, macos_switcher, monkeypatch
+    ):
+        """An observation must be UPDATED by a later observation, not frozen.
+
+        `_keychain_op_failed` records that an op failed, and nothing clears it.
+        The cooldown re-probe in `_use_keychain` normally masks a stale one —
+        but `_pin_file_mode` zeroes `_keychain_disabled_until`, so once a write
+        falls back the mask is gone for the rest of the process.
+
+        Measured timeline: a read times out (t0); the Keychain recovers and the
+        cooldown lapses, verified `unreadable is False` (t1); a later write
+        takes the file branch purely because ROUTING still says file, no op
+        raises, and its `_delete_active_keychain_entry()` SUCCEEDS so there is
+        no residual and the file genuinely is the authority (t2). From t2 on,
+        forever: `degraded=True`, `_fetch_active_usage` reports
+        "keychain unavailable" every pass, `_refuse_degraded_capture` blocks
+        `cswap add`, `_resync_rotated_backup` never runs.
+
+        That violates the same self-heal this predicate's own docstring
+        promises: one transient failure must not be permanent for the process.
+        A SUCCESSFUL op is evidence too, and it is the newer one.
+        """
+        import time
+
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        # Save the conftest fake rather than using monkeypatch.undo(), which
+        # would also unwind the keychain stub and let the call reach the real
+        # `security` binary.
+        healthy = _kc.get_password
+        monkeypatch.setattr(_kc, "get_password", locked)
+        with pytest.raises(_kc.KeychainError):
+            store._kc_call(_kc.get_password, "svc", "acct")
+        assert store._keychain_unreadable is True, "premise: inside the cooldown"
+
+        monkeypatch.setattr(_kc, "get_password", healthy)
+        store._keychain_disabled_until = time.monotonic() - 1
+        assert store._keychain_unreadable is False, "premise: cooldown lapsed"
+
+        # A real op now succeeds — the Keychain is demonstrably back.
+        store._kc_call(_kc.get_password, "svc", "acct")
+
+        # ...and later a write falls back and pins, zeroing the re-probe.
+        store._pin_file_mode()
+
+        assert store._keychain_unreadable is False, (
+            "a Keychain that answered successfully after the failure is still "
+            "reported unreadable — the failure latched through the pin"
+        )
+
     def test_a_lapsed_cooldown_clears_the_unreadable_verdict(self, macos_switcher):
         """One transient failure must not be permanent for the process.
 
