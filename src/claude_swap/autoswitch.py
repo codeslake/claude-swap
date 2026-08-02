@@ -804,6 +804,19 @@ class AutoSwitchEngine:
 
     # -- tick -----------------------------------------------------------------
 
+    def _release_live(self) -> None:
+        """Drop the LIVE lock, once. Idempotent by construction.
+
+        `stop()` does NOT route through this — it detaches `_live_lock` before
+        the wait on purpose, so a nested `stop()` (a second SIGTERM while the
+        first is still waiting) hits the `is None` early return instead of
+        entering the wait again. Measured with both unified: the nested call
+        blocked the full ceiling, 2.00s against a 2s limit.
+        """
+        lock, self._live_lock = self._live_lock, None
+        if lock is not None:
+            lock.release()
+
     def _retry_live_promotion(self) -> None:
         """A demotion is a contention answer, not a preference.
 
@@ -1606,9 +1619,7 @@ class AutoSwitchEngine:
                     # A `stop()` arrived on this thread mid-switch and deferred
                     # its release to here. Same thread, so no lock needed.
                     self._release_pending = False
-                    lock, self._live_lock = self._live_lock, None
-                    if lock is not None:
-                        lock.release()
+                    self._release_live()
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
