@@ -306,27 +306,41 @@ class DashboardScreen(Screen):
                 return
             target = action_id.split(":", 1)[1]
             snap = app.snapshot
-            if target == "clear":
-                impl.apply_pin(app.switcher, None, None)
-                app.notify("Cloud pin cleared")
-            else:
-                acc = next(
-                    (a for a in (snap.accounts if snap else ()) if a.number == target),
-                    None,
-                )
-                if acc is not None:
-                    impl.apply_pin(app.switcher, acc.email, acc.org_uuid)
-                    # An RC session that is already open keeps its old owner
-                    # (the server fixed it at creation); reconnecting inside it
-                    # is what moves it. Say so only when there is one.
-                    open_rc = impl.live_remote_control_sessions()
-                    note = (
-                        "  Reconnect open Remote Control sessions to move them "
-                        "(/rc → Disconnect → /rc)."
-                        if open_rc
-                        else ""
+            # The guard above catches _impl() but stopped one line short of the
+            # call that does the work, so a failing apply_pin propagated out of
+            # on_list_view_selected and KILLED the dashboard. Every sibling
+            # action in this file goes through app._start_action, which catches
+            # and reports; these two did not. A real trigger needs no injection:
+            # a plain FILE where <backup>/pin-proxy should be a directory makes
+            # ensure_proxy's mkdir raise FileExistsError.
+            try:
+                if target == "clear":
+                    impl.apply_pin(app.switcher, None, None)
+                    app.notify("Cloud pin cleared")
+                else:
+                    acc = next(
+                        (
+                            a
+                            for a in (snap.accounts if snap else ())
+                            if a.number == target
+                        ),
+                        None,
                     )
-                    app.notify(f"Cloud pin → {acc.email}.{note}")
+                    if acc is not None:
+                        impl.apply_pin(app.switcher, acc.email, acc.org_uuid)
+                        # An RC session that is already open keeps its old owner
+                        # (the server fixed it at creation); reconnecting inside
+                        # it is what moves it. Say so only when there is one.
+                        open_rc = impl.live_remote_control_sessions()
+                        note = (
+                            "  Reconnect open Remote Control sessions to move "
+                            "them (/rc → Disconnect → /rc)."
+                            if open_rc
+                            else ""
+                        )
+                        app.notify(f"Cloud pin → {acc.email}.{note}")
+            except Exception as exc:  # noqa: BLE001
+                app.notify(f"Cloud pin failed: {exc}")
             await self._pop_menu()
         else:
             actions[action_id]()
