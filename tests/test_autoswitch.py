@@ -3630,6 +3630,40 @@ class TestHorizonAxisDoesNotFlap:
             "the guard belonging to the OTHER leg's axis"
         )
 
+    def test_the_spent_fallback_needs_a_meaningfully_sooner_reset(self, harness):
+        """The fallback is bounded by the SAME hysteresis the recovery axis uses.
+
+        Its other two guards are pinned by the tests above (dropping the spent
+        gate reddens `test_one_point_of_headroom_does_not_move` and
+        `test_the_return_leg_is_blocked_too`; dropping `h >= active` reddens
+        `test_a_peer_worth_having_is_not_filtered_out_of_the_worth_having_check`).
+        The margin was the one nothing killed — measured, replacing
+        `< active_recovery_ts - RECOVERY_HYSTERESIS_S` with a bare
+        `< active_recovery_ts` left all 168 tests in this file green.
+
+        Exhaustive 2- and 3-account sweep over headroom x reset, 16200 shapes:
+        exactly 42 change answer, all of the shape below.
+
+            acct 1   2.5 points, reset 500.02h out   (active)
+            acct 2   4.0 points, reset 500.00h out   (72s sooner)
+
+            with the margin     no move, both legs
+            without it          active=1 moves to 2; active=2 holds
+
+        One-way, so not a flap — a credential rewrite bought with 72 seconds
+        of earlier return, on a pair that both come back in three weeks. The
+        margin is what makes "sooner" mean sooner enough to be worth the write.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(97.5, self._days_out(harness, 500.02)),  # active, 2.5 left
+            "2": _usage(96.0, self._days_out(harness, 500.0)),   # 4 left, 72s sooner
+        })
+        assert harness.active_number() == 1, (
+            "moved for a 72-second-sooner reset three weeks out — inside "
+            "RECOVERY_HYSTERESIS_S, which is what bounds the write rate"
+        )
+        assert outcome is not TickOutcome.SWITCHED
+
     def test_a_materially_better_peer_still_wins(self, harness):
         """The escape must survive: 2 points left against 10 is a real move."""
         outcome = harness.tick_with_usage({
