@@ -3034,6 +3034,51 @@ class TestHorizonAxisDoesNotFlap:
         )
         assert outcome is not TickOutcome.SWITCHED
 
+    def test_the_tier_byte_puts_a_returning_peer_ahead_of_a_distant_one(
+        self, harness
+    ):
+        """`(0, ...)` before `(1, ...)` — the tier prefix itself, not its tail.
+
+        Both existing tier tests compare candidates WITHIN one tier, so the
+        byte cancels and neither pins it. Collapsing it to a flat key left the
+        suite green.
+
+        A candidate returning inside the horizon beats one that does not,
+        whatever its headroom: acct 2 is nearly spent but works again in an
+        hour; acct 3 has nine points that never return this session.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(99, self._days_out(harness, 300)),    # active, 1 left
+            "2": _usage(98.5, self._days_out(harness, 1)),    # 1.5 left, back in 1h
+            "3": _usage(91, self._days_out(harness, 400)),    # 9 left, never
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            f"landed on {harness.active_number()} — took headroom that never "
+            "returns over a peer that works again in an hour"
+        )
+
+    def test_the_fallback_breaks_a_reset_tie_by_headroom(self, harness):
+        """The fallback key's THIRD slot: `(0, recovery_ts, -h)`.
+
+        `test_the_fallback_ranks_by_reset_not_by_headroom` pins the second
+        slot (reset leads). The third was untested — `-h` to `h` left the suite
+        green. It needs an actual tie in `recovery_ts` AND both peers routed
+        through the fallback, which requires the active to sit exactly at
+        SPENT_HEADROOM_PCT so neither peer meets the ratio.
+        """
+        same = self._days_out(harness, 10)
+        outcome = harness.tick_with_usage({
+            "1": _usage(97, self._days_out(harness, 300)),   # active, 3.0 left
+            "2": _usage(97, same),                            # 3.00 left
+            "3": _usage(96.95, same),                         # 3.05 left
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3, (
+            f"landed on {harness.active_number()} — at an equal reset the "
+            "fallback took the smaller headroom"
+        )
+
     def test_past_the_horizon_headroom_decides_before_the_reset(self, harness):
         """Tier 1 is `(1, -h, recovery_ts)` — headroom leads, reset breaks ties.
 
@@ -3109,6 +3154,39 @@ class TestHorizonAxisDoesNotFlap:
         assert seen[-4:] == [seen[-1]] * 4, (
             f"active trace {seen} — the walk never settled"
         )
+
+    def test_the_no_return_filter_does_not_block_the_at_limit_escape(
+        self, harness
+    ):
+        """Every sibling anti-flap gate is scoped to the proactive triggers.
+
+        `at-limit` and `failover` skip them by design — there we are escaping a
+        dead account, not optimising a return time. The no-return filter ran in
+        `_tick_inner` BEFORE the trigger is consulted, so it stripped the
+        candidate from those escapes too.
+
+        Measured, 2 accounts, the active exhausted and the peer at full quota:
+
+            base 9f35426   switches on tick 1
+            here           switches=0, "no-candidates" every tick, 720 ticks
+
+        Nothing releases it: `lastSwitchFrom` is only rewritten by a successful
+        switch, and the field is what prevents the switch. On a 3-account fleet
+        it also emits AllExhaustedEvent — a false claim that reaches the user
+        as a macOS notification and a critical TUI row while a peer sits at 0%.
+        """
+        harness.engine._mutate_state(
+            lambda st: st.__setitem__("lastSwitchFrom", "2")
+        )
+        outcome = harness.tick_with_usage({
+            "1": _usage(100),      # active, exhausted -> at-limit
+            "2": _usage(0),        # the account we left, now at full quota
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "the at-limit escape was refused because we had left that account "
+            "once — the engine sits on an exhausted account with a peer at 0%"
+        )
+        assert harness.active_number() == 2
 
     def test_a_burn_walk_never_returns_to_what_it_left(self, harness):
         """The axis can flip more than once, and nothing bounded how often.
