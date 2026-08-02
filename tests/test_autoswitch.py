@@ -2806,6 +2806,44 @@ class TestFreshenRoutesThroughGate:
             status = harness.engine._freshen_target("2", "b@example.com")
         assert status == "store-unmirrored"
 
+    def test_an_actionable_cause_is_not_hidden_by_a_self_clearing_one(
+        self, temp_home
+    ):
+        """The tick reports ONE systemic cause, and it must be the actionable one.
+
+        ``systemic`` was assigned unconditionally per candidate, so the LAST
+        one won. ``consume-busy`` clears itself on the next pass; the other two
+        need a human (unset an env var, chase a rejected client_id). Whenever a
+        busy slot sorted after an unmirrored one, the message named the harmless
+        cause and the real one was invisible — the same "reads as intermittent,
+        nothing names the cause" trap these kinds were split out to escape.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=1)
+        h.seed(3, "c@example.com", expires_at=1)
+        h.make_live("a@example.com", 1)
+
+        # Slot 2 needs a human (an env var is set); slot 3 clears itself.
+        def by_slot(num, email, *a, **kw):
+            return "store-unmirrored" if num == "2" else "consume-busy"
+
+        with patch.object(
+            h.engine, "_freshen_target", side_effect=by_slot
+        ):
+            h.tick_with_usage({
+                "1": _usage7(95, 95, _R_LATER),   # active, over threshold
+                "2": _usage7(10, 10, _R_SOON),
+                "3": _usage7(10, 10, _R_LATEST),
+            })
+
+        errors = [e for e in h.events if getattr(e, "message", None)]
+        assert errors, f"no error event; got kinds {h.kinds()}"
+        msg = errors[-1].message
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in msg, (
+            f"got {msg!r}: the self-clearing cause hid the one needing a human"
+        )
+
     def test_a_real_transient_still_reads_transient(self, temp_home):
         from claude_swap import oauth as oauth_mod
 

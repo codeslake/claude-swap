@@ -59,6 +59,14 @@ STATE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("claude-swap")
 
+# Systemic freshen refusals, MOST ACTIONABLE FIRST. Deterministic conditions
+# that every candidate hits identically, so the tick reports one of them —
+# and the order decides which, because reporting the wrong one is how a cause
+# needing a human hides behind one that clears itself. store-unmirrored and
+# invalid_client stay until somebody unsets an env var or fixes a client
+# registration; consume-busy is gone by the next pass.
+_SYSTEMIC_STATUSES = ("store-unmirrored", "invalid_client", "consume-busy")
+
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
 # expired" re-read holds with margin after our swap.
@@ -668,9 +676,7 @@ class AutoSwitchEngine:
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
-        if outcome.error in (
-            "store-unmirrored", "invalid_client", "consume-busy"
-        ):
+        if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
             # refuses identically and keeps refusing until something outside
             # this process changes — the shell for store-unmirrored (an
@@ -1111,10 +1117,19 @@ class AutoSwitchEngine:
             if status == "transient":
                 transient_failure = True
                 continue
-            if status in (
-                "store-unmirrored", "invalid_client", "consume-busy"
-            ):
-                systemic = status
+            if status in _SYSTEMIC_STATUSES:
+                # ONE cause is reported, so it must be the one worth acting
+                # on. Assigning unconditionally made it the LAST candidate's,
+                # and `consume-busy` clears itself on the next pass while the
+                # other two need a human — unset an env var, chase a rejected
+                # client_id. So a busy slot sorting after an unmirrored one
+                # named the harmless cause and hid the real one: exactly the
+                # "reads as intermittent, nothing names it" trap these kinds
+                # were split out of "transient" to escape.
+                if not systemic or _SYSTEMIC_STATUSES.index(
+                    status
+                ) < _SYSTEMIC_STATUSES.index(systemic):
+                    systemic = status
                 continue
             if status == "skip-live-session":
                 continue
