@@ -581,6 +581,51 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "reported unreadable — the failure latched through the pin"
         )
 
+    def test_an_idle_backup_read_does_not_erase_the_active_verdict(
+        self, macos_switcher, monkeypatch
+    ):
+        """A success on ONE item is not evidence about ANOTHER.
+
+        `_kc_call` clears `_keychain_op_failed` on any successful op, and
+        backup reads go straight through it (`_read_account_credentials` never
+        consults `_use_keychain`). So one idle slot's readable backup erased
+        the verdict recorded when the ACTIVE OAuth read failed, and
+        `_read_active_credentials().degraded` flipped to False while the
+        plaintext file still held the superseded generation.
+
+        Measured, same fixture, only the slot ORDER changed:
+
+            [2,3]  degraded=True   sentinel='keychain unavailable'  POSTed: []
+            [3,2]  degraded=False  error='invalid_grant'            POSTed: ['rt-SPENT']
+
+        and it does not self-heal — the strike binds to the backup's
+        fingerprint, the backup still holds that generation, so a brand-new
+        process with a healthy Keychain keeps reporting "re-login needed".
+
+        The clear was right about a success being a newer observation; it was
+        wrong about WHAT it observes. "The Keychain answers" and "this active
+        read succeeded" are different facts, and `degraded` needs the second.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+        real_get = _kc.get_password
+
+        def only_the_active_item_fails(service, account):
+            if "credentials" in service:
+                raise _kc.KeychainError("locked")
+            return real_get(service, account)
+
+        monkeypatch.setattr(_kc, "get_password", only_the_active_item_fails)
+
+        assert store._read_active_credentials().degraded is True, "premise"
+        store._read_account_credentials("3", "c@example.com")  # idle, succeeds
+        assert store._read_active_credentials().degraded is True, (
+            "an unrelated slot's readable backup erased the active read's own "
+            "failure — the consume gate now POSTs a possibly-spent generation"
+        )
+
     def test_a_lapsed_cooldown_clears_the_unreadable_verdict(self, macos_switcher):
         """One transient failure must not be permanent for the process.
 
