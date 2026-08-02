@@ -100,23 +100,18 @@ RECOVERY_HORIZON_S = 4 * 3600.0
 HORIZON_HEADROOM_RATIO = 2.0
 
 # "Is anything worth having?" — a DIFFERENT question from the anti-flap margin
-# above, and it needs its own number. Reusing HORIZON_HEADROOM_RATIO for both
-# excluded peers that plainly have quota: at 2x-minus-epsilon a peer is very
-# much worth having, it merely fails this tick's margin. With every candidate
-# below that floor `max(..., default=0.0)` yields 0.0, which SATISFIES the
-# spent clause — so the clause fired for everybody and ranking fell to soonest
-# reset regardless of headroom. Measured: active 3.00 pts, peerA 5.99, peerB
-# 0.10 -> took peerB, discarding 60x the runway.
+# above, and lower, because it is weaker: not "is this peer enough better to
+# justify a move?" but "does this peer have anything at all?"
 #
-# Lower than the margin because it answers a weaker question: not "is this peer
-# enough better to justify a move?" but "does this peer have anything at all?"
-#
-# KNOWN RESIDUE, and it is structural rather than a bad constant. This floor and
-# HORIZON_HEADROOM_RATIO are both anchored to `active_headroom`, so they leave a
-# gap: a peer between them is VISIBLE (the spent clause goes false, the reset
-# axis switches off) yet UNCHOOSABLE (it misses the larger margin). Monotonicity
-# inverts there — adding headroom flips a move into a refusal. Measured, active
-# 3.00 pts / 500h against ONE peer better on BOTH axes:
+# BOTH ARE ANCHORED TO `active_headroom`, and that is the defect neither number
+# can fix. They leave a gap where a peer is VISIBLE (the spent clause goes
+# false, so the reset axis switches off) yet UNCHOOSABLE (it misses the larger
+# margin) — and either end of the gap is a real misbehaviour. Below it, an
+# empty `max(..., default=0.0)` reads as "nothing is worth having" and ranking
+# falls to soonest reset: measured, active 3.00 pts took a 0.10-pt peer over a
+# 5.99-pt one, discarding 60x the runway. Inside it, monotonicity inverts —
+# adding headroom flips a move into a refusal. Measured, active 3.00 pts / 500h
+# against ONE peer better on BOTH axes:
 #
 #     peer pts   3.88   3.90   4.50   5.99   6.00
 #     base       move   move   move   move   move
