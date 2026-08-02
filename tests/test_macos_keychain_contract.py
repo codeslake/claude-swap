@@ -305,7 +305,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         self, macos_switcher
     ):
         store = macos_switcher._store
-        store._pin_file_mode()  # OUR write; nothing failed
+        store._pin_file_mode(residual_cleared=True)  # OUR write; nothing failed
         _value, unreadable = store._read_account_credentials_ex("9", "x@e.com")
         assert unreadable is False
 
@@ -574,7 +574,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         store._kc_call(_kc.get_password, "svc", "acct")
 
         # ...and later a write falls back and pins, zeroing the re-probe.
-        store._pin_file_mode()
+        store._pin_file_mode(residual_cleared=True)
 
         assert store._keychain_unreadable is False, (
             "a Keychain that answered successfully after the failure is still "
@@ -639,18 +639,18 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         the pin then resurrected it by zeroing the deadline.
 
         This flag is set from the read's OWN outcome, so a pin cannot resurrect
-        anything:
+        anything. Both cases here pin with `residual_cleared=True`, which is
+        what a write that verified its delete reports:
 
             no failure ever, then a pin      -> False, degraded False
             failure, cooldown healed it,
               then a pin                     -> False, degraded False
-            failure, then a pin              -> True,  degraded True
 
-        The third is correct rather than latched. `_pin_file_mode`'s own
-        docstring says why: it is only reachable from a write whose best-effort
-        Keychain delete may have failed, so re-probing could read a residual
-        and name the wrong account. "No re-probe after a pin" is the contract;
-        reporting the last real verdict is what honouring it looks like.
+        What happens to a real failure across a pin is not this flag's call any
+        more — see `test_a_verified_clear_ends_the_degraded_verdict` and
+        `test_a_failed_clear_survives_an_unrelated_success`, where the delete's
+        own outcome decides. This test keeps the narrower contract: a pin never
+        RESURRECTS a verdict that was already cleared.
         """
         import time
 
@@ -665,7 +665,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         # 1. nothing ever failed
         store._keychain_usable_cache = True
         store._read_active_credentials()
-        store._pin_file_mode()
+        store._pin_file_mode(residual_cleared=True)
         assert store._active_read_failed is False
         assert store._read_active_credentials().degraded is False
 
@@ -679,12 +679,166 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         store._keychain_disabled_until = time.monotonic() - 1
         store._read_active_credentials()          # re-probe succeeds
         assert store._active_read_failed is False, "premise: healed"
-        store._pin_file_mode()
+        store._pin_file_mode(residual_cleared=True)
         assert store._active_read_failed is False, (
             "a pin resurrected a verdict the cooldown had already cleared — "
             "that is the latch, not the contract"
         )
         assert store._read_active_credentials().degraded is False
+
+    def test_a_verified_clear_ends_the_degraded_verdict(
+        self, macos_switcher, monkeypatch
+    ):
+        """The pin OBSERVES whether a residual survived; it must not guess.
+
+        `_pin_file_mode` is sticky because its best-effort delete of the old
+        Keychain item MAY have failed — a residual Claude Code reads first
+        would make our file the superseded generation. That is the whole
+        reason there is no re-probe.
+
+        But the delete answers the question. `delete_password` returns only on
+        rc 0 or rc 44 (already absent); anything else raises. A return is proof
+        no active item is there to shadow the file, which is the case
+        `8799f7b` carved out as not-degraded.
+
+        The code threw that answer away, so `degraded` was derived from a flag
+        nothing could clear. Measured, residual delete SUCCEEDED throughout:
+
+            t0  read fails (rc=36)            afr=True   degraded=True
+            t1  Keychain healthy again
+            t2  a write falls back and pins   afr=True   degraded=True
+            t3+ forever                       afr=True   degraded=True
+
+        `_pin_file_mode` zeroes the re-probe deadline, so `_use_keychain()` is
+        False for the life of the process and the branch that would record a
+        fresh verdict is unreachable. Harm: `_refuse_degraded_capture` refuses
+        `cswap add` forever, and `_fetch_active_usage` returns the
+        keychain-unavailable sentinel on every pass, so the active token is
+        never refreshed and `_resync_rotated_backup` never runs — the exact
+        list `5928119` was written to prevent, one flag over.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("errSecAuthFailed rc=36")
+
+        monkeypatch.setattr(_kc, "get_password", locked)
+        assert store._read_active_credentials().degraded is True, "premise: it failed"
+
+        # The Keychain recovers (a GUI ACL grant), and a write falls back for
+        # its own reason. Its delete of the old item SUCCEEDS.
+        monkeypatch.setattr(_kc, "get_password", lambda *_a, **_kw: None)
+        monkeypatch.setattr(_kc, "delete_password", lambda *_a, **_kw: None)
+        cleared = store._delete_active_keychain_entry()
+        assert cleared is True, "premise: the residual is provably gone"
+        store._pin_file_mode(residual_cleared=cleared)
+
+        assert store._read_active_credentials().degraded is False, (
+            "the file is the authority — we verified no Keychain item can "
+            "shadow it — yet the verdict stayed degraded with no way back"
+        )
+
+    def test_a_failed_clear_survives_an_unrelated_success(
+        self, macos_switcher, monkeypatch
+    ):
+        """The other half: an UNVERIFIED clear must not be erasable.
+
+        When the failure originated in a WRITE, no active read ever ran, so
+        `_active_read_failed` is False and the verdict rested entirely on
+        `_keychain_op_failed` — which `_kc_call` clears on ANY later success,
+        including an idle slot's readable backup. Measured through the real
+        `_fetch_active_usage`, same fixture, only whether a sibling backup was
+        read first:
+
+            sibling read first:  degraded=False  error='invalid_grant'
+                                 POSTed=['rt-SPENT']   add_guard=passed
+            no sibling read:     degraded=True   sentinel='keychain unavailable'
+                                 POSTed=[]             add_guard=refused
+
+        `invalid_grant` is in PERMANENT_AUTH_ERRORS with AUTH_DEAD_STRIKES = 1,
+        so a live account is quarantined as "re-login needed" because an
+        unrelated slot happened to be read first. The pin records the delete's
+        own outcome, which no other item's success can speak for.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        def write_denied(*_a, **_kw):
+            raise _kc.KeychainError("write denied")
+
+        monkeypatch.setattr(_kc, "set_password", write_denied)
+        with pytest.raises(_kc.KeychainError):
+            store._kc_call(
+                _kc.set_password, "svc", "acct", "v"
+            )
+        assert store._active_read_failed is False, "premise: no read ever failed"
+
+        monkeypatch.setattr(_kc, "delete_password", write_denied)
+        cleared = store._delete_active_keychain_entry()
+        assert cleared is False, "premise: the residual may survive"
+        store._pin_file_mode(residual_cleared=cleared)
+        assert store._read_active_credentials().degraded is True, "premise"
+
+        # One readable idle backup, an entirely different Keychain item.
+        monkeypatch.setattr(_kc, "get_password", lambda *_a, **_kw: "sibling-token")
+        assert macos_switcher._read_account_credentials("9", "i@e.com") == (
+            "sibling-token"
+        ), "premise: the sibling read succeeds"
+
+        assert store._read_active_credentials().degraded is True, (
+            "an unrelated slot's readable backup erased a verdict about the "
+            "ACTIVE item's residual — the consume gate now POSTs a possibly-"
+            "spent generation and quarantines a live account"
+        )
+
+    def test_the_sentinel_asks_about_the_slot_it_is_describing(
+        self, macos_switcher, monkeypatch
+    ):
+        """`_static_usage_sentinel` read the PROCESS flag, not the slot's read.
+
+        `_keychain_unreadable` answers "has any op failed and not since
+        succeeded", and `_kc_call` clears it on every success — including an
+        rc-44 miss, which decrypts nothing and succeeds on a fully locked
+        Keychain. So a slot whose live backup could NOT be read is described
+        using a verdict some other slot's read produced.
+
+        Measured with every Keychain read denied and a real backup on slot 2:
+
+            slot2='no credentials'   slot9='no credentials'
+
+        Slot 2's backup is alive and unread, and "no credentials" sends the
+        user to re-add it — the one remedy that cannot work, and the exact
+        dead-end `41313b9` removed from three sites.
+
+        `_read_account_credentials_ex` already returns the per-read verdict;
+        the sentinel just was not asking it.
+        """
+        from claude_swap import macos_keychain as _kc
+
+        s = macos_switcher
+        store = s._store
+        store._keychain_usable_cache = True
+        store._write_account_credentials(
+            "2", "b@e.com", '{"claudeAiOauth": {"accessToken": "ALIVE"}}'
+        )
+
+        def denied(*_a, **_kw):
+            raise _kc.KeychainError("errSecAuthFailed")
+
+        monkeypatch.setattr(_kc, "get_password", denied)
+
+        verdict = s._static_usage_sentinel(
+            ("2", "b@e.com", None, None, False, "", None)
+        )
+        assert verdict == USAGE_KEYCHAIN_UNAVAILABLE, (
+            f"slot 2 reported {verdict!r} while its backup sat unread in the "
+            f"Keychain — the advice is to re-add a slot that has one"
+        )
 
     def test_a_lapsed_cooldown_clears_the_unreadable_verdict(self, macos_switcher):
         """One transient failure must not be permanent for the process.
@@ -725,7 +879,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         self, macos_switcher
     ):
         """Same conflation on the display path."""
-        macos_switcher._store._pin_file_mode()
+        macos_switcher._store._pin_file_mode(residual_cleared=True)
         verdict = macos_switcher._static_usage_sentinel(
             ("9", "x@e.com", None, None, False, "", None)
         )
@@ -760,7 +914,7 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
                 },
             },
         )
-        s._store._pin_file_mode()  # OUR write; nothing failed
+        s._store._pin_file_mode(residual_cleared=True)  # OUR write; nothing failed
 
         with pytest.raises(SwitchError) as exc:
             s._perform_switch("2", emit_output=False, force_activate=True)

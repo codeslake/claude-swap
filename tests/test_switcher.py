@@ -8318,7 +8318,9 @@ class TestDegradedReadProvenance:
         switcher._setup_directories()
         switcher.platform = Platform.MACOS
         store = switcher._store
-        store._pin_file_mode()          # we chose file mode; nothing failed
+        # we chose file mode; nothing failed, and the delete confirmed no
+        # residual can shadow the file.
+        store._pin_file_mode(residual_cleared=True)
 
         got = store._read_active_credentials()
         assert got.value == ""          # the premise: nothing stored
@@ -8357,7 +8359,7 @@ class TestDegradedReadProvenance:
                 "expiresAt": 9_999_999_999_000,
             }
         }))
-        store._pin_file_mode()
+        store._pin_file_mode(residual_cleared=True)
         assert store._read_active_credentials().degraded is False, (
             "a self-pinned file mode reads as a degraded keychain read, so "
             "cswap stops refreshing the active token for this process"
