@@ -918,6 +918,23 @@ class TestDashboard:
         finally:
             pin.is_available, pin._impl = real_avail, real_impl
 
+    async def test_an_informational_row_does_not_kill_the_dashboard(self, tmp_path):
+        """A row with no action must do nothing, not raise KeyError.
+
+        _pin_entries returns [(str(exc), ""), _BACK] when the package is
+        present but unusable — an informational row, deliberately without an
+        action. `actions[action_id]()` raised KeyError out of
+        on_list_view_selected and took the app down: the same class as a
+        raising apply_pin, one menu level up.
+        """
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await app.screen._dispatch("")
+            await pilot.pause()
+            assert app.is_running, "an actionless row killed the dashboard"
+
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
             [

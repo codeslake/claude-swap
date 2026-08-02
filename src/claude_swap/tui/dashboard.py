@@ -342,8 +342,14 @@ class DashboardScreen(Screen):
             except Exception as exc:  # noqa: BLE001
                 app.notify(f"Cloud pin failed: {exc}")
             await self._pop_menu()
-        else:
+        elif action_id in actions:
             actions[action_id]()
+        # An id that matches nothing is an INFORMATIONAL row (see
+        # _pin_entries, which shows the reason the pin is unusable). It has no
+        # action by design, and `actions[action_id]()` raised KeyError out of
+        # on_list_view_selected and killed the dashboard — the same class of
+        # failure as a raising apply_pin, one menu level up. Selecting a row
+        # that says nothing should do nothing.
 
     # -- actions ----------------------------------------------------------------
 
