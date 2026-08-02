@@ -27,6 +27,22 @@ from types import ModuleType
 
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
+def _install_how() -> str:
+    """The install COMMAND for this install method, on its own.
+
+    Split out so there is exactly one place that decides it. A second
+    hardcoded `uv tool install ...` survived beside the derived hint and
+    diverged from it on a pipx machine — one screen apart, both wrong for
+    someone.
+    """
+    from claude_swap.update_check import _detect_install_method
+
+    return {
+        "uv": "uv tool install 'claude-swap[pin]'",
+        "pipx": "pipx install 'claude-swap[pin]'",
+    }.get(_detect_install_method() or "", "pip install 'claude-swap[pin]'")
+
+
 def _install_hint() -> str:
     """How to install the extra, in a form that reaches THIS install.
 
@@ -37,13 +53,7 @@ def _install_hint() -> str:
     `cswap upgrade` already solves this; reuse its detector rather than
     re-deriving it.
     """
-    from claude_swap.update_check import _detect_install_method
-
-    how = {
-        "uv": "uv tool install 'claude-swap[pin]'",
-        "pipx": "pipx install 'claude-swap[pin]'",
-    }.get(_detect_install_method() or "", "pip install 'claude-swap[pin]'")
-    return f"The cloud pin requires 'cswap-pin'. Install with: {how}"
+    return f"The cloud pin requires 'cswap-pin'. Install with: {_install_how()}"
 
 
 # The FLOOR is a correctness bound, not packaging hygiene. 0.1.0 is the release
@@ -216,8 +226,21 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     # launch left behind would send this child at a port nothing answers.
     # ONE tail, not one per branch: duplicating it ran the unwire twice when
     # the None path's own unwire raised.
+    #
+    # BOUNDED, like the no-package branch above. `unwire_if_dead` takes no
+    # timeout and uses the package's own claude_config_lock(timeout=5), so a
+    # held .claude.json.lock made every `cswap run` wait 5.3s (measured, 5.19s
+    # of it inside the unwire) before returning the env unchanged — and Claude
+    # Code holds that lock routinely while refreshing credentials. The budget
+    # this path was given was only ever applied to the branch where the package
+    # is absent.
+    #
+    # If the lock is not free right now, SKIP: the wiring is stale but the next
+    # launch heals it, and a launch that blocks is worse than a launch that is
+    # briefly unpinned — the whole reason this path fails open.
     try:
-        pin.unwire_if_dead(switcher.backup_dir / "pin-proxy")
+        if _config_lock_is_free(_LAUNCH_LOCK_BUDGET_S):
+            pin.unwire_if_dead(switcher.backup_dir / "pin-proxy")
     except Exception:  # noqa: BLE001
         pass
     return env
@@ -296,6 +319,75 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     return changed
 
 
+def _config_lock_is_free(budget: float) -> bool:
+    """Can the config lock be taken within ``budget`` seconds?
+
+    A probe, not a hold — the caller re-locks immediately after. That race is
+    deliberate: losing it costs one skipped unwire (the next launch heals it),
+    while the alternative is the launch itself waiting on the package's own
+    5-second lock timeout, which it has no way to shorten.
+    """
+    from claude_swap.claude_locks import proper_lockfile
+    from claude_swap.paths import get_global_config_path
+
+    path = get_global_config_path()
+    try:
+        with proper_lockfile(path.parent / (path.name + ".lock"), timeout=budget):
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _pinned_email_now(switcher) -> tuple[str, str] | None:
+    """The pin record as cswap's OWN file has it, or None. Never the package.
+
+    Both the clear and set paths need this and neither can ask ``cswap_pin``
+    for it: the package is precisely what may be broken, and on the set path
+    ``apply_pin`` has already written the record by the time a failure is
+    known. ``settings.json -> remoteControl`` is cswap's file, so read it.
+    """
+    from claude_swap import settings as _s
+
+    section = _s._read_raw(_s.settings_path(switcher.backup_dir)).get("remoteControl")
+    if not isinstance(section, dict):
+        return None
+    email = section.get("pinnedEmail")
+    if not email:
+        return None
+    return email, section.get("pinnedOrganizationUuid")
+
+
+def _wiring_present(switcher) -> bool:
+    """Does either config still carry a pin wiring?
+
+    The companion to :func:`clear_wiring`'s return value, which cannot answer
+    this: it returns False both for "there was nothing to remove" and for "the
+    lock was contended so this path was skipped", and only the second is a
+    failure. Read without a lock — a stale read here costs a re-run, while
+    waiting on the same lock that just failed costs the command.
+    """
+    # Imported here, as clear_wiring does: paths.py reads CLAUDE_CONFIG_DIR at
+    # CALL time, and a module-scope import would freeze the resolution for a
+    # process whose env changes (the `cswap run` case both functions exist for).
+    from claude_swap.paths import (
+        get_default_global_config_path,
+        get_global_config_path,
+    )
+
+    seen = set()
+    for path in (get_global_config_path(), get_default_global_config_path()):
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — unreadable/absent is not "wired"
+            continue
+        if isinstance(raw, dict) and raw.get(_WIRE_MARK):
+            return True
+    return False
+
+
 def _clear_wiring_locked(switcher, path) -> bool:
     """The read-modify-write of :func:`clear_wiring`, under its lock."""
     try:
@@ -366,16 +458,8 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # The pin record is cswap's OWN file (settings.json -> remoteControl),
         # so the one command whose job is to work when the pin does not should
         # not need the pin to answer "is it still there".
-        def _pinned_now() -> bool:
-            from claude_swap import settings as _s
-
-            section = _s._read_raw(_s.settings_path(switcher.backup_dir)).get(
-                "remoteControl"
-            )
-            return isinstance(section, dict) and bool(section.get("pinnedEmail"))
-
         try:
-            had_pin = _pinned_now()
+            had_pin = _pinned_email_now(switcher) is not None
         except Exception:  # noqa: BLE001 — an unreadable file is not a pin
             had_pin = False
         still_pinned = had_pin
@@ -390,7 +474,7 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # Reading here covers all of them at once — a raising _impl(), a
         # raising apply_pin, and an apply_pin that returns having done nothing.
         try:
-            still_pinned = _pinned_now()
+            still_pinned = _pinned_email_now(switcher) is not None
         except Exception:  # noqa: BLE001
             still_pinned = had_pin
         # ALWAYS, not only when apply_pin failed. The package unwires through
@@ -403,13 +487,28 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # apply_pin cannot answer "was there anything to clear": it returns
         # whether a proxy is now serving, which on this path is always False.
         cleared_wiring = clear_wiring(switcher)
-        if still_pinned:
-            # The wiring may well be gone; the PIN is not. Saying "Unpinned"
-            # here is the failure, not the pin surviving: a user who is told
-            # they are unpinned stops looking.
+        # RE-READ THE WIRING TOO, for the reason the pin is re-read: a return
+        # value cannot separate "nothing to clear" from "could not clear".
+        # clear_wiring skips a path whose lock it cannot take (deliberate — the
+        # launch path must not fail over a contended config) and returns False
+        # either way, so a read-only ~ or Claude Code holding
+        # .claude.json.lock past the wait printed "Unpinned" while the wiring
+        # stayed. The daemon then idles out and every hand-launched claude
+        # dials a dead port — the exact stranding clear_wiring was moved into
+        # this repo to prevent, reported as success.
+        still_wired = _wiring_present(switcher)
+        if still_pinned or still_wired:
             warning("Could not remove the cloud pin")
-            print(dimmed("  the pin package is installed but not usable here"))
-            print(dimmed("  reinstall it:  uv tool install 'claude-swap[pin]'"))
+            if still_pinned:
+                print(dimmed("  the pin package is installed but not usable here"))
+                print(dimmed(f"  reinstall it:  {_install_how()}"))
+            if still_wired:
+                print(
+                    dimmed(
+                        "  the proxy wiring is still in .claude.json (locked or "
+                        "read-only) — re-run `cswap pin --clear` once it frees up"
+                    )
+                )
             return 1
         if not cleared_wiring and not had_pin:
             print(dimmed("No cloud account pinned"))
@@ -428,6 +527,24 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         return 0
 
     account_num, email, org_uuid = switcher.resolve_account(account)
+
+    # REFUSE AN API-KEY ACCOUNT. `sk-ant-api...` is not OAuth JSON, so the
+    # proxy's credential provider returns None for every request and each one
+    # fails open — the pin is accepted, the daemon spawns, the badge shows
+    # `○ cloud`, and nothing is ever pinned. session.py:_ensure_not_api_key
+    # already refuses these for `cswap run` for the same reason; refusing here
+    # is the same call at the same level, rather than teaching the badge a new
+    # broken state after the fact.
+    try:
+        is_api_key = switcher._account_kind(account_num) == "api_key"
+    except Exception:  # noqa: BLE001 — an unreadable kind is not a refusal
+        is_api_key = False
+    if is_api_key:
+        raise ClaudeSwitchError(
+            f"Account-{account_num} ({email}) is an API-key account, which the "
+            "cloud pin cannot use: Remote Control and Artifacts need an OAuth "
+            "bearer. Pin an account added with `cswap add` after /login."
+        )
     # The SET path needs the same honesty the clear path was given, and for the
     # same reason: apply_pin writes the record BEFORE it starts the proxy, so
     # a failure here leaves a pin that `cswap pin` and the TUI badge both
@@ -437,11 +554,37 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
     # here are not that: with <backup>/pin-proxy a plain file (a leftover, a
     # restore-from-backup), ensure_proxy's certdir.mkdir raises FileExistsError
     # and the user gets a traceback plus a recorded pin.
+    had_pin_before = _pinned_email_now(switcher)
     try:
         started = pin.apply_pin(switcher, email, org_uuid)
     except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
+        # ROLL THE RECORD BACK. Reporting the failure is not enough while
+        # apply_pin has already written remoteControl: `cswap pin` then reads
+        # it back and prints the account as pinned, the TUI badge shows
+        # ○ cloud, and the command that failed has handed the user a command
+        # that contradicts it. Restore whatever was pinned before — including
+        # nothing, which is the common case.
+        rolled_back = True
+        try:
+            pin.apply_pin(switcher, *(had_pin_before or (None, None)))
+        except Exception:  # noqa: BLE001
+            rolled_back = False
         warning(f"Could not pin the cloud account: {exc}")
-        print(dimmed("  nothing is wired; run `cswap pin` to see the current state"))
+        if rolled_back:
+            print(
+                dimmed(
+                    "  nothing is wired and the previous pin is unchanged"
+                    if had_pin_before
+                    else "  nothing is wired and nothing is pinned"
+                )
+            )
+        else:
+            print(
+                dimmed(
+                    "  WARNING: the record may still name "
+                    f"{email} — check with `cswap pin`"
+                )
+            )
         return 1
     print(
         f"{accent('Pinned')} the cloud account (RC/artifacts) to "
