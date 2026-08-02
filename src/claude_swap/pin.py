@@ -319,15 +319,21 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # whatever the first left.
     import time as _time
 
-    deadline = None if timeout is None else _time.monotonic() + timeout
+    # An UNTIMED call still gets a total. Leaving `None` meant each config
+    # independently waited the lock's own default, so `cswap pin --clear`
+    # with both locks held froze for 2x that (measured: 18.18s against a 9s
+    # default) — the same multiple-of-the-configs bug this deadline was added
+    # to fix, on the branch that did not pass a timeout.
+    if timeout is None:
+        from claude_swap.claude_locks import DEFAULT_TIMEOUT_S
+
+        timeout = DEFAULT_TIMEOUT_S
+    deadline = _time.monotonic() + timeout
     changed = False
     for path in paths:
-        if deadline is not None:
-            left = deadline - _time.monotonic()
-            if left <= 0:
-                continue  # budget spent; the next launch heals what is left
-        else:
-            left = None
+        left = deadline - _time.monotonic()
+        if left <= 0:
+            continue  # budget spent; the next launch heals what is left
         try:
             with proper_lockfile(
                 path.parent / (path.name + ".lock"), timeout=left
@@ -377,7 +383,12 @@ def _pinned_email_now(switcher) -> tuple[str, str] | None:
     email = section.get("pinnedEmail")
     if not email:
         return None
-    return email, section.get("pinnedOrganizationUuid")
+    # `or ""` to match the WRITER. cswap_pin.save_pin always writes
+    # `org_uuid or ""`, so a record with no org key read back as None here
+    # while the same record after a rollback read as "" — unequal, and
+    # _restore_pin then reported a successful rollback as a failure. The
+    # package's own load_pin already normalizes; this reader had diverged.
+    return email, section.get("pinnedOrganizationUuid") or ""
 
 
 def _safe(exc: object) -> str:
@@ -440,6 +451,22 @@ def _clear_pin_record(switcher) -> None:
         pass
 
 
+def _wire_mark_of(raw: object) -> list | None:
+    """The marker THIS module wrote, or None. The single reader.
+
+    ``_wiring_present`` and ``_clear_wiring_locked`` both answer "is it
+    wired", and they disagreed: one accepted any truthy marker, the other
+    required a non-empty list. A malformed marker (a hand-edit, a format
+    change in a future cswap-pin) therefore satisfied the first and not the
+    second, so `--clear` reported "could not remove the wiring — re-run once
+    it frees up" forever: nothing was contended and nothing ever converged.
+    """
+    if not isinstance(raw, dict):
+        return None
+    ours = raw.get(_WIRE_MARK)
+    return ours if isinstance(ours, list) and ours else None
+
+
 def _wiring_present(switcher) -> bool:
     """Does either config still carry a pin wiring?
 
@@ -466,7 +493,7 @@ def _wiring_present(switcher) -> bool:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 — unreadable/absent is not "wired"
             continue
-        if isinstance(raw, dict) and raw.get(_WIRE_MARK):
+        if _wire_mark_of(raw) is not None:
             return True
     return False
 
@@ -480,8 +507,8 @@ def _clear_wiring_locked(switcher, path) -> bool:
     if not isinstance(raw, dict):
         return False
 
-    ours = raw.get(_WIRE_MARK)
-    if not isinstance(ours, list) or not ours:
+    ours = _wire_mark_of(raw)
+    if ours is None:
         return False  # nothing of ours in there
 
     env = raw.get("env")
