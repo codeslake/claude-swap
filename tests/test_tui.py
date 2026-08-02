@@ -882,6 +882,42 @@ class TestDashboard:
             finally:
                 pin.is_available = monkey
 
+    async def test_a_failing_pin_does_not_kill_the_dashboard(self, tmp_path):
+        """apply_pin failing must be an error message, not a dead TUI.
+
+        The guard above the dispatch catches `pin._impl()` but stopped one
+        line short of the call that does the work, so an exception propagated
+        out of on_list_view_selected and took the app down. A real trigger
+        needs no injection: a plain FILE where <backup>/pin-proxy should be a
+        directory makes ensure_proxy's mkdir raise FileExistsError.
+        """
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+
+        class _Impl:
+            def load_pin(self, _d):
+                return None
+
+            def apply_pin(self, *_a):
+                raise OSError("disk full")
+
+            def live_remote_control_sessions(self):
+                return []
+
+        real_avail, real_impl = pin.is_available, pin._impl
+        pin.is_available = lambda: True
+        pin._impl = lambda: _Impl()
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                await app.screen._dispatch("pin:clear")
+                await pilot.pause()
+                assert app.is_running, "a failing pin killed the dashboard"
+        finally:
+            pin.is_available, pin._impl = real_avail, real_impl
+
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
             [
@@ -1773,4 +1809,3 @@ class TestThemeWiring:
             await menu_select(pilot, "theme:light")
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
-
