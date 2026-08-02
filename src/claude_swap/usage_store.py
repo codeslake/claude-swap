@@ -493,25 +493,15 @@ def _failure_backoff_s(
         # past TRUST_MAX_AGE_S as the margin would have. The bound belongs to
         # the path, not to the margin.
         asked = min(asked, TRUST_MAX_AGE_S)
-    # NO TRUST TRIM. Shortening a 429 wait when the stored trust expires
-    # before the server's deadline was measured wrong and removed.
-    #
-    # It cannot salvage the trust it is named for: the precondition is
-    # `trust < ask` and the floor keeps `wait >= ask`, so the row is untrusted
-    # at release either way. Measured over 180 reachable reset offsets: fired
-    # 35 times, salvaged trust 0 times, both waits releasing with the row
-    # unknown at every one.
-    #
-    # Its only effect was to drop the wait onto the deadline, which is where
-    # this PR's evidence says we re-block 10 of 19 times for a fresh hour.
-    # Episode model on that number, 3600 runs:
+    # NO TRUST TRIM. Cutting a 429 wait back to the deadline when the stored
+    # trust expires first cannot salvage that trust — `trust < ask` is its own
+    # precondition and the floor keeps `wait >= ask`, so the row is untrusted
+    # at release either way (measured: fired 35 of 180 offsets, salvaged 0).
+    # It only lands us on the deadline, where 10 of 19 lapses re-block for a
+    # fresh hour. Episode model on that number, 3600 runs:
     #
     #     with the trim    blind 1148s   requests 1.21
     #     without it       blind  550s   requests 1.00
-    #
-    # Most it could save was RETRY_AFTER_MARGIN_S (900s); expected cost of a
-    # firing is 0.526 x 3600 = 1895s, compounding because each re-block leaves
-    # the trust further expired.
     return max(asked, computed)
 
 
