@@ -3229,7 +3229,10 @@ class TestHorizonAxisDoesNotFlap:
         """
         pct = {"1": 92.0, "2": 92.0}
         seen = []
-        for _ in range(24):
+        # 60, not 24: the settling point moves with fleet size (measured 3 /
+        # 6 / 8 / 10 moves at n = 2 / 3 / 4 / 5) and 24 ticks caught this
+        # shape mid-walk.
+        for _ in range(60):
             harness.tick_with_usage({
                 "1": _usage(pct["1"], self._days_out(harness, 500)),
                 "2": _usage(pct["2"], self._days_out(harness, 400)),
@@ -3240,10 +3243,17 @@ class TestHorizonAxisDoesNotFlap:
             harness.clock.advance(301.0)
 
         moves = [n for i, n in enumerate(seen) if i == 0 or n != seen[i - 1]]
-        assert len(moves) <= 4, (
-            f"move sequence {moves} — the walk did not settle. Without the "
-            "ratio release it is unbounded; with it, 120 and 400 ticks both "
-            "measure the same four moves."
+        # SETTLING is the property, not a move count. `len(moves) <= 4` was
+        # true of this 2-account shape and false of every other: measured over
+        # 120 ticks with the fleet grown, 3 / 6 / 8 / 10 moves at n = 2 / 3 /
+        # 4 / 5 — the bar refuses only the ONE account left last, so a longer
+        # ring walks further before it comes back. All four settle.
+        #
+        # A count that holds for one fleet size reads as a bound and is not
+        # one. What the walk has to do is END.
+        assert len(set(seen[-8:])) == 1, (
+            f"move sequence {moves} — the walk was still moving in the last "
+            "eight ticks, so it does not settle at all"
         )
 
     def test_a_proactive_move_does_not_lock_out_the_next_one(self, harness):
@@ -3483,6 +3493,53 @@ class TestHorizonAxisDoesNotFlap:
         )
         assert list(barred) == [], (
             f"the bar did not remove account 1 from the ranking: {list(barred)}"
+        )
+
+    def test_the_bar_lifts_when_the_only_alternative_cannot_be_chosen(
+        self, temp_home
+    ):
+        """Existing is not the same as being an alternative.
+
+        The leaves-nothing release asked whether any OTHER account exists. A
+        third account that exists but can never qualify — at its limit, or with
+        unreadable headroom — answered yes while offering the ranking nothing,
+        so the release never fired and the n=2 stall simply moved to n>=3.
+
+        Measured before this, one ordinary proactive move and no seeded state:
+        30 ticks / 30h all BLOCKED with the active on 2 points and the barred
+        peer on 3, while the same fleet with the bar cleared switches on the
+        first tick.
+
+        THIRD ACCOUNT AT ITS LIMIT on purpose: with a healthy third the bar is
+        correct and the sibling tests cover it. The defect needs an alternative
+        that the ranking loop would skip anyway.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+            "3": _usage(100, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(301.0)
+
+        outcomes = []
+        for _ in range(30):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(97, self._days_out(h, 10)),    # barred, 3 pts
+                "2": _usage(98, self._days_out(h, 500)),   # active, 2 pts
+                "3": _usage(100, self._days_out(h, 300)),  # exists, spent
+            }))
+            h.clock.advance(3601.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"30 ticks of {[o.name for o in outcomes[:6]]}… — the only "
+            "choosable peer was barred and the third account is at its limit, "
+            "so the bar left the engine nothing"
         )
 
     def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
