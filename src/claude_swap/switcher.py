@@ -334,19 +334,11 @@ class ClaudeAccountSwitcher:
         # from the active slot's own read; consumed later by the usage
         # sentinel, the rotation resync and the consume gate.
         #
-        # Thread-local because it is a fact about one READ, not about the
-        # process, and the TUI runs two lanes on one switcher: `tui/app.py`
-        # starts a store refresh while a normal refresh is in flight, each
-        # guarded separately. A build's unconditional reset at the top then
-        # erased the other lane's verdict. Measured against a 4ms window
-        # (`_FETCH_STAGGER_S` is 250ms, so the real window is 501ms at 3
-        # accounts and 1001ms at 10): 60 of 60 verdicts lost, after which the
-        # consume gate POSTs a possibly-spent grant and AUTH_DEAD_STRIKES = 1
-        # quarantines a live account.
-        #
-        # An earlier comment here claimed "main thread writes it before the
-        # fetch pool starts -> no data race". True of the pool, false of the
-        # TUI.
+        # Thread-local: a fact about one READ, and the TUI runs two lanes on
+        # one switcher (`tui/app.py` starts a store refresh while a normal one
+        # is in flight). A build's unconditional reset erased the other lane's
+        # verdict — measured against a 4ms window, 60 of 60 lost, after which
+        # the consume gate POSTs a possibly-spent grant.
         self._active_verdict_tls = threading.local()
 
         # Accounts already warned about a provenance problem with the active
