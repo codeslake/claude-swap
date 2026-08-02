@@ -438,7 +438,12 @@ def _rate_limited_trust_ok(
     return now < ceiling
 
 
-def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -> float:
+def _failure_backoff_s(
+    consecutive_failures: int,
+    retry_after_s: float | None,
+    *,
+    rate_limited: bool = True,
+) -> float:
     computed = min(
         BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
         BACKOFF_CAP_S,
@@ -458,8 +463,30 @@ def _failure_backoff_s(consecutive_failures: int, retry_after_s: float | None) -
     # takes no margin and still retries near its deadline. Nothing local
     # separates that ask from a genuine short burst block, so it is left open.
     asked = retry_after_s
-    if retry_after_s > BACKOFF_CAP_S:
+    if retry_after_s > BACKOFF_CAP_S and rate_limited:
+        # THE MARGIN IS 429-ONLY, and the ceiling is why. It was measured on
+        # usage-endpoint blocks, whose stale data stays decision-trusted until
+        # the window resets (or RATE_LIMIT_TRUST_MAX_AGE_S = 7200s), so a
+        # 4500s wait sits comfortably inside its own trust.
+        #
+        # Every other failure falls back to TRUST_MAX_AGE_S = 3600s — and
+        # `_classify_usage_error` parses Retry-After for ANY HTTPError code,
+        # not just 429. A 503 carrying `Retry-After: 3600` therefore took the
+        # margin and waited 4500s while its last_good went untrusted at 3600s:
+        # 900s in which the row can neither be re-polled (still in backoff) nor
+        # used (unknown), and the unhealthy-tick counter reads that blindness
+        # as a failing account and fails over. Measured: blind window 179s ->
+        # 1079s, and a failover at +3780s that main never performs.
+        #
+        # Capping the constant instead would land a 3600s ask exactly on its
+        # deadline — the defect this whole change exists to fix.
         asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)
+    elif not rate_limited:
+        # Nor may the ASK itself outlast that trust. Dropping the margin is not
+        # enough: a 503 that simply asks for 4500s parks the row exactly as far
+        # past TRUST_MAX_AGE_S as the margin would have. The bound belongs to
+        # the path, not to the margin.
+        asked = min(asked, TRUST_MAX_AGE_S)
     return max(asked, computed)
 
 
@@ -738,7 +765,9 @@ class UsageStore:
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
                     row["last429At"] = now
                 row["backoffUntil"] = now + _failure_backoff_s(
-                    failures, rec.retry_after_s
+                    failures,
+                    rec.retry_after_s,
+                    rate_limited=rec.error == "http-429",
                 )
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no

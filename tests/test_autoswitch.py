@@ -805,6 +805,51 @@ class TestAdaptiveScheduler:
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
+    def test_backoff_never_outlasts_the_trust_it_relies_on(
+        self, temp_home, monkeypatch
+    ):
+        """A row must never be BOTH un-pollable and un-trusted.
+
+        The sibling test above pins the property that matters — deliberate
+        staleness keeps headroom known, so no unhealthy ticks — but asks for
+        600s and advances 400s, so it never reaches a ceiling. At hour scale
+        the two bounds cross: ``TRUST_MAX_AGE_S`` caps how long last_good
+        stays decision-trusted, and the Retry-After margin can push the
+        backoff past it. In that window the engine cannot re-poll (backoff)
+        and cannot use what it has (untrusted), so the unhealthy-tick counter
+        converts the blindness into a failover away from a healthy account.
+
+        The margin belongs to 429s, whose stale data stays trusted until the
+        window resets (or 7200s). Every OTHER failure falls back to
+        TRUST_MAX_AGE_S, and `_classify_usage_error` parses Retry-After for any
+        HTTP code — so a 503 carrying `Retry-After: 3600` is the shape that
+        crosses. Asserted per path on the constants rather than on one tick
+        trace, because the invariant is what must hold.
+        """
+        from claude_swap.usage_store import (
+            RATE_LIMIT_TRUST_MAX_AGE_S,
+            TRUST_MAX_AGE_S,
+            _failure_backoff_s,
+        )
+
+        for ask in (601.0, 3600.0, 4500.0, 10_000.0):
+            other = _failure_backoff_s(1, ask, rate_limited=False)
+            assert other <= TRUST_MAX_AGE_S, (
+                f"non-429 ask={ask:.0f} backs off {other:.0f}s while its "
+                f"last_good stays trusted only {TRUST_MAX_AGE_S:.0f}s — "
+                f"{other - TRUST_MAX_AGE_S:.0f}s un-pollable AND unknown"
+            )
+            rl = _failure_backoff_s(1, ask, rate_limited=True)
+            assert rl <= RATE_LIMIT_TRUST_MAX_AGE_S, (
+                f"429 ask={ask:.0f} backs off {rl:.0f}s past its own "
+                f"{RATE_LIMIT_TRUST_MAX_AGE_S:.0f}s fallback ceiling"
+            )
+
+        # The margin still does its job where it was measured.
+        assert _failure_backoff_s(1, 3600.0, rate_limited=True) == 4500.0, (
+            "the hour-scale 429 margin was lost"
+        )
+
     def test_all_exhausted_escalation_preserves_wider_plan(
         self, temp_home, monkeypatch
     ):
