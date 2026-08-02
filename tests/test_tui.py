@@ -935,6 +935,74 @@ class TestDashboard:
             await pilot.pause()
             assert app.is_running, "an actionless row killed the dashboard"
 
+    async def test_the_tui_clear_also_removes_the_wiring(self, tmp_path):
+        """The TUI never got the CLI's both-configs clear.
+
+        The package unwires through its own single-path resolver, so from a
+        `cswap run` terminal it cleared the session config and left
+        ~/.claude.json naming a dead port. The CLI in the identical state
+        clears both.
+        """
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        called = []
+
+        class _Impl:
+            def apply_pin(self, *_a):
+                return None
+
+            def live_remote_control_sessions(self):
+                return []
+
+        real = (pin.is_available, pin._impl, pin.clear_wiring, pin.pinned_email)
+        pin.is_available = lambda: True
+        pin._impl = lambda: _Impl()
+        pin.clear_wiring = lambda *a, **k: called.append("clear_wiring") or True
+        pin.pinned_email = lambda _sw: None
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                await app.screen._dispatch("pin:clear")
+                await pilot.pause()
+                assert "clear_wiring" in called, (
+                    "the TUI cleared the pin but left the wiring behind"
+                )
+                assert app.is_running
+        finally:
+            pin.is_available, pin._impl, pin.clear_wiring, pin.pinned_email = real
+
+    async def test_the_tui_does_not_report_a_pin_no_proxy_serves(self, tmp_path):
+        """apply_pin's return was discarded, so False read as success."""
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        notes = []
+
+        class _Impl:
+            def apply_pin(self, *_a):
+                return False          # no proxy serving
+
+            def live_remote_control_sessions(self):
+                return []
+
+        real = (pin.is_available, pin._impl)
+        pin.is_available = lambda: True
+        pin._impl = lambda: _Impl()
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                app.notify = lambda msg, **k: notes.append(msg)
+                await app.screen._dispatch("pin:1")
+                await pilot.pause()
+                joined = " ".join(notes)
+                assert "nothing is pinned yet" in joined, joined
+                assert app.is_running
+        finally:
+            pin.is_available, pin._impl = real
+
     async def test_remove_menu_shows_alias_before_email(self, tmp_path):
         fake = FakeSwitcher(
             [
