@@ -1342,7 +1342,22 @@ class AutoSwitchEngine:
             and left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO
         ):
             return None                      # beats us outright; not a flip
-        if all(n == barred for n in oauth_candidates):
+        # CHOOSABLE, not merely present. `all(n == barred ...)` asked whether
+        # any OTHER account exists — and a third account that exists but can
+        # never qualify (spent, or headroom unknown) answered yes while
+        # offering the ranking nothing. Measured, one ordinary proactive move
+        # and no seeded state: active on 2 pts, the barred peer on 3, a third
+        # at its limit — 30 ticks / 30h all BLOCKED, and the same fleet with
+        # the bar cleared switches on the first one. The n=2 stall the release
+        # was added for simply moved to n>=3.
+        #
+        # A candidate the loop would skip anyway (`h is None` or `h <= 0`) is
+        # not an alternative, so barring on its account is still barring on
+        # nothing.
+        if not any(
+            n != barred and (headroom.get(n) or 0.0) > 0.0
+            for n in oauth_candidates
+        ):
             return None                      # barring it leaves nothing
         return barred
 
@@ -1387,27 +1402,26 @@ class AutoSwitchEngine:
         all_above = _every_account_above_threshold(
             oauth_candidates, headroom, active_headroom, settings.threshold
         )
-        # The most headroom any candidate the ranking could ACTUALLY CHOOSE
-        # offers — "is there anything worth having?" Unknown headrooms are
-        # excluded rather than counted as zero: a row we cannot read is not
-        # evidence of an empty account.
+        # "Is anything worth having?" — the most headroom any candidate with a
+        # READABLE row offers. Two exclusions and no others:
         #
-        # Scoped to choosable candidates, not all of them. A peer 0.05 points
-        # above SPENT_HEADROOM_PCT answers "yes, something is worth having" and
-        # so turns the spent check off for EVERYBODY — while being unchoosable
-        # itself, because it does not meet HORIZON_HEADROOM_RATIO against the
-        # active. Nothing then qualifies and the engine parks on the account
-        # that returns LAST. Measured: active 3.00 pts/200h, peer 3.00 pts/10h,
-        # vetoer 3.05 pts/500h -> base switches to the 10h peer, this branch
-        # blocked. The band is (SPENT_HEADROOM_PCT, active x RATIO], up to 3
-        # points wide at the defaults.
-        #
-        # Every candidate whose headroom is KNOWN, unfiltered. An unknown one
-        # is not evidence that somebody has quota left — measured, one
+        # Unknown headrooms are skipped rather than counted as zero. A row we
+        # cannot read is not evidence of an empty account — measured, one
         # sentinel row (expired token, locked keychain) made `all(...)` False
-        # forever and parked the engine on the account resetting LAST. A ratio
-        # floor used to sit here too and inverted monotonicity; the fallback
-        # below is what lets it go.
+        # forever and parked the engine on the account resetting LAST.
+        #
+        # Nothing else is filtered, INCLUDING the no-return bar. An earlier
+        # version of this comment claimed it was "scoped to choosable
+        # candidates"; the code below has never done that and the two
+        # paragraphs contradicted each other. Leaving the barred account in is
+        # deliberate: this answers whether the FLEET has quota, and the bar is
+        # about which account to move to, not about what exists. A peer just
+        # above SPENT_HEADROOM_PCT can therefore turn the spent check off while
+        # being unchoosable itself — the band is (SPENT_HEADROOM_PCT, active x
+        # RATIO], up to 3 points wide at the defaults, and the one-way fallback
+        # below is what stops that band parking the engine. A ratio floor used
+        # to sit here too and inverted monotonicity; removing it is what let
+        # the fallback do the job.
         best_candidate_headroom = max(
             (
                 h
