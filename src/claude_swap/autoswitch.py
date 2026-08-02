@@ -211,19 +211,15 @@ def _recovery_is_useful(
         active_headroom <= SPENT_HEADROOM_PCT
         and best_candidate_headroom <= SPENT_HEADROOM_PCT
     ):
-        # The axis CAN change as the fleet burns, and that is not a leak.
-        # Measured, only the active burning, both resets past the horizon:
+        # The axis CAN change as the fleet burns, and that is not a leak:
         #
-        #     out    active 2.0 / peer 4.0   headroom axis, ratio 4.0 >= 2.0x2
+        #     out    active 2.0 / peer 4.0   headroom axis, 4.0 >= 2.0x2
         #     back   active 3.0 / peer 2.0   recovery  axis, 10h vs 80h
         #
-        # Each leg is legitimate on the axis its own state selects: at the
-        # first the fleet still held real headroom, by the second every
-        # account is spent, which is the regime the reset axis exists for.
-        # 21 of 576 burn walks make that transition and read as A-B-A;
-        # constraining either gate to stop them (candidate-spent on the
-        # fallback, `max`/`min` over the pair here) changes the count by 0,
-        # because the transition is in the DATA rather than in the gates.
+        # Each leg is legitimate on the axis its own state selects. 21 of 576
+        # burn walks make that transition and read as A-B-A; constraining
+        # either gate changes the count by 0, because the transition is in the
+        # DATA rather than in the gates.
         return True
     return (
         candidate_recovery_ts - now <= RECOVERY_HORIZON_S
