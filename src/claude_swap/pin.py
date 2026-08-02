@@ -27,10 +27,36 @@ from types import ModuleType
 
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
-_INSTALL_HINT = (
-    "The cloud pin requires 'cswap-pin'. "
-    "Install with: pip install 'claude-swap[pin]'"
-)
+def _install_hint() -> str:
+    """How to install the extra, in a form that reaches THIS install.
+
+    Not a constant, because `pip install` is wrong for the install method most
+    users have. Under a uv tool install, pip puts a second copy in whatever pip
+    is on PATH and the extra never reaches the tool's environment — the user
+    follows the instruction, it succeeds, and the pin is still missing.
+    `cswap upgrade` already solves this; reuse its detector rather than
+    re-deriving it.
+    """
+    from claude_swap.update_check import _detect_install_method
+
+    how = {
+        "uv": "uv tool install 'claude-swap[pin]'",
+        "pipx": "pipx install 'claude-swap[pin]'",
+    }.get(_detect_install_method() or "", "pip install 'claude-swap[pin]'")
+    return f"The cloud pin requires 'cswap-pin'. Install with: {how}"
+
+
+# The FLOOR is a correctness bound, not packaging hygiene. 0.1.0 is the release
+# that hands a REFUSED swap to the client instead of retrying it unswapped, and
+# Claude Code treats 401/403/404 as terminal (SSETransport sets state="closed"
+# and never reconnects), so one misrouted request ends that session's Remote
+# Control for the life of the process.
+#
+# pyproject's `pin = ["cswap-pin>=0.1.1"]` binds a FRESH resolve only. Anyone
+# who installed cswap-pin before 0.1.1 and later upgrades claude-swap WITHOUT
+# the extra keeps 0.1.0 — and nothing here noticed, because the seam only ever
+# asked "does it import".
+_MIN_PIN_VERSION = (0, 1, 1)
 
 
 def _impl() -> ModuleType:
@@ -78,8 +104,32 @@ def _impl() -> ModuleType:
     except ValueError:
         found = False
     if not found:
-        raise ClaudeSwitchError(_INSTALL_HINT)
-    return importlib.import_module("cswap_pin.proxy")
+        raise ClaudeSwitchError(_install_hint())
+    mod = importlib.import_module("cswap_pin.proxy")
+
+    # A RUNTIME floor, because pyproject's only binds a fresh resolve. Refusing
+    # is right rather than warning: below the floor a refused swap reaches the
+    # client and ends that session's Remote Control permanently, which is worse
+    # than not pinning at all. An unparseable or absent version is NOT treated
+    # as too old — that would break a dev checkout over a guess.
+    #
+    # Read off the PACKAGE, not `proxy`: measured against the installed 0.1.1,
+    # cswap_pin.__version__ is "0.1.1" and cswap_pin.proxy.__version__ does not
+    # exist. Reading the wrong one makes this check dead code that passes for
+    # every version, which is the failure it exists to prevent.
+    raw = getattr(sys.modules.get("cswap_pin"), "__version__", "")
+    try:
+        got = tuple(int(p) for p in str(raw).split(".")[:3])
+    except ValueError:
+        got = ()
+    if got and got < _MIN_PIN_VERSION:
+        want = ".".join(str(p) for p in _MIN_PIN_VERSION)
+        raise ClaudeSwitchError(
+            f"cswap-pin {raw} is too old (need >= {want}): it hands a refused "
+            f"swap to the client, which ends that session's Remote Control. "
+            f"{_install_hint()}"
+        )
+    return mod
 
 
 def _live_impl() -> ModuleType | None:
@@ -303,22 +353,44 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         # unusable" (a broken cryptography) is the other way a user ends up
         # here, and a traceback is the worst possible outcome for the one
         # command whose job is to work when the pin does not.
-        had_pin = False
-        still_pinned = False
+        # READ THE RECORD OURSELVES, not through the package.
+        #
+        # An earlier fix re-read the pin AFTER apply_pin, which covered
+        # "apply_pin raises" and missed the case its own comment names.
+        # A broken `cryptography` does not make apply_pin raise: cswap_pin's
+        # __init__ imports nothing from proxy, so find_spec succeeds and it is
+        # `import_module("cswap_pin.proxy")` inside _impl() that raises —
+        # one line EARLIER than that guard. `had_pin` was then never measured,
+        # the except set it False, and "Unpinned" printed over a live pin.
+        #
+        # The pin record is cswap's OWN file (settings.json -> remoteControl),
+        # so the one command whose job is to work when the pin does not should
+        # not need the pin to answer "is it still there".
+        def _pinned_now() -> bool:
+            from claude_swap import settings as _s
+
+            section = _s._read_raw(_s.settings_path(switcher.backup_dir)).get(
+                "remoteControl"
+            )
+            return isinstance(section, dict) and bool(section.get("pinnedEmail"))
+
+        try:
+            had_pin = _pinned_now()
+        except Exception:  # noqa: BLE001 — an unreadable file is not a pin
+            had_pin = False
+        still_pinned = had_pin
         try:
             impl = _impl()
-            had_pin = impl.load_pin(switcher.backup_dir) is not None
             impl.apply_pin(switcher, None, None)
-            # RE-READ, do not infer. `had_pin` was measured BEFORE apply_pin;
-            # reporting on it says what was true a moment ago, not what is
-            # true now. The failure that matters is silent by construction:
-            # the except below swallows it, and the success message was gated
-            # on clear_wiring(), which only ever reports on the .claude.json
-            # wiring -- never on the pin itself. So a broken cryptography made
-            # apply_pin raise, settings.json kept remoteControl, and the user
-            # was told "Unpinned" while RC/Artifacts silently returned to the
-            # old account the moment the import worked again.
-            still_pinned = impl.load_pin(switcher.backup_dir) is not None
+        except Exception:  # noqa: BLE001
+            pass
+        # Re-read either way. The success message was gated on clear_wiring(),
+        # which reports on the .claude.json wiring and never on the pin itself,
+        # so every way of failing above printed "Unpinned" over a live pin.
+        # Reading here covers all of them at once — a raising _impl(), a
+        # raising apply_pin, and an apply_pin that returns having done nothing.
+        try:
+            still_pinned = _pinned_now()
         except Exception:  # noqa: BLE001
             still_pinned = had_pin
         # ALWAYS, not only when apply_pin failed. The package unwires through
@@ -356,14 +428,34 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
         return 0
 
     account_num, email, org_uuid = switcher.resolve_account(account)
-    started = pin.apply_pin(switcher, email, org_uuid)
+    # The SET path needs the same honesty the clear path was given, and for the
+    # same reason: apply_pin writes the record BEFORE it starts the proxy, so
+    # a failure here leaves a pin that `cswap pin` and the TUI badge both
+    # report as live while nothing serves it.
+    #
+    # _pin_command catches ClaudeSwitchError only, and the failures that reach
+    # here are not that: with <backup>/pin-proxy a plain file (a leftover, a
+    # restore-from-backup), ensure_proxy's certdir.mkdir raises FileExistsError
+    # and the user gets a traceback plus a recorded pin.
+    try:
+        started = pin.apply_pin(switcher, email, org_uuid)
+    except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
+        warning(f"Could not pin the cloud account: {exc}")
+        print(dimmed("  nothing is wired; run `cswap pin` to see the current state"))
+        return 1
     print(
         f"{accent('Pinned')} the cloud account (RC/artifacts) to "
         f"Account-{account_num} ({email})"
     )
 
     if not started:
-        return 0
+        # False means NO PROXY IS SERVING. The record is written, so the pin
+        # takes effect on the next launch that can start one — but nothing is
+        # pinned right now, and "Pinned" alone reads as if it were. Suppressing
+        # the follow-up note was the only signal this failure had.
+        print(dimmed("  but no proxy is running, so nothing is pinned yet"))
+        print(dimmed("  the daemon log says why: <backup>/pin-proxy/daemon.log"))
+        return 1
 
     # A re-pin takes effect under the live proxy: the pinned account is re-read
     # per request, so nothing has to restart. The one thing it cannot move is a
