@@ -92,6 +92,13 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Whether the CURRENT engine's dry_run was True the last time this
+        # screen observed it — seeded by `_start_engine` from the engine's
+        # actual starting state. Lets the self-promotion persist (below) key
+        # on a TRANSITION rather than the steady-state fact `not
+        # engine.dry_run`, which also holds for an engine that started LIVE
+        # from `--auto` with nobody confirming anything (MAJOR-3).
+        self._engine_was_dry_run = True
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -229,6 +236,12 @@ class AutoScreen(Screen):
         # the machine's lock. Report what actually started, not what was asked
         # for — the badge reads engine.dry_run, so it is already right.
         dry_run = engine.dry_run
+        # Seed the transition tracker from the engine's ACTUAL starting
+        # state (see `_on_engine_event`): an engine that starts LIVE here —
+        # `--auto` or a resumed `autoStartLive` — was never dry-run under
+        # this screen, so it can never look "promoted" and must not fire
+        # the self-promotion persist below.
+        self._engine_was_dry_run = dry_run
         self.run_worker(
             engine.run_loop,
             thread=True,
@@ -272,15 +285,24 @@ class AutoScreen(Screen):
         # bug — the refusal correctly records nothing, and so did the later
         # grant.
         #
-        # Keyed on the engine BEING live, the same fact the badge above is
-        # rendered from, not on the event kind that happened to announce it: a
-        # `config-warning` test here would be a per-kind opt-in the next event
-        # is not on. One-directional on purpose — `autoStartLive` is one
-        # shared setting, so writing False from a dry-run engine would revoke
-        # the LIVE holder's consent, which is exactly the demotion bug.
+        # Keyed on a TRANSITION (this screen watched the engine go from
+        # dry-run to LIVE), not on the steady-state fact `not engine.dry_run`
+        # — that fact is ALSO true for an engine that started LIVE from
+        # `--auto` or a resumed `autoStartLive`, where nobody confirmed
+        # anything on this launch (MAJOR-3: one `cswap tui --auto` was
+        # writing permanent go-live consent on its very first poll event).
+        # Not on the event kind either: a `config-warning` check here would
+        # be a per-kind opt-in the next event is not on. One-directional on
+        # purpose — `autoStartLive` is one shared setting, so writing False
+        # from a dry-run engine would revoke the LIVE holder's consent,
+        # which is exactly the demotion bug.
         engine = self._engine
+        was_dry_run = self._engine_was_dry_run
+        if engine is not None:
+            self._engine_was_dry_run = engine.dry_run
         if (
             engine is not None
+            and was_dry_run
             and not engine.dry_run
             and not self._settings.auto_start_live
         ):
