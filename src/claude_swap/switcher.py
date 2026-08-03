@@ -920,6 +920,7 @@ class ClaudeAccountSwitcher:
             ValidationError: alias format is invalid.
             ConfigError: the normalized alias is already used by another account.
         """
+        self._refuse_session_shell()
         try:
             normalized = normalize_alias(alias)
         except ValueError as e:
@@ -955,6 +956,7 @@ class ClaudeAccountSwitcher:
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
         """
+        self._refuse_session_shell()
         self._get_sequence_data_migrated()
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
@@ -1015,6 +1017,7 @@ class ClaudeAccountSwitcher:
         # resolve-validate-mutate sequence — a concurrent switch or usage-
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
+        self._refuse_session_shell()
         with FileLock(self.lock_file):
             return self._swap_accounts_locked(first, second)
 
@@ -1389,6 +1392,7 @@ class ClaudeAccountSwitcher:
         Returns ``(source_num, target_num, swapped)`` where ``swapped`` is True
         when an occupant was displaced.
         """
+        self._refuse_session_shell()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -3270,6 +3274,7 @@ class ClaudeAccountSwitcher:
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
         the TUI, which collects confirmation before calling).
         """
+        self._refuse_session_shell()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -5906,8 +5911,13 @@ class ClaudeAccountSwitcher:
         shell IS a session — its "live store" is the profile, not the
         default login; a switch/add here would splice the default sequence
         against the wrong live store (mirrors SessionManager's own guard).
-        Guarded at the shared chokepoint so every entry point — switch_to,
-        plain rotation, strategy switches, add — is covered once.
+        Called by every entry point that mutates the live store or the
+        roster. There is no single chokepoint to hang this on: the one it
+        used to claim was `_perform_switch`, which covers the switch family
+        only, so `remove_account`, `swap_accounts`, `move_account`, `purge`
+        and the alias setters all ran happily inside a session shell —
+        `remove_account` deleting the session profile of the very shell it
+        was running in. Nine call sites is the honest cost of that.
         """
         cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
         if not cfg_dir:
@@ -6491,6 +6501,7 @@ class ClaudeAccountSwitcher:
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
+        self._refuse_session_shell()
         legacy = get_legacy_backup_root()
         legacy_distinct = legacy != self.backup_dir
 

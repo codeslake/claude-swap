@@ -9574,6 +9574,100 @@ class TestGateUltraReviewFixes:
             "the re-added backup, not the presumed-stale profile"
         )
 
+    # -- session-profile precedence: the other three conjuncts -----------
+
+    def test_a_foreign_profile_never_supersedes_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """#117 credential poisoning through the gate's resync.
+
+        The precedence block writes the session profile INTO the slot
+        (`_write_account_credentials`) before POSTing it. Only the
+        STALE_MARKER conjunct was covered; drop the identity check and a
+        profile whose own .claude.json names SOMEONE ELSE is written into
+        this slot and its grant consumed — so the slot ends up holding a
+        foreign lineage's successor.
+
+        Measured with the guard off:
+            POSTed rt       = rt-foreign   (baseline: rt-bk)
+            backup rt after = rt-n         (the foreign lineage's successor)
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # A profile on a NEWER generation, but logged in as another account.
+        foreign = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-foreign", "refreshToken": "rt-foreign",
+            "expiresAt": 999999}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(foreign)
+        s._write_json(sdir / ".claude.json", {"oauthAccount": {
+            "emailAddress": "SOMEONE-ELSE@example.com",
+            "accountUuid": "other-uuid",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert posted["creds"] == backup, (
+            "the gate POSTed a profile logged in as another account"
+        )
+        assert "rt-foreign" not in s._read_account_credentials(
+            "1", "test@example.com"
+        ), "a foreign lineage was written into the slot"
+
+    def test_an_older_profile_never_supersedes_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The precedence exists for a profile holding the NEWER generation.
+
+        An older one (lower expiresAt) is the spent predecessor: adopting it
+        POSTs a generation the backup already superseded, which is the
+        invalid_grant this gate exists to avoid.
+
+        Measured with `prof_exp > cur_exp` off:
+            POSTed rt = rt-pf-SPENT   (baseline: rt-bk)
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 5000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        older = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-pf", "refreshToken": "rt-pf-SPENT",
+            "expiresAt": 1000}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(older)
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert posted["creds"] == backup, (
+            "the gate POSTed the profile's older, already-superseded "
+            "generation instead of the backup"
+        )
+
     # -- unreadable backup defers ----------------------------------------
 
     def test_unreadable_backup_defers_instead_of_posting_snapshot(
@@ -10096,3 +10190,82 @@ class TestUnreadableBackupIsNotAbsent:
             "the active path delegates to the collectors' rule, which holds "
             "an unprovable strike — correct there, destructive here"
         )
+
+
+class TestSessionShellGuardCoversEveryMutator:
+    """H-4: `_refuse_session_shell`'s docstring claims "a shared chokepoint
+    so every entry point is covered once", but the chokepoint it sits on is
+    `_perform_switch`, not the store. Measured with CLAUDE_CONFIG_DIR pointed
+    at a session profile dir:
+
+        switch_to:        refused, correct
+        remove_account:   SUCCEEDED inside a session shell   (seq now: [1])
+        swap_accounts:    SUCCEEDED inside a session shell
+        purge:            reached the confirmation prompt, not the guard
+
+    `remove_account` additionally deletes the session profile of the very
+    shell it is running in, via `_delete_account_files`.
+    """
+
+    def _switcher(self, sample_sequence_data, monkeypatch):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        inside = s.backup_dir / "sessions" / "1-test-example-com"
+        inside.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(inside))
+        return s
+
+    def test_remove_account_refuses_inside_a_session_shell(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        with pytest.raises(SwitchError):
+            s.remove_account("2", assume_yes=True)
+        assert s._get_sequence_data()["sequence"] == [1, 2], (
+            "the roster was mutated from inside a session shell"
+        )
+
+    def test_swap_accounts_refuses_inside_a_session_shell(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        with pytest.raises(SwitchError):
+            s.swap_accounts("1", "2")
+
+    def test_move_account_refuses_inside_a_session_shell(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        with pytest.raises(SwitchError):
+            s.move_account("2", "5")
+
+    def test_purge_refuses_inside_a_session_shell(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        """Must refuse at the guard, BEFORE the confirmation prompt — a
+        prompt is not a guard, and purge deletes everything."""
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        with pytest.raises(SwitchError):
+            s.purge()
+
+    def test_set_alias_refuses_inside_a_session_shell(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        with pytest.raises(SwitchError):
+            s.set_alias("2", "work")
+
+    def test_unset_alias_refuses_inside_a_session_shell(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        s = self._switcher(sample_sequence_data, monkeypatch)
+        with pytest.raises(SwitchError):
+            s.unset_alias("2")
