@@ -2370,6 +2370,22 @@ class ClaudeAccountSwitcher:
         return self._active_verdict().keychain_unavailable
 
     @property
+    def _active_read_unreadable(self) -> bool:
+        """Whether THIS thread's active-credential read outright FAILED
+        (plaintext-file OSError), as opposed to a genuinely absent slot.
+
+        ``keychain_unavailable`` alone misses this off macOS:
+        ``_read_active_credentials``'s file-read-error arm returns
+        ``ActiveCredentials(None, keychain_failed, keychain_failed)``, and
+        ``keychain_failed`` stays False on Linux/WSL/Windows (there is no
+        Keychain to fail there) — ``value is None`` is the only surviving
+        signal of the three states (readable / genuinely absent / could not
+        be read). Mirrors the ``is None`` guard ``_slot_token_dead`` already
+        uses for the same tri-state on the backup side.
+        """
+        return self._active_verdict().value is None
+
+    @property
     def _active_read_degraded(self) -> bool:
         return self._active_verdict().degraded
 
@@ -4127,7 +4143,9 @@ class ClaudeAccountSwitcher:
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
-            if is_active and self._active_keychain_unavailable:
+            if is_active and (
+                self._active_keychain_unavailable or self._active_read_unreadable
+            ):
                 return USAGE_KEYCHAIN_UNAVAILABLE
             if not is_active and self._read_account_credentials_ex(
                 str(num), email
