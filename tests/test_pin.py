@@ -2027,6 +2027,43 @@ class TestHealNeverTearsDownAServingPin:
     from a call's return instead of re-read from the state.
     """
 
+    @staticmethod
+    def _serving(port=0):
+        """A listener that ACCEPTS, in a thread, until it is closed.
+
+        A bare ``listen(n)`` that never accepts is not "a serving port" — it is
+        a port with n free backlog slots, and each probe consumes one for the
+        life of the test. Measured on Linux with ``listen(1)``: connect #1 OK,
+        #2 OK, #3 times out. Windows CI is stricter and refused the SECOND
+        connect, which is what made
+        ``test_the_serving_check_needs_no_package`` red there while `test` and
+        `macos-keychain` passed.
+
+        Raising the backlog would only move the ceiling, and silently: the next
+        probe someone adds to `heal` puts it back, on one platform, in CI. So
+        drain the queue instead — then "serving" means what the name says, for
+        any number of probes, on any platform.
+        """
+        import socket
+        import threading
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(8)
+
+        def _drain():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return  # closed by the test: the only exit
+                conn.close()
+
+        t = threading.Thread(target=_drain, daemon=True)
+        t.start()
+        return srv, srv.getsockname()[1]
+
     def _wired_to(self, tmp_path, port):
         import types
 
@@ -2071,11 +2108,7 @@ class TestHealNeverTearsDownAServingPin:
 
         from claude_swap import pin
 
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(4)
-        port = srv.getsockname()[1]
+        srv, port = self._serving()
         try:
             sw, cfg = self._wired_to(tmp_path, port)
             self._paths(monkeypatch, cfg)
@@ -2121,16 +2154,15 @@ class TestHealNeverTearsDownAServingPin:
         sw, cfg = self._wired_to(tmp_path, port)
         self._paths(monkeypatch, cfg)
         revived = {}
+        outer = self
 
         class _Reviver:
             def heal(self, backup_dir):
                 # Bind the SAME port: this is what a real revival looks like,
                 # and it is why the outcome must be re-read rather than taken
-                # from the return value.
-                srv = socket.socket()
-                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                srv.bind(("127.0.0.1", port))
-                srv.listen(2)
+                # from the return value. Accepting, not merely listening — see
+                # _serving.
+                srv, _ = outer._serving(port)
                 revived["srv"] = srv
                 return False  # "nothing to report" — NOT failure
 
@@ -2174,18 +2206,121 @@ class TestHealNeverTearsDownAServingPin:
 
         from claude_swap import pin
 
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(1)
-        port = srv.getsockname()[1]
+        srv, port = self._serving()
         try:
             sw, cfg = self._wired_to(tmp_path, port)
             self._paths(monkeypatch, cfg)
             monkeypatch.setattr(pin, "_live_impl", lambda: None)  # no extra
+            # TWO probes: the explicit one here, and heal's own. That is what
+            # made this the test Windows CI failed — see _serving.
             assert pin._wired_port_is_serving(sw) is True
             changed, _ = pin.heal(sw)
             assert not changed
             assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
         finally:
             srv.close()
+
+    def test_the_launch_path_never_unwires_a_serving_pin(self, tmp_path, monkeypatch):
+        """The guard `heal` had and `wire_launch_env` did not.
+
+        `_impl()` raising says nothing about the daemon — a broken
+        `cryptography` after an unrelated upgrade, a half-finished reinstall,
+        an import error in a new release all land on that branch while the
+        proxy on the port keeps answering every session already wired to it.
+        Measured before the fix: ONE `cswap run` in that state stripped the env
+        block from a pin whose port was serving, and every session on the box
+        lost it. Same damage as the outage `heal` exists to end, in the other
+        direction, at the other call site.
+        """
+        from claude_swap import pin
+
+        srv, port = self._serving()
+        try:
+            sw, cfg = self._wired_to(tmp_path, port)
+            self._paths(monkeypatch, cfg)
+
+            def _broken():
+                raise RuntimeError("cryptography is broken after an upgrade")
+
+            monkeypatch.setattr(pin, "_impl", _broken)
+            # Asserting on the file alone would let the guard be deleted while
+            # a *failing* unwire kept the test green — the wiring surviving for
+            # the wrong reason. Make the call itself the failure.
+            monkeypatch.setattr(
+                pin,
+                "clear_wiring",
+                lambda *a, **k: pytest.fail(
+                    "the launch path unwired a SERVING pin"
+                ),
+            )
+            out = pin.wire_launch_env(sw, {})
+            assert out == {}  # unpinned this launch, but nothing torn down
+            assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+        finally:
+            srv.close()
+
+    def test_the_launch_path_still_unwires_a_dead_one(self, tmp_path, monkeypatch):
+        """The guard above must not disable the removal it guards.
+
+        A wiring whose proxy is gone MUST still go: `.claude.json`'s env block
+        is applied at boot, so leaving it sends every new session at a dead
+        port — the outage this whole path exists to prevent.
+        """
+        import socket
+
+        from claude_swap import pin
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+
+        sw, cfg = self._wired_to(tmp_path, dead)
+        self._paths(monkeypatch, cfg)
+
+        def _broken():
+            raise RuntimeError("not installed")
+
+        monkeypatch.setattr(pin, "_impl", _broken)
+        pin.wire_launch_env(sw, {})
+        assert "_cswapPinWiredKeys" not in json.loads(cfg.read_text())
+
+    def test_heal_does_not_report_health_over_an_unwire_it_could_not_do(
+        self, tmp_path, monkeypatch
+    ):
+        """`present and clear_wiring(...)` collapsed two outcomes into one.
+
+        When the wiring is present, the port is dead, and the unwire fails
+        because the config lock is contended, control used to fall to the
+        healthy verdict — over an outage in progress. That path is routine, not
+        exotic: the budget is 0.5s and Claude Code holds this lock during a
+        credential refresh. And the status line calls `heal` on a timer, so the
+        user's only signal during the exact failure it reports said everything
+        was fine.
+
+        The lock is held FOR REAL rather than mocked: "can this be taken" is a
+        question about the filesystem, and a stubbed clear_wiring would pass
+        while the real one still lied.
+        """
+        import socket
+
+        from claude_swap import pin
+        from claude_swap.claude_locks import proper_lockfile
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+
+        sw, cfg = self._wired_to(tmp_path, dead)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+
+        with proper_lockfile(cfg.parent / (cfg.name + ".lock"), timeout=5):
+            changed, msg = pin.heal(sw)
+
+        assert not changed  # nothing was removed, and it must not claim so
+        assert msg != "Nothing to heal", "reported health over a live outage"
+        assert "could not be removed" in msg, msg
+        # The wiring really did survive — the message is describing reality.
+        assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
