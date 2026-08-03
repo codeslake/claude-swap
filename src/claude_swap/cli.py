@@ -118,25 +118,38 @@ Examples:
   cswap pin 2          pin Remote Control / artifacts to account 2
   cswap pin            show the current pin
   cswap pin --clear    remove the pin
+  cswap pin --heal     restart a pin proxy that died, or unwire it
         """,
     )
     parser.add_argument(
         "account", nargs="?", metavar="NUM|EMAIL", help="Account to pin to"
     )
     parser.add_argument("--clear", action="store_true", help="Remove the pin")
+    parser.add_argument(
+        "--heal",
+        action="store_true",
+        help=(
+            "Restart the pin proxy if it died; if it cannot be restarted, "
+            "remove the wiring so sessions fall back instead of failing"
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
     # `cswap pin 2 --clear` otherwise unpins and prints "Unpinned", giving no
     # sign the 2 was discarded — indistinguishable from having pinned it.
     if args.clear and args.account:
         parser.error("--clear takes no account")
+    if args.heal and (args.account or args.clear):
+        parser.error("--heal takes no account and does not combine with --clear")
 
     from claude_swap.pin import run as pin_run
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
-        sys.exit(pin_run(switcher, args.account, clear=args.clear))
+        sys.exit(
+            pin_run(switcher, args.account, clear=args.clear, heal_only=args.heal)
+        )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
