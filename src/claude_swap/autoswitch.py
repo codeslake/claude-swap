@@ -32,6 +32,7 @@ from __future__ import annotations
 import enum
 import json
 import logging
+import math
 import random
 import threading
 import time
@@ -1131,6 +1132,7 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
+        decided_now = self.clock()
         ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
@@ -1140,7 +1142,7 @@ class AutoSwitchEngine:
             current=current,
             active_headroom=active_headroom,
             settings=settings,
-            now=self.clock(),
+            now=decided_now,
         )
 
         if trigger == "consume-first" and ordered:
@@ -1161,6 +1163,7 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
+            decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
@@ -1170,7 +1173,7 @@ class AutoSwitchEngine:
                 current=current,
                 active_headroom=active_headroom,
                 settings=settings,
-                now=self.clock(),
+                now=decided_now,
             )
 
         if not ordered and api_key_candidates and trigger != "consume-first":
@@ -1263,7 +1266,7 @@ class AutoSwitchEngine:
         # consume-first that is the phase-2 refetch, not the stale one.
         left_snapshot = (
             active_headroom,
-            _binding_recovery_ts(usage.get(current), self._models, self.clock()),
+            _binding_recovery_ts(usage.get(current), self._models, decided_now),
         )
         transient_failure = False
         for num in ordered:
@@ -1327,7 +1330,7 @@ class AutoSwitchEngine:
         headroom: dict[str, float | None],
         active_headroom: float | None,
         recovered: bool,
-        settings: AutoSwitchSettings | None = None,
+        settings: AutoSwitchSettings,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1564,7 +1567,20 @@ class AutoSwitchEngine:
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
-            return peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
+            # The active's recovery must be a REAL measurement, not merely
+            # "larger" -- `_binding_recovery_ts` returns `inf` for both
+            # "never resets" and "we do not know" (no windows, no
+            # `resets_at`, or a stale/past `resets_at`). Reading `inf` as
+            # "never" here made `peer < inf - HYST` true for ANY finite
+            # peer reset, releasing onto a peer arbitrarily far out on no
+            # evidence (R7 review, C-1). `math.isfinite` requires the
+            # active to have a genuine, known reset before the comparison
+            # even runs -- unknown holds, exactly like unreadable already
+            # does on the headroom axis (F6).
+            return (
+                math.isfinite(active_recovery_ts)
+                and peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
+            )
         # Dominance over the ACTIVE, only reached once a real baseline is
         # confirmed to exist above -- a peer that was already miles ahead of
         # the active at departure (moved for a DIFFERENT reason -- e.g.
@@ -1581,6 +1597,17 @@ class AutoSwitchEngine:
         # branch above uses when IT has no baseline to compare against
         # either, rather than silently treating "unreadable" as "no
         # dominance".
+        #
+        # DEFENSIVE, not currently outcome-changing (I-2, R7 review):
+        # measured exhaustively, `active_headroom=None` on this path closes
+        # BOTH of `_rank_candidates`'s gates before this leg is ever asked
+        # (`_every_account_above_threshold` is False on a None active, and
+        # the consume-first `active_reset_ts` gate is None too), so no
+        # fleet shape has been found where this branch changes a `tick()`
+        # outcome. Kept because the call IS reachable (confirmed via the
+        # phase-2 refetch) and a future change to those gates could make it
+        # live without anyone revisiting this function -- silently reading
+        # None as "no dominance" would then be exactly F6's original bug.
         if h is not None:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
