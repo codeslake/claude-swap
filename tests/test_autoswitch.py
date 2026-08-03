@@ -15,6 +15,7 @@ from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
+    RECOVERY_HORIZON_S,
     AllExhaustedEvent,
     AutoSwitchEngine,
     ConfigWarningEvent,
@@ -25,6 +26,7 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
     UnquarantineEvent,
+    _recovery_is_useful,
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -3331,6 +3333,50 @@ class TestEveryAccountAboveThreshold:
         assert sw.trigger == "at-limit"
 
 
+class TestRecoveryIsUsefulEitherClause:
+    """I1: the `or active_recovery_ts` leg of `_recovery_is_useful` had no
+    killer in the full suite, even through `tick()`.
+
+    `test_a_pair_straddling_the_horizon_does_not_ping_pong` (the branch's own
+    headline test for this clause) is masked by the no-return bar: 5 of its 6
+    ticks are BLOCKED by the bar before `_recovery_is_useful` is ever asked,
+    so removing `either` and leaving `cand-only` does not change that test's
+    outcome. `either` differs from `cand-only` in exactly one of the four
+    (candidate inside/outside horizon) x (active inside/outside horizon)
+    combinations: `cand-outside / act-inside`. This drives that quadrant
+    directly, at the unit level, bypassing the bar entirely.
+    """
+
+    def test_the_active_alone_being_inside_the_horizon_is_enough(self):
+        """cand-outside / act-inside: `either` says True, `cand-only` says
+        False. Past `SPENT_HEADROOM_PCT` on both sides, so the all-spent
+        escape hatch at the top of the function does not pre-empt this."""
+        now = 1_000_000.0
+        cand_recovery_ts = now + RECOVERY_HORIZON_S + 3600.0   # OUTSIDE
+        active_recovery_ts = now + 1800.0                       # INSIDE
+        assert _recovery_is_useful(
+            cand_recovery_ts, active_recovery_ts,
+            active_headroom=50.0, best_candidate_headroom=50.0, now=now,
+        ) is True, (
+            "the active's own reset is inside the horizon, which must rank "
+            "by recovery even though the candidate's reset is not — this is "
+            "the `either` clause, and `cand-only` would answer False here"
+        )
+
+    def test_the_control_neither_inside_falls_back_to_headroom(self):
+        """Control: both outside the horizon -> ranks by headroom (False)."""
+        now = 1_000_000.0
+        cand_recovery_ts = now + RECOVERY_HORIZON_S + 3600.0
+        active_recovery_ts = now + RECOVERY_HORIZON_S + 7200.0
+        assert _recovery_is_useful(
+            cand_recovery_ts, active_recovery_ts,
+            active_headroom=50.0, best_candidate_headroom=50.0, now=now,
+        ) is False, (
+            "premise: with neither reset inside the horizon, the function "
+            "must fall back to headroom — control for the test above"
+        )
+
+
 class TestRecoveryHorizon:
     """The recovery escape must not spend real headroom on a distant reset.
 
@@ -3402,6 +3448,51 @@ class TestRecoveryHorizon:
             "an unreadable peer vetoed the spent check and parked the engine "
             "on the account resetting last"
         )
+
+    def test_an_unreadable_peer_does_not_forge_headroom_for_the_spent_check(
+        self, temp_home
+    ):
+        """I2: counting an unreadable candidate's headroom as 100.0 instead
+        of excluding it turns the all-spent gate off for the whole fleet.
+
+        `best_candidate_headroom` filters `None` (unreadable) rows out of the
+        max — the sibling test above proves exclusion doesn't VETO the check.
+        This proves the other failure mode: if an unreadable row were instead
+        counted as a maximal 100.0, `best_candidate_headroom` would read 100
+        even though every REAL candidate is spent, so the all-spent branch
+        of `_recovery_is_useful` goes false and the far-out-reset fallback
+        below it (which requires the candidate to be no worse than the
+        active) excludes a candidate that is legitimately better on the
+        recovery axis alone.
+
+        Active and the one real candidate are both spent (<= SPENT_HEADROOM_
+        PCT), the candidate resets meaningfully sooner than the active but
+        both resets are far past RECOVERY_HORIZON_S (so the per-pair "back
+        soon" fallback in `_recovery_is_useful` cannot rescue it either), and
+        the candidate holds LESS raw headroom than the active (so the
+        separate spent-headroom fallback, which requires `h >= active_
+        headroom`, does not re-admit it). Only the all-spent branch treating
+        `best_candidate_headroom` as the real 2.0 (not a forged 100.0) lets
+        this candidate through.
+        """
+        h = EngineHarness(temp_home)
+        for n, e in ((1, "a@example.com"), (2, "b@example.com"),
+                     (3, "c@example.com")):
+            h.seed(n, e)
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(97.5, self._at(h, 500 * 3600)),  # active, 2.5 pts
+            "2": _usage(98.0, self._at(h, 490 * 3600)),  # 2.0 pts, sooner reset
+            "3": USAGE_TOKEN_EXPIRED,                     # sentinel: headroom None
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "the real candidate is spent but resets meaningfully sooner than "
+            "the active; forging its unreadable sibling's headroom as 100.0 "
+            "turns off the all-spent recovery escape that should have picked "
+            "it"
+        )
+        assert h.active_number() == 2
 
     def test_a_weekly_bound_active_does_not_refuse_a_peer_back_in_minutes(
         self, harness
@@ -3607,7 +3698,59 @@ class TestHorizonAxisDoesNotFlap:
         )
 
     def _days_out(self, harness, hours):
-        return self._at(harness, hours * 3600)
+        """Absolute reset ANCHORED on first use, per (harness, hours).
+
+        `_at(harness, seconds)` computes `now + seconds` from the CURRENT
+        clock every call. Called again after `harness.clock.advance(...)`
+        with the same `hours`, that keeps producing "N hours from NOW",
+        which never approaches -- a real `resets_at` is a fixed epoch, and
+        the remaining time to it shrinks as the clock advances. Memoizing
+        the first computed timestamp per (harness, hours) makes repeated
+        calls in a multi-tick loop return the SAME absolute instant, so it
+        genuinely draws nearer as the test's clock advances.
+        """
+        cache = self.__dict__.setdefault("_days_out_cache", {})
+        key = (id(harness), hours)
+        if key not in cache:
+            cache[key] = self._at(harness, hours * 3600)
+        return cache[key]
+
+    def test_a_fixed_reset_crosses_into_the_horizon_as_the_clock_advances(
+        self, harness
+    ):
+        """I4: `_days_out` must return a FIXED absolute instant, not
+        "N hours from whenever this is called."
+
+        Both accounts start above the threshold (`all_above`), the peer's
+        reset fixed 5h out — outside `RECOVERY_HORIZON_S` (4h) — so the
+        first tick ranks by headroom, where the peer's one extra point does
+        not clear `HORIZON_HEADROOM_RATIO` and the tick holds. Advancing the
+        clock 90 minutes brings that SAME fixed reset to 3.5h away — inside
+        the horizon — so the second tick must rank by recovery instead and
+        switch. A `_days_out` that recomputes "N hours from now" on every
+        call would keep reporting the peer's reset as exactly 5h out
+        forever, and the horizon would never be crossed.
+        """
+        outcome1 = harness.tick_with_usage({
+            "1": _usage(95, self._days_out(harness, 400)),   # active, far reset
+            "2": _usage(94, self._days_out(harness, 5)),     # peer, 5h out
+        })
+        assert outcome1 is not TickOutcome.SWITCHED, (
+            "premise: 5h is outside RECOVERY_HORIZON_S and one point of "
+            "headroom is not enough to qualify on its own"
+        )
+        harness.clock.advance(90 * 60.0)
+
+        outcome2 = harness.tick_with_usage({
+            "1": _usage(95, self._days_out(harness, 400)),
+            "2": _usage(94, self._days_out(harness, 5)),     # SAME fixed reset
+        })
+        assert outcome2 is TickOutcome.SWITCHED, (
+            "the peer's fixed reset is now 3.5h away, inside the horizon — "
+            "a `_days_out` that recomputes from `now` every call would still "
+            "report 5h out and never cross it"
+        )
+        assert harness.active_number() == 2
 
     def test_one_point_of_headroom_does_not_move(self, harness):
         """The measured flap: 95% active against a 94% peer, both days out."""
