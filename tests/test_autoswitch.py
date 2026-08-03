@@ -3184,6 +3184,181 @@ class TestConsumeFirstStrategy:
         assert sw.trigger == "at-limit"
 
 
+class TestConsumeFirstDepartureRecordsItsOwnTrigger:
+    """R8 review I-B: a `consume-first` departure's phase-2 refetch can write
+    `(leftHeadroom, leftRecoveryAt) = (None, None)` -- the exact snapshot
+    shape a `failover` departure writes -- whenever the refetched active row
+    has a `pct` but is otherwise unmeasurable in the SAME tick its weekly
+    reset is known (`account_headroom` needs a numeric `pct`;
+    `_seven_day_reset_ts` needs only `resets_at` -- one row can satisfy one
+    and not the other, exactly what the normalizer emits for
+    `utilization: null`). `_left_account_recovered` then infers the trigger
+    from the two nulls and runs the FAILOVER legs (landing floor + recovery)
+    on what was really an ORDINARY departure (dominance + self-improvement +
+    recovery) -- and the two branches disagree.
+
+    Fleet: barred peer 11 pts, active 5 pts, no resets anywhere. Failover's
+    landing floor (`h > 100 - threshold` = 10) releases at 11. Ordinary's
+    dominance ratio (`h > active*2+3` = 13) does not, self-improvement has
+    no baseline to diff against (`leftHeadroom` genuinely unmeasured), and
+    the recovery leg is inf-vs-inf. The two branches give OPPOSITE answers
+    on the identical (None, None) snapshot -- only which trigger produced it
+    tells them apart, and that is exactly the bit `leftTrigger` records.
+    """
+
+    def test_the_null_snapshot_answers_differently_by_recorded_trigger(self):
+        from claude_swap.autoswitch import AutoSwitchEngine
+        from claude_swap.settings import AutoSwitchSettings
+
+        class Fake(AutoSwitchEngine):
+            def __init__(self):
+                self._models = ()
+
+        e = Fake()
+        settings = AutoSwitchSettings()
+        now = 1_000_000.0
+        usage = {"1": _usage(89.0), "2": _usage(95.0)}   # peer 11 pts, active 5 pts
+        headroom = {"1": 11.0}
+
+        failover_state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": None,
+            "leftRecoveryAt": None,
+            "leftTrigger": "failover",
+        }
+        consume_first_state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": None,
+            "leftRecoveryAt": None,
+            "leftTrigger": "consume-first",
+        }
+
+        failover_recovered = e._left_account_recovered(
+            failover_state, usage, headroom, 5.0, settings, now, "2"
+        )
+        ordinary_recovered = e._left_account_recovered(
+            consume_first_state, usage, headroom, 5.0, settings, now, "2"
+        )
+        assert failover_recovered is True, (
+            "a real failover departure's landing floor (h > 10) releases "
+            "on an 11-point peer with no baseline to diff against"
+        )
+        assert ordinary_recovered is False, (
+            "a consume-first departure's dominance leg (h > active*2+3=13) "
+            "does not clear at 11 points, and there is no leftHeadroom "
+            "baseline to self-improve against -- must hold, not borrow the "
+            "failover branch's more permissive landing floor"
+        )
+
+    def test_pre_upgrade_null_snapshot_without_leftTrigger_still_infers_failover(
+        self,
+    ):
+        """Backward compatibility: a record written before `leftTrigger`
+        existed has no such key. Must fall back to the old two-null
+        inference (failover) rather than crash or silently misclassify."""
+        from claude_swap.autoswitch import AutoSwitchEngine
+        from claude_swap.settings import AutoSwitchSettings
+
+        class Fake(AutoSwitchEngine):
+            def __init__(self):
+                self._models = ()
+
+        e = Fake()
+        settings = AutoSwitchSettings()
+        now = 1_000_000.0
+        usage = {"1": _usage(89.0), "2": _usage(95.0)}
+        headroom = {"1": 11.0}
+        legacy_state = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": None,
+            "leftRecoveryAt": None,
+            # no "leftTrigger" key
+        }
+        recovered = e._left_account_recovered(
+            legacy_state, usage, headroom, 5.0, settings, now, "2"
+        )
+        assert recovered is True, (
+            "no leftTrigger recorded -> fall back to the pre-I-B inference "
+            "(both null -> failover), same as before this fix"
+        )
+
+    def test_a_legacy_record_with_a_real_leftHeadroom_is_never_forced_through_the_failover_legs(
+        self,
+    ):
+        """The fallback must only trigger on the OLD (None, None) shape, not
+        unconditionally. A legacy record (no `leftTrigger`) with a REAL
+        `leftHeadroom` is unambiguous -- it is an ordinary-path departure by
+        construction (only `_perform`'s (None, None) write for failover ever
+        leaves both null) -- and must still take the ordinary legs, not the
+        more permissive failover landing floor, regardless of whether some
+        future change makes the failover branch unconditional."""
+        from claude_swap.autoswitch import AutoSwitchEngine
+        from claude_swap.settings import AutoSwitchSettings
+
+        class Fake(AutoSwitchEngine):
+            def __init__(self):
+                self._models = ()
+
+        e = Fake()
+        settings = AutoSwitchSettings()
+        now = 1_000_000.0
+        usage = {"1": _usage(89.0), "2": _usage(95.0)}  # peer 11 pts, active 5 pts
+        headroom = {"1": 11.0}
+        legacy_state_real_headroom = {
+            "lastSwitchFrom": "1",
+            "leftHeadroom": 10.0,
+            "leftRecoveryAt": None,
+            # no "leftTrigger" key
+        }
+        recovered = e._left_account_recovered(
+            legacy_state_real_headroom, usage, headroom, 5.0, settings, now, "2"
+        )
+        assert recovered is False, (
+            "leftHeadroom=10.0 is a real (non-null) baseline, so this is "
+            "unambiguously an ORDINARY departure -- the failover landing "
+            "floor (h > 10, which 11 clears) must NOT decide this; the "
+            "ordinary legs (dominance h > active*2+3=13, self-improvement "
+            "h >= left+3=13) both fail at h=11 and must hold"
+        )
+
+    def test_end_to_end_consume_first_departure_records_its_own_trigger(
+        self, temp_home
+    ):
+        """Drive a real consume-first departure through `_perform` and read
+        the persisted state back: `leftTrigger` must be `"consume-first"`,
+        not silently absent."""
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        out = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10, _R_SOON),
+        })
+        assert out is TickOutcome.SWITCHED
+        state = h.engine._read_state()
+        assert state.get("leftTrigger") == "consume-first", (
+            f"expected leftTrigger='consume-first', got {state.get('leftTrigger')!r}"
+        )
+
+    def test_end_to_end_failover_departure_records_its_own_trigger(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        out = None
+        for _ in range(3):
+            out = h.tick_with_usage({"1": None, "2": _usage(4)})
+            h.clock.advance(60.0)
+        assert out is TickOutcome.SWITCHED
+        state = h.engine._read_state()
+        assert state.get("leftTrigger") == "failover", (
+            f"expected leftTrigger='failover', got {state.get('leftTrigger')!r}"
+        )
+
+
 class TestEveryAccountAboveThreshold:
     """With nothing below the threshold, go to whatever comes back soonest.
 
@@ -5535,6 +5710,89 @@ class TestHorizonAxisDoesNotFlap:
             out = h.tick_with_usage({
                 "1": _usage(97.5, self._at(h, 400 * 3600)),  # barred peer, 400h out
                 "2": active_row(h),                            # active
+            })
+            assert out is expected_outcome and h.active_number() == expected_active, (
+                f"{label}: got {out.name}/active={h.active_number()}, want "
+                f"{expected_outcome.name}/active={expected_active}"
+            )
+
+    def test_r8_isfinite_guard_must_not_hold_when_a_near_peer_is_available(
+        self, temp_home
+    ):
+        """R8 review I-A: `math.isfinite(active_recovery_ts)` (C-1, R7) reads
+        ALL FIVE `inf` states as "unknown, hold" -- but two of them are
+        ordinary API shapes for an active that is plainly alive and burning:
+        no `resets_at` reported, or a `resets_at` already elapsed. On those
+        the bar now sits on a near-spent active even when the peer is back
+        within `RECOVERY_HORIZON_S` -- the same PR's own constant for "near
+        enough to matter".
+
+        Same failover setup as the sibling C1 tests (peer barred at
+        departure, active burns down), then a single tick with four
+        variants -- only the ACTIVE's `resets_at` (and, for NEG, the peer's)
+        differs across rows:
+
+            POS   active reset 400h out, peer back in ~50min  -> SWITCHED
+            NEG   active reset 400h out, peer only 60s sooner -> BLOCKED
+            DMG-a active reset UNREPORTED, peer back in ~50min-> SWITCHED
+            DMG-b active reset in the PAST, peer back in ~50min-> SWITCHED
+
+        POS/NEG must already pass unfixed -- they pin the guard's intended
+        behaviour (both controls invariant, per the review's damage table).
+        DMG-a/DMG-b fail against 5c69ad2 because `isfinite` reads the
+        active's `inf` as "unknown" and holds even though the peer is
+        inside the horizon.
+        """
+        cases = [
+            (
+                "POS active reset 400h out, peer ~50min out",
+                lambda h: _usage(98.0, self._at(h, 400 * 3600)),
+                lambda h: self._at(h, 3000.0),
+                TickOutcome.SWITCHED,
+                1,
+            ),
+            (
+                "NEG active reset 400h out, peer only 60s sooner",
+                lambda h: _usage(98.0, self._at(h, 400 * 3600)),
+                lambda h: self._at(h, 400 * 3600 - 60.0),
+                TickOutcome.BLOCKED,
+                2,
+            ),
+            (
+                "DMG-a active NO resets_at, peer ~50min out",
+                lambda h: _usage(98.0),
+                lambda h: self._at(h, 3000.0),
+                TickOutcome.SWITCHED,
+                1,
+            ),
+            (
+                "DMG-b active reset in PAST, peer ~50min out",
+                lambda h: _usage(98.0, self._at(h, -3600.0)),
+                lambda h: self._at(h, 3000.0),
+                TickOutcome.SWITCHED,
+                1,
+            ),
+        ]
+        for label, active_row, peer_reset, expected_outcome, expected_active in cases:
+            h = EngineHarness(temp_home)
+            h.seed(1, "a@example.com")
+            h.seed(2, "b@example.com")
+            h.make_live("a@example.com", 1)
+
+            outcome = None
+            for _ in range(3):  # unhealthy_ticks default is 3
+                outcome = h.tick_with_usage({
+                    "1": None,                              # unreadable -> failover
+                    "2": _usage(4, self._at(h, 400 * 3600)),
+                })
+                h.clock.advance(60.0)
+            assert outcome is TickOutcome.SWITCHED
+            assert h.active_number() == 2
+
+            h.clock.advance(301.0)
+            out = h.tick_with_usage({
+                "1": _usage(96.0, peer_reset(h)),  # barred peer, 4 pts (below floor)
+                "2": active_row(h),                # active, 2 pts
             })
             assert out is expected_outcome and h.active_number() == expected_active, (
                 f"{label}: got {out.name}/active={h.active_number()}, want "

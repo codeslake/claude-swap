@@ -1536,7 +1536,26 @@ class AutoSwitchEngine:
         h = headroom.get(barred)
         left_headroom = state.get("leftHeadroom")
         left_recovery = state.get("leftRecoveryAt")
-        if left_headroom is None and left_recovery is None:
+        # I-B (R8 review): a `consume-first` departure can ALSO write
+        # (None, None) -- the same shape a real failover writes -- whenever
+        # the phase-2 refetch's active row is unmeasurable for headroom but
+        # still has a known weekly reset (the split shape `oauth.
+        # build_usage_result` emits for `utilization: null` plus a
+        # `resets_at`). Inferring "failover" from the two nulls then ran the
+        # more permissive failover legs (landing floor + recovery-only) on
+        # what was really an ordinary departure -- reachable on 32%+ of
+        # swept fleets, both directions. `leftTrigger` records the actual
+        # trigger so this never has to guess again; a record written before
+        # this field existed has no such key, so fall back to the old
+        # two-null inference for it (unchanged behaviour for pre-upgrade
+        # state).
+        left_trigger = state.get("leftTrigger")
+        is_failover_snapshot = (
+            left_trigger == "failover"
+            if left_trigger is not None
+            else (left_headroom is None and left_recovery is None)
+        )
+        if is_failover_snapshot:
             # Failover: real departure, severity unmeasured at the time --
             # not absence of evidence, and there is no baseline to diff
             # against (that is exactly what "unmeasured" means), so this
@@ -1577,8 +1596,24 @@ class AutoSwitchEngine:
             # active to have a genuine, known reset before the comparison
             # even runs -- unknown holds, exactly like unreadable already
             # does on the headroom axis (F6).
+            #
+            # But two of the five `inf` states are ordinary shapes for an
+            # active that is plainly alive and burning -- a `pct` reported
+            # with no `resets_at`, or a `resets_at` already elapsed -- not
+            # unknowns (R8 review, I-A). Reading all five as "unknown, hold"
+            # pins the engine on a near-spent active for up to a full window
+            # even when the peer is back within `RECOVERY_HORIZON_S`, the
+            # same constant this PR already uses for "near enough to
+            # matter" (`_recovery_is_useful`). Requiring EITHER a known
+            # active reset OR a peer inside that horizon keeps C-1's
+            # intended release (a known active vs. an arbitrarily-far peer
+            # still needs `isfinite`) while letting a near peer through
+            # regardless of why the active's own reset reads `inf`.
             return (
-                math.isfinite(active_recovery_ts)
+                (
+                    math.isfinite(active_recovery_ts)
+                    or peer_recovery_ts - now <= RECOVERY_HORIZON_S
+                )
                 and peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
             )
         # Dominance over the ACTIVE, only reached once a real baseline is
@@ -2027,6 +2062,15 @@ class AutoSwitchEngine:
             state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
             state["leftHeadroom"], recovery = left
             state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+            # I-B (R8 review): a `consume-first` phase-2 refetch can write the
+            # SAME (None, None) shape a `failover` departure writes, whenever
+            # the refetched active row has a `pct` but is otherwise
+            # unmeasurable in the same tick its weekly reset is known --
+            # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
+            # needs only `resets_at`. Inferring the trigger from the two
+            # nulls then runs the wrong legs. Record it directly so the
+            # reader never has to guess.
+            state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
         self._emit(
