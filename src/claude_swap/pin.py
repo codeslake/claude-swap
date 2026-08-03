@@ -967,7 +967,14 @@ def run(switcher, account: str | None, clear: bool = False, heal_only: bool = Fa
     pin = _impl()  # raises ClaudeSwitchError with the install hint
 
     if account is None:
-        current = pin.load_pin(switcher.backup_dir)
+        # Same rule for the read-only path: a malformed pin file is "no pin I
+        # can read", not "the package is broken". The TUI badge already answers
+        # None in this exact state, so reporting an error here made the two
+        # front ends disagree about one file.
+        try:
+            current = pin.load_pin(switcher.backup_dir)
+        except Exception:  # noqa: BLE001
+            current = None
         if current:
             print(f"Cloud account (RC/artifacts): {current[0]}")
         else:
@@ -996,7 +1003,25 @@ def run(switcher, account: str | None, clear: bool = False, heal_only: bool = Fa
     # Remote Control session that is ALREADY open — the server fixed its owner
     # at creation, so reconnecting inside it is what mints a new one under the
     # new pin. Name those sessions instead of telling everyone to restart.
-    open_rc = pin.live_remote_control_sessions()
+    # A NOTE MUST NOT FAIL THE ACTION. The pin is already applied and
+    # "Pinned…" has already printed; everything below is advice about which
+    # sessions need reconnecting. This was the one call into the optional
+    # package in `run()` that no `try` covered, so a raise here — from a peer
+    # on its own release schedule — turned a SUCCEEDED pin into:
+    #
+    #     Error: the cloud pin is installed but not usable: …
+    #       `cswap pin --clear` still works, and removes the wiring …
+    #     Pinned the cloud account (RC/artifacts) to Account-2 (…)
+    #     exit 1
+    #
+    # Exit 1 and advice to `--clear` over a pin that is on disk and working —
+    # a user following it destroys it. The TUI's sibling call already guards
+    # this (dashboard.py, "a note must not fail the action"); the two front
+    # ends disagreeing is the defect this module's header names as its own.
+    try:
+        open_rc = pin.live_remote_control_sessions()
+    except Exception:  # noqa: BLE001 — advice is not the operation
+        open_rc = None
     if open_rc:
         which = ", ".join(open_rc[:3])
         if len(open_rc) > 3:
