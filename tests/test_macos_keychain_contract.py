@@ -583,6 +583,63 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
             "reported unreadable — the failure latched through the pin"
         )
 
+    def test_a_recovered_keychain_does_not_latch_through_an_UNVERIFIED_pin(
+        self, macos_switcher, monkeypatch
+    ):
+        """The same timeline, but with the pin the code actually takes.
+
+        The sibling test above calls `_pin_file_mode(residual_cleared=True)`,
+        whose True branch clears `_keychain_op_failed` a SECOND time. So its
+        assertion holds with the clear in `_kc_call` deleted — the setup is
+        doing the guard's job for it, and the guard mutates green.
+
+        The managed-key write fallback (`_write_managed_key`) always passes
+        `residual_cleared=False`, and that path does NOT clear the flag: it is
+        deliberately conservative about a residual it could not verify. So on
+        the only pin shape that reaches this timeline in production, the clear
+        in `_kc_call` is the sole thing standing between a recovered Keychain
+        and a latch that lasts the whole process:
+
+            _keychain_unreadable after recovery + unverified pin
+              with the clear    -> False
+              without it        -> True   (degraded forever)
+
+        A latch means `_refuse_degraded_capture` blocks `cswap add`,
+        `_fetch_active_usage` returns USAGE_KEYCHAIN_UNAVAILABLE every pass,
+        and `_resync_rotated_backup` never runs.
+        """
+        import time
+
+        from claude_swap import macos_keychain as _kc
+
+        store = macos_switcher._store
+        store._keychain_usable_cache = True
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        healthy = _kc.get_password
+        monkeypatch.setattr(_kc, "get_password", locked)
+        with pytest.raises(_kc.KeychainError):
+            store._kc_call(_kc.get_password, "svc", "acct")
+        assert store._keychain_unreadable is True, "premise: inside the cooldown"
+
+        monkeypatch.setattr(_kc, "get_password", healthy)
+        store._keychain_disabled_until = time.monotonic() - 1
+        assert store._keychain_unreadable is False, "premise: cooldown lapsed"
+
+        # The Keychain demonstrably answers again.
+        store._kc_call(_kc.get_password, "svc", "acct")
+
+        # The pin the managed-key fallback actually performs: unverified, so
+        # it settles nothing and clears nothing.
+        store._pin_file_mode(residual_cleared=False)
+
+        assert store._keychain_unreadable is False, (
+            "the recovery observation was dropped, so a transient failure "
+            "latched for the rest of the process"
+        )
+
     def test_an_idle_backup_read_does_not_erase_the_active_verdict(
         self, macos_switcher, monkeypatch
     ):
