@@ -61,16 +61,30 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
     something matching this frozen set, which is exactly the moment a write
     must be refused.
 
-    Mirrors ``_isolate_real_home``'s notion of "real": ``CLAUDE_CONFIG_DIR``/
-    ``CLAUDE_SECURESTORAGE_CONFIG_DIR``/``XDG_DATA_HOME`` are cleared for this
-    one resolution (then restored), so a developer who happens to have one of
-    those exported in their normal shell still gets the genuinely-default
-    roots protected — the same three vars that fixture neutralizes for every
-    test, regardless of ``temp_home``.
+    Two snapshots are unioned, because there are two notions of "real" and a
+    developer can be on either one:
+
+    * The GENUINELY-DEFAULT roots: mirrors ``_isolate_real_home``'s notion of
+      "real" — ``CLAUDE_CONFIG_DIR``/``CLAUDE_SECURESTORAGE_CONFIG_DIR``/
+      ``XDG_DATA_HOME`` are cleared for this resolution (then restored), so a
+      developer who happens to have one of those exported in their normal
+      shell still gets the default roots (``~/.claude``, ``~/.local/share/
+      claude-swap``) protected — the same three vars that fixture neutralizes
+      for every test, regardless of ``temp_home``.
+    * The AMBIENT-OVERRIDE roots: resolved WITHOUT clearing those vars, i.e.
+      exactly what ``claude_swap.paths`` resolves to under the environment as
+      it actually is at conftest import time. A developer with
+      ``XDG_DATA_HOME`` exported outside ``$HOME`` in their normal shell has
+      their REAL account store at that override path, not at the
+      cleared-env default — the defaults-only snapshot left it unprotected
+      (measured: a write to the override-resolved backup root went through).
+      Both must be protected: the default-profile developer and the
+      override-profile developer are both real users of this same conftest.
 
     ``recursive=True`` roots (the cswap backup root, current-XDG and legacy)
     are exclusively cswap's own data — everything beneath them is protected,
-    any depth.
+    any depth. This applies to an override-derived backup root too: it's
+    still cswap's own data regardless of which env var pointed at it.
 
     ``recursive=False`` roots are directories cswap shares with unrelated
     machinery — notably ``~/.claude``, which also holds Claude Code CLI's
@@ -84,15 +98,12 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
     ``CLAUDE_CONFIG_DIR`` override is set — ``~/.claude.json``,
     ``~/.claude.json.lock``, ``~/.claude.lock``). A deeply nested path (a
     job's worktree several directories under ``~/.claude/jobs/...``) is
-    correctly left alone.
+    correctly left alone. An override-derived config home (``CLAUDE_CONFIG_
+    DIR``) gets the same treatment: it's shared with other machinery just
+    like the default ``~/.claude`` is, so it stays non-recursive too.
     """
-    saved_env = {
-        k: os.environ.get(k)
-        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME")
-    }
-    for k in saved_env:
-        os.environ.pop(k, None)
-    try:
+
+    def _resolve() -> tuple[tuple[Path, bool], ...]:
         return (
             (_paths.get_backup_root(), True),
             (_paths.get_legacy_backup_root(), True),
@@ -101,12 +112,32 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             (_paths.get_global_config_path().parent, False),
             (_paths.get_default_global_config_path().parent, False),
         )
+
+    ambient_specs = _resolve()
+
+    saved_env = {
+        k: os.environ.get(k)
+        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME")
+    }
+    for k in saved_env:
+        os.environ.pop(k, None)
+    try:
+        default_specs = _resolve()
     finally:
         for k, v in saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    seen: set[Path] = set()
+    merged: list[tuple[Path, bool]] = []
+    for root, recursive in (*default_specs, *ambient_specs):
+        if root in seen:
+            continue
+        seen.add(root)
+        merged.append((root, recursive))
+    return tuple(merged)
 
 
 _REAL_STORE_SPECS = _freeze_real_store_specs()
