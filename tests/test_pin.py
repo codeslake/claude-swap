@@ -2804,3 +2804,99 @@ class TestHealNeverTearsDownAServingPin:
             assert pin._wiring_is_stale(sw) is False
         finally:
             srv.close()
+
+
+class TestANoteMustNotFailTheAction:
+    """`run()` had one unguarded call into the optional package, after the pin
+    had already been applied and "Pinned…" already printed.
+
+    A raise there — from a peer on its own release schedule — turned a
+    SUCCEEDED pin into `Error: the cloud pin is installed but not usable`, exit
+    1, plus advice to run `--clear`, which would have destroyed it. The TUI's
+    sibling call already guarded the same thing, so the two front ends
+    disagreed about one outcome.
+    """
+
+    def _sw(self, tmp_path):
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text("{}")
+        return types.SimpleNamespace(
+            backup_dir=backup,
+            resolve_account=lambda a: ("2", "user2@example.com", None),
+            _account_kind=lambda n: "oauth",
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+
+    def _impl(self, backup, *, rc_raises=False, load_raises=False):
+        class _I:
+            def load_pin(self, b):
+                if load_raises:
+                    raise ValueError("settings.json is not valid JSON")
+                raw = json.loads((b / "settings.json").read_text() or "{}")
+                rc = raw.get("remoteControl") or {}
+                return (rc["pinnedEmail"], rc.get("pinnedOrganizationUuid") or "") \
+                    if rc.get("pinnedEmail") else None
+
+            def apply_pin(self, switcher, email=None, org=None, *a, **k):
+                # The REAL signature: (switcher, email, org). A stub taking a
+                # path described a call production never makes.
+                (switcher.backup_dir / "settings.json").write_text(json.dumps(
+                    {"remoteControl": {"pinnedEmail": email,
+                                       "pinnedOrganizationUuid": org}} if email else {}))
+                return True
+
+            def live_remote_control_sessions(self):
+                if rc_raises:
+                    raise RuntimeError(
+                        "GET http://svc:s3cr3t@127.0.0.1:9901/sessions failed")
+                return []
+
+        return _I()
+
+    def test_a_note_that_raises_does_not_fail_a_pin_that_worked(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        monkeypatch.setattr(
+            pin, "_impl", lambda: self._impl(sw.backup_dir, rc_raises=True)
+        )
+        rc = pin.run(sw, "2")
+        out = capsys.readouterr().out
+        assert rc == 0, f"a pin that succeeded returned a failure code: {out}"
+        assert "Pinned" in out, out
+        recorded = json.loads((sw.backup_dir / "settings.json").read_text())
+        assert (recorded.get("remoteControl") or {}).get("pinnedEmail") == \
+            "user2@example.com", "the pin is on disk — reporting failure invites --clear"
+
+    def test_an_unreadable_pin_file_is_no_pin_not_a_broken_package(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The read-only path. The TUI badge answers None in this exact state."""
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        monkeypatch.setattr(
+            pin, "_impl", lambda: self._impl(sw.backup_dir, load_raises=True)
+        )
+        rc = pin.run(sw, None)
+        out = capsys.readouterr().out
+        assert rc == 0, "a malformed pin file made a read-only command fail"
+        assert "No cloud account pinned" in out, out
+
+    def test_the_cli_catch_all_scrubs_credentials(self, capsys):
+        """`_safe` exists for exactly this renderer, and it was the one
+        renderer not using it."""
+        import claude_swap.cli as cli
+        from claude_swap.pin import _safe
+
+        leaky = "GET http://svc:s3cr3t@127.0.0.1:9901/sessions failed"
+        assert "s3cr3t" not in _safe(ValueError(leaky)), _safe(ValueError(leaky))
+        src = __import__("inspect").getsource(cli._pin_command)
+        assert "_safe(e)" in src, (
+            "the catch-all renders a package exception without the scrubber"
+        )

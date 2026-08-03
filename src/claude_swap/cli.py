@@ -163,7 +163,15 @@ Examples:
         # the shell rendered it, so a missing `cryptography` reached the user
         # as a 6-frame traceback. Measured on work-mac, and this command is the
         # one that has to stay usable when the pin does not.
-        error(f"Error: the cloud pin is installed but not usable: {e}")
+        # THROUGH THE SCRUBBER. `_safe` exists because every failure renderer
+        # here interpolates an exception built by an optional package, and the
+        # proxy's own URL carries `user:secret@`. This renderer was the one
+        # that did not use it, so a message naming the proxy printed the
+        # credential verbatim — measured: `http://svc:s3cr3t@127.0.0.1:9901/…`
+        # reached the screen, where `_safe` yields `http://***@127.0.0.1:9901/…`.
+        from claude_swap.pin import _safe
+
+        error(f"Error: the cloud pin is installed but not usable: {_safe(e)}")
         # NOT an unconditional promise: `cswap pin --clear` works without the
         # package, but a contended config lock can still make it skip a
         # config it never got to try (see clear_wiring's budget) — reword
