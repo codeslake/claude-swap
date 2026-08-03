@@ -198,6 +198,19 @@ class TestEngineHarnessIsolation:
     accounts' stores into one without any assertion noticing.
     """
 
+    @pytest.mark.skipif(
+        Platform.detect() not in (Platform.LINUX, Platform.WSL),
+        reason=(
+            "the mechanism under test does not exist off Linux/WSL: "
+            "get_backup_root() consults $XDG_DATA_HOME only on those two "
+            "platforms and returns ~/.claude-swap-backup everywhere else, so "
+            "two harnesses on one HOME legitimately share a store there. "
+            "Measured, same probe, XDG set to two different values: "
+            "LINUX honours it (True), MACOS and WINDOWS do not (False). "
+            "backup_dir is resolved inside ClaudeAccountSwitcher() before "
+            "the harness pins .platform = LINUX, so the real OS decides."
+        ),
+    )
     def test_two_harnesses_on_one_temp_home_get_distinct_stores(self, temp_home):
         # Two DIFFERENT subtrees of the same temp_home, matching the
         # existing multi-harness usage pattern (see decision_at() in
