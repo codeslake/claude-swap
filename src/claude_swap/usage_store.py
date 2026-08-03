@@ -404,6 +404,23 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
     return min(resets) if resets else None
 
 
+def _trust_deadline(
+    last_good: dict | None, fetched_at: float, models: tuple[str, ...] = ()
+) -> float:
+    """The instant a 429-stale ``last_good`` stops being usable.
+
+    One expression of the bound, because there are two callers that must not
+    drift: ``_rate_limited_trust_ok`` asks whether NOW is inside it, and
+    ``_trust_left_s`` asks how much of it is left so a backoff can be capped.
+    Written twice they would be a second copy of the same gate.
+
+        min(earliest future relevant-window reset, fetched_at + ceiling)
+    """
+    ceiling = fetched_at + RATE_LIMIT_TRUST_MAX_AGE_S
+    soonest = _earliest_reset(last_good, models)
+    return min(soonest, ceiling) if soonest is not None else ceiling
+
+
 def _rate_limited_trust_ok(
     last_good: dict | None,
     age_s: float | None,
@@ -437,11 +454,28 @@ def _rate_limited_trust_ok(
     """
     if age_s is None:
         return False
-    ceiling = now + (RATE_LIMIT_TRUST_MAX_AGE_S - age_s)
-    soonest = _earliest_reset(last_good, models)
-    # The soonest window to roll over invalidates the snapshot; never trust past
-    # it, and never past the client-side ceiling.
-    return now < (min(soonest, ceiling) if soonest is not None else ceiling)
+    return now < _trust_deadline(last_good, now - age_s, models)
+
+
+def _trust_left_s(row: dict, now: float, models: tuple[str, ...] = ()) -> float | None:
+    """How much longer this row's stored snapshot stays usable, or None.
+
+    The same bound `_rate_limited_trust_ok` applies, expressed as a duration so
+    a backoff can be capped by it: `min(earliest reset, fetchedAt + ceiling)`.
+    None when there is nothing to protect — no `lastGood`, or a row that has
+    never been fetched — in which case the constant ceilings bound the wait.
+
+    Anchored on `fetchedAt`, NOT on `now`. Failure never advances `fetchedAt`
+    (only the success branch does), so across a re-block chain the remaining
+    trust shrinks with every honored wait while the wait itself would keep
+    being recomputed at full length. Reading the anchor is what makes the chain
+    converge instead of marching past its own trust.
+    """
+    last_good = row.get("lastGood")
+    fetched_at = _num_or_none(row.get("fetchedAt"))
+    if not isinstance(last_good, dict) or fetched_at is None:
+        return None
+    return max(0.0, _trust_deadline(last_good, fetched_at, models) - now)
 
 
 def _failure_backoff_s(
@@ -449,7 +483,17 @@ def _failure_backoff_s(
     retry_after_s: float | None,
     *,
     rate_limited: bool = True,
+    trust_left_s: float | None = None,
 ) -> float:
+    """Seconds to stay in backoff after a failed fetch.
+
+    ``trust_left_s`` is how long the row's OWN stored snapshot stays usable —
+    ``min(earliest reset, fetchedAt + ceiling) - now``, which only the row can
+    answer. Waiting past it produces a window that is un-pollable AND unknown,
+    and the unhealthy-tick counter converts that into a failover from a healthy
+    account. ``None`` means the caller has nothing to protect (no ``lastGood``,
+    or no reset metadata at all), and the constant ceilings bound it instead.
+    """
     computed = min(
         BACKOFF_BASE_S * (2 ** min(max(0, consecutive_failures - 1), BACKOFF_MAX_SHIFT)),
         BACKOFF_CAP_S,
@@ -495,16 +539,28 @@ def _failure_backoff_s(
         # past TRUST_MAX_AGE_S as the margin would have. The bound belongs to
         # the path, not to the margin.
         asked = min(asked, TRUST_MAX_AGE_S)
-    # NO TRUST TRIM. Cutting a 429 wait back to the deadline when the stored
-    # trust expires first cannot salvage that trust — `trust < ask` is its own
-    # precondition and the floor keeps `wait >= ask`, so the row is untrusted
-    # at release either way (measured: fired 35 of 180 offsets, salvaged 0).
-    # It only lands us on the deadline, where 10 of 19 lapses re-block for a
-    # fresh hour. Episode model on that number, 3600 runs:
+    # NO TRUST TRIM AGAINST THE SERVER'S DEADLINE. Cutting a 429 wait back to
+    # the deadline when the stored trust expires first cannot salvage that
+    # trust — `trust < ask` is its own precondition and the floor keeps
+    # `wait >= ask`, so the row is untrusted at release either way (measured:
+    # fired 35 of 180 offsets, salvaged 0). It only lands us on the deadline,
+    # where 10 of 19 lapses re-block for a fresh hour. Episode model on that
+    # number, 3600 runs:
     #
     #     with the trim    blind 1148s   requests 1.21
     #     without it       blind  550s   requests 1.00
-    return max(asked, computed)
+    wait = max(asked, computed)
+    # BUT DO TRIM AGAINST OUR OWN. That paragraph is about the SERVER's
+    # deadline, where landing early re-blocks for a fresh hour. `trust_left_s`
+    # is a different clock — our own window rolling over, or the client-side
+    # age ceiling. Past it the stored snapshot is worthless whatever we do, so
+    # the extra wait buys no data and produces only the blind window.
+    #
+    # Never below `computed`: that is the anti-hammer floor, and a reset a
+    # minute away is not a licence to retry a minute from now.
+    if trust_left_s is not None:
+        wait = max(min(wait, trust_left_s), computed)
+    return wait
 
 
 class UsageStore:
@@ -785,6 +841,7 @@ class UsageStore:
                     failures,
                     rec.retry_after_s,
                     rate_limited=rec.error == "http-429",
+                    trust_left_s=_trust_left_s(row, now),
                 )
                 # Only a permanent-auth failure advances the dead-token count; a
                 # transient error (429/timeout) leaves it as-is — it is no
