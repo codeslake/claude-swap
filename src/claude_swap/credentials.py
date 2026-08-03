@@ -1035,17 +1035,31 @@ class CredentialStore:
         if enc_present:
             try:
                 encoded = enc_file.read_text(encoding="utf-8").strip()
-                # validate=True: reject non-alphabet junk (e.g. "!!!!") instead of
-                # silently discarding it to empty bytes, which would let a corrupt
-                # .enc shadow a valid Keychain copy.
-                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
-            except Exception as e:
-                # Corrupt/garbled .enc → on macOS fall through to the Keychain copy.
+            except OSError as e:
+                # The .enc EXISTS but could not be read (permissions, a
+                # mid-unmount, ...) — a real read failure, not "no backup".
+                # Reported through the caller's list, the same as the
+                # Keychain OSError arm below: this is the ONLY backend on
+                # Linux/WSL/Windows, and it wins over the Keychain on macOS,
+                # so masking it must not read as "absent" on any platform.
+                if failed is not None:
+                    failed.append(True)
                 self._host._logger.warning(f"Failed to read credentials file: {e}")
             else:
-                if decoded:
-                    return decoded
-                # Empty/whitespace .enc is not a real backup → try the Keychain.
+                try:
+                    # validate=True: reject non-alphabet junk (e.g. "!!!!") instead
+                    # of silently discarding it to empty bytes, which would let a
+                    # corrupt .enc shadow a valid Keychain copy.
+                    decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+                except Exception as e:
+                    # Corrupt/garbled .enc → on macOS fall through to the Keychain
+                    # copy (documented recovery) — content-level, not a read
+                    # failure, so this does NOT mark `failed`.
+                    self._host._logger.warning(f"Failed to read credentials file: {e}")
+                else:
+                    if decoded:
+                        return decoded
+                    # Empty/whitespace .enc is not a real backup → try the Keychain.
         if self._host.platform == Platform.MACOS:
             try:
                 return self._kc_read_backup(account_num, email)
@@ -1065,20 +1079,24 @@ class CredentialStore:
     ) -> tuple[str, bool]:
         """Backup read with an unreadable-vs-absent verdict.
 
-        Returns ``(value, unreadable)``. ``unreadable`` is True only when the
-        ``.enc`` had nothing AND the macOS Keychain read *raised* (locked /
-        denied / timeout) — the backup may exist but cannot be seen right
-        now. A genuinely absent backup (no .enc, keychain answered "not
-        found") reads as ``("", False)``. Callers use the distinction to say
-        "keychain unavailable — retry from a GUI session" instead of
-        nudging the user into an unnecessary re-add/re-login.
+        Returns ``(value, unreadable)``. ``unreadable`` is True when the read
+        that produced ``""`` actually FAILED rather than finding nothing: the
+        ``.enc`` exists but raised an ``OSError`` (permissions, a mid-unmount
+        — every platform), or the ``.enc`` had nothing and the macOS Keychain
+        read itself *raised* (locked / denied / timeout). A genuinely absent
+        backup (no .enc, keychain answered "not found") reads as
+        ``("", False)``. Callers use the distinction to say "keychain
+        unavailable — retry from a GUI session" instead of nudging the user
+        into an unnecessary re-add/re-login. The ``.enc`` is the ONLY backend
+        on Linux/WSL/Windows, so its own read failure must reach this verdict
+        there too, not only on macOS.
         """
         failed: list = []
         value = self._read_account_credentials(account_num, email, failed)
         if value:
             return value, False
         if self._host.platform != Platform.MACOS:
-            return "", False
+            return "", bool(failed)
         # Whether THIS read reached the Keychain, observed at the read itself.
         #
         # This used to ask `_keychain_unreadable`, which answers a different
