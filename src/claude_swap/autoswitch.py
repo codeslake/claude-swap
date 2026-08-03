@@ -201,10 +201,9 @@ def _recovery_is_useful(
         #     out    active 2.0 / peer 4.0   headroom axis, 4.0 >= 2.0x2
         #     back   active 3.0 / peer 2.0   recovery  axis, 10h vs 80h
         #
-        # Each leg is legitimate on the axis its own state selects. 21 of 576
-        # burn walks make that transition and read as A-B-A; constraining
-        # either gate changes the count by 0, because the transition is in the
-        # DATA rather than in the gates.
+        # Each leg is legitimate on the axis its own state selects, and the
+        # transition is in the DATA rather than in the gates: constraining
+        # either gate does not remove it.
         return True
     return (
         candidate_recovery_ts - now <= RECOVERY_HORIZON_S
@@ -1019,65 +1018,10 @@ class AutoSwitchEngine:
         oauth_candidates = [
             n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
         ]
-        # NEVER UNDO THE PREVIOUS MOVE. Each anti-flap gate is one-way on its
-        # own axis, but the axis is a property of the pair's STATE and burn
-        # changes that state: the ratio gate is relative (`h >= active x 2`)
-        # and the spent gate absolute (`active <= 3.0`), so a burning pair
-        # crosses the boundary repeatedly and each crossing re-opens a move.
-        # Measured, both resets past the horizon, only the active burning:
-        #
-        #     t8   1->2  headroom axis   active 4.0 / best 8.0
-        #     t20  2->1  headroom axis   active 2.0 / best 4.0
-        #     t22  1->2  recovery axis   active 3.0 / best 2.0
-        #
-        # move sequence [1, 2, 1, 2] where base makes one move. Nothing
-        # bounded how many crossings could happen.
-        #
-        # Only the account we left LAST, and only until we move again — so a
-        # three-account fleet still reaches every peer, and any later move
-        # releases the previous one. This bounds the direction, not the rate:
-        # the cooldown already bounds the rate, and it had lapsed at every one
-        # of the moves above (301s ticks against a 300s cooldown).
-        # SCOPED like every sibling gate: `at-limit` and `failover` skip the
-        # anti-flap gates by design. Unscoped this stranded a 2-account fleet
-        # on an exhausted active with the peer at 0%, "no-candidates" every
-        # tick, with nothing able to release it.
-        #
-        # AND IT NEEDS A RELEASE CONDITION. Identity alone has none: on a
-        # 2-account fleet the filter removes the only candidate, and
-        # `lastSwitchFrom` is rewritten ONLY by a successful switch — the very
-        # switch it prevents. Measured, reached by one ordinary proactive move
-        # and no seeded state: the peer resets to 0%, the active burns to 97%,
-        # and 20 ticks / 10h answer "no-candidates". Persisted, so it survives
-        # a restart and a week of wall clock. The engine then escapes only at a
-        # hard 100% — the proactive feature off, on the fleet size that has
-        # nowhere else to go.
-        #
-        # Released by the SAME ratio the anti-flap margin uses. The filter
-        # exists to stop a flip undoing the move before it; a peer that now
-        # beats us by 2x is not that flip, it is a move the outbound leg would
-        # have made on its own merits. One-way stays one-way: the margin is
-        # what makes it so, and re-using it keeps the release from becoming a
-        # second, looser threshold that has to be reasoned about separately.
-        # NOT REMOVED FROM THE LIST — barred from being CHOSEN. Removing it
-        # made eight downstream consumers believe the account does not exist:
-        # `truly_exhausted` (a peer holding 15 points produced
-        # AllExhaustedEvent, a macOS notification and a critical TUI row),
-        # `not oauth_candidates` -> "no candidates at all" with a stretched
-        # poll interval, `_every_account_above_threshold` (a hidden
-        # below-threshold peer flipped `all_above` and switched the whole
-        # ranking axis), `best_candidate_headroom`, and `any_known` ->
-        # "no candidate has readable usage", which was false.
-        #
-        # The filter's job is "do not go back to the account we just left".
-        # That is a statement about the CHOICE, and it belongs where the
-        # choice is made — `_rank_candidates` — not in the census of what
-        # exists. Measured before this move: disabling the filter entirely
-        # left the full suite green, because both its tests only exercised
-        # the released branch.
-        no_return = self._no_return_account(
-            trigger, state, headroom, active_headroom, oauth_candidates
-        )
+        # The no-return bar itself lives in `_rank` below: it is a statement
+        # about the CHOICE, so it belongs where the choice is made rather than
+        # in this census of what exists. See `_no_return_account` for the
+        # incident, the scoping, and the release.
         api_key_candidates = (
             [n for n in candidates if self.switcher.account_kind_for(n) == "api_key"]
             if settings.include_api_key_accounts
@@ -1116,21 +1060,61 @@ class AutoSwitchEngine:
         consume_first = settings.strategy == "consume-first"
 
         def _rank(**kw):
-            """Rank with the no-return bar, and WITHOUT it if that empties.
+            """Rank with the no-return bar, and WITHOUT it if that empties AND
+            the barred account is a different proposition from the one we left.
 
-            The bar has no release of its own — `lastSwitchFrom` is rewritten
-            only by a successful switch — so a bar that leaves nothing is
-            permanent, not anti-flap. Two predicates that tried to predict
-            emptiness both landed a gate short of the loop (see
-            `_no_return_account`), so the question is put to the ranking
-            itself. Exact by construction, and it cannot fall behind the gates
-            because it is not a second copy of them.
+            Emptiness alone cannot be the release. On two accounts there is
+            exactly one candidate, so barring it ALWAYS empties the list —
+            measured, sweeping active x barred headroom x both reset shapes,
+            `n=2 barred-rank EMPTY=320 NONEMPTY=0`. An emptiness-only release
+            therefore fires every tick and the bar is inert at the fleet size
+            the flap was reported on: pcts 92/92, resets 500h/400h, 60 ticks
+            gave `[1, 2, 1, 2]` with the bar on and the identical `[1, 2, 1, 2]`
+            with `lastSwitchFrom` popped every tick.
+
+            "BARRING LEAVES NOTHING" AND "WE ARE FLAPPING" ARE DIFFERENT
+            STATES, and at n=2 they are always the same state — which is how
+            one swallowed the other. The ranking cannot separate them: it sees
+            only the present, and both look like an empty list. What separates
+            them is WHY the ranking flipped. Traced at each leg of that walk:
+
+                t8   1->2   left 1 holding 4.0 pts, 500h out
+                t20  2->1   account 1 still 4.0 pts, still 500h out
+                t22  1->2   account 2 still 2.0 pts, still 400h out
+
+            Every return won because the ACTIVE burned down, never because the
+            target recovered. So the release asks the one question the ranking
+            cannot: is the account we left better than when we left it?
+
+            ON BOTH AXES THE RANKING USES, and with the margins it already
+            uses — ``SPENT_HEADROOM_PCT`` of headroom (below that an edge is
+            under two poll intervals of work) or ``RECOVERY_HYSTERESIS_S``
+            sooner. An account's headroom rises only when a window rolls over
+            and its binding reset only moves nearer when a nearer window
+            starts binding, so both are real events rather than the boundary
+            crossings burn manufactures for free.
+
+            Emptiness still decides whether to ASK. Where the bar leaves a
+            real alternative it simply applies, so a fleet with somewhere else
+            to go is untouched by any of this.
 
             Cheap: the retry runs only when the barred list came back empty,
             which is the tick that was about to do nothing anyway.
             """
+            # Recomputed per snapshot, never once per tick: the consume-first
+            # two-phase commit replaces `headroom` and `active_headroom` and
+            # re-ranks, and the ratio release consumes exactly those two
+            # values. Computed once, the bar answered from a snapshot the
+            # ranking had already thrown away — `left=20 active=30` bars,
+            # `left=90 active=10` releases, and phase 2 is where that flips.
+            recovered = self._left_account_recovered(
+                state, kw["usage"], kw["headroom"], kw["now"]
+            )
+            no_return = self._no_return_account(
+                trigger, state, kw["headroom"], kw["active_headroom"], recovered
+            )
             ranked = self._rank_candidates(no_return=no_return, **kw)
-            if no_return is not None and not ranked[0]:
+            if no_return is not None and not ranked[0] and recovered:
                 unbarred = self._rank_candidates(no_return=None, **kw)
                 if unbarred[0]:
                     return unbarred
@@ -1263,6 +1247,13 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
+        # The departure snapshot of the account we are leaving, taken from the
+        # SAME `usage`/`headroom` the ranking just decided on — for
+        # consume-first that is the phase-2 refetch, not the stale one.
+        left_snapshot = (
+            active_headroom,
+            _binding_recovery_ts(usage.get(current), self._models, self.clock()),
+        )
         transient_failure = False
         for num in ordered:
             email = self.switcher.account_email(num)
@@ -1288,7 +1279,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger)
+                return self._perform(num, email, trigger, left_snapshot)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -1305,7 +1296,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger)
+            return self._perform(num, email, trigger, left_snapshot)
 
         if transient_failure:
             self._emit(
@@ -1324,7 +1315,7 @@ class AutoSwitchEngine:
         state: dict,
         headroom: dict[str, float | None],
         active_headroom: float | None,
-        oauth_candidates: list[str],
+        recovered: bool,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1342,7 +1333,15 @@ class AutoSwitchEngine:
 
         RELEASED when the account we left now beats us by the same ratio the
         anti-flap margin uses: that is not the flip this bars, it is a move the
-        outbound leg would have made on its own merits.
+        outbound leg would have made on its own merits — BUT ONLY IF IT HAS
+        ACTUALLY RECOVERED. The ratio compares against the ACTIVE, and the
+        active burns, so ungated it comes true on a target that has done
+        nothing. Measured on the cited walk, the barred account held 4.0 pts at
+        departure and 4.0 pts at every return; the ratio fired purely because
+        the active fell to 2.0, which is the flap arriving through the release
+        instead of through the ranking. `recovered` is that gate, computed once
+        per snapshot by `_left_account_recovered` and shared with the
+        leaves-nothing retry in `_rank` so the two cannot disagree.
 
         THE LEAVES-NOTHING RELEASE IS NOT HERE. It used to be, and it was
         rewritten twice for the same reason both times: this function cannot
@@ -1362,11 +1361,18 @@ class AutoSwitchEngine:
         10h, active 2 pts / 500h out, third 1 pt — 30 ticks all BLOCKED, and
         the same fleet with `lastSwitchFrom` popped switches on the first.
 
-        `_tick_inner` now ASKS the ranking instead: it ranks with the bar, and
+        `_rank` now ASKS the ranking instead: it ranks with the bar, and
         re-ranks without it when the result is empty. That is exact by
         construction, covers the recovery axis this predicate never could, and
         cannot be one gate behind because it is not a separate copy of the
         gates.
+
+        EMPTINESS ALONE IS NOT THE RELEASE, though — see `_rank`. At n=2 the
+        barred ranking is always empty, so an emptiness-only retry is a no-op
+        at exactly the fleet size the flap was reported on. Both the retry and
+        the ratio above are gated on `recovered`, which is the one question the
+        ranking cannot answer: is this a different account from the one we
+        left, or only a different active?
         """
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
@@ -1376,6 +1382,8 @@ class AutoSwitchEngine:
         # account that is not in it bars nothing. The check was a no-op and
         # nothing killed it under mutation.
         barred = str(came_from)
+        if not recovered:
+            return barred        # the ratio below burns true on its own; see above
         left_headroom = headroom.get(barred)
         if (
             left_headroom is not None
@@ -1384,6 +1392,70 @@ class AutoSwitchEngine:
         ):
             return None                      # beats us outright; not a flip
         return barred
+
+    def _left_account_recovered(
+        self,
+        state: dict,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        now: float,
+    ) -> bool:
+        """Is the account we left a better proposition than when we left it?
+
+        This is the release the bar needs and the ranking cannot supply. A bar
+        that leaves nothing is a stall, but "leaves nothing" is also what every
+        flap looks like on two accounts, so lifting on emptiness alone lifts
+        always. The distinction is not in the present state — it is between the
+        present and the moment of departure, which is why `_perform` records
+        that moment (`leftHeadroom` / `leftRecoveryAt`) alongside
+        `lastSwitchFrom`.
+
+        Measured on the walk this guard exists for, the barred account was
+        IDENTICAL at every return — same headroom, same reset — and only the
+        active had changed. That is the flap: the ranking flipped underneath a
+        target that did nothing.
+
+        Two axes, matching the ranking's two, each with the margin that axis
+        already uses:
+
+          headroom   `+SPENT_HEADROOM_PCT` — below that an edge is under two
+                     poll intervals, the same reason the spent band exists.
+          recovery   `-RECOVERY_HYSTERESIS_S` — the same margin the recovery
+                     axis ranks by one gate later.
+
+        Burn cannot manufacture either: headroom rises only when a window rolls
+        over, and the binding reset moves nearer only when a nearer window
+        starts binding.
+
+        NO SNAPSHOT MEANS RELEASE. State written before this field existed, or
+        by a switch that never recorded one, carries no evidence either way —
+        and of the two failure modes the permanent proactive lockout is the
+        worse one, because it is persisted and survives a restart and a week of
+        wall clock. Absence of evidence releases.
+        """
+        came_from = state.get("lastSwitchFrom")
+        if came_from is None:
+            return True
+        barred = str(came_from)
+        left_headroom = state.get("leftHeadroom")
+        left_recovery = state.get("leftRecoveryAt")
+        if left_headroom is None and left_recovery is None:
+            return True
+        h = headroom.get(barred)
+        if (
+            isinstance(left_headroom, (int, float))
+            and h is not None
+            and h >= left_headroom + SPENT_HEADROOM_PCT
+        ):
+            return True
+        # `None` is the JSON-safe spelling of "unknown or already past", which
+        # `_binding_recovery_ts` returns as `inf`: an account nobody can
+        # schedule around. Moving off it onto a real reset IS the improvement.
+        was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
+        return (
+            _binding_recovery_ts(usage.get(barred), self._models, now)
+            < was - RECOVERY_HYSTERESIS_S
+        )
 
     def _rank_candidates(
         self,
@@ -1729,7 +1801,13 @@ class AutoSwitchEngine:
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
 
-    def _perform(self, number: str, email: str, trigger: str) -> TickOutcome:
+    def _perform(
+        self,
+        number: str,
+        email: str,
+        trigger: str,
+        left: tuple[float | None, float],
+    ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
             current_email = self.switcher.account_email(current) if current else ""
@@ -1768,9 +1846,15 @@ class AutoSwitchEngine:
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state["lastSwitchAt"] = self.clock()
             state["lastSwitchTo"] = number
-            # WHERE we came from, so the next tick can refuse to undo this.
-            # See the filter in `_tick_inner` for why.
+            # WHERE we came from, so the next tick can refuse to undo this,
+            # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
+            # cannot fake. See `_left_account_recovered` for why the present
+            # state alone cannot supply one. `inf` is stored as null: it is not
+            # portable JSON, and every other reader of this file would have to
+            # learn about it.
             state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
+            state["leftHeadroom"], recovery = left
+            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
             atomic_write_json(self.state_path, state)
 
         self._emit(
