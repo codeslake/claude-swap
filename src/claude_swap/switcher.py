@@ -485,6 +485,58 @@ class ClaudeAccountSwitcher:
             return None
         return data
 
+    def _salvage_unreadable(
+        self, path: Path, emit_output: bool, warnings_out: list[str]
+    ) -> Path:
+        """Copy an unreadable file aside before it is replaced. Returns the copy.
+
+        Three things the first cut got wrong, all of them the same promise —
+        THE BYTES SURVIVE AND THE USER KNOWS:
+
+        MODE. `shutil.copy2` preserves the source mode. Measured on a 0644
+        `~/.claude.json` holding `primaryApiKey`: the replacement got 0600 from
+        `_write_json` and the salvage stayed 0644, so the secret ended up
+        world-readable in a file cswap created. Copied without metadata and
+        chmod'ed 0600 explicitly.
+
+        COLLISION. `get_timestamp()` is second-resolution and `copy2` onto an
+        existing name overwrites. Two failed switches inside one second left
+        ONE file — measured, the first user's data unrecoverable. The retry is
+        exactly what a user does next, so the guard lost the bytes precisely
+        when it was needed. A counter suffix makes each copy its own file.
+
+        VISIBILITY. `warnings_out` is only rendered by the JSON envelope. In
+        human mode the user saw "Activated Account-1" and nothing else while
+        their `projects`/`mcpServers` were gone from the live config — every
+        other `warnings_out.append` in `_perform_switch` is paired with an
+        `if emit_output: warning(msg)`; this one was not.
+        """
+        stem = f"{path.name}.unreadable-{get_timestamp()}"
+        salvage = path.with_name(stem)
+        n = 1
+        while salvage.exists():
+            salvage = path.with_name(f"{stem}.{n}")
+            n += 1
+        try:
+            shutil.copy(path, salvage)          # NOT copy2: mode is set below
+            if sys.platform != "win32":
+                os.chmod(salvage, 0o600)
+        except OSError as e:
+            raise SwitchError(
+                f"{path} could not be parsed and the salvage copy failed "
+                f"({e}); aborting rather than destroying it"
+            )
+        msg = (
+            f"{path.name} could not be parsed — a copy was kept at "
+            f"{salvage.name}"
+        )
+        self._logger.warning(f"{path} could not be parsed; a copy was kept at "
+                             f"{salvage} before it was replaced")
+        warnings_out.append(msg)
+        if emit_output:
+            warning(msg)
+        return salvage
+
     def _write_json(self, path: Path, data: dict) -> None:
         """Write JSON file with validation."""
         content = json.dumps(data, indent=2)
@@ -2386,8 +2438,25 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, init_data)
 
     def _get_sequence_data(self) -> dict | None:
-        """Get sequence data."""
-        return self._read_json(self.sequence_file)
+        """Get sequence data. None ONLY when the roster does not exist yet.
+
+        `strict=True` because ~59 call sites read this and 27 of them write
+        the result back through `or {}` — so a torn or unreadable
+        `sequence.json` read as "no accounts" and the next write rebuilt the
+        roster from nothing. Measured on a torn file with a resident slot 1:
+        `add_account` collapsed `_get_next_account_number` to 1, overwrote the
+        live credential backup at :2934, and THEN died at :2941 with a raw
+        TypeError that `cli.py`'s `except ClaudeSwitchError` does not catch —
+        so `--json` emitted no envelope at all.
+
+            before  sha256:296e3
+            raised  TypeError    is_ClaudeSwitchError=False
+            after   sha256:6aabc    DESTROYED
+            with strict: ConfigError, backup unchanged
+
+        Guarding each caller was the alternative and it is 27 edits that the
+        28th forgets. This is the reader; the distinction belongs here."""
+        return self._read_json(self.sequence_file, strict=True)
 
     def _get_next_account_number(self) -> int:
         """Get next account number."""
@@ -6009,31 +6078,20 @@ class ClaudeAccountSwitcher:
                     existing_config = (
                         self._read_json(config_path) if config_path.exists() else None
                     )
-                    if existing_config:
+                    if existing_config is not None:
+                        # `is not None`, not truthiness. A VALID but empty `{}`
+                        # is readable and loses nothing by being spliced; the
+                        # falsy form sent it down the salvage branch and told
+                        # the user it "could not be parsed", which is the same
+                        # ""-vs-None conflation this branch exists to separate.
                         existing_config["oauthAccount"] = target_oauth
                         self._write_json(config_path, existing_config)
                     else:
                         if config_path.exists():
-                            salvage = config_path.with_name(
-                                f"{config_path.name}.unreadable-{get_timestamp()}"
+                            salvage = self._salvage_unreadable(
+                                config_path, emit_output, warnings_out
                             )
-                            try:
-                                shutil.copy2(config_path, salvage)
-                                self._logger.warning(
-                                    f"{config_path} could not be parsed; a copy "
-                                    f"was kept at {salvage} before it was "
-                                    "replaced"
-                                )
-                                warnings_out.append(
-                                    f"{config_path.name} could not be parsed — "
-                                    f"a copy was kept at {salvage.name}"
-                                )
-                            except OSError as e:  # pragma: no cover - defensive
-                                raise SwitchError(
-                                    f"{config_path} could not be parsed and the "
-                                    f"salvage copy failed ({e}); aborting "
-                                    "rather than destroying it"
-                                )
+                            del salvage
                         self._write_json(config_path, target_config_data)
                     config_written = True
 
