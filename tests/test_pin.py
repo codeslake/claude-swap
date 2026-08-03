@@ -13,6 +13,26 @@ import pytest
 from claude_swap.exceptions import ClaudeSwitchError
 
 
+def _dead_port() -> int:
+    """A port nothing is listening on, obtained by binding and closing.
+
+    NOT a hardcoded number. The heal tests once used 36301, which is the port
+    a real pin daemon uses — so on a machine where the pin was actually
+    running they described a LIVE wiring while claiming to describe a dead
+    one, and every assertion about healing was inverted. Asking the OS for a
+    port and releasing it is the only way to be sure it is closed.
+
+    ``TestNoFixtureNamesARealDaemonPort`` lints for the literal coming back.
+    """
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 class TestImportSafeWithoutTheExtra:
     def test_the_module_imports(self):
         """A top-level import of the optional dependency would make cswap
@@ -198,12 +218,13 @@ class TestTheWiringCanAlwaysBeRemoved:
     def _wired(self, tmp_path):
         tmp_path.mkdir(parents=True, exist_ok=True)
         cfg = tmp_path / ".claude.json"
+        port = _dead_port()
         cfg.write_text(
             json.dumps(
                 {
                     "env": {
-                        "HTTPS_PROXY": "http://127.0.0.1:36301",
-                        "CSWAP_PIN_PORT": "36301",
+                        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                        "CSWAP_PIN_PORT": str(port),
                         "UNRELATED": "keep me",
                     },
                     "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
@@ -305,6 +326,58 @@ class TestTheWiringCanAlwaysBeRemoved:
         )
         # The contended one was correctly skipped, not broken.
         assert "_cswapPinWiredKeys" in json.loads(session.read_text())
+
+    def test_the_untimed_deadline_is_a_total_not_a_per_path_allowance(
+        self, tmp_path, monkeypatch
+    ):
+        """MEASURED (reviewer, two live-held locks): 9.29s unmutated vs 18.03s
+        with ``timeout = DEFAULT_TIMEOUT_S * len(paths)`` — exactly the 2x
+        regression the shared-deadline comment says this was added to fix, on
+        the UNTIMED call (``clear_wiring(sw)``, no explicit ``timeout``).
+
+        Every other test here passes an explicit ``timeout``, so none of them
+        exercises the branch that resolves ``DEFAULT_TIMEOUT_S`` itself. Fast
+        by construction: ``DEFAULT_TIMEOUT_S`` is shrunk before the call, so
+        the whole test still runs in a couple of seconds rather than 9-18.
+        """
+        import time
+
+        import claude_swap.claude_locks as claude_locks
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        session = self._wired(tmp_path / "session")
+        default = self._wired(tmp_path / "home")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
+        # Shrink the DEFAULT this function resolves internally when no
+        # timeout is passed — the mutation under test doubles WHATEVER this
+        # is, so a small value keeps the doubled case fast too.
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 1.0)
+
+        # BOTH locks live-held, for real: a stubbed lock would not exercise
+        # clear_wiring's own per-path share arithmetic.
+        session_lock = session.parent / (session.name + ".lock")
+        default_lock = default.parent / (default.name + ".lock")
+        session_lock.mkdir()
+        default_lock.mkdir()
+        try:
+            start = time.monotonic()
+            changed = pin.clear_wiring(ClaudeAccountSwitcher())  # no timeout
+            elapsed = time.monotonic() - start
+        finally:
+            session_lock.rmdir()
+            default_lock.rmdir()
+
+        assert not changed, "fixture invalid: nothing should have been removed"
+        # 1x the (shrunk) default plus slack, never 2x it — the doubled
+        # mutation reliably clears this bar (measured ~2.2s against a 1.0s
+        # DEFAULT_TIMEOUT_S here; the fix stays under ~1.3s).
+        assert elapsed < 1.9, (
+            f"the untimed deadline behaved as a PER-PATH allowance, not a "
+            f"total: {elapsed:.2f}s against a shrunk default of 1.0s"
+        )
 
     def test_the_launch_path_does_not_wait_on_the_config_lock(
         self, tmp_path, monkeypatch
@@ -973,6 +1046,68 @@ class TestTheRollbackVerdictIsNotFooledByShape:
         )
         assert "the previous pin is unchanged" in msg, msg
 
+    def test_a_rollback_that_does_not_land_says_so(self, tmp_path):
+        """The MEASURED case, not the shape mismatch above: the rollback
+        ATTEMPT itself fails to reach the proxy, so the record never moves
+        off the failed pin. `_restore_pin`'s verdict must come from re-reading
+        the file, not from having made the call — mutating its last line to
+        `return True` leaves the record naming `new@e.com` while the message
+        claims the previous pin is unchanged.
+        """
+        import json as _json
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        settings = backup / "settings.json"
+        settings.write_text(
+            _json.dumps({"remoteControl": {"pinnedEmail": "old@e.com", "pinnedOrganizationUuid": "org"}})
+        )
+
+        class _I:
+            n = 0
+
+            def apply_pin(self, sw, email, org):
+                _I.n += 1
+                if _I.n == 1:
+                    # The ORIGINAL set_pin call: writes the new pin, then the
+                    # proxy dies.
+                    settings.write_text(
+                        _json.dumps(
+                            {"remoteControl": {"pinnedEmail": email, "pinnedOrganizationUuid": org or ""}}
+                        )
+                    )
+                    raise RuntimeError("proxy exploded")
+                # THE ROLLBACK ATTEMPT (_restore_pin calling apply_pin with
+                # `before`). It also fails to reach the proxy and must NOT be
+                # believed just because it was called — the file is untouched.
+                raise RuntimeError("rollback could not reach the proxy either")
+
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            resolve_account=lambda a: ("2", "new@e.com", "org"),
+            _account_kind=lambda n: "oauth",
+        )
+        real = pin._impl
+        pin._impl = lambda: _I()
+        try:
+            ok, msg = pin.set_pin(sw, "new@e.com", "org", num="2")
+        finally:
+            pin._impl = real
+
+        assert not ok
+        # THE FACT the mutation hides: the record never moved off the pin
+        # that just failed.
+        assert pin._pinned_email_now(sw)[0] == "new@e.com", (
+            "fixture invalid: the rollback attempt actually wrote the file"
+        )
+        assert "the previous pin is unchanged" not in msg, (
+            f"claimed the old pin survived while the record names new@e.com: {msg}"
+        )
+        assert "may still name new@e.com" in msg, msg
+
 
 class TestTheTwoWiringPredicatesAgree:
     """"Is it wired" is asked in two places, and they must not disagree.
@@ -1054,7 +1189,7 @@ class TestPurgeDoesNotStrandTheWiring:
 
         cfg = tmp_path / ".claude.json"
         cfg.write_text(_json.dumps({
-            "env": {"HTTPS_PROXY": "http://127.0.0.1:36301"},
+            "env": {"HTTPS_PROXY": f"http://127.0.0.1:{_dead_port()}"},
             "_cswapPinWiredKeys": ["HTTPS_PROXY"],
             "_cswapPinWiredKeysSaved": {},
         }))
@@ -1117,8 +1252,9 @@ class TestPurgeDoesNotStrandTheWiring:
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         cfg = tmp_path / ".claude.json"
+        port = _dead_port()
         cfg.write_text(_json.dumps({
-            "env": {"HTTPS_PROXY": "http://127.0.0.1:36301", "CSWAP_PIN_PORT": "36301"},
+            "env": {"HTTPS_PROXY": f"http://127.0.0.1:{port}", "CSWAP_PIN_PORT": str(port)},
             "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
             "_cswapPinWiredKeysSaved": {},
         }))
@@ -1175,7 +1311,7 @@ class TestClearRunsWithTheExtraGone:
         cfg.write_text(
             json.dumps(
                 {
-                    "env": {"HTTPS_PROXY": "http://127.0.0.1:36301", "K": "v"},
+                    "env": {"HTTPS_PROXY": f"http://127.0.0.1:{_dead_port()}", "K": "v"},
                     "_cswapPinWiredKeys": ["HTTPS_PROXY"],
                 }
             )
@@ -1548,7 +1684,7 @@ class TestARound2Regressions:
         cfg.write_text(
             json.dumps(
                 {
-                    "env": {"HTTPS_PROXY": "http://127.0.0.1:36301"},
+                    "env": {"HTTPS_PROXY": f"http://127.0.0.1:{_dead_port()}"},
                     "_cswapPinWiredKeys": ["HTTPS_PROXY"],
                 }
                 if wired
@@ -2022,7 +2158,14 @@ class TestTheVerdictHasExactlyOneImplementation:
         try:
             ok, msg = pin.set_pin(sw, "dup@example.com", "org", num="2")
             assert not ok, "a duplicate email got past the API-key refusal"
-            assert "API-key account" in msg, msg
+            # THE DISTINGUISHING TEXT. "API-key account" alone appears in BOTH
+            # this refusal ("... is an API-key account, which the cloud pin
+            # cannot use ...") and the resolve-FAILURE message ("... so the
+            # cloud pin cannot check it is not an API-key account") — a bug
+            # that swallows the ConfigError and falls into the resolve-failure
+            # branch instead of ever reaching `_account_kind` would match the
+            # substring just as well as the real refusal does.
+            assert "which the cloud pin cannot use" in msg, msg
             assert applied == [], "apply_pin ran for an API-key account"
         finally:
             pin._impl = real_impl
@@ -2080,24 +2223,6 @@ class TestHealADeadPin:
     must leave Claude working exactly as it did before the pin existed.
     """
 
-    @staticmethod
-    def _dead_port():
-        """A port nothing is listening on, obtained by binding and closing.
-
-        NOT a hardcoded number. These tests once used 36301, which is the port
-        a real pin daemon uses — so on a machine where the pin was actually
-        running they described a LIVE wiring while claiming to describe a dead
-        one, and every assertion about healing was inverted. Asking the OS for
-        a port and releasing it is the only way to be sure it is closed.
-        """
-        import socket
-
-        s = socket.socket()
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-        s.close()
-        return port
-
     def _sw(self, tmp_path, wired=True, pinned="cloud@example.com"):
         import types
 
@@ -2107,7 +2232,7 @@ class TestHealADeadPin:
             json.dumps({"remoteControl": {"pinnedEmail": pinned}} if pinned else {})
         )
         cfg = tmp_path / ".claude.json"
-        dead = self._dead_port()
+        dead = _dead_port()
         cfg.write_text(
             json.dumps(
                 {
@@ -2313,6 +2438,72 @@ class TestHealADeadPin:
         )
         monkeypatch.setattr(pin, "heal", lambda s: (True, "Removed a stale wiring"))
         assert pin.run(sw, None, heal_only=True) == 0
+
+    def test_heal_does_not_claim_success_over_a_PARTIAL_unwire(
+        self, tmp_path, monkeypatch
+    ):
+        """`clear_wiring` returns True when ANY of the two configs changed —
+        `heal` trusted that bool instead of re-reading, so with the session
+        config's lock held (contended) and the default config free, the
+        default cleared, `clear_wiring` returned True for that one change,
+        and `heal` reported success while the SESSION config still named a
+        dead port. `clear_pin` gets this right by re-reading
+        `_wiring_present`; `heal` must do the same.
+
+        TWO DISTINCT CONFIG FILES, not `_sw`'s single-file fixture: every
+        existing heal test points both `get_global_config_path` and
+        `get_default_global_config_path` at the SAME file, so a clear that
+        only reaches one of two never arises there.
+        """
+        from claude_swap import pin
+        from claude_swap.claude_locks import proper_lockfile
+
+        session_dir = tmp_path / "session"
+        default_dir = tmp_path / "default"
+        session_dir.mkdir()
+        default_dir.mkdir()
+        session_cfg = session_dir / ".claude.json"
+        default_cfg = default_dir / ".claude.json"
+        for cfg in (session_cfg, default_cfg):
+            dead = _dead_port()
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "HTTPS_PROXY": f"http://127.0.0.1:{dead}",
+                            "CSWAP_PIN_PORT": str(dead),
+                        },
+                        "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                    }
+                )
+            )
+
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: session_cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default_cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)  # nothing can restart
+
+        sw, _cfg = self._sw(tmp_path)  # only used for backup_dir/_write_json
+
+        # Hold the SESSION lock for real, exactly as the reviewer measured —
+        # a stub would not exercise clear_wiring's per-path skip logic.
+        with proper_lockfile(session_cfg.parent / (session_cfg.name + ".lock"), timeout=5):
+            changed, msg = pin.heal(sw)
+
+        assert "_cswapPinWiredKeys" in json.loads(session_cfg.read_text()), (
+            "fixture invalid: the session config was not actually contended"
+        )
+        # THE STATE, not the call's own return value — exactly what clear_pin
+        # already does and heal did not.
+        assert pin._wiring_present(sw) is True, (
+            "fixture invalid: no wiring survives to disagree with the verdict"
+        )
+        assert not changed, (
+            f"heal reported success ({msg!r}) while a wiring survives on disk "
+            "— every new session from that terminal still boots against a "
+            "dead port"
+        )
 
 
 class TestHealNeverTearsDownAServingPin:
@@ -2899,4 +3090,224 @@ class TestANoteMustNotFailTheAction:
         src = __import__("inspect").getsource(cli._pin_command)
         assert "_safe(e)" in src, (
             "the catch-all renders a package exception without the scrubber"
+        )
+
+
+class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
+    """`_wiring_present` keys on the MARKER; `_wired_port_is_serving` reads only
+    `CSWAP_PIN_PORT`. A config carrying the marker and no port is therefore
+    "wired" and "not serving" at the same time, so `_wiring_is_stale` is True
+    and the wiring goes — against a live proxy.
+
+    Today's writer always emits `CSWAP_PIN_PORT`, so this is not reachable
+    through it. But the seam's own stated threat model is that the package is a
+    PEER on an independent release schedule (`_impl`'s comment says exactly
+    that), and the seam refuses to trust its RETURN VALUE while trusting its
+    FILE FORMAT with the destructive operation. "I cannot tell" must not read
+    as "it is dead".
+    """
+
+    def _wired_without_port(self, tmp_path):
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": "c@e.com"}})
+        )
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({
+            # The marker is present. The port is not — a shape the seam must
+            # not read as "nothing is serving".
+            "env": {"HTTPS_PROXY": "http://127.0.0.1:0"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY"],
+        }))
+        return types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        ), cfg
+
+    def test_a_marker_with_no_port_is_not_reported_as_stale(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap import pin
+
+        sw, cfg = self._wired_without_port(tmp_path)
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        assert pin._wiring_present(sw) is True, "fixture is not wired"
+        assert pin._wiring_is_stale(sw) is False, (
+            "a wiring whose port cannot be read was called stale — the next "
+            "launch would tear down a pin that may be perfectly live"
+        )
+
+
+class TestOneConfigIsOneOpinion:
+    """The two config getters resolve to the SAME file outside a session
+    terminal, and `_wired_ports` de-dups on that. Nothing tested the de-dup:
+    deleting it left the whole suite green (measured, as a mutation), because
+    every fixture that points both getters at one file also asserts on
+    outcomes a doubled reading happens not to change.
+
+    It matters to the caller that COUNTS. `_wired_port_is_serving` returns
+    `bool(ports)` and probes each entry, so a doubled list makes one config
+    look like two agreeing opinions and doubles the connect attempts against
+    a port that may be refusing — the slow path, on the launch path.
+    """
+
+    def test_one_file_seen_through_both_getters_is_counted_once(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap import pin
+
+        port = _dead_port()
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                        "CSWAP_PIN_PORT": str(port),
+                    },
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                }
+            )
+        )
+        import claude_swap.paths as paths
+
+        # THE COMMON CASE, not a contrived one: outside a session terminal
+        # both getters resolve to ~/.claude.json.
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        assert pin._wired_ports() == [port], (
+            "one config read through both getters produced more than one "
+            "opinion — the serving probe would count a single file twice"
+        )
+
+    def test_two_distinct_configs_are_two_opinions(self, tmp_path, monkeypatch):
+        """The de-dup must key on the PATH, not collapse everything to one:
+        two genuinely different configs each get a say (that asymmetry is why
+        `_wired_port_is_serving` requires every named port to answer).
+        """
+        from claude_swap import pin
+
+        ports = []
+        paths_ = []
+        for name in ("session", "default"):
+            d = tmp_path / name
+            d.mkdir()
+            p = _dead_port()
+            cfg = d / ".claude.json"
+            cfg.write_text(
+                json.dumps(
+                    {
+                        "env": {
+                            "HTTPS_PROXY": f"http://127.0.0.1:{p}",
+                            "CSWAP_PIN_PORT": str(p),
+                        },
+                        "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                    }
+                )
+            )
+            ports.append(p)
+            paths_.append(cfg)
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: paths_[0])
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: paths_[1])
+
+        assert pin._wired_ports() == ports, (
+            "two distinct configs did not produce two opinions — a dead "
+            "default config would hide behind a live session one"
+        )
+
+    def test_a_box_with_no_wiring_is_not_reported_as_serving(
+        self, tmp_path, monkeypatch
+    ):
+        """No config names a port, so there is nothing to serve.
+
+        PRE-EXISTING GAP, not one this refactor introduced: mutating the final
+        `return bool(ports)` (`return any_wired` before the shared walk) to
+        `return True` left the suite green at HEAD too — measured, 89 passed.
+
+        `_wiring_is_stale` is `wired and not serving`, so a serving probe that
+        answers True unconditionally makes every stale wiring look healthy and
+        `heal` reports "Nothing to heal" forever — the same silent-failure
+        shape as the OR-over-configs bug this function's own comment records,
+        just reached from the other end.
+        """
+        from claude_swap import pin
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {"UNRELATED": "keep me"}}))
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        assert pin._wired_ports() == [], "fixture names a port"
+        assert pin._wired_port_is_serving(None) is False, (
+            "a box with no pin wiring at all was reported as SERVING — "
+            "_wiring_is_stale then reads every dead wiring as healthy and "
+            "heal answers 'Nothing to heal' forever"
+        )
+
+
+class TestNoFixtureNamesARealDaemonPort:
+    """A fixture that hardcodes a port a real daemon uses describes the
+    opposite of what it claims, on exactly the machines that run the pin.
+
+    This was found once and fixed in the heal tests; the module-level
+    `_dead_port` helper carries the reasoning: "these tests once used 36301 …
+    so on a machine where the pin was actually running they described a LIVE
+    wiring while claiming to describe a dead one, and every assertion about
+    healing was inverted."
+
+    The same literal survived in other fixtures. It is a lint, not a scenario:
+    the number cannot be right, because the test cannot know what the machine
+    is running.
+    """
+
+    def test_no_test_fixture_hardcodes_the_pin_daemon_port(self):
+        import ast
+        import pathlib
+
+        here = pathlib.Path(__file__)
+        offenders = []
+        for path in sorted(here.parent.glob("test_*.py")):
+            text = path.read_text()
+            tree = ast.parse(text)
+            skip = set()
+            for n in ast.walk(tree):
+                # A DOCSTRING'S FULL SPAN, not just the line with the
+                # delimiter — `'"""' in line` only caught the opening/closing
+                # line, so a multi-line docstring's own CONTINUATION lines
+                # (the prose this lint is supposed to exempt) still matched.
+                if (
+                    isinstance(
+                        n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+                    )
+                    and n.body
+                    and isinstance(n.body[0], ast.Expr)
+                    and isinstance(n.body[0].value, ast.Constant)
+                    and isinstance(n.body[0].value.value, str)
+                ):
+                    doc = n.body[0].value
+                    skip.update(range(doc.lineno, doc.end_lineno + 1))
+                # THIS LINT'S OWN CODE, which has to contain the literal to
+                # look for it — without this it flagged itself.
+                if isinstance(n, ast.ClassDef) and n.name == self.__class__.__name__:
+                    skip.update(range(n.lineno, n.end_lineno + 1))
+            for i, line in enumerate(text.splitlines(), 1):
+                if "36301" not in line or i in skip or line.lstrip().startswith("#"):
+                    continue
+                offenders.append(f"{path.name}:{i}: {line.strip()}")
+        assert not offenders, (
+            "a fixture hardcodes 36301, the port a real pin daemon uses — on a "
+            "machine running the pin these describe a LIVE wiring while "
+            "claiming a dead one:\n  " + "\n  ".join(offenders)
         )

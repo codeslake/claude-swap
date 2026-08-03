@@ -737,9 +737,65 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     sibling and every call site can keep passing the switcher it already has
     on hand without checking which predicate needs it.
     """
-    return _wiring_present(_switcher) and not _wired_port_is_serving(
-        _switcher, connect_timeout=connect_timeout
+    if not _wiring_present(_switcher):
+        return False
+    # "I CANNOT TELL" IS NOT "IT IS DEAD". `_wiring_present` keys on the
+    # marker; the serving probe reads CSWAP_PIN_PORT. A config carrying the
+    # marker and no port satisfied both "wired" and "not serving" at once, so
+    # the launch path tore it down — against a proxy that may be perfectly
+    # live.
+    #
+    # Today's writer always emits the port, so this is not reachable through
+    # it. But the seam's stated threat model is that the package is a PEER on
+    # an independent release schedule, and refusing to trust its return value
+    # while trusting its file FORMAT with the destructive operation is the same
+    # inference this module keeps being burned by.
+    if _wired_port_of(_switcher) is None:
+        return False
+    return not _wired_port_is_serving(_switcher, connect_timeout=connect_timeout)
+
+
+def _wired_ports() -> list[int]:
+    """Every pin port the configs name, in read order. Unreadable ones are
+    absent rather than zero — "no opinion" and "port 0" are different facts.
+
+    ONE walk for both callers. `_wired_port_of` and `_wired_port_is_serving`
+    each had their own copy of it: same two getters, same de-dup, same
+    ``int(env["CSWAP_PIN_PORT"])``. The de-dup is the part that must not
+    drift — the two getters resolve to the SAME file outside a session
+    terminal, and a probe that counted it twice would report a second opinion
+    the machine does not have.
+    """
+    import json as _json
+
+    from claude_swap.paths import (
+        get_default_global_config_path,
+        get_global_config_path,
     )
+
+    ports, seen = [], set()
+    for get in (get_global_config_path, get_default_global_config_path):
+        try:
+            path = get()
+            if path in seen:
+                continue
+            seen.add(path)
+            env = _json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+            port = int(env.get("CSWAP_PIN_PORT") or 0)
+        except Exception:  # noqa: BLE001 — unreadable/unwired: no opinion
+            continue
+        if port:
+            ports.append(port)
+    return ports
+
+
+def _wired_port_of(_switcher) -> int | None:
+    """The pin port a wired config names, or None when none can be read.
+
+    Separate from the serving probe because "no port named" and "the port
+    refuses" are different facts, and only the second licenses a teardown.
+    """
+    return next(iter(_wired_ports()), None)
 
 
 def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
@@ -760,13 +816,7 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     ``_switcher`` is unused (see :func:`_wiring_present`) but kept, and
     underscore-prefixed, for the same call-compatibility reason.
     """
-    import json as _json
     import socket
-
-    from claude_swap.paths import (
-        get_default_global_config_path,
-        get_global_config_path,
-    )
 
     # EVERY WIRED CONFIG MUST SERVE, not merely one of them.
     #
@@ -786,21 +836,8 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     # An unwired config is not a counter-example — it sends nobody anywhere.
     # Only a config that NAMES a port has an opinion, and every such opinion
     # has to be right for the pin to be serving.
-    seen = set()
-    any_wired = False
-    for get in (get_global_config_path, get_default_global_config_path):
-        try:
-            path = get()
-            if path in seen:
-                continue
-            seen.add(path)
-            env = _json.loads(path.read_text(encoding="utf-8")).get("env") or {}
-            port = int(env.get("CSWAP_PIN_PORT") or 0)
-        except Exception:  # noqa: BLE001 — unreadable/unwired: not serving
-            continue
-        if not port:
-            continue
-        any_wired = True
+    ports = _wired_ports()
+    for port in ports:
         sock = socket.socket()
         sock.settimeout(connect_timeout)
         try:
@@ -809,7 +846,7 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
             return False  # a config names a port nothing serves
         finally:
             sock.close()
-    return any_wired
+    return bool(ports)
 
 
 def heal(switcher) -> tuple[bool, str]:
@@ -911,9 +948,18 @@ def heal(switcher) -> tuple[bool, str]:
     # That is this file's signature defect, in the channel that matters most:
     # the status line calls `heal` on a timer, so during the exact failure it
     # exists to report, the user's only signal said everything was fine.
+    #
+    # RE-READ AFTER CLEAR_WIRING, exactly as clear_pin already does — its
+    # bool is True when ANY of the two configs changed, not when BOTH did.
+    # Measured with the session config's lock held and the default config
+    # free: clear_wiring cleared the default, returned True for that one
+    # change, and `heal` reported "Removed a cloud pin wiring" while the
+    # session config still named the dead port — every new session from that
+    # terminal kept booting against it.
     try:
         if _wiring_present(switcher):
-            if clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S):
+            clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
+            if not _wiring_present(switcher):
                 return True, (
                     "Removed a cloud pin wiring whose proxy was gone — "
                     "sessions fall back to the proxy they had before the pin"
