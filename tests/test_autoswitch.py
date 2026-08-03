@@ -3921,6 +3921,160 @@ class TestLiveLock:
         assert out.stdout.strip() == "False", out.stderr
 
 
+def _seed_healed_strike(h: EngineHarness, num: str, email: str, *, stale: bool = False):
+    """A row that trips `_collect_usage_entries`'s `elif` heal branch.
+
+    switcher.py:4063  `_entry_token_dead(...)` -> False: it passes
+        `stored_fp=fingerprint(backup)`, which != struckFingerprint, so
+        `token_dead` returns False (the fingerprint healed the verdict).
+    switcher.py:4065  `elif entry.auth_dead_strikes and entry.token_dead()`
+        -> True: auth_dead_strikes == 1 == AUTH_DEAD_STRIKES, and
+        `token_dead()` called with NO stored_fp skips the fingerprint check.
+    switcher.py:4071  -> `clear_dead_token` -> `_mutate` -> `_write_rows`.
+    """
+    path = h.switcher._usage_store.path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schemaVersion": 2,
+        "accounts": {
+            num: {
+                "email": email,
+                "organizationUuid": "",
+                "authDeadStrikes": 1,
+                "struckFingerprint": "fp-of-a-generation-that-is-gone",
+                "consecutiveFailures": 3,
+                "lastError": "invalid_grant",
+                "backoffUntil": 9e18,
+                # stale=True lets a successor's reserve() win the row later.
+                "fetchedAt": h.clock.now - (100000.0 if stale else 0.0),
+                "lastGood": {"five_hour": {"pct": 10.0}},
+            }
+        },
+    }))
+    return path
+
+
+def _seed_stale_quarantine(h: EngineHarness, num: str, email: str) -> None:
+    """Fingerprint no longer matches -> released next tick, which EMITS.
+    That emit is the stop's landing site, and it is exempt from stop()'s
+    wait by design (autoswitch.py's `_emit_in_flight` exemption)."""
+    (h.switcher.backup_dir / "autoswitch_state.json").write_text(json.dumps({
+        "schemaVersion": 1,
+        "quarantine": {
+            num: {
+                "email": email,
+                "reason": "invalid_grant",
+                "at": "2024-01-01T00:00:00Z",
+                "refreshTokenFingerprint": "stale-fingerprint",
+            }
+        },
+    }))
+
+
+def _run_write_probe(harness: EngineHarness, *, with_strike: bool):
+    h = harness
+    path = h.switcher._usage_store.path
+    if with_strike:
+        _seed_healed_strike(h, "2", "b@example.com")
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "2": {
+                    "email": "b@example.com",
+                    "organizationUuid": "",
+                    "authDeadStrikes": 0,          # <- the ONLY difference
+                    "consecutiveFailures": 3,
+                    "lastError": "invalid_grant",
+                    "backoffUntil": 9e18,
+                    "fetchedAt": h.clock.now,
+                    "lastGood": {"five_hour": {"pct": 10.0}},
+                }
+            },
+        }))
+    _seed_stale_quarantine(h, "3", "c@example.com")
+
+    before = json.loads(path.read_text())
+
+    engine = h.engine            # holds the LIVE lock: built first
+    assert not engine.dry_run, "probe needs a LIVE engine, not a demoted one"
+
+    seen: list[str] = []
+    fetch_calls: list = []
+    writes: list[str] = []
+    real = h.switcher.usage_entries_by_account
+    real_write = h.switcher._usage_store._write_rows
+
+    def spy(fetch=None, **kw):
+        fetch_calls.append(set(fetch) if fetch is not None else None)
+        return real(fetch=fetch, **kw)          # PASS-THROUGH, not a stub
+
+    def spy_write(rows):
+        writes.append("write")
+        return real_write(rows)
+
+    def on_event(ev) -> None:
+        seen.append(ev.kind)
+        if ev.kind == "account-unquarantined":
+            engine._stop.set()                  # the stop lands in the emit
+
+    engine.on_event = on_event
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=spy), \
+         patch.object(h.switcher._usage_store, "_write_rows", side_effect=spy_write), \
+         patch.object(h.switcher, "_run_usage_fetches", return_value={}) as no_net:
+        outcome = engine.tick()
+
+    return {
+        "outcome": outcome, "events": seen, "fetch_calls": fetch_calls,
+        "store_writes": len(writes), "network": no_net.call_count,
+        "before": before, "after": json.loads(path.read_text()),
+    }
+
+
+def test_repro_usage_json_written_after_stop(harness: EngineHarness):
+    """RED with the gate absent, GREEN with it restored."""
+    r = _run_write_probe(harness, with_strike=True)
+    b, a = r["before"]["accounts"]["2"], r["after"]["accounts"]["2"]
+
+    # NON-VACUITY. Only facts that hold in BOTH worlds -- whether the
+    # collection ran is exactly what the gate decides, so it is printed as a
+    # diagnostic below, never asserted as a precondition.
+    assert "account-unquarantined" in r["events"], r["events"]   # vector fired
+    assert "no-switch" in r["events"], r["events"]               # tick aborted
+    assert b["authDeadStrikes"] == 1                             # strike seeded
+
+    print(f"\nA outcome={r['outcome']} events={r['events']}")
+    print(f"A usage_entries_by_account calls = {r['fetch_calls']}   "
+          f"(gate absent -> [set()], the :1552 pre-read; restored -> [])")
+    print(f"A _write_rows calls = {r['store_writes']}   network fetches = {r['network']}")
+    print(f"A before: strikes={b['authDeadStrikes']} fp={b['struckFingerprint']!r} "
+          f"failures={b['consecutiveFailures']} backoffUntil={b['backoffUntil']}")
+    print(f"A after : strikes={a['authDeadStrikes']} fp={a['struckFingerprint']!r} "
+          f"failures={a['consecutiveFailures']} backoffUntil={a['backoffUntil']}")
+    print(f"A usage.json MUTATED AFTER STOP = {r['before'] != r['after']}")
+
+    assert r["before"] == r["after"], (
+        "a stopped engine wrote usage.json -- clear_dead_token ran below the "
+        "deleted gate, reached via the pre-read at autoswitch.py:1552 which "
+        "sits ABOVE _collect_scheduled_usage's own gate at :1606"
+    )
+
+
+def test_repro_control_no_strike_no_write(harness: EngineHarness):
+    """CONTROL: identical vector, no strike to heal -> no writer reached.
+    Green in BOTH worlds. If this ever goes red the probe is measuring
+    something other than the heal path."""
+    r = _run_write_probe(harness, with_strike=False)
+    assert "account-unquarantined" in r["events"], r["events"]
+    print(f"\nA-CONTROL store_writes={r['store_writes']} "
+          f"MUTATED={r['before'] != r['after']}")
+    assert r["before"] == r["after"]
+
+
+# ======================= B: CONSEQUENCE DEMONSTRATION ======================
+
+
 class TestStoppedEngineDoesNotAct:
     """A stopped engine must not switch, even mid-tick.
 
@@ -4067,6 +4221,66 @@ class TestStoppedEngineDoesNotAct:
         assert harness.state().get("quarantine", {}) == {}, (
             f"state={harness.state()} — a stopped engine quarantined an "
             "account on behalf of a successor that already owns LIVE"
+        )
+
+    def test_a_stop_before_the_collection_writes_no_usage_store_row(
+        self, harness
+    ):
+        """The deleted gate at :992 was NOT redundant, and the census that
+        called it redundant asked the wrong question.
+
+        The reasoning was "nothing between here and `_collect_scheduled_usage`'s
+        own gate emits or mutates". That gate is at :1606, but the method's
+        FIRST statement is at :1552 --
+
+            pre = self.switcher.usage_entries_by_account(fetch=set())
+
+        -- which runs ABOVE it. `fetch=set()` makes it no-NETWORK, and the
+        comment above the inner gate says exactly that ("touch no network and
+        stay"). No-network is not no-write: it reaches
+        `switcher.py:_collect_usage_entries` -> `usage_store.clear_dead_token`,
+        which does `row["claimId"] = None` and `self._mutate(...)` -> a real
+        `_write_rows`.
+
+        Nulling `claimId` is not cosmetic. `record()` fences on it
+        (`row.get("claimId") != expected -> continue`), so a stopped
+        predecessor's write DISCARDS a successor's in-flight fetch.
+
+        The stop is injected inside the unquarantine emit because that path is
+        exempt from `stop()`'s wait by design -- which is precisely where the
+        deleted gate used to catch it.
+        """
+        engine = harness.engine
+        # Spy on the WRITE, not on clear_dead_token: reaching that particular
+        # mutator needs `auth_dead_strikes and token_dead()`, which this
+        # harness never sets, so a spy on it is vacuous -- it reports zero
+        # calls whether or not the gate exists. `_write_rows` is the point
+        # every usage-store mutation funnels through, so it catches the class.
+        writes: list[str] = []
+        store = engine.switcher._usage_store
+        real_write = store._write_rows
+
+        def spy_write(rows):
+            writes.append("_write_rows")
+            return real_write(rows)
+
+        store._write_rows = spy_write
+
+        real_release = engine._release_recovered_quarantines
+
+        def release_then_stop(state):
+            out = real_release(state)
+            engine.stop()       # lands where the deleted gate used to sit
+            return out
+
+        engine._release_recovered_quarantines = release_then_stop
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(95), "2": _usage(5)})
+
+        assert writes == [], (
+            f"a stopped engine ran {writes} -- a usage-store write for a "
+            "successor that already owns LIVE; clear_dead_token nulls "
+            "claimId, the field record() fences on"
         )
 
     def test_stop_inside_phase1_fetch_blocks_the_escalation_refetch(
