@@ -97,6 +97,17 @@ RECOVERY_HYSTERESIS_S = 300.0
 # still worse than the race, hence a ceiling rather than an unbounded wait.
 _STOP_SWITCH_WAIT_S = 30.0
 
+
+class _EngineStopped(Exception):
+    """`stop()` landed mid-tick; abandon the tick without pretending to fail.
+
+    The stop checkpoints inside `_collect_scheduled_usage` used to return an
+    empty triple, which is indistinguishable from a fetch that answered
+    nothing: `headroom.get(current)` came back None and the tick charged
+    `_unhealthy_ticks` — measured 0 -> 1 — while emitting no event at all, so
+    a `--once` run returned NO_ACTION with no reason line. Every other `_stop`
+    checkpoint emits `engine-stopped`; these two were the odd ones out."""
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -832,6 +843,17 @@ class AutoSwitchEngine:
         lock = FileLock(self.switcher.backup_dir / LIVE_LOCK_FILENAME, timeout=0)
         if not lock.acquire():
             return
+        # RE-CHECK AFTER THE ACQUIRE. `acquire()` and the assignment are two
+        # statements, and `stop()` between them reads `_live_lock is None`,
+        # returns immediately, and then this line hands a real cross-process
+        # flock to an engine that will never tick again. Measured:
+        # `stopped=True holds_lock=True successor_demoted=True` — no engine on
+        # the machine can go LIVE until the process exits, because nothing
+        # reclaims it (`_release_live` runs only from `_perform`'s finally,
+        # and `stop()` already returned).
+        if self._stop.is_set():
+            lock.release()
+            return
         self._live_lock = lock
         self.dry_run = False
         self.demoted_from_live = False
@@ -942,9 +964,13 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="engine-stopped"))
             return TickOutcome.NO_ACTION
 
-        entries, usage, headroom = self._collect_scheduled_usage(
-            current, quarantined, threshold=settings.threshold
-        )
+        try:
+            entries, usage, headroom = self._collect_scheduled_usage(
+                current, quarantined, threshold=settings.threshold
+            )
+        except _EngineStopped:
+            self._emit(NoSwitchEvent(reason="engine-stopped"))
+            return TickOutcome.NO_ACTION
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1548,7 +1574,7 @@ class AutoSwitchEngine:
         # only its entrance left the other two live. The `fetch=set()` reads at
         # :1494 and :1924 touch no network and stay.
         if self._stop.is_set():
-            return {}, {}, {}
+            raise _EngineStopped()
         entries = self.switcher.usage_entries_by_account(
             fetch=plan,
             # A candidate-style plan on the active slot is deliberately
@@ -1596,7 +1622,7 @@ class AutoSwitchEngine:
                 ):
                     escalation_fetch.remove(num)
             if self._stop.is_set():
-                return {}, {}, {}      # see the note above the plan fetch
+                raise _EngineStopped()   # see the note above the plan fetch
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
@@ -1798,9 +1824,33 @@ class AutoSwitchEngine:
         # the `finally` clears it whether or not the gate returns.
         self._emit_in_flight.set()
         try:
-            if self._stop.is_set():
+            # THE STOP GATE MUST NOT SWALLOW THE STOP NOTICE. Every `_stop`
+            # checkpoint emits `engine-stopped` so a `--once` run can say why
+            # it did nothing — and the gate below, added to stop a torn-down
+            # consumer being called, was eating exactly those. Measured: a stop
+            # landing mid-collection produced `events []`, so the tick
+            # abandoned itself silently. The gate exists for the events that
+            # NARRATE an abandoned tick; this one IS the abandonment.
+            if self._stop.is_set() and getattr(event, "reason", None) != (
+                "engine-stopped"
+            ):
                 return
             self.on_event(event)
+        except Exception as exc:  # noqa: BLE001 — see below
+            # A CONSUMER EXCEPTION IS NOT THE ENGINE'S FAILURE. `tick()`
+            # documents "Never raises", and its `try` covers only
+            # `_tick_inner` — so an emit from `_announce_demotion` /
+            # `_retry_live_promotion` (before the try) or from the except
+            # handlers (outside it) escaped. Measured through the real CLI:
+            # `cswap auto --once --json | head -1` closed the pipe and the
+            # documented 0/1/2/3 exit contract became a BrokenPipeError
+            # traceback, losing the tick's actual outcome.
+            #
+            # Swallowed to the logger, which is where `stop()`'s own release
+            # warning already goes and which has no consumer that can refuse
+            # it. BaseException is deliberately NOT caught: a KeyboardInterrupt
+            # raised inside a callback is the user asking to stop.
+            _logger.warning(f"auto-switch event consumer raised: {exc}")
         finally:
             self._emit_in_flight.clear()
 
@@ -1843,6 +1893,13 @@ class AutoSwitchEngine:
             # inside one window — the failure the lock exists to prevent,
             # reached through the handover rather than two TUIs.
             lock, self._live_lock = self._live_lock, None
+            # A STOPPED ENGINE IS NOT LIVE. `autoview` renders the badge from
+            # `not engine.dry_run`, and leaving it False after the release made
+            # a dead engine read " LIVE ". Normally masked because
+            # `_restart_engine` replaces `_engine` at once — but `_start_engine`
+            # can raise after this `stop()`, leaving the screen pointing at the
+            # stopped one.
+            self.dry_run = True
             # Only when someone ELSE is running it. Called from the tick's own
             # thread the wait can never be satisfied — the flag is set by the
             # frame this call is standing on.
