@@ -750,7 +750,22 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     # an independent release schedule, and refusing to trust its return value
     # while trusting its file FORMAT with the destructive operation is the same
     # inference this module keeps being burned by.
-    if _wired_port_of(_switcher) is None:
+    #
+    # MACHINE-WIDE, not per-config: this guards a WHOLE-MACHINE action
+    # (`clear_wiring` clears every wired config), so "I cannot tell" has to
+    # mean nothing ON THE MACHINE names a readable port — not merely that
+    # THIS config (`_wired_port_of`, deliberately per-config for its own
+    # contract) does not. The shipped deployment shape makes the narrower
+    # reading the COMMON case, not a corner one: `cswap run` wires
+    # ~/.claude.json and launches a child whose OWN config is seeded with no
+    # wiring at all, and the status line hook inside that child is what calls
+    # `heal` on a timer. So the process that heals is normally the one whose
+    # own config has no port to name — and a dead port sitting in the OTHER
+    # config must still be reachable. Measured (real path getters, package
+    # uninstalled): own config unwired, ~/.claude.json wired to a dead port —
+    # `_wired_port_of` (own config) was None, so this used to return False
+    # and `heal()` answered "Nothing to heal" over a dead port that survived.
+    if not _wired_ports():
         return False
     return not _wired_port_is_serving(_switcher, connect_timeout=connect_timeout)
 
@@ -788,14 +803,24 @@ def _wired_ports() -> list[int]:
 
     ports, seen = [], set()
     for get in (get_global_config_path, get_default_global_config_path):
-        path = get()
+        # THE GETTER ITSELF CAN RAISE. `get()` is not just "resolve a path and
+        # a set membership test" — a claim this file's own history made once
+        # and measured wrong: `get_default_global_config_path` calls
+        # `Path.home()`, which raises RuntimeError when HOME is unset and the
+        # uid has no /etc/passwd entry (the standard rootless-container
+        # shape). `heal`'s docstring promises "never raises" because the
+        # status line calls it on a timer, and this function sits on the path
+        # from `heal` through `_wired_port_is_serving` with no guard above it
+        # — a raise here reached the status line's caller directly. Measured:
+        # `pin.heal(sw)` raised RuntimeError instead of returning
+        # ``(False, 'Could not heal…')``.
+        try:
+            path = get()
+        except Exception:  # noqa: BLE001 — unreadable/unresolvable: no opinion
+            continue
         if path in seen:
             continue
         seen.add(path)
-        # No try here: the only work above is resolving a path and a set
-        # membership test, and every way a CONFIG can be unreadable is
-        # already caught inside `_port_of_config`. A catch-all around code
-        # that cannot raise can only ever hide a real bug later.
         port = _port_of_config(path)
         if port:
             ports.append(port)

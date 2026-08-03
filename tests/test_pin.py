@@ -13,6 +13,34 @@ import pytest
 from claude_swap.exceptions import ClaudeSwitchError
 
 
+def _cfg(tmp_path, name, port=None, *, marker=True):
+    """A `.claude.json` under its own dir: wired to `port`, or unwired.
+
+    Module-level because three classes had near-identical copies and the ONE
+    detail that must not drift is the marker list — `_wire_mark_of` returns
+    None for an empty list by design, so `"_cswapPinWiredKeys": []` is not a
+    wired config at all. A fixture that wrote `[]` while its docstring claimed
+    "carries the marker" made every test built on it assert about a config the
+    code would never look at twice.
+    """
+    d = tmp_path / name
+    d.mkdir()
+    cfg = d / ".claude.json"
+    if not marker:
+        cfg.write_text(json.dumps({}))
+        return cfg
+    env = (
+        {"HTTPS_PROXY": f"http://127.0.0.1:{port}", "CSWAP_PIN_PORT": str(port)}
+        if port is not None
+        else {}
+    )
+    cfg.write_text(json.dumps({
+        "env": env,
+        "_cswapPinWiredKeys": list(env) or ["HTTPS_PROXY"],
+    }))
+    return cfg
+
+
 def _dead_port() -> int:
     """A port nothing is listening on, obtained by binding and closing.
 
@@ -2480,20 +2508,33 @@ class TestHealADeadPin:
 
     def test_heal_never_raises(self, tmp_path, monkeypatch):
         """The status line calls this on a timer; an exception there breaks the
-        prompt itself, which is worse than the fault it is reporting."""
+        prompt itself, which is worse than the fault it is reporting.
+
+        MEASURED, not invented: `_wired_ports()` resolves
+        `get_default_global_config_path()`, which calls `Path.home()` — this
+        raises RuntimeError when HOME is unset and the uid has no
+        /etc/passwd entry (the standard rootless-container shape). An
+        earlier version of this test monkeypatched `_wiring_present` to
+        throw instead — that lands INSIDE the try at the bottom of `heal`
+        and passes for the wrong reason, without ever touching the call
+        this test now exercises: `elif _wired_port_is_serving(switcher):`
+        sits OUTSIDE any try, and `_wired_port_is_serving` calls
+        `_wired_ports()` directly.
+        """
+        import pathlib
+
         from claude_swap import pin
 
-        sw, cfg = self._sw(tmp_path)
-        self._paths(monkeypatch, cfg)
-
-        class _I:
-            def heal(self, backup_dir):
-                raise RuntimeError("boom")
-
-        monkeypatch.setattr(pin, "_live_impl", lambda: _I())
+        sw, _cfg = self._sw(tmp_path)  # own config wired to a genuinely dead port
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("HOME", raising=False)
         monkeypatch.setattr(
-            pin, "_wiring_present", lambda *a: (_ for _ in ()).throw(OSError("nope"))
+            pathlib.Path,
+            "home",
+            staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no HOME"))),
         )
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)  # package absent
+
         changed, msg = pin.heal(sw)  # must not raise
         assert not changed
         assert "Could not heal" in msg, msg
@@ -3267,24 +3308,148 @@ class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
         )
 
 
+class TestTheDeadPortCanBeInTheOtherConfig:
+    """`_wiring_is_stale` short-circuited False whenever THIS process's OWN
+    config (what `_wired_port_of` reads) named no port — even when a
+    DIFFERENT, genuinely wired config named a port nothing serves.
+    `_wiring_is_stale` gates a WHOLE-MACHINE action (`clear_wiring` clears
+    every config carrying the marker), so bailing out on "my own config has
+    no opinion" made a dead wiring in the OTHER config permanently
+    unreachable. The Background note makes this the COMMON case, not a
+    corner one: the process that heals is normally the one whose own config
+    is unwired.
+
+    MEASURED (real path getters, no monkeypatching of pin internals, package
+    uninstalled) — session config (this process's own) unwired, default
+    config (~/.claude.json) wired to a dead port:
+
+        _wired_ports         [dead-port]
+        _wired_port_of        None
+        _wiring_is_stale      False    <- "do not touch"
+        heal()                (False, 'Nothing to heal')
+        ~/.claude.json after  DEAD PORT SURVIVES
+
+    The parent commit (0cff56c), before `_wired_port_of` was narrowed to one
+    file, measured True / (True, 'Removed a cloud pin wiring…') / {} for the
+    same scenario.
+    """
+
+    def _sw(self, tmp_path):
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": "c@e.com"}})
+        )
+        return types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+
+    def test_a_dead_port_in_the_other_config_is_reachable(
+        self, tmp_path, monkeypatch
+    ):
+        """THE REGRESSION. The process's own config names no port (nothing
+        to say), the OTHER config names a genuinely dead one — the guard
+        must still see it, not bail out on "I cannot tell about MY config"."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        cfg_own = _cfg(tmp_path, "session", marker=False)
+        dead = _dead_port()
+        cfg_other = _cfg(tmp_path, "default", dead)
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_own)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg_other)
+
+        assert pin._wired_port_of(None) is None, "own config names no port"
+        assert pin._wiring_is_stale(None) is True, (
+            "a dead port in the OTHER config is unreachable when this "
+            "process's own config has no opinion — it must still be healed"
+        )
+
+    def test_heal_clears_a_dead_wiring_that_lives_only_in_the_other_config(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        cfg_own = _cfg(tmp_path, "session", marker=False)
+        dead = _dead_port()
+        cfg_other = _cfg(tmp_path, "default", dead)
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_own)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg_other)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)  # package removed
+
+        changed, msg = pin.heal(sw)
+        assert changed, msg
+        assert "_cswapPinWiredKeys" not in json.loads(cfg_other.read_text(encoding="utf-8"))
+
+    def test_the_guard_does_not_fire_when_the_other_configs_port_is_live(
+        self, tmp_path, monkeypatch
+    ):
+        """The other direction: a guard that ALWAYS fires whenever this
+        process's own config has no port reintroduces round 4's defect. When
+        the only port anywhere on the machine is actually serving, nothing is
+        stale."""
+        import socket
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            cfg_own = _cfg(tmp_path, "session", marker=False)
+            cfg_other = _cfg(tmp_path, "default", port)  # actually live
+
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_own)
+            monkeypatch.setattr(
+                paths, "get_default_global_config_path", lambda: cfg_other
+            )
+            assert pin._wiring_is_stale(None) is False, (
+                "a live port in the other config was read as stale"
+            )
+        finally:
+            srv.close()
+
+
 class TestTheGuardIsPerConfigNotPerMachine:
     """`_wired_port_of` was `next(iter(_wired_ports()), None)` —
     `_wired_ports()` flattens BOTH configs into one list, so this returned
     the first port found on the MACHINE, not the port of the config being
-    judged. As soon as ANY config named a port, `_wiring_is_stale` proceeded
-    to the serving check and `clear_wiring` — called from `heal` and from
-    `wire_launch_env` — clears every wired config, live ones included.
+    judged. `_wired_port_of` itself is fixed to stay per-config (below), and
+    that part of the class name still holds for it.
 
-    Same class of bug as the OR-over-configs `_wired_port_is_serving`'s own
-    comment records (:821-838), pointing the other way: there the danger was
-    one LIVE config masking a dead one; here it is one DEAD config's port
-    manufacturing an opinion about a config that named none.
+    It does NOT hold for `_wiring_is_stale`'s own short-circuit, which a
+    LATER round (Task 1 of the same brief) deliberately made per-MACHINE:
+    `_wiring_is_stale` gates a whole-machine `clear_wiring`, and bailing out
+    on "MY config has no port" left a dead port sitting in the OTHER config
+    permanently unreachable — see `TestTheDeadPortCanBeInTheOtherConfig`.
+    `test_a_dead_default_does_not_condemn_a_portless_live_session` below
+    used to assert the opposite (that a dead default must NOT make a
+    portless session's wiring look stale); that assertion is what Task 1's
+    fix legitimately overturns, so it is re-aimed rather than kept red.
     """
 
     def _wired_no_port(self, tmp_path, name):
         """A config carrying the marker with no CSWAP_PIN_PORT — the shape
         Task 1's fixture uses, now on ONE of two configs rather than the
         only one.
+
+        The marker list must be NON-EMPTY: `_wire_mark_of` returns None for
+        an empty list BY DESIGN, so `"_cswapPinWiredKeys": []` is not wired
+        at all — this config would not even satisfy `_wiring_present`, which
+        makes it a config the caller would never look at twice, not the
+        "carries the marker, no readable port" shape this fixture claims to
+        build. (Fixed here — an earlier version wrote `[]` and every test
+        built on it was asserting on a config that was silently unwired.)
 
         No HTTPS_PROXY value: neither predicate under test reads it, so a
         port in there would describe a proxy nothing asks about."""
@@ -3293,7 +3458,7 @@ class TestTheGuardIsPerConfigNotPerMachine:
         cfg = d / ".claude.json"
         cfg.write_text(json.dumps({
             "env": {},
-            "_cswapPinWiredKeys": [],
+            "_cswapPinWiredKeys": ["HTTPS_PROXY"],
         }))
         return cfg
 
@@ -3307,21 +3472,32 @@ class TestTheGuardIsPerConfigNotPerMachine:
         }))
         return cfg
 
-    def test_a_dead_default_does_not_condemn_a_portless_live_session(
+    def test_a_dead_default_correctly_condemns_a_portless_session_too(
         self, tmp_path, monkeypatch
     ):
-        """MEASURED (reviewer): session config in the new shape (marker, no
-        port, proxy actually live) + default config carrying an old wiring
-        naming a DEAD port:
+        """RE-AIMED (see class docstring). Session config in the new shape
+        (marker, no port — "I cannot tell") + default config carrying an old
+        wiring naming a port that is CONFIRMED DEAD:
 
-            _wired_ports       : [41403]
-            _wired_port_of     : 41403   (the DEFAULT's dead one)
-            _wiring_is_stale   : True
-            session still wired: False   <- the LIVE pin's wiring, gone
+            _wired_ports       : [dead-port]
+            _wired_port_of     : None    (session's own answer, unchanged)
+            _wiring_is_stale   : True    <- machine-wide: something IS dead
+            session still wired: False   <- cleared along with the default
 
-        A config that names no port must not have its verdict decided by a
-        DIFFERENT config's port — the default's dead port must not make the
-        session's un-checkable wiring look stale.
+        This used to assert `is False`, on the theory that the session's
+        portless wiring must never be judged by a different config's port.
+        Task 1 overturns that: `_wiring_is_stale` gates `clear_wiring`, which
+        already clears BOTH configs as one operation (its own docstring:
+        "BOTH configs... Clearing only the resolved path leaves the other
+        wired"), so there is no per-config selective clear to preserve here.
+        Once ANY config on the machine names a port that is confirmed dead,
+        "nothing is known to be dead" is no longer true of the machine, and
+        `_wired_port_is_serving`'s own rule — EVERY wired config must serve,
+        not merely one — already treats the portless session's silence as no
+        opinion, never as a counter-vote. The alternative (bailing out
+        because the session itself has "no opinion") is exactly the Task 1
+        regression: a dead port stuck behind a portless config becomes
+        permanently unreachable.
         """
         from claude_swap import pin
         import claude_swap.paths as paths
@@ -3332,10 +3508,11 @@ class TestTheGuardIsPerConfigNotPerMachine:
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_session)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg_default)
 
-        assert pin._wiring_is_stale(None) is False, (
-            "the default's dead port condemned the session's portless "
-            "wiring — a config that names no port must not be judged by a "
-            "different config's port"
+        assert pin._wired_port_of(None) is None, "own config still names no port"
+        assert pin._wiring_is_stale(None) is True, (
+            "a confirmed-dead port in the default config must make the "
+            "guard fire, even though the session's own config has no "
+            "opinion — otherwise that dead port is unreachable (Task 1)"
         )
 
     def test_wired_port_of_does_not_borrow_a_different_configs_port(
@@ -3541,4 +3718,47 @@ class TestNoFixtureNamesARealDaemonPort:
         assert offenders, (
             "conftest.py was not scanned — a hardcoded 36301 placed there "
             "would slip past this lint entirely"
+        )
+
+    def test_an_unrelated_def_in_own_file_is_not_exempted(self, tmp_path):
+        """The own-file exemption used to be
+        ``is_own_file and isinstance(n, (ast.ClassDef, ast.FunctionDef))``
+        with no check on WHICH def — that exempts every class/function in
+        own_file, not just the lint's own code (``own_names``). A genuine
+        36301 hardcode inside some unrelated function in the SAME file as
+        the lint must still be caught; only defs named in ``own_names`` may
+        be skipped.
+        """
+        own_file = tmp_path / "test_lint_home.py"
+        own_file.write_text(
+            f"class {self.__class__.__name__}:\n"
+            "    def test_x(self):\n"
+            "        pass\n"
+            "\n"
+            "def unrelated_helper():\n"
+            "    port = 36301\n"
+            "    return port\n",
+            encoding="utf-8",
+        )
+        offenders = _port_literal_offenders(tmp_path, own_file, self.__class__.__name__)
+        assert offenders, (
+            "a real 36301 hardcode inside a function that is NOT the "
+            "lint's own code was exempted merely for living in own_file"
+        )
+
+    def test_a_comment_mentioning_the_literal_is_not_an_offender(self, tmp_path):
+        """A comment such as ``# never hardcode 36301`` MENTIONS the literal
+        without hardcoding it as a value — only lines that are not comments
+        count.
+        """
+        (tmp_path / "test_comment.py").write_text(
+            "# reasoning: never hardcode 36301, call _dead_port() instead\n",
+            encoding="utf-8",
+        )
+        offenders = _port_literal_offenders(
+            tmp_path, tmp_path / "nonexistent.py", self.__class__.__name__
+        )
+        assert not offenders, (
+            "a comment merely mentioning 36301 was flagged as a hardcode: "
+            + "\n  ".join(offenders)
         )
