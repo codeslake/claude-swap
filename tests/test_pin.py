@@ -1849,7 +1849,10 @@ class TestHealADeadPin:
         monkeypatch.setattr(pin, "_live_impl", lambda: _I())
         changed, msg = pin.heal(sw)
         assert changed, msg
-        assert "Restarted" in msg, msg
+        # "Restored", not "Restarted": the same call also re-wires a daemon
+        # that is serving while the config names nothing, so a message naming
+        # only the restart would be wrong half the time it fires.
+        assert "Restored" in msg, msg
         assert called == [sw.backup_dir]
         # The wiring is CORRECT now — healing must not have torn it down.
         assert "_cswapPinWiredKeys" in cfg.read_text()
