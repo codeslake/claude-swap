@@ -828,9 +828,12 @@ class TestAdaptiveScheduler:
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
-    def test_a_non_429_ask_is_bounded_at_the_floor_cap(self, temp_home, monkeypatch):
-        """A non-429 ask passes through untouched below the floor cap, and is
-        bounded AT it above — never left to park a row unboundedly.
+    def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
+        self, temp_home, monkeypatch
+    ):
+        """A non-429 ask passes through untouched below its own trust ceiling,
+        and is bounded AT it above — never left to park a row past the point
+        `entries()` already reads it unknown.
 
         This test used to assert the opposite (`other == ask` at every ask up
         to 20000, i.e. no bound at all — `test_a_non_429_ask_passes_through_
@@ -839,39 +842,45 @@ class TestAdaptiveScheduler:
         endpoint sits behind Cloudflare, which routinely emits Retry-After on
         503s. A `503 Retry-After: 86400` parked a row 24h with no bound at
         all — reproduced end-to-end, see the Blocker in review round 5 of PR
-        #197. The fix restores `min(asked, RETRY_AFTER_FLOOR_CAP_S)`
-        unconditionally, so both arms share one ceiling on how long an ask
-        can park a row — not a claim that the row stays trusted at release
-        (it does not; see the PARK BOUND comment at the call site).
+        #197.
 
-        Asks below the cap are asserted with `==`, not `<=`, so a
-        reintroduced blanket clamp (e.g. back to TRUST_MAX_AGE_S = 3600) that
-        would also shorten 601/3600 still fails this test.
+        A LATER FIX bounded it at `RETRY_AFTER_FLOOR_CAP_S` (4500) —
+        reasoning "one ceiling for how long any ask can park a row" — but
+        that is the 429 arm's ceiling, not this one's: `entries()` reads a
+        non-429 row unknown once `TRUST_MAX_AGE_S` (3600) elapses past the
+        last success, so a non-429 ask between 3600 and 4500 parked the row
+        past its own trust for up to 900s (a regression against
+        upstream/main introduced by this PR, round 6 Blocker). The bound is
+        now `TRUST_MAX_AGE_S`, the ceiling this arm's trust actually uses.
+
+        Asks below the ceiling are asserted with `==`, not `<=`, so a
+        reintroduced blanket clamp to something shorter still fails this
+        test.
         """
-        from claude_swap.usage_store import RETRY_AFTER_FLOOR_CAP_S, _failure_backoff_s
+        from claude_swap.usage_store import TRUST_MAX_AGE_S, _failure_backoff_s
 
-        for ask in (601.0, 3600.0, 4499.0):
+        for ask in (601.0, 3600.0):
             other = _failure_backoff_s(1, ask, rate_limited=False)
             assert other == ask, (
                 f"non-429 ask={ask:.0f} backs off {other:.0f}s — an ask below "
-                "the floor cap must pass through untouched"
+                "the trust ceiling must pass through untouched"
             )
 
-        for ask in (4500.0, 7200.0, 10_000.0, 20_000.0, 86_400.0, float("inf")):
+        for ask in (3601.0, 4500.0, 7200.0, 10_000.0, 20_000.0, 86_400.0, float("inf")):
             other = _failure_backoff_s(1, ask, rate_limited=False)
-            assert other == RETRY_AFTER_FLOOR_CAP_S, (
+            assert other == TRUST_MAX_AGE_S, (
                 f"non-429 ask={ask} backs off {other}s, not the "
-                f"{RETRY_AFTER_FLOOR_CAP_S:.0f}s floor cap — a non-429 "
-                "Retry-After can park a row without limit again"
+                f"{TRUST_MAX_AGE_S:.0f}s trust ceiling — a non-429 Retry-After "
+                "can park a row past its own trust again"
             )
 
         # `float("inf")` and an overflow literal parse to the same IEEE inf
         # via `_classify_usage_error`'s `float(raw.strip())` (oauth.py); both
-        # must land on the cap, never inf, or the row is wedged forever and
-        # the wedge survives a restart (json.dumps writes the non-standard
-        # `Infinity` literal).
+        # must land on the ceiling, never inf, or the row is wedged forever
+        # and the wedge survives a restart (json.dumps writes the
+        # non-standard `Infinity` literal).
         assert _failure_backoff_s(1, float("1e400"), rate_limited=False) == (
-            RETRY_AFTER_FLOOR_CAP_S
+            TRUST_MAX_AGE_S
         ), "a 1e400 ask (parses to inf) must be bounded, not left infinite"
 
         # The margin still does its job where it was measured, and the 429
@@ -1113,6 +1122,30 @@ class TestAdaptiveScheduler:
             "lapses re-blocked for a fresh hour"
         )
 
+        # SECOND KILLING ASSERTION — the PARK BOUND itself.
+        #
+        # This test's own scenario asks exactly `block_s` = 3600s, where the
+        # margin arm's uncapped sum (3600 + 900 = 4500) coincidentally lands
+        # exactly ON `RETRY_AFTER_FLOOR_CAP_S`, so the loop above passes
+        # identically whether the PARK BOUND is applied or not — confirmed by
+        # mutation (removing the PARK BOUND entirely still leaves this test
+        # green; orchestrator's own measurement: exactly 1 test in the full
+        # suite dies without it, and this was not that test). An ask
+        # genuinely past the cap (4000s: 4000 + 900 = 4900, uncapped) is
+        # needed to tell the two apart.
+        from claude_swap.usage_store import (
+            RETRY_AFTER_FLOOR_CAP_S,
+            _failure_backoff_s,
+        )
+
+        past_cap_wait = _failure_backoff_s(1, 4000.0, rate_limited=True)
+        assert past_cap_wait == RETRY_AFTER_FLOOR_CAP_S, (
+            f"a 4000s ask (uncapped sum 4900s) waited {past_cap_wait:.0f}s, "
+            f"not the {RETRY_AFTER_FLOOR_CAP_S:.0f}s PARK BOUND — an ask "
+            "genuinely past the cap can park a row unboundedly again, the "
+            "same request-storm shape this test otherwise guards"
+        )
+
     def test_the_trim_never_lands_inside_the_re_block_band(self, temp_home):
         """A wait past the deadline but short of the margin re-blocks.
 
@@ -1225,18 +1258,15 @@ class TestAdaptiveScheduler:
         it, not on cross-test contamination.
 
         The ask is chosen strictly between `TRUST_MAX_AGE_S` (3600) and
-        `RETRY_AFTER_FLOOR_CAP_S` (4500), not at either constant: at 3600 the
-        429-margin path and the correct non-429 path both land on 3600 (the
-        margin path only starts to diverge once `ask > BACKOFF_CAP_S` inflates
-        past the shared ceiling), and at or above 4500 both the margin path
-        AND the PARK BOUND clip the non-429 arm to the same shared
-        `RETRY_AFTER_FLOOR_CAP_S`, so neither boundary value can tell the
-        wiring bug apart from the correct wiring. Between them, the margin
-        path is capped to 4500 (900 pushes it past the ceiling) while the
-        correct non-429 path passes the ask through unclipped, so the two
-        provably disagree. `_classify_usage_error` parses Retry-After for ANY
-        HTTPError code, so a 503 carrying this Retry-After is the reachable
-        shape.
+        `RETRY_AFTER_FLOOR_CAP_S` (4500). Above `TRUST_MAX_AGE_S`, the
+        correct non-429 wiring clips the wait to `TRUST_MAX_AGE_S` (its own
+        trust ceiling, so a non-429 park never outlasts it — see the round-6
+        Blocker). The buggy wiring (defaulting to `rate_limited=True`) takes
+        the 429-only margin instead: `min(ask + 900, RETRY_AFTER_FLOOR_CAP_S)`
+        = 4500 for any ask at or above 3600. The two provably disagree (3600
+        vs 4500) for any ask in this range. `_classify_usage_error` parses
+        Retry-After for ANY HTTPError code, so a 503 carrying this Retry-After
+        is the reachable shape.
         """
         from claude_swap.usage_store import (
             RETRY_AFTER_FLOOR_CAP_S,
@@ -1259,9 +1289,10 @@ class TestAdaptiveScheduler:
         st.record({"1": FetchRecord(error="http-503", retry_after_s=ask)}, ident)
         entry = st.entries(ident)["1"]
         waited = entry.backoff_until - t1
-        assert waited == ask, (
-            f"a non-429 backed off {waited:.0f}s, not the server's {ask:.0f}s "
-            "ask — it took the 429-only margin at the record() call site"
+        assert waited == TRUST_MAX_AGE_S, (
+            f"a non-429 backed off {waited:.0f}s, not its own trust ceiling "
+            f"{TRUST_MAX_AGE_S:.0f}s — it took the 429-only margin at the "
+            "record() call site"
         )
 
     def test_all_exhausted_escalation_preserves_wider_plan(

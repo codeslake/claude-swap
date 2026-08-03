@@ -398,15 +398,16 @@ class TestBackoff:
     def test_hour_scale_margin_clears_the_measured_re_block_band(self):
         # Honoring Retry-After *exactly* puts the retry on the deadline itself,
         # where the server is not reliably ready: measured over this machine's
-        # log (re-measured 2026-08-03), 10 of 23 block lapses re-blocked
-        # within 900s of their own deadline (+2s … +715s) and each cost a
-        # fresh full hour, while the next one after that is +1004s. On the
-        # hour-scale block that produced that evidence, the margin must clear
-        # the whole 900s band.
+        # log (re-measured 2026-08-03, method in the RETRY_AFTER_MARGIN_S
+        # comment), 21 of 38 block lapses re-blocked within 900s of their own
+        # deadline (+2s … +887s) and each cost a fresh full hour, while the
+        # next one after that is +1004s. On the hour-scale block that
+        # produced that evidence, the margin must clear the whole 900s band
+        # (13s of clearance: 900 - 887).
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 >= 900.0
 
     def test_a_short_accurate_block_is_not_inflated(self):
-        # The re-block evidence is entirely hour-scale (40 of 42 blocks
+        # The re-block evidence is entirely hour-scale (40 of 41 blocks
         # opened at exactly 3600, re-measured 2026-08-03), while short blocks
         # were separately measured as accurate — Retry-After 300 meant a
         # 300s block. Inflating those on no
@@ -431,12 +432,13 @@ class TestBackoff:
         # countdown to it — so what the server reports depends on WHEN we ask.
         # The budget is account-scoped, so a second machine polling into a block
         # another one opened sees only the remainder: that is the normal case,
-        # not an edge (33 of 75 observed 429s were mid-block, re-measured
-        # 2026-08-03). A margin computed as a FRACTION of the remainder
-        # shrinks toward zero as the deadline
-        # nears — the 0.25 fraction this replaces made a 1800s remainder land
-        # +450s and a 900s remainder land +225s, both inside the measured
-        # +2s..+716s re-block band. An absolute margin does not decay.
+        # not an edge (34 of 75 observed 429s were mid-block, re-measured
+        # 2026-08-03, method in the RETRY_AFTER_MARGIN_S comment). A margin
+        # computed as a FRACTION of the remainder shrinks toward zero as the
+        # deadline nears — the 0.25 fraction this replaces made a 1800s
+        # remainder land +450s and a 900s remainder land +225s, both inside
+        # the measured +2s..+887s re-block band. An absolute margin does not
+        # decay.
         for remaining in (3600.0, 1800.0, 900.0):
             overshoot = usage_store._failure_backoff_s(1, remaining) - remaining
             assert overshoot >= 900.0, (
@@ -459,9 +461,10 @@ class TestBackoff:
         What it did do is drop the wait onto the deadline, which is where the
         measured evidence says we re-block 10 of 19 times for a fresh hour (as
         measured when this was derived — the re-block fraction has since
-        moved to 10 of 23; this episode model concerns the removed 429
-        trust-trim, out of the live path, and is not re-derived at the new
-        fraction). Episode model on the original number, 3600 runs:
+        moved to 21 of 38, re-measured 2026-08-03, corrected method; this
+        episode model concerns the removed 429 trust-trim, out of the live
+        path, and is not re-derived at the new fraction). Episode model on
+        the original number, 3600 runs:
 
             with the trim    blind 1148s   requests 1.21
             without it       blind  550s   requests 1.00
@@ -498,7 +501,7 @@ class TestBackoff:
         `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
 
         That leaves 2700s of slack in which the constant can drift silently, so
-        the arithmetic identity its comment states ("40 of 42 observed blocks
+        the arithmetic identity its comment states ("40 of 41 observed blocks
         opened at exactly 3600, and 3600 + 900 = this" — re-measured
         2026-08-03) is pinned outright below. The inequality stays as the
         invariant that explains WHY the margin is 429-only.
@@ -528,6 +531,34 @@ class TestBackoff:
                 f"ask {ask} produced a {wait}s wait, past the trust ceiling"
             )
 
+    def test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses(self):
+        """A non-429 park must never outlast TRUST_MAX_AGE_S, its own ceiling.
+
+        `entries()` reads a non-429 row unknown once `TRUST_MAX_AGE_S` (3600s)
+        elapses past the last success — that is the ceiling this arm's trust
+        actually uses. Before this fix, the PARK BOUND capped every ask at
+        `RETRY_AFTER_FLOOR_CAP_S` (4500s) regardless of which arm produced it,
+        so a non-429 ask above 3600 parked the row past its own trust: blind
+        (un-pollable AND unknown) for up to 900s — a regression this PR
+        introduced against upstream/main, where `RETRY_AFTER_FLOOR_CAP_S` was
+        3600, identical to `TRUST_MAX_AGE_S`, so the blind window was always
+        0. The 429 arm keeps `RETRY_AFTER_FLOOR_CAP_S`, correctly inside its
+        own ceiling `RATE_LIMIT_TRUST_MAX_AGE_S` (7200s).
+        """
+        for ask in (3601.0, 4500.0, 7200.0, 86_400.0, float("inf")):
+            wait = usage_store._failure_backoff_s(1, ask, rate_limited=False)
+            assert wait <= usage_store.TRUST_MAX_AGE_S, (
+                f"non-429 ask {ask} produced a {wait}s park, past its own "
+                f"trust ceiling {usage_store.TRUST_MAX_AGE_S}s — blind for "
+                f"{wait - usage_store.TRUST_MAX_AGE_S:.0f}s"
+            )
+        for ask in (4500.0, 7200.0, 50_000.0, 86_400.0, float("inf")):
+            wait = usage_store._failure_backoff_s(1, ask, rate_limited=True)
+            assert wait <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S, (
+                f"429 ask {ask} produced a {wait}s park, past the 429 trust "
+                f"ceiling {usage_store.RATE_LIMIT_TRUST_MAX_AGE_S}s"
+            )
+
     def test_a_soon_resetting_window_can_end_trust_before_the_429_wait_releases(
         self, store, clock
     ):
@@ -542,10 +573,22 @@ class TestBackoff:
 
         Retry-After 3600 -> a 429 wait released at +4500s (measured in
         `test_hour_scale_retry_after_honored`). Here the 5h window resets at
-        +3600s, before that release: the row goes untrusted while still in
-        backoff (un-pollable AND unknown at once) — a blind gap that exists
-        and is bounded, not the "sits comfortably inside its own trust" the
-        old comment claimed.
+        +1800s, well before that release: the row goes untrusted while still
+        in backoff (un-pollable AND unknown at once) — a blind gap that
+        exists and is bounded, not the "sits comfortably inside its own
+        trust" the old comment claimed.
+
+        The reset is fixed at +1800s, not +3600s: at +3600s the reset lands
+        exactly on `TRUST_MAX_AGE_S`, where this test's own branch (the 429
+        trust bound, `_rate_limited_trust_ok`) and the general age-ceiling
+        branch (`age_s <= TRUST_MAX_AGE_S`) give identical answers at all
+        three instants this test checks — a mutation that routes 429 rows
+        through the general branch (`if row.get("lastError") == "http-429"`
+        -> `if False`) survives here even though it kills 8 tests elsewhere.
+        +1800 makes the two branches disagree (confirmed: MUT-D reads
+        `decision_value() == usage` at t0+1801 instead of `None`), so this
+        test now actually depends on the 429-specific trust path it exists
+        to pin.
         """
         from datetime import datetime, timezone
 
@@ -557,7 +600,7 @@ class TestBackoff:
             )
 
         usage = {
-            "five_hour": {"pct": 25.0, "resets_at": iso(3600.0)},
+            "five_hour": {"pct": 25.0, "resets_at": iso(1800.0)},
             "seven_day": {"pct": 10.0, "resets_at": iso(100 * 3600.0)},
         }
         # Schema gotcha: the window key is "pct", not "utilization" — confirm
@@ -572,7 +615,7 @@ class TestBackoff:
         wait = usage_store._failure_backoff_s(1, 3600.0, rate_limited=True)
         assert wait == pytest.approx(4500.0)
 
-        clock.advance(3599.0)  # just before the 5h reset
+        clock.advance(1799.0)  # just before the 5h reset
         entry = store.entries(IDENT)["1"]
         assert entry.in_backoff(clock.now)
         assert entry.decision_value() == usage
@@ -582,7 +625,7 @@ class TestBackoff:
         assert entry.in_backoff(clock.now)  # still can't be re-polled...
         assert entry.decision_value() is None  # ...and already unknown
 
-        clock.advance(wait - 3601.0)  # past the wait's release
+        clock.advance(wait - 1801.0)  # past the wait's release
         entry = store.entries(IDENT)["1"]
         assert not entry.in_backoff(clock.now)
         assert entry.decision_value() is None

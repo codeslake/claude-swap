@@ -119,11 +119,10 @@ BACKOFF_MAX_SHIFT = 32
 # The usage endpoint enforces a request budget on non-first-party
 # User-Agents (proven 2026-07-11: an idle token, polling alone trips it;
 # poll_policy documents the measured shape — an hour-scale window, exact edge
-# algorithm undocumented). The budget is **not** scoped to the access token:
-# on 2026-07-28 a freshly minted token was blocked 135s after issue, which a
-# per-token counter cannot produce, so the scope is the account/org. Nothing
-# below depends on which it is — the wait comes from the server's own deadline.
-# Cumulative polling from cswap's own surfaces is what saturates it.
+# algorithm undocumented). Nothing below depends on whether the budget is
+# scoped to the account/org or to the token — the wait comes from the
+# server's own deadline either way. Cumulative polling from cswap's own
+# surfaces is what saturates it.
 # Retry-After tells the rules apart:
 # - "Retry-After: 0" = the saturated-budget edge: the trailing hour's budget
 #   is spent and frees only as old requests age out, so immediate retries
@@ -146,22 +145,35 @@ BACKOFF_MAX_SHIFT = 32
 #
 # Honoring it EXACTLY is not enough: the retry lands ON the deadline, where
 # the server is not reliably ready. Measured over this machine's whole log
-# (re-measured 2026-08-03; this figure ages as the log grows — re-derive
-# rather than trust it verbatim), 10 of 23 lapses re-blocked within 900s of
-# their own deadline (+2s..+715s), each earning a fresh full hour; the next
-# one is +1004s, so the distribution is bimodal and 900s is the edge of the
-# band. The margin is ABSOLUTE, not a fraction of the ask: Retry-After counts
-# down to a fixed deadline, so a machine polling into a block another one
-# opened sees only the remainder, and a fraction of that shrinks toward zero
-# exactly when it matters.
+# (re-measured 2026-08-03; these figures age as the log grows — re-derive
+# rather than trust them verbatim, using the method below), 21 of 38 lapses
+# re-blocked within 900s of their own deadline (+2s..+887s), each earning a
+# fresh full hour; the next one is +1004s, so the distribution is bimodal and
+# 900s is the edge of the band — with only 13s of clearance (900 - 887), not
+# the 185s an earlier, wrong figure implied. The margin is ABSOLUTE, not a
+# fraction of the ask: Retry-After counts down to a fixed deadline, so a
+# machine polling into a block another one opened sees only the remainder,
+# and a fraction of that shrinks toward zero exactly when it matters.
+#
+# METHOD (re-derive with this, not ad hoc, to get the same numbers): parse
+# ``claude-swap.log`` lines "Usage fetch failed for account N: http-429,
+# retry-after Ks"; EXCLUDE K == 0 (the saturated-budget edge above, a
+# different rule from the burst block this margin is sized against — 439 such
+# lines in the 2026-08-03 log, and mixing them into the block counts is what
+# produced the earlier wrong figures); group the remaining events per account
+# into blocks by clustering on the deadline ``ts + K`` (a new block opens when
+# the deadline jumps forward past a tolerance — stable for any tolerance from
+# 5s to 300s). 41 blocks result, 40 of them opened at exactly K=3600; 34 of
+# 75 observations land mid-block (not block-opening); the lapse gap is each
+# block's next observation's timestamp minus the PRIOR block's deadline.
 RETRY_AFTER_MARGIN_S = 900.0
 # Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
-# account for hours. Sized to clear the measured shape: 40 of 42 observed
-# blocks opened at exactly 3600 (re-measured 2026-08-03), and 3600 + 900 =
-# this. At an ask of exactly this value the margin is already fully eaten,
-# and beyond it the wait is SHORTER than the server asked — a guaranteed 429,
-# costing one request rather than a fresh hour (probing does not re-arm a
-# block). Above 3600 the cap eats
+# account for hours. Sized to clear the measured shape: 40 of 41 observed
+# blocks opened at exactly 3600 (re-measured 2026-08-03, method above), and
+# 3600 + 900 = this. At an ask of exactly this value the margin is already
+# fully eaten, and beyond it the wait is SHORTER than the server asked — a
+# guaranteed 429, costing one request rather than a fresh hour (probing does
+# not re-arm a block). Above 3600 the cap eats
 # the margin (a 3700s ask keeps only +800s), which is deliberate — an ask past
 # the measured window is already outside the evidence, and bounding it matters
 # more there than preserving a margin derived from hour-scale blocks. If real
@@ -530,36 +542,55 @@ def _failure_backoff_s(
         #
         # Capping the constant instead would land a 3600s ask exactly on its
         # deadline — the defect this whole change exists to fix.
-        asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)
-    # PARK BOUND — every ask is capped at RETRY_AFTER_FLOOR_CAP_S, whichever
-    # arm produced it. This restores nothing about trust: `entries()` still
-    # reads the row unknown once TRUST_MAX_AGE_S elapses past the last
-    # SUCCESS, exactly as before this line, so a capped ask can still be
-    # released un-pollable and unknown together. What this bounds is the PARK
-    # itself — how long the row can be held un-pollable — not whether it is
-    # trusted at the end of it.
+        #
+        # No cap here: `min(x, RETRY_AFTER_FLOOR_CAP_S)` would be redundant
+        # with the PARK BOUND below, which still applies
+        # `RETRY_AFTER_FLOOR_CAP_S` unconditionally on this (`rate_limited`)
+        # arm — `min(min(x, c), c) == min(x, c)`. Re-verified after B1 (the
+        # PARK BOUND split by arm): still dead, because this branch is only
+        # reached when `rate_limited` is True, and that is exactly the arm
+        # the PARK BOUND still caps at `RETRY_AFTER_FLOOR_CAP_S`. Confirmed
+        # by mutation: removing it survives the full suite.
+        asked = retry_after_s + RETRY_AFTER_MARGIN_S
+    # PARK BOUND — every ask is capped, but by the ceiling ITS OWN arm's trust
+    # actually uses, not a single shared constant. This restores nothing about
+    # trust: `entries()` still reads the row unknown once the relevant ceiling
+    # elapses past the last SUCCESS, exactly as before this line, so a capped
+    # ask can still be released un-pollable and unknown together. What this
+    # bounds is the PARK itself — how long the row can be held un-pollable —
+    # not whether it is trusted at the end of it.
     #
-    # Without it the non-429 arm is server-controlled and unbounded:
+    # Without it BOTH arms are at risk of outliving their own trust:
     # `_classify_usage_error` (oauth.py) parses Retry-After for ANY HTTPError
     # code, not just 429, and the usage endpoint sits behind Cloudflare, which
     # emits Retry-After on 503s as routine overload signaling. Measured: a
-    # `503 Retry-After: 86400` parks the row 24h instead of the 4500s the 429
-    # arm above is already held to, and `Retry-After: inf` (Python parses
-    # "inf", "Infinity", and any overflow literal like "1e400" to
-    # `float('inf')`) wedges the row permanently — `json.dumps` writes the
-    # non-standard `Infinity` literal, which survives a restart. Reusing
-    # RETRY_AFTER_FLOOR_CAP_S, already the ceiling the margin above is held
-    # to, keeps one answer to "how long can any ask park a row", independent
-    # of which failure kind produced the ask.
-    asked = min(asked, RETRY_AFTER_FLOOR_CAP_S)
+    # `503 Retry-After: 86400` parks the row 24h, and `Retry-After: inf`
+    # (Python parses "inf", "Infinity", and any overflow literal like "1e400"
+    # to `float('inf')`) wedges the row permanently — `json.dumps` writes the
+    # non-standard `Infinity` literal, which survives a restart.
+    #
+    # A PRIOR REVISION reused RETRY_AFTER_FLOOR_CAP_S (4500) for both arms,
+    # reasoning "one answer to how long any ask can park a row". That is
+    # wrong for the non-429 arm: `entries()` reads a non-429 row unknown once
+    # TRUST_MAX_AGE_S (3600) elapses past the last success, not
+    # RETRY_AFTER_FLOOR_CAP_S — so a non-429 ask above 3600 parked the row
+    # 900s past its own trust: blind (un-pollable AND unknown) for that whole
+    # margin, a regression this PR introduced against upstream/main (there
+    # RETRY_AFTER_FLOOR_CAP_S was 3600, identical to TRUST_MAX_AGE_S, so the
+    # blind window was always 0). See
+    # `test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses`. The 429
+    # arm keeps RETRY_AFTER_FLOOR_CAP_S (4500), correctly inside its own
+    # ceiling RATE_LIMIT_TRUST_MAX_AGE_S (7200).
+    asked = min(asked, RETRY_AFTER_FLOOR_CAP_S if rate_limited else TRUST_MAX_AGE_S)
     # NO TRUST TRIM AGAINST THE SERVER'S DEADLINE. Cutting a 429 wait back to
     # the deadline when the stored trust expires first cannot salvage that
     # trust — `trust < ask` is its own precondition and the floor keeps
     # `wait >= ask`, so the row is untrusted at release either way (measured:
     # fired 35 of 180 offsets, salvaged 0). It only lands us on the deadline,
     # where 10 of 19 lapses re-block for a fresh hour (as measured when this
-    # was derived — the re-block fraction has since moved to 10 of 23; the
-    # episode model below is not re-derived at the new fraction, since it
+    # was derived — the re-block fraction has since moved to 21 of 38
+    # (re-measured 2026-08-03, corrected method: see RETRY_AFTER_MARGIN_S);
+    # the episode model below is not re-derived at the new fraction, since it
     # concerns the removed 429 trust-trim and is out of the live path).
     # Episode model on the original number, 3600 runs:
     #
