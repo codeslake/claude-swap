@@ -2826,6 +2826,41 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_a_consume_first_target_must_still_be_healthy(self, temp_home):
+        """The threshold landing gate has no cover on the consume-first path.
+
+        `if (100.0 - h) >= settings.threshold and not all_above: continue` ->
+        `if False` survives the whole suite. On the `best` path the hysteresis
+        gate below masks it; consume-first has no headroom test at all — its
+        `elif` compares weekly resets only, so with the gate gone a 96%-used
+        account whose weekly window resets sooner is a valid target. Measured:
+
+            active 1: 60 pts (util 40%), weekly reset 500h
+            peer   2:  4 pts (util 96%), weekly reset  10h
+            ORIGINAL ranking=[]      tick -> NO_ACTION
+            MUTANT   ranking=['2']   tick -> SWITCHED to 2
+
+        Landing there re-triggers on the very next tick, which is the harm the
+        comment on that gate describes.
+
+        TWO accounts on purpose: a third healthy peer would win the sort and
+        hide the defect behind a correct answer.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage7(40, 40, _R_LATEST),   # active, 60 pts, resets LAST
+            "2": _usage7(96, 96, _R_SOON),     # 4 pts: sooner, but spent
+        })
+        assert outcome is not TickOutcome.SWITCHED, (
+            "consume-first moved onto an account at 96% utilization because "
+            "its weekly window resets sooner — it re-triggers next tick"
+        )
+        assert h.active_number() == 1
+
     def test_respects_cooldown(self, temp_home):
         h = self._harness(temp_home)  # default cooldown 300s
         h.tick_with_usage({
@@ -3752,9 +3787,8 @@ class TestHorizonAxisDoesNotFlap:
 
         Both legs are legitimate on the axis their own state selects: at the
         first the fleet still held real headroom, by the second every account
-        is spent, which is the regime the reset axis exists for. 21 of 576
-        burn walks make that transition; base makes 0 because it refuses the
-        outbound leg too.
+        is spent, which is the regime the reset axis exists for. Base never
+        makes that transition because it refuses the outbound leg too.
 
         Two candidate constraints were measured and BOTH changed the count by
         zero — requiring the fallback's candidate to be spent, and taking
@@ -4331,10 +4365,10 @@ class TestHorizonAxisDoesNotFlap:
     def test_the_bar_reaches_the_ranking_through_tick(self, temp_home):
         """The bar's production WIRING, which nothing pinned.
 
-        `_no_return_account` is computed in `_tick_inner` and threaded into
-        both `_rank_candidates` calls. Measured: replacing that computation
-        with `no_return = None` — the whole feature off in production — left
-        the FULL suite at 1732 passed. The only test of the bar's effect drives
+        `_no_return_account` is computed inside `_rank` and threaded into
+        `_rank_candidates`. Measured: replacing that computation with
+        `no_return = None` — the whole feature off in production — left the
+        full suite green. The only test of the bar's effect drives
         `_rank_candidates` directly and passes `no_return` by hand, so the unit
         was pinned and the integration was not: any refactor that drops the
         kwarg reverts the anti-flap bound silently.
@@ -4349,11 +4383,10 @@ class TestHorizonAxisDoesNotFlap:
         an answer at all. Past the horizon the release (`left >= active x
         RATIO` -> not barred) and the ranking gate (`h >= active x RATIO` ->
         qualifies) are the SAME inequality, so anything the bar could remove
-        the loop had already dropped: swept 18 headroom combinations, every one
-        `unbarred == barred`. Inside the horizon the ranking sorts by reset
-        time instead, the two stop agreeing, and the bar bites — 162 of the
-        swept combinations differ. Both peers are back within the hour here,
-        which is what puts the tick on that axis.
+        the loop had already dropped. Inside the horizon the ranking sorts by
+        reset time instead, the two stop agreeing, and the bar bites. Both
+        peers are back within the hour here, which is what puts the tick on
+        that axis.
 
         ONE fleet, ticked twice: `temp_home` is a single home and a second
         `EngineHarness` over it inherits the first run's roster, so the control
@@ -4399,6 +4432,346 @@ class TestHorizonAxisDoesNotFlap:
             "premise: unbarred, the account we left returns soonest and IS the "
             "pick — without this the assertion above would pass on a fleet "
             "where 3 wins for its own reasons"
+        )
+
+    def test_the_release_needs_the_barred_account_to_have_improved(
+        self, temp_home
+    ):
+        """An empty barred ranking is a reason to ASK, not a reason to release.
+
+        On two accounts the barred ranking is ALWAYS empty — barring the only
+        candidate necessarily empties the list — so a release keyed on
+        emptiness alone is a no-op at n=2, which is the fleet size the flap was
+        reported on. Measured on the emptiness-only release, sweeping active x
+        barred headroom x both reset shapes through `_rank_candidates(
+        no_return="1", oauth_candidates=["1"])`:
+
+            n=2 barred-rank EMPTY=320 NONEMPTY=0
+
+        So the retry fired every time and the bar never applied. The cited flap
+        reproduced unchanged: pcts 92/92, resets 500h/400h, 60 ticks gave
+        `[1, 2, 1, 2]` with the bar ON and `[1, 2, 1, 2]` with `lastSwitchFrom`
+        popped every tick — identical, and worse than base's single move.
+
+        WHAT SEPARATES THE TWO STATES is not the ranking, which only sees the
+        present. It is whether the barred account is a different proposition
+        from the one we left. At each leg of that walk it was not:
+
+            t8   1->2   left 1 holding 4.0 pts, 500h out
+            t20  2->1   account 1 holds 4.0 pts, 500h out   <- nothing changed
+            t22  1->2   account 2 holds 2.0 pts, 400h out   <- nothing changed
+
+        Every return won because the ACTIVE burned down, never because the
+        target recovered. That is the flap, exactly.
+
+        Both legs of the test below are the flap shape: the barred account is
+        no better than we left it on either axis. The bar must hold even
+        though the ranking is empty and the tick therefore does nothing.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(96, self._days_out(h, 500)),   # 4 pts
+            "2": _usage(92, self._days_out(h, 400)),   # 8 pts
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(3612.0)
+
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                # unchanged since we left it: same headroom, same reset
+                "1": _usage(96, self._days_out(h, 500)),
+                "2": _usage(98, self._days_out(h, 400)),   # active, burnt down
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED not in outcomes, (
+            f"{[o.name for o in outcomes]} — the engine went back to an "
+            "account that is exactly as we left it. The ranking flipped "
+            "because the active burned, not because the target recovered; "
+            "that is the flap this bar exists for."
+        )
+
+    def test_a_reset_that_crept_nearer_is_not_a_recovery(self, temp_home):
+        """The recovery leg carries `RECOVERY_HYSTERESIS_S`, and it must.
+
+        Without a margin (`< was - 0.0`) any reset that moved a second nearer
+        counts as the barred account "recovering", and a `resets_at` that
+        drifts — a refetch landing a slightly different estimate, or simply a
+        nearer window starting to bind — hands the flap a release for free.
+        That is the same shape as the ratio gate before it was gated: a
+        threshold burn crosses on its own.
+
+        Measured with the margin removed: the walk below returns to account 1
+        because its binding reset reads 60s nearer than the value recorded at
+        departure, while its headroom is unchanged.
+
+        `RECOVERY_HYSTERESIS_S` is the margin the recovery AXIS already ranks
+        by one gate later, so the release and the ranking agree about what
+        "meaningfully sooner" means rather than being two numbers to reason
+        about separately.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        depart = self._at(h, 500 * 3600)
+        assert h.tick_with_usage({
+            "1": _usage(96, depart),                    # 4 pts
+            "2": _usage(92, self._days_out(h, 400)),    # 8 pts
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(3612.0)
+
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                # same headroom as at departure; the reset crept 60s nearer,
+                # which is well inside RECOVERY_HYSTERESIS_S
+                "1": _usage(96, self._at(h, 500 * 3600 - 3612 - 60)),
+                "2": _usage(98, self._days_out(h, 400)),
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED not in outcomes, (
+            f"{[o.name for o in outcomes]} — a reset one minute nearer is not "
+            "the barred account recovering; without the margin any drift in "
+            "`resets_at` releases the bar"
+        )
+
+    def test_an_unschedulable_account_that_gained_a_reset_has_recovered(
+        self, temp_home
+    ):
+        """`inf` is the right departure value for an unknown reset, not zero.
+
+        `_binding_recovery_ts` returns `inf` for a binding window with no
+        usable `resets_at` — an account nobody can schedule around — and
+        `_perform` stores that as JSON `null`. Reading it back as `0.0` makes
+        the recovery leg unsatisfiable, because no real timestamp is below
+        `0 - RECOVERY_HYSTERESIS_S`, so an account that gained a reset while we
+        were away is refused forever on that axis.
+
+        That IS an improvement, and it is one the headroom leg cannot see: the
+        account below holds the same 4 points it had at departure, so only the
+        reset changed. Measured with the default flipped to `0.0`: 10 ticks
+        BLOCKED with the peer back in an hour.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(96),                            # 4 pts, NO reset known
+            "2": _usage(92, self._days_out(h, 400)),
+        }) is TickOutcome.SWITCHED
+        assert h.engine._read_state().get("leftRecoveryAt") is None, (
+            "premise: the departure reset was unknown and stored as null"
+        )
+        h.clock.advance(3612.0)
+
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                # SAME 4 points; only the reset is now known, and it is near
+                "1": _usage(96, self._at(h, 3600)),
+                "2": _usage(98, self._days_out(h, 400)),
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} — the barred account went from "
+            "unschedulable to back-in-an-hour, which the headroom leg cannot "
+            "see; reading the stored null as 0.0 makes that unreachable"
+        )
+
+    def test_a_switch_that_recorded_no_snapshot_still_releases(
+        self, temp_home
+    ):
+        """No departure snapshot means release, and that direction is chosen.
+
+        State written before `leftHeadroom`/`leftRecoveryAt` existed — an
+        upgrade in place, with the file persisted across restarts — names a
+        barred account and carries no evidence about it either way. The two
+        failure modes are not symmetric: barring on absent evidence is the
+        permanent proactive lockout this branch has already fixed twice, and it
+        survives a restart and a week of wall clock, while releasing costs at
+        most one extra move that the next switch then records properly.
+
+        Measured with the default flipped to `return False`: the shape below
+        answers BLOCKED for 20 ticks with a peer at full quota.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        # A pre-upgrade record: the bar is named, the snapshot is not there.
+        h.engine._mutate_state(lambda st: st.update({"lastSwitchFrom": "2"}))
+        h.engine._mutate_state(lambda st: st.pop("leftHeadroom", None))
+        h.engine._mutate_state(lambda st: st.pop("leftRecoveryAt", None))
+        assert "leftHeadroom" not in h.engine._read_state(), (
+            "premise: the state carries no departure snapshot"
+        )
+
+        outcomes = []
+        for _ in range(20):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(97, self._days_out(h, 500)),   # active, 3 pts
+                "2": _usage(0, self._days_out(h, 400)),    # barred, FULL quota
+            }))
+            h.clock.advance(1801.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"20 ticks of {[o.name for o in outcomes[:6]]}… — state written "
+            "before the snapshot field existed barred the only peer forever, "
+            "which is the persisted lockout, not anti-flap"
+        )
+
+    def test_the_release_fires_when_the_barred_account_recovered(
+        self, temp_home
+    ):
+        """The control: same fleet, same bar, the barred account IS better.
+
+        Without this the assertion above would pass on a bar that never
+        releases at all, which is the permanent 2-account lockout this branch
+        already fixed twice. Only account 1's numbers differ — it reset to full
+        quota — and that must move the engine on the recovery axis the
+        emptiness retry was reaching for.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(96, self._days_out(h, 500)),
+            "2": _usage(92, self._days_out(h, 400)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(3612.0)
+
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(0, self._days_out(h, 500)),    # reset to FULL
+                "2": _usage(98, self._days_out(h, 400)),
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} — account 1 came back to full "
+            "quota and is the only peer; refusing it is the permanent "
+            "2-account lockout, not anti-flap"
+        )
+
+    def test_the_ratio_release_changes_where_the_engine_lands(self, temp_home):
+        """`left >= active x HORIZON_HEADROOM_RATIO` — worth 50 points, unpinned.
+
+        Measured: replacing the whole condition with `False` left the full
+        suite green. It is not equivalent. `test_the_bar_never_applies_to_an_
+        escape` deliberately uses 15 against 10 so the ratio CANNOT fire, and
+        every other bar test releases through the emptiness path instead, so
+        nothing observed the release doing its job.
+
+        End-to-end after a 1->2 move, active 2 on 10 pts, the barred 1 on 80,
+        a third peer on 30:
+
+            release ON   -> SWITCHED to account 1 (80 pts)
+            release OFF  -> SWITCHED to account 3 (30 pts)
+
+        Asserts the DESTINATION: the tick switches either way, so an outcome
+        assertion would pass with the release gone.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+            "3": _usage(70, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(301.0)
+
+        assert h.tick_with_usage({
+            "1": _usage(20, self._days_out(h, 500)),   # barred, 80 pts
+            "2": _usage(90, self._days_out(h, 400)),   # active, 10 pts
+            "3": _usage(70, self._days_out(h, 300)),   # peer, 30 pts
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} — the account we left now holds "
+            "8x the active's headroom, which is a move the outbound leg would "
+            "have made on its own merits, not the flip the bar refuses"
+        )
+
+    def test_the_bar_is_recomputed_on_the_phase_two_snapshot(self, temp_home):
+        """Consume-first refetches, and the bar has to be re-asked.
+
+        The two-phase commit replaces `usage`, `headroom` and `active_headroom`
+        with an escalated refetch, then re-ranks — but the bar was computed
+        once, before phase 1, from the STALE snapshot. `_no_return_account`'s
+        ratio release consumes exactly the two values phase 2 replaces, so the
+        bar is decided on data the ranking has already thrown away:
+
+            no_return(stale: left=20, active=30) = '1'    (barred)
+            no_return(fresh: left=90, active=15) = None   (released)
+
+        Drives a real consume-first tick and swaps the snapshot underneath it:
+        phase A serves the stale numbers, the phase-2 escalation (the only
+        fetch that asks for every account) serves the fresh ones. On the fresh
+        numbers the account we left holds 6x the active's headroom and its
+        weekly window resets soonest, so it is the pick — unless the bar is
+        still answering from the stale snapshot, where it lost by well under
+        the ratio and stayed barred.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage7(20, 20, self._days_out(h, 500)),   # active, LAST
+            "2": _usage7(5, 5, self._days_out(h, 10)),      # SOONEST
+            "3": _usage7(5, 5, self._days_out(h, 400)),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(301.0)
+
+        stale = {
+            "1": _usage7(80, 80, self._days_out(h, 10)),    # left; 20 pts
+            "2": _usage7(70, 70, self._days_out(h, 500)),   # active; 30 pts
+            "3": _usage7(60, 60, self._days_out(h, 400)),   # 40 pts
+        }
+        fresh = {
+            "1": _usage7(10, 10, self._days_out(h, 10)),    # left; 90 pts NOW
+            "2": _usage7(85, 85, self._days_out(h, 500)),   # active; 15 pts
+            "3": _usage7(60, 60, self._days_out(h, 400)),   # 40 pts
+        }
+
+        def _serve(fetch=frozenset(), **kw):
+            # The phase-2 escalation is the only call that asks for the whole
+            # fleet; everything before it is the stale baseline.
+            snap = fresh if len(fetch) >= 3 else stale
+            return {n: _entry_for(v, h.clock.now) for n, v in snap.items()}
+
+        with patch.object(
+            h.switcher, "usage_entries_by_account", side_effect=_serve
+        ):
+            assert h.engine.tick() is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} — on the FRESH snapshot the "
+            "account we left holds 6x the active's headroom and its weekly "
+            "window resets soonest, so the release fires; the bar was still "
+            "answering from the stale snapshot the ranking had replaced"
         )
 
     def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
@@ -4536,6 +4909,44 @@ class TestAllSpentGoesToTheSoonestReset:
         })
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 2
+
+    def test_a_spent_fleet_takes_the_soonest_reset_over_the_most_headroom(
+        self, harness
+    ):
+        """`_recovery_is_useful`'s spent clause, as a whole, was unpinned.
+
+        Its two legs are individually killed
+        (`test_a_peer_with_real_headroom_still_wins_past_the_horizon`,
+        `test_an_unknown_active_reset_keeps_the_headroom`), but removing the
+        entire `if` — the clause's whole stated purpose — left the full suite
+        green. Reachable through `tick()`:
+
+            active 1: 0.5 pts, 300h out
+            peer   2: 0.5 pts, back in 10h
+            peer   3: 1.0 pt,  500h out
+
+            ORIGINAL -> SWITCHED to 2 (the 10h account)
+            MUTANT   -> SWITCHED to 3 (the 500h account)
+
+        Every account is under SPENT_HEADROOM_PCT, which is exactly the regime
+        the clause exists for: at half a point a headroom edge is minutes of
+        work, so the only real question is who returns first. Without the
+        clause the axis falls back to headroom, and one extra point buys a
+        490-hour wait.
+
+        Asserts the DESTINATION — both answers are a switch.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(99.5, self._at(harness, 300 * 3600)),  # active, 0.5 pt
+            "2": _usage(99.5, self._at(harness, 10 * 3600)),   # 0.5 pt, SOON
+            "3": _usage(99.0, self._at(harness, 500 * 3600)),  # 1.0 pt, LAST
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2, (
+            f"landed on {harness.active_number()} — every account is spent, "
+            "so half a point of extra headroom bought a 490-hour wait over an "
+            "account back in ten"
+        )
 
     def test_the_flap_guard_survives_in_the_spent_band(self, harness):
         """Ranking by reset must not reintroduce ping-pong: an account whose
