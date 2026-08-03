@@ -6417,10 +6417,24 @@ class ClaudeAccountSwitcher:
                 if not oauth_section:
                     raise SwitchError("Invalid oauthAccount in backup")
 
+                # `is not None`, not truthiness — same conflation the direct-
+                # activation branch above (:6148-6165) already guards
+                # against. A torn ~/.claude.json reads as None here too;
+                # `current_config_data["oauthAccount"] = ...` on that None
+                # raised `'NoneType' object does not support item
+                # assignment` with no salvage copy, losing the user's torn
+                # config for good. Absent/unreadable both fall to the same
+                # salvage-then-replace the direct-activation branch uses.
                 current_config_data = self._read_json(config_path)
-                current_config_data["oauthAccount"] = oauth_section
-
-                self._write_json(config_path, current_config_data)
+                if current_config_data is not None:
+                    current_config_data["oauthAccount"] = oauth_section
+                    self._write_json(config_path, current_config_data)
+                else:
+                    if config_path.exists():
+                        self._salvage_unreadable(
+                            config_path, emit_output, warnings_out
+                        )
+                    self._write_json(config_path, target_config_data)
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 
