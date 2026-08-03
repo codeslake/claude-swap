@@ -796,7 +796,11 @@ class UsageStore:
         self._mutate(identities, plans.keys(), apply)
 
     def clear_dead_token(
-        self, nums: Iterable[str], identities: dict[str, Identity]
+        self,
+        nums: Iterable[str],
+        identities: dict[str, Identity],
+        *,
+        revoke_claim: bool = True,
     ) -> None:
         """Lift the dead-token quarantine for slots whose credential was refreshed.
 
@@ -804,14 +808,25 @@ class UsageStore:
         strike count (and the failure/backoff state riding with it) no longer
         reflects reality, and the account must become fetch-eligible again so the
         next pass can prove the new token good. A no-op for rows with no strikes.
+
+        ``revoke_claim`` (default True) also fences out any fetch lease bound
+        to the OLD credential generation — needed by the credential-refresh
+        callers (login/add/import), whose whole premise is that lineage is
+        now dead. Callers with no credential change of their own to fence —
+        the collector's fingerprint-healed strike-clear reachable from a
+        lock-free, no-network ``fetch=set()`` read every 3s — must pass
+        ``revoke_claim=False``: nulling `claimId` there voids a DIFFERENT
+        collector's live, in-flight lease on ``record()``'s own fencing
+        field, discarding its measurement.
         """
         nums = list(nums)
         if not nums:
             return
 
         def apply(_num: str, row: dict) -> None:
-            row["claimId"] = None
-            row["claimUntil"] = 0.0
+            if revoke_claim:
+                row["claimId"] = None
+                row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
             row["consecutiveFailures"] = 0

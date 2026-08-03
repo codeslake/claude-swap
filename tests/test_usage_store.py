@@ -788,6 +788,60 @@ class TestDeadTokenQuarantine:
         assert entry.last_error is None
         assert entry.backoff_until is None
 
+    def test_clear_dead_token_revokes_the_claim_by_default(self, store, clock):
+        """The credential-refresh callers (login/add/import) need this: a
+        fresh credential fences out any claim still bound to the OLD
+        lineage, so a superseded fetch's `record()` can't land — see
+        `test_credential_refresh_revokes_an_old_fetch_claim`. Default
+        behavior stays unchanged; ``revoke_claim=False`` is the opt-out for
+        callers with no credential change to fence (below)."""
+        store.reserve(["1"], IDENT, respect_plans=True)
+        assert store.entries(IDENT)["1"].claimed(clock.now)
+        store.clear_dead_token(["1"], IDENT)
+        assert not store.entries(IDENT)["1"].claimed(clock.now)
+
+    def test_clear_dead_token_can_preserve_a_live_claim(self, store, clock):
+        """`revoke_claim=False`: a lock-free heal (no credential change, no
+        network) must not be able to void a lease it did not issue.
+
+        Measured before this guard existed: a zero-strike row holding a
+        live fetch claim (a collector's in-flight lease) had `claimId`
+        nulled by `clear_dead_token` unconditionally — reachable from the
+        TUI's lock-free 3s `fetch=set()` poll, every tick, with no strikes
+        involved at all. `record()` fences its own writes on `claimId`, so
+        that silently discarded a concurrent collector's in-flight fetch
+        outcome — the engine's own measurement, thrown away by a stale
+        read one poll cycle later.
+
+        Control in the same test: strikes/backoff/error state are still
+        cleared with the flag off — only the CLAIM is preserved, proving
+        the mutator's real job (lifting the quarantine) survives the guard.
+        """
+        claims = store.reserve(["1"], IDENT, respect_plans=True)
+        assert claims, "premise: the reserve won a live claim"
+        before = store.entries(IDENT)["1"]
+        assert before.auth_dead_strikes == 0, "premise: no strikes"
+        assert before.claimed(clock.now), "premise: the claim is live"
+
+        store.clear_dead_token(["1"], IDENT, revoke_claim=False)
+
+        after = store.entries(IDENT)["1"]
+        assert after.claimed(clock.now), (
+            f"claim_until {before.claim_until!r} -> {after.claim_until!r}: "
+            "revoke_claim=False must leave a live claim untouched"
+        )
+        assert after.claim_until == before.claim_until
+        assert store.record(
+            {"1": FetchRecord(usage=USAGE)}, IDENT, claims
+        ) == {"1"}, "the preserved claim must still fence a real record()"
+
+        # Control: strike/backoff/error state is still cleared with the flag
+        # off — the guard narrows the write, it does not disable it.
+        store.record({"2": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["2"].token_dead()
+        store.clear_dead_token(["2"], IDENT, revoke_claim=False)
+        assert not store.entries(IDENT)["2"].token_dead()
+
 
 class TestReserve:
     """Atomic fetch reservation: eligibility re-checked under the lock."""

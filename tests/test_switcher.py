@@ -9858,6 +9858,106 @@ class TestStrikeUnbindsInCollector:
         entries = s._collect_usage_entries(info, fetch=set())
         assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED
 
+    def test_a_lock_free_heal_does_not_void_a_concurrent_live_claim(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """MAJOR-1/2 repro: the auto view's steady state, every 3s, no stop
+        involved.
+
+        Sequence measured by the round-4 review (`test_probe_C`):
+
+            T (TUI store-only poll)  entries() lock-free -> sees strikes
+            E (engine collector)     clear_dead_token -> strikes=0;
+                                      reserve() -> wins claim C_E
+            E                        ...on the network...
+            T                        clear_dead_token on its STALE read ->
+                                      claimId=None, wiping C_E
+            E                        record(C_E) -> fenced out; the fetch is
+                                      DISCARDED
+
+        T's decision to heal is made on its own `entries()` read, captured
+        BEFORE E's claim exists on disk; T's WRITE (`clear_dead_token`) lands
+        AFTER E has already claimed. Reproduced by intercepting T's write
+        call and running E's actions inside it -- exactly the ordering the
+        review measured, not a race that merely looks similar.
+        """
+        from claude_swap.usage_store import FetchRecord as StoreRecord
+
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt-dead",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", dead)
+        identities = {"2": ("b@example.com", "")}
+        store = s._usage_store
+        struck_claims = store.reserve(["2"], identities, respect_plans=False)
+        store.record(
+            {"2": StoreRecord(error="invalid_grant",
+                              struck_fp=oauth.credential_fingerprint(dead))},
+            identities, struck_claims,
+        )
+        # The credential heals (fresh lineage) -- T's read (below) sees the
+        # strike as fingerprint-healed, so it takes the `elif` heal branch
+        # rather than the `if` re-login-required branch.
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", fresh)
+
+        engine_claims: dict[str, str] = {}
+        real_clear = s._usage_store.clear_dead_token
+
+        def engine_claims_then_clear(nums, idents, **kw):
+            # T's write is about to land. Before it runs, E completes its
+            # own heal+claim on the (still-struck, on-disk) row -- the
+            # ordering the review measured: E acted between T's read and
+            # T's write. E's own heal must not itself revoke anything (no
+            # claim exists yet), so it goes straight to the store, not
+            # through the method under test.
+            struck = idents == identities and list(nums) == ["2"]
+            assert struck, "premise: this is the row under test"
+            store._mutate(idents, nums, lambda _n, row: row.update(
+                authDeadStrikes=0, struckFingerprint=None,
+                consecutiveFailures=0, lastError=None, backoffUntil=None,
+            ))
+            engine_claims.update(
+                store.reserve(list(nums), idents, respect_plans=False)
+            )
+            assert engine_claims, "premise: E won a live claim before T wrote"
+            # T's own write proceeds now, exactly as the unpatched call
+            # would -- whatever kwargs the switcher itself passes (none
+            # before the fix, `revoke_claim=False` after).
+            return real_clear(nums, idents, **kw)
+
+        s._usage_store.clear_dead_token = engine_claims_then_clear
+        try:
+            # T: the TUI's lock-free, no-network store-only poll.
+            info = [(2, "b@example.com", "", "", False, fresh, "")]
+            s._collect_usage_entries(info, fetch=set())
+        finally:
+            s._usage_store.clear_dead_token = real_clear
+
+        # E returns from the network and records its outcome, fenced by the
+        # claim it won above.
+        accepted = store.record(
+            {"2": StoreRecord(usage={"five_hour": {"pct": 12.0}})},
+            identities, engine_claims,
+        )
+        assert accepted == {"2"}, (
+            f"accepted={accepted} -- the engine's live claim was voided by "
+            "T's lock-free heal, so record() fenced out its own measurement"
+        )
+        assert store.entries(identities)["2"].last_good == {
+            "five_hour": {"pct": 12.0}
+        }
+
 
 class TestStoreResolutionParity:
     """M4: when CC resolves its credential store somewhere cswap does not

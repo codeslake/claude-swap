@@ -4068,8 +4068,17 @@ class ClaudeAccountSwitcher:
                 # Clear the stale strike ROW too: display and fetch
                 # eligibility (_row_eligible gates on the raw count) must
                 # agree, or the slot silently freezes at last-good.
+                #
+                # revoke_claim=False: this call has no credential change of
+                # its own to fence. Reached from a lock-free, no-network
+                # `fetch=set()` read (the TUI's 3s poll among others),
+                # nulling `claimId` unconditionally would void a DIFFERENT,
+                # concurrent collector's live in-flight lease — the field
+                # `record()` fences its own write on — discarding that
+                # collector's measurement for a strike this call is merely
+                # observing, not causing.
                 self._usage_store.clear_dead_token(
-                    [num], {num: identities[num]}
+                    [num], {num: identities[num]}, revoke_claim=False
                 )
                 entries = store.entries(identities, models)
         requested = [
