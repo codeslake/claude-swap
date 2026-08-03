@@ -1079,6 +1079,41 @@ class TestCleanHomeActivation:
                 merged = json.loads(config_path.read_text())
                 assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
 
+    def test_a_valid_empty_config_is_spliced_not_called_unparseable(
+        self, temp_home: Path
+    ):
+        """M-2: `is not None`, not truthiness.
+
+        A valid but EMPTY `{}` config is readable and loses nothing by being
+        spliced. Under a truthiness test it falls to the salvage branch, which
+        copies the file aside and tells the user it "could not be parsed" —
+        the same ""-vs-None conflation this whole PR exists to separate, one
+        level up. The sibling malformed-config test cannot see it: `{not
+        valid json` is genuinely unreadable, so both forms agree there.
+        """
+        src_home = temp_home.parent / "src"
+        src_home.mkdir()
+        export_path = self._seed_and_export(src_home)
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                config_path = dst._get_claude_config_path()
+                config_path.write_text("{}")
+
+                import_accounts(dst, str(export_path))
+                with patch.object(dst, "list_accounts"):
+                    dst.switch_to("1")
+
+                merged = json.loads(config_path.read_text())
+                assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+                assert not list(config_path.parent.glob("*.unreadable-*")), (
+                    "a valid empty config was salvaged and reported as "
+                    "unparseable"
+                )
+
     def test_active_seeded_when_envelope_active_was_skipped(
         self, temp_home: Path
     ):

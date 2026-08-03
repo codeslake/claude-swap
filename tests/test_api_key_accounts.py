@@ -22,10 +22,13 @@ from claude_swap.credentials import (
     approved_form,
     looks_like_api_key,
 )
+from unittest.mock import patch
+
 from claude_swap.exceptions import (
     ClaudeSwitchError,
     CredentialWriteError,
     SessionError,
+    SwitchError,
     ValidationError,
 )
 from claude_swap.json_output import USAGE_API_KEY, usage_fields
@@ -505,6 +508,66 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
             "projects/mcpServers/userID are unrecoverable"
         )
         assert salvage[0].read_text(encoding="utf-8") == torn_bytes
+
+
+    def test_a_failed_salvage_aborts_instead_of_flattening_the_config(
+        self, temp_home: Path
+    ):
+        """M-1: the abort is the salvage's whole license to proceed.
+
+        `_salvage_unreadable` turns an OSError into SwitchError precisely so
+        the switch stops before `_write_json` replaces the torn config. Its
+        four sibling promises (mode, collision, name, visibility) each have a
+        test; the abort did not. Swallowing it would replace the user's file
+        with the 1-key backup config and still return `switched: True` — the
+        exact invisible data loss the salvage exists to prevent, with the
+        guard that prevents it deleted.
+        """
+        s = _linux_switcher()
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_config(str(num), email, json.dumps({
+                "oauthAccount": {"emailAddress": email,
+                                 "accountUuid": f"uuid-{num}"}}))
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            data["accounts"][str(num)] = {
+                "email": email, "uuid": f"uuid-{num}",
+                "organizationUuid": "", "organizationName": "",
+                "added": "2024-01-01T00:00:00Z",
+            }
+            if num not in data["sequence"]:
+                data["sequence"].append(num)
+        data["sequence"].sort()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        cfg = get_global_config_path()
+        real = {
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+            "projects": {"/work": {"allowedTools": []}},
+            "mcpServers": {"x": {"command": "y"}},
+            "userID": "uid-123",
+        }
+        cfg.write_text(json.dumps(real, indent=2)[:-14], encoding="utf-8")
+        torn_bytes = cfg.read_text(encoding="utf-8")
+
+        # The salvage copy cannot be written (ENOSPC, a read-only dir, ...).
+        def no_space(*_a, **_kw):
+            raise OSError(28, "No space left on device")
+
+        with patch("claude_swap.switcher.shutil.copy", side_effect=no_space):
+            with pytest.raises(SwitchError):
+                s.switch_to("2", json_output=True)
+
+        assert cfg.read_text(encoding="utf-8") == torn_bytes, (
+            "the salvage failed and the switch replaced the config anyway — "
+            "projects/mcpServers/userID are unrecoverable"
+        )
 
 
 class TestATornRosterDoesNotDestroyBackups:
