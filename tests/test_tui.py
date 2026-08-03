@@ -1385,11 +1385,28 @@ class _ContendedFakeEngine:
         self.demoted_from_live = True
         self.stopped = False
         self._stop = threading.Event()
+        self._promote_requested = threading.Event()
         _ContendedFakeEngine.instances.append(self)
 
     def run_loop(self) -> int:
+        # `on_event` -- like the real engine's -- must run from THIS worker
+        # thread: `_emit_from_thread` reaches it via Textual's
+        # `call_from_thread`, which raises RuntimeError (silently swallowed)
+        # when called from the app's own thread. `promote()` merely flags
+        # the request from the test's thread; the actual emit happens here,
+        # matching where the real `_retry_live_promotion` runs.
         self.on_event(NoSwitchEvent(reason="cooldown"))
-        self._stop.wait(30)
+        while not self._stop.is_set():
+            if self._promote_requested.wait(0.05):
+                self._promote_requested.clear()
+                self.dry_run = False
+                self.demoted_from_live = False
+                self.on_event(
+                    ConfigWarningEvent(
+                        message="the LIVE holder released the lock — this "
+                                "engine is now LIVE"
+                    )
+                )
         return 0
 
     def stop(self) -> None:
@@ -1403,14 +1420,16 @@ class _ContendedFakeEngine:
         pass
 
     def promote(self) -> None:
-        self.dry_run = False
-        self.demoted_from_live = False
-        self.on_event(
-            ConfigWarningEvent(
-                message="the LIVE holder released the lock — this engine "
-                        "is now LIVE"
-            )
-        )
+        self._promote_requested.set()
+
+    def wait_promoted(self, timeout: float = 1.0) -> bool:
+        """Block until `run_loop`'s worker thread has flipped `dry_run`."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.dry_run:
+                return True
+            time.sleep(0.01)
+        return not self.dry_run
 
 
 @pytest.fixture
@@ -2081,77 +2100,6 @@ class TestAutoStartLive:
             "comes back dry-run, contradicting what the user last saw"
         )
 
-    def test_a_contended_auto_flag_self_promotion_persists_no_consent(
-        self, tmp_path
-    ):
-        """I1: a CONTENDED `cswap tui --auto` must not write permanent
-        go-live consent either.
-
-        `test_auto_flag_self_promotion_persists_no_consent` above covers the
-        UNCONTENDED `--auto` launch: the engine starts LIVE on its very
-        first event, so `_engine_was_dry_run` is seeded False by
-        `_start_engine` and the transition guard alone already blocks the
-        persist.
-
-        A CONTENDED `--auto` is different: another LIVE engine holds the
-        lock, so `AutoSwitchEngine.__init__` demotes this one to dry-run —
-        `_start_engine` seeds `_engine_was_dry_run = True` from that ACTUAL
-        (demoted) starting state, exactly as it would for a human who
-        pressed `l` and got demoted. When the holder later exits,
-        `_retry_live_promotion` (running on the engine thread) self-promotes
-        this engine with no modal, no `_on_live_confirm` call — nobody
-        confirmed anything on THIS launch, only `--auto` on the command
-        line. The transition guard (`_engine_was_dry_run` True ->
-        `engine.dry_run` False) is satisfied exactly like a real human
-        promotion, so it alone cannot be what distinguishes them.
-        """
-        from unittest.mock import MagicMock, patch
-
-        from claude_swap.settings import load_settings
-        from claude_swap.tui.autoview import AutoScreen
-
-        assert load_settings(tmp_path).auto_start_live is False, "premise"
-
-        view = AutoScreen.__new__(AutoScreen)
-        view._settings = load_settings(tmp_path)
-        persisted: list[bool] = []
-        view._persist_auto_start_live = persisted.append
-        view._update_badge = lambda: None
-        view.query_one = MagicMock()
-        from claude_swap.tui.theme import CSWAP_DARK
-        app = MagicMock()
-        app.current_theme = CSWAP_DARK     # Palette.from_theme reads real fields
-
-        # `--start_live=True` (`--auto`), but the lock was already held: the
-        # engine actually STARTED dry-run (demoted), exactly what
-        # `_start_engine` seeds from the engine's real starting state.
-        view._engine_was_dry_run = True
-        # `_start_live=True`: THIS screen was opened by `--auto`, so a later
-        # self-promotion must not read as human confirmation just because
-        # nobody explicitly pressed the toggle.
-        view._start_live = True
-        promoted = MagicMock()
-        promoted.dry_run = False           # the holder exited; self-promoted
-        promoted.demoted_from_live = False
-        view._engine = promoted
-
-        with patch.object(
-            AutoScreen, "is_attached", property(lambda self: True)
-        ), patch.object(AutoScreen, "app", property(lambda self: app)):
-            AutoScreen._on_engine_event(
-                view,
-                ConfigWarningEvent(
-                    message="the LIVE holder released the lock — this engine "
-                            "is now LIVE"
-                ),
-            )
-
-        assert persisted == [], (
-            f"persisted {persisted} — a contended `cswap tui --auto` "
-            "self-promoted with no human confirmation on this launch, and "
-            "wrote permanent go-live consent anyway"
-        )
-
     def test_a_dry_run_engine_still_writes_nothing(self, tmp_path):
         """The persist must stay one-directional.
 
@@ -2287,7 +2235,17 @@ class TestAutoStartLive:
 
             # The holder exits; this engine self-promotes with no further
             # human input -- the same shape `_retry_live_promotion` produces.
+            # The emit must run on the engine's OWN worker thread (matching
+            # the real `_retry_live_promotion`): `_emit_from_thread` reaches
+            # `_on_engine_event` via Textual's `call_from_thread`, which
+            # raises (silently swallowed) when called from the app's own
+            # thread -- calling `promote()` synchronously here would emit
+            # nothing and the test would pass for the wrong reason.
             engine.promote()
+            assert await asyncio.to_thread(engine.wait_promoted), (
+                "premise: the engine worker thread never flipped dry_run"
+            )
+            await pilot.pause()
             await pilot.pause()
             assert engine.dry_run is False, "premise: it is now LIVE"
 
