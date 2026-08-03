@@ -639,6 +639,48 @@ class TestTheSalvageKeepsItsPromise:
             "is readable by anyone on the box"
         )
 
+    def test_the_salvage_name_is_creatable_on_every_supported_platform(
+        self, temp_home: Path
+    ):
+        """A salvage that cannot be CREATED saves nothing.
+
+        `get_timestamp()` renders `2026-08-03T00:26:55Z`, and `:` is forbidden
+        in a Windows filename. Measured on CI (run 30774451162, job
+        test-windows): five tests died with `SwitchError: ... the salvage copy
+        failed ([Errno 22] Invalid argument:
+        '...\\.claude.json.unreadable-2026-08-03T00:25:49Z')`. The copy raised,
+        the guard re-raised, and the switch ABORTED — so on Windows this branch
+        turned "your config was replaced but a copy was kept" into "the switch
+        will not run at all", which is strictly worse than the bug it fixes.
+
+        Asserts the NAME, not that the copy succeeds: `:` is a perfectly good
+        filename character on Linux, so a behavioural test is green here and
+        red only on the platform nobody runs locally. The forbidden set is
+        Windows', a superset of POSIX's — a name legal there is legal
+        everywhere cswap runs.
+
+        The codebase already had two answers and neither was reused:
+        `credentials.py:1372`'s `.corrupt-{int(time.time())}` and
+        `session.py:145`'s `slugify_email`. This asserts the property both
+        satisfy, so a third format cannot be invented without a test noticing.
+        """
+        s = _linux_switcher()
+        self._seed_two(s)
+        cfg = self._torn(s)
+
+        s.switch_to("2", json_output=True)
+
+        salvage = [
+            q for q in cfg.parent.iterdir()
+            if q.name.startswith(f"{cfg.name}.unreadable-")
+        ]
+        assert len(salvage) == 1, "premise: a salvage was made"
+        bad = set(salvage[0].name) & set('<>:"/\\|?*')
+        assert not bad, (
+            f"salvage name {salvage[0].name!r} holds {sorted(bad)}, which "
+            "Windows refuses — the copy raises OSError and the switch aborts"
+        )
+
     def test_a_second_failure_does_not_overwrite_the_first_salvage(
         self, temp_home: Path
     ):
