@@ -4074,9 +4074,17 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     CLI, 0 -> 6 lines over 6 ticks. So those two record at DEBUG.
 
     `clear_wiring` is the exception and warns: `heal` reaches it only through
-    `_wiring_is_stale`, and it is the only place naming WHY a wiring could not
-    be removed. Dropping it to DEBUG with the other two is the round-13
-    overcorrection `TestTheSelfLimitingCallSiteStillWarns` exists to catch.
+    `_wiring_is_stale`, so it is gated rather than per-tick. Dropping it to
+    DEBUG with the other two is the round-13 overcorrection
+    `TestTheSelfLimitingCallSiteStillWarns` exists to catch.
+
+    IT IS NOT THE PLACE THAT NAMES WHY A WIRING COULD NOT BE REMOVED, though
+    four rounds of this docstring said so. That record is the lock WARNING at
+    the BOTTOM of `clear_wiring` (`TestTheLockFailureThatStrandsTheWiringIsNamed`),
+    added for exactly the shape this one cannot reach. This getter record's
+    job is the narrower one: a config that could not be LOCATED is missing
+    from `paths`, and `clear_wiring`'s bool only ever claimed to cover the
+    paths it REACHED.
     """
 
     def _no_home(self, monkeypatch):
@@ -4130,8 +4138,15 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # makes `funcName` the CALLER, which is the fact these tests are about.
     _PER_TICK_SITES = ("_wiring_present", "_wired_ports")
 
-    def _heal(self, tmp_path, monkeypatch, caplog, *, wired):
-        """One `heal` tick with an unresolvable `Path.home()`, wired or not."""
+    def _heal(self, tmp_path, monkeypatch, caplog, *, wired, removable=True):
+        """One `heal` tick with an unresolvable `Path.home()`, wired or not.
+
+        ``removable=False`` makes the config's DIRECTORY read-only, so
+        `proper_lockfile`'s `os.mkdir` cannot create the lock and the wiring
+        is stuck — the shape the bottom WARNING was added for. The config
+        itself stays readable, so the tick gets all the way to the lock
+        rather than failing earlier.
+        """
         import logging
         import types
 
@@ -4148,8 +4163,14 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
             backup_dir=tmp_path,
             _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
         )
-        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
-            pin.heal(sw)
+        if not removable:
+            cfg_dir.chmod(0o500)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+                pin.heal(sw)
+        finally:
+            if not removable:
+                cfg_dir.chmod(0o700)  # or tmp_path cleanup cannot remove it
         return caplog.records
 
     def test_the_per_tick_getters_stay_below_INFO(self, tmp_path, monkeypatch, caplog):
@@ -4199,8 +4220,9 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
             f"{[(r.funcName, r.levelname, r.getMessage()) for r in loud]}"
         )
 
-    def test_a_tick_with_work_warns_once_and_only_from_clear_wiring(
-        self, tmp_path, monkeypatch, caplog
+    @pytest.mark.parametrize("removable", [True, False])
+    def test_a_tick_with_work_warns_only_from_clear_wirings_own_two_sites(
+        self, removable, tmp_path, monkeypatch, caplog
     ):
         """The other direction, on the ordinary shape when `heal` has work.
 
@@ -4209,10 +4231,26 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         improvement — and the level-only assertion went red on this PR's own
         intended WARNING, which reads as "the WARNING is wrong" and invites
         the all-DEBUG regression back.
+
+        BOTH REMOVABILITIES, because the count is not the same on the two and
+        the version of this test that ran only the removable one asserted
+        something FALSE about the other. `clear_wiring` has two WARNING sites
+        now — the getter at the top and the lock at the bottom — and on an
+        unremovable wiring they BOTH fire on the same tick. Measured, one
+        tick, no HOME:
+
+            REMOVABLE     [('clear_wiring', 'WARNING')]
+            UNREMOVABLE   [('clear_wiring', 'WARNING'), ('clear_wiring', 'WARNING')]
+
+        so the old `== [("clear_wiring", WARNING)]` equality was False on the
+        second — passing only because the fixture made the removal succeed,
+        which is the shape where the stranding this PR is about cannot happen.
         """
         import logging
 
-        records = self._heal(tmp_path, monkeypatch, caplog, wired=True)
+        records = self._heal(
+            tmp_path, monkeypatch, caplog, wired=True, removable=removable
+        )
 
         # EVERY record at INFO+, not just the pin's own call sites: churn is
         # origin-agnostic, and any INFO+ line on `heal`'s path is paid 43200
@@ -4238,13 +4276,47 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # and survives the filter. Origin is the only axis that separates
         # them, which is why this asserts on `funcName`.
         #
-        # The ORDER the equality also pins is not load-bearing at one element;
-        # a second record fails the test either way and the message names it.
-        loud = [(r.funcName, r.levelno) for r in records if r.levelno >= logging.INFO]
-        assert loud == [("clear_wiring", logging.WARNING)], (
-            "a tick with work to do must warn exactly once, from the ONE call "
-            "site gated behind `_wiring_is_stale` — it is the only place "
-            f"naming WHY a wiring could not be removed. Got: {loud}"
+        # AND `funcName` ALONE IS NO LONGER ENOUGH. Both of `clear_wiring`'s
+        # WARNINGs are lexically inside it, so both report
+        # `funcName == "clear_wiring"` and an equality on that axis cannot
+        # tell the getter site from the lock site — it can only count them.
+        # The MESSAGE is what separates them, and it is the same text the user
+        # reads in the log, so a format change that made the two
+        # indistinguishable there fails here too. `lineno` would also separate
+        # these two, but it is the wrong axis for the same reason the comment
+        # above gives: every `_log_unresolvable` record shares one line, so
+        # `lineno` cannot tell the THREE getter call sites apart, and a key
+        # that works for one half of this assertion and not the other is the
+        # guard-that-passes-for-the-wrong-reason again.
+        #
+        # The ORDER the equality pins is deterministic: the getter record is
+        # emitted from the `paths` loop, the lock record from the loop below
+        # it, so on the unremovable shape it is always resolve-then-unwire.
+        loud = [
+            (
+                r.funcName,
+                "resolve"
+                if "could not be resolved" in r.getMessage()
+                else "unwire"
+                if "could not be unwired" in r.getMessage()
+                else "?",
+                r.levelno,
+            )
+            for r in records
+            if r.levelno >= logging.INFO
+        ]
+        # The getter WARNING fires on both shapes (this fixture's `Path.home()`
+        # raises either way). The lock WARNING is what the UNREMOVABLE shape
+        # adds — and it is the one that names why the wiring is still there.
+        expected = [("clear_wiring", "resolve", logging.WARNING)]
+        if not removable:
+            expected.append(("clear_wiring", "unwire", logging.WARNING))
+        assert loud == expected, (
+            "a tick with work to do must warn only from `clear_wiring`'s own "
+            "two sites, gated behind `_wiring_is_stale` — the getter one for "
+            "a config that could not be LOCATED, and (when the removal fails) "
+            "the lock one, which is what names WHY the wiring could not be "
+            f"removed. Expected: {expected}. Got: {loud}"
         )
 
 
@@ -4490,7 +4562,9 @@ class TestTheSelfLimitingCallSiteStillWarns:
         assert warned, (
             "clear_wiring logged below WARNING — this call site is gated "
             "behind _wiring_is_stale so it cannot churn, and it is the only "
-            "place that names WHY a wiring could not be removed"
+            "record that a config was never even LOCATED (the lock WARNING "
+            "below it covers the different case of one that was located and "
+            "could not be unwired)"
         )
 
 
@@ -4580,5 +4654,89 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
             "logged WHICH config or WHY — the exact silence the "
             "unresolvable-getter WARNING is kept for, on the one shape that "
             f"WARNING cannot reach. Records: "
+            f"{[(r.funcName, r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root): root removes the "
+        "stale lock dir regardless, so the takeover succeeds",
+    )
+    def test_a_permanently_orphaned_lock_is_named_at_warning_too(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The OTHER exception this `except` catches, and the worse one.
+
+        Routing `ClaudeCodeLockTimeout` to DEBUG is an appealing split —
+        transient contention (two `cswap run`s racing) is a Tuesday and logs
+        at the same level as a permanently unwritable config. It is wrong,
+        and this test is what makes it fail rather than merely look tidy: the
+        two are the SAME TYPE here. A live competitor raises
+        `ClaudeCodeLockTimeout`, and so does the shape below — an ORPHANED
+        lock dir (a holder killed -9) inside a config dir this process cannot
+        write. `proper_lockfile`'s stale-takeover path `rmdir`s the dead
+        holder's dir, and that `rmdir` needs write permission on the parent it
+        will never get, so this machine is stuck forever. Measured, 10 ticks:
+        10 lines, still wired, every tick identical.
+
+        So the split silences precisely the machine the WARNING exists for,
+        and keeps only `PermissionError` — the kind that least needs it, since
+        it names its own errno. What separates transient from permanent is not
+        the type but whether it CLEARS: measured, a 3s competitor costs 10
+        lines and the very next free tick unwires the config.
+        """
+        import logging
+        import time
+        import types
+
+        from claude_swap import pin
+
+        cfg = _cfg(tmp_path, "session", _dead_port())
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg.parent))
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+
+        # The orphan: a lock dir with nobody touching it, aged past
+        # `CONFIG_STALENESS_S` so the takeover path is the one exercised —
+        # and then made un-removable by the read-only parent.
+        lock = cfg.parent / (cfg.name + ".lock")
+        os.mkdir(lock)
+        os.utime(lock, (time.time() - 3600, time.time() - 3600))
+        cfg.parent.chmod(0o500)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+                changed, message = pin.heal(sw)
+        finally:
+            cfg.parent.chmod(0o700)  # or tmp_path cleanup cannot remove it
+
+        assert not changed and "could not be removed" in message, (
+            f"fixture did not reach the stranded shape: {(changed, message)}"
+        )
+
+        named = [
+            r
+            for r in caplog.records
+            if r.funcName == "clear_wiring" and r.levelno >= logging.WARNING
+        ]
+        # "Could not acquire" IS THE TYPE ASSERTION. That sentence is written
+        # at exactly one place in the codebase — the `raise
+        # ClaudeCodeLockTimeout` in `claude_locks.proper_lockfile` — so
+        # matching it proves this shape reaches the `except` as that type and
+        # not as the `PermissionError` the test above covers. Without it this
+        # test would silently duplicate that one, and the split it rules out
+        # would be reachable again with CI green.
+        assert any(
+            str(cfg) in r.getMessage() and "Could not acquire" in r.getMessage()
+            for r in named
+        ), (
+            "a permanently stuck wiring logged below WARNING — this is the "
+            "machine the record exists for, and `ClaudeCodeLockTimeout` is "
+            "the type it raises. Routing that type to DEBUG silences the "
+            "stuck case and keeps only the one that names its own errno. "
+            f"Records: "
             f"{[(r.funcName, r.levelname, r.getMessage()) for r in caplog.records]}"
         )

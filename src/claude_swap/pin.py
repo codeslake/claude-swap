@@ -61,8 +61,12 @@ def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> No
     raise silently) without paying for it every tick: the rotating handler does
     not record DEBUG by default, so the record is there for anyone who turns
     the level up and costs nothing when nobody has. `clear_wiring` overrides to
-    WARNING because it is gated (see its call site) and is the only place that
-    names WHY a wiring could not be removed.
+    WARNING because it is gated (see its call site), and because a config that
+    could not be LOCATED is the one fact its return value cannot carry: the
+    bool is a claim about every path it REACHED. Naming why a wiring could not
+    be REMOVED is a different record — the lock WARNING at the bottom of
+    `clear_wiring`, which is the site that fires on the stuck shape this one
+    cannot reach.
     """
     # `stacklevel=2` ATTRIBUTES THE RECORD TO THE CALLER. Without it all three
     # call sites' records are identical in origin — same `funcName`, same
@@ -287,11 +291,28 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         # the default 2s: a black-holed port must not turn a launch-path guard
         # into the stall it was written to avoid.
         #
-        # `clear_wiring`'s WARNING is self-limiting HERE only in the same
-        # sense it is inside `heal` (see its call site) — the gate goes false
-        # when the removal succeeds, not otherwise — so an unremovable wiring
-        # logs a line per LAUNCH too (measured: 6 launches, 6 lines; 0 with
-        # nothing wired). At human cadence that is negligible, which is why
+        # `clear_wiring`'s WARNINGs — there are TWO of them, the getter one at
+        # the top and the lock one at the bottom — are self-limiting HERE only
+        # in the same sense they are inside `heal` (see those call sites): the
+        # gate goes false when the removal succeeds, not otherwise. So an
+        # unremovable wiring logs per LAUNCH, and on the shape where both fire
+        # it logs TWICE per launch. Measured, 6 launches through this branch,
+        # counting only what the INFO-level logger actually writes:
+        #
+        #                                       259f598      HEAD
+        #   no HOME, unremovable (ro dir)      6 lines     12 lines  {getter 6, lock 6}
+        #   no HOME, REMOVABLE                 1 line       1 line
+        #   nothing wired                      0 lines      0 lines
+        #   HOME fine, ro dir, wired           0 lines      6 lines  {lock 6}
+        #
+        # THE BOTTOM ROW IS THE FIX WORKING, not a regression. That shape — a
+        # config dir this process cannot write, HOME perfectly resolvable — is
+        # the flagship stranding, and before the lock WARNING existed it went
+        # to the user's screen on every launch with ZERO records at any level
+        # naming which config or why. The getter WARNING cannot cover it: on
+        # this shape nothing raises and it never fires (row 4, left column).
+        #
+        # At human cadence six launches is negligible either way, which is why
         # the churn arithmetic lives at the statusline call site and not here.
         try:
             if _wiring_is_stale(switcher, connect_timeout=_LAUNCH_PROBE_S):
@@ -516,21 +537,54 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             #   stale, removed on tick 1            0 lines,  unwired
             #   stale, unremovable (read-only dir) 10 lines,  still wired
             #
-            # A line is 97 B plus the config path twice (it appears once bare
-            # and once inside the lock path), so the cost is the user's own
-            # path length: 147 B for `/home/j.lee8/.claude.json` — 6.06
-            # MiB/day at 43200 ticks. The number that matters to someone
-            # reading the log is the ACTIVE file, `maxBytes=1024*1024`
-            # (`logging_config.py:47`): that wraps every 4.0 h, so a `tail`
-            # four hours late shows none of it. The 4 MiB across all
-            # `backupCount=3` rotations lasts 15.9 h.
+            # A LINE'S SIZE DEPENDS ON WHICH EXCEPTION THIS CAUGHT, and there
+            # are two reachable kinds. `%s` renders the path once bare, and
+            # then whatever the exception's own message carries. Measured
+            # through the real formatter, then scaled to
+            # `/home/j.lee8/.claude.json` (25 chars):
             #
-            # KEPT ANYWAY, at WARNING, and this is the site the "a silent log
-            # is the worse failure" argument was always about: it fires only
-            # on a machine where a wiring is genuinely stuck, it is the only
-            # record naming which config and which errno, and every one of
-            # those ticks is already printing an unexplained failure to the
+            #                          path appears   per line    active file
+            #   PermissionError          2x           147 B       wraps 3.96 h
+            #   ClaudeCodeLockTimeout    1x           198 B       wraps 2.94 h
+            #
+            # `PermissionError` renders the LOCK path (the config path plus
+            # `.lock`), so the config path appears twice and the old
+            # `97 B + 2*len(path)` model is exact for it. `ClaudeCodeLockTimeout`
+            # names only `lock_dir.name`, so the path appears ONCE — but its
+            # fixed sentence ("Could not acquire … Claude Code appears to be
+            # refreshing credentials. Retry in a few seconds.") is longer than
+            # the path it drops, and the model UNDERCOUNTS it by 32 B. At
+            # 43200 ticks: 6.06 MiB/day and 8.16 MiB/day respectively, against
+            # `maxBytes=1024*1024` (`logging_config.py:47`), so a `tail` three
+            # hours late shows none of it; the 4 MiB across all
+            # `backupCount=3` rotations lasts 15.9 h / 11.8 h.
+            #
+            # THE WORST CASE IS THE TIMEOUT, and it is also the one that never
+            # stops. An ORPHANED lock dir (a holder killed -9) inside a config
+            # dir this process cannot write is permanent: the takeover path
+            # `rmdir`s the stale dir, that `rmdir` needs write permission on
+            # the parent, and it never gets it. Measured, 10 ticks: 10 lines,
+            # still wired, every tick identical.
+            #
+            # KEPT AT WARNING, BOTH KINDS, and this is the site the "a silent
+            # log is the worse failure" argument was always about: it is the
+            # only record naming which config and which cause, and every one
+            # of those ticks is already printing an unexplained failure to the
             # user's status line.
+            #
+            # SPLITTING `ClaudeCodeLockTimeout` DOWN TO DEBUG WAS PROPOSED AND
+            # MEASURED WRONG. It reads as "transient contention is a Tuesday,
+            # a stuck machine is the emergency" — but the two are the SAME
+            # TYPE here. Measured: a live competitor holding the lock raises
+            # `ClaudeCodeLockTimeout`, and so does the permanently-orphaned
+            # lock dir above. The split would silence exactly the machine this
+            # WARNING exists for and keep only `PermissionError`, which is the
+            # kind that does NOT need help — it names its own errno. What
+            # separates transient from permanent is not the type but whether
+            # it clears: measured, a 3s competitor costs 10 lines and the very
+            # next free tick unwires the config, while the orphan case is on
+            # line 10 with nothing changed.
+
             _logger.warning("%s could not be unwired: %s", path, exc)
             continue
     return changed
