@@ -845,20 +845,21 @@ class TestAdaptiveScheduler:
 
         for ask in (601.0, 3600.0, 4500.0, 10_000.0):
             other = _failure_backoff_s(1, ask, rate_limited=False)
-            assert other <= TRUST_MAX_AGE_S, (
-                f"non-429 ask={ask:.0f} backs off {other:.0f}s while its "
-                f"last_good stays trusted only {TRUST_MAX_AGE_S:.0f}s — "
-                f"{other - TRUST_MAX_AGE_S:.0f}s un-pollable AND unknown"
+            # `== min(ask, TRUST)`, not `<= TRUST`. The inequality was
+            # decorative: `computed` at failures=1 is BACKOFF_BASE_S = 30 and
+            # floors every result, so `other > TRUST_MAX_AGE_S` needs
+            # TRUST_MAX_AGE_S < 30 — the real value is 3600, 120x the firing
+            # threshold. The equality pins the clamp that is actually there.
+            assert other == min(ask, TRUST_MAX_AGE_S), (
+                f"non-429 ask={ask:.0f} backs off {other:.0f}s, not the "
+                f"{min(ask, TRUST_MAX_AGE_S):.0f}s its last_good stays "
+                "trusted for — un-pollable AND unknown for the difference"
             )
             # NOT `rl <= RATE_LIMIT_TRUST_MAX_AGE_S`. That was here, and it is
             # true for every possible input: the 429 path is already bounded by
             # RETRY_AFTER_FLOOR_CAP_S = 4500 and the ceiling it compared against
             # is 7200, so it could not fail even with the cap raised to 7199 —
-            # which would make the blind window 3599s worse. It also names the
-            # wrong bound: 7200 is only the FALLBACK for rows carrying no
-            # resets_at. When one is present, and it usually is, the real bound
-            # is min(earliest reset, ceiling), which
-            # `test_a_429_wait_never_outlasts_the_rows_own_reset` asserts.
+            # which would make the blind window 3599s worse.
             #
             # `assert rl <= RETRY_AFTER_FLOOR_CAP_S` USED TO SIT HERE and is
             # gone: isolated it is true for every input. `rl = max(min(ask +
@@ -874,105 +875,83 @@ class TestAdaptiveScheduler:
             "the hour-scale 429 margin was lost"
         )
 
-    def test_a_429_wait_never_outlasts_the_rows_own_reset(self, temp_home):
-        """A 429 wait that runs past the row's OWN reset is blind for nothing.
+    def test_shortening_a_429_wait_cannot_move_when_the_row_goes_unknown(
+        self, temp_home
+    ):
+        """Un-pollable and unknown are independent axes, and this is why.
 
-        `RATE_LIMIT_TRUST_MAX_AGE_S = 7200` is only the FALLBACK ceiling, for
-        rows carrying no `resets_at`. When one is present — the normal case —
-        the real trust bound is `min(earliest reset, ceiling)`. The wait was
-        computed from `now` and the ask alone, so nothing compared it against
-        that reset, and every reset landing inside the wait opened a window
-        where the row can neither be re-polled (still in backoff) nor used
-        (`decision_value()` is None). The unhealthy-tick counter reads that
-        blindness as a failing account and fails over from a healthy one.
+        A previous round clipped the 429 wait to `min(earliest reset, fetchedAt
+        + ceiling) - now`, reading the row's remaining trust as a second
+        deadline the wait had to respect. The reasoning was that a wait running
+        past that instant leaves the row un-pollable AND unknown, which the
+        unhealthy-tick counter converts into a failover.
 
-        Measured on the pre-fix form, ask 3600 (wait 4500):
+        The blind window is real. Shortening the wait does not touch it.
+        `entries()` decides trust from `lastGood`/`fetchedAt`, and `record()`
+        writes both in the SUCCESS branch only — a 429 refreshes neither. So
+        the instant the row goes unknown is fixed by the last SUCCESSFUL fetch,
+        and no choice of backoff can move it by one second. A shorter wait only
+        samples that same instant more often, at one request each.
 
-            reset in 1800 -> blind 2700s      reset in 3900 -> blind  600s
-            reset in 3000 -> blind 1500s      reset in 4400 -> blind  100s
-            reset in 3600 -> blind  900s      reset in 5000 -> blind    0
-
-        and against upstream's cap-3600-no-margin form at the same asks, the
-        margin adds exactly 900s of blindness everywhere it is not already
-        zero — with `reset in (3600, 4500)` a band upstream never blinds in at
-        all. That band is the last quarter-hour of a 5h window, so it is hit
-        about once per window per machine.
-
-        WAITING PAST OUR OWN RESET BUYS NOTHING. The `NO TRUST TRIM` argument
-        above is about the SERVER's deadline, where landing early re-blocks for
-        a fresh hour. This is our own window rolling over, after which the
-        stored snapshot is worthless whatever we do — so the only thing the
-        extra wait can produce is the blind window.
-
-        Drives `record()` rather than `_failure_backoff_s` directly: the bound
-        needs `lastGood` and `fetchedAt`, which only the row has, and a direct
-        call cannot show that they reach the computation.
+        Asserted by driving two histories that differ ONLY in how long they
+        waited, and reading the moment trust actually lapses in each. It is the
+        regression guard for the clip: any re-added trim makes the two diverge
+        and this fails.
         """
         from datetime import datetime, timezone
 
         from claude_swap.usage_store import FetchRecord
 
-        def _at(seconds):
+        def _at(base, seconds):
             return (
-                datetime.fromtimestamp(h.clock.now + seconds, tz=timezone.utc)
+                datetime.fromtimestamp(base + seconds, tz=timezone.utc)
                 .isoformat()
                 .replace("+00:00", "Z")
             )
 
-        h = EngineHarness(temp_home)
-        h.seed(1, "a@example.com")
-        store = h.switcher._usage_store
-        ids = {"1": ("a@example.com", "")}
-        now = h.clock.now
+        def trust_lapses_at(home, waits):
+            """When `decision_value()` first goes None, given a 429 cadence."""
+            h = EngineHarness(home)
+            h.seed(1, "a@example.com")
+            store = h.switcher._usage_store
+            ids = {"1": ("a@example.com", "")}
+            t0 = h.clock.now
+            store.record({"1": FetchRecord(usage=_usage(50, _at(t0, 1800)))}, ids)
+            for w in waits:
+                store.record(
+                    {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ids
+                )
+                h.clock.advance(w)
+                if store.entries(ids)["1"].decision_value() is None:
+                    return h.clock.now - t0
+            return None
 
-        for reset_in in (1800.0, 3000.0, 3600.0, 3900.0, 4400.0):
-            store.record(
-                {"1": FetchRecord(usage=_usage(50, _at(reset_in)))}, ids
-            )
-            store.record(
-                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ids
-            )
-            entry = store.entries(ids)["1"]
-            wait = (entry.backoff_until or 0.0) - now
-            assert wait <= reset_in, (
-                f"reset in {reset_in:.0f}s but the 429 backs off {wait:.0f}s — "
-                f"{wait - reset_in:.0f}s in which the row cannot be re-polled "
-                "and its last_good is already stale"
-            )
-
-    def test_a_re_block_chain_does_not_march_past_its_own_trust(self, temp_home):
-        """`fetchedAt` never advances on failure, so the chain compounds.
-
-        `record()` writes `fetchedAt` only in the success branch, while every
-        wait was recomputed from `now` at full length. So each honored block
-        aged the row by the whole wait and shortened nothing, and the release
-        times marched past the trust ceiling and never came back. Measured on
-        the pre-fix form, four consecutive `Retry-After: 3600` 429s each waited
-        out in full, trust ending at 7200:
-
-            block 0  release  4500  blind     0
-            block 1  release  9000  blind  1800
-            block 2  release 13500  blind  6300
-            block 3  release 18000  blind 10800
-
-        — 900s more per block than upstream's, which is the margin compounding.
-
-        Reading `trust_left_s` off `fetchedAt` is what converges it: the anchor
-        does not move, so the remaining trust shrinks as the chain runs and
-        each wait is clipped to what is actually left.
-
-        The residue this asserts is the ANTI-HAMMER FLOOR, not the defect. Once
-        trust is spent, `max(..., computed)` still holds the retry off for the
-        exponential-backoff interval — 120s at three failures, 240s at four,
-        which is exactly the 120/360 seen here. Asserting a small multiple of
-        that rather than zero, because zero would demand hammering a row whose
-        server just asked for an hour.
-        """
-        from claude_swap.usage_store import (
-            RATE_LIMIT_TRUST_MAX_AGE_S,
-            FetchRecord,
-            _failure_backoff_s,
+        # 60 short polls and 2 long ones cover the same 3600s horizon.
+        hammered = trust_lapses_at(temp_home / "short", [60.0] * 60)
+        honored = trust_lapses_at(temp_home / "long", [1800.0, 1800.0])
+        assert hammered == honored == 1800.0, (
+            f"the row went unknown at +{hammered}s when hammered and "
+            f"+{honored}s when the wait was honored — the backoff moved a "
+            "deadline that belongs to the last successful fetch"
         )
+
+    def test_a_re_block_chain_spends_one_request_per_block(self, temp_home):
+        """A chain of blocks costs one request each, however long it runs.
+
+        This test used to assert `waited <= max(trust_left, floor)`, pinning a
+        clip that shortened each wait to the row's remaining trust. That bound
+        is satisfied by a wait of ZERO, and once the trust was spent the
+        `max(..., computed)` floor supplied one — turning each further block
+        into a burst of exponential-curve retries. What it called the
+        anti-hammer floor doing its job was the ask being discarded.
+
+        The budget is what a re-block chain actually threatens.
+        `poll_policy` measured ~28-30 requests per trailing hour, per ACCOUNT,
+        shared across every machine holding it. So the invariant is a request
+        count, not an interval: each block costs exactly one poll, and four
+        consecutive hour-long blocks cost four.
+        """
+        from claude_swap.usage_store import FetchRecord
 
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -981,27 +960,22 @@ class TestAdaptiveScheduler:
         t0 = h.clock.now
 
         store.record({"1": FetchRecord(usage=_usage(50))}, ids)
-        trust_ends = t0 + RATE_LIMIT_TRUST_MAX_AGE_S
 
-        for blk in range(4):
+        polls = 0
+        for _ in range(4):
+            # One block: poll, get 429, honor the wait it hands back.
+            polls += 1
             store.record(
                 {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ids
             )
-            before = h.clock.now
-            release = store.entries(ids)["1"].backoff_until or 0.0
-            waited = release - before
-            floor = _failure_backoff_s(blk + 1, None)
-            # Each wait, not the cumulative release: once trust is spent every
-            # further block adds its own floor, so the total drifts past
-            # `trust_ends` by design. What must hold is that no SINGLE wait
-            # runs past what the row still has, floor aside.
-            assert waited <= max(trust_ends - before, floor), (
-                f"block {blk}: waited {waited:.0f}s from +{before - t0:.0f} "
-                f"with trust ending at +{trust_ends - t0:.0f} — "
-                f"{waited - max(trust_ends - before, floor):.0f}s past both the "
-                "trust it relies on and the anti-hammer floor"
-            )
-            h.clock.now = release
+            h.clock.now = store.entries(ids)["1"].backoff_until or 0.0
+
+        elapsed = h.clock.now - t0
+        assert polls == 4, f"{polls} requests for 4 blocks"
+        assert elapsed >= 4 * 3600.0, (
+            f"4 blocks of 3600s each elapsed only {elapsed:.0f}s — a wait was "
+            "cut short of the deadline the server actually gave"
+        )
 
     def test_the_margin_is_not_traded_away_for_a_dead_scoped_window(self, temp_home):
         """A scoped window that already ended the trust does not shorten the wait.
@@ -1035,6 +1009,81 @@ class TestAdaptiveScheduler:
         assert waited == 4500.0, (
             f"waited {waited:.0f}s — the wait is the server's deadline plus "
             "the margin, and a dead scoped window does not buy it back"
+        )
+
+    def test_an_expired_trust_does_not_turn_one_block_into_a_request_storm(
+        self, temp_home
+    ):
+        """Spent trust is not a licence to retry; the server's ask still governs.
+
+        The sibling tests all assert `waited <= trust_left`, which is the
+        direction that produced the defect: they are satisfied by a wait of
+        ZERO. Once the clip drove the wait below `computed`, the
+        `max(..., computed)` floor took over and returned the exponential
+        curve — capped at `BACKOFF_CAP_S = 600` — so a live 3600s
+        `Retry-After` became a 30s wait and the row re-polled through its own
+        block. Measured on the pre-fix form, a genuine 3600s block with the
+        5h window resetting 1800s in:
+
+            req       t  Retry-After  trust_left    wait
+              1       0         3600        1800    1800
+              2    1800         1800           0      60
+              3    1860         1740           0     120
+              4    1980         1620           0     240
+              5    2220         1380           0     480
+              6    2700          900           0     600
+              7    3300          300           0     600
+
+        Seven requests inside one block, against a ~28-30/hour budget SHARED
+        by every machine on the account, and the last retry lands at
+        deadline+300s — inside the +2..716s band `RETRY_AFTER_MARGIN_S` exists
+        to clear. Upstream spends two.
+
+        Every retry from #2 on is also un-pollable AND unknown, the exact state
+        the clip was added to prevent: `record()` writes `lastGood`/`fetchedAt`
+        in the SUCCESS branch only, so a 429 refreshes nothing and the row
+        stays unknown however often it is polled.
+
+        Asserts the request count and the landing offset, not `waited <=
+        trust_left` — a bound satisfied by retrying immediately cannot catch
+        this.
+        """
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
+
+        block_s = 3600.0
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 1800)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 400000)},
+        })}, ident)
+
+        requests = 0
+        while h.clock.now - t0 < block_s and requests < 40:
+            requests += 1
+            # Retry-After counts down to a FIXED deadline: 37 of 39 measured
+            # blocks opened at exactly 3600 and every machine in an episode
+            # reported the same one.
+            remaining = block_s - (h.clock.now - t0)
+            st.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=remaining)},
+                ident,
+            )
+            h.clock.now = st.entries(ident, models=("Fable",))["1"].backoff_until
+
+        landed = h.clock.now - t0
+        assert requests <= 2, (
+            f"{requests} requests inside one {block_s:.0f}s block — upstream "
+            "spends 2, and the usage endpoint's ~28-30/hour budget is shared "
+            "across every machine on this account"
+        )
+        assert landed >= block_s + RETRY_AFTER_MARGIN_S, (
+            f"the last retry lands at deadline+{landed - block_s:.0f}s, inside "
+            f"the +2..{RETRY_AFTER_MARGIN_S:.0f}s band where 10 of 19 measured "
+            "lapses re-blocked for a fresh hour"
         )
 
     def test_the_trim_never_lands_inside_the_re_block_band(self, temp_home):
@@ -1083,34 +1132,24 @@ class TestAdaptiveScheduler:
                 f"margin — inside the measured re-block band"
             )
 
-    def test_a_re_block_chain_keeps_its_waits_while_the_trust_lasts(
-        self, temp_home
-    ):
-        """Every block waits deadline + margin FOR AS LONG AS THE ROW CAN.
+    def test_a_re_block_chain_does_not_shorten_its_own_waits(self, temp_home):
+        """Every block waits deadline + margin, however deep into the chain.
 
-        This test used to assert `waited == 4500.0` at every block, on the
-        reasoning that shortening a later wait lands on the server's deadline
-        and costs a fresh hour. That reasoning is right about the SERVER's
-        deadline and wrong about ours, and the distinction is the whole fix:
-        `fetchedAt` does not advance on failure, so the row's own trust really
-        does shrink with each honored wait, and waiting past what is left buys
-        no data — only a window that is un-pollable AND unknown.
+        A previous round rewrote this to `max(min(4500, trust_left), floor)`,
+        on the reasoning that the row's own trust shrinks as the chain runs and
+        a wait past it buys no data. The shrinking is real; acting on it is
+        what was wrong. The stored trust is not a second deadline the wait must
+        respect — see
+        `test_shortening_a_429_wait_cannot_move_when_the_row_goes_unknown` —
+        and clipping to it only drops later waits onto (or short of) the
+        server's deadline, which is the 10-of-19 re-block band this PR exists
+        to clear.
 
-        So the invariant is no longer a constant. While the trust outlasts the
-        wait, the margin is untouched; once it does not, the wait is what is
-        left. The five-hour window here resets at +16000, well past the chain,
-        so the binding bound is the `fetchedAt + RATE_LIMIT_TRUST_MAX_AGE_S`
-        ceiling at +7200.
-
-        Measured on this tree: 4500 / 2700 / 120 / 240 — full margin, then the
-        remainder of the trust, then the anti-hammer floor, which is `computed`
-        at three and four failures exactly.
+        So the invariant is a constant again. The five-hour window here resets
+        at +16000 and the ceiling would bind at +7200, both well inside the
+        chain: a wait that honors neither is the point.
         """
-        from claude_swap.usage_store import (
-            RATE_LIMIT_TRUST_MAX_AGE_S,
-            FetchRecord,
-            _failure_backoff_s,
-        )
+        from claude_swap.usage_store import FetchRecord
 
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -1121,27 +1160,18 @@ class TestAdaptiveScheduler:
             "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 16000)},
             "seven_day": {"pct": 0.0},
         })}, ident)
-        trust_ends = t0 + RATE_LIMIT_TRUST_MAX_AGE_S
 
         for block in range(4):
             st.record(
                 {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
             )
-            e = st.entries(ident)["1"]
-            waited = e.backoff_until - h.clock.now
-            left = trust_ends - h.clock.now
-            floor = _failure_backoff_s(block + 1, None)
-            expected = max(min(4500.0, left), floor)
-            assert waited == expected, (
-                f"block {block}: waited {waited:.0f}s with {left:.0f}s of "
-                f"trust left and a {floor:.0f}s floor — expected "
-                f"{expected:.0f}s"
+            waited = st.entries(ident)["1"].backoff_until - h.clock.now
+            assert waited == 4500.0, (
+                f"block {block}: waited {waited:.0f}s, not the server's "
+                "3600s deadline plus the 900s margin — a later block traded "
+                "the margin away for trust it cannot salvage"
             )
             h.clock.advance(waited)
-
-        # The first block is untouched: that is the margin this PR exists for,
-        # and a chain must not cost it.
-        assert st.entries(ident)["1"].backoff_until is not None
 
     def test_a_non_429_recorded_through_record_does_not_take_the_margin(
         self, temp_home

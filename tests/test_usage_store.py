@@ -474,24 +474,26 @@ class TestBackoff:
 
         `RETRY_AFTER_FLOOR_CAP_S`'s own comment justifies the 429-only margin
         with "a 4500s wait sits comfortably inside its own trust"
-        (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured, the
-        suite admits `[4500, 50900]` — 4499 fails 8 tests, 50900 passes, and
-        the upper edge comes from `test_retry_after_floor_is_capped` asserting
-        `_failure_backoff_s(1, 50000) == cap`.
+        (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured on
+        this tree by mutating the constant and running the full suite, the
+        inequality below admits `[4500, 7200]` — 4499 fails 9, 7201 fails 1.
 
-        Blind windows through `record()` at the admitted extremes:
+        That leaves 2700s of slack in which the constant can drift silently, so
+        the arithmetic identity its comment states ("37 of 39 observed blocks
+        opened at exactly 3600, and 3600 + 900 = this") is pinned outright
+        below. The inequality stays as the invariant that explains WHY the
+        margin is 429-only.
 
-            cap     ask     reset   wait    trust ends   blind
-            4500    3600    +3600   4500    3600           900
-            7199    7000    +3600   7199    3600          3599
-            50900   86400   none    50900   7200         43700
-
-        At the top a single header parks a row 43700s past even the fallback
-        ceiling — un-pollable AND unknown, the state
-        `test_backoff_never_outlasts_the_trust_it_relies_on` exists to prevent
-        on the other path. The same bound neutralises `Retry-After: inf`,
-        which reaches `min(inf + 900, cap)` and is finite only because of it.
+        The same bound neutralises `Retry-After: inf`, which reaches
+        `min(inf + 900, cap)` and is finite only because of it.
         """
+        assert usage_store.RETRY_AFTER_FLOOR_CAP_S == (
+            3600.0 + usage_store.RETRY_AFTER_MARGIN_S
+        ), (
+            f"cap {usage_store.RETRY_AFTER_FLOOR_CAP_S} is no longer the "
+            "measured block (3600s) plus the margin — the inequality below "
+            "admits up to 7200, so nothing else would catch the drift"
+        )
         assert (
             usage_store.RETRY_AFTER_FLOOR_CAP_S
             <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S
