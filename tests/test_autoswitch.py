@@ -3965,6 +3965,54 @@ class TestHorizonAxisDoesNotFlap:
             "one proactive move disabled proactive switching permanently."
         )
 
+    def test_an_ordinary_departure_does_not_stall_on_a_weekly_bound_peer(
+        self, temp_home
+    ):
+        """I3: the anti-flap snapshot stalls ORDINARY departures too, not
+        just failover, whenever the barred peer is weekly-bound.
+
+        Same root as C1 (a release keyed away from the ACTIVE), reached
+        without any failover: an ordinary consume-first departure records
+        `leftHeadroom`/`leftRecoveryAt`, and `_left_account_recovered`'s
+        headroom leg (`h >= left_headroom + SPENT_HEADROOM_PCT`) can only
+        rise when the barred peer's OWN headroom improves. A peer whose
+        headroom is pinned by 7-day utilization (5-hour rollovers do not
+        raise it) never improves, and its `resets_at` is a fixed absolute
+        that never creeps nearer, so the recovery leg cannot fire either —
+        both legs are permanently unsatisfiable even though the peer is
+        already 35x better than the active.
+
+        Peer 1's reset (20 days out) stays sooner than active account 2's
+        (400 days out) throughout, so the ordinary consume-first
+        reset-ordering gate does not exclude it either; only the anti-flap
+        snapshot does.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage7(30, 30, self._days_out(h, 20)),   # 70 pts, resets in 20d
+            "2": _usage7(50, 50, self._days_out(h, 10)),   # 50 pts, resets SOONER
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(301.0)
+
+        outcomes = []
+        for active_pct in (50, 80, 90, 95, 98, 99.5, 100):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage7(30, 30, self._days_out(h, 20)),   # frozen, 70 pts
+                "2": _usage7(active_pct, active_pct, self._days_out(h, 400)),
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED in outcomes[:-1], (
+            f"{[o.name for o in outcomes]} — peer 1 held 70 points the whole "
+            "time, far ahead of the active, and the engine only returned "
+            "once the active hit a hard 100%"
+        )
+
     def test_a_filtered_candidate_does_not_forge_an_all_exhausted_claim(
         self, temp_home
     ):
@@ -4703,14 +4751,14 @@ class TestHorizonAxisDoesNotFlap:
         state = {"lastSwitchFrom": "2"}  # pre-upgrade: keys genuinely absent
 
         assert harness.engine._left_account_recovered(
-            state, {"2": _usage(96)}, {"2": 4.0}, harness.clock()
+            state, {"2": _usage(96)}, {"2": 4.0}, 2.0, harness.clock()
         ) is True, (
             "a pre-upgrade record (no snapshot) must release even when the "
             "barred account is currently poor (4 pts) — absence of evidence "
             "is not the same state as a measured-unmeasurable failover"
         )
         assert harness.engine._left_account_recovered(
-            state, {"2": None}, {"2": None}, harness.clock()
+            state, {"2": None}, {"2": None}, 2.0, harness.clock()
         ) is True, (
             "a pre-upgrade record (no snapshot) must release even when the "
             "barred account is currently unreadable — absence of evidence "
@@ -4875,6 +4923,60 @@ class TestHorizonAxisDoesNotFlap:
             "below the threshold. The engine stayed put: a permanent "
             "proactive lockout, not the bounded hold this predicate should "
             "produce."
+        )
+
+    def test_a_failover_departure_releases_a_healthy_but_not_near_full_peer(
+        self, temp_home
+    ):
+        """`(None, None)` must release a HEALTHY peer, not just a near-full one.
+
+        `test_a_failover_departure_releases_once_the_peer_is_readable_again`
+        only proves the bar is not PERMANENT — it drives the peer to a full
+        100.0, which also clears the (unfixed) absolute `>= 97.0` floor. That
+        floor makes any peer that has spent more than 3% of its weekly window
+        unreachable: a peer sitting on a perfectly healthy 70 points, with the
+        active burnt down to 2, is held exactly as hard as one on 4 points —
+        the two states this predicate exists to tell apart collapse onto the
+        same answer. C1.
+
+        Reached with a real failover, same setup as the sibling tests, then
+        the peer comes back READABLE at 70 points (well under the 97 floor,
+        well over the 4-point flap the bar must still catch) while the active
+        burns to 2.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = None
+        for _ in range(3):  # unhealthy_ticks default is 3
+            outcome = h.tick_with_usage({
+                "1": None,                              # unreadable -> failover
+                "2": _usage(4, self._days_out(h, 400)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.engine._read_state()
+        assert state.get("leftHeadroom") is None and state.get(
+            "leftRecoveryAt"
+        ) is None, "premise: a failover snapshot, keys present, values null"
+
+        h.clock.advance(301.0)
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(30, self._days_out(h, 10)),   # READABLE, 70 pts
+                "2": _usage(98, self._days_out(h, 400)),  # active burnt to 2 pts
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} — peer 1 is READABLE at 70 points, "
+            "35x the active's 2 points, and the engine never returned. The "
+            "release floor is absolute (h >= 97), so any peer past 3% of its "
+            "weekly window is held until the active hits its own limit."
         )
 
     def test_a_failover_hold_still_escapes_at_limit(self, temp_home):

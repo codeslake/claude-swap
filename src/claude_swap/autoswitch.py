@@ -1108,7 +1108,7 @@ class AutoSwitchEngine:
             # ranking had already thrown away — `left=20 active=30` bars,
             # `left=90 active=10` releases, and phase 2 is where that flips.
             recovered = self._left_account_recovered(
-                state, kw["usage"], kw["headroom"], kw["now"]
+                state, kw["usage"], kw["headroom"], kw["active_headroom"], kw["now"]
             )
             no_return = self._no_return_account(
                 trigger, state, kw["headroom"], kw["active_headroom"], recovered
@@ -1398,6 +1398,7 @@ class AutoSwitchEngine:
         state: dict,
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
+        active_headroom: float | None,
         now: float,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
@@ -1415,17 +1416,27 @@ class AutoSwitchEngine:
         active had changed. That is the flap: the ranking flipped underneath a
         target that did nothing.
 
-        Two axes, matching the ranking's two, each with the margin that axis
-        already uses:
+        Three legs, checked in this order, each with the margin its axis
+        already uses. Burn cannot manufacture any of them: headroom rises
+        only when a window rolls over, the ratio needs the active to lose
+        HALF its remaining headroom, and the binding reset moves nearer only
+        when a nearer window starts binding.
 
-          headroom   `+SPENT_HEADROOM_PCT` — below that an edge is under two
-                     poll intervals, the same reason the spent band exists.
-          recovery   `-RECOVERY_HYSTERESIS_S` — the same margin the recovery
-                     axis ranks by one gate later.
-
-        Burn cannot manufacture either: headroom rises only when a window rolls
-        over, and the binding reset moves nearer only when a nearer window
-        starts binding.
+          dominance   `> active x HORIZON_HEADROOM_RATIO` against the
+                      ACTIVE, checked first and needing no departure
+                      baseline. A peer moved AWAY from for a reason other
+                      than headroom (e.g. consume-first's reset ordering)
+                      can dominate the active from the moment it was left,
+                      and self-improvement against its own departure
+                      baseline never fires for an account that had nothing
+                      to improve on. Same ratio `_no_return_account` and
+                      the ranking's headroom axis (`:1626`) already use.
+          headroom    `+SPENT_HEADROOM_PCT` against the DEPARTURE baseline
+                      — below that an edge is under two poll intervals, the
+                      same reason the spent band exists.
+          recovery    `-RECOVERY_HYSTERESIS_S` against the DEPARTURE
+                      baseline — the same margin the recovery axis ranks by
+                      one gate later.
 
         NO SNAPSHOT MEANS RELEASE. State written before this field existed, or
         by a switch that never recorded one, carries no evidence either way —
@@ -1439,18 +1450,21 @@ class AutoSwitchEngine:
         the key is PRESENT with unknown values, which is real evidence that
         the departure's severity could not be measured, not an absence of
         evidence. `(None, None)` conflates two different peer states, though:
-        "still unmeasurable" (hold) and "measurable again, at/near full" (a
-        real change of state -- release). There is no recorded baseline for
-        either axis to diff against, so the only trustworthy signal is
-        whether the peer is now READABLE and close to full: `h >= 100 -
-        SPENT_HEADROOM_PCT`, the same margin the headroom leg below uses,
-        applied against the 100 cap instead of a stored `left_headroom`. A
-        peer that is readable but still poor (the flap 0b369e0 fixed) does
-        not clear that bar and the hold stands. This only gates the
-        proactive/consume-first return; `_no_return_account` scopes at-limit
-        and failover out of the bar by design, so either trigger still
-        escapes the account untouched, and the next successful switch
-        overwrites the snapshot outright.
+        "still unmeasurable" (hold) and "measurable again, dominant" (a real
+        change of state -- release). There is no recorded baseline for either
+        headroom-vs-departure or recovery-vs-departure to diff against, so
+        beyond the dominance leg above the only trustworthy signal left is
+        whether the peer is still unmeasurable or not yet good enough:
+        neither is release. In particular the headroom leg CANNOT fall back
+        to an absolute floor on the peer alone here — `account_headroom` is
+        `100 - max(pct)`, so any peer that has spent more than
+        `SPENT_HEADROOM_PCT` of its weekly window could never clear a fixed
+        `100 - SPENT_HEADROOM_PCT` bar, no matter how far ahead of the
+        ACTIVE it is; that is exactly the failure the dominance leg exists to
+        catch instead. This only gates the proactive/consume-first return;
+        `_no_return_account` scopes at-limit and failover out of the bar by
+        design, so either trigger still escapes the account untouched, and
+        the next successful switch overwrites the snapshot outright.
         """
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
@@ -1458,21 +1472,37 @@ class AutoSwitchEngine:
         barred = str(came_from)
         if "leftHeadroom" not in state:
             return True          # pre-upgrade record: genuinely no evidence
+        h = headroom.get(barred)
+        # Dominance over the ACTIVE, checked before either baseline-relative
+        # leg below: a peer that was already miles ahead of the active at
+        # departure (moved for a DIFFERENT reason -- e.g. consume-first's
+        # reset ordering, not headroom) never "improves" on its own baseline
+        # and would stall on self-improvement alone despite dominating
+        # throughout. Same ratio `_no_return_account` and the ranking's
+        # headroom axis (`:1626`) already use, so a peer that beats the
+        # active this hard is a move the outbound leg would make on its own
+        # merits regardless of departure history -- and it needs no stored
+        # baseline, so it applies to the failover `(None, None)` case too.
+        if (
+            h is not None
+            and active_headroom is not None
+            and h > active_headroom * HORIZON_HEADROOM_RATIO
+        ):
+            return True
         left_headroom = state.get("leftHeadroom")
         left_recovery = state.get("leftRecoveryAt")
         if left_headroom is None and left_recovery is None:
             # Failover: real departure, severity unmeasured at the time -- not
             # absence of evidence. There is no recorded baseline to diff
-            # against (that is exactly what "unmeasured" means), so the only
-            # trustworthy signal is the peer's OWN headroom now: require it
-            # within SPENT_HEADROOM_PCT of the 100 cap, the margin the
-            # headroom leg below already uses. The recovery leg has no such
-            # floor here -- with no baseline `was` would collapse to `inf`,
-            # which any known reset beats for free, disarming on the first
-            # readable tick regardless of how little recovered. That is the
-            # exact flap 0b369e0 fixed, so recovery sits out this branch.
-            return (headroom.get(barred) or 0.0) >= 100.0 - SPENT_HEADROOM_PCT
-        h = headroom.get(barred)
+            # against (that is exactly what "unmeasured" means) and dominance
+            # was already checked above, so the only thing left is: still
+            # unmeasurable, or not yet good enough. Hold. The recovery leg
+            # has no baseline-relative form here either -- with no baseline
+            # `was` would collapse to `inf`, which any known reset beats for
+            # free, disarming on the first readable tick regardless of how
+            # little recovered. That is the exact flap 0b369e0 fixed, so
+            # recovery sits out this branch.
+            return False
         if (
             isinstance(left_headroom, (int, float))
             and h is not None
