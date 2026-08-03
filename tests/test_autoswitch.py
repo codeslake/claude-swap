@@ -2939,6 +2939,140 @@ class TestLiveLock:
             "belong to whoever holds LIVE now"
         )
 
+    def test_a_stop_during_the_promotion_does_not_strand_the_lock(
+        self, harness
+    ):
+        """`acquire()` and the assignment are two statements.
+
+        `stop()` between them reads `_live_lock is None`, returns, and the
+        promotion then hands a real cross-process flock to an engine that will
+        never tick again. Nothing reclaims it — `_release_live` runs only from
+        `_perform`'s finally — so no engine on the machine can go LIVE until
+        the process exits. Measured before this:
+        `stopped=True holds_lock=True successor_demoted=True`.
+
+        Asserts a SUCCESSOR can take LIVE, not that `_live_lock` is None: the
+        attribute is bookkeeping, the flock is the resource.
+        """
+        from claude_swap.locking import FileLock
+
+        demoted = harness._make_engine(dry_run=False)
+        assert demoted.demoted_from_live, "premise: the harness holds LIVE"
+        harness.engine.stop()                       # the holder exits
+
+        real_acquire = FileLock.acquire
+
+        def acquire_then_stop(self, *a, **kw):
+            ok = real_acquire(self, *a, **kw)
+            if ok:
+                demoted.stop()                      # lands in the window
+            return ok
+
+        FileLock.acquire = acquire_then_stop
+        try:
+            demoted._retry_live_promotion()
+        finally:
+            FileLock.acquire = real_acquire
+
+        successor = harness._make_engine(dry_run=False)
+        try:
+            assert not successor.demoted_from_live, (
+                "a stopped engine still holds the LIVE flock; nothing on this "
+                "machine can go LIVE until the process exits"
+            )
+        finally:
+            successor.stop()
+
+    def test_a_raising_consumer_does_not_escape_the_tick(self, harness):
+        """`tick()` documents "Never raises" and its try covers only
+        `_tick_inner`.
+
+        So an emit from `_announce_demotion` / `_retry_live_promotion` (before
+        the try) or from the except handlers (outside it) escaped. Measured
+        through the real CLI: `cswap auto --once --json | head -1` closed the
+        pipe and the documented 0/1/2/3 exit contract became a BrokenPipeError
+        traceback, losing the tick's outcome.
+
+        Drives BOTH shapes — the ordinary path and a pending demotion
+        announcement — because fixing only the pre-try emits leaves the
+        handlers open.
+        """
+        engine = harness.engine
+        engine.on_event = lambda ev: (_ for _ in ()).throw(
+            BrokenPipeError("consumer went away")
+        )
+        engine.tick()                     # must not raise
+
+        second = harness._make_engine(dry_run=False)
+        second.demoted_from_live = True
+        second._demotion_announced = False
+        second.on_event = lambda ev: (_ for _ in ()).throw(
+            BrokenPipeError("consumer went away")
+        )
+        try:
+            second.tick()                 # the pre-try emit path
+        finally:
+            second.stop()
+
+    def test_a_stopped_engine_is_not_badged_live(self, harness):
+        """`autoview` renders the badge from `not engine.dry_run`.
+
+        Leaving it False after the release made a dead engine read " LIVE ".
+        Masked in the normal flow because `_restart_engine` replaces `_engine`
+        at once — but `_start_engine` can raise after this `stop()`, and the
+        screen then points at the stopped one.
+        """
+        engine = harness.engine
+        assert not engine.dry_run, "premise: this engine is LIVE"
+        engine.stop()
+        assert engine.dry_run, (
+            "a stopped engine still reports dry_run=False, so the badge reads "
+            "LIVE for an engine that will never tick"
+        )
+
+    def test_a_stop_mid_collection_is_not_an_unhealthy_tick(self, harness):
+        """The stop-returns were indistinguishable from a failed fetch.
+
+        Both guards returned an empty triple, so `headroom.get(current)` came
+        back None and the tick charged `_unhealthy_ticks` — measured 0 -> 1 —
+        while emitting nothing, so a `--once` run answered NO_ACTION with no
+        reason line. Every other `_stop` checkpoint emits `engine-stopped`.
+        """
+        engine = harness.engine
+        before = engine._unhealthy_ticks
+        # Stopped on the collector's no-network probe — the last point before
+        # its two network fetches, which is where the guards live. Stopping
+        # earlier hits `_tick_inner`'s entry gate instead, and that one has
+        # always emitted; the test would then pass without reaching the
+        # guards at all.
+        calls = {"n": 0}
+        real = harness.switcher.usage_entries_by_account
+
+        def stop_at_the_probe(*a, **kw):
+            calls["n"] += 1
+            out = real(*a, **kw)
+            if calls["n"] == 1:
+                engine._stop.set()
+            return out
+
+        harness.events.clear()
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", stop_at_the_probe
+        ):
+            engine.tick()
+
+        assert engine._unhealthy_ticks == before, (
+            f"unhealthy_ticks {before} -> {engine._unhealthy_ticks}: a stop is "
+            "not a fetch failure"
+        )
+        assert any(
+            getattr(e, "reason", None) == "engine-stopped"
+            for e in harness.events
+        ), (
+            f"events {[getattr(e, 'reason', type(e).__name__) for e in harness.events]}"
+            " — the tick abandoned itself silently"
+        )
+
     def test_a_demoted_engine_takes_live_once_the_holder_releases_it(
         self, harness
     ):
