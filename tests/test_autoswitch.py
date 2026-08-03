@@ -3866,6 +3866,52 @@ class TestHorizonAxisDoesNotFlap:
             "that is the flap this bar exists for."
         )
 
+    def test_a_departure_at_full_quota_is_immediately_eligible(self, temp_home):
+        """`left_headroom == 100.0` must not be a permanent lockout.
+
+        `h >= left_headroom + SPENT_HEADROOM_PCT` is `h >= 103.0` when the
+        departure was recorded at a full 100.0 points — unsatisfiable forever,
+        because `oauth.account_headroom` caps `h` at 100.0
+        (`100 - max(pct)`, and pct cannot go negative). consume-first departs
+        BELOW the threshold, so this is the routine case, not a corner one: a
+        fresh/full account handed off to a sooner-resetting peer records
+        exactly this.
+
+        The account below holds the SAME 100.0 points at every check (never
+        spent anything) and the SAME resets_at (no recovery-axis movement
+        either) — the only way this switches is if a departure at the cap is
+        treated as needing no recovery on the headroom axis.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=90.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage7(0.0, 0.0, self._days_out(h, 500)),
+            "2": _usage7(0.0, 0.0, self._days_out(h, 100)),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert h.engine._read_state().get("leftHeadroom") == 100.0, (
+            "premise: consume-first recorded a full-quota departure"
+        )
+        h.clock.advance(301.0)
+
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                # unchanged since departure on BOTH axes
+                "1": _usage7(0.0, 0.0, self._days_out(h, 500)),
+                "2": _usage7(90.0, 0.0, self._days_out(h, 100)),
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} — account 1 never dropped below a "
+            "full 100.0 points and is the only peer; refusing it is the "
+            "unsatisfiable-above-97 lockout, not anti-flap"
+        )
+
     def test_a_reset_that_crept_nearer_is_not_a_recovery(self, temp_home):
         """The recovery leg carries `RECOVERY_HYSTERESIS_S`, and it must.
 
