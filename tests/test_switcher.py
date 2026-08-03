@@ -3921,10 +3921,6 @@ class TestDeadTokenQuarantine:
         # is discarded and :3581 is what comes back. Asserting only on a
         # follow-up `fetch=set()` call covered the line that does NOT run:
         # measured, mutating :3581 alone left the whole suite green.
-        # THE FETCHING PATH. `_collect_usage_entries` reads the store twice —
-        # :3520 before the fetch and :3581 after it — and on a tick that
-        # fetched, :3581's value is the one returned. Only :3520 was covered:
-        # measured, mutating :3581 alone left the whole suite green.
         #
         # `record()` is what makes this hard to reach. `models` only changes an
         # answer while `lastError == "http-429"`, and any second fetch rewrites

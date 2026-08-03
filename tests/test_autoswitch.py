@@ -816,59 +816,39 @@ class TestAdaptiveScheduler:
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
 
-    def test_backoff_never_outlasts_the_trust_it_relies_on(
-        self, temp_home, monkeypatch
-    ):
-        """A row must never be BOTH un-pollable and un-trusted.
+    def test_a_non_429_ask_passes_through_uncapped(self, temp_home, monkeypatch):
+        """A non-429 ask is never clamped against TRUST_MAX_AGE_S.
 
-        The sibling test above pins the property that matters — deliberate
-        staleness keeps headroom known, so no unhealthy ticks — but asks for
-        600s and advances 400s, so it never reaches a ceiling. At hour scale
-        the two bounds cross: ``TRUST_MAX_AGE_S`` caps how long last_good
-        stays decision-trusted, and the Retry-After margin can push the
-        backoff past it. In that window the engine cannot re-poll (backoff)
-        and cannot use what it has (untrusted), so the unhealthy-tick counter
-        converts the blindness into a failover away from a healthy account.
+        This test used to pin a clamp (`asked = min(asked, TRUST_MAX_AGE_S)`
+        on the non-429 arm) on the theory that a row must never be BOTH
+        un-pollable and un-trusted. Enumerated over every ask and every
+        reachable row age at the moment of failure, the clamp never delivered
+        that: `age_at_release = age_at_failure + clamped_wait`, and staying
+        `<= TRUST_MAX_AGE_S` needs `age_at_failure == 0` — the row would have
+        to succeed and fail in the same clock tick, and even then it only
+        lands exactly on the boundary. For every reachable state (age > 0)
+        the clamp fired and STILL released the row unknown, while also
+        cutting the wait short of what the server actually asked for — the
+        same "no-op or futile, never a fix" shape `ce2c44d` proved for the
+        sibling 429 trust-clip 16 lines above this one in the source. So the
+        ask now passes straight through, same as that sibling.
 
         The margin belongs to 429s, whose stale data stays trusted until the
-        window resets (or 7200s). Every OTHER failure falls back to
-        TRUST_MAX_AGE_S, and `_classify_usage_error` parses Retry-After for any
-        HTTP code — so a 503 carrying `Retry-After: 3600` is the shape that
-        crosses. Asserted per path on the constants rather than on one tick
-        trace, because the invariant is what must hold.
+        window resets (or 7200s) — see the assertion below, unaffected by
+        this deletion.
         """
-        from claude_swap.usage_store import (
-            RETRY_AFTER_FLOOR_CAP_S,
-            TRUST_MAX_AGE_S,
-            _failure_backoff_s,
-        )
+        from claude_swap.usage_store import _failure_backoff_s
 
-        for ask in (601.0, 3600.0, 4500.0, 10_000.0):
+        for ask in (601.0, 3600.0, 4500.0, 10_000.0, 20_000.0):
             other = _failure_backoff_s(1, ask, rate_limited=False)
-            # `== min(ask, TRUST)`, not `<= TRUST`. The inequality was
-            # decorative: `computed` at failures=1 is BACKOFF_BASE_S = 30 and
-            # floors every result, so `other > TRUST_MAX_AGE_S` needs
-            # TRUST_MAX_AGE_S < 30 — the real value is 3600, 120x the firing
-            # threshold. The equality pins the clamp that is actually there.
-            assert other == min(ask, TRUST_MAX_AGE_S), (
-                f"non-429 ask={ask:.0f} backs off {other:.0f}s, not the "
-                f"{min(ask, TRUST_MAX_AGE_S):.0f}s its last_good stays "
-                "trusted for — un-pollable AND unknown for the difference"
+            # `computed` at failures=1 is BACKOFF_BASE_S = 30, well under any
+            # of these asks, so `other == ask` pins "no clamp" precisely —
+            # not `<= ask`, which a reintroduced clamp would also satisfy.
+            assert other == ask, (
+                f"non-429 ask={ask:.0f} backs off {other:.0f}s — something is "
+                "still clamping the ask against a trust bound it cannot "
+                "restore"
             )
-            # NOT `rl <= RATE_LIMIT_TRUST_MAX_AGE_S`. That was here, and it is
-            # true for every possible input: the 429 path is already bounded by
-            # RETRY_AFTER_FLOOR_CAP_S = 4500 and the ceiling it compared against
-            # is 7200, so it could not fail even with the cap raised to 7199 —
-            # which would make the blind window 3599s worse.
-            #
-            # `assert rl <= RETRY_AFTER_FLOOR_CAP_S` USED TO SIT HERE and is
-            # gone: isolated it is true for every input. `rl = max(min(ask +
-            # MARGIN, CAP), computed)` with `computed <= BACKOFF_CAP_S = 600`,
-            # so `rl > CAP` needs `CAP < 600`. A previous round kept it on the
-            # evidence that mutating the cap to 601 and 1000 turns this test
-            # red — true, but it is the `== 4500.0` line below that fires, not
-            # this one. Neutralising the siblings and sweeping the cap: green
-            # at 601, 1000, 3600, 4500, 7200 and 50900.
 
         # The margin still does its job where it was measured.
         assert _failure_backoff_s(1, 3600.0, rate_limited=True) == 4500.0, (
@@ -1185,23 +1165,33 @@ class TestAdaptiveScheduler:
         whole suite green. `record()` is the only path production reaches, so
         the guard was untested where it runs.
 
-        `_classify_usage_error` parses Retry-After for ANY HTTPError code, so a
-        503 carrying `Retry-After: 3600` is the reachable shape.
+        Drives a REAL success through `record()` first, so `last_good` and
+        `fetched_at` actually exist and are decision-trusted before the 503 —
+        the round-3 defect this test previously carried recorded neither
+        (`last_good=None, fetched_at=None`) and asserted a trust relationship
+        that was never exercised. `_classify_usage_error` parses Retry-After
+        for ANY HTTPError code, so a 503 carrying `Retry-After: 3600` is the
+        reachable shape.
         """
-        from claude_swap.usage_store import TRUST_MAX_AGE_S, FetchRecord
+        from claude_swap.usage_store import FetchRecord
 
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
         st = h.switcher._usage_store
-        t0 = h.clock.now
         ident = {"1": ("a@example.com", "")}
+
+        st.record({"1": FetchRecord(usage=_usage(50))}, ident)
+        h.clock.advance(120.0)  # ages last_good, still well inside STALE_OK_S
+        premise = st.entries(ident)["1"]
+        assert premise.decision_value() is not None, "premise: last_good trusted"
+        t1 = h.clock.now
 
         st.record({"1": FetchRecord(error="http-503", retry_after_s=3600.0)}, ident)
         entry = st.entries(ident)["1"]
-        waited = entry.backoff_until - t0
-        assert waited <= TRUST_MAX_AGE_S, (
-            f"a non-429 backed off {waited:.0f}s while its last_good stays "
-            f"trusted only {TRUST_MAX_AGE_S:.0f}s — it took the 429 margin"
+        waited = entry.backoff_until - t1
+        assert waited == 3600.0, (
+            f"a non-429 backed off {waited:.0f}s, not the server's 3600s "
+            "ask — it took the 429-only margin at the record() call site"
         )
 
     def test_all_exhausted_escalation_preserves_wider_plan(

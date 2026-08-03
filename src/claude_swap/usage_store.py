@@ -519,12 +519,18 @@ def _failure_backoff_s(
         # Capping the constant instead would land a 3600s ask exactly on its
         # deadline — the defect this whole change exists to fix.
         asked = min(retry_after_s + RETRY_AFTER_MARGIN_S, RETRY_AFTER_FLOOR_CAP_S)
-    elif not rate_limited:
-        # Nor may the ASK itself outlast that trust. Dropping the margin is not
-        # enough: a 503 that simply asks for 4500s parks the row exactly as far
-        # past TRUST_MAX_AGE_S as the margin would have. The bound belongs to
-        # the path, not to the margin.
-        asked = min(asked, TRUST_MAX_AGE_S)
+    # NO CLAMP ON A NON-429 ASK EITHER. This branch used to clamp
+    # `asked = min(asked, TRUST_MAX_AGE_S)` on the theory that the ask itself
+    # must not outlast the trust the row relies on. Enumerated over every ask
+    # and every reachable row age at the moment of failure, it never delivered
+    # that: `age_at_release = age_at_failure + clamped_wait`, and staying
+    # trusted needs `age_at_failure == 0` — the row succeeding and failing in
+    # the same clock tick, landing exactly on the boundary even then. For
+    # every reachable state (age > 0) the row was released unknown regardless,
+    # while the clamp also cut the wait short of what the server actually
+    # asked for. Same "no-op or futile, never a fix" shape as the 429
+    # trust-clip below — see `ce2c44d`.
+    #
     # NO TRUST TRIM AGAINST THE SERVER'S DEADLINE. Cutting a 429 wait back to
     # the deadline when the stored trust expires first cannot salvage that
     # trust — `trust < ask` is its own precondition and the floor keeps
