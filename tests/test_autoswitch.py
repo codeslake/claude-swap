@@ -15,6 +15,7 @@ from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
+    SPENT_HEADROOM_PCT,
     AllExhaustedEvent,
     AutoSwitchEngine,
     ConfigWarningEvent,
@@ -3499,6 +3500,17 @@ class TestHorizonAxisDoesNotFlap:
         (400 days out) throughout, so the ordinary consume-first
         reset-ordering gate does not exclude it either; only the anti-flap
         snapshot does.
+
+        DISCRIMINATES RELATIONAL FROM ABSOLUTE (F3, round-5 review): the
+        first tick below (active_pct=50, active_headroom=50.0) is chosen so
+        that ANY absolute floor at or below 70 — the exact defect class round
+        4b shipped, and the round-5 review found this test could not tell
+        apart from a relational fix — would release the peer immediately
+        (70 clears a `>= floor<=70` bar outright), while the relational fix
+        needs `70 > 50 x 2 + 3 = 103`, which is false, so it must still hold
+        at that first tick. Only once the active has burned enough for the
+        RATIO against it (not the peer's own absolute value) to clear does
+        the release fire.
         """
         h = EngineHarness(temp_home, strategy="consume-first")
         h.seed(1, "a@example.com")
@@ -3520,6 +3532,11 @@ class TestHorizonAxisDoesNotFlap:
             }))
             h.clock.advance(301.0)
 
+        assert outcomes[0] is not TickOutcome.SWITCHED, (
+            f"{[o.name for o in outcomes]} — the very first tick (active at "
+            "50%, ratio only 1.4x) already switched. An absolute floor <= 70 "
+            "would fire here immediately; the relational fix must not."
+        )
         assert TickOutcome.SWITCHED in outcomes[:-1], (
             f"{[o.name for o in outcomes]} — peer 1 held 70 points the whole "
             "time, far ahead of the active, and the engine only returned "
@@ -4028,6 +4045,62 @@ class TestHorizonAxisDoesNotFlap:
         Both legs of the test below are the flap shape: the barred account is
         no better than we left it on either axis. The bar must hold even
         though the ranking is empty and the tick therefore does nothing.
+
+        WALKED PAST THE OLD BOUNDARY (F5, round-5 review): the pre-fix
+        dominance leg was a bare `h > active x RATIO`, which held only up to
+        and including ratio exactly 2.00 (`active=2.0` pts) and opened on the
+        very next cell (`active=1.8`) — round 5's own defect, the exact shape
+        the review measured. The fixed leg adds a flat `+SPENT_HEADROOM_PCT`
+        on top of the ratio, so the boundary against this same 4.0-pt frozen
+        peer moves from `active=2.0` to `active=0.5` — the walk below covers
+        every cell in between, well past where round 5 opened.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(96, self._days_out(h, 500)),   # 4 pts
+            "2": _usage(92, self._days_out(h, 400)),   # 8 pts
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(3612.0)
+
+        outcomes = []
+        # 98 (2.0 pts, the old exact boundary) through 99.5 (0.5 pts, the new
+        # boundary's last holding cell) — well past where round 5's bare
+        # ratio opened at 1.8 pts.
+        for active_pct in (98.0, 98.2, 98.4, 99.0, 99.5):
+            outcomes.append(h.tick_with_usage({
+                # unchanged since we left it: same headroom, same reset
+                "1": _usage(96, self._days_out(h, 500)),
+                "2": _usage(active_pct, self._days_out(h, 400)),   # active, burnt down
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED not in outcomes, (
+            f"{[o.name for o in outcomes]} — the engine went back to an "
+            "account that is exactly as we left it. The ranking flipped "
+            "because the active burned, not because the target recovered; "
+            "that is the flap this bar exists for."
+        )
+
+    def test_the_release_fires_on_this_same_fleet_once_the_peer_actually_improves(
+        self, temp_home
+    ):
+        """The release partner for the hold above (F5): SAME fleet, PEER moves.
+
+        The sibling test proves the bar holds no matter how far the active
+        burns while the peer is frozen. Without this partner, an
+        over-conservative predicate that never releases at all — the
+        permanent 2-account lockout this branch has already fixed twice —
+        would also pass that test, since "never SWITCHED" is satisfied
+        trivially by "never releases anything, ever". This uses the exact
+        same departure (1 at 4.0 pts / 500h, 2 at 8.0 pts / 400h) and then
+        lets account 1 recover to full quota while the active sits at the
+        SAME 98% the sibling test holds at — the only variable that changes
+        is the peer.
         """
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -4044,17 +4117,16 @@ class TestHorizonAxisDoesNotFlap:
         outcomes = []
         for _ in range(10):
             outcomes.append(h.tick_with_usage({
-                # unchanged since we left it: same headroom, same reset
-                "1": _usage(96, self._days_out(h, 500)),
-                "2": _usage(98, self._days_out(h, 400)),   # active, burnt down
+                "1": _usage(0, self._days_out(h, 500)),    # RECOVERED: reset to full
+                "2": _usage(98, self._days_out(h, 400)),   # active, same 98% as the hold
             }))
             h.clock.advance(301.0)
 
-        assert TickOutcome.SWITCHED not in outcomes, (
-            f"{[o.name for o in outcomes]} — the engine went back to an "
-            "account that is exactly as we left it. The ranking flipped "
-            "because the active burned, not because the target recovered; "
-            "that is the flap this bar exists for."
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} — account 1 reset to full quota, "
+            "the peer's own state, and the engine never returned; a bar that "
+            "never releases at any active burn is the permanent lockout, not "
+            "anti-flap"
         )
 
     def test_a_departure_at_full_quota_is_immediately_eligible(self, temp_home):
@@ -4101,6 +4173,42 @@ class TestHorizonAxisDoesNotFlap:
             f"{[o.name for o in outcomes]} — account 1 never dropped below a "
             "full 100.0 points and is the only peer; refusing it is the "
             "unsatisfiable-above-97 lockout, not anti-flap"
+        )
+
+    def test_the_clamp_stays_load_bearing_when_dominance_does_not_fire(
+        self, harness
+    ):
+        """F4 (round-5 review): dominance must not shadow the `min(...,100.0)`
+        clamp — the round-4a shape recurring, a new leg silently disarming an
+        existing guard's killer.
+
+        The sibling test above (`test_a_departure_at_full_quota_is_
+        immediately_eligible`) uses active=10, where dominance ALSO fires
+        (`100 > 10*2+3`), so mutating away the clamp there is invisible: the
+        dominance leg answers True regardless of the clamp. Isolate the
+        clamp with an active_headroom chosen so dominance is FALSE
+        (`100 > 60*2+3=123` is false) while the clamp (`100 >= min(98+3,
+        100)`) is still True — exactly the shape the round-5 review measured
+        (left=98 / peer=100 / active=60) as flipping between clamp on/off.
+        """
+        state = {"lastSwitchFrom": "1", "leftHeadroom": 98.0, "leftRecoveryAt": None}
+        recovered = harness.engine._left_account_recovered(
+            state,
+            {"1": _usage(0)},
+            {"1": 100.0},
+            60.0,
+            harness.settings,
+            harness.clock(),
+        )
+        assert recovered is True, (
+            "the clamp must still release a departure recorded at a near-full "
+            "leftHeadroom even where dominance over the active does not fire"
+        )
+        # Control: without the clamp (`h >= left_headroom + SPENT_HEADROOM_PCT`
+        # unclamped -> `h >= 101.0`), 100.0 fails and this would be False —
+        # confirms the clamp, not some other leg, is what makes it True.
+        assert not (100.0 >= 98.0 + SPENT_HEADROOM_PCT), (
+            "premise: the unclamped threshold is unsatisfiable at h=100.0"
         )
 
     def test_a_reset_that_crept_nearer_is_not_a_recovery(self, temp_home):
@@ -4264,14 +4372,14 @@ class TestHorizonAxisDoesNotFlap:
         state = {"lastSwitchFrom": "2"}  # pre-upgrade: keys genuinely absent
 
         assert harness.engine._left_account_recovered(
-            state, {"2": _usage(96)}, {"2": 4.0}, 2.0, harness.clock()
+            state, {"2": _usage(96)}, {"2": 4.0}, 2.0, harness.settings, harness.clock()
         ) is True, (
             "a pre-upgrade record (no snapshot) must release even when the "
             "barred account is currently poor (4 pts) — absence of evidence "
             "is not the same state as a measured-unmeasurable failover"
         )
         assert harness.engine._left_account_recovered(
-            state, {"2": None}, {"2": None}, 2.0, harness.clock()
+            state, {"2": None}, {"2": None}, 2.0, harness.settings, harness.clock()
         ) is True, (
             "a pre-upgrade record (no snapshot) must release even when the "
             "barred account is currently unreadable — absence of evidence "
@@ -4280,6 +4388,9 @@ class TestHorizonAxisDoesNotFlap:
 
     def test_a_failover_departure_does_not_disarm_the_bar(self, temp_home):
         """`(None, None)` from a failover must not read the same as `absent`.
+
+        R2 of the round-5 acceptance matrix: failover, peer FROZEN, active
+        burning -> HOLD.
 
         `_perform` writes `leftHeadroom`/`leftRecoveryAt` unconditionally on
         every trigger, including `failover`, where `active_headroom` is None
@@ -4292,10 +4403,19 @@ class TestHorizonAxisDoesNotFlap:
 
         Reached with a real failover (active usage unreadable for
         `unhealthy_ticks` ticks), then the classic flap shape: the barred
-        account frozen at 4 pts, the new active burning from 4 to 2 pts —
-        the same shape `test_the_release_needs_the_barred_account_to_have_improved`
-        uses for a PROACTIVE departure, which correctly holds. A failover
-        departure must hold the same way, not disarm on the very next tick.
+        account frozen at 4 pts, the new active burning from 4 pts down past
+        the exact boundary (98.2%) round 5's dominance leg opened at —
+        `4.0 > 1.8 x 2` — walked further still, to a bare sliver (99.9%,
+        0.1 pts). The round-5 defect switched back to the frozen peer at
+        98.2%, measured on this exact fleet (round-5 review F1/F2). This
+        leaves the ORDINARY-path shape (`test_the_release_needs_the_barred_
+        account_to_have_improved`) as the sibling proving the general
+        dominance leg's own margin separately; this one is failover-only,
+        which never reads `leftHeadroom`/`leftRecoveryAt` at all, so it also
+        discriminates a relational fix from an absolute one: mutate the
+        failover leg to a bare `h >= 4.0` (the peer's own constant value) and
+        every tick below flips to SWITCHED, because that mutant no longer
+        reads the active at all.
         """
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -4321,17 +4441,20 @@ class TestHorizonAxisDoesNotFlap:
 
         h.clock.advance(301.0)
         outcomes = []
-        for _ in range(10):
+        # 98.0 (2.0 pts, the old boundary), 98.2 (1.8 pts, round 5's exact
+        # kill shot), then further still down to a bare sliver — the peer
+        # never moves, so nothing on this walk is evidence it improved.
+        for active_pct in (98.0, 98.2, 98.4, 99.0, 99.5, 99.9):
             outcomes.append(h.tick_with_usage({
                 "1": _usage(96, frozen1),                     # frozen, 4 pts
-                "2": _usage(98, self._days_out(h, 400)),       # active, burnt to 2 pts
+                "2": _usage(active_pct, self._days_out(h, 400)),
             }))
             h.clock.advance(301.0)
 
         assert TickOutcome.SWITCHED not in outcomes, (
             f"{[o.name for o in outcomes]} — a failover departure was treated "
-            "as 'no evidence, release', undoing the failover on the very next "
-            "proactive tick"
+            "as 'no evidence, release', undoing the failover once the active "
+            "burned far enough, however far — the peer never changed"
         )
 
     def test_a_failover_departure_still_unreadable_does_not_crash_or_release(
@@ -4445,17 +4568,31 @@ class TestHorizonAxisDoesNotFlap:
 
         `test_a_failover_departure_releases_once_the_peer_is_readable_again`
         only proves the bar is not PERMANENT — it drives the peer to a full
-        100.0, which also clears the (unfixed) absolute `>= 97.0` floor. That
-        floor makes any peer that has spent more than 3% of its weekly window
-        unreachable: a peer sitting on a perfectly healthy 70 points, with the
-        active burnt down to 2, is held exactly as hard as one on 4 points —
-        the two states this predicate exists to tell apart collapse onto the
-        same answer. C1.
+        100.0, which also clears a fixed near-100 floor. C1's original bug was
+        an absolute `>= 97.0` floor, unreachable for any peer that had spent
+        more than 3% of its weekly window.
+
+        THIS IS DELIBERATELY NOT RELATIONAL TO THE ACTIVE (round-5 correction):
+        round 5's fix made this branch dominance-vs-active, and that is
+        exactly what broke `test_a_failover_departure_does_not_disarm_the_bar`
+        — a `(None, None)` snapshot has no recorded baseline for either
+        headroom or recovery, so there is nothing to diff the ACTIVE's burn
+        away from; any leg that reads the active here reproduces the flap the
+        moment the active burns far enough, however far. What this branch
+        uses instead is `h > 100 - settings.threshold`: the same "would the
+        ranking accept this as a landing spot" test every candidate already
+        passes (`:1617`), so the floor is the user's OWN policy rather than a
+        hardcoded constant, and it moves when they change it. It genuinely
+        cannot tell "the peer just recovered" from "the peer was always this
+        good" — there is nothing recorded to tell them apart on a failover
+        departure — so both land on RELEASE, which is the documented,
+        measurement-backed choice (see `_left_account_recovered`'s docstring)
+        for a case R-A and R-B cannot be separated in.
 
         Reached with a real failover, same setup as the sibling tests, then
-        the peer comes back READABLE at 70 points (well under the 97 floor,
-        well over the 4-point flap the bar must still catch) while the active
-        burns to 2.
+        the peer comes back READABLE at 70 points (well over the default
+        threshold-derived floor of 10, well over the 4-point flap the bar
+        must still catch) while the active burns to 2.
         """
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -4768,6 +4905,202 @@ class TestHorizonAxisDoesNotFlap:
         })
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
+
+
+class TestAcceptance204eR1toR7:
+    """Task 204e's acceptance matrix, one test per line.
+
+    R1  failover, peer readable and dominant AND CHANGED     -> RELEASE
+    R2  failover, peer FROZEN, active burning                -> HOLD    (F1)
+    R3  failover, peer still poor                            -> HOLD
+    R4  failover, peer still unreadable                      -> HOLD
+    R5  ordinary departure, weekly-bound peer that recovered -> RELEASE
+    R6  pre-upgrade record (keys absent)                     -> RELEASE
+    R7  at-limit escape                                      -> works
+
+    Some of these are also proven end-to-end elsewhere in this file
+    (`test_a_failover_departure_does_not_disarm_the_bar` is R2 through a real
+    tick loop, `test_a_switch_that_recorded_no_snapshot_still_releases` is
+    R6, `test_a_failover_hold_still_escapes_at_limit` is R7); this class
+    drives `_left_account_recovered` directly so each line of the matrix is
+    checkable in isolation, against the exact state shape that line names,
+    without a multi-tick walk's other gates (cooldown, ranking, hysteresis)
+    able to hide a wrong answer.
+    """
+
+    def _at(self, harness, seconds: float) -> str:
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(harness.clock.now + seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    def test_r1_failover_peer_readable_dominant_and_changed_releases(
+        self, harness
+    ):
+        """R1: a failover snapshot, peer now readable and clearly healthy.
+
+        h=15: past the threshold-derived floor (`100 - 90 = 10`) but under
+        20 and 50 — chosen so an absolute floor of 20 or 50 (MRELF-a/b in
+        the mutation sweep) would give the WRONG answer (False) here, while
+        the threshold-derived floor correctly releases. A peer at 70, past
+        every plausible floor, would not tell the two apart.
+        """
+        state = {"lastSwitchFrom": "2", "leftHeadroom": None, "leftRecoveryAt": None}
+        assert harness.engine._left_account_recovered(
+            state, {"2": _usage(85)}, {"2": 15.0}, 2.0, harness.settings, harness.clock()
+        ) is True, (
+            "a failover departure with the peer now readable at 15 points "
+            "(past the threshold-derived floor of 10, under any floor of "
+            "20 or 50) must release"
+        )
+
+    def test_r1_floor_moves_with_the_users_threshold(self, temp_home):
+        """The failover floor is `settings.threshold`-derived, not a fixed 10.
+
+        At the default threshold (90) the floor happens to be exactly 10,
+        indistinguishable from a hardcoded `h >= 10.0` (MRELF-c in the
+        mutation sweep survived for exactly this reason). The property this
+        branch actually claims is that the floor is the USER'S policy, so it
+        must move when `settings.threshold` does: the SAME peer, held fixed
+        at 35 points, must hold under a threshold whose floor sits above 35
+        and release under one whose floor sits below it.
+        """
+        h_low = EngineHarness(temp_home, threshold=60.0)   # floor = 100-60 = 40
+        h_low.seed(1, "a@example.com")
+        h_low.seed(2, "b@example.com")
+        h_low.make_live("a@example.com", 1)
+        state = {"lastSwitchFrom": "2", "leftHeadroom": None, "leftRecoveryAt": None}
+        assert h_low.engine._left_account_recovered(
+            state, {"2": _usage(65)}, {"2": 35.0}, 2.0, h_low.settings, h_low.clock()
+        ) is False, (
+            "threshold=60 -> floor=40; a peer at 35 points is BELOW that "
+            "floor and must hold"
+        )
+
+        h_high = EngineHarness(temp_home, threshold=71.0)  # floor = 100-71 = 29
+        h_high.seed(1, "a@example.com")
+        h_high.seed(2, "b@example.com")
+        h_high.make_live("a@example.com", 1)
+        assert h_high.engine._left_account_recovered(
+            state, {"2": _usage(65)}, {"2": 35.0}, 2.0, h_high.settings, h_high.clock()
+        ) is True, (
+            "the SAME peer at 35 points, only `settings.threshold` changed "
+            "(71 -> floor 29) — a hardcoded absolute floor would answer the "
+            "same both times; this must flip, proving the floor is the "
+            "user's own policy, not a fixed constant"
+        )
+
+    def test_r2_failover_peer_frozen_active_burning_holds(self, temp_home):
+        """R2 (F1): a failover snapshot, peer frozen, only the active moves.
+
+        End-to-end walk, not a direct predicate call: this is the exact shape
+        round 5 shipped broken, so it is worth proving through the real tick
+        loop rather than only the unit. See `test_a_failover_departure_does_
+        not_disarm_the_bar` for the longer walk this is a focused version of.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = None
+        for _ in range(3):
+            outcome = h.tick_with_usage({
+                "1": None,
+                "2": _usage(4, self._at(h, 400 * 3600)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.clock.advance(301.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(96, self._at(h, 500 * 3600)),   # frozen, 4 pts, below floor
+            "2": _usage(98.2, self._at(h, 400 * 3600)),  # active burnt, round 5's kill shot
+        })
+        assert outcome is not TickOutcome.SWITCHED, (
+            "the peer never changed and is well under the threshold-derived "
+            "floor; burning the active alone must not release a failover hold"
+        )
+
+    def test_r3_failover_peer_still_poor_holds(self, harness):
+        """R3: a failover snapshot, peer readable but genuinely poor."""
+        state = {"lastSwitchFrom": "2", "leftHeadroom": None, "leftRecoveryAt": None}
+        # 5.0 < 100 - 90 = 10, the threshold-derived floor: readable, but poor.
+        assert harness.engine._left_account_recovered(
+            state, {"2": _usage(95)}, {"2": 5.0}, 2.0, harness.settings, harness.clock()
+        ) is False, (
+            "a failover departure with the peer readable but under the "
+            "floor must hold — readable is not the same as recovered"
+        )
+
+    def test_r4_failover_peer_still_unreadable_holds(self, harness):
+        """R4: a failover snapshot, peer still unreadable."""
+        state = {"lastSwitchFrom": "2", "leftHeadroom": None, "leftRecoveryAt": None}
+        assert harness.engine._left_account_recovered(
+            state, {"2": None}, {"2": None}, 2.0, harness.settings, harness.clock()
+        ) is False, (
+            "a failover departure with the peer still unreadable must hold; "
+            "unknown is not evidence of recovery"
+        )
+
+    def test_r5_ordinary_departure_weekly_bound_peer_that_recovered_releases(
+        self, harness
+    ):
+        """R5: a real (non-failover) baseline, and the peer's WEEKLY window
+        actually rolled over — genuine recovery on the recovery axis, which
+        the headroom axis (pinned by 7-day utilization) cannot see at all.
+        """
+        state = {
+            "lastSwitchFrom": "2",
+            "leftHeadroom": 4.0,
+            "leftRecoveryAt": harness.clock.now + 3600.0,  # was back in 1h
+        }
+        # Same 4.0 pts as departure (headroom leg cannot fire), but the
+        # binding reset is now well past the old one plus the hysteresis
+        # margin — a real recovery event, not drift.
+        assert harness.engine._left_account_recovered(
+            state,
+            {"2": _usage(96, self._at(harness, 60.0))},  # now back in 1 MINUTE
+            {"2": 4.0},
+            8.0,
+            harness.settings,
+            harness.clock(),
+        ) is True, (
+            "the peer's weekly-bound reset moved meaningfully nearer, which "
+            "is a real recovery event the headroom leg cannot see"
+        )
+
+    def test_r6_pre_upgrade_record_keys_absent_releases(self, harness):
+        """R6: state written before the snapshot fields existed."""
+        state = {"lastSwitchFrom": "2"}  # no leftHeadroom / leftRecoveryAt key
+        assert harness.engine._left_account_recovered(
+            state, {"2": _usage(96)}, {"2": 4.0}, 2.0, harness.settings, harness.clock()
+        ) is True, (
+            "absence of the snapshot fields (a pre-upgrade record) carries "
+            "no evidence either way and must release, not hold forever"
+        )
+
+    def test_r7_at_limit_escape_still_works(self, harness):
+        """R7: at-limit skips this predicate's bar entirely by trigger scope.
+
+        `_no_return_account` (not `_left_account_recovered`) is what gates
+        at-limit/failover out; this confirms the fix did not touch that
+        scoping. See `test_a_failover_hold_still_escapes_at_limit` for the
+        longer end-to-end version through a real failover-then-at-limit walk.
+        """
+        state = {"lastSwitchFrom": "2"}
+        headroom = {"1": 0.0, "2": 100.0}
+        for active in (0.0, None):
+            assert harness.engine._no_return_account(
+                "at-limit", state, headroom, active, ["1", "2"]
+            ) is None, (
+                "at-limit must escape the bar regardless of active_headroom "
+                "or the recovered predicate's answer"
+            )
 
 
 class TestAllSpentGoesToTheSoonestReset:
