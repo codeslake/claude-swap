@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -77,17 +76,19 @@ class EngineHarness:
 
     def __init__(self, temp_home: Path, **settings_kwargs):
         self.temp_home = temp_home
-        # get_backup_root() (switcher.py) resolves via $XDG_DATA_HOME, not
-        # via the `temp_home` argument below — that argument is used only by
-        # make_live(). Without this, every EngineHarness in a test process
-        # shares one store (all point at the pytest `temp_home` fixture's
-        # single patched $HOME), so two harnesses alias each other's rows.
-        # Scoping XDG_DATA_HOME to this instance's own subtree for
-        # construction only (backup_dir is resolved once, in __init__, and
-        # cached) gives each harness its own sequence.json/credentials/cache.
-        with patch.dict(
-            os.environ, {"XDG_DATA_HOME": str(self.temp_home / ".local" / "share")}
-        ):
+        # get_backup_root() (switcher.py) resolves via Path.home(), not via
+        # the pytest `temp_home` fixture's own patched $HOME — that fixture
+        # patches Path.home() once for the whole test, so every EngineHarness
+        # in a test process would otherwise share one store (all pointing at
+        # the same patched home) and alias each other's rows. Scoping
+        # `Path.home()` to this instance's own subtree for construction only
+        # (backup_dir is resolved once, in __init__, and cached) gives each
+        # harness its own sequence.json/credentials/cache — on every
+        # platform, since get_backup_root()'s XDG branch AND its legacy
+        # `get_legacy_backup_root()` fallback both honour Path.home()
+        # (paths.py:101-108), unlike `$XDG_DATA_HOME`, which only LINUX/WSL
+        # consult.
+        with patch("pathlib.Path.home", return_value=self.temp_home):
             self.switcher = ClaudeAccountSwitcher()
             self.switcher.platform = Platform.LINUX
             self.switcher._setup_directories()
@@ -185,46 +186,56 @@ def harness(temp_home: Path) -> EngineHarness:
 
 
 class TestEngineHarnessIsolation:
-    """Pins the guarantee `EngineHarness.__init__`'s per-instance
-    `XDG_DATA_HOME` scoping exists for (see its docstring): two harnesses
-    built against the SAME `temp_home` must not resolve to the same store.
+    """Pins the guarantee `EngineHarness.__init__`'s per-instance isolation
+    exists for (see its docstring): two harnesses built against the SAME
+    `temp_home` must not resolve to the same store.
 
     I2 (round-8 review): the prior form of this guard had no test that could
     kill it — reverting the scoping left the full suite green (round-7's
     `test_a_non_429_recorded_through_record_does_not_take_the_margin` no
     longer depends on it; that test's premise now stands on its own
     `record()` call). Without a test, a future cleanup could delete the
-    `patch.dict` silently, and the next multi-harness test would alias two
+    isolation silently, and the next multi-harness test would alias two
     accounts' stores into one without any assertion noticing.
+
+    I2 (round-9 review): round-8's fix scoped isolation on `$XDG_DATA_HOME`,
+    which `get_backup_root()` only consults on LINUX/WSL (paths.py:101) — so
+    the guard's OWN skipif, added because the mechanism is genuinely absent
+    off Linux, also left the guard itself untested there (S2 mutation:
+    skip forced + scoping reverted, full suite SURVIVED). The aliasing it
+    guards against is real off Linux (direct probe: two harnesses on
+    distinct subtrees collapsed to one store under the legacy
+    ~/.claude-swap-backup path, and h1's seeded account silently became
+    h2's). `Path.home()` is honoured by get_backup_root() on EVERY platform
+    (both its XDG branch and its `get_legacy_backup_root()` fallback —
+    paths.py:101-108), so scoping there instead makes the guard, and this
+    test, load-bearing everywhere and lets the skipif be deleted.
     """
 
-    @pytest.mark.skipif(
-        Platform.detect() not in (Platform.LINUX, Platform.WSL),
-        reason=(
-            "the mechanism under test does not exist off Linux/WSL: "
-            "get_backup_root() consults $XDG_DATA_HOME only on those two "
-            "platforms and returns ~/.claude-swap-backup everywhere else, so "
-            "two harnesses on one HOME legitimately share a store there. "
-            "Measured, same probe, XDG set to two different values: "
-            "LINUX honours it (True), MACOS and WINDOWS do not (False). "
-            "backup_dir is resolved inside ClaudeAccountSwitcher() before "
-            "the harness pins .platform = LINUX, so the real OS decides."
-        ),
+    @pytest.mark.parametrize(
+        "platform",
+        [Platform.LINUX, Platform.WSL, Platform.MACOS, Platform.WINDOWS],
     )
-    def test_two_harnesses_on_one_temp_home_get_distinct_stores(self, temp_home):
+    def test_two_harnesses_on_one_temp_home_get_distinct_stores(
+        self, temp_home, monkeypatch, platform
+    ):
         # Two DIFFERENT subtrees of the same temp_home, matching the
         # existing multi-harness usage pattern (see decision_at() in
-        # TestAdaptiveScheduler) — EngineHarness scopes XDG_DATA_HOME off
-        # the exact temp_home argument it is given, not off a shared
-        # ambient one, so distinct subtrees are what the guard promises to
-        # keep separate.
+        # TestAdaptiveScheduler) — EngineHarness scopes isolation off the
+        # exact temp_home argument it is given, not off a shared ambient
+        # one, so distinct subtrees are what the guard promises to keep
+        # separate. Parametrized over Platform.detect() (patched here, read
+        # once inside ClaudeAccountSwitcher() before the harness pins
+        # .platform = LINUX for the switcher's own runtime checks) so the
+        # guard is pinned on macOS/Windows CI too, not only whichever OS
+        # happens to run this suite.
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: platform))
         h1 = EngineHarness(temp_home / "h1")
         h2 = EngineHarness(temp_home / "h2")
         assert h1.switcher.backup_dir != h2.switcher.backup_dir, (
-            f"both harnesses resolved to {h1.switcher.backup_dir} — "
-            "EngineHarness.__init__'s XDG_DATA_HOME scoping is not doing "
-            "its job, so two harnesses alias each other's sequence.json/"
-            "credentials/cache"
+            f"both harnesses ({platform}) resolved to {h1.switcher.backup_dir} "
+            "— EngineHarness.__init__'s isolation is not doing its job, so "
+            "two harnesses alias each other's sequence.json/credentials/cache"
         )
 
         h1.seed(1, "a@example.com")
@@ -1074,10 +1085,9 @@ class TestAdaptiveScheduler:
         release either way (see
         `test_a_429_wait_is_the_deadline_plus_the_margin`) — while landing on
         the deadline re-blocks 20 of 35 times for a fresh hour (re-measured
-        2026-08-03, round 8; of 35, not 38 raw gaps — 3 are negative, the
-        server revising a block's deadline forward mid-block rather than a
-        clock/ordering artifact, excluded from both numerator and
-        denominator).
+        2026-08-03, round 8; of 35, not 38 raw gaps — 3 are negative, not a
+        uniform mechanism (per-gap detail in the RETRY_AFTER_MARGIN_S
+        comment), excluded from both numerator and denominator).
 
         So the wait stays deadline + margin whatever the scoped window says.
         What the scoped window still decides is whether the row SERVES its
@@ -1212,8 +1222,8 @@ class TestAdaptiveScheduler:
         RETRY_AFTER_MARGIN_S is 900 because 20 of 35 measured lapses
         re-blocked at +2s..+887s past their own deadline (re-measured
         2026-08-03, round 8; "of 35" not "of 38": 3 of the 38 raw gaps are
-        negative — the server revising a block's deadline forward mid-block,
-        not a clock/ordering artifact — excluded from both numerator and
+        negative — not a uniform mechanism (per-gap detail in the
+        RETRY_AFTER_MARGIN_S comment) — excluded from both numerator and
         denominator), each earning a fresh hour. So `(deadline, deadline +
         900)` — the MEASURED band, a literal, independent of whatever
         `RETRY_AFTER_MARGIN_S` happens to be configured to — is the interval

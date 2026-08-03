@@ -402,12 +402,14 @@ class TestBackoff:
         # RETRY_AFTER_MARGIN_S comment), 20 of 35 block lapses re-blocked
         # within 900s of their own deadline (+2s … +887s) and each cost a
         # fresh full hour, while the next one after that is +1004s. ("20 of
-        # 35", not "of 38": 3 of the 38 raw gaps are negative — the server
-        # revising a block's deadline forward mid-block, not a clock/ordering
-        # artifact — excluded from both numerator and denominator so the
-        # fraction stays apples-to-apples; the prior "21 of 36"/"2 of 38"
-        # figures here did not reproduce under the method as stated and are
-        # corrected.) On the hour-scale block that produced that evidence,
+        # 35", not "of 38": 3 of the 38 raw gaps are negative — not a uniform
+        # mechanism (per-gap detail in the RETRY_AFTER_MARGIN_S comment) —
+        # excluded from both numerator and denominator so the fraction stays
+        # apples-to-apples; the prior "21 of 36"/"2 of 38" figures here
+        # reproduce too, on the OTHER of two equally-valid readings — round 8
+        # switched readings, it did not correct a non-reproducing figure; see
+        # the RETRY_AFTER_MARGIN_S comment for which reading and why.) On the
+        # hour-scale block that produced that evidence,
         # the margin must clear the whole 900s band (13s of clearance:
         # 900 - 887).
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 >= 900.0
@@ -496,7 +498,9 @@ class TestBackoff:
         with "a 4500s wait sits comfortably inside its own trust"
         (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured on
         this tree by mutating the constant and running the full suite, the
-        inequality below admits `[4500, 7200]` — 4499 fails 12, 7201 fails 1.
+        inequality below admits `[4500, 7200]` — 4499 fails 12, 7201 fails 5
+        (re-measured 2026-08-03: this PR added four more tests that also bind
+        the constant since the "1" was first measured).
 
         The inequality is NOT what bounds blind time. It compares two
         constants; raising the cap to 7200 satisfies it while, at an ask of

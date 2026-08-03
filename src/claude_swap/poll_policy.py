@@ -32,10 +32,13 @@ over one machine's full log (re-measured 2026-08-03; re-derive rather than
 trust this verbatim, it ages as the log grows — method recorded next to
 ``usage_store.RETRY_AFTER_MARGIN_S``), 20 of 35 lapsed blocks re-blocked
 within 900s of their own deadline (+2s..+887s), each for a fresh full hour
-("of 35", not 38 raw gaps: 3 are negative — the server revising a block's
-deadline forward mid-block, not clock/ordering artifacts — excluded from
-both numerator and denominator; round 8 corrected the prior "21 of 36"/
-"2 of 38" figures here, which did not reproduce under the method as stated).
+("of 35", not 38 raw gaps: 3 are negative — NOT a uniform mechanism (one has
+no within-block revision at all, one is revised BACKWARD mid-block, one is
+unchanged — see usage_store.RETRY_AFTER_MARGIN_S's comment for the per-gap
+detail) — excluded from both numerator and denominator; round 8 switched
+from the prior "21 of 36"/"2 of 38" figures here to these, on the OTHER of
+two equally-reproducing readings — see usage_store.RETRY_AFTER_MARGIN_S's
+comment for which reading and why).
 The prior "10 of 23" figure here did not reproduce under any of 40 method
 variants swept and is superseded. That is why the wait is Retry-After plus
 ``usage_store.RETRY_AFTER_MARGIN_S`` and not Retry-After alone. What would

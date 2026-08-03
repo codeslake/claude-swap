@@ -146,21 +146,27 @@ BACKOFF_MAX_SHIFT = 32
 # Honoring it EXACTLY is not enough: the retry lands ON the deadline, where
 # the server is not reliably ready. Measured over this machine's whole log
 # (re-measured 2026-08-03, round 8 — the round-7 "21 of 36"/"2 of 38" figures
-# did not reproduce under the method below AS WRITTEN and are corrected here;
-# these figures age as the log grows — re-derive rather than trust them
-# verbatim, using the method below), 20 of 35 lapses re-blocked within 900s
+# do reproduce under the method below, on the OTHER of its two valid
+# readings; round 8 switched readings, see the METHOD paragraph below for
+# which and why the two differ; these figures age as the log grows —
+# re-derive rather than trust them verbatim, using the method below), 20 of
+# 35 lapses re-blocked within 900s
 # of their own deadline (+2s..+887s), each earning a fresh full hour; the
 # next one is +1004s, so the distribution is bimodal and 900s is the edge of
 # the band — with only 13s of clearance (900 - 887), not the 185s an earlier,
 # wrong figure implied. ("20 of 35", not "of 38": the denominator is
 # restricted to the 35 POSITIVE lapse gaps, matching the numerator — 3 of the
 # 38 raw gaps are negative, and mixing them into an "of 38" denominator
-# understates the fraction. The negative gaps are NOT a clock/ordering
-# artifact: each traces to the server revising a block's deadline FORWARD
-# while the block was still running, so a new block's opening observation
-# lands before the prior block's own opening deadline — a real event, just
-# not a lapse to measure. Excluding them from a lapse-gap analysis is still
-# correct: a block that never lapsed has no lapse gap.) The margin is
+# understates the fraction. The negative gaps are NOT a uniform mechanism —
+# measured per gap: acct2 block10→11 (no within-block revision at all, a
+# single-observation block whose NEXT block's opening simply lands later);
+# block11→12 (the deadline was revised BACKWARD 903s mid-block, the opposite
+# of "forward"); block12→13 (deadline unchanged mid-block). None is a forward
+# revision. What they share is only the effect, not the cause: each next
+# block's opening observation lands before the prior block's own deadline —
+# a real event, just not a lapse to measure. Excluding them from a lapse-gap
+# analysis is still correct on that basis: a block that never lapsed has no
+# lapse gap.) The margin is
 # ABSOLUTE, not a fraction of the ask: Retry-After counts down to a fixed
 # deadline, so a machine polling into a block another one opened sees only
 # the remainder, and a fraction of that shrinks toward zero exactly when it
@@ -178,11 +184,19 @@ BACKOFF_MAX_SHIFT = 32
 # 75 observations land mid-block (not block-opening); the lapse gap is each
 # block's next observation's timestamp minus the PRIOR block's deadline —
 # where a block has more than one observation (a mid-block deadline
-# revision), "the block's deadline" means its OPENING observation's deadline,
-# the same one "40 of them opened at exactly K=3600" reads. Picking the
-# block's LAST observation's deadline instead reproduces neither the "21 of
-# 36" nor the "2 of 38" figures this comment used to carry — that pairing was
-# never disclosed and does not reproduce from the method as stated.
+# revision), "the block's deadline" means its OPENING observation's deadline
+# — the reading used below and the same one "40 of them opened at exactly
+# K=3600" reads, so every figure in this comment stays internally consistent
+# on one reading. Picking the block's LAST observation's deadline instead
+# does NOT fail to reproduce: it is equally stable at every tolerance from 5s
+# to 900s and gives "21 of 36"/"2 of 38", the figures this comment used to
+# carry before round 8. The two readings differ on exactly ONE gap (acct2
+# block11→12): its opening observation asks K=3600, but two later
+# observations in the same block report a deadline 903s EARLIER, so OPENING
+# reads that gap as -900.1s (excluded, negative) while LAST reads it as
+# +3.0s (included, a lapse inside the band). Either reading sizes the
+# constant identically — both put the band edge at +887s, so
+# RETRY_AFTER_MARGIN_S = 900 clears it with 13s to spare under both.
 RETRY_AFTER_MARGIN_S = 900.0
 # Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
 # account for hours. Sized to clear the measured shape: 40 of 41 observed
@@ -567,7 +581,8 @@ def _failure_backoff_s(
         # PARK BOUND split by arm): still dead, because this branch is only
         # reached when `rate_limited` is True, and that is exactly the arm
         # the PARK BOUND still caps at `RETRY_AFTER_FLOOR_CAP_S`. Confirmed
-        # by mutation: removing it survives the full suite.
+        # by mutation: adding it back (`min(x, RETRY_AFTER_FLOOR_CAP_S)`
+        # around the line below) survives the full suite.
         asked = retry_after_s + RETRY_AFTER_MARGIN_S
     # PARK BOUND — every ask is capped, but by the ceiling ITS OWN arm's trust
     # actually uses, not a single shared constant. This restores nothing about
