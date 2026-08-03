@@ -171,6 +171,68 @@ class TestReadTextWithRetry:
             read_text_with_retry(target, attempts=0)
 
 
+class TestSkipifArgumentsAreEvaluatedEverywhere:
+    """A `skipif` ARGUMENT runs at collection on every platform.
+
+    So a POSIX-only call in one decorator is reached even when a second
+    decorator below it would skip the test on Windows — and Windows has no
+    `os.geteuid`, so the module fails to IMPORT and the whole suite stops:
+
+        collected 1819 items / 1 error
+        E   AttributeError: module 'os' has no attribute 'geteuid'
+        !!! Interrupted: 1 error during collection !!!
+
+    Nothing in the suite could catch that, because the suite is what dies.
+    This asserts the property directly instead: every `skipif` condition in
+    this module must be evaluable on a platform where the POSIX-only names
+    are absent.
+    """
+
+    def test_no_skipif_condition_calls_a_posix_only_name_unguarded(self):
+        import ast
+        import pathlib
+
+        src = pathlib.Path(__file__).read_text()
+        # Names that do not exist on Windows. A call to one of these inside a
+        # skipif condition must be short-circuited by a platform test to its
+        # LEFT, in the same expression — a separate decorator cannot do it.
+        posix_only = {"geteuid", "getuid", "geteguid", "getgid"}
+        offenders = []
+
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr in posix_only):
+                continue
+            offenders.append(fn.attr)
+
+        # Every such call must sit inside a BoolOp whose earlier operand tests
+        # the platform, so `or`/`and` short-circuits before it is reached.
+        guarded = []
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.BoolOp):
+                continue
+            for i, operand in enumerate(node.values):
+                if i == 0:
+                    continue
+                for sub in ast.walk(operand):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr in posix_only
+                    ):
+                        earlier = ast.dump(node.values[0])
+                        if "platform" in earlier:
+                            guarded.append(sub.func.attr)
+
+        assert sorted(offenders) == sorted(guarded), (
+            f"POSIX-only calls {offenders} but only {guarded} are behind a "
+            "platform short-circuit — an unguarded one is evaluated at "
+            "COLLECTION on Windows and takes the whole suite down"
+        )
+
+
 class TestStrictRosterReadBranches:
     """`_read_json(strict=True)`'s OSError and non-dict branches were both
     reachable and both unkilled. `_get_sequence_data` is strict because ~59
@@ -197,11 +259,6 @@ class TestStrictRosterReadBranches:
         with pytest.raises(ConfigError, match="not a JSON object"):
             self._switcher(tmp_path)._read_json(p, strict=True)
 
-    # ONE condition, and the POSIX check must be INSIDE it. `skipif`'s argument
-    # is evaluated at COLLECTION, on every platform, so `os.geteuid()` in a
-    # second decorator runs before the win32 skip above it can apply — and
-    # Windows has no `geteuid`, so the module fails to import and the WHOLE
-    # suite is interrupted (1819 collected / 1 error), not just this test.
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
         reason="POSIX mode semantics; root reads through a 0000 mode",
