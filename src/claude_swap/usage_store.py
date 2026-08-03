@@ -501,9 +501,10 @@ def _failure_backoff_s(
         # WHAT ACTUALLY BOUNDS IT is the identity `cap == 3600 + MARGIN` in
         # `test_the_cap_sits_inside_the_trust_it_relies_on`, NOT the
         # `cap <= RATE_LIMIT_TRUST_MAX_AGE_S` inequality that test also states.
-        # The inequality admits [4500, 7200], and at 7200 the same three blocks
-        # go blind 14400s (2.3x). Reason about this from blind time; the
-        # constant comparison does not imply it. Pinned by
+        # The inequality admits [4500, 7200], and at 7200 an ask of 6300s or
+        # more pushes the wait itself to 7200, taking the same three blocks
+        # from 6300s to 14400s blind (2.3x). Reason about this from blind
+        # time; the constant comparison does not imply it. Pinned by
         # `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
         #
         # Every other failure falls back to TRUST_MAX_AGE_S = 3600s — and

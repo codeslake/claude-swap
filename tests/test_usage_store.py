@@ -480,13 +480,15 @@ class TestBackoff:
         with "a 4500s wait sits comfortably inside its own trust"
         (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured on
         this tree by mutating the constant and running the full suite, the
-        inequality below admits `[4500, 7200]` — 4499 fails 11, 7201 fails 1.
+        inequality below admits `[4500, 7200]` — 4499 fails 12, 7201 fails 1.
 
         The inequality is NOT what bounds blind time. It compares two
-        constants; raising the cap to 7200 satisfies it while more than
-        doubling the blind window over consecutive blocks (6300s -> 14400s,
-        measured). The IDENTITY assertion below is what actually stops that
-        drift, and it is the reason this test still fails at 7200. See
+        constants; raising the cap to 7200 satisfies it while, at an ask of
+        6300s or more (where the wait itself reaches the raised cap), more
+        than doubling the blind window over consecutive blocks (6300s ->
+        14400s, measured). The IDENTITY assertion below is what actually
+        stops that drift, and it is the reason this test still fails at
+        7200. See
         `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
 
         That leaves 2700s of slack in which the constant can drift silently, so
@@ -605,7 +607,8 @@ class TestBackoff:
 
         WHY THIS IS A TEST AND NOT A COMMENT FIX. The inequality in
         `test_the_cap_sits_inside_the_trust_it_relies_on` admits [4500, 7200],
-        and at 7200 the same three blocks go blind 14400s — 2.3x. What
+        and at 7200 an ask of 6300s or more drives the wait itself to 7200,
+        taking the same three blocks from 6300s to 14400s blind — 2.3x. What
         actually stops that drift is the IDENTITY assertion
         (`cap == 3600 + MARGIN`) in that same test, not the inequality the
         comment reasons from. Pin the consequence directly so the bound is
