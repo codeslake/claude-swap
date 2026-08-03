@@ -762,6 +762,68 @@ class TestBackoff:
         # added: 300 is under BACKOFF_CAP_S, where our own curve governs.
         assert usage_store._failure_backoff_s(1, 300.0) == pytest.approx(300.0)
 
+    def test_park_bound_blind_window_equals_age_at_failure(self, tmp_path):
+        """PIN, not fix: the PARK BOUND caps the park, never the blind window.
+
+        The PARK BOUND (`asked = min(asked, ceiling ...)`, right below this
+        test's target) compares a `now`-relative duration (`asked`) against a
+        `fetchedAt`-relative ceiling (`TRUST_MAX_AGE_S` /
+        `RATE_LIMIT_TRUST_MAX_AGE_S`). Those only agree when the row was
+        already fresh (age 0) at the moment it failed — round-7 review found
+        an earlier comment here wrongly claimed this bound closed the gap in
+        general ("the blind window was always 0"); it does not, on either
+        arm, and this is pre-existing upstream behaviour left open
+        (documented, not fixed, in this PR — see the PARK BOUND comment).
+
+        Driven end-to-end through the real `store.record()` /
+        `entries().decision_value()`, not a hand-rolled stand-in, on the
+        non-429 arm where the park cap equals TRUST_MAX_AGE_S (3600)
+        exactly, so the gap is the whole story rather than diluted by 429
+        trust's extra slack. `age_at_fail=0` is the CONTROL: no gap.
+        """
+        IDENT_1 = {"1": ("a@example.com", "")}
+
+        def blind_window(age_at_fail: float, ask: float) -> float:
+            clock = FakeClock()
+            store = UsageStore(tmp_path / f"cache-{age_at_fail}-{ask}", clock=clock)
+            store.record({"1": FetchRecord(usage={"five_hour": {"pct": 1.0}})}, IDENT_1)
+            clock.advance(age_at_fail)
+            store.record(
+                {"1": FetchRecord(error="http-500", retry_after_s=ask)}, IDENT_1
+            )
+            park_end = store.entries(IDENT_1)["1"].backoff_until
+            assert park_end is not None
+            blind_start = None
+            t = clock.now
+            while t < park_end:
+                clock.now = t
+                entry = store.entries(IDENT_1)["1"]
+                if entry.in_backoff(clock.now) and entry.decision_value() is None:
+                    blind_start = t
+                    break
+                t += 1.0
+            clock.now = park_end
+            return 0.0 if blind_start is None else park_end - blind_start
+
+        # (age_at_fail, ask, expected blind window)
+        cases = [
+            (0.0, 5000.0, 0.0),  # CONTROL: fresh at failure, no gap
+            (1.0, 5000.0, 1.0),
+            (120.0, 5000.0, 120.0),
+            (300.0, 5000.0, 300.0),
+            (1800.0, 5000.0, 1800.0),
+            (3599.0, 5000.0, 3599.0),
+            (300.0, 4000.0, 300.0),
+            (300.0, 3600.0, 300.0),
+            (300.0, 600.0, 0.0),  # park itself (600) is short: never blind
+        ]
+        for age_at_fail, ask, expected in cases:
+            blind = blind_window(age_at_fail, ask)
+            assert blind == pytest.approx(expected, abs=2.0), (
+                f"age@fail={age_at_fail:.0f} ask={ask:.0f}: blind window "
+                f"{blind:.0f}s, expected {expected:.0f}s"
+            )
+
 
 class TestIdentityGuard:
     def test_slot_reuse_hides_old_usage(self, store):

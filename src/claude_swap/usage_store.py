@@ -575,12 +575,64 @@ def _failure_backoff_s(
     # TRUST_MAX_AGE_S (3600) elapses past the last success, not
     # RETRY_AFTER_FLOOR_CAP_S — so a non-429 ask above 3600 parked the row
     # 900s past its own trust: blind (un-pollable AND unknown) for that whole
-    # margin, a regression this PR introduced against upstream/main (there
-    # RETRY_AFTER_FLOOR_CAP_S was 3600, identical to TRUST_MAX_AGE_S, so the
-    # blind window was always 0). See
-    # `test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses`. The 429
-    # arm keeps RETRY_AFTER_FLOOR_CAP_S (4500), correctly inside its own
-    # ceiling RATE_LIMIT_TRUST_MAX_AGE_S (7200).
+    # margin. See `test_each_arm_is_bounded_by_the_ceiling_its_own_trust_uses`.
+    # The 429 arm keeps RETRY_AFTER_FLOOR_CAP_S (4500), correctly inside its
+    # own ceiling RATE_LIMIT_TRUST_MAX_AGE_S (7200).
+    #
+    # CORRECTED 2026-08-03 — the line above does NOT close the blind window
+    # in general, on either arm, and an earlier version of this comment
+    # wrongly claimed it did ("a regression this PR introduced against
+    # upstream/main ... the blind window was always 0"). That is false,
+    # measured. The bound below compares the wrong pair of quantities:
+    # `asked` is a DURATION measured from the FAILURE (now), but the ceiling
+    # it is capped against (`RETRY_AFTER_FLOOR_CAP_S` / `TRUST_MAX_AGE_S`) is
+    # an AGE measured from the last SUCCESS (`fetchedAt`), which `entries()`
+    # actually uses. Those agree only when the row was already fresh (age 0)
+    # at the moment it failed — the blind window otherwise equals the row's
+    # AGE AT FAILURE, up to the whole park. Measured end-to-end through
+    # `store.record()` / `entries().decision_value()`, with a control (row
+    # already fresh at failure -> no gap):
+    #
+    #  age@fail     ask    park   blind  starts  verdict
+    #         0    5000    3600       0    None  ok      <- CONTROL
+    #         1    5000    3600       0    None  ok
+    #       120    5000    3600     119  3481.0  blind
+    #       300    5000    3600     299  3301.0  blind
+    #      1800    5000    3600    1799  1801.0  blind
+    #      3599    5000    3600    3598     2.0  blind
+    #       300    4000    3600     299  3301.0  blind
+    #       300    3600    3600     299  3301.0  blind
+    #       300     600     600       0    None  ok
+    #
+    # Blind = the row is in backoff (un-pollable) AND `decision_value()` is
+    # None (unknown) at the same instant. The blind window equals the age at
+    # failure, up to the whole park. Every row above is the non-429
+    # (`rate_limited=False`) arm, where the park cap equals TRUST_MAX_AGE_S
+    # (3600) exactly — the ask=4000/3600 rows show the SAME park (3600) as
+    # ask=5000 once the ask exceeds the ceiling, and ask=600 shows a park
+    # shorter than the ceiling never goes blind at all (its own curve is the
+    # binding constraint, not the ceiling).
+    #
+    # THIS IS PRE-EXISTING, not a regression this PR introduced: the
+    # orchestrator ran the identical probe against a real upstream/main
+    # worktree and got a byte-identical table. Upstream's
+    # RETRY_AFTER_FLOOR_CAP_S also equalled TRUST_MAX_AGE_S (3600), so the
+    # coincidence only ever hid this for a FIRST failure at age 0 — never in
+    # general. `autoswitch.py` reads a blind row as `active_headroom is None`
+    # and turns it into failover pressure — the exact downstream consequence
+    # round 6 was written to remove, and did not.
+    #
+    # DECISION: left open in this PR, not closed. The honest fix is
+    # `min(asked, ceiling - age_at_failure)`, which needs `_failure_backoff_s`
+    # to know the row's age at the moment it failed — a real signature
+    # change. `record()` is its only production caller, but well over a
+    # dozen tests across this file and `tests/test_autoswitch.py` call
+    # `_failure_backoff_s` directly against its current two-positional-plus-
+    # `rate_limited` shape, so widening it ripples well past this bound.
+    # This round's charge is comment accuracy and test rigor, not a new
+    # defect fix riding on an already-narrow, already-reviewed PARK BOUND
+    # change; conflating the two works against reviewability. Tracked as a
+    # follow-up, not fixed here.
     asked = min(asked, RETRY_AFTER_FLOOR_CAP_S if rate_limited else TRUST_MAX_AGE_S)
     # NO TRUST TRIM AGAINST THE SERVER'S DEADLINE. Cutting a 429 wait back to
     # the deadline when the stored trust expires first cannot salvage that
