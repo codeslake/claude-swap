@@ -141,20 +141,76 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
 
 
 _REAL_STORE_SPECS = _freeze_real_store_specs()
+# Frozen alongside _REAL_STORE_SPECS, at the same moment — see
+# _derive_real_store_hints for why this must be a snapshot passed in
+# explicitly rather than a live Path.home() call at hint-derivation time.
+_HOME_AT_FREEZE_TIME = Path.home()
 
 
-# Cheap pre-filter substrings: every protected root's basename contains one
-# of these, OR the target is a direct child of $HOME (recursive=False roots
-# resolve to $HOME itself when CLAUDE_CONFIG_DIR is unset — ~/.claude.json
-# lives there). Checked before any Path resolution, so the overwhelming
-# majority of audit events (Python's own imports, pytest's internals,
-# unrelated stdlib file activity — the guard fires on EVERY "open"
-# system-wide for the whole test run) are rejected with a plain substring
-# scan, not a function call into claude_swap.paths.
-_REAL_STORE_HINTS = (".claude", "claude-swap")
+def _derive_real_store_hints(
+    specs: tuple[tuple[Path, bool], ...], home: Path,
+) -> tuple[str, ...]:
+    """Cheap pre-filter substrings, checked before any Path resolution so the
+    overwhelming majority of audit events (Python's own imports, pytest's
+    internals, unrelated stdlib file activity — the guard fires on EVERY
+    "open" system-wide for the whole test run) are rejected with a plain
+    substring scan, not a function call into claude_swap.paths.
+
+    C2: this used to be a hardcoded guess, ``(".claude", "claude-swap")`` —
+    correct for the two DEFAULT roots (the XDG backup root always ends in
+    ``/claude-swap``, the config home in ``/.claude``), but a developer with
+    ``CLAUDE_CONFIG_DIR=$HOME/work-profile`` exported has their real store at
+    ``~/work-profile/.credentials.json``, which contains neither substring —
+    so the pre-filter rejected it before the (correct) specs loop ever ran,
+    and the write went through. ``CLAUDE_CONFIG_DIR`` is arbitrary; a fixed
+    guess can't anticipate it. Deriving the hints from every FROZEN root's
+    own basename closes that class of gap entirely — any root actually
+    protected gets a hint for free, including a future one — while the two
+    defaults stay unioned in as a floor (``.name`` is empty for a root
+    resolving to ``/``).
+
+    One root is deliberately EXCLUDED from this: ``Path.home()`` itself
+    (``get_global_config_path().parent``/``get_default_global_config_path()
+    .parent`` when no ``CLAUDE_CONFIG_DIR`` is set, or no legacy
+    ``.config.json``). Its basename is the developer's OS username, and
+    every path on the machine tends to contain it (``/tmp/pytest-of-
+    <user>/...``, any project under their home directory) — using it as a
+    pre-filter hint would make the "cheap reject" match almost everything,
+    defeating the pre-filter's purpose while adding nothing: this root's
+    only protected direct children are the hardcoded, always-dot-claude-
+    prefixed ``~/.claude.json``/``~/.claude.json.lock``/``~/.claude.lock``
+    (see ``_freeze_real_store_specs``'s docstring), which the ``.claude``
+    floor hint already catches. Known residual: a developer who sets
+    ``CLAUDE_CONFIG_DIR`` to their bare ``$HOME`` (not a subdirectory) would
+    reintroduce a narrower version of the C2 gap for that one degenerate
+    config, since a root that happens to equal ``home`` is excluded
+    regardless of why it resolved there. Not fixed here: the brief's own
+    reproduction (and every realistic override) points at a *subdirectory*
+    of ``$HOME``, never ``$HOME`` itself.
+
+    ``home`` is a required parameter, not a live ``Path.home()`` call inside
+    this function: callers (including tests that recompute ``specs`` under a
+    monkeypatched ``Path.home``) must pass the SAME home that produced
+    ``specs``. A live lookup here would silently disagree with it whenever
+    something ELSE patches ``Path.home`` afterward — measured directly: the
+    autouse ``_isolate_real_home`` fixture does exactly that for any test
+    without its own ``temp_home``, which reintroduced ``$HOME``'s basename
+    into the hints for every such test despite the module-level global
+    (computed once, correctly, at conftest import time) excluding it.
+    """
+    return tuple(
+        {".claude", "claude-swap"}
+        | {root.name for root, _r in specs if root.name and root != home}
+    )
+
+
+_REAL_STORE_HINTS = _derive_real_store_hints(_REAL_STORE_SPECS, _HOME_AT_FREEZE_TIME)
 
 _WRITE_EVENTS = frozenset(
-    {"open", "os.rename", "os.mkdir", "os.remove", "os.rmdir", "shutil.rmtree"}
+    {
+        "open", "os.rename", "os.mkdir", "os.remove", "os.rmdir",
+        "shutil.rmtree", "os.symlink", "os.truncate",
+    }
 )
 
 
@@ -191,10 +247,26 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         candidates = (path,)
     elif event == "os.rename":
         # Covers os.replace too (same underlying audit event) — args are
-        # (src, dst, src_dir_fd, dst_dir_fd); only the DESTINATION matters,
-        # a rename FROM inside a protected root but landing outside it is
-        # not a write into the store.
+        # (src, dst, src_dir_fd, dst_dir_fd). I-1: the SOURCE matters too,
+        # not only the destination — `shutil.move`'s `os.rename` (which is
+        # what `migrate_legacy_backup_dir` uses) relocates the protected
+        # root itself when the source is inside it and the destination is
+        # not, the same "make the store disappear from where every reader
+        # expects it" shape the `shutil.rmtree` branch below exists for.
+        candidates = (args[0], args[1])
+    elif event == "os.symlink":
+        # I-2: args are (src, dst, dir_fd) — `src` is the link's TARGET
+        # (arbitrary, may point anywhere) and is not itself written; `dst`
+        # is the link path being CREATED, which is the write. A symlink
+        # planted inside a protected root is exactly the same "make a
+        # write elsewhere alias into the store" shape a hardlink or bind
+        # mount would be — only the destination matters here.
         candidates = (args[1],)
+    elif event == "os.truncate":
+        # I-4: `os.truncate(path, length)` destroys content in place without
+        # going through `open`, so it reached none of the write-mode checks
+        # above. args are (path, length).
+        candidates = (args[0],)
     elif event == "shutil.rmtree":
         # `sys.audit("shutil.rmtree", path, dir_fd)` fires ONCE, at the top,
         # before a single child is touched. The fd-based walk it then runs
@@ -202,14 +274,16 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         # support) removes children by name RELATIVE to an open directory fd
         # — `os.remove('seq.json', dir_fd=...)` — so hooking the per-child
         # `os.remove`/`os.rmdir` events (like every other write event here)
-        # can't see them: their `path` argument is never absolute, and
-        # `target.is_absolute()` below correctly (for every OTHER event)
-        # rejects a relative candidate as out of scope. `shutil.rmtree`'s own
-        # top-level event is the one place a relative-by-dir_fd deletion is
-        # still announced with an absolute path — refusing here stops the
-        # walk before its first unlink, instead of refusing on the final
-        # `os.rmdir(path)` after every child is already gone. Measured
-        # before this branch existed: 5 entries -> 0, guard raised anyway.
+        # can't see them at all: a `dir_fd`-relative name is resolved by the
+        # KERNEL against that fd, not against `os.getcwd()`, so there is no
+        # candidate string this hook could even join against (unlike I-3's
+        # relative paths below, which genuinely do resolve against cwd).
+        # `shutil.rmtree`'s own top-level event is the one place a
+        # relative-by-dir_fd deletion is still announced with an absolute
+        # path — refusing here stops the walk before its first unlink,
+        # instead of refusing on the final `os.rmdir(path)` after every
+        # child is already gone. Measured before this branch existed:
+        # 5 entries -> 0, guard raised anyway.
         #
         # Unlike every other event here, `path` is `sys.audit`'s VERBATIM
         # first argument to `shutil.rmtree()` — a caller passing a `Path`
@@ -226,13 +300,43 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         candidates = (args[0],)
 
     for candidate in candidates:
-        if isinstance(candidate, (bytes, int)) or candidate is None:
+        if candidate is None or isinstance(candidate, int):
             continue
-        if not any(hint in candidate for hint in _REAL_STORE_HINTS):
+        if isinstance(candidate, bytes):
+            # I-5: a bytes path (`open(b"/path", ...)`) reached `hint in
+            # candidate` below as a `bytes in bytes` substring test against
+            # a `str` hints tuple, which is never True for any real path —
+            # not a false positive, a silent skip. Decode so every
+            # candidate reaches the SAME str-space check regardless of how
+            # the caller spelled the path; malformed bytes fail closed
+            # (reported, not silently ignored) rather than bypassing the
+            # filter the way the original silent mismatch did.
+            try:
+                candidate = os.fsdecode(candidate)
+            except (UnicodeDecodeError, ValueError):
+                candidate = str(candidate)
+        # Cheap reject on the raw string first — the overwhelming common
+        # case (an absolute path with no hint substring) never pays for a
+        # cwd lookup or a Path() construction below.
+        hinted = any(hint in candidate for hint in _REAL_STORE_HINTS)
+        if not hinted and not os.path.isabs(candidate):
+            # I-3: a RELATIVE path is resolved against os.getcwd() by every
+            # syscall this hook guards — `open("sequence.json", "w")` with a
+            # cwd inside a protected root writes there exactly as much as
+            # the absolute spelling would. The raw relative string never
+            # contains a hint substring on its own (it's just a filename),
+            # so the cheap reject above cannot be trusted for it alone —
+            # join against the real cwd and re-check before rejecting.
+            # Relative candidates are rare (pytest/import-machinery/stdlib
+            # activity — the overwhelming majority of audit events — pass
+            # absolute paths), so this extra join only costs the uncommon
+            # case, not the hot path the pre-filter exists for.
+            joined = os.path.join(os.getcwd(), candidate)
+            hinted = any(hint in joined for hint in _REAL_STORE_HINTS)
+            candidate = joined
+        if not hinted:
             continue  # cheap reject — the common case
         target = Path(candidate)
-        if not target.is_absolute():
-            continue  # relative paths under a protected root never occur here
         for root, recursive in _REAL_STORE_SPECS:
             hit = (
                 target == root or root in target.parents

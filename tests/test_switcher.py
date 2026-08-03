@@ -6065,6 +6065,66 @@ class TestMacosKeychainFallback:
         assert not s._backup_enc_path("1", "a@example.com").exists()
         assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
 
+    # -- .prev retention on an unreadable current generation --------------
+
+    def test_prev_keychain_item_retained_readable_control(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """CONTROL: a normal overwrite (current generation readable) must
+        retain the outgoing bytes as a ``.prev`` Keychain item — the
+        baseline against which the unreadable-path probe below is judged."""
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "gen-1")
+        s._write_account_credentials("1", "a@example.com", "gen-2")
+        assert (SECURITY_SERVICE, "account-1-a@example.com.prev") in block_real_keychain.data
+        assert s._store._read_previous_backup("1", "a@example.com") == "gen-1"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_prev_keychain_item_retained_when_current_read_fails(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """C1: on the one input where the fail-open (``unresolved``) is most
+        likely to be wrong — the current generation's read FAILED rather
+        than finding nothing — ``_retain_previous_backup`` used to ``return``
+        without writing anything, so the write it could not protect against
+        proceeded with no recovery cushion at all. ``.prev`` is a Keychain
+        item on macOS (not a file), which is why a file-only probe would
+        miss this.
+
+        The current generation lives in an unreadable ``.enc`` (permissions,
+        mid-unmount) — not a locked Keychain — so the Keychain capability
+        cache stays healthy and the write still routes to the Keychain,
+        isolating the one variable under test: whether retention itself
+        wrote a ``.prev``.
+        """
+        s = self._macos_switcher()
+        store = s._store
+        store._write_backup_enc("1", "a@example.com", "gen-1")
+        enc = store._backup_enc_path("1", "a@example.com")
+
+        enc.chmod(0o000)
+        try:
+            value, unreadable = store._read_account_credentials_ex("1", "a@example.com")
+            assert unreadable is True, f"premise: the .enc read must FAIL, got {(value, unreadable)}"
+            s._write_account_credentials("1", "a@example.com", "gen-2")
+        finally:
+            if enc.exists():
+                enc.chmod(0o600)
+
+        assert (SECURITY_SERVICE, "account-1-a@example.com.prev") in block_real_keychain.data, (
+            "DEFECT: the current generation's read failed (not absent) — the "
+            "outgoing bytes must still be retained as .prev, since the "
+            "write's own fail-open proceeds regardless of whether retention "
+            "happened"
+        )
+        assert s._store._read_previous_backup("1", "a@example.com") == "gen-2", (
+            "the true previous generation is unrecoverable here, so the "
+            "incoming credential is retained as a checkpoint instead"
+        )
+
     # -- healthy-Mac no-op guard & follow-up ------------------------------
 
     def test_healthy_mac_reads_create_no_files(
@@ -7237,6 +7297,12 @@ class TestStashAndRetentionStore:
         silent no-op. Retention is best-effort, but "the backup is intact
         and merely unreadable this instant" must not look identical in the
         logs to "there was never anything to retain".
+
+        C1 (a later fix on this same function) changed what happens after
+        the warning: the true previous generation is unrecoverable here, so
+        the incoming credential is retained as a ``.prev`` checkpoint
+        instead of leaving no ``.prev`` at all — see
+        ``test_prev_keychain_item_retained_when_current_read_fails``.
         """
         import logging
 
@@ -7253,8 +7319,9 @@ class TestStashAndRetentionStore:
         finally:
             enc.chmod(0o600)
 
-        assert store._read_previous_backup("1", "a@b.c") == "", (
-            "premise: an unreadable current backup cannot be copied to .prev"
+        assert store._read_previous_backup("1", "a@b.c") == "gen-2", (
+            "the current generation could not be read, so the incoming "
+            "credential is retained as a checkpoint (C1)"
         )
         assert any(
             "could not be retained" in r.message.lower()
