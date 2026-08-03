@@ -31,9 +31,10 @@ from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 _logger = logging.getLogger("claude-swap")
 
 def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> None:
-    """Record a path getter's raise at DEBUG, every time it happens.
+    """Record a path getter's raise, every time it happens. DEBUG by default.
 
-    NOT a WARNING, and no cap. Both were wrong, and measured wrong through the
+    THE LEVEL IS THE CALLER'S, and only `clear_wiring` passes WARNING. No cap.
+    Both a cap and a blanket WARNING were wrong, and measured wrong through the
     real CLI rather than reasoned about.
 
     A once-per-PROCESS cap cannot suppress anything here: the statusline hook
@@ -55,12 +56,27 @@ def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> No
     overwriting the whole 4MB history every ~22.7h — the damage the code
     claimed to prevent, created by the code that claimed it.
 
-    DEBUG keeps the observability that was genuinely missing (both getters
-    swallowed the raise silently) without paying for it every tick: the
-    rotating handler does not record DEBUG by default, so the record is there
-    for anyone who turns the level up and costs nothing when nobody has.
+    So the default is DEBUG, for the two getters `heal` calls unconditionally.
+    It keeps the observability that was genuinely missing (both swallowed the
+    raise silently) without paying for it every tick: the rotating handler does
+    not record DEBUG by default, so the record is there for anyone who turns
+    the level up and costs nothing when nobody has. `clear_wiring` overrides to
+    WARNING because it is gated (see its call site) and is the only place that
+    names WHY a wiring could not be removed.
     """
-    _logger.log(level, "%s could not be resolved: %s", get.__name__, exc)
+    # `stacklevel=2` ATTRIBUTES THE RECORD TO THE CALLER. Without it all three
+    # call sites' records are identical in origin — same `funcName`, same
+    # `pathname`, same `lineno`, this line — so nothing downstream can tell the
+    # per-tick getters from the gated one. That is not academic: the guard on
+    # this split could only key on LEVEL, which made it pass on a fixture that
+    # never reached `clear_wiring` at all, and fail on the correct WARNING as
+    # soon as the fixture was hardened. With it, `record.funcName` is
+    # `_wiring_present` / `_wired_ports` / `clear_wiring`.
+    #
+    # Production output is UNCHANGED: `logging_config` formats
+    # "%(asctime)s - %(levelname)s - %(message)s" and never renders funcName,
+    # filename or lineno.
+    _logger.log(level, "%s could not be resolved: %s", get.__name__, exc, stacklevel=2)
 
 
 def _install_how() -> str:
@@ -270,6 +286,13 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         # The probe is bounded well under the launch budget rather than given
         # the default 2s: a black-holed port must not turn a launch-path guard
         # into the stall it was written to avoid.
+        #
+        # `clear_wiring`'s WARNING is self-limiting HERE only in the same
+        # sense it is inside `heal` (see its call site) — the gate goes false
+        # when the removal succeeds, not otherwise — so an unremovable wiring
+        # logs a line per LAUNCH too (measured: 6 launches, 6 lines; 0 with
+        # nothing wired). At human cadence that is negligible, which is why
+        # the churn arithmetic lives at the statusline call site and not here.
         try:
             if _wiring_is_stale(switcher, connect_timeout=_LAUNCH_PROBE_S):
                 clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
@@ -384,14 +407,38 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
             # WARNING HERE ONLY. `heal` reaches `clear_wiring` through
-            # `_wiring_is_stale`, which goes false the moment the wiring is
-            # removed — so this logs once and goes quiet, which is what
-            # `cae7cfa` did correctly before I broke it. The two getters
-            # `heal` calls UNCONDITIONALLY stay at DEBUG; putting WARNING
-            # there is what produced 12 lines per 6 ticks. Measured: this
-            # split gives 0 lines/tick in the ordinary case and 6 in the
-            # pathological one where a config genuinely cannot be repaired
-            # and a human needs to know why.
+            # `_wiring_is_stale`, which goes false ONCE THE REMOVAL SUCCEEDS
+            # — so this logs once and goes quiet, which is what `cae7cfa` did
+            # correctly before I broke it. The two getters `heal` calls
+            # UNCONDITIONALLY stay at DEBUG; putting WARNING there is what
+            # produced 12 lines per 6 ticks.
+            #
+            # SELF-LIMITING ONLY WHEN THE REMOVAL SUCCEEDS, which is not the
+            # same as always. A wiring that can NEVER be removed — a
+            # read-only config dir, the OSError-30 case `switcher.py`
+            # documents — keeps `_wiring_is_stale` true forever, and that is
+            # the exact condition this WARNING exists to explain. Measured
+            # through the real CLI, 10 ticks each:
+            #
+            #   nothing wired               0 lines,    unwired
+            #   stale, removed on tick 1    1 line,     unwired
+            #   stale, unremovable         10 lines,    still wired
+            #
+            # 165 B/line x 43200 ticks/day = 6.80 MB/day, overwriting the 4 MB
+            # rotating history every 14.1 h — worse than the 4.2 MB/day and
+            # 22.7 h round 13 condemned.
+            #
+            # KEPT ANYWAY, at WARNING. `cae7cfa` behaved identically and
+            # shipped; the churn is bounded to a machine that is genuinely
+            # broken, and there the user is being told "could not be removed
+            # — re-run `cswap pin --heal`" every tick with nothing naming the
+            # cause. A silent log is the worse failure.
+            #
+            # Narrowing it to fire only when `clear_wiring` is about to
+            # return False was the alternative and it buys nothing: measured,
+            # the unremovable case IS the False return, so all 10 lines
+            # survive the narrowing, and the only line it removes is the
+            # single one from the case that already self-limits.
             _log_unresolvable(get, exc, logging.WARNING)
             continue
         if path not in paths:
