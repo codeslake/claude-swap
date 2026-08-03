@@ -30,27 +30,37 @@ from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
 _logger = logging.getLogger("claude-swap")
 
-# Path getters that raised, by name — logged the first time, silent after.
-# `heal` polls on a timer (the status line, ~2s cadence) and the condition an
-# unresolvable getter reports (no HOME, no /etc/passwd entry) is PERSISTENT:
-# it does not fix itself between ticks. Logging every occurrence would write
-# ~6MB/day at that cadence and overwrite the ENTIRE 4MB/3-backup rotating
-# history (logging_config.py: maxBytes=1MB, backupCount=3) roughly every
-# 15.5 hours — the record destroys every other record before anyone reads
-# it. Shared across every caller resolving these getters (clear_wiring,
-# _wiring_present, _wired_ports all do) via one module-level set, so a
-# single heal tick that reaches all three logs the getter once total, not
-# once per function.
-_unresolvable_warned: set[str] = set()
-
-
 def _warn_unresolvable_once(get, exc: BaseException) -> None:
-    """Log a path getter's raise the first time this process sees it."""
-    name = get.__name__
-    if name in _unresolvable_warned:
-        return
-    _unresolvable_warned.add(name)
-    _logger.warning("%s could not be resolved: %s", name, exc)
+    """Record a path getter's raise at DEBUG, every time it happens.
+
+    NOT a WARNING, and no cap. Both were wrong, and measured wrong through the
+    real CLI rather than reasoned about.
+
+    A once-per-PROCESS cap cannot suppress anything here: the statusline hook
+    spawns `cswap pin --heal` fresh on a ~2s cadence (`pin-ensure`), `heal`'s
+    only caller is `pin.run(..., heal_only=True)` from `cli.py`, and there is
+    no long-lived daemon. The cap's lifetime IS one tick.
+
+    Worse, adding the warning to `_wiring_present` and `_wired_ports` — which
+    `heal` calls on EVERY tick regardless of wiring state — inverted the thing
+    it claimed to fix. Counting lines in the real rotating log with an
+    unreadable `~/.claude`:
+
+        tick   before        after adding it
+        1      0             1
+        6      0             6
+
+    Before, the warning was reachable only from `clear_wiring`, gated behind
+    `_wiring_is_stale`, so it logged once and went quiet. After, ~4.2MB/day,
+    overwriting the whole 4MB history every ~22.7h — the damage the code
+    claimed to prevent, created by the code that claimed it.
+
+    DEBUG keeps the observability that was genuinely missing (both getters
+    swallowed the raise silently) without paying for it every tick: the
+    rotating handler does not record DEBUG by default, so the record is there
+    for anyone who turns the level up and costs nothing when nobody has.
+    """
+    _logger.debug("%s could not be resolved: %s", get.__name__, exc)
 
 
 def _install_how() -> str:
