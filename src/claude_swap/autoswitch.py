@@ -1432,15 +1432,26 @@ class AutoSwitchEngine:
         and of the two failure modes the permanent proactive lockout is the
         worse one, because it is persisted and survives a restart and a week of
         wall clock. Absence of evidence releases.
+
+        That is "no snapshot" - the key ABSENT. A failover departure writes a
+        snapshot too, but with both values `null` (`active_headroom` is
+        unreadable by definition, and its `inf` recovery serializes that way):
+        the key is PRESENT with unknown values, which is real evidence that
+        the departure's severity could not be measured, not an absence of
+        evidence. The conservative default for unknown severity is to HOLD the
+        bar, not release it - the recovery leg or the ratio release in
+        `_no_return_account` can still lift it once real evidence shows up.
         """
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
             return True
         barred = str(came_from)
+        if "leftHeadroom" not in state:
+            return True          # pre-upgrade record: genuinely no evidence
         left_headroom = state.get("leftHeadroom")
         left_recovery = state.get("leftRecoveryAt")
         if left_headroom is None and left_recovery is None:
-            return True
+            return False         # failover: real departure, severity unknown -> hold
         h = headroom.get(barred)
         if (
             isinstance(left_headroom, (int, float))
