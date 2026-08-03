@@ -1029,6 +1029,7 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     # stops writing it, or an unrelated var of the same name) sitting in
     # either config and pointing at a dead port makes `_wiring_is_stale`
     # True with nothing of cswap's actually wired.
+    #
     # Measured with this line deleted: `_wiring_present=False`,
     # `_wired_ports=[<dead>]`, `_wiring_is_stale=True`, and `heal()` reports
     # "Removed a cloud pin wiring…" while the config is byte-for-byte
@@ -1293,6 +1294,7 @@ def heal(switcher) -> tuple[bool, str]:
     # change, and `heal` reported "Removed a cloud pin wiring" while the
     # session config still named the dead port — every new session from that
     # terminal kept booting against it.
+    #
     # THE SAME QUESTION `_wiring_is_stale` ASKS, not `_wiring_present` alone.
     # `_wiring_present` keys on the marker only, so a config carrying the
     # marker with no readable CSWAP_PIN_PORT satisfied it and got torn down
