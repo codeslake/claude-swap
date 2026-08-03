@@ -30,6 +30,29 @@ from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
 _logger = logging.getLogger("claude-swap")
 
+# Path getters that raised, by name — logged the first time, silent after.
+# `heal` polls on a timer (the status line, ~2s cadence) and the condition an
+# unresolvable getter reports (no HOME, no /etc/passwd entry) is PERSISTENT:
+# it does not fix itself between ticks. Logging every occurrence would write
+# ~6MB/day at that cadence and overwrite the ENTIRE 4MB/3-backup rotating
+# history (logging_config.py: maxBytes=1MB, backupCount=3) roughly every
+# 15.5 hours — the record destroys every other record before anyone reads
+# it. Shared across every caller resolving these getters (clear_wiring,
+# _wiring_present, _wired_ports all do) via one module-level set, so a
+# single heal tick that reaches all three logs the getter once total, not
+# once per function.
+_unresolvable_warned: set[str] = set()
+
+
+def _warn_unresolvable_once(get, exc: BaseException) -> None:
+    """Log a path getter's raise the first time this process sees it."""
+    name = get.__name__
+    if name in _unresolvable_warned:
+        return
+    _unresolvable_warned.add(name)
+    _logger.warning("%s could not be resolved: %s", name, exc)
+
+
 def _install_how() -> str:
     """The install COMMAND for this install method, on its own.
 
@@ -350,7 +373,7 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
         try:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
-            _logger.warning("%s could not be resolved: %s", get.__name__, exc)
+            _warn_unresolvable_once(get, exc)
             continue
         if path not in paths:
             paths.append(path)
@@ -569,7 +592,8 @@ def _wiring_present(_switcher) -> bool:
         # `_wiring_present` had no such guard and raised.
         try:
             path = get()
-        except Exception:  # noqa: BLE001 — unresolvable: no opinion
+        except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
+            _warn_unresolvable_once(get, exc)
             continue
         if path in seen:
             continue
@@ -880,7 +904,8 @@ def _wired_ports() -> list[int]:
         # ``(False, 'Could not heal…')``.
         try:
             path = get()
-        except Exception:  # noqa: BLE001 — unreadable/unresolvable: no opinion
+        except Exception as exc:  # noqa: BLE001 — unreadable/unresolvable: no opinion
+            _warn_unresolvable_once(get, exc)
             continue
         if path in seen:
             continue
