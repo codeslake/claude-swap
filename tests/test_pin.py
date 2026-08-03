@@ -6,6 +6,7 @@ install, not as a traceback.
 """
 
 import json
+import os
 import pathlib
 import sys
 
@@ -4163,11 +4164,27 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # with nothing wired, `_wiring_is_stale` is False and `heal` never
         # calls `clear_wiring` at all, so the assertion below was never once
         # applied to the call site whose level it was written to pin.
+        # THE TWO WAYS THIS FILTER GOES EMPTY ARE DIFFERENT BUGS and it used
+        # to name only one. "never reached them" is the vacuous-fixture case
+        # this assertion exists for. But add ONE frame between a call site and
+        # `_log_unresolvable`'s `log` call and `stacklevel=2` names the
+        # wrapper instead of the caller: every record still fires, the filter
+        # still empties, and the old message sent the reader looking for a
+        # fixture fault that is not there. Measured with that frame added:
+        # `Origins seen: ['_log_unresolvable']` — the emitter itself, which
+        # `stacklevel` exists to keep OUT of `funcName`.
+        emitted = [r for r in records if "could not be resolved" in r.getMessage()]
         assert per_tick, (
             "no unresolvable-getter record came from "
-            f"{self._PER_TICK_SITES} — this tick never reached them, so the "
-            f"level assertion below proves nothing. Origins seen: "
-            f"{sorted({r.funcName for r in records})}"
+            f"{self._PER_TICK_SITES}, so the level assertion below proves "
+            + (
+                "nothing — the getters DID log, but the records are "
+                "attributed elsewhere: `_log_unresolvable`'s `stacklevel=2` "
+                "no longer names its caller (a frame added in between?). "
+                if emitted
+                else "nothing — this tick never reached them. "
+            )
+            + f"Origins seen: {sorted({r.funcName for r in records})}"
         )
         # BELOW INFO, not merely below WARNING. The logger sits at INFO by
         # default (`logging_config.setup_logging`), so an INFO record reaches
@@ -4209,6 +4226,20 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # level-only assertion reported it as "an unresolvable getter logged
         # at or above INFO", while this one reports
         # `[('clear_wiring', 30), ('proper_lockfile', 30)]` and names it.
+        #
+        # THE BREADTH IS THE POINT, AND IT CANNOT BE NARROWED BY NAME. This
+        # reads `caplog.records`, which is root-scoped, so ANY logger's INFO+
+        # record inside the window breaks the equality — deliberately: a tick
+        # costs 43200 lines a day whoever wrote them. Filtering to
+        # `r.name == "claude-swap"` would not even remove the one reachable
+        # intruder anyone worries about: `claude_locks` calls
+        # `getLogger("claude-swap")` too (claude_locks.py:63), so
+        # `proper_lockfile`'s release WARNING carries that same record name
+        # and survives the filter. Origin is the only axis that separates
+        # them, which is why this asserts on `funcName`.
+        #
+        # The ORDER the equality also pins is not load-bearing at one element;
+        # a second record fails the test either way and the message names it.
         loud = [(r.funcName, r.levelno) for r in records if r.levelno >= logging.INFO]
         assert loud == [("clear_wiring", logging.WARNING)], (
             "a tick with work to do must warn exactly once, from the ONE call "
@@ -4460,4 +4491,94 @@ class TestTheSelfLimitingCallSiteStillWarns:
             "clear_wiring logged below WARNING — this call site is gated "
             "behind _wiring_is_stale so it cannot churn, and it is the only "
             "place that names WHY a wiring could not be removed"
+        )
+
+
+class TestTheLockFailureThatStrandsTheWiringIsNamed:
+    """`heal` says "could not be removed (the config is locked)" and nothing
+    anywhere says WHICH config or WHY.
+
+    The unresolvable-getter WARNING above is NOT this record. That one needs
+    `Path.home()` to raise, and on the shape it fires it names
+    `get_default_global_config_path` — a DIFFERENT config from the stuck one,
+    which resolves fine through `get_global_config_path`. Measured on the
+    flagship shape the comments cite (read-only config dir, HOME perfectly
+    resolvable): five `heal` ticks, the "could not be removed" message every
+    time, ZERO log records at any level, and the swallowed cause was
+    `PermissionError: [Errno 13] ... '<session>/.claude.json.lock'`.
+
+    So the case the WARNING was kept for was the one case the WARNING could
+    not reach. `clear_wiring`'s `except Exception: continue` around the lock
+    is where that fact dies.
+
+    KEYED ON ORIGIN, as the round-16 guards are: every record from
+    `_log_unresolvable` is emitted from the same line, so `record.funcName`
+    (via `stacklevel=2`) is the only thing that tells the call sites apart.
+    A new record on `heal`'s path that is not attributable the same way
+    cannot be distinguished from a per-tick regression.
+    """
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root): root writes into "
+        "a 0o500 dir regardless, so the lock never fails",
+    )
+    def test_a_lock_that_cannot_be_taken_names_the_config_and_the_errno(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+        import types
+
+        from claude_swap import pin
+
+        # A read-only DIRECTORY, not a read-only file: `proper_lockfile` takes
+        # the lock with `os.mkdir`, and the config itself must stay readable
+        # so the run gets all the way to the lock rather than failing earlier.
+        #
+        # HOME points somewhere harmless rather than being made to raise —
+        # that is the whole point of this shape — but it must still be
+        # redirected: `get_default_global_config_path` resolves through it,
+        # and the real `~/.claude.json` is not this test's to lock.
+        cfg = _cfg(tmp_path, "session", _dead_port())
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg.parent))
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        cfg.parent.chmod(0o500)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+                changed, message = pin.heal(sw)
+        finally:
+            cfg.parent.chmod(0o700)  # or tmp_path cleanup cannot remove it
+
+        # The user-visible half of the defect, so the test fails loudly if the
+        # fixture ever stops reaching the stranded state it is about.
+        assert not changed and "could not be removed" in message, (
+            f"fixture did not reach the stranded shape: {(changed, message)}"
+        )
+
+        named = [
+            r
+            for r in caplog.records
+            if r.funcName == "clear_wiring" and r.levelno >= logging.WARNING
+        ]
+        # THE CONFIG MUST BE NAMED INDEPENDENTLY OF THE ERRNO. `PermissionError`
+        # renders the LOCK path, which contains the config path as a prefix, so
+        # the naive `str(cfg) in message` passes on the exception text alone:
+        # measured, dropping `path` from the log call entirely still satisfied
+        # it. Removing the lock path first makes the two facts separable, and
+        # does it without pinning which order the message puts them in.
+        assert any(
+            str(cfg) in r.getMessage().replace(f"{cfg}.lock", "")
+            and "Permission denied" in r.getMessage()
+            for r in named
+        ), (
+            "heal told the user the wiring could not be removed and nothing "
+            "logged WHICH config or WHY — the exact silence the "
+            "unresolvable-getter WARNING is kept for, on the one shape that "
+            f"WARNING cannot reach. Records: "
+            f"{[(r.funcName, r.levelname, r.getMessage()) for r in caplog.records]}"
         )
