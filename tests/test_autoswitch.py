@@ -4735,6 +4735,65 @@ class TestHorizonAxisDoesNotFlap:
             "proactive tick"
         )
 
+    def test_a_failover_hold_still_escapes_at_limit(self, temp_home):
+        """The failover hold blocks the PROACTIVE return, not every return.
+
+        `_no_return_account` scopes at-limit and failover out of the bar by
+        design (`if trigger not in ("proactive", "consume-first"): return
+        None`) — a failover-installed hold hard-blocks the proactive path via
+        `_left_account_recovered`'s unconditional `return False`, but that
+        predicate is never even consulted on the at-limit path. Without this
+        test, a permanent-forever hold (e.g. accidentally deleting the
+        trigger scope check, or a future refactor routing at-limit through
+        the same predicate) would pass every other test in this class and
+        strand the engine on an exhausted account with a healthy peer sitting
+        right there.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = None
+        for _ in range(3):  # unhealthy_ticks default is 3
+            outcome = h.tick_with_usage({
+                "1": None,                              # unreadable -> failover
+                "2": _usage(4, self._days_out(h, 400)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.engine._read_state()
+        assert "leftHeadroom" in state, (
+            "premise: _perform writes the keys unconditionally even on failover"
+        )
+        assert state.get("leftHeadroom") is None
+        assert state.get("leftRecoveryAt") is None
+
+        h.clock.advance(301.0)
+        outcomes = []
+        for _ in range(3):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(96, self._days_out(h, 500)),   # frozen, 4 pts
+                "2": _usage(98, self._days_out(h, 400)),   # active, burnt to 2 pts
+            }))
+            h.clock.advance(301.0)
+        assert TickOutcome.SWITCHED not in outcomes, (
+            f"{[o.name for o in outcomes]} — premise broken: the failover "
+            "hold should still be blocking the proactive return here"
+        )
+
+        outcome = h.tick_with_usage({
+            "1": _usage(0, self._days_out(h, 500)),     # barred, but FULL quota
+            "2": _usage(100, self._days_out(h, 400)),   # active, exhausted -> at-limit
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "the failover hold blocked an at-limit escape onto a healthy peer "
+            "— that is a permanent lockout, not the bounded hold this "
+            "predicate is supposed to produce"
+        )
+        assert h.active_number() == 1
+
     def test_the_release_fires_when_the_barred_account_recovered(
         self, temp_home
     ):
