@@ -5868,6 +5868,36 @@ class ClaudeAccountSwitcher:
         )
         return entry_id
 
+    def _read_target_credentials(self, account_num: str, email: str) -> str:
+        """The switch target's stored credential, or a SwitchError naming why.
+
+        One helper because `_perform_switch` reads the target twice — the
+        direct-activation branch (fresh machine, post-import, --force) and
+        the normal branch (every ordinary switch on a working install) — and
+        only the first carried the unreadable check. The normal branch sent
+        every ordinary `cswap switch` to "Re-add with: cswap --add-account",
+        which burns the stored grant of a slot whose backup is merely behind
+        a locked Keychain. `session.py`'s `_bootstrap` carried a third copy.
+        """
+        creds, unreadable = self._read_account_credentials_ex(
+            account_num, email
+        )
+        if creds:
+            return creds
+        if unreadable:
+            # The backup may exist but the Keychain cannot be read right now
+            # (locked / non-GUI session) — a re-add would needlessly burn the
+            # stored grant.
+            raise SwitchError(
+                f"Account-{account_num}'s backup is in the macOS Keychain "
+                f"but it is unreadable right now (locked or no GUI "
+                f"session). Retry from a GUI terminal; do not re-add."
+            )
+        raise SwitchError(
+            f"Account-{account_num} has no stored credentials. "
+            f"Re-add with: cswap --add-account --slot {account_num}"
+        )
+
     def _refuse_session_shell(self) -> None:
         """Refuse live-store mutation from inside a ``cswap run`` shell.
 
@@ -5996,28 +6026,10 @@ class ClaudeAccountSwitcher:
                     from_ref = account_ref(None, current_identity[0])
                 else:
                     from_ref = account_ref(int(current_account), current_identity[0])
-                target_creds = self._read_account_credentials(
+                target_creds = self._read_target_credentials(
                     target_account, target_email
                 )
-                backup_unreadable = (
-                    not target_creds and self._store._keychain_unreadable
-                )
                 target_config = self._read_account_config(target_account, target_email)
-                if not target_creds:
-                    if backup_unreadable:
-                        # The backup may exist but the Keychain cannot be
-                        # read right now (locked / non-GUI session) — a
-                        # re-add would needlessly burn the stored grant.
-                        raise SwitchError(
-                            f"Account-{target_account}'s backup is in the "
-                            f"macOS Keychain but it is unreadable right now "
-                            f"(locked or no GUI session). Retry from a GUI "
-                            f"terminal; do not re-add."
-                        )
-                    raise SwitchError(
-                        f"Account-{target_account} has no stored credentials. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
-                    )
                 if not target_config:
                     raise SwitchError(
                         f"Account-{target_account} has no stored config backup. "
@@ -6361,16 +6373,11 @@ class ClaudeAccountSwitcher:
                     self._logger.info(f"Backed up account {current_account}")
 
                 # Step 2: Retrieve target account
-                target_creds = self._read_account_credentials(
+                target_creds = self._read_target_credentials(
                     target_account, target_email
                 )
                 target_config = self._read_account_config(target_account, target_email)
 
-                if not target_creds:
-                    raise SwitchError(
-                        f"Account-{target_account} has no stored credentials. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
-                    )
                 if not target_config:
                     raise SwitchError(
                         f"Account-{target_account} has no stored config backup. "

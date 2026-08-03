@@ -625,8 +625,18 @@ class SessionManager:
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)
 
-        creds = self.switcher.read_account_credentials(account_num, email)
+        creds, unreadable = self.switcher._read_account_credentials_ex(
+            account_num, email
+        )
         if not creds:
+            if unreadable:
+                # Third copy of the switch path's message; same reason not to
+                # send the user to a re-add over a locked Keychain.
+                raise SessionError(
+                    f"Account-{account_num}'s backup is in the macOS Keychain "
+                    f"but it is unreadable right now (locked or no GUI "
+                    f"session). Retry from a GUI terminal; do not re-add."
+                )
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"
