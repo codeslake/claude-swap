@@ -3279,7 +3279,18 @@ class TestNoFixtureNamesARealDaemonPort:
         here = pathlib.Path(__file__)
         offenders = []
         for path in sorted(here.parent.glob("test_*.py")):
-            text = path.read_text()
+            # encoding="utf-8" EXPLICITLY. `read_text()` uses the platform
+            # default, which is cp1252 on the Windows runner — this lint reads
+            # every test file in the tree, and one of them carries a byte
+            # cp1252 has no mapping for, so the lint died on an encoding error
+            # while the file it was reading was perfectly fine:
+            #
+            #     UnicodeDecodeError: 'charmap' codec can't decode byte 0x8f
+            #     in position 7322: character maps to <undefined>
+            #
+            # A source file's encoding is UTF-8 by definition (PEP 3120), so
+            # the platform default is never the right answer for reading one.
+            text = path.read_text(encoding="utf-8")
             tree = ast.parse(text)
             skip = set()
             for n in ast.walk(tree):
