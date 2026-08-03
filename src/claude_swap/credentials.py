@@ -1531,18 +1531,40 @@ class CredentialStore:
             pass
         return entries
 
-    def _read_unclaimed_credential(self, entry_id: str) -> str:
-        """Decode one stashed credential's bytes; "" when unreadable/absent."""
+    def _read_unclaimed_credential(self, entry_id: str) -> tuple[str, bool]:
+        """Decode one stashed credential's bytes.
+
+        Returns ``(value, unreadable)`` -- the same shape as
+        ``_read_account_credentials_ex``. ``unreadable`` is True when the
+        entry file EXISTS but its bytes could not be read (locked
+        Keychain-adjacent volume, mid-unmount, transient EIO/permissions).
+        A stash entry exists only because a prior gate pass already
+        consumed a grant and could not persist the successor -- the entry
+        is the SOLE copy of that generation, so the caller must not treat
+        a transient read failure as "nothing to adopt".
+
+        A genuinely ABSENT entry, or one that exists but is CORRUPT
+        (undecodable base64 -- its bytes are unrecoverable, not merely
+        inaccessible right now), both return ``("", False)``: there is
+        nothing a retry could ever adopt either way.
+        """
+        path = self._stash_entry_path(entry_id)
         try:
-            encoded = self._stash_entry_path(entry_id).read_text(
-                encoding="utf-8"
-            ).strip()
-            return base64.b64decode(encoded, validate=True).decode("utf-8")
+            encoded = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return "", False
+        except OSError as e:
+            self._host._logger.warning(
+                f"Unclaimed credential {entry_id} unreadable: {e}"
+            )
+            return "", True
+        try:
+            return base64.b64decode(encoded, validate=True).decode("utf-8"), False
         except Exception as e:
             self._host._logger.warning(
-                f"Failed to read unclaimed credential {entry_id}: {e}"
+                f"Failed to decode unclaimed credential {entry_id}: {e}"
             )
-            return ""
+            return "", False
 
     def _remove_unclaimed_credential(self, entry_id: str) -> None:
         """Delete a stash entry (bytes + manifest row) after it was adopted."""

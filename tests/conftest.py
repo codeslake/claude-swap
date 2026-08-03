@@ -125,24 +125,46 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
 
     ambient_specs = _resolve()
 
-    saved_env = {
-        k: os.environ.get(k)
-        for k in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME")
-    }
-    for k in saved_env:
-        os.environ.pop(k, None)
-    try:
-        default_specs = _resolve()
-    finally:
-        for k, v in saved_env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    def _resolve_with_cleared(*names: str) -> tuple[tuple[Path, bool], ...]:
+        saved = {k: os.environ.get(k) for k in names}
+        for k in saved:
+            os.environ.pop(k, None)
+        try:
+            return _resolve()
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    default_specs = _resolve_with_cleared(
+        "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"
+    )
+    # C-0: a THIRD snapshot, additive to (not replacing) default_specs above.
+    # The mandated review/CI isolation recipe sets HOME/USERPROFILE (and
+    # XDG_DATA_HOME) BEFORE the interpreter starts — before conftest is even
+    # imported — so neither ambient_specs (ambient HOME) nor default_specs
+    # (HOME still ambient, only XDG/CLAUDE_CONFIG_DIR cleared) ever resolves
+    # to the account's TRUE real-store roots in that shape: both see the
+    # scratch HOME. Clearing HOME/USERPROFILE too makes `Path.home()` fall
+    # back to the OS account home (`pwd` on POSIX), which is what a real
+    # developer's real store sits under regardless of what the recipe
+    # exported. Kept as its own pass rather than folded into default_specs:
+    # default_specs' contract (XDG/CLAUDE_CONFIG_DIR cleared, HOME left
+    # exactly as ambient) is relied on elsewhere in this test suite (e.g. a
+    # test that clears XDG_DATA_HOME mid-run via monkeypatch and asserts on
+    # the HOME-ambient-only resolution) — folding HOME into the same clear
+    # collapses that distinct combination and silently drops the roots it
+    # used to protect.
+    home_default_specs = _resolve_with_cleared(
+        "CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME",
+        "HOME", "USERPROFILE",
+    )
 
     seen: set[Path] = set()
     merged: list[tuple[Path, bool]] = []
-    for root, recursive in (*default_specs, *ambient_specs):
+    for root, recursive in (*default_specs, *home_default_specs, *ambient_specs):
         if root in seen:
             continue
         seen.add(root)

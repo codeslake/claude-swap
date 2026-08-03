@@ -10650,6 +10650,145 @@ class TestUnreadableBackupIsNotAbsent:
         )
 
 
+class TestStashReaderUnreadableVsAbsent:
+    """I-1: ``_read_unclaimed_credential`` collapses UNREADABLE onto ABSENT
+    (its own docstring says so), so ``_adopt_stashed_successor`` silently
+    declines and the gate falls through to POSTing the store's spent
+    generation instead of adopting the live successor sitting right there.
+
+    Rows A/B/C mirror the review's measured table exactly. The corrupt-entry
+    row is a fourth, distinct state: its bytes are genuinely unrecoverable
+    (not merely inaccessible right now), so it must keep its CURRENT
+    behaviour byte-identical before and after the fix.
+    """
+
+    _OLD = json.dumps({
+        "claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-old",
+                          "expiresAt": 1000}})
+    _NEW = json.dumps({
+        "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new",
+                          "expiresAt": 9999999999000}})
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    def _stash_successor(self, s):
+        return s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "1",
+             "consumedFp": oauth.credential_fingerprint(self._OLD),
+             "fingerprint": oauth.credential_fingerprint(self._NEW)},
+        )
+
+    def _post_rejects_spent(self, credentials, **kw):
+        # The gate is only ever exercised here with the spent snapshot as
+        # input; the adopted-successor path short-circuits before any POST.
+        assert credentials == self._OLD, (
+            f"posted something other than the spent snapshot: {credentials!r}"
+        )
+        return oauth.RefreshOutcome(None, "invalid_grant")
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_row_a_unreadable_entry_does_not_post_the_spent_generation(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """ROW A: the stash entry exists but is momentarily unreadable
+        (locked Keychain, mid-unmount, transient EIO). Adoption must DEFER,
+        not fall through to POSTing the store's already-spent generation."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        entry_path = s._store._stash_entry_path(self._stash_successor(s))
+        entry_path.chmod(0o000)
+        try:
+            with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                       side_effect=self._post_rejects_spent) as post:
+                out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+        finally:
+            entry_path.chmod(0o600)
+
+        assert not post.called, (
+            "DEFECT: an unreadable stash entry made adoption fall through "
+            "and POST the spent generation it was supposed to replace"
+        )
+        assert out.error == "transient", (
+            f"unreadable stash entry -> error={out.error!r}; the entry is "
+            "the only copy of the live credential, so the gate must defer, "
+            "never report the spent-generation POST's invalid_grant"
+        )
+        assert s.list_unclaimed_credentials(), (
+            "the entry must survive for the next pass to adopt"
+        )
+
+    def test_row_b_control_readable_entry_adopts(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """ROW B (control): a readable entry adopts normally. Must stay
+        true before and after the fix -- the fix only touches the unreadable
+        branch."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor(s)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert not post.called, "adopted successor must short-circuit the POST"
+        assert out.error is None
+        assert out.credentials == self._NEW
+        assert not s.list_unclaimed_credentials(), "stash entry consumed"
+
+    def test_row_c_control_nothing_stashed_posts_the_snapshot(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """ROW C (control): nothing stashed, so the gate has no successor to
+        adopt and must POST the snapshot. Must stay true before and after
+        the fix."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._post_rejects_spent) as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert post.called
+        assert out.error == "invalid_grant"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_corrupt_entry_keeps_its_current_behaviour(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """A CORRUPT (undecodable) stash entry is a different defect from an
+        unreadable one: its bytes are genuinely gone, not just momentarily
+        inaccessible. It must keep POSTing the spent snapshot exactly as it
+        does today -- the fix must not change this row at all."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        entry_path = s._store._stash_entry_path(self._stash_successor(s))
+        entry_path.write_text("not-valid-base64!!!", encoding="utf-8")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._post_rejects_spent) as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert post.called, (
+            "a corrupt (undecodable) entry must behave like ABSENT, not "
+            "like unreadable -- its bytes are unrecoverable, not just "
+            "temporarily inaccessible"
+        )
+        assert out.error == "invalid_grant"
+
+
 class TestSessionShellGuardCoversEveryMutator:
     """H-4: `_refuse_session_shell`'s docstring claims "a shared chokepoint
     so every entry point is covered once", but the chokepoint it sits on is
