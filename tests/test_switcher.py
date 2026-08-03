@@ -3914,10 +3914,48 @@ class TestDeadTokenQuarantine:
         row["fetchedAt"] -= 1860.0
         store.path.write_text(json.dumps(table))
 
-        # THE COLLECTOR'S OWN RETURN VALUE. Calling `store.entries(ident,
-        # ("Fable",))` here re-supplies the models this test exists to check
-        # were passed — measured, stripping `models` from BOTH call sites left
-        # this test green while the wiring was gone.
+        # BOTH RETURN PATHS, and the FETCHING one first. `_collect_usage_entries`
+        # has two `store.entries(identities, models)` sites: :3520 on the
+        # no-fetch path and :3581 on the post-fetch re-read. On a tick that
+        # actually fetched — every 429 tick, which is this one — :3520's value
+        # is discarded and :3581 is what comes back. Asserting only on a
+        # follow-up `fetch=set()` call covered the line that does NOT run:
+        # measured, mutating :3581 alone left the whole suite green.
+        # THE FETCHING PATH. `_collect_usage_entries` reads the store twice —
+        # :3520 before the fetch and :3581 after it — and on a tick that
+        # fetched, :3581's value is the one returned. Only :3520 was covered:
+        # measured, mutating :3581 alone left the whole suite green.
+        #
+        # `record()` is what makes this hard to reach. `models` only changes an
+        # answer while `lastError == "http-429"`, and any second fetch rewrites
+        # that row — a usage payload clears it, a fresh 429 resets `fetchedAt`
+        # so the window is no longer past. Four earlier revisions of this
+        # assertion each passed with the wiring cut, each for a different one
+        # of those reasons.
+        #
+        # BACKOFF MUST BE PAST, or `reserve` refuses and `if claims:` never
+        # opens — measured, `claims={}` on the second call and :3581 was
+        # unreachable through six earlier shapes of this assertion. The row's
+        # own backoff is cleared here rather than by advancing a clock the
+        # store does not share with the test.
+        with store.path.open() as fh:
+            table = json.load(fh)
+        table["accounts"]["2"]["backoffUntil"] = None
+        store.path.write_text(json.dumps(table))
+
+        # And the fetch answers with NOTHING: the slot is claimed so the block
+        # opens and :3581 runs, but `record()` gets an empty `records`, touches
+        # no row, and the re-read sees exactly the state staged above.
+        with patch.object(
+            switcher, "_run_usage_fetches", return_value={},
+        ):
+            fetched = switcher._collect_usage_entries(info, fetch={"2"})["2"]
+        assert fetched.decision_value() is None, (
+            f"the FETCHING path returned a row still serving last_good "
+            f"(trust_extended={fetched.trust_extended}) although its scoped "
+            "window has reset — :3581 never got the configured models"
+        )
+
         returned = switcher._collect_usage_entries(info, fetch=set())["2"]
         assert returned.decision_value() is None, (
             f"the collector RETURNED a row still serving last_good "
