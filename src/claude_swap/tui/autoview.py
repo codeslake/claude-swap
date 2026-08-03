@@ -99,6 +99,17 @@ class AutoScreen(Screen):
         # engine.dry_run`, which also holds for an engine that started LIVE
         # from `--auto` with nobody confirming anything (MAJOR-3).
         self._engine_was_dry_run = True
+        # I1: whether a HUMAN confirmed the modal for the current engine's
+        # live-attempt, on THIS launch. `_engine_was_dry_run` alone is not
+        # enough — a CONTENDED `cswap tui --auto` also starts its engine
+        # dry_run=True (demoted), which makes its later self-promotion look
+        # exactly like the confirmed-then-demoted-then-promoted case
+        # `_engine_was_dry_run` was built to allow, even though `--auto`
+        # never showed the modal at all. Only `_on_live_confirm`'s confirmed
+        # branch sets this True; mount (`--auto` / a resumed
+        # `autoStartLive`) never does, so a contended `--auto` engine's
+        # later self-promotion cannot pass the self-promotion persist below.
+        self._live_confirmed_this_launch = False
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -305,6 +316,7 @@ class AutoScreen(Screen):
             and was_dry_run
             and not engine.dry_run
             and not self._settings.auto_start_live
+            and self._live_confirmed_this_launch
         ):
             self._persist_auto_start_live(True)
         if event.kind == "switch":
@@ -330,6 +342,10 @@ class AutoScreen(Screen):
 
     def _on_live_confirm(self, confirmed: bool | None) -> None:
         if confirmed:
+            # A HUMAN just confirmed the modal for THIS engine's live
+            # attempt — the one fact `_on_engine_event`'s self-promotion
+            # persist needs and a contended `--auto` launch never has (I1).
+            self._live_confirmed_this_launch = True
             # Persist AFTER the engine reports what it actually became: a
             # demotion (another LIVE holder) would otherwise record consent
             # for a LIVE that never ran, and every later launch would
