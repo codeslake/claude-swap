@@ -499,11 +499,19 @@ class ClaudeAccountSwitcher:
         world-readable in a file cswap created. Copied without metadata and
         chmod'ed 0600 explicitly.
 
-        COLLISION. `get_timestamp()` is second-resolution and `copy2` onto an
-        existing name overwrites. Two failed switches inside one second left
-        ONE file — measured, the first user's data unrecoverable. The retry is
-        exactly what a user does next, so the guard lost the bytes precisely
-        when it was needed. A counter suffix makes each copy its own file.
+        COLLISION. The stamp is second-resolution and `copy2` onto an existing
+        name overwrites. Two failed switches inside one second left ONE file —
+        measured, the first user's data unrecoverable. The retry is exactly
+        what a user does next, so the guard lost the bytes precisely when it
+        was needed. A counter suffix makes each copy its own file.
+
+        NAME. The first cut stamped with `get_timestamp()`, whose ISO form
+        carries `:` — forbidden in a Windows filename. Measured on CI (run
+        30774451162): five tests died with `[Errno 22] Invalid argument`, the
+        copy raised, and the switch ABORTED, which is worse than the data loss
+        this guard exists to prevent. `int(time.time())` is what
+        `credentials.py`'s sibling `.corrupt-` aside already uses; reusing it
+        keeps one convention rather than inventing a third.
 
         VISIBILITY. `warnings_out` is only rendered by the JSON envelope. In
         human mode the user saw "Activated Account-1" and nothing else while
@@ -511,7 +519,7 @@ class ClaudeAccountSwitcher:
         other `warnings_out.append` in `_perform_switch` is paired with an
         `if emit_output: warning(msg)`; this one was not.
         """
-        stem = f"{path.name}.unreadable-{get_timestamp()}"
+        stem = f"{path.name}.unreadable-{int(time.time())}"
         salvage = path.with_name(stem)
         n = 1
         while salvage.exists():
