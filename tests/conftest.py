@@ -122,7 +122,9 @@ _REAL_STORE_SPECS = _freeze_real_store_specs()
 # scan, not a function call into claude_swap.paths.
 _REAL_STORE_HINTS = (".claude", "claude-swap")
 
-_WRITE_EVENTS = frozenset({"open", "os.rename", "os.mkdir", "os.remove", "os.rmdir"})
+_WRITE_EVENTS = frozenset(
+    {"open", "os.rename", "os.mkdir", "os.remove", "os.rmdir", "shutil.rmtree"}
+)
 
 
 def _is_write_open(mode: str | None, flags: int) -> bool:
@@ -162,6 +164,33 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         # a rename FROM inside a protected root but landing outside it is
         # not a write into the store.
         candidates = (args[1],)
+    elif event == "shutil.rmtree":
+        # `sys.audit("shutil.rmtree", path, dir_fd)` fires ONCE, at the top,
+        # before a single child is touched. The fd-based walk it then runs
+        # (`_rmtree_safe_fd`, the default on every platform with `dir_fd`
+        # support) removes children by name RELATIVE to an open directory fd
+        # — `os.remove('seq.json', dir_fd=...)` — so hooking the per-child
+        # `os.remove`/`os.rmdir` events (like every other write event here)
+        # can't see them: their `path` argument is never absolute, and
+        # `target.is_absolute()` below correctly (for every OTHER event)
+        # rejects a relative candidate as out of scope. `shutil.rmtree`'s own
+        # top-level event is the one place a relative-by-dir_fd deletion is
+        # still announced with an absolute path — refusing here stops the
+        # walk before its first unlink, instead of refusing on the final
+        # `os.rmdir(path)` after every child is already gone. Measured
+        # before this branch existed: 5 entries -> 0, guard raised anyway.
+        #
+        # Unlike every other event here, `path` is `sys.audit`'s VERBATIM
+        # first argument to `shutil.rmtree()` — a caller passing a `Path`
+        # (every call site in this repo does) reaches this hook as a
+        # `PosixPath`, not the `str` every other event always delivers.
+        # `Path` has no `__contains__`, so the substring hint-check below
+        # would raise `TypeError` on the very case this branch exists for.
+        # `os.fspath` normalizes both to `str`/`bytes` uniformly.
+        try:
+            candidates = (os.fspath(args[0]),)
+        except TypeError:
+            candidates = ()
     else:  # os.mkdir / os.remove / os.rmdir
         candidates = (args[0],)
 
