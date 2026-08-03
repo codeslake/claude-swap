@@ -30,7 +30,7 @@ from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
 _logger = logging.getLogger("claude-swap")
 
-def _warn_unresolvable_once(get, exc: BaseException) -> None:
+def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> None:
     """Record a path getter's raise at DEBUG, every time it happens.
 
     NOT a WARNING, and no cap. Both were wrong, and measured wrong through the
@@ -60,7 +60,7 @@ def _warn_unresolvable_once(get, exc: BaseException) -> None:
     rotating handler does not record DEBUG by default, so the record is there
     for anyone who turns the level up and costs nothing when nobody has.
     """
-    _logger.debug("%s could not be resolved: %s", get.__name__, exc)
+    _logger.log(level, "%s could not be resolved: %s", get.__name__, exc)
 
 
 def _install_how() -> str:
@@ -383,7 +383,16 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
         try:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
-            _warn_unresolvable_once(get, exc)
+            # WARNING HERE ONLY. `heal` reaches `clear_wiring` through
+            # `_wiring_is_stale`, which goes false the moment the wiring is
+            # removed — so this logs once and goes quiet, which is what
+            # `cae7cfa` did correctly before I broke it. The two getters
+            # `heal` calls UNCONDITIONALLY stay at DEBUG; putting WARNING
+            # there is what produced 12 lines per 6 ticks. Measured: this
+            # split gives 0 lines/tick in the ordinary case and 6 in the
+            # pathological one where a config genuinely cannot be repaired
+            # and a human needs to know why.
+            _log_unresolvable(get, exc, logging.WARNING)
             continue
         if path not in paths:
             paths.append(path)
@@ -603,7 +612,7 @@ def _wiring_present(_switcher) -> bool:
         try:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
-            _warn_unresolvable_once(get, exc)
+            _log_unresolvable(get, exc)
             continue
         if path in seen:
             continue
@@ -915,7 +924,7 @@ def _wired_ports() -> list[int]:
         try:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unreadable/unresolvable: no opinion
-            _warn_unresolvable_once(get, exc)
+            _log_unresolvable(get, exc)
             continue
         if path in seen:
             continue

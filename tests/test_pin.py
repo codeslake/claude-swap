@@ -4128,8 +4128,18 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
             pin.heal(sw)
 
-        loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert not loud, f"an unresolvable getter shouted: {[r.getMessage() for r in loud]}"
+        # BELOW INFO, not merely below WARNING. The logger sits at INFO by
+        # default (`logging_config.setup_logging`), so an INFO record reaches
+        # the rotating file on every tick exactly as the WARNING did —
+        # measured: `debug` -> `info` passes all 128 tests while the real CLI
+        # writes 12 lines over 6 ticks. A guard keyed on WARNING lets the
+        # regression land again with CI green.
+        loud = [r for r in caplog.records if r.levelno >= logging.INFO]
+        assert not loud, (
+            "an unresolvable getter logged at or above INFO — the default "
+            f"logger level, so this reaches the file every tick: "
+            f"{[(r.levelname, r.getMessage()) for r in loud]}"
+        )
 
 
 class TestTheLoggerNameStaysPinnedToClaudeSwap:
@@ -4317,3 +4327,58 @@ class TestTheWarningDoesNotFireOnEveryTick:
             "get_default_global_config_path" in r.getMessage()
             for r in caplog.records
         ), "the unresolvable getter left no record at any level"
+
+
+class TestTheSelfLimitingCallSiteStillWarns:
+    """`clear_wiring` is the ONE call site where WARNING was always correct.
+
+    `heal` reaches it only through `_wiring_is_stale`, which goes false the
+    moment the wiring is removed — so it logs once and goes quiet. The two
+    getters `heal` calls UNCONDITIONALLY (`_wiring_present`, `_wired_ports`)
+    are what produced per-tick churn when I put WARNING on them: 12 lines
+    over 6 ticks through the real CLI.
+
+    Dropping everything to DEBUG fixed the churn and threw this away with it.
+    A user whose `~/.claude` becomes unreadable then gets "could not be
+    removed — re-run `cswap pin --heal`" every tick forever, with NOTHING in
+    the log naming the cause. Before the regression, one WARNING named the
+    getter and the errno.
+
+    Measured for the split: 0 lines/tick in the ordinary case, and in the
+    pathological one (raising getter AND a wiring that cannot be removed) 6
+    over 6 ticks — which is a condition a human genuinely needs to see.
+    """
+
+    def test_clear_wiring_warns_when_it_cannot_resolve_a_config(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(
+            pathlib.Path,
+            "home",
+            staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no HOME"))),
+        )
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            pin.clear_wiring(sw, timeout=0.1)
+
+        warned = [
+            r
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "get_default_global_config_path" in r.getMessage()
+        ]
+        assert warned, (
+            "clear_wiring logged below WARNING — this call site is gated "
+            "behind _wiring_is_stale so it cannot churn, and it is the only "
+            "place that names WHY a wiring could not be removed"
+        )
