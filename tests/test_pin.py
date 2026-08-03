@@ -1180,28 +1180,32 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
         )
 
 
-class TestTheRuntimeVersionFloor:
-    """pyproject's floor binds a fresh resolve only.
+class TestTheExtraIsGatedByOneFloorOnly:
+    """The extra's version floor lives in pyproject, and NOWHERE else.
 
-    Anyone who installed cswap-pin before 0.1.1 and later upgrades claude-swap
-    WITHOUT the extra keeps 0.1.0 — the release where a refused swap is handed
-    to the client and ends that process's Remote Control.
+    A hardcoded `_MIN_PIN_VERSION` tuple used to sit in `pin.py` and refuse an
+    older cswap-pin at import time. It was removed because it cannot survive
+    the release cycle: cswap-pin ships on its own schedule, so every release of
+    it needed a matching pull request against THIS project just to raise a
+    constant. A gate whose upkeep depends on someone else's cadence goes stale,
+    and a stale floor is worse than none — it refuses a package the installer
+    has just chosen, blaming the user's version.
 
-    WINDOWS REFUSES BEFORE ANY VERSION IS READ. `_impl` raises on win32 first
-    (POSIX locks and FIFOs), so on Windows every assertion below about the
-    version is unreachable — and the failure that taught this was the quiet
-    kind: `test_an_old_pin_is_refused_by_version` PASSED its `"REFUSED" in out`
-    line there, for the platform, not for the version. A version check that did
-    nothing at all would have passed it too.
+    This is exactly how the sibling extra behaves: `menubar = ["rumps>=0.4.0"]`
+    in pyproject, and `menubar.py` asks only whether the import works. Keeping
+    a bad release out is an install-time job, not one the seam re-litigates on
+    every call.
 
-    So Windows is not skipped, it is asserted separately: the platform refusal
-    is itself a property worth holding, and a bare skip would leave the OS
-    where the seam is most likely to drift with no coverage of it.
+    WINDOWS REFUSES BEFORE ANYTHING ELSE. `_impl` raises on win32 first (POSIX
+    locks and FIFOs), and the failure that taught this was the quiet kind: an
+    older test's bare `"REFUSED" in out` passed there for the PLATFORM, not for
+    the reason it named. So Windows is asserted separately rather than skipped.
     """
 
     WIN = sys.platform == "win32"
 
     def _probe(self, version_literal):
+        """Run `_impl()` against a synthetic cswap_pin carrying any version."""
         import subprocess
         import textwrap
         from pathlib import Path
@@ -1235,26 +1239,54 @@ class TestTheRuntimeVersionFloor:
             [sys.executable, "-c", code], capture_output=True, text=True
         ).stdout
 
-    def test_an_old_pin_is_refused_by_version(self):
-        out = self._probe('pkg.__version__ = "0.1.0"')
-        if self.WIN:
-            assert "not available on Windows" in out, out
-            return
-        # Never a bare `"REFUSED" in out`: that is what passed on Windows for
-        # the wrong reason. The MESSAGE is the assertion.
-        assert "0.1.0 is too old" in out, f"0.1.0 was accepted at runtime: {out}"
+    def test_no_version_is_refused_at_runtime(self):
+        """Any installed version imports. Refusing one here would need a
+        constant this project cannot keep current."""
+        for literal in (
+            'pkg.__version__ = "0.1.0"',
+            'pkg.__version__ = "0.0.1"',
+            "pass",  # a dev checkout with no __version__ at all
+        ):
+            out = self._probe(literal)
+            expected = "not available on Windows" if self.WIN else "ACCEPTED"
+            assert expected in out, f"{literal!r} -> {out}"
+            assert "too old" not in out, f"a runtime floor came back: {out}"
 
-    def test_the_current_version_is_accepted(self):
-        out = self._probe('pkg.__version__ = "0.1.1"')
-        assert ("not available on Windows" if self.WIN else "ACCEPTED") in out, out
+    def test_the_floor_is_declared_in_pyproject(self):
+        """The one place it lives. If this disappears, an install resolves to
+        whatever is newest and the correctness bound is gone entirely."""
+        import re
+        from pathlib import Path
 
-    def test_an_absent_version_is_not_treated_as_old(self):
-        # A dev checkout must not be refused over a guess.
+        root = Path(__file__).resolve().parent.parent
+        text = (root / "pyproject.toml").read_text(encoding="utf-8")
+        assert re.search(r'pin\s*=\s*\[\s*"cswap-pin>=[0-9]', text), (
+            "the pin extra no longer declares a version floor"
+        )
+
+    def test_the_seam_holds_no_version_constant(self):
+        """Asserts the ABSENCE, because the constant is easy to reintroduce and
+        the cost lands on a future release rather than on the commit."""
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parent.parent
+            / "src"
+            / "claude_swap"
+            / "pin.py"
+        ).read_text(encoding="utf-8")
+        assert "_MIN_PIN_VERSION" not in src, (
+            "a runtime version floor is back; raising it needs an upstream PR "
+            "per cswap-pin release"
+        )
+
+    def test_windows_is_still_refused_for_the_platform(self):
+        """Unreachable elsewhere, and the OS where this seam is most likely to
+        drift — so it is asserted rather than skipped."""
+        if not self.WIN:
+            pytest.skip("asserted on Windows only; POSIX path covered above")
         out = self._probe("pass")
-        assert ("not available on Windows" if self.WIN else "ACCEPTED") in out, out
-        # And never for the version, on either platform: "too old" here would
-        # mean an absent version was read as 0.
-        assert "too old" not in out, out
+        assert "not available on Windows" in out, out
 
 
 class TestARound2Regressions:
