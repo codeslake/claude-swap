@@ -33,6 +33,97 @@ def _dead_port() -> int:
     return port
 
 
+def _port_literal_offenders(directory, own_file, own_class_name: str) -> list:
+    """Every line in ``directory``'s test files (and its ``conftest.py``)
+    that hardcodes the pin daemon's port, ``36301`` — the regression guard
+    behind ``TestNoFixtureNamesARealDaemonPort``, extracted so the guard's
+    OWN correctness (self-exemption scope, which files get scanned) is
+    itself testable rather than only exercisable through the one real run
+    against this file.
+
+    THIS IS A REGRESSION GUARD FOR ONE KNOWN LITERAL (``36301``), not a
+    general "no port literal" lint — `36302` and any other value slip
+    through by design. Generalising it was considered and rejected: a
+    matcher broad enough to catch every port literal would also flag the
+    legitimate ones fixtures construct throughout this file (`_dead_port`'s
+    OS-assigned port compared against a wired config, deliberate 0/negative
+    values exercising `OverflowError` paths, and so on), trading one honest
+    known-literal guard for a noisy one nobody could keep green.
+
+    ``own_file``/``own_class_name`` scope the self-exemption to the code that
+    IS this lint, in the file that IS this lint. Matching by class name alone
+    (across every file the glob visits) let a same-named class in a
+    DIFFERENT file inherit the exemption for a real hardcode — a coincidence
+    a routine rename makes more likely, not less, since the replacement name
+    is chosen fresh and nothing stops it colliding with a class elsewhere.
+    Requiring ``path == own_file`` as well closes that: the exemption now
+    answers "is this the lint itself", not just "is this named like it".
+    """
+    import ast
+
+    own_file = own_file.resolve()
+    # THE LINT'S OWN CODE now lives in two places in ITS OWN FILE: the test
+    # class (the caller) and this function (the literal comparison actually
+    # lives here since Task 3 pulled it out to make it independently
+    # testable). Both need the literal to describe it, so both are exempt —
+    # but ONLY in own_file; the name match must never cross files.
+    own_names = {own_class_name, "_port_literal_offenders"}
+
+    paths = sorted(directory.glob("test_*.py"))
+    conftest = directory / "conftest.py"
+    if conftest.exists():
+        paths.append(conftest)
+
+    offenders = []
+    for path in paths:
+        # encoding="utf-8" EXPLICITLY. `read_text()` uses the platform
+        # default, which is cp1252 on the Windows runner — this lint reads
+        # every test file in the tree, and one of them carries a byte
+        # cp1252 has no mapping for, so the lint died on an encoding error
+        # while the file it was reading was perfectly fine:
+        #
+        #     UnicodeDecodeError: 'charmap' codec can't decode byte 0x8f
+        #     in position 7322: character maps to <undefined>
+        #
+        # A source file's encoding is UTF-8 by definition (PEP 3120), so
+        # the platform default is never the right answer for reading one.
+        text = path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+        skip = set()
+        is_own_file = path.resolve() == own_file
+        for n in ast.walk(tree):
+            # A DOCSTRING'S FULL SPAN, not just the line with the
+            # delimiter — `'"""' in line` only caught the opening/closing
+            # line, so a multi-line docstring's own CONTINUATION lines
+            # (the prose this lint is supposed to exempt) still matched.
+            if (
+                isinstance(
+                    n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+                )
+                and n.body
+                and isinstance(n.body[0], ast.Expr)
+                and isinstance(n.body[0].value, ast.Constant)
+                and isinstance(n.body[0].value.value, str)
+            ):
+                doc = n.body[0].value
+                skip.update(range(doc.lineno, doc.end_lineno + 1))
+            # THIS LINT'S OWN CODE, which has to contain the literal to look
+            # for it — without this it flagged itself. Scoped to OWN_FILE:
+            # a same-named class or function elsewhere describes nothing
+            # about the lint and must not borrow its exemption.
+            if (
+                is_own_file
+                and isinstance(n, (ast.ClassDef, ast.FunctionDef))
+                and n.name in own_names
+            ):
+                skip.update(range(n.lineno, n.end_lineno + 1))
+        for i, line in enumerate(text.splitlines(), 1):
+            if "36301" not in line or i in skip or line.lstrip().startswith("#"):
+                continue
+            offenders.append(f"{path.name}:{i}: {line.strip()}")
+    return offenders
+
+
 class TestImportSafeWithoutTheExtra:
     def test_the_module_imports(self):
         """A top-level import of the optional dependency would make cswap
@@ -3144,6 +3235,133 @@ class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
             "launch would tear down a pin that may be perfectly live"
         )
 
+    def test_heal_does_not_tear_down_a_marker_with_no_port(
+        self, tmp_path, monkeypatch
+    ):
+        """`_wiring_is_stale` refuses to call this shape stale (the test
+        above), but `heal` never asks it: it calls `_wired_port_is_serving`
+        directly and unwires on `_wiring_present` alone. So the exact config
+        the guard declares must not be touched is the one `heal` tears down —
+        and `heal` is the worse of the two to leave unguarded, because the
+        status line calls it on a timer, unattended, while the launch path
+        runs once.
+
+        Asserts on the STATE ON DISK (is the marker still there), not on
+        which branch ran — the fix must survive a refactor of heal's control
+        flow, not just today's shape of it.
+        """
+        from claude_swap import pin
+
+        sw, cfg = self._wired_without_port(tmp_path)
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)  # package removed
+
+        pin.heal(sw)
+
+        assert pin._wiring_present(sw) is True, (
+            "heal tore down a wiring whose port could not be read — the "
+            "same inference _wiring_is_stale exists to forbid"
+        )
+
+
+class TestTheGuardIsPerConfigNotPerMachine:
+    """`_wired_port_of` was `next(iter(_wired_ports()), None)` —
+    `_wired_ports()` flattens BOTH configs into one list, so this returned
+    the first port found on the MACHINE, not the port of the config being
+    judged. As soon as ANY config named a port, `_wiring_is_stale` proceeded
+    to the serving check and `clear_wiring` — called from `heal` and from
+    `wire_launch_env` — clears every wired config, live ones included.
+
+    Same class of bug as the OR-over-configs `_wired_port_is_serving`'s own
+    comment records (:821-838), pointing the other way: there the danger was
+    one LIVE config masking a dead one; here it is one DEAD config's port
+    manufacturing an opinion about a config that named none.
+    """
+
+    def _wired_no_port(self, tmp_path, name):
+        """A config carrying the marker with no CSWAP_PIN_PORT — the shape
+        Task 1's fixture uses, now on ONE of two configs rather than the
+        only one.
+
+        No HTTPS_PROXY value: neither predicate under test reads it, so a
+        port in there would describe a proxy nothing asks about."""
+        d = tmp_path / name
+        d.mkdir()
+        cfg = d / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {},
+            "_cswapPinWiredKeys": [],
+        }))
+        return cfg
+
+    def _wired_with_port(self, tmp_path, name, port):
+        d = tmp_path / name
+        d.mkdir()
+        cfg = d / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {"CSWAP_PIN_PORT": str(port)},
+            "_cswapPinWiredKeys": ["CSWAP_PIN_PORT"],
+        }))
+        return cfg
+
+    def test_a_dead_default_does_not_condemn_a_portless_live_session(
+        self, tmp_path, monkeypatch
+    ):
+        """MEASURED (reviewer): session config in the new shape (marker, no
+        port, proxy actually live) + default config carrying an old wiring
+        naming a DEAD port:
+
+            _wired_ports       : [41403]
+            _wired_port_of     : 41403   (the DEFAULT's dead one)
+            _wiring_is_stale   : True
+            session still wired: False   <- the LIVE pin's wiring, gone
+
+        A config that names no port must not have its verdict decided by a
+        DIFFERENT config's port — the default's dead port must not make the
+        session's un-checkable wiring look stale.
+        """
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        cfg_session = self._wired_no_port(tmp_path, "session")
+        cfg_default = self._wired_with_port(tmp_path, "default", _dead_port())
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_session)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg_default)
+
+        assert pin._wiring_is_stale(None) is False, (
+            "the default's dead port condemned the session's portless "
+            "wiring — a config that names no port must not be judged by a "
+            "different config's port"
+        )
+
+    def test_wired_port_of_does_not_borrow_a_different_configs_port(
+        self, tmp_path, monkeypatch
+    ):
+        """Direct unit test on `_wired_port_of` itself: nothing pinned its
+        return value down before this (the reviewer's own tell — mutating it
+        to return the LAST port instead of the FIRST survived the whole
+        suite, 97 passed, because the only consumer was an `is None` check).
+
+        Pins the exact contract: when one wired config names no port and the
+        OTHER names one, the answer is None — not that other config's port.
+        """
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        cfg_session = self._wired_no_port(tmp_path, "session")
+        cfg_default = self._wired_with_port(tmp_path, "default", _dead_port())
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_session)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg_default)
+
+        assert pin._wired_port_of(None) is None, (
+            "a config with no port got the OTHER config's port as its answer"
+        )
+
 
 class TestOneConfigIsOneOpinion:
     """The two config getters resolve to the SAME file outside a session
@@ -3273,52 +3491,54 @@ class TestNoFixtureNamesARealDaemonPort:
     """
 
     def test_no_test_fixture_hardcodes_the_pin_daemon_port(self):
-        import ast
         import pathlib
 
         here = pathlib.Path(__file__)
-        offenders = []
-        for path in sorted(here.parent.glob("test_*.py")):
-            # encoding="utf-8" EXPLICITLY. `read_text()` uses the platform
-            # default, which is cp1252 on the Windows runner — this lint reads
-            # every test file in the tree, and one of them carries a byte
-            # cp1252 has no mapping for, so the lint died on an encoding error
-            # while the file it was reading was perfectly fine:
-            #
-            #     UnicodeDecodeError: 'charmap' codec can't decode byte 0x8f
-            #     in position 7322: character maps to <undefined>
-            #
-            # A source file's encoding is UTF-8 by definition (PEP 3120), so
-            # the platform default is never the right answer for reading one.
-            text = path.read_text(encoding="utf-8")
-            tree = ast.parse(text)
-            skip = set()
-            for n in ast.walk(tree):
-                # A DOCSTRING'S FULL SPAN, not just the line with the
-                # delimiter — `'"""' in line` only caught the opening/closing
-                # line, so a multi-line docstring's own CONTINUATION lines
-                # (the prose this lint is supposed to exempt) still matched.
-                if (
-                    isinstance(
-                        n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
-                    )
-                    and n.body
-                    and isinstance(n.body[0], ast.Expr)
-                    and isinstance(n.body[0].value, ast.Constant)
-                    and isinstance(n.body[0].value.value, str)
-                ):
-                    doc = n.body[0].value
-                    skip.update(range(doc.lineno, doc.end_lineno + 1))
-                # THIS LINT'S OWN CODE, which has to contain the literal to
-                # look for it — without this it flagged itself.
-                if isinstance(n, ast.ClassDef) and n.name == self.__class__.__name__:
-                    skip.update(range(n.lineno, n.end_lineno + 1))
-            for i, line in enumerate(text.splitlines(), 1):
-                if "36301" not in line or i in skip or line.lstrip().startswith("#"):
-                    continue
-                offenders.append(f"{path.name}:{i}: {line.strip()}")
+        offenders = _port_literal_offenders(here.parent, here, self.__class__.__name__)
         assert not offenders, (
             "a fixture hardcodes 36301, the port a real pin daemon uses — on a "
             "machine running the pin these describe a LIVE wiring while "
             "claiming a dead one:\n  " + "\n  ".join(offenders)
+        )
+
+    def test_a_same_named_class_in_another_file_is_not_exempted(self, tmp_path):
+        """The self-exemption used to key on the class name ALONE
+        (``n.name == self.__class__.__name__``), with no check that the
+        matching class lives in the lint's OWN file. A routine rename of
+        this class — or a copy of it landing in another test file, same
+        name — would silently exempt whatever a class of that name
+        contains anywhere in the tree, including a genuine 36301 hardcode
+        that is exactly what this lint exists to catch.
+
+        The exemption must be scoped to the lint's own file, not to any
+        file that happens to define a same-named class.
+        """
+        decoy = tmp_path / "test_decoy.py"
+        decoy.write_text(
+            f"class {self.__class__.__name__}:\n"
+            "    def test_x(self):\n"
+            "        port = 36301\n"
+            "        assert port\n",
+            encoding="utf-8",
+        )
+        offenders = _port_literal_offenders(
+            tmp_path, tmp_path / "test_lint_home.py", self.__class__.__name__
+        )
+        assert offenders, (
+            "a class in ANOTHER file sharing the lint's own class name "
+            "silently exempted a real 36301 hardcode"
+        )
+
+    def test_conftest_py_is_scanned_too(self, tmp_path):
+        """``glob('test_*.py')`` does not match ``conftest.py`` — exactly
+        the file a shared fixture would most naturally live in, and exactly
+        the file this lint's own docstring never mentions as excluded.
+        """
+        (tmp_path / "conftest.py").write_text("port = 36301\n", encoding="utf-8")
+        offenders = _port_literal_offenders(
+            tmp_path, tmp_path / "nonexistent.py", self.__class__.__name__
+        )
+        assert offenders, (
+            "conftest.py was not scanned — a hardcoded 36301 placed there "
+            "would slip past this lint entirely"
         )
