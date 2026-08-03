@@ -4133,9 +4133,16 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # `lineno`/`pathname` either. `pathname` is useless — every record comes
     # from `pin.py`. `lineno` is NOT useless, and the claim that it was is
     # wrong: `stacklevel=2` moves it to the caller exactly as it moves
-    # `funcName`, so the unremovable tick yields THREE distinct linenos —
-    # one per `_log_unresolvable` call site plus the lock WARNING, including
-    # the two that share `funcName == "clear_wiring"`.
+    # `funcName`, so the unremovable tick yields THREE distinct linenos.
+    # NOT one per `_log_unresolvable` site, as this said for two rounds:
+    # there are THREE such sites and this shape reaches only TWO of them,
+    # `_wired_ports` and `clear_wiring`'s getter site. The third lineno is
+    # `clear_wiring`'s lock WARNING — a bare `_logger.warning`, not a
+    # `_log_unresolvable` site at all. So the three are two getter sites plus
+    # the lock WARNING, and the lock WARNING is what separates the two
+    # records that share `funcName == "clear_wiring"`. `_wiring_present`, the
+    # site this shape misses, fires only on the REMOVABLE shape — which this
+    # comment is explicitly not describing (measured on both).
     #
     # `funcName` is chosen because a lineno key is BRITTLE, not because it
     # cannot discriminate. Deliberately not quoting the numbers here: the
@@ -4626,11 +4633,15 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
     not reach. `clear_wiring`'s `except Exception: continue` around the lock
     is where that fact dies.
 
-    KEYED ON ORIGIN, as the round-16 guards are: every record from
-    `_log_unresolvable` is emitted from the same line, so `record.funcName`
-    (via `stacklevel=2`) is the only thing that tells the call sites apart.
-    A new record on `heal`'s path that is not attributable the same way
-    cannot be distinguished from a per-tick regression.
+    KEYED ON ORIGIN, as the round-16 guards are — but NOT because `funcName`
+    is the only axis that can tell the call sites apart, which is what this
+    said for four rounds. `stacklevel=2` moves `lineno` to the caller exactly
+    as it moves `funcName`, so the sites differ on that axis too (measured:
+    the records come out at three distinct linenos, not one). `funcName` is
+    chosen because a lineno key is BRITTLE — see the comment at
+    `_PER_TICK_SITES`, where editing `pin.py`'s COMMENTS alone renumbered two
+    of them. A new record on `heal`'s path that is not attributable the same
+    way cannot be distinguished from a per-tick regression.
 
     THE FIRST TEST BELOW NEEDS NO PERMISSION BITS, and that is why it is
     first. The other two in this class, and the `removable=False` case in
@@ -4697,13 +4708,26 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # Fresh mtime by construction (just created), so the takeover path is
         # NOT the one exercised — the mtime is the only thing keeping this
         # from being the orphan case the test below covers.
-        os.mkdir(cfg.parent / (cfg.name + ".lock"))
+        lock = cfg.parent / (cfg.name + ".lock")
+        os.mkdir(lock)
 
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
             changed, message = pin.heal(sw)
 
-        assert not changed and "could not be removed" in message, (
-            f"fixture did not reach the stranded shape: {(changed, message)}"
+        # THE LOCK DIR SURVIVING IS THE GATE, not the message. `heal` returns
+        # this same `(False, "…could not be removed…")` for ANY raise inside
+        # `clear_wiring`'s per-path `try`, so the message alone does not say
+        # the lock was the thing that failed. Measured by deleting the
+        # `os.mkdir` above: `1 failed, 133 passed` — the message assertion
+        # still passed, because `sw` has no `_write_json` and
+        # `_clear_wiring_locked` raised `AttributeError` INSIDE the lock and
+        # landed in the same `except` (`pin.py:633`), with `proper_lockfile`
+        # never once refused. `proper_lockfile` `rmdir`s in a `finally`
+        # (`claude_locks.py:161`), so the dir is gone whenever it acquired —
+        # it is still here only when it never could, which is this shape.
+        assert lock.is_dir() and not changed and "could not be removed" in message, (
+            "fixture did not reach the stranded shape: "
+            f"{(lock.is_dir(), changed, message)}"
         )
 
         named = [

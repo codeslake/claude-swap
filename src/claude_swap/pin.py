@@ -624,8 +624,23 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             #   tight loop (no sleep)   11 unwire lines, cleared on tick 12
             #   real ~2s statusline      2 unwire lines, cleared on tick 3
             #
+            # THE 2 IS A FUNCTION OF THE COMPETITOR'S 3s, not a property of
+            # the transient case: the line count is however many ticks fit
+            # inside the hold. Same 2s cadence, competitor length moved:
+            #
+            #    3s competitor (above)         2 lines, cleared on tick 3
+            #   30s competitor                14 lines, cleared on tick 15
+            #   30s NON-TOUCHING holder        5 lines, cleared on tick 6
+            #
+            # The non-touching row caps at 5 because `CONFIG_STALENESS_S`
+            # (10.0) lets `proper_lockfile` take the lock over, so the
+            # unbounded shape is a LIVE holder that keeps touching — which is
+            # the first two rows, and is what a Claude Code credential
+            # refresh actually is.
+            #
             # TWO LINES, once, against 43200/day forever. That is what four
-            # lines of mtime arithmetic would buy, and it is not worth it. The
+            # lines of mtime arithmetic would buy, and it is not worth it —
+            # 1:21600 at the documented 3s, still ~1:3000 at 30s. The
             # transient case is self-limiting by construction: the competitor
             # lets go and the very next free tick unwires the config, while
             # the orphan is still on line 43200 with nothing changed.
