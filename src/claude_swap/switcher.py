@@ -4396,12 +4396,20 @@ class ClaudeAccountSwitcher:
         if unreadable:
             return False
         # The stored source, as _build_accounts_info reports it: the LIVE
-        # credential for the active slot, the backup otherwise.
-        stored = (
-            (self._store._read_active_credentials().value or "")
-            if is_active
-            else backup
-        )
+        # credential for the active slot, the backup otherwise. `.value` is
+        # tri-state (`""` genuinely absent, `None` a read ERROR) — collapsing
+        # it with `or ""` fed `credential_fingerprint("")` (None) into
+        # `token_dead`, which treats a None stored_fp as "binds
+        # unconditionally" and condemned a slot whose live credential simply
+        # could not be read this instant. Same "we cannot see it, we cannot
+        # condemn it" rule as the backup guard above.
+        if is_active:
+            active_value = self._store._read_active_credentials().value
+            if active_value is None:
+                return False
+            stored = active_value
+        else:
+            stored = backup
         return self._entry_token_dead(entry, num, email, stored, is_active)
 
     def _entry_token_dead(
