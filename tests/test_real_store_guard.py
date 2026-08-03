@@ -440,6 +440,18 @@ def test_arbitrary_claude_config_dir_is_not_dropped_by_the_hint_prefilter(
             target.write_text('{"pwned": true}', encoding="utf-8")
         assert not target.exists()
     finally:
+        # `ignore_errors=True` swallows OSError ONLY. I-3 deliberately rebased
+        # `RealStoreWriteBlocked` off `PermissionError` so no `except OSError`
+        # can swallow a refusal -- which means this cleanup, whose own paths
+        # are inside the root this test froze into `_REAL_STORE_SPECS`, now
+        # raises out of `finally` instead of being ignored. Measured: the
+        # Windows runner failed here with `os.rmdir refused: ...\home\.claude`
+        # while Linux/macOS passed, because their tmp roots do not collide.
+        #
+        # Unfreezing the specs first is the fix rather than catching the
+        # exception: the guard must stay armed for the assertion above, and a
+        # bare `except Exception` in cleanup is how a real refusal gets hidden.
+        monkeypatch.undo()
         shutil.rmtree(root_dir, ignore_errors=True)
 
 
