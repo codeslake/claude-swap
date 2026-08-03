@@ -3182,6 +3182,49 @@ class TestLiveLock:
         )
         second.stop()
 
+    def test_a_stopped_demoted_engine_makes_no_flock_attempt(self, harness):
+        """`:841` (`if not self.demoted_from_live or self._stop.is_set():
+        return`) is not redundant with `:870`'s post-acquire re-check.
+
+        `:870` catches a `stop()` landing DURING the promotion and releases
+        the lock afterwards — the outcome converges either way. But without
+        `:841`, a stopped engine still ISSUES the flock acquire, and
+        `timeout=0` means that attempt can WIN: measured, a stopped engine
+        took the machine's LIVE lock (0 flock attempts -> 1, and the
+        attempt succeeded). A concurrent successor's own `timeout=0`
+        acquire then loses to a lock held by an engine that will never
+        tick again.
+
+        Pins the PRE-check: a stopped, demoted engine must issue ZERO
+        acquire calls, not merely end up dry-run (which :870 alone would
+        also produce, so an outcome-only assertion cannot tell the two
+        gates apart — this is why the gate previously survived mutation).
+        """
+        from claude_swap.locking import FileLock
+
+        demoted = harness._make_engine(dry_run=False)
+        assert demoted.demoted_from_live, "premise: the harness holds LIVE"
+        demoted.stop()  # stopped BEFORE any retry -- the steady-state shape
+
+        attempts: list[bool] = []
+        real_acquire = FileLock.acquire
+
+        def counting_acquire(self, *a, **kw):
+            attempts.append(True)
+            return real_acquire(self, *a, **kw)
+
+        FileLock.acquire = counting_acquire
+        try:
+            demoted._retry_live_promotion()
+        finally:
+            FileLock.acquire = real_acquire
+
+        assert attempts == [], (
+            f"flock acquire attempts = {len(attempts)} — a stopped engine "
+            "must never even TRY the machine's LIVE lock, not merely fail "
+            "to keep it"
+        )
+
     def test_a_sigterm_inside_the_switch_does_not_free_live_mid_switch(
         self, harness
     ):
@@ -4394,6 +4437,36 @@ class TestStoppedEngineDoesNotAct:
             "claimId, the field record() fences on"
         )
 
+        # Acceptance control (MINOR-2): the same vector, engine NOT stopped,
+        # must actually reach `_write_rows` -- otherwise `writes == []`
+        # above is vacuous and a later change that removes the write from
+        # this path would pass silently with no signal. `engine` above
+        # already released the machine's LIVE lock in `stop()`, but a fresh
+        # `dry_run=True` engine avoids depending on that release timing --
+        # `dry_run` does not gate the collector's heal-write path, only
+        # whether `_perform` switches an account, so this is still the same
+        # vector under test.
+        _seed_healed_strike(harness, "2", "b@example.com")
+        _seed_stale_quarantine(harness, "3", "c@example.com")
+        control_engine = harness._make_engine(dry_run=True)
+        control_writes: list[str] = []
+        control_real_write = store._write_rows
+
+        def control_spy_write(rows):
+            control_writes.append("_write_rows")
+            return control_real_write(rows)
+
+        store._write_rows = control_spy_write
+        with patch.object(
+            harness.switcher, "_run_usage_fetches", return_value={}
+        ):
+            control_engine.tick()
+        assert control_writes != [], (
+            "acceptance control: the NOT-stopped engine ran 0 "
+            "_write_rows calls on this same vector -- the assertion above "
+            "would be vacuous"
+        )
+
     def test_stop_inside_phase1_fetch_blocks_the_escalation_refetch(
         self, harness
     ):
@@ -4681,6 +4754,38 @@ class TestStoppedEngineDoesNotAct:
             f"LIVE. strikes {b.get('authDeadStrikes')} -> "
             f"{a.get('authDeadStrikes')}, claimId {b.get('claimId')!r} -> "
             f"{a.get('claimId')!r}"
+        )
+
+        # Acceptance control (MINOR-2): the same vector, engine NOT stopped,
+        # must actually reach `_write_rows` -- otherwise `writes == []`
+        # above is vacuous and a later change that removes the write from
+        # this path would pass silently with no signal. `engine` above
+        # already holds the machine's LIVE lock and stays stopped (`_stop`
+        # is a one-shot flag), so the control uses a fresh `dry_run=True`
+        # engine on the SAME switcher/store instead of contending for that
+        # lock -- `dry_run` does not gate the collector's heal-write path,
+        # only whether `_perform` switches an account, so this is still the
+        # same vector under test.
+        _seed_healed_strike(harness, "2", "b@example.com")
+        _seed_stale_quarantine(harness, "3", "c@example.com")
+        control_engine = harness._make_engine(dry_run=True)
+        control_writes: list[str] = []
+        control_real_write = store._write_rows
+
+        def control_spy_write(rows):
+            control_writes.append("_write_rows")
+            return control_real_write(rows)
+
+        store._write_rows = control_spy_write
+        with patch.object(
+            harness.switcher, "_run_usage_fetches", return_value={}
+        ):
+            control_outcome = control_engine.tick()
+            control_engine._next_delay(control_outcome)
+        assert control_writes != [], (
+            "acceptance control: the NOT-stopped engine ran 0 "
+            "_write_rows calls on this same vector -- the assertion above "
+            "would be vacuous"
         )
 
 class TestFreshenRoutesThroughGate:
