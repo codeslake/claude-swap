@@ -510,6 +510,201 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         assert salvage[0].read_text(encoding="utf-8") == torn_bytes
 
 
+    def test_config_torn_between_the_switch_start_and_step_4_survives(
+        self, temp_home: Path
+    ):
+        """I1: the normal-switch branch's OWN re-read at step 4, not the
+        pre-existing torn-at-the-start case above.
+
+        A config that is ALREADY torn when the switch starts makes
+        ``_get_current_account()`` return None, which routes the whole
+        switch through the direct-activation branch (:6148-6165) — which
+        already carries the ``is not None`` guard, the salvage copy, and the
+        warning (see the class above). The branch this test targets is only
+        reached when the config is READABLE at the start (so
+        ``current_identity`` resolves and the normal branch is taken) and
+        THEN tears before step 4's own re-read — e.g. a concurrent writer,
+        or a crash mid-write racing the switch. Step 4 reads the file a
+        SECOND time (``current_config_data = self._read_json(config_path)``
+        at :6428) rather than reusing the earlier snapshot, so this window
+        is real, not contrived.
+
+        Before the fix this raised a raw
+        ``'NoneType' object does not support item assignment`` (from
+        ``current_config_data["oauthAccount"] = ...`` on a None) with no
+        salvage copy — the user's torn config was gone for good, worse than
+        the bug the direct-activation branch's guard already closed.
+        """
+        s = _linux_switcher()
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_config(str(num), email, json.dumps({
+                "oauthAccount": {"emailAddress": email,
+                                 "accountUuid": f"uuid-{num}"}}))
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            data["accounts"][str(num)] = {
+                "email": email, "uuid": f"uuid-{num}",
+                "organizationUuid": "", "organizationName": "",
+                "added": "2024-01-01T00:00:00Z",
+            }
+            if num not in data["sequence"]:
+                data["sequence"].append(num)
+        data["sequence"].sort()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        cfg = get_global_config_path()
+        real = {
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+            "projects": {"/work": {"allowedTools": []}},
+            "mcpServers": {"x": {"command": "y"}},
+            "userID": "uid-123",
+        }
+        cfg.write_text(json.dumps(real), encoding="utf-8")
+        get_credentials_path().parent.mkdir(parents=True, exist_ok=True)
+        get_credentials_path().write_text(OAUTH_JSON, encoding="utf-8")
+
+        # CONTROL: an ordinary switch with the config intact the whole way
+        # through lands cleanly, with no salvage — proves the instrument
+        # says "fine" on the healthy case, not just "broken" on the torn one.
+        out_control = s.switch_to("2", json_output=True)
+        assert out_control["switched"] is True
+        assert out_control["warnings"] == []
+        no_salvage = [
+            p for p in cfg.parent.iterdir()
+            if p.name.startswith(f"{cfg.name}.unreadable-")
+        ]
+        assert no_salvage == [], "control: a clean switch must not salvage"
+
+        # Reset back to account 1's identity directly (bypassing another
+        # switch, whose own reads would consume the patched call count
+        # below), then reproduce the race: the config reads fine when
+        # `_get_current_account()` resolves identity, and only tears by the
+        # time step 4 re-reads it.
+        real["oauthAccount"] = {"emailAddress": "a@example.com",
+                                 "accountUuid": "uuid-1"}
+        cfg.write_text(json.dumps(real), encoding="utf-8")
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        orig_read_json = type(s)._read_json
+        calls = {"n": 0}
+
+        def read_json_that_tears_at_step_4(self, path, **kw):
+            if path == cfg:
+                calls["n"] += 1
+                if calls["n"] == 4:
+                    # Simulates the file being torn/unreadable at exactly
+                    # this re-read — `_read_json` already answers None for
+                    # both ABSENT and UNREADABLE, so returning None here
+                    # reproduces the real failure mode without needing a
+                    # second on-disk write mid-call.
+                    return None
+            return orig_read_json(self, path, **kw)
+
+        with patch.object(
+            type(s), "_read_json", read_json_that_tears_at_step_4
+        ):
+            out = s.switch_to("2", json_output=True)
+
+        assert out["switched"] is True, (
+            "the switch must still land — a torn config must not abort a "
+            "switch that upstream would otherwise complete"
+        )
+        assert out["warnings"], (
+            "no warning surfaced — the user is not told their config could "
+            "not be parsed"
+        )
+        salvage = [
+            p for p in cfg.parent.iterdir()
+            if p.name.startswith(f"{cfg.name}.unreadable-")
+        ]
+        assert len(salvage) == 1, (
+            f"no salvage copy beside {cfg} after step 4's own re-read saw a "
+            "torn file — the user's config bytes are unrecoverable"
+        )
+
+    def test_valid_empty_config_at_step_4_is_spliced_not_salvaged(
+        self, temp_home: Path
+    ):
+        """I1 sibling to M-2 (``test_a_valid_empty_config_is_spliced_not_
+        called_unparseable`` in test_transfer.py, which covers the
+        DIRECT-ACTIVATION branch only): the normal-switch branch's OWN
+        ``is not None`` check at step 4 needs the same control.
+
+        A valid but EMPTY ``{}`` config is readable and loses nothing by
+        being spliced. Under a truthiness test it falls to the salvage
+        branch, copies the file aside, and tells the user their config
+        "could not be parsed" — wrong, since it parsed fine and was simply
+        empty. This is the control in the OTHER direction from the torn-
+        config test above: proves the guard says "fine, splice it" on a
+        readable-but-empty file, not just "salvage" on a torn one.
+        """
+        s = _linux_switcher()
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_config(str(num), email, json.dumps({
+                "oauthAccount": {"emailAddress": email,
+                                 "accountUuid": f"uuid-{num}"}}))
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            data["accounts"][str(num)] = {
+                "email": email, "uuid": f"uuid-{num}",
+                "organizationUuid": "", "organizationName": "",
+                "added": "2024-01-01T00:00:00Z",
+            }
+            if num not in data["sequence"]:
+                data["sequence"].append(num)
+        data["sequence"].sort()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        cfg = get_global_config_path()
+        real = {"oauthAccount": {"emailAddress": "a@example.com",
+                                  "accountUuid": "uuid-1"}}
+        cfg.write_text(json.dumps(real), encoding="utf-8")
+        get_credentials_path().parent.mkdir(parents=True, exist_ok=True)
+        get_credentials_path().write_text(OAUTH_JSON, encoding="utf-8")
+
+        orig_read_json = type(s)._read_json
+        calls = {"n": 0}
+
+        def read_json_empty_at_step_4(self, path, **kw):
+            if path == cfg:
+                calls["n"] += 1
+                if calls["n"] == 4:
+                    # A valid, empty, PARSED config — not a read failure.
+                    return {}
+            return orig_read_json(self, path, **kw)
+
+        with patch.object(type(s), "_read_json", read_json_empty_at_step_4):
+            out = s.switch_to("2", json_output=True)
+
+        assert out["switched"] is True
+        assert out["warnings"] == [], (
+            "an empty-but-valid config triggered a salvage warning — "
+            "it was never unreadable"
+        )
+        salvage = [
+            p for p in cfg.parent.iterdir()
+            if p.name.startswith(f"{cfg.name}.unreadable-")
+        ]
+        assert salvage == [], (
+            "a valid empty {} config was salvaged and reported as "
+            "unparseable — is-not-None was tested as truthiness"
+        )
+        assert json.loads(cfg.read_text(encoding="utf-8"))["oauthAccount"][
+            "emailAddress"
+        ] == "b@example.com"
+
     def test_a_failed_salvage_aborts_instead_of_flattening_the_config(
         self, temp_home: Path
     ):
