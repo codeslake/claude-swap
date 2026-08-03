@@ -2983,6 +2983,76 @@ class TestLiveLock:
         finally:
             successor.stop()
 
+    def test_a_stop_one_statement_later_does_not_strand_the_lock(
+        self, harness
+    ):
+        """The sibling test fires `stop()` from inside `FileLock.acquire`.
+
+        That lands BEFORE the re-check, which is exactly the case the
+        re-check catches. One statement later — after the re-check passed and
+        before `_live_lock = lock` — reproduces the original symptom verbatim:
+        `stop()` reads `_live_lock is None`, takes its idempotent early
+        return, and the assignment then hands a live cross-process flock to an
+        engine that will never tick again. Nothing reclaims it, so no engine
+        on the machine can go LIVE until the process exits.
+
+        Same window, second symptom: `dry_run = False` is published with no
+        stop re-check after it either, and `autoview._update_badge` renders
+        " LIVE " from exactly `not engine.dry_run` — so a dead engine reads
+        LIVE. `test_a_stopped_engine_is_not_badged_live` covers the plain
+        `stop()` path; this is the other way in.
+
+        A check-then-act pair cannot be closed by adding a third check, so
+        this drives the stop through `_stop_lock` — the one lock `stop()`
+        itself takes. Serializing against that lock is what "indivisible with
+        respect to `stop()`" means here; a fix that publishes outside it
+        leaves the window open no matter how many checks precede it.
+        """
+        demoted = harness._make_engine(dry_run=False)
+        assert demoted.demoted_from_live, "premise: the harness holds LIVE"
+        harness.engine.stop()                       # the holder exits
+
+        real_lock = demoted._stop_lock
+        fired: list[bool] = []
+
+        class _StopInsideTheWindow:
+            """`stop()` lands after the re-check, before the publish."""
+
+            def __enter__(self):
+                real_lock.__enter__()
+                # Once: the `stop()` below re-enters this same RLock.
+                if not fired:
+                    fired.append(True)
+                    demoted.stop()
+                return self
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+        demoted._stop_lock = _StopInsideTheWindow()
+        try:
+            demoted._retry_live_promotion()
+        finally:
+            demoted._stop_lock = real_lock
+
+        assert fired, (
+            "premise: the acquire->publish transition must run under "
+            "`_stop_lock`, the lock `stop()` also takes — outside it the "
+            "window stays open and no number of re-checks closes it"
+        )
+        assert demoted.dry_run, (
+            "a stopped engine reports dry_run=False after the promotion, so "
+            "the badge reads LIVE for an engine that will never tick"
+        )
+        successor = harness._make_engine(dry_run=False)
+        try:
+            assert not successor.demoted_from_live, (
+                "a stopped engine still holds the LIVE flock; nothing on this "
+                "machine can go LIVE until the process exits"
+            )
+        finally:
+            successor.stop()
+
     def test_a_raising_consumer_does_not_escape_the_tick(self, harness):
         """`tick()` documents "Never raises" and its try covers only
         `_tick_inner`.
@@ -3217,6 +3287,51 @@ class TestLiveLock:
             "an operator has two engines and no explanation"
         )
 
+    def test_the_release_warning_reaches_a_consumer_too(
+        self, harness
+    ):
+        """The sibling test asserts on `caplog` only, so it passed while the
+        `_emit` beside the log line was dead code on EVERY surface.
+
+        `_stop.set()` is the FIRST statement of `stop()`, and `_emit` used to
+        drop anything without `.reason == "engine-stopped"` — `ErrorEvent` has
+        no `.reason` at all. So `cswap auto --json` got no `error` record for
+        the one condition where two engines can act at once, which is the
+        single most important thing this engine can tell an operator.
+
+        The log line matters for the TUI (Textual refuses `call_from_thread`
+        from the app's own thread); the event matters for every consumer that
+        is not the TUI. Both, not either.
+        """
+        import logging
+
+        from claude_swap import autoswitch as autoswitch_mod
+
+        engine = harness.engine
+        released: list[bool] = []
+
+        class _Lock:
+            def release(self):
+                released.append(True)
+
+        engine._live_lock = _Lock()
+        engine._tick_thread_id = -1          # someone else's tick, not ours
+        engine._tick_in_flight.clear()
+        harness.events.clear()
+
+        with patch.object(autoswitch_mod, "_STOP_SWITCH_WAIT_S", 0.05):
+            engine.stop()
+
+        assert released == [True], "premise: the ceiling expired"
+        assert any(
+            isinstance(e, ErrorEvent) and "two engines may act once" in e.message
+            for e in harness.events
+        ), (
+            f"events {[type(e).__name__ for e in harness.events]} — a JSONL "
+            "consumer gets no `error` record for the one condition where two "
+            "engines can act at once"
+        )
+
     def test_stop_on_the_ui_thread_does_not_block_on_the_worker(self, harness):
         """`own_tick` covers ONE thread. The TUI has two, and it is the shape.
 
@@ -3345,6 +3460,67 @@ class TestLiveLock:
             "thread called it — the TUI freezes and SIGTERM self-deadlocks"
         )
 
+    def test_a_sigterm_deep_in_the_tick_does_not_block_on_its_own_thread(
+        self, harness
+    ):
+        """`not own_tick` in the wait condition is load-bearing and untested.
+
+        The two shipped tests reach `stop()` from inside `_emit` (exempted by
+        `_emit_in_flight`) or inside `switch_to` (exempted by
+        `_switch_in_flight`). A SIGTERM landing ANYWHERE ELSE in the tick —
+        `_freshen_target`'s refresh POST is the widest such window — has all
+        three flags in the one state only `own_tick` handles:
+        `_tick_in_flight` clear, `_emit_in_flight` clear,
+        `_switch_in_flight` False.
+
+        With `not own_tick` removed and the ceiling patched to 2.0s the
+        reviewer measured `stop()` blocking the full 2.00s on its own thread
+        and then logging the unsafe-release warning. At the shipped 30s
+        ceiling that is a 30s `cswap auto` SIGTERM hang followed by an unsafe
+        release — the signal handler waiting on a flag only the frame it
+        interrupted can set.
+
+        Bounded well under the patched ceiling: the point is that the handler
+        does not wait on itself, not the exact duration.
+        """
+        import time
+
+        from claude_swap import autoswitch as autoswitch_mod
+
+        harness.seed(2, "b@example.com")
+        engine = harness.engine
+        elapsed: list[float] = []
+
+        def freshen_then_sigterm(number, email):
+            # The signal handler runs INSIDE the frame it interrupts, so this
+            # is `stop()` on the tick's own thread with no flag exempting it.
+            assert not engine._tick_in_flight.is_set(), "premise: tick running"
+            assert not engine._emit_in_flight.is_set(), "premise: not emitting"
+            assert not engine._switch_in_flight, "premise: not switching"
+            t0 = time.monotonic()
+            engine.stop()
+            elapsed.append(time.monotonic() - t0)
+            return "ok"
+
+        engine._freshen_target = freshen_then_sigterm
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in {"1": _usage(99), "2": _usage(5)}.items()
+        }
+        with patch.object(autoswitch_mod, "_STOP_SWITCH_WAIT_S", 2.0):
+            with patch.object(
+                harness.switcher, "usage_entries_by_account",
+                return_value=entries,
+            ):
+                engine.tick()
+
+        assert elapsed, "premise: stop() ran from inside the tick"
+        assert elapsed[0] < 1.0, (
+            f"stop() blocked {elapsed[0]:.2f}s waiting on the tick whose own "
+            "thread called it — a SIGTERM to `cswap auto` hangs for the full "
+            "ceiling and then releases LIVE unsafely"
+        )
+
     def test_the_freshen_loop_stops_between_candidates(self, harness):
         """The ceiling is a backstop; the loop must not need it.
 
@@ -3389,6 +3565,69 @@ class TestLiveLock:
         assert len(freshened) == 1, (
             f"freshened {freshened} after stop() — the loop kept POSTing "
             "one-time grants for accounts the successor already owns"
+        )
+
+    def test_the_freshen_loop_names_the_stop_not_a_stale_fetch(self, harness):
+        """The sibling test asserts `len(freshened) == 1` and passes with the
+        gate deleted, because `stop()` flips `dry_run = True` and the NEXT
+        iteration took `_perform`'s dry-run branch and returned. The loop was
+        bounded by that flip, not by the guard the test names.
+
+        The flip no longer decides it — `_perform` asks `_stop` before it
+        reads `dry_run` — so the grants are bounded either way. What the gate
+        still owns is the DIAGNOSIS. Reached from consume-first, the next
+        iteration hits the staleness check first, and with the gate removed a
+        stopped engine reports:
+
+            reasons=['PollEvent', 'stale-usage']
+
+        against `['PollEvent', 'engine-stopped']` unmutated. "usage could not
+        be refreshed this tick (backoff or a concurrent poller); retrying"
+        sends an operator after a fetch problem that does not exist, for an
+        engine that simply stopped.
+
+        Asserts the REASON, which is what the gate decides now, rather than
+        the freshen count, which something else already bounds.
+        """
+        harness.seed(2, "b@example.com")
+        harness.seed(3, "c@example.com")
+        harness.settings = replace(harness.settings, strategy="consume-first")
+        engine = harness._make_engine()
+        engine.settings = harness.settings
+        harness.engine.stop()          # free LIVE for the engine under test
+        engine.dry_run = False
+
+        freshened: list[str] = []
+
+        def spy(number, email):
+            freshened.append(number)
+            if len(freshened) == 1:
+                engine.stop()          # the handover happens here
+            return "transient"         # keeps the loop moving to the next one
+
+        engine._freshen_target = spy
+        events: list = []
+        engine.on_event = events.append
+        entries = {
+            "1": _entry_for(_usage7(20, 20, _R_LATEST), harness.clock.now),
+            "2": _entry_for(_usage7(10, 10, _R_SOON), harness.clock.now),
+            # The next candidate's entry is stale — the branch that runs
+            # first once the gate is gone.
+            "3": _entry_for(
+                _usage7(10, 10, _R_LATER), harness.clock.now - 100_000
+            ),
+        }
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            engine.tick()
+
+        assert freshened == ["2"], f"premise: the stop landed mid-loop, {freshened}"
+        reasons = [e.reason for e in events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["engine-stopped"], (
+            f"reasons {reasons} — a stopped engine blamed a stale fetch, "
+            "sending an operator after a backoff/poller problem that is not "
+            "happening"
         )
 
     def test_a_stopped_engine_does_not_finish_freshening(self, harness):
@@ -3698,6 +3937,130 @@ class TestStoppedEngineDoesNotAct:
         outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(5)})
         assert outcome is TickOutcome.NO_ACTION
         assert harness.active_number() == 1
+
+    def test_a_stop_in_the_refresh_post_does_not_report_a_switch(
+        self, harness
+    ):
+        """Exit 0 = SWITCHED for a switch that never happened.
+
+        The freshen loop's `_stop` gate sits BEFORE `_freshen_target` and
+        nothing re-checks between the freshen returning and `_perform`. So a
+        `stop()` landing inside the refresh POST — the widest window in the
+        loop — finds `_perform`'s first statement `if self.dry_run:`, which
+        `stop()` has just flipped True. The engine emits a `dryRun: true`
+        SwitchEvent and returns SWITCHED.
+
+        Measured before the fix:
+
+            outcome=SWITCHED exit_code=0 active=1 events=['PollEvent']
+
+        `cli.py:702` is `sys.exit(engine.tick().value)`, so a cron wrapper
+        keying on exit 0 records a successful switch that did not occur, the
+        one-time grant is already spent, and the successor inherits a burned
+        generation. The SwitchEvent that would have said `dryRun: true` never
+        arrives either — `_emit`'s stop gate drops it.
+
+        `_EngineStopped` is the shape for this: abandon the tick, do not
+        report work.
+        """
+        harness.seed(2, "b@example.com")
+        engine = harness.engine
+        assert not engine.dry_run, "premise: this engine is LIVE"
+
+        def freshen_then_sigterm(number, email):
+            engine.stop()      # SIGTERM lands inside the refresh POST
+            return "ok"        # ... and the POST succeeded
+
+        engine._freshen_target = freshen_then_sigterm
+        harness.events.clear()
+        entries = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in {"1": _usage(99), "2": _usage(5)}.items()
+        }
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries
+        ):
+            outcome = engine.tick()
+
+        assert harness.active_number() == 1, "premise: nothing switched"
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"exit {outcome.value} = SWITCHED while the active account is "
+            f"still {harness.active_number()} — a cron wrapper records a "
+            "switch that did not happen"
+        )
+        assert any(
+            getattr(e, "reason", None) == "engine-stopped"
+            for e in harness.events
+        ), (
+            f"events {[type(e).__name__ for e in harness.events]} — the tick "
+            "abandoned itself with no reason line"
+        )
+
+    def test_every_event_class_survives_a_stop(self, harness):
+        """`_emit`'s stop gate exempted `.reason == "engine-stopped"`.
+
+        Only 3 of the 9 event classes HAVE a `.reason` field, so the other 6
+        were silently dropped once `_stop` was set — including the two emitted
+        on paths that run after `stop()`: `SwitchEvent` (the dry-run switch
+        above) and `ErrorEvent` (the "two engines may act once" warning, which
+        `stop()` emits AFTER its own `_stop.set()`).
+
+        A per-class opt-in is the defect one layer down: the next event class
+        will not be on the list. This asserts the property structurally —
+        `_emit` delivers what it is given — so a NEW class is safe by default
+        rather than by remembering to update anything. The coverage assert
+        below fails loudly if a class is added and not listed, instead of the
+        class being quietly dropped at runtime.
+
+        Delivering is the safe default: the gate was censoring the NARRATION
+        of a stopped engine, which never stopped it acting — it only removed
+        the evidence that it had.
+        """
+        import inspect
+
+        from claude_swap import autoswitch as m
+
+        samples = [
+            m.AutoSwitchEvent(),
+            m.PollEvent(active=None, headroom={}, threshold=80.0),
+            m.SwitchEvent(trigger="proactive", from_ref=None, to_ref=None),
+            m.NoSwitchEvent(reason="cooldown"),
+            m.QuarantineEvent(number="2", email="b@example.com", reason="x"),
+            m.UnquarantineEvent(number="2", email="b@example.com"),
+            m.AllExhaustedEvent(earliest_reset_at=None),
+            m.SleepEvent(seconds=1.0, until="2024-01-01T00:00:00Z"),
+            m.ErrorEvent(message="two engines may act once"),
+            m.ConfigWarningEvent(message="now LIVE"),
+        ]
+        discovered = {
+            name
+            for name, obj in vars(m).items()
+            if inspect.isclass(obj)
+            and name.endswith("Event")
+            and issubclass(obj, m.AutoSwitchEvent)
+        }
+        assert {type(s).__name__ for s in samples} == discovered, (
+            f"event classes {discovered - {type(s).__name__ for s in samples}}"
+            " are not exercised here — a class `_emit` has never been proven "
+            "to deliver"
+        )
+
+        engine = harness.engine
+        engine.stop()
+        assert engine._stop.is_set(), "premise: the engine is stopped"
+        harness.events.clear()
+        for event in samples:
+            engine._emit(event)
+
+        dropped = [
+            type(s).__name__
+            for s in samples
+            if not any(e is s for e in harness.events)
+        ]
+        assert dropped == [], (
+            f"{len(dropped)} of {len(samples)} event classes never reached "
+            f"the consumer after stop(): {dropped}"
+        )
 
     def test_stopping_mid_tick_aborts_the_switch(self, harness):
         """The real shape: the tick has already decided and is entering
