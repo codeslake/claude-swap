@@ -1563,6 +1563,63 @@ class TestImportClearsDeadTokenQuarantine:
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_HEALED"
 
+    def test_a_healed_strike_does_not_license_a_plain_import_to_replace(
+        self, temp_home: Path, capsys
+    ):
+        """`import_accounts` must consult the helper, not `token_dead()` raw.
+
+        The two new tests in this class both pass against the pre-PR inline
+        expression: one asserts `_slot_token_dead` DIRECTLY without going
+        through `import_accounts`, and in the other the old expression happens
+        to return True as well. So reverting transfer.py's routing to
+        `entries(...)[slot].token_dead()` leaves the suite green and nothing
+        pins that the import asks the collectors' question at all.
+
+        The verdicts differ exactly where the fingerprint binding does its
+        work: a strike bound to a generation the slot no longer stores is
+        HEALED. `entry.token_dead()` with no `stored_fp` still says dead — and
+        a plain import then replaces a healthy slot's credential, which is the
+        whole reason `--force` exists.
+        """
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        # Struck on a generation that is NOT what the slot stores now.
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant",
+                              struck_fp="sha256:someothergeneration")},
+            ident,
+        )
+        # The raw row is dead; the fingerprint-bound question says healed.
+        assert s._usage_store.entries(ident)["2"].token_dead(), (
+            "premise: the unbound verdict, which the pre-PR import used"
+        )
+        stored = s._read_account_credentials("2", "bob@example.com")
+        assert not s._usage_store.entries(ident)["2"].token_dead(
+            stored_fp=oauth.credential_fingerprint(stored)
+        ), "premise: bound to the stored generation, the strike is healed"
+        assert not s._slot_token_dead("2", "bob@example.com")
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_OVERWRITTEN"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "already exists, use --force" in err, (
+            "the import used the unbound verdict, so a slot whose strike the "
+            "fingerprint already healed was replaced without --force"
+        )
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds).get("_marker") != "BOB_OVERWRITTEN", (
+            "a healthy slot's credential was overwritten by a plain import"
+        )
+
     def test_the_heal_finds_the_row_of_an_org_scoped_account(
         self, temp_home: Path, capsys
     ):
