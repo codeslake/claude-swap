@@ -23,7 +23,6 @@ _TRANSIENT_WIN_ERRORS = frozenset({5, 32, 33})
 def read_text_with_retry(
     path: os.PathLike | str,
     *,
-    encoding: str = "utf-8",
     attempts: int = 10,
     initial_delay: float = 0.002,
 ) -> str:
@@ -50,7 +49,7 @@ def read_text_with_retry(
     delay = initial_delay
     for attempt in range(attempts):
         try:
-            return Path(path).read_text(encoding=encoding)
+            return Path(path).read_text(encoding="utf-8")
         except OSError as e:
             transient = (
                 sys.platform == "win32"
@@ -60,7 +59,7 @@ def read_text_with_retry(
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 0.25)
-    raise AssertionError("unreachable")  # pragma: no cover
+    raise AssertionError("unreachable")  # pragma: no cover - loop always exits
 
 
 def replace_with_retry(
