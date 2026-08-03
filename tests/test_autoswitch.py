@@ -4049,6 +4049,44 @@ class TestHorizonAxisDoesNotFlap:
             "which is the persisted lockout, not anti-flap"
         )
 
+    def test_absence_of_a_snapshot_releases_even_a_poor_or_unreadable_peer(
+        self, harness
+    ):
+        """The pre-upgrade absence guard must fire before the null check.
+
+        The sibling test above only drives absence with a peer at FULL quota
+        — `(headroom.get(barred) or 0.0) >= 100.0 - SPENT_HEADROOM_PCT` also
+        happens to return `True` for that shape, so a suite with only that
+        case cannot tell "the absence guard ran" from "the near-full floor
+        happened to agree with it". Genuinely absent keys carry NO evidence
+        either way (`_perform` never ran to record any), which is a different
+        state from a failover's `(None, None)` — real evidence the departure
+        was unmeasurable — and the two must not collapse onto the same
+        answer merely because they share a code path once the leading `if
+        "leftHeadroom" not in state: return True` guard is gone.
+
+        Drives the two shapes that DO tell them apart: the barred account
+        POOR (well under the near-full floor) and UNREADABLE (`headroom` is
+        `None`, which the null-check branch maps to `0.0` via `or 0.0` and
+        so also fails the floor). Absence must still release both.
+        """
+        state = {"lastSwitchFrom": "2"}  # pre-upgrade: keys genuinely absent
+
+        assert harness.engine._left_account_recovered(
+            state, {"2": _usage(96)}, {"2": 4.0}, harness.clock()
+        ) is True, (
+            "a pre-upgrade record (no snapshot) must release even when the "
+            "barred account is currently poor (4 pts) — absence of evidence "
+            "is not the same state as a measured-unmeasurable failover"
+        )
+        assert harness.engine._left_account_recovered(
+            state, {"2": None}, {"2": None}, harness.clock()
+        ) is True, (
+            "a pre-upgrade record (no snapshot) must release even when the "
+            "barred account is currently unreadable — absence of evidence "
+            "releases regardless of what can be measured right now"
+        )
+
     def test_a_failover_departure_does_not_disarm_the_bar(self, temp_home):
         """`(None, None)` from a failover must not read the same as `absent`.
 
