@@ -403,58 +403,85 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_a_contended_first_path_does_not_starve_a_free_second(
         self, tmp_path, monkeypatch
     ):
-        """MEASURED (reviewer, only the session lock held, timeout 0.5s):
-        `clear_wiring` returned False with BOTH configs still wired. The first
-        path waited the WHOLE budget on a lock nobody released, so `left <= 0`
-        by the time the loop reached the second path — free the entire time —
-        and it was `continue`d without ever being tried.
+        """MEASURED (reviewer, only the session lock held, at the REAL
+        production budget ``_LAUNCH_LOCK_BUDGET_S = 0.5``): `clear_wiring`
+        returned False with BOTH configs still wired. The first path waited
+        the WHOLE budget on a lock nobody released, so `left <= 0` by the
+        time the loop reached the second path — free the entire time — and
+        it was `continue`d without ever being tried.
 
-        The total must still be bounded (that budget is real, and the launch
-        path depends on it), so the fix is a fair SHARE of what remains per
-        path, not the whole remaining budget going to whichever path is
-        first.
+        ASSERTS THE OBSERVABLE PROPERTY, not a wall clock. A prior version of
+        this test asserted `elapsed < BUDGET_S * 2` at an inflated 3.0s
+        test-only budget. Two measured facts killed that version: deleting
+        its `elapsed` assertion changed nothing (the mutant this test names,
+        `share = left / (len(paths) - i)` -> `share = left`, survives it and
+        is killed by a different test), and starvation is directly
+        observable as "path 2 was never attempted" — so assert that,
+        via a recording wrapper around
+        ``claude_swap.claude_locks.proper_lockfile`` that records every
+        ``lock_dir`` it is asked to acquire.
 
-        RED ON WINDOWS CI (2a01e24), green on Linux 30/30: a 0.5s total
-        budget split two ways gave each path 0.25s — no larger than ONE
-        jittered retry sleep in `proper_lockfile` (``0.25 + random()*0.25``).
-        One sleep could consume the whole remaining budget, starving the free
-        second path. The budget is now sized against that constant rather
-        than tuned to one platform. NOT verified on Windows — no access.
+        Runs at the REAL `_LAUNCH_LOCK_BUDGET_S` (0.5s), not a test-only
+        constant: with the lock's own retry sleep now clamped to the
+        remaining budget (see test_claude_locks.py), a 0.5s total split two
+        ways gives each path a real 0.25s rather than one jittered sleep
+        (0.25-0.5s) swallowing it whole — the fair-share arithmetic this test
+        guards is only meaningful once the sleep itself respects a deadline.
         """
-        import time
+        from contextlib import contextmanager
 
         import claude_swap.paths as paths
-        from claude_swap import pin
+        from claude_swap import claude_locks, pin
         from claude_swap.switcher import ClaudeAccountSwitcher
-
-        # Comfortably larger than proper_lockfile's own retry-sleep floor
-        # (0.25s-0.5s jittered) so a fair per-path SHARE of it cannot be
-        # swallowed by one retry cycle's syscall overhead, on any runner.
-        BUDGET_S = 3.0
 
         session = self._wired(tmp_path / "session")
         default = self._wired(tmp_path / "home")
         monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
 
+        # PIN THE JITTER TO ITS WORST CASE, deterministically. Left random,
+        # `proper_lockfile`'s retry sleep (0.25-0.5s) only OCCASIONALLY draws
+        # long enough to exceed a 0.25s fair share, so an unclamped sleep
+        # (the very mutant this test exists to kill — see the reinstate-and
+        # -show-red proof in the task report) starves path 2 on some runs and
+        # not others: measured 5/5 green with the mutant in and the jitter
+        # left to chance. Forcing `random.random() == 1.0` makes every retry
+        # sleep exactly 0.5s — the full budget on the FIRST path alone — so
+        # the unclamped mutant fails every time, not by luck of the draw.
+        monkeypatch.setattr(claude_locks.random, "random", lambda: 1.0)
+
+        real_proper_lockfile = claude_locks.proper_lockfile
+        attempted = []
+
+        @contextmanager
+        def _recording_lockfile(lock_dir, **kwargs):
+            attempted.append(lock_dir)
+            with real_proper_lockfile(lock_dir, **kwargs):
+                yield
+
+        # `clear_wiring` does `from claude_swap.claude_locks import
+        # proper_lockfile` INSIDE its own body, so patching the module
+        # attribute (not a `pin.proper_lockfile` name that does not exist)
+        # is what every call re-resolves to.
+        monkeypatch.setattr(claude_locks, "proper_lockfile", _recording_lockfile)
+
         # A live holder on the SESSION lock only — fresh mtime, so it is never
         # taken over as stale, and it is held for the whole call.
         held = session.parent / (session.name + ".lock")
         held.mkdir()
         try:
-            start = time.monotonic()
-            changed = pin.clear_wiring(ClaudeAccountSwitcher(), timeout=BUDGET_S)
-            elapsed = time.monotonic() - start
+            changed = pin.clear_wiring(
+                ClaudeAccountSwitcher(), timeout=pin._LAUNCH_LOCK_BUDGET_S
+            )
         finally:
             held.rmdir()
 
-        # Loose: only guards against the total blowing way past its own
-        # budget (e.g. a regression back to a PER-path timeout). The
-        # starvation bug itself does not violate this — reinstating
-        # `share = left` still finishes within BUDGET_S, it just starves
-        # the second path while doing so, which the assertions below catch.
-        assert elapsed < BUDGET_S * 2, (
-            f"blew well past the {BUDGET_S}s budget: {elapsed:.2f}s"
+        session_lock = session.parent / (session.name + ".lock")
+        default_lock = default.parent / (default.name + ".lock")
+        assert session_lock in attempted, "the contended path was never even tried"
+        assert default_lock in attempted, (
+            "the free default profile was starved by the contended session "
+            "lock — its lock was never even attempted"
         )
         assert changed is True, (
             "the free default profile was starved by the contended session "
@@ -4030,4 +4057,223 @@ class TestTheSiblingGettersGuardTheirPathGettersToo:
             "an unresolvable path getter was swallowed with no record — "
             "indistinguishable from a config that resolved and had nothing "
             f"wired. Records: {[r.getMessage() for r in caplog.records]}"
+        )
+
+
+class TestTheUnresolvablePathWarningDoesNotDestroyItsOwnHistory:
+    """`heal` polls on a timer (the status line, every ~2s) and the condition
+    an unresolvable path getter reports is PERSISTENT — a missing HOME or a
+    permission bit does not fix itself between ticks. Logging it every tick,
+    as `clear_wiring` used to, writes ~6MB/day at that cadence and overwrites
+    the entire 4MB/3-backup rotating history (`logging_config.py`) with the
+    same line roughly every 15.5 hours — the record destroys every other
+    record. Log once per process instead: still observable (an operator sees
+    it at least once), no longer self-defeating.
+
+    `_wiring_present` and `_wired_ports` resolve the SAME two getters with
+    the same bare ``except Exception: continue`` and logged NOTHING at all —
+    a single `heal` tick hits the raising getter four times (once each via
+    `_wiring_present`, `_wired_ports`, `_wired_port_is_serving` calling
+    `_wired_ports` again, and `clear_wiring`): 3 silent, 1 logged before this
+    fix. The once-per-process cap has to be shared across all three call
+    sites, not per-function, or the same getter logs once from each of three
+    functions instead of once total.
+
+    The shared ``pin._unresolvable_warned`` set is reset before every test by
+    an autouse conftest fixture (mirroring ``_reset_pin_live_impl_cache``), so
+    no test here has to reset it by hand.
+    """
+
+    def _no_home(self, monkeypatch):
+        import pathlib
+
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(
+            pathlib.Path,
+            "home",
+            staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no HOME"))),
+        )
+
+    def test_clear_wiring_logs_the_unresolvable_getter_only_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        self._no_home(monkeypatch)
+
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            pin.clear_wiring(sw, timeout=0.1)
+            pin.clear_wiring(sw, timeout=0.1)
+            pin.clear_wiring(sw, timeout=0.1)
+
+        hits = [
+            r
+            for r in caplog.records
+            if "get_default_global_config_path" in r.getMessage()
+        ]
+        assert len(hits) == 1, (
+            f"logged {len(hits)} times across 3 calls in one process — a "
+            "persistent condition must be logged once, not every tick"
+        )
+
+    @pytest.mark.parametrize(
+        "name, call",
+        [
+            ("_wiring_present", lambda pin: pin._wiring_present(None) is False),
+            ("_wired_ports", lambda pin: pin._wired_ports() == []),
+        ],
+    )
+    def test_the_previously_silent_call_sites_also_log(
+        self, name, call, tmp_path, monkeypatch, caplog
+    ):
+        """Both swallowed the same raise `clear_wiring` logs, with no record
+        at all. Parametrized rather than duplicated: the fixture and the
+        assertion are identical and only the call differs, so a third call
+        site added later is one tuple, not another copy."""
+        import logging
+
+        from claude_swap import pin
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        self._no_home(monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert call(pin)
+
+        assert any(
+            "get_default_global_config_path" in r.getMessage()
+            for r in caplog.records
+        ), f"{name} swallowed an unresolvable getter with no record"
+
+    def test_the_cap_is_shared_across_all_three_call_sites(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A single `heal` tick hits the raising getter through THREE
+        different functions. The once-per-process cap must be shared state,
+        not a per-function counter, or each function logs its own first
+        occurrence and the same tick still writes 3 lines instead of 1."""
+        import logging
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        self._no_home(monkeypatch)
+
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            pin._wiring_present(None)
+            pin._wired_ports()
+            pin.clear_wiring(sw, timeout=0.1)
+
+        hits = [
+            r
+            for r in caplog.records
+            if "get_default_global_config_path" in r.getMessage()
+        ]
+        assert len(hits) == 1, (
+            f"logged {len(hits)} times across 3 DIFFERENT functions in one "
+            "process — the cap must be shared, not per-function"
+        )
+
+
+class TestTheLoggerNameStaysPinnedToClaudeSwap:
+    """`getLogger("claude-swap")` -> `getLogger(__name__)` (i.e.
+    `getLogger("claude_swap.pin")`) survives the whole suite silently: every
+    test asserting on log records filters with
+    ``caplog.at_level(..., logger="claude-swap")``, so a module-named logger
+    that falls through to `logging.lastResort` (stderr) instead of the
+    configured "claude-swap" logger (`logging_config.setup_logging`) produces
+    NO test failure — the record simply never reaches the handler the
+    configured logger owns, and every caplog-based assertion silently sees
+    nothing from this module rather than failing loudly.
+
+    Pin the logger's OWN name, not just its behavior through some other
+    test's assertions.
+    """
+
+    def test_logger_name_is_the_shared_claude_swap_name(self):
+        from claude_swap import pin
+
+        assert pin._logger.name == "claude-swap"
+
+    def test_a_warning_from_this_module_carries_that_record_name(self, caplog):
+        """Not just the logger object's `.name` attribute — the actual
+        LogRecord `.name` a handler receives, which is what a real filter
+        or handler routing decision keys on."""
+        import logging
+
+        from claude_swap import pin
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            pin._logger.warning("probe")
+
+        assert any(r.name == "claude-swap" for r in caplog.records), (
+            f"no record named 'claude-swap': {[r.name for r in caplog.records]}"
+        )
+
+
+class TestClearWiringDoesNotLockTheSameFileTwice:
+    """With `CLAUDE_CONFIG_DIR` unset, `get_global_config_path` and
+    `get_default_global_config_path` resolve to the SAME file (both fall
+    back to `Path.home() / ".claude.json"`). Dropping `if path not in
+    paths:` (keeping the bare `paths.append(path)`) survives the whole
+    suite: `clear_wiring` then locks and clears that one file TWICE in the
+    same call, and — because the fair-share arithmetic divides the budget by
+    `len(paths)` — the launch path silently halves its own sub-second budget
+    against a single file for no reason, exactly the "locked and cleared
+    twice" the task brief measured.
+    """
+
+    def test_one_config_is_locked_only_once(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+
+        import claude_swap.paths as paths
+        from claude_swap import claude_locks, pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {"CSWAP_PIN_PORT": "1"},
+                    "_cswapPinWiredKeys": ["CSWAP_PIN_PORT"],
+                }
+            )
+        )
+        # BOTH getters resolve to the SAME path — the no-CLAUDE_CONFIG_DIR
+        # shape the dedup exists for.
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        real_proper_lockfile = claude_locks.proper_lockfile
+        attempted = []
+
+        @contextmanager
+        def _recording_lockfile(lock_dir, **kwargs):
+            attempted.append(lock_dir)
+            with real_proper_lockfile(lock_dir, **kwargs):
+                yield
+
+        monkeypatch.setattr(claude_locks, "proper_lockfile", _recording_lockfile)
+
+        changed = pin.clear_wiring(ClaudeAccountSwitcher(), timeout=2.0)
+
+        assert changed is True
+        lock_dir = cfg.parent / (cfg.name + ".lock")
+        assert attempted.count(lock_dir) == 1, (
+            f"the SAME config file was locked {attempted.count(lock_dir)} "
+            "times in one call — the two getters resolving to one path must "
+            "collapse to one attempt, not one per getter"
         )

@@ -103,6 +103,7 @@ def proper_lockfile(
         timeout = DEFAULT_TIMEOUT_S
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
+    deadline = start + timeout
     while True:
         try:
             os.mkdir(lock_dir)
@@ -124,9 +125,21 @@ def proper_lockfile(
             try:
                 os.rmdir(lock_dir)
             except OSError:
-                time.sleep(0.05)  # can't remove it either; don't spin hot
+                # Can't remove it either; don't spin hot, but never past the
+                # deadline (see the clamp below — same reasoning applies).
+                time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
-        time.sleep(0.25 + random.random() * 0.25)
+        # CLAMPED TO THE REMAINING BUDGET. This jittered sleep used to run
+        # full-length regardless of `timeout`, so a caller passing a small
+        # timeout (e.g. `clear_wiring`'s fair-share arithmetic handing each
+        # path a fraction of a shrinking budget) always overshot it — the
+        # deadline check above never fires because the sleep itself blows
+        # past it first. MEASURED (this file, before this clamp,
+        # `overshoot.py`): timeout=0.01 -> worst elapsed 0.408s (+0.398s);
+        # timeout=0.25 -> 0.487s (+0.237s); timeout=0.5 -> 0.910s (+0.410s).
+        # When there IS a full sleep's worth of budget left, this clamp is a
+        # no-op and the jitter still spreads waiters apart exactly as before.
+        time.sleep(max(0.0, min(0.25 + random.random() * 0.25, deadline - time.monotonic())))
 
     stop_touching = threading.Event()
 
