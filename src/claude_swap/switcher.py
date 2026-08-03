@@ -2328,7 +2328,21 @@ class ClaudeAccountSwitcher:
                         "race, so no pass can ever adopt it.", account_num,
                     )
                 continue
-            creds = self._store._read_unclaimed_credential(entry_id)
+            creds, unreadable = self._store._read_unclaimed_credential(entry_id)
+            if unreadable:
+                # This entry is the SOLE copy of a generation a prior gate
+                # pass already consumed and could not persist. Falling
+                # through here would make the caller POST the slot's
+                # spent generation -- an unrecoverable invalid_grant on an
+                # account whose live credential is sitting right here,
+                # merely unreadable this instant. Raise into the caller's
+                # existing pre-consume exception handling, which already
+                # degrades to "transient" and defers to the next pass.
+                raise CredentialReadError(
+                    f"stash entry {entry_id} for account {account_num} is "
+                    "unreadable; deferring adoption rather than discarding "
+                    "its generation"
+                )
             if not creds:
                 continue
             self._write_account_credentials(account_num, email, creds)
