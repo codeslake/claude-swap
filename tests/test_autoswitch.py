@@ -4049,6 +4049,62 @@ class TestHorizonAxisDoesNotFlap:
             "which is the persisted lockout, not anti-flap"
         )
 
+    def test_a_failover_departure_does_not_disarm_the_bar(self, temp_home):
+        """`(None, None)` from a failover must not read the same as `absent`.
+
+        `_perform` writes `leftHeadroom`/`leftRecoveryAt` unconditionally on
+        every trigger, including `failover`, where `active_headroom` is None
+        (that is the definition of failover) and the recorded recovery is
+        `inf` -> stored as `null`. The resulting state —
+        `{"leftHeadroom": null, "leftRecoveryAt": null}`, KEYS PRESENT — is
+        byte-identical over JSON to a pre-upgrade record where the keys were
+        never written, and the old code read both with `state.get(...)`,
+        which cannot tell presence-with-null from absence.
+
+        Reached with a real failover (active usage unreadable for
+        `unhealthy_ticks` ticks), then the classic flap shape: the barred
+        account frozen at 4 pts, the new active burning from 4 to 2 pts —
+        the same shape `test_the_release_needs_the_barred_account_to_have_improved`
+        uses for a PROACTIVE departure, which correctly holds. A failover
+        departure must hold the same way, not disarm on the very next tick.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        frozen1 = self._days_out(h, 500)
+        outcome = None
+        for _ in range(3):  # unhealthy_ticks default is 3
+            outcome = h.tick_with_usage({
+                "1": None,                              # unreadable -> failover
+                "2": _usage(4, self._days_out(h, 400)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.engine._read_state()
+        assert "leftHeadroom" in state, (
+            "premise: _perform writes the keys unconditionally even on failover"
+        )
+        assert state.get("leftHeadroom") is None
+        assert state.get("leftRecoveryAt") is None
+
+        h.clock.advance(301.0)
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(96, frozen1),                     # frozen, 4 pts
+                "2": _usage(98, self._days_out(h, 400)),       # active, burnt to 2 pts
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED not in outcomes, (
+            f"{[o.name for o in outcomes]} — a failover departure was treated "
+            "as 'no evidence, release', undoing the failover on the very next "
+            "proactive tick"
+        )
+
     def test_the_release_fires_when_the_barred_account_recovered(
         self, temp_home
     ):
