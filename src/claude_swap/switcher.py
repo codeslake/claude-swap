@@ -5708,9 +5708,17 @@ class ClaudeAccountSwitcher:
         """
         active = self._store._read_active_credentials()
         live = active.value
-        if live is None or active.degraded or (
-            live == "" and active.keychain_unavailable
-        ):
+        # m1: `live == "" and active.keychain_unavailable` used to sit
+        # alongside `active.degraded` here. `_read_active_credentials`'s only
+        # return path producing `value == ""` is the nothing-anywhere
+        # fallback -- `unreachable = keychain_failed or
+        # self._managed_read_failed; return ActiveCredentials("",
+        # unreachable, unreachable)` -- both flags come from that SAME
+        # variable, so whenever the dropped term could be True, `degraded` is
+        # already True too. Confirmed by mutation: deleting the term changed
+        # no test outcome across `TestSwitchSkipsBrokenSlots` (27 tests) or
+        # the full `test_switcher.py` (434 tests).
+        if live is None or active.degraded:
             # PRESENT BUT UNREADABLE — not the same as absent, and the two used
             # to take the same branch because both are falsy. `""` means nothing
             # is there and clearing costs nothing; `None` means a credential
@@ -5724,26 +5732,18 @@ class ClaudeAccountSwitcher:
             # method is reached from the direct-activation path BEFORE its
             # rollback snapshot, so nothing downstream can put it back.
             #
-            # `keychain_unavailable` is the SAME fact wearing the Keychain's
-            # spelling. A failed OAuth read that nothing else covers returns
-            # `("", True)`, not `None` — and `""` is falsy, so the stash was
-            # skipped while the clear went ahead. The delete is not the read:
-            # `-w` decrypts, `delete-generic-password` is attribute-only and
-            # runs outside `_use_keychain`, so a read that times out under the
-            # statusline contention this module names, then a delete that
-            # succeeds once it clears, is ordinary. Measured, unmanaged login:
-            # SwitchError promising a stash, keychain item gone, stash empty.
-            #
-            # `degraded` is the THIRD axis, and it is neither of the two above:
-            # the value is real bytes, so it is not `None` and not `""`. It
-            # means the Keychain read failed and the plaintext file covered
-            # it — and Claude Code writes rotations Keychain-only on macOS, so
-            # those bytes can be a SUPERSEDED generation while the current one
-            # sits in the item we could not read. The clear then deletes that
-            # item (attribute-only, see above), and the stash holds the stale
-            # copy. Measured: stash carries STALE-GEN-7, `CURRENT-GEN-9` exists
-            # nowhere. `ActiveCredentials.degraded` says these bytes must not
-            # be trusted; deleting the original on their word is the strongest
+            # `degraded` means the Keychain read failed and the plaintext file
+            # (or emptiness) covered it — and Claude Code writes rotations
+            # Keychain-only on macOS, so those bytes can be a SUPERSEDED
+            # generation while the current one sits in the item we could not
+            # read. The clear then deletes that item (attribute-only:
+            # `delete-generic-password` runs outside `_use_keychain`, so a
+            # read that times out under the statusline contention this module
+            # names, then a delete that succeeds once it clears, is
+            # ordinary), and the stash holds the stale copy. Measured: stash
+            # carries STALE-GEN-7, `CURRENT-GEN-9` exists nowhere.
+            # `ActiveCredentials.degraded` says these bytes must not be
+            # trusted; deleting the original on their word is the strongest
             # possible way to trust them.
             #
             # Refusing is the same contract the stash already states: a
