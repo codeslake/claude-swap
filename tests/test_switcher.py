@@ -23,7 +23,13 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
+from claude_swap.usage_store import (
+    FetchRecord,
+    UsageEntry,
+    UsageStore,
+    SERVE_TTL_S,
+    _row_eligible,
+)
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
@@ -9957,6 +9963,126 @@ class TestStrikeUnbindsInCollector:
         assert store.entries(identities)["2"].last_good == {
             "five_hour": {"pct": 12.0}
         }
+
+    def test_the_heal_does_not_erase_a_live_server_backoff(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """C1: the collector's fingerprint-healed strike-clear must not wipe
+        the server's 429 ``backoffUntil`` -- reachable from a no-network read
+        the TUI performs every 3 seconds, re-opening a throttled token
+        inside its own block.
+
+        Reproduced through the real store, via the real
+        ``_collect_usage_entries`` call path, with a CONTROL at each offset
+        (a separate, un-healed row on the same clock) so the eligibility
+        flip is attributed to the heal and not to the backoff's own expiry.
+
+        Corrected boundary: ``_row_eligible`` also requires ``stale``
+        (``now - fetchedAt > SERVE_TTL_S == 180``), so the earliest the
+        control's own backoff-oblivious staleness could flip eligible is
+        +181s, not +120s -- the reviewer's original number. At every offset
+        the throttle itself (``backoffUntil``) must survive the heal
+        unchanged; only display/fetch ELIGIBILITY may legitimately track
+        staleness once trust_extended can no longer paper over it (a
+        question for I2, not this test).
+        """
+        from claude_swap.usage_store import FetchRecord as StoreRecord
+
+        assert SERVE_TTL_S == 180.0, "premise: brief's +181s boundary"
+
+        class FakeClock:
+            def __init__(self, now: float = 1_000_000.0):
+                self.now = now
+
+            def __call__(self) -> float:
+                return self.now
+
+            def advance(self, seconds: float) -> None:
+                self.now += seconds
+
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        clock = FakeClock()
+        s._usage_store.clock = clock
+
+        dead = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt-dead",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", dead)
+        identities = {"2": ("b@example.com", "")}
+        store = s._usage_store
+        # A prior success, so `fetchedAt` is set and staleness is measured
+        # from a real anchor rather than None (which is unconditionally
+        # stale -- the point is to test the BOUNDARY, not the None case).
+        store.record({"2": StoreRecord(usage={"five_hour": {"pct": 3.0}})},
+                      identities)
+        # Strike + a long server-side block (retry_after_s=1800), exactly
+        # the shape a 429-adjacent invalid_grant leaves on the row. Unfenced
+        # (no claim) -- the row was just successfully fetched a moment ago
+        # and is neither stale nor poll-due, so `reserve()` would not win it
+        # a claim; a real collector's own failed fetch writes through
+        # `record()` fenced by ITS OWN prior claim, which is exactly this
+        # unfenced shape once that claim has already been consumed by the
+        # success above.
+        accepted = store.record(
+            {"2": StoreRecord(error="invalid_grant", retry_after_s=1800.0,
+                               struck_fp=oauth.credential_fingerprint(dead))},
+            identities,
+        )
+        assert accepted == {"2"}, "premise: the strike was recorded"
+        row0 = store._read_rows()["2"]
+        backoff_at_strike = row0["backoffUntil"]
+        assert backoff_at_strike is not None
+        assert backoff_at_strike - clock.now == pytest.approx(1800.0)
+
+        # The credential heals (fresh lineage) -- the collector's read below
+        # takes the fingerprint-healed `elif` branch, not re-login-required.
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", fresh)
+
+        for advance_s, label in (
+            (120.0, "+120s (still inside SERVE_TTL_S)"),
+            (61.0, "+181s (past SERVE_TTL_S, still inside the 1800s block)"),
+            (1519.0, "+1700s (still inside the 1800s block)"),
+        ):
+            clock.advance(advance_s)
+            now = clock.now
+
+            # CONTROL: an identically-clocked row that is never healed --
+            # same struck state, same age. Read directly (no heal call).
+            ctrl_row = dict(store._read_rows()["2"])
+            ctrl_backoff = ctrl_row["backoffUntil"]
+            ctrl_eligible = _row_eligible(ctrl_row, now, respect_plans=False)
+
+            info = [(2, "b@example.com", "", "", False, fresh, "")]
+            s._collect_usage_entries(info, fetch=set())
+
+            heal_row = store._read_rows()["2"]
+            heal_backoff = heal_row["backoffUntil"]
+            heal_eligible = _row_eligible(heal_row, now, respect_plans=False)
+
+            assert ctrl_backoff == backoff_at_strike, (
+                f"{label}: control backoffUntil moved on its own -- the "
+                "clock-offset premise is broken"
+            )
+            assert heal_backoff == backoff_at_strike, (
+                f"{label}: the heal erased backoffUntil "
+                f"({backoff_at_strike} -> {heal_backoff}) -- a throttled "
+                "token was re-opened inside its own server-side block"
+            )
+            assert heal_eligible == ctrl_eligible, (
+                f"{label}: heal eligibility ({heal_eligible}) diverged from "
+                f"the un-healed control ({ctrl_eligible}) -- the heal must "
+                "not itself flip fetch eligibility via the throttle field"
+            )
 
 
 class TestStoreResolutionParity:

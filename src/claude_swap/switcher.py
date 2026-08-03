@@ -4077,8 +4077,25 @@ class ClaudeAccountSwitcher:
                 # `record()` fences its own write on — discarding that
                 # collector's measurement for a strike this call is merely
                 # observing, not causing.
+                #
+                # strike_only=True: this call is evidence a STRIKE healed
+                # (the fingerprint no longer matches), not evidence the
+                # server's own 429 throttle lifted — `backoffUntil` and
+                # `lastError` are the server's word, not this call's to
+                # erase (round 7 C1: an unconditional clear here re-opened
+                # a token still inside its own block).
+                #
+                # expected_fingerprints re-checks the row UNDER THE LOCK
+                # against what THIS lock-free read just saw: the decision
+                # to heal was made on `entries` above, with no re-check
+                # before this write, so a strike (or a different
+                # collector's own heal) landing in that gap must not be
+                # silently overwritten by a now-stale decision.
                 self._usage_store.clear_dead_token(
-                    [num], {num: identities[num]}, revoke_claim=False
+                    [num], {num: identities[num]},
+                    revoke_claim=False,
+                    strike_only=True,
+                    expected_fingerprints={num: entry.struck_fingerprint},
                 )
                 entries = store.entries(identities, models)
         requested = [
