@@ -755,19 +755,32 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     return not _wired_port_is_serving(_switcher, connect_timeout=connect_timeout)
 
 
+def _port_of_config(path) -> int | None:
+    """The pin port ONE config file names, or None when it names none, is
+    unreadable, or malformed. The single-file read :func:`_wired_ports` and
+    :func:`_wired_port_of` each build on, so a config's own answer is asked
+    once and the two callers cannot drift on how they extract it.
+    """
+    import json as _json
+
+    try:
+        env = _json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+        port = int(env.get("CSWAP_PIN_PORT") or 0)
+    except Exception:  # noqa: BLE001 — unreadable/unwired: no opinion
+        return None
+    return port or None
+
+
 def _wired_ports() -> list[int]:
     """Every pin port the configs name, in read order. Unreadable ones are
     absent rather than zero — "no opinion" and "port 0" are different facts.
 
-    ONE walk for both callers. `_wired_port_of` and `_wired_port_is_serving`
-    each had their own copy of it: same two getters, same de-dup, same
-    ``int(env["CSWAP_PIN_PORT"])``. The de-dup is the part that must not
-    drift — the two getters resolve to the SAME file outside a session
-    terminal, and a probe that counted it twice would report a second opinion
-    the machine does not have.
+    For "is ANYTHING wired at all" questions (``_wiring_present``,
+    ``clear_wiring``, the every-config-must-serve probe below) where both
+    configs' opinions genuinely apply at once. NOT for a per-config
+    staleness verdict — see :func:`_wired_port_of`, which deliberately does
+    NOT call this.
     """
-    import json as _json
-
     from claude_swap.paths import (
         get_default_global_config_path,
         get_global_config_path,
@@ -775,27 +788,45 @@ def _wired_ports() -> list[int]:
 
     ports, seen = [], set()
     for get in (get_global_config_path, get_default_global_config_path):
-        try:
-            path = get()
-            if path in seen:
-                continue
-            seen.add(path)
-            env = _json.loads(path.read_text(encoding="utf-8")).get("env") or {}
-            port = int(env.get("CSWAP_PIN_PORT") or 0)
-        except Exception:  # noqa: BLE001 — unreadable/unwired: no opinion
+        path = get()
+        if path in seen:
             continue
+        seen.add(path)
+        # No try here: the only work above is resolving a path and a set
+        # membership test, and every way a CONFIG can be unreadable is
+        # already caught inside `_port_of_config`. A catch-all around code
+        # that cannot raise can only ever hide a real bug later.
+        port = _port_of_config(path)
         if port:
             ports.append(port)
     return ports
 
 
 def _wired_port_of(_switcher) -> int | None:
-    """The pin port a wired config names, or None when none can be read.
+    """The pin port THIS invocation's OWN config names, or None when it
+    names none or cannot be read.
 
-    Separate from the serving probe because "no port named" and "the port
-    refuses" are different facts, and only the second licenses a teardown.
+    Deliberately ONE file — ``get_global_config_path()``, the config
+    ``wire_global_config`` actually writes for this session/process — NOT
+    the merged list :func:`_wired_ports` returns. That list flattens BOTH
+    configs, so borrowing from it here made this answer THE FIRST PORT
+    FOUND ON THE MACHINE, not the port of the config being judged: as soon
+    as ANY config named a port, ``_wiring_is_stale`` proceeded to the
+    serving probe and ``clear_wiring`` — reachable from both ``heal`` and
+    ``wire_launch_env`` — clears every wired config, live ones included.
+    Measured: a session config carrying the marker with no readable port
+    (live proxy, "I cannot tell") plus a default config naming an old DEAD
+    port turned the guard True and cleared the session's wiring along with
+    the default's.
+
+    A config that names no port must not have its verdict decided by a
+    DIFFERENT config's port — separate from the serving probe because "no
+    port named" and "the port refuses" are different facts, and only the
+    second licenses a teardown.
     """
-    return next(iter(_wired_ports()), None)
+    from claude_swap.paths import get_global_config_path
+
+    return _port_of_config(get_global_config_path())
 
 
 def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
@@ -956,8 +987,15 @@ def heal(switcher) -> tuple[bool, str]:
     # change, and `heal` reported "Removed a cloud pin wiring" while the
     # session config still named the dead port — every new session from that
     # terminal kept booting against it.
+    # THE SAME QUESTION `_wiring_is_stale` ASKS, not `_wiring_present` alone.
+    # `_wiring_present` keys on the marker only, so a config carrying the
+    # marker with no readable CSWAP_PIN_PORT satisfied it and got torn down
+    # here — the exact shape `_wiring_is_stale`'s own guard (see its
+    # docstring) declares must not be read as "the proxy is dead". `heal` is
+    # the worse of the two call sites to leave unguarded: the status line
+    # calls it on a timer, unattended, while the launch path runs once.
     try:
-        if _wiring_present(switcher):
+        if _wiring_is_stale(switcher):
             clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
             if not _wiring_present(switcher):
                 return True, (
