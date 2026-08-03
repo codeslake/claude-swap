@@ -6,6 +6,7 @@ install, not as a traceback.
 """
 
 import json
+import pathlib
 import sys
 
 import pytest
@@ -4047,7 +4048,7 @@ class TestTheSiblingGettersGuardTheirPathGettersToo:
             backup_dir=tmp_path,
             _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
         )
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
             pin.clear_wiring(sw, timeout=0.1)
 
         assert any(
@@ -4060,33 +4061,19 @@ class TestTheSiblingGettersGuardTheirPathGettersToo:
         )
 
 
-class TestTheUnresolvablePathWarningDoesNotDestroyItsOwnHistory:
-    """`heal` polls on a timer (the status line, every ~2s) and the condition
-    an unresolvable path getter reports is PERSISTENT — a missing HOME or a
-    permission bit does not fix itself between ticks. Logging it every tick,
-    as `clear_wiring` used to, writes ~6MB/day at that cadence and overwrites
-    the entire 4MB/3-backup rotating history (`logging_config.py`) with the
-    same line roughly every 15.5 hours — the record destroys every other
-    record. Log once per process instead: still observable (an operator sees
-    it at least once), no longer self-defeating.
+class TestEveryCallSiteRecordsAnUnresolvableGetter:
+    """All three call sites resolve the same two getters and all three used to
+    swallow a raise with no record — `clear_wiring` logged, `_wiring_present`
+    and `_wired_ports` said nothing.
 
-    `_wiring_present` and `_wired_ports` resolve the SAME two getters with
-    the same bare ``except Exception: continue`` and logged NOTHING at all —
-    a single `heal` tick hits the raising getter four times (once each via
-    `_wiring_present`, `_wired_ports`, `_wired_port_is_serving` calling
-    `_wired_ports` again, and `clear_wiring`): 3 silent, 1 logged before this
-    fix. The once-per-process cap has to be shared across all three call
-    sites, not per-function, or the same getter logs once from each of three
-    functions instead of once total.
-
-    The shared ``pin._unresolvable_warned`` set is reset before every test by
-    an autouse conftest fixture (mirroring ``_reset_pin_live_impl_cache``), so
-    no test here has to reset it by hand.
+    The record is at DEBUG, not WARNING, and there is no cap. See
+    `_warn_unresolvable_once`: a once-per-PROCESS cap suppresses nothing when
+    every statusline tick is a fresh `cswap pin --heal`, and a WARNING on the
+    two getters `heal` calls unconditionally turned "1 line ever" into "1 line
+    per tick" — measured through the real CLI, 0 -> 6 lines over 6 ticks.
     """
 
     def _no_home(self, monkeypatch):
-        import pathlib
-
         monkeypatch.delenv("HOME", raising=False)
         monkeypatch.setattr(
             pathlib.Path,
@@ -4094,8 +4081,16 @@ class TestTheUnresolvablePathWarningDoesNotDestroyItsOwnHistory:
             staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no HOME"))),
         )
 
-    def test_clear_wiring_logs_the_unresolvable_getter_only_once(
-        self, tmp_path, monkeypatch, caplog
+    @pytest.mark.parametrize(
+        "name, call",
+        [
+            ("clear_wiring", lambda pin, sw: pin.clear_wiring(sw, timeout=0.1) is False),
+            ("_wiring_present", lambda pin, sw: pin._wiring_present(None) is False),
+            ("_wired_ports", lambda pin, sw: pin._wired_ports() == []),
+        ],
+    )
+    def test_the_call_site_leaves_a_debug_record(
+        self, name, call, tmp_path, monkeypatch, caplog
     ):
         import logging
         import types
@@ -4104,62 +4099,20 @@ class TestTheUnresolvablePathWarningDoesNotDestroyItsOwnHistory:
 
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         self._no_home(monkeypatch)
-
         sw = types.SimpleNamespace(
             backup_dir=tmp_path,
             _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
         )
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            pin.clear_wiring(sw, timeout=0.1)
-            pin.clear_wiring(sw, timeout=0.1)
-            pin.clear_wiring(sw, timeout=0.1)
-
-        hits = [
-            r
-            for r in caplog.records
-            if "get_default_global_config_path" in r.getMessage()
-        ]
-        assert len(hits) == 1, (
-            f"logged {len(hits)} times across 3 calls in one process — a "
-            "persistent condition must be logged once, not every tick"
-        )
-
-    @pytest.mark.parametrize(
-        "name, call",
-        [
-            ("_wiring_present", lambda pin: pin._wiring_present(None) is False),
-            ("_wired_ports", lambda pin: pin._wired_ports() == []),
-        ],
-    )
-    def test_the_previously_silent_call_sites_also_log(
-        self, name, call, tmp_path, monkeypatch, caplog
-    ):
-        """Both swallowed the same raise `clear_wiring` logs, with no record
-        at all. Parametrized rather than duplicated: the fixture and the
-        assertion are identical and only the call differs, so a third call
-        site added later is one tuple, not another copy."""
-        import logging
-
-        from claude_swap import pin
-
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-        self._no_home(monkeypatch)
-
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            assert call(pin)
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            assert call(pin, sw)
 
         assert any(
             "get_default_global_config_path" in r.getMessage()
             for r in caplog.records
-        ), f"{name} swallowed an unresolvable getter with no record"
+        ), f"{name} swallowed an unresolvable getter with no record at all"
 
-    def test_the_cap_is_shared_across_all_three_call_sites(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        """A single `heal` tick hits the raising getter through THREE
-        different functions. The once-per-process cap must be shared state,
-        not a per-function counter, or each function logs its own first
-        occurrence and the same tick still writes 3 lines instead of 1."""
+    def test_no_call_site_emits_a_WARNING(self, tmp_path, monkeypatch, caplog):
+        """The level is the whole point: WARNING here is per-tick log churn."""
         import logging
         import types
 
@@ -4167,25 +4120,16 @@ class TestTheUnresolvablePathWarningDoesNotDestroyItsOwnHistory:
 
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         self._no_home(monkeypatch)
-
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
         sw = types.SimpleNamespace(
             backup_dir=tmp_path,
             _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
         )
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            pin._wiring_present(None)
-            pin._wired_ports()
-            pin.clear_wiring(sw, timeout=0.1)
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            pin.heal(sw)
 
-        hits = [
-            r
-            for r in caplog.records
-            if "get_default_global_config_path" in r.getMessage()
-        ]
-        assert len(hits) == 1, (
-            f"logged {len(hits)} times across 3 DIFFERENT functions in one "
-            "process — the cap must be shared, not per-function"
-        )
+        loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not loud, f"an unresolvable getter shouted: {[r.getMessage() for r in loud]}"
 
 
 class TestTheLoggerNameStaysPinnedToClaudeSwap:
@@ -4277,3 +4221,99 @@ class TestClearWiringDoesNotLockTheSameFileTwice:
             "times in one call — the two getters resolving to one path must "
             "collapse to one attempt, not one per getter"
         )
+
+
+class TestTheWarningDoesNotFireOnEveryTick:
+    """A once-per-PROCESS cap cannot help when every tick is a new process.
+
+    `cswap pin --heal` is spawned fresh by the statusline hook (`pin-ensure`
+    runs `timeout 10 cswap pin --heal` on a ~2s cadence). `pin.heal` has one
+    caller — `pin.run(..., heal_only=True)` from `cli.py` — and no long-lived
+    daemon. So the module-level cap's lifetime IS one tick, and it can never
+    suppress a line across ticks.
+
+    MEASURED through the real CLI with an unreadable `~/.claude` (a reachable
+    `PermissionError` from `get_default_global_config_path`), counting lines
+    in the actual rotating log:
+
+        tick   before this fix   after adding it to all three call sites
+        1      0                 1
+        2      0                 2
+        6      0                 6
+
+    The direction is inverted from what the fix claimed. Before, the warning
+    was reachable only from `clear_wiring`, which `heal` calls only when
+    `_wiring_is_stale` — false once the wiring is gone, so it logged once and
+    never again. Adding it to `_wiring_present` and `_wired_ports`, which run
+    on EVERY tick unconditionally, turned "1 line ever" into "1 line per
+    tick": ~4.2MB/day at 98 bytes, overwriting the whole 4MB rotating history
+    every ~22.7h. That is the damage the comment claimed to prevent, newly
+    created by the code that claimed it.
+
+    Observability on those two getters is still worth having — they were
+    swallowing the raise silently. It belongs at DEBUG, which the rotating
+    handler does not record by default, so the record exists for anyone who
+    turns it up and costs nothing per tick.
+    """
+
+    def test_repeated_heal_ticks_do_not_each_write_a_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(
+            pathlib.Path,
+            "home",
+            staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no HOME"))),
+        )
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        # Three ticks. With no per-process state left, repeating the call
+        # IS the fresh-process simulation — which is the point: nothing can
+        # accumulate that a new process would reset.
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            for _ in range(3):
+                pin.heal(sw)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not warnings, (
+            "a per-tick WARNING survives across processes — at a ~2s cadence "
+            "this overwrites the whole rotating log history daily: "
+            f"{[r.getMessage() for r in warnings]}"
+        )
+
+    def test_the_record_still_exists_at_debug(self, tmp_path, monkeypatch, caplog):
+        """Silence was the original defect. The getter's failure must still be
+        recoverable by anyone who turns the level up."""
+        import logging
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(
+            pathlib.Path,
+            "home",
+            staticmethod(lambda: (_ for _ in ()).throw(RuntimeError("no HOME"))),
+        )
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            pin.heal(sw)
+
+        assert any(
+            "get_default_global_config_path" in r.getMessage()
+            for r in caplog.records
+        ), "the unresolvable getter left no record at any level"
