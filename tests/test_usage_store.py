@@ -582,7 +582,7 @@ class TestBackoff:
         assert entry.decision_value() is None
 
     def test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success(
-        self,
+        self, store, clock
     ):
         """The blind gap is bounded PER BLOCK, never across a chain of them.
 
@@ -592,7 +592,10 @@ class TestBackoff:
         `record()` writes `fetchedAt` only when `rec.error is None`
         (usage_store.py, the success branch) — a chain of failed blocks never
         refreshes it, so trust keeps expiring against the FIRST success while
-        each new block adds another full wait.
+        each new block adds another full wait. Driven through the real
+        `store.record()`/`store.entries()` round trip, not a hand-rolled
+        stand-in, so a regression in the success-only write actually fails
+        this test.
 
         Measured here with far-future resets only, so `_earliest_reset` can
         never bind and only the ceiling can:
@@ -636,30 +639,36 @@ class TestBackoff:
         assert oauth.relevant_windows(last_good, ()) != []
         assert usage_store._earliest_reset(last_good) is not None
 
-        wait = usage_store._failure_backoff_s(1, 3600.0, rate_limited=True)
-        assert wait == pytest.approx(4500.0)
+        # ONE success establishes fetchedAt; every record() after this is a
+        # 429 failure, so a chain of them must never move it again.
+        store.record({"1": FetchRecord(usage=last_good)}, IDENT)
+        fetched_at = store.entries(IDENT)["1"].fetched_at
 
-        # fetchedAt stays at the last SUCCESS (t=0): `record()` writes it only
-        # when `rec.error is None`, so a chain of failed blocks never moves it.
-        fetched_at = 0.0
-        t = 0.0
         blind_per_block = []
         for _ in range(3):
-            end = t + wait
-            # Ask the REAL predicate at each second-boundary of this block.
-            blind = 0.0
-            probe = max(t, 0.0)
-            while probe < end:
-                age = probe - fetched_at
-                if not usage_store._rate_limited_trust_ok(
-                    last_good, age, probe
-                ):
-                    blind = end - probe
-                    break
-                probe += 60.0
-            blind_per_block.append(blind)
-            t = end
+            store.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+            )
+            entry = store.entries(IDENT)["1"]
+            assert entry.fetched_at == fetched_at, (
+                "a failed record() moved fetchedAt — the chain premise this "
+                "test pins no longer holds"
+            )
+            assert entry.backoff_until is not None
+            block_end = entry.backoff_until
+            wait = block_end - clock.now
 
+            # Ask the REAL read model at each second-boundary of this block.
+            blind = 0.0
+            while clock.now < block_end:
+                if store.entries(IDENT)["1"].decision_value() is None:
+                    blind = block_end - clock.now
+                    break
+                clock.advance(60.0)
+            blind_per_block.append(blind)
+            clock.advance(max(block_end - clock.now, 0.0))
+
+        assert wait == pytest.approx(4500.0)
         assert blind_per_block[0] == 0.0, (
             "the first block is supposed to sit inside its trust — if this "
             "fires, the single-block claim itself is wrong"

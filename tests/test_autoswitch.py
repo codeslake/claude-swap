@@ -1359,7 +1359,7 @@ class TestAdaptiveScheduler:
         """Finding-2 regression: the owned+expired sentinel must not be hidden
         by the active row's failure backoff (e.g. a Retry-After window), or
         the engine would count unhealthy ticks toward a spurious failover."""
-        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
+        from claude_swap.usage_store import FetchRecord
 
         h = self._harness(temp_home, monkeypatch)
         # Active token locally expired while an owner is present.
