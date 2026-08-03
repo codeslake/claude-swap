@@ -602,17 +602,18 @@ class TestTheTuiSurfaceSurvivesTheSplit:
 
     def test_the_menu_rebuilds_on_the_poll(self):
         """The root menu was built once at mount, so a row that appears on
-        install could not appear until a restart."""
-        import inspect
+        install could not appear until a restart.
 
+        The METHOD only — that something fires it is asserted by driving a real
+        snapshot through a real app in
+        ``test_tui_pin.py::test_a_snapshot_actually_rebuilds_the_root_menu``.
+        This used to grep ``on_mount``'s source for the name, which a comment
+        satisfies: deleting the subscription and leaving the word behind kept
+        the suite green while the pin row could no longer appear.
+        """
         from claude_swap.tui import dashboard
 
         assert hasattr(dashboard.DashboardScreen, "refresh_root_menu")
-        assert "refresh_root_menu" in inspect.getsource(
-            dashboard.DashboardScreen.on_mount
-        ) or "_refresh_menu_on_snapshot" in inspect.getsource(
-            dashboard.DashboardScreen.on_mount
-        ), "nothing rebuilds the root menu after mount"
 
     def test_opening_the_pin_submenu_lists_the_accounts(self, monkeypatch):
         """The row existing is not the same as the row WORKING.
@@ -695,22 +696,116 @@ class TestTheTuiSurfaceSurvivesTheSplit:
                   if action == "pin-menu"]
         assert "Cloud account" in labels[0]
 
-    def test_both_account_renderers_take_the_badge(self):
+    def test_both_account_renderers_actually_render_the_badge(self):
         """The badge rides on the account rows, and there are two renderers —
         the full card and the minimised line. Losing it from one is the half
-        that reads as healthy."""
-        import inspect
+        that reads as healthy.
 
-        from claude_swap.tui import widgets
+        RENDERED TEXT, not signatures and not source text. The previous version
+        asserted `"cloud_pinned" in inspect.signature(...)` plus
+        `"○ cloud" in inspect.getsource(...)`, and both are satisfiable with
+        the feature gone: a parameter can exist and be ignored, and the glyph
+        also appears in a comment. Measured — with the minimised renderer's
+        badge block changed to `if False and cloud_pinned:`, the whole TUI
+        suite stayed green.
+        """
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+        from tests.test_tui import make_account
 
-        for fn in (widgets.account_card_text, widgets.mini_account_text):
-            assert "cloud_pinned" in inspect.signature(fn).parameters, (
-                f"{fn.__name__} cannot render the cloud badge"
+        acc = make_account(1, active=True)
+        for name, render in (
+            ("account_card_text", lambda **kw: account_card_text(acc, 80, **kw)),
+            ("mini_account_text", lambda **kw: mini_account_text(acc, 0.0, **kw)),
+        ):
+            on = render(cloud_pinned=True).plain
+            off = render(cloud_pinned=False).plain
+            assert "○ cloud" in on, f"{name} does not render the cloud badge"
+            assert "○ cloud" not in off, f"{name} renders the badge unpinned"
+
+    def test_the_auto_switch_view_renders_the_badge_on_the_pinned_row(
+        self, monkeypatch
+    ):
+        """Same assertion for the third renderer, which had only a source grep.
+
+        Measured: deleting the badge block from `_candidates_text` and leaving
+        the glyph in a comment kept the suite green.
+        """
+        import types
+
+        from claude_swap.tui import autoview
+        from claude_swap.tui.theme import CSWAP_LIGHT
+        from tests.test_tui import make_account
+
+        accounts = [make_account(1, active=True), make_account(2)]
+        pinned = accounts[1].email
+        snap = types.SimpleNamespace(accounts=accounts)
+
+        screen = object.__new__(autoview.AutoScreen)
+        screen._settings = None
+        # `app` is a read-only property on the Textual screen, so the stub goes
+        # on the CLASS. Nothing here touches the real app.
+        monkeypatch.setattr(
+            autoview.AutoScreen,
+            "app",
+            property(
+                lambda self: types.SimpleNamespace(
+                    current_theme=CSWAP_LIGHT, switcher=types.SimpleNamespace()
+                )
+            ),
+            raising=False,
+        )
+
+        monkeypatch.setattr(autoview.pin, "pinned_email", lambda sw: pinned)
+        with_pin = screen._candidates_text(snap, accounts[0].number).plain
+        monkeypatch.setattr(autoview.pin, "pinned_email", lambda sw: None)
+        without = screen._candidates_text(snap, accounts[0].number).plain
+
+        assert "○ cloud" in with_pin, "the auto-switch view lost the cloud badge"
+        assert "○ cloud" not in without, "badged a row with nothing pinned"
+        # And on the RIGHT row: the badge exists to save you matching an email
+        # against the list below it.
+        badged = [ln for ln in with_pin.splitlines() if "○ cloud" in ln]
+        assert len(badged) == 1, badged
+        assert accounts[1].number in badged[0], (
+            f"badge landed on the wrong account row: {badged[0]!r}"
+        )
+
+    def test_a_BROKEN_pin_says_so_in_both_renderers(self):
+        """The fail-open warning is the whole point of `pin_is_broken`.
+
+        A pinned account with no usable credential still shows the cloud badge,
+        so without this the one place claiming "your claude.ai side lives here"
+        is the one place not admitting it no longer does.
+
+        `pin_is_broken` was unit-tested, but nothing asserted its result ever
+        reached TEXT — measured: with both `(not applying)` renders changed to
+        `if False and pin_is_broken(acc):`, the whole TUI suite stayed green.
+        """
+        import dataclasses
+
+        from claude_swap.tui.widgets import (
+            account_card_text,
+            mini_account_text,
+            pin_is_broken,
+        )
+        from tests.test_tui import make_account
+
+        healthy = make_account(1, active=True)
+        broken = dataclasses.replace(healthy, kind="api_key")
+        assert pin_is_broken(broken) and not pin_is_broken(healthy), (
+            "fixture does not describe the state under test"
+        )
+
+        for name, render in (
+            ("account_card_text", lambda a: account_card_text(a, 80, cloud_pinned=True)),
+            ("mini_account_text", lambda a: mini_account_text(a, 0.0, cloud_pinned=True)),
+        ):
+            assert "(not applying)" in render(broken).plain, (
+                f"{name} shows a cloud badge over a pin that cannot apply"
             )
-        assert "○ cloud" in inspect.getsource(widgets)
-        assert "○ cloud" in inspect.getsource(
-            __import__("claude_swap.tui.autoview", fromlist=["x"])
-        ), "the auto-switch view lost the cloud badge"
+            assert "(not applying)" not in render(healthy).plain, (
+                f"{name} warns about a healthy pin"
+            )
 
     def test_a_pinned_account_actually_renders_the_badge(self):
         """Not just the parameter — the glyph has to reach the text."""
@@ -2049,19 +2144,42 @@ class TestHealADeadPin:
     def test_heal_restarts_the_proxy_when_it_can(self, tmp_path, monkeypatch):
         """Preferred outcome: the daemon comes back on the SAME port, so live
         sessions — whose env is fixed at exec — reattach with no restart."""
+        import socket
+        import threading
+
         from claude_swap import pin
 
         sw, cfg = self._sw(tmp_path)
         self._paths(monkeypatch, cfg)
         called = []
+        revived = {}
 
         class _I:
             def heal(self, backup_dir):
+                # A REAL heal binds the port the wiring names. Returning True
+                # while binding nothing is a state no working package can
+                # produce, and `heal` now re-reads rather than believing it —
+                # so a fixture that only returns True would be asserting the
+                # seam trusts a claim it must not trust.
                 called.append(backup_dir)
+                port = int(json.loads(cfg.read_text())["env"]["CSWAP_PIN_PORT"])
+                srv = socket.socket()
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", port))
+                srv.listen(8)
+                revived["srv"] = srv
+                threading.Thread(
+                    target=lambda: [srv.accept()[0].close() for _ in iter(int, 1)],
+                    daemon=True,
+                ).start()
                 return True
 
         monkeypatch.setattr(pin, "_live_impl", lambda: _I())
-        changed, msg = pin.heal(sw)
+        try:
+            changed, msg = pin.heal(sw)
+        finally:
+            if "srv" in revived:
+                revived["srv"].close()
         assert changed, msg
         # "Restored", not "Restarted": the same call also re-wires a daemon
         # that is serving while the config names nothing, so a message naming
@@ -2577,5 +2695,112 @@ class TestHealNeverTearsDownAServingPin:
             assert not changed
             assert msg == "Nothing to heal", msg
             assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+        finally:
+            srv.close()
+
+    def test_heal_does_not_take_the_packages_TRUE_on_trust(self, tmp_path, monkeypatch):
+        """The False path re-reads; the True path used to be believed.
+
+        Same mistake, opposite direction. This function's whole thesis is that
+        a verdict comes from the state rather than from a call — and it matters
+        because `cswap-pin` is a PEER on its own release schedule, so the seam
+        cannot promise what a future version returns.
+
+        Measured before the fix, with an impl returning True while binding
+        nothing: heal() -> (True, "Restored the cloud pin") while the wired
+        port served nothing. The status line calls this on a timer, so the
+        user's only signal said the outage was over.
+        """
+        import socket
+
+        from claude_swap import pin
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+
+        sw, cfg = self._wired_to(tmp_path, dead)
+        self._paths(monkeypatch, cfg)
+
+        class _Liar:
+            def heal(self, backup_dir):
+                return True  # claims success, binds nothing
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _Liar())
+        changed, msg = pin.heal(sw)
+        assert msg != "Restored the cloud pin", (
+            "claimed a restore while the wired port serves nothing"
+        )
+        # It must still do something useful: the wiring named a dead port, so
+        # removing it is the honest outcome.
+        assert changed, msg
+        assert "_cswapPinWiredKeys" not in json.loads(cfg.read_text())
+
+    def test_a_live_config_does_not_mask_a_dead_one(self, tmp_path, monkeypatch):
+        """`_wired_port_is_serving` ORed across the two config paths.
+
+        The writer is asymmetric — `cswap_pin.wire_global_config` writes only
+        the session config while the seam reads both — so a live session config
+        masked a DEAD default config. A user launching plain `claude` from a
+        terminal booted against the dead one, and `--heal` answered "Nothing to
+        heal" every tick.
+
+        An unwired config is not a counter-example: it sends nobody anywhere.
+        Only a config that NAMES a port has an opinion, and every such opinion
+        has to be right.
+        """
+        import socket
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        srv, live = self._serving()
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+        try:
+            sw, cfg_live = self._wired_to(tmp_path, live)
+            cfg_dead = tmp_path / "default.json"
+            cfg_dead.write_text(json.dumps({
+                "env": {"CSWAP_PIN_PORT": str(dead)},
+                "_cswapPinWiredKeys": ["CSWAP_PIN_PORT"],
+            }))
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_live)
+            monkeypatch.setattr(
+                paths, "get_default_global_config_path", lambda: cfg_dead
+            )
+            assert pin._wired_port_is_serving(sw) is False, (
+                "a live session config masked a dead default config"
+            )
+            assert pin._wiring_is_stale(sw) is True
+        finally:
+            srv.close()
+
+    def test_an_unwired_second_config_is_not_a_counter_example(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard above must not turn every healthy pin into a broken one.
+
+        Only ONE config is normally written, so if an absent wiring counted
+        against serving, `_wired_port_is_serving` would be False on every
+        healthy machine — and `wire_launch_env` would unwire a live pin on the
+        next launch.
+        """
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        srv, live = self._serving()
+        try:
+            sw, cfg_live = self._wired_to(tmp_path, live)
+            cfg_bare = tmp_path / "default.json"
+            cfg_bare.write_text(json.dumps({}))  # nothing wired here
+            monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg_live)
+            monkeypatch.setattr(
+                paths, "get_default_global_config_path", lambda: cfg_bare
+            )
+            assert pin._wired_port_is_serving(sw) is True
+            assert pin._wiring_is_stale(sw) is False
         finally:
             srv.close()

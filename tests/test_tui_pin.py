@@ -432,3 +432,38 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
             assert started == ["clear cloud pin"]
         finally:
             pin._impl, pin.clear_pin = real
+
+    async def test_a_snapshot_actually_rebuilds_the_root_menu(self, tmp_path):
+        """The SUBSCRIPTION, not just the method it calls.
+
+        `refresh_root_menu` had a direct-call test, so its logic was covered —
+        but nothing asserted that anything FIRES it. The old assertion grepped
+        `on_mount`'s source for the name, which a comment satisfies: measured,
+        deleting `self.watch(self.app, "snapshot", ...)` and leaving the name
+        in a comment kept the whole suite green, while the pin row could no
+        longer appear on a mid-session install. That is the exact behaviour the
+        test names.
+
+        So drive a snapshot through the app and assert the rebuild happened.
+        """
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            calls = []
+            original = app.screen.refresh_root_menu
+
+            async def _counted():
+                calls.append(1)
+                await original()
+
+            app.screen.refresh_root_menu = _counted
+            # A poll publishes a new snapshot; that is the app's own mechanism,
+            # not a helper invented here.
+            app.snapshot = types.SimpleNamespace(accounts=[make_account(1, active=True)])
+            await pilot.pause()
+            await settle(pilot)
+            assert calls, (
+                "a snapshot did not rebuild the root menu — the pin row cannot "
+                "appear on a mid-session install"
+            )
