@@ -8816,13 +8816,27 @@ class TestBackupUnreadableDisplay:
         info_ok = (1, "a@example.com", "", "", True, active.value or "", "")
         assert s._static_usage_sentinel(info_ok) is None, "control broken"
 
-        # PROBE: unreadable (mode 000) -> keychain unavailable, not "no
-        # credentials" (which would nudge the user into an unneeded re-add).
-        cred_path.chmod(0o000)
-        try:
+        # PROBE: the read FAILS -> keychain unavailable, not "no credentials"
+        # (which would nudge the user into an unneeded re-add).
+        #
+        # The failure is injected at `read_text`, not via `chmod(0o000)`:
+        # POSIX mode bits do not deny the owner a read on Windows, so the
+        # chmod version READ THE FILE BACK there and the probe asserted
+        # against a healthy value (measured: CI test-windows, `assert
+        # '{"claudeAiOauth": ...}' is None`). The defect under test is
+        # platform-independent — `credentials.py`'s file-read-error arm
+        # returns `value=None` on every platform — so skipping Windows would
+        # drop real coverage for a fault that exists there. Injecting the
+        # OSError reproduces the same arm everywhere.
+        real_read_text = Path.read_text
+
+        def failing_read_text(self_path, *a, **kw):
+            if self_path == cred_path:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(self_path, *a, **kw)
+
+        with patch.object(Path, "read_text", failing_read_text):
             active_bad = s._store._read_active_credentials()
-        finally:
-            cred_path.chmod(0o600)
         assert active_bad.value is None, "premise: unreadable file gives value=None"
         assert active_bad.keychain_unavailable is False, (
             "premise: Linux never sets this True"
