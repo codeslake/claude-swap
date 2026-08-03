@@ -194,8 +194,21 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         # 1.37-1.64s with Claude Code holding the lock, against a documented
         # cap of 0.5s. _wiring_present is lock-free and answers in ~1.5ms, and
         # for that user the answer is always "nothing to remove".
+        #
+        # AND NOT SERVING. `_impl()` raising says nothing about the daemon: a
+        # broken cryptography, a half-finished reinstall, an import error in a
+        # new release all land here while the proxy on the port keeps answering
+        # every session already wired to it. This branch used to unwire on
+        # presence alone. Measured: with `_impl` raising and the port serving,
+        # one `cswap run` stripped the env block and unpinned a healthy pin —
+        # the same damage heal's own guard exists to prevent, at the other
+        # call site.
+        #
+        # The probe is bounded well under the launch budget rather than given
+        # the default 2s: a black-holed port must not turn a launch-path guard
+        # into the stall it was written to avoid.
         try:
-            if _wiring_present(switcher):
+            if _wiring_is_stale(switcher, connect_timeout=_LAUNCH_PROBE_S):
                 clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
         except Exception:  # noqa: BLE001
             pass
@@ -244,6 +257,14 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 # must not wait long. Nothing is lost by giving up — an unremoved wiring is
 # retried on the next launch, and the caller fails open either way.
 _LAUNCH_LOCK_BUDGET_S = 0.5
+
+# The same reasoning for the SERVING probe on that path. A refused connect on
+# loopback comes back in microseconds, so this only ever bites on a port that
+# accepts nothing and answers nothing — a firewall rule, a half-dead daemon —
+# and there a 2s default would blow the launch budget four times over on the
+# probe alone. Guessing "not serving" after 0.2s costs at worst one unwire the
+# next launch redoes; guessing wrong the other way costs a stalled launch.
+_LAUNCH_PROBE_S = 0.2
 
 
 def clear_wiring(switcher, timeout: float | None = None) -> bool:
@@ -643,7 +664,29 @@ def set_pin(
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
 
-def _wired_port_is_serving(switcher) -> bool:
+def _wiring_is_stale(switcher, connect_timeout: float = 2.0) -> bool:
+    """Should this wiring be removed? Present AND not serving.
+
+    THE VERDICT LIVES HERE, NOT AT EACH CALL SITE — the rule this file already
+    states for the pin record, applied to the wiring. It was not, and the two
+    places that forgot the serving half both tore down a working pin:
+
+      * ``heal`` had the guard.
+      * ``wire_launch_env`` did not. Measured: with ``_impl()`` raising for a
+        reason unrelated to the daemon (a broken ``cryptography`` after an
+        unrelated upgrade — precisely the case ``_impl`` re-raises separately),
+        one ``cswap run`` unwired a pin whose port was answering, and every
+        session on the box lost it.
+
+    ``connect_timeout`` exists because the launch path has a sub-second budget
+    and a black-holed port would otherwise blow it on the probe alone.
+    """
+    return _wiring_present(switcher) and not _wired_port_is_serving(
+        switcher, connect_timeout=connect_timeout
+    )
+
+
+def _wired_port_is_serving(switcher, connect_timeout: float = 2.0) -> bool:
     """Is the port the CONFIG names actually answering?
 
     Asks the thing that is about to be removed, rather than any state file.
@@ -680,7 +723,7 @@ def _wired_port_is_serving(switcher) -> bool:
         if not port:
             continue
         sock = socket.socket()
-        sock.settimeout(2)
+        sock.settimeout(connect_timeout)
         try:
             sock.connect(("127.0.0.1", port))
             return True
@@ -749,13 +792,29 @@ def heal(switcher) -> tuple[bool, str]:
     # the daemon it points at. clear_wiring works WITHOUT the package on
     # purpose — the wiring is cswap's own record, and the case where the extra
     # is broken is exactly when a user cannot afford to be stranded.
+    #
+    # AND SAY WHICH OF THE TWO HAPPENED. `present and clear_wiring(...)`
+    # collapsed "there was nothing to remove" into "I could not remove it", and
+    # fell through to the healthy verdict for both. The second is reachable and
+    # routine: the budget here is 0.5s and Claude Code holds the config lock
+    # during a credential refresh. Measured with the lock held — wiring
+    # present, port dead — `heal` returned (False, "Nothing to heal") over an
+    # outage in progress, and the wiring survived.
+    #
+    # That is this file's signature defect, in the channel that matters most:
+    # the status line calls `heal` on a timer, so during the exact failure it
+    # exists to report, the user's only signal said everything was fine.
     try:
-        if _wiring_present(switcher) and clear_wiring(
-            switcher, timeout=_LAUNCH_LOCK_BUDGET_S
-        ):
-            return True, (
-                "Removed a cloud pin wiring whose proxy was gone — "
-                "sessions fall back to the proxy they had before the pin"
+        if _wiring_present(switcher):
+            if clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S):
+                return True, (
+                    "Removed a cloud pin wiring whose proxy was gone — "
+                    "sessions fall back to the proxy they had before the pin"
+                )
+            return False, (
+                "A cloud pin wiring points at a proxy that is gone, and it "
+                "could not be removed (the config is locked) — re-run "
+                "`cswap pin --heal`"
             )
     except Exception as exc:  # noqa: BLE001
         return False, f"Could not heal the cloud pin ({_safe(exc)})"
