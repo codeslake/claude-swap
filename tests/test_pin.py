@@ -260,6 +260,52 @@ class TestTheWiringCanAlwaysBeRemoved:
                 f"{cfg.parent.name} left wired — its sessions still dial a dead port"
             )
 
+    def test_a_contended_first_path_does_not_starve_a_free_second(
+        self, tmp_path, monkeypatch
+    ):
+        """MEASURED (reviewer, only the session lock held, timeout 0.5s):
+        `clear_wiring` returned False with BOTH configs still wired. The first
+        path waited the WHOLE budget on a lock nobody released, so `left <= 0`
+        by the time the loop reached the second path — free the entire time —
+        and it was `continue`d without ever being tried.
+
+        The total must still be bounded (that budget is real, and the launch
+        path depends on it), so the fix is a fair SHARE of what remains per
+        path, not the whole remaining budget going to whichever path is
+        first."""
+        import time
+
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        session = self._wired(tmp_path / "session")
+        default = self._wired(tmp_path / "home")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
+
+        # A live holder on the SESSION lock only — fresh mtime, so it is never
+        # taken over as stale, and it is held for the whole call.
+        held = session.parent / (session.name + ".lock")
+        held.mkdir()
+        try:
+            start = time.monotonic()
+            changed = pin.clear_wiring(ClaudeAccountSwitcher(), timeout=0.5)
+            elapsed = time.monotonic() - start
+        finally:
+            held.rmdir()
+
+        assert elapsed < 2.0, f"blew well past the 0.5s budget: {elapsed:.2f}s"
+        assert changed is True, (
+            "the free default profile was starved by the contended session "
+            "lock — clear_wiring reported nothing removed"
+        )
+        assert "_cswapPinWiredKeys" not in json.loads(default.read_text()), (
+            "the uncontended config was never attempted"
+        )
+        # The contended one was correctly skipped, not broken.
+        assert "_cswapPinWiredKeys" in json.loads(session.read_text())
+
     def test_the_launch_path_does_not_wait_on_the_config_lock(
         self, tmp_path, monkeypatch
     ):
