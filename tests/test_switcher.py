@@ -8541,6 +8541,93 @@ class TestBackupReadTriState:
         assert unreadable is False
 
 
+class TestEncPermissionDeniedIsUnreadable:
+    """C1: a ``.enc`` that EXISTS but cannot be READ (mode 000) must not
+    report the same ``("", False)`` as a genuinely absent one.
+
+    The ``.enc`` is the ONLY backend on Linux/WSL/Windows, and it wins over
+    the Keychain on macOS. ``_read_account_credentials`` already logs the
+    ``OSError`` and swallows it; before the fix nothing propagated that
+    swallow to ``_read_account_credentials_ex``'s verdict, so a slot holding
+    a live refresh token but momentarily unreadable (permissions, a
+    mid-unmount) read as "there is no backup" on every platform.
+    """
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_unreadable_enc_is_not_absent_on_linux(self, temp_home: Path):
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        num, email = "3", "c@example.com"
+        s._write_account_credentials(num, email, '{"access_token":"live"}')
+        enc = s._backup_enc_path(num, email)
+        assert enc.exists(), "premise: the backup landed in the .enc"
+
+        # CONTROL A: readable -> value, not unreadable (instrument says YES)
+        v_a, unread_a = s._store._read_account_credentials_ex(num, email)
+        assert v_a and unread_a is False, f"control A broken: {(bool(v_a), unread_a)}"
+
+        # CONTROL B: genuinely absent -> ("", False) (instrument says NO)
+        v_b, unread_b = s._store._read_account_credentials_ex(
+            "9", "nobody@example.com"
+        )
+        assert (v_b, unread_b) == ("", False), f"control B broken: {(v_b, unread_b)}"
+
+        # THE PROBE: present but unreadable
+        enc.chmod(0o000)
+        try:
+            v_c, unread_c = s._store._read_account_credentials_ex(num, email)
+        finally:
+            enc.chmod(0o600)
+
+        assert unread_c is True, (
+            f"({v_c!r}, {unread_c}) is byte-identical to the ABSENT control "
+            f"({v_b!r}, {unread_b}). A backup that exists and holds a live "
+            "refresh token read as 'there is no backup' on the only backend "
+            "this platform has."
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_unreadable_enc_is_not_absent_on_macos(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """Same probe on macOS, where the ``.enc`` wins over the Keychain:
+        the Keychain has nothing for this slot, so a masked ``.enc`` read
+        failure must not fall through to a clean Keychain miss."""
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        num, email = "3", "c@example.com"
+        s._write_backup_enc(num, email, '{"access_token":"live"}')
+        enc = s._backup_enc_path(num, email)
+
+        v_a, unread_a = s._store._read_account_credentials_ex(num, email)
+        assert v_a and unread_a is False, f"control A broken: {(bool(v_a), unread_a)}"
+
+        v_b, unread_b = s._store._read_account_credentials_ex(
+            "9", "nobody@example.com"
+        )
+        assert (v_b, unread_b) == ("", False), f"control B broken: {(v_b, unread_b)}"
+
+        enc.chmod(0o000)
+        try:
+            v_c, unread_c = s._store._read_account_credentials_ex(num, email)
+        finally:
+            enc.chmod(0o600)
+
+        assert unread_c is True, (
+            f"({v_c!r}, {unread_c}) is byte-identical to the ABSENT control "
+            f"({v_b!r}, {unread_b}) — the .enc-wins ordering let a masked "
+            "read failure fall through to a clean Keychain miss."
+        )
+
+
 class TestBackupUnreadableDisplay:
     """M1: an idle slot whose backup is keychain-unreadable shows
     'keychain unavailable', never 'no credentials' (which nudges re-add)."""
