@@ -29,11 +29,16 @@ wake-from-sleep catch-up, and the bounded urgent mode below.
 Health invariant to watch in the logs: steady state shows zero http-429.
 A post-burst 429 does NOT reliably clear at its stated horizon — measured
 over one machine's full log (re-measured 2026-08-03; re-derive rather than
-trust this verbatim, it ages as the log grows), 10 of 23 lapsed blocks
-re-blocked within 900 s of their own deadline, each for a fresh full hour.
-That is why the wait is Retry-After plus ``usage_store.RETRY_AFTER_MARGIN_S``
-and not Retry-After alone. What would mean this model needs revisiting is a
-429 episode at modest rates that outlasts an hour *past* that margin.
+trust this verbatim, it ages as the log grows — method recorded next to
+``usage_store.RETRY_AFTER_MARGIN_S``), 21 of 36 lapsed blocks re-blocked
+within 900s of their own deadline (+2s..+887s), each for a fresh full hour
+("of 36", not 38 raw gaps: 2 are negative clock/ordering clustering
+artifacts, excluded from both numerator and denominator). The prior
+"10 of 23" figure here did not reproduce under any of 40 method variants
+swept and is superseded. That is why the wait is Retry-After plus
+``usage_store.RETRY_AFTER_MARGIN_S`` and not Retry-After alone. What would
+mean this model needs revisiting is a 429 episode at modest rates that
+outlasts an hour *past* that margin.
 
 Plans computed here are persisted per account in the usage store
 (``nextPollAt``/``pollIntervalS``) by whichever collector fetched, so every

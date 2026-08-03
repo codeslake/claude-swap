@@ -399,11 +399,14 @@ class TestBackoff:
         # Honoring Retry-After *exactly* puts the retry on the deadline itself,
         # where the server is not reliably ready: measured over this machine's
         # log (re-measured 2026-08-03, method in the RETRY_AFTER_MARGIN_S
-        # comment), 21 of 38 block lapses re-blocked within 900s of their own
+        # comment), 21 of 36 block lapses re-blocked within 900s of their own
         # deadline (+2s … +887s) and each cost a fresh full hour, while the
-        # next one after that is +1004s. On the hour-scale block that
-        # produced that evidence, the margin must clear the whole 900s band
-        # (13s of clearance: 900 - 887).
+        # next one after that is +1004s. ("21 of 36", not "of 38": 2 of the 38
+        # raw gaps are negative, a clock/ordering clustering artifact excluded
+        # from both numerator and denominator so the fraction stays
+        # apples-to-apples.) On the hour-scale block that produced that
+        # evidence, the margin must clear the whole 900s band (13s of
+        # clearance: 900 - 887).
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 >= 900.0
 
     def test_a_short_accurate_block_is_not_inflated(self):
@@ -461,7 +464,7 @@ class TestBackoff:
         What it did do is drop the wait onto the deadline, which is where the
         measured evidence says we re-block 10 of 19 times for a fresh hour (as
         measured when this was derived — the re-block fraction has since
-        moved to 21 of 38, re-measured 2026-08-03, corrected method; this
+        moved to 21 of 36, re-measured 2026-08-03, corrected method; this
         episode model concerns the removed 429 trust-trim, out of the live
         path, and is not re-derived at the new fraction). Episode model on
         the original number, 3600 runs:

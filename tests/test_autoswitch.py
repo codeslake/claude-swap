@@ -1020,8 +1020,9 @@ class TestAdaptiveScheduler:
         Measured, the trim never salvaged the trust — the row is unknown at
         release either way (see
         `test_a_429_wait_is_the_deadline_plus_the_margin`) — while landing on
-        the deadline re-blocks 10 of 23 times for a fresh hour (re-measured
-        2026-08-03).
+        the deadline re-blocks 21 of 36 times for a fresh hour (re-measured
+        2026-08-03; of 36, not 38 raw gaps — 2 are negative clock/ordering
+        artifacts, excluded from both numerator and denominator).
 
         So the wait stays deadline + margin whatever the scoped window says.
         What the scoped window still decides is whether the row SERVES its
@@ -1072,8 +1073,8 @@ class TestAdaptiveScheduler:
 
         Seven requests inside one block, against a ~28-30/hour budget SHARED
         by every machine on the account, and the last retry lands at
-        deadline+300s — inside the +2..716s band `RETRY_AFTER_MARGIN_S` exists
-        to clear. Upstream spends two.
+        deadline+300s — inside the +2..887s band `RETRY_AFTER_MARGIN_S` exists
+        to clear (re-measured 2026-08-03). Upstream spends two.
 
         Every retry from #2 on is also un-pollable AND unknown, the exact state
         the clip was added to prevent: `record()` writes `lastGood`/`fetchedAt`
@@ -1100,7 +1101,7 @@ class TestAdaptiveScheduler:
         requests = 0
         while h.clock.now - t0 < block_s and requests < 40:
             requests += 1
-            # Retry-After counts down to a FIXED deadline: 40 of 42 measured
+            # Retry-After counts down to a FIXED deadline: 40 of 41 measured
             # blocks opened at exactly 3600 (re-measured 2026-08-03) and every
             # machine in an episode reported the same one.
             remaining = block_s - (h.clock.now - t0)
@@ -1118,7 +1119,7 @@ class TestAdaptiveScheduler:
         )
         assert landed >= block_s + RETRY_AFTER_MARGIN_S, (
             f"the last retry lands at deadline+{landed - block_s:.0f}s, inside "
-            f"the +2..{RETRY_AFTER_MARGIN_S:.0f}s band where 10 of 23 measured "
+            f"the +2..{RETRY_AFTER_MARGIN_S:.0f}s band where 21 of 36 measured "
             "lapses re-blocked for a fresh hour"
         )
 
@@ -1147,51 +1148,66 @@ class TestAdaptiveScheduler:
         )
 
     def test_the_trim_never_lands_inside_the_re_block_band(self, temp_home):
-        """A wait past the deadline but short of the margin re-blocks.
+        """A 429 wait must clear the WHOLE measured re-block band, not just
+        avoid landing inside a window sized by the very margin under test.
 
-        RETRY_AFTER_MARGIN_S is 900 because 10 of 23 measured lapses re-blocked
-        at +2s..+715s past their own deadline (re-measured 2026-08-03), each
-        earning a fresh hour. So `(deadline, deadline + MARGIN)` is the one
-        interval a 429 wait must not land in — and the trust bound, applied
-        unconditionally, put it there:
-        below the deadline the floor holds anyway, so the expression returned
-        `trust_expires_in_s` whenever it sat inside that window.
+        RETRY_AFTER_MARGIN_S is 900 because 21 of 36 measured lapses
+        re-blocked at +2s..+887s past their own deadline (re-measured
+        2026-08-03; "of 36" not "of 38": 2 of the 38 raw gaps are negative
+        clock/ordering clustering artifacts, excluded from both numerator and
+        denominator), each earning a fresh hour. So `(deadline, deadline +
+        900)` — the MEASURED band, a literal, independent of whatever
+        `RETRY_AFTER_MARGIN_S` happens to be configured to — is the interval
+        a 429 wait must clear.
 
-        Measured with a scoped window binding (--model Fable, ask 3600), mean
-        blind seconds under the PR's own re-block model:
+        ROUND-7 FINDING: the previous form of this assertion compared
+        `waited` (which the code under test computed AS `3600 +
+        RETRY_AFTER_MARGIN_S`) against an upper bound of `3600.0 +
+        RETRY_AFTER_MARGIN_S` — the SAME margin constant on both sides. So
+        the upper edge of the band always equalled the wait itself, and
+        `x < x` is false for any margin, including 0 and 450 — the assertion
+        could not fail regardless of what the margin was set to. Mutation-
+        confirmed: `RETRY_AFTER_MARGIN_S = 0.0` and `= 450.0` both still
+        passed, and neutralising `oauth.relevant_windows` to always return
+        `[]` (removing the scoped-window mechanism entirely) also still
+        passed. Fixed here by comparing against `MEASURED_BAND_S`, a literal
+        that does not consume `RETRY_AFTER_MARGIN_S`.
 
-            scoped reset   base    unconfined trim   confined
-            +3700          4042        4095            800
-            +4000          3885        4095            500
-            +4400          3675        4095            100
-
-        The unconfined trim is worse than BASE. Buying at most 900s of trust
-        for a full extra hour of blindness is the wrong trade, so the trim
-        fires only where it can actually reach the ask.
+        The `for scoped in (3700, 4000, 4400)` loop that used to wrap this
+        assertion is deleted: `_failure_backoff_s` takes no window argument,
+        and the ONLY mechanism that ever made a scoped reset change the
+        computed wait — a trust-based clip against a soon-resetting window
+        — was removed in an earlier round (see `usage_store.py`'s "NO TRUST
+        TRIM AGAINST THE SERVER'S DEADLINE"). All three scoped values
+        therefore drove byte-identical `waited`; the loop exercised nothing
+        that differed between iterations. A single scoped window is kept
+        below (not swept) to confirm the record()->entries() round trip
+        still produces the deadline+margin wait with a live scoped binding
+        present, not to distinguish scoped values from each other.
         """
-        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
+        from claude_swap.usage_store import FetchRecord
 
-        for scoped in (3700, 4000, 4400):
-            h = EngineHarness(temp_home / f"s{scoped}", model="Fable")
-            h.seed(1, "a@example.com")
-            st = h.switcher._usage_store
-            t0 = h.clock.now
-            ident = {"1": ("a@example.com", "")}
-            st.record({"1": FetchRecord(usage={
-                "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 7200)},
-                "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 30 * 86400)},
-                "scoped": [{"name": "Fable", "pct": 60.0,
-                            "resets_at": _iso_at(t0 + scoped)}],
-            })}, ident)
-            st.record(
-                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
-            )
-            waited = st.entries(ident, models=("Fable",))["1"].backoff_until - t0
-            assert not (3600.0 < waited < 3600.0 + RETRY_AFTER_MARGIN_S), (
-                f"scoped reset +{scoped}: waited {waited:.0f}s, which is "
-                f"{waited - 3600:.0f}s past the deadline and short of the "
-                f"margin — inside the measured re-block band"
-            )
+        MEASURED_BAND_S = 900.0  # the measured re-block band; NOT RETRY_AFTER_MARGIN_S
+
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 7200)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 30 * 86400)},
+            "scoped": [{"name": "Fable", "pct": 60.0,
+                        "resets_at": _iso_at(t0 + 4000)}],
+        })}, ident)
+        st.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
+        )
+        waited = st.entries(ident, models=("Fable",))["1"].backoff_until - t0
+        assert waited >= 3600.0 + MEASURED_BAND_S, (
+            f"waited {waited:.0f}s, {waited - 3600:.0f}s past the deadline — "
+            f"short of the measured {MEASURED_BAND_S:.0f}s re-block band"
+        )
 
     def test_a_re_block_chain_does_not_shorten_its_own_waits(self, temp_home):
         """Every block waits deadline + margin, however deep into the chain.
@@ -1203,8 +1219,8 @@ class TestAdaptiveScheduler:
         respect — see
         `test_shortening_a_429_wait_cannot_move_when_the_row_goes_unknown` —
         and clipping to it only drops later waits onto (or short of) the
-        server's deadline, which is the 10-of-19 re-block band this PR exists
-        to clear.
+        server's deadline, which is the 21-of-36 re-block band this PR exists
+        to clear (re-measured 2026-08-03).
 
         So the invariant is a constant again. The five-hour window here resets
         at +16000 and the ceiling would bind at +7200, both well inside the

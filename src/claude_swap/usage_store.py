@@ -146,14 +146,19 @@ BACKOFF_MAX_SHIFT = 32
 # Honoring it EXACTLY is not enough: the retry lands ON the deadline, where
 # the server is not reliably ready. Measured over this machine's whole log
 # (re-measured 2026-08-03; these figures age as the log grows — re-derive
-# rather than trust them verbatim, using the method below), 21 of 38 lapses
+# rather than trust them verbatim, using the method below), 21 of 36 lapses
 # re-blocked within 900s of their own deadline (+2s..+887s), each earning a
 # fresh full hour; the next one is +1004s, so the distribution is bimodal and
 # 900s is the edge of the band — with only 13s of clearance (900 - 887), not
-# the 185s an earlier, wrong figure implied. The margin is ABSOLUTE, not a
-# fraction of the ask: Retry-After counts down to a fixed deadline, so a
-# machine polling into a block another one opened sees only the remainder,
-# and a fraction of that shrinks toward zero exactly when it matters.
+# the 185s an earlier, wrong figure implied. ("21 of 36", not "of 38": the
+# denominator is restricted to the 36 POSITIVE lapse gaps, matching the
+# numerator — 2 of the 38 raw gaps are negative, a clock/ordering artifact
+# of the block-clustering method, not a real re-block observation, and mixing
+# them into an "of 38" denominator understates the fraction.) The margin is
+# ABSOLUTE, not a fraction of the ask: Retry-After counts down to a fixed
+# deadline, so a machine polling into a block another one opened sees only
+# the remainder, and a fraction of that shrinks toward zero exactly when it
+# matters.
 #
 # METHOD (re-derive with this, not ad hoc, to get the same numbers): parse
 # ``claude-swap.log`` lines "Usage fetch failed for account N: http-429,
@@ -640,7 +645,7 @@ def _failure_backoff_s(
     # `wait >= ask`, so the row is untrusted at release either way (measured:
     # fired 35 of 180 offsets, salvaged 0). It only lands us on the deadline,
     # where 10 of 19 lapses re-block for a fresh hour (as measured when this
-    # was derived — the re-block fraction has since moved to 21 of 38
+    # was derived — the re-block fraction has since moved to 21 of 36
     # (re-measured 2026-08-03, corrected method: see RETRY_AFTER_MARGIN_S);
     # the episode model below is not re-derived at the new fraction, since it
     # concerns the removed 429 trust-trim and is out of the live path).
