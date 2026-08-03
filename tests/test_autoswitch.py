@@ -4069,6 +4069,107 @@ class TestStoppedEngineDoesNotAct:
             "account on behalf of a successor that already owns LIVE"
         )
 
+    def test_stop_inside_phase1_fetch_blocks_the_escalation_refetch(
+        self, harness
+    ):
+        """Gate :1647 (escalation refetch) is not mutation-covered by
+        anything else in the suite — deleting it alone still leaves every
+        other test passing.
+
+        A stop landing inside the phase-1 collection fetch surfaces on the
+        way back from that call, before `_collect_scheduled_usage` has
+        decided whether to escalate. Measured (one candidate, active near
+        the escalation band):
+
+            gate present:  network_fetches == [['2']]
+            gate deleted:  network_fetches == [['2'], ['1', '2', '3']]
+
+        A stopped engine would issue a full 3-account fetch for a
+        successor that already owns LIVE — exactly the harm the :1590
+        comment above the phase-1 gate exists to prevent, one call later.
+        """
+        engine = harness.engine
+        network_fetches: list[list[str]] = []
+        canned = {
+            num: _entry_for(value, harness.clock.now)
+            for num, value in {
+                "1": _usage(80), "2": _usage(10), "3": _usage(10),
+            }.items()
+        }
+
+        def spy(fetch=None, **kw):
+            if fetch:
+                network_fetches.append(sorted(fetch))
+                if len(network_fetches) == 1:
+                    engine.stop()  # SIGTERM lands inside the phase-1 fetch
+            return canned
+
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=spy
+        ):
+            engine.tick()
+
+        assert network_fetches == [["2"]], (
+            f"network_fetches={network_fetches} — a stopped engine issued "
+            "a full candidate refetch for a successor that already owns "
+            "LIVE"
+        )
+
+    def test_stop_inside_phase1_fetch_blocks_the_consume_first_recheck(
+        self, harness
+    ):
+        """Gate :1180 (consume-first two-phase-commit refetch) is not
+        mutation-covered by anything else in the suite either — deleting it
+        alone still leaves every other test passing. The sibling test above
+        pins :1647; this pins the OTHER unmutated gate the same measurement
+        names.
+
+        `test_the_freshen_loop_names_the_stop_not_a_stale_fetch` pins the
+        same invariant one branch over, but needs the switch-worthy
+        candidate to be freshened first — a stop landing this early, before
+        `_rank_candidates` even runs provisionally, is invisible to it.
+
+        A stop landing inside `_collect_scheduled_usage`'s OWN phase-1
+        fetch is far below the escalation band here (so that collection
+        returns normally without ever reaching :1647), and surfaces only
+        when the two-phase commit re-checks before spending its own
+        refetch. Measured (active well below threshold, one sooner-resetting
+        candidate):
+
+            gate present:  network_fetches == [['2']]
+            gate deleted:  network_fetches == [['2'], ['1', '2', '3']]
+        """
+        harness.settings = replace(harness.settings, strategy="consume-first")
+        engine = harness._make_engine()
+        engine.settings = harness.settings
+        harness.engine.stop()  # free LIVE for the engine under test
+        engine.dry_run = False
+
+        network_fetches: list[list[str]] = []
+        canned = {
+            "1": _entry_for(_usage7(20, 20, _R_LATER), harness.clock.now),
+            "2": _entry_for(_usage7(10, 10, _R_SOON), harness.clock.now),
+            "3": _entry_for(_usage7(10, 10, _R_LATEST), harness.clock.now),
+        }
+
+        def spy(fetch=None, **kw):
+            if fetch:
+                network_fetches.append(sorted(fetch))
+                if len(network_fetches) == 1:
+                    engine.stop()  # SIGTERM lands inside the phase-1 fetch
+            return canned
+
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=spy
+        ):
+            engine.tick()
+
+        assert network_fetches == [["2"]], (
+            f"network_fetches={network_fetches} — a stopped engine issued "
+            "a full candidate refetch for a successor that already owns "
+            "LIVE"
+        )
+
     def test_every_event_class_survives_a_stop(self, harness):
         """`_emit`'s stop gate exempted `.reason == "engine-stopped"`.
 
