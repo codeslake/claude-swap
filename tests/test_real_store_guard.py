@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 
@@ -367,3 +368,215 @@ def test_layout_a_runtime_real_store_is_refused_and_unrelated_tmp_still_writes(
     no_target.parent.mkdir(parents=True, exist_ok=True)
     no_target.write_text("ok", encoding="utf-8")
     assert no_target.read_text(encoding="utf-8") == "ok"
+
+
+# -- C2: an arbitrary CLAUDE_CONFIG_DIR must not slip past the hint pre-filter --
+#
+# M3 (narrowing `_REAL_STORE_HINTS`) was KILLED under a `/tmp` basetemp but
+# SURVIVED under a basetemp inside `~/.claude` — pytest's own `tmp_path` then
+# already contains the substring ".claude" somewhere in its ancestry, so even
+# a WRONG hint tuple accidentally matched and the kill was luck, not a
+# property of the fix. This test builds its own root via `tempfile.mkdtemp()`
+# rather than the `tmp_path` fixture specifically so its verdict cannot
+# depend on where pytest's basetemp happens to live.
+
+
+def test_module_level_hints_are_wired_to_the_derivation_function():
+    """Wiring check: the mutation-battery equivalent of asserting
+    ``_REAL_STORE_HINTS = _derive_real_store_hints(_REAL_STORE_SPECS)`` is
+    still the live assignment, not a hardcoded tuple that happens to agree
+    with it today. The two other C2 tests exercise ``_derive_real_store_hints``
+    directly against a simulated environment (correctly — that's the actual
+    bypass) but neither one would notice if the module-level global were
+    quietly reverted to a fixed guess while the (now-orphaned) function stayed
+    correct; only comparing the real, currently-imported global against a
+    fresh call catches that."""
+    assert conftest._REAL_STORE_HINTS == conftest._derive_real_store_hints(
+        conftest._REAL_STORE_SPECS, conftest._HOME_AT_FREEZE_TIME
+    )
+
+
+def test_arbitrary_claude_config_dir_is_not_dropped_by_the_hint_prefilter(
+    monkeypatch,
+):
+    """C2: the audit hook's cheap substring pre-filter used to be a fixed
+    guess (``(".claude", "claude-swap")``) — correct for the two DEFAULT
+    roots, but a real store reached via
+    ``CLAUDE_CONFIG_DIR=$HOME/work-profile`` resolves to
+    ``~/work-profile/.credentials.json``, which contains neither substring.
+    The pre-filter rejected it before the (already-correct) specs loop ever
+    ran, so the write went through even though the root IS in
+    ``_REAL_STORE_SPECS``.
+    """
+    root_dir = Path(tempfile.mkdtemp(prefix="cswap-c2-noclaude-"))
+    try:
+        home = root_dir / "home"
+        home.mkdir()
+        (home / ".claude").mkdir()
+        work_profile = home / "work-profile"
+        work_profile.mkdir()
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: home)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(work_profile))
+        monkeypatch.setenv("HOME", str(home))
+
+        specs = conftest._freeze_real_store_specs()
+        assert work_profile in {r for r, _rec in specs}, (
+            "premise: the CLAUDE_CONFIG_DIR-resolved root must actually be "
+            "in the frozen specs, or this isn't testing the pre-filter"
+        )
+        monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", specs)
+        monkeypatch.setattr(
+            conftest, "_REAL_STORE_HINTS",
+            conftest._derive_real_store_hints(specs, home),
+        )
+
+        target = work_profile / ".credentials.json"
+        assert not any(
+            hint in str(target) for hint in (".claude", "claude-swap")
+        ), "premise: the target must miss BOTH of the old hardcoded hints"
+
+        with pytest.raises(conftest.RealStoreWriteBlocked):
+            target.write_text('{"pwned": true}', encoding="utf-8")
+        assert not target.exists()
+    finally:
+        shutil.rmtree(root_dir, ignore_errors=True)
+
+
+# -- I-list: five previously-untested guard bypasses, each measured by hand --
+
+
+def test_i1_os_rename_source_out_of_protected_root_is_refused(
+    tmp_path: Path, monkeypatch
+):
+    """I-1: the guard checked only the DESTINATION of ``os.rename`` — the
+    same shape ``migrate_legacy_backup_dir``/``shutil.move`` uses to
+    relocate the legacy backup directory. Renaming the protected root itself
+    OUT to an unprotected location must be refused too, or the store simply
+    vanishes from where every reader expects it (the same "make it
+    disappear" shape the ``shutil.rmtree`` branch above exists for)."""
+    stand_in_root = tmp_path / "claude-swap"
+    stand_in_root.mkdir()
+    (stand_in_root / "sequence.json").write_text("{}")  # seeded before arming
+
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    outside = tmp_path / "outside_dst"
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        os.rename(stand_in_root, outside)
+    assert stand_in_root.exists(), "the protected root must still be at its original path"
+    assert not outside.exists()
+
+
+def test_i2_os_symlink_into_protected_root_is_refused(
+    tmp_path: Path, monkeypatch
+):
+    """I-2: ``os.symlink`` was not even in ``_WRITE_EVENTS``, so a symlink
+    planted inside a protected root — aliasing an arbitrary target onto a
+    path a reader (Claude Code, cswap itself) would trust as real store
+    content — went through untouched."""
+    stand_in_root = tmp_path / "claude-swap"
+    stand_in_root.mkdir()
+
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    attacker_target = tmp_path / "attacker.txt"
+    attacker_target.write_text("x")
+    link_path = stand_in_root / "evil-link"
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        os.symlink(attacker_target, link_path)
+    assert not link_path.exists() and not link_path.is_symlink()
+
+
+def test_i3_relative_path_with_cwd_inside_protected_root_is_refused(
+    tmp_path: Path, monkeypatch
+):
+    """I-3: a relative path is resolved against ``os.getcwd()`` by the
+    underlying syscall exactly as much as an absolute path would be — the
+    guard's ``if not target.is_absolute(): continue`` let ``open("x", "w")``
+    through untouched whenever the process cwd happened to be inside a
+    protected root."""
+    stand_in_root = tmp_path / "claude-swap"
+    stand_in_root.mkdir()
+
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    old_cwd = os.getcwd()
+    os.chdir(stand_in_root)
+    try:
+        with pytest.raises(conftest.RealStoreWriteBlocked):
+            with open("relative_seq.json", "w") as f:
+                f.write("{}")
+    finally:
+        os.chdir(old_cwd)
+    assert not (stand_in_root / "relative_seq.json").exists()
+
+
+def test_i4_os_truncate_on_protected_root_file_is_refused(
+    tmp_path: Path, monkeypatch
+):
+    """I-4: ``os.truncate`` destroys content in place without going through
+    ``open``, so it reached none of the write-mode checks — a bare
+    ``os.truncate(path, 0)`` on a protected-root file went through
+    untouched."""
+    stand_in_root = tmp_path / "claude-swap"
+    stand_in_root.mkdir()
+    target = stand_in_root / "sequence.json"
+    target.write_text('{"accounts": {"1": "a"}}')  # seeded before arming
+
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        os.truncate(target, 0)
+    assert target.stat().st_size > 0, "the file must not have been truncated"
+
+
+def test_i5_bytes_path_into_protected_root_is_refused(
+    tmp_path: Path, monkeypatch
+):
+    """I-5: a ``bytes`` path (``open(b"/path", "wb")``) reached the
+    substring pre-filter as ``hint in candidate`` where ``candidate`` was
+    ``bytes`` and every hint is ``str`` — never equal, so the check silently
+    always missed rather than raising, and the write went through."""
+    stand_in_root = tmp_path / "claude-swap"
+    stand_in_root.mkdir()
+    target = stand_in_root / "sequence.json"
+    target.write_text('{"accounts": {"1": "a"}}')  # seeded before arming
+
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    bpath = os.fsencode(str(target))
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        with open(bpath, "wb") as f:
+            f.write(b"OVERWRITTEN")
+    assert target.read_text() == '{"accounts": {"1": "a"}}', (
+        "the file must not have been overwritten via a bytes path"
+    )
+
+
+def test_derived_hints_exclude_the_bare_home_root_basename():
+    """C2 follow-up: deriving hints from every frozen root's basename would,
+    without an exclusion, include ``Path.home()``'s own basename — the
+    developer's OS username — as a pre-filter substring. Almost every path
+    on the machine contains the username (``/tmp/pytest-of-<user>/...``, any
+    project under the home directory), so that would make the "cheap
+    reject" reject almost nothing, defeating the pre-filter's purpose. The
+    bare-home root's only protected children are the hardcoded
+    ``.claude*``-prefixed files already caught by the ``.claude`` floor
+    hint, so excluding it costs nothing.
+    """
+    home = Path("/home/some-real-looking-username")
+    specs = (
+        (home / ".local" / "share" / "claude-swap", True),
+        (home / ".claude", False),
+        (home, False),  # the bare-home root itself
+    )
+    hints = conftest._derive_real_store_hints(specs, home)
+    assert home.name not in hints, (
+        f"DEFECT: {home.name!r} (the username) is in the pre-filter hints "
+        "— this would make the cheap reject match almost every path on "
+        "the machine"
+    )
+    # Sanity: the bare-home root's real protected children still match via
+    # the unconditional '.claude' floor hint.
+    assert any(hint in str(home / ".claude.json") for hint in hints)

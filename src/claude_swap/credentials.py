@@ -1130,13 +1130,19 @@ class CredentialStore:
         # substitutes `_read_account_credentials` never reaches the setter, and
         # a stale True there would defer forever.
         #
-        # NO TEST SEPARATES THIS FROM `_keychain_unreadable` today, and that is
-        # worth stating: `_kc_read_backup` routes through `_kc_call`, so the
-        # process flag agrees on every state a SINGLE thread can reach, and
-        # swapping this for `_keychain_unreadable` leaves the suite green on
-        # one thread. Concurrently it does not: the sentinel calls this seam
-        # unlocked while the consume gate holds a per-slot lock, and the TUI
-        # runs three workers on one store.
+        # Swapping this for `_keychain_unreadable` was once believed to leave
+        # the suite green on a single thread (the process flag supposedly
+        # agreeing with `_kc_read_backup`'s own `_kc_call`-routed verdict on
+        # every state one thread can reach) — re-measured directly (swap the
+        # return value, run the full suite) and that does NOT reproduce:
+        # `TestOurOwnFileModeIsNotAKeychainFailure::
+        # test_two_concurrent_backup_reads_keep_their_own_verdicts` and
+        # `TestEncPermissionDeniedIsUnreadable::
+        # test_unreadable_enc_is_not_absent_on_macos` both fail on a single
+        # thread. Concurrently it is wrong for the additional reason above
+        # (the sentinel calls this seam unlocked while the consume gate holds
+        # a per-slot lock, and the TUI runs three workers on one store) — but
+        # the single-thread case was never actually safe either.
         return "", bool(failed)
 
     def _write_account_credentials(
@@ -1298,27 +1304,39 @@ class CredentialStore:
     def _retain_previous_backup(
         self, account_num: str, email: str, new_credentials: str
     ) -> None:
-        """Retain the slot's current backup as ``.prev`` before it is replaced."""
+        """Retain the slot's current backup as ``.prev`` before it is replaced.
+
+        C1: when the current generation can't be read (a locked Keychain, an
+        unreadable ``.enc``), the caller's overwrite proceeds regardless — the
+        write this retention protects is never conditional on retention
+        succeeding. Declining to write anything left ``.prev`` exactly as
+        empty as a slot that never had a backup, discarding the one recovery
+        cushion a misclassified fail-open (e.g. the switch-time
+        ``unresolved`` branch) depends on precisely when it's most likely to
+        be wrong. The true previous generation is unrecoverable by
+        definition here, so the incoming bytes are retained as a checkpoint
+        instead: not a real rollback target, but a ``.prev`` item that
+        exists and is discoverable, giving a human a thread to pull (cross-
+        reference logs, another machine's synced roster, the unclaimed
+        stash) instead of a silent absence indistinguishable from "there was
+        never anything here".
+        """
         try:
             current, unreadable = self._read_account_credentials_ex(account_num, email)
         except Exception as e:  # pragma: no cover - _read swallows its own errors
             self._host._logger.warning(f"Could not read backup for retention: {e}")
             return
         if unreadable:
-            # The plain reader's `""` here is indistinguishable from "no
-            # backup exists" — but this one FAILED to read, so treating it
-            # as "nothing to retain" silently drops the only recovery copy a
-            # fail-open write (e.g. the switch-time `unresolved` branch)
-            # depends on. Loud, not fatal: retention has always been
-            # best-effort defense in depth, not a transactional guard.
             self._host._logger.warning(
                 f"Could not retain previous credential generation for "
                 f"account {account_num}: the current backup exists but "
-                "could not be read (not absent) — no .prev recovery copy "
-                "will exist for this write"
+                "could not be read (not absent) — retaining the incoming "
+                "credential as .prev instead of the true previous generation"
             )
-            return
-        if not current or current == new_credentials:
+            if not new_credentials:
+                return  # nothing to checkpoint either
+            current = new_credentials
+        elif not current or current == new_credentials:
             return
         try:
             if self._use_keychain():
