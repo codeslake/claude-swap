@@ -4170,6 +4170,42 @@ class TestStoppedEngineDoesNotAct:
             "LIVE"
         )
 
+    def test_stop_is_diagnosed_before_the_unmanaged_active_advice(
+        self, temp_home
+    ):
+        """Gate :934 sits before `current_account_number()` is even read, so
+        it is the only thing that makes a stopped engine report
+        `engine-stopped` on a live-but-unmanaged login — deleting it alone
+        still leaves the whole suite green.
+
+        Without it, `current` comes back None (unmanaged, not absent) and
+        the tick falls all the way through to `has_live_login()`'s advice
+        branch, which knows nothing about `_stop`. Measured:
+
+            gate present:  reasons == ['engine-stopped']
+            :934 deleted:  reasons == [None, 'unmanaged-active-account']
+
+        A SIGTERM landing before this tick even starts would tell the
+        operator to run `cswap --add-account` instead of saying the engine
+        simply stopped.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.make_live("unmanaged@example.com", 99)  # not in sequence -> unmanaged
+        h.engine.stop()
+
+        outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [
+            getattr(e, "reason", None) for e in h.events
+            if isinstance(e, NoSwitchEvent)
+        ]
+        assert reasons == ["engine-stopped"], (
+            f"reasons={reasons} — a stopped engine advised "
+            "'cswap --add-account' instead of naming the stop"
+        )
+
     def test_every_event_class_survives_a_stop(self, harness):
         """`_emit`'s stop gate exempted `.reason == "engine-stopped"`.
 
