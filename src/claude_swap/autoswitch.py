@@ -1438,11 +1438,19 @@ class AutoSwitchEngine:
         unreadable by definition, and its `inf` recovery serializes that way):
         the key is PRESENT with unknown values, which is real evidence that
         the departure's severity could not be measured, not an absence of
-        evidence. The conservative default for unknown severity is to HOLD the
-        bar - but only on the proactive/consume-first return this predicate
-        gates. `_no_return_account` scopes at-limit and failover out of the
-        bar by design, so either trigger still escapes the account untouched,
-        and the next successful switch overwrites the snapshot outright.
+        evidence. `(None, None)` conflates two different peer states, though:
+        "still unmeasurable" (hold) and "measurable again, at/near full" (a
+        real change of state -- release). There is no recorded baseline for
+        either axis to diff against, so the only trustworthy signal is
+        whether the peer is now READABLE and close to full: `h >= 100 -
+        SPENT_HEADROOM_PCT`, the same margin the headroom leg below uses,
+        applied against the 100 cap instead of a stored `left_headroom`. A
+        peer that is readable but still poor (the flap 0b369e0 fixed) does
+        not clear that bar and the hold stands. This only gates the
+        proactive/consume-first return; `_no_return_account` scopes at-limit
+        and failover out of the bar by design, so either trigger still
+        escapes the account untouched, and the next successful switch
+        overwrites the snapshot outright.
         """
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
@@ -1453,7 +1461,17 @@ class AutoSwitchEngine:
         left_headroom = state.get("leftHeadroom")
         left_recovery = state.get("leftRecoveryAt")
         if left_headroom is None and left_recovery is None:
-            return False         # failover: real departure, severity unknown -> hold
+            # Failover: real departure, severity unmeasured at the time -- not
+            # absence of evidence. There is no recorded baseline to diff
+            # against (that is exactly what "unmeasured" means), so the only
+            # trustworthy signal is the peer's OWN headroom now: require it
+            # within SPENT_HEADROOM_PCT of the 100 cap, the margin the
+            # headroom leg below already uses. The recovery leg has no such
+            # floor here -- with no baseline `was` would collapse to `inf`,
+            # which any known reset beats for free, disarming on the first
+            # readable tick regardless of how little recovered. That is the
+            # exact flap 0b369e0 fixed, so recovery sits out this branch.
+            return (headroom.get(barred) or 0.0) >= 100.0 - SPENT_HEADROOM_PCT
         h = headroom.get(barred)
         if (
             isinstance(left_headroom, (int, float))
