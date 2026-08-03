@@ -179,12 +179,18 @@ def _recovery_is_useful(
     The #202 case oscillated on the original code too — its test ticks once,
     so it only ever observed the outbound leg.
 
-    The step between the two axes used to be non-monotone. That was a property
-    of `best_candidate_headroom`'s ratio floor, not of this predicate. Swept
-    directly over the predicate — active 1..12 pts against a peer walked
-    0.5..40 at 0.05, four reset shapes — a strictly-improving peer never flips
-    a move into a refusal: 0 inversions. The one refusal left in
-    [3.00, 10.00] is at peer == active exactly, where the tie is the answer.
+    The step between the two axes is NOT monotone, and an earlier version of
+    this docstring claimed it was ("0 inversions"). Re-swept directly over the
+    predicate — active 1..12 pts against a peer walked 0.5..40 at 0.05, four
+    reset shapes — a strictly-better peer does flip a move into a refusal, and
+    every case sits on one point: `peer_h` crossing SPENT_HEADROOM_PCT, where
+    the spent clause goes false and the axis changes underneath the comparison.
+
+    That is the axis boundary, not a leak, and it is NOT reachable through
+    `tick()`: the fallback at the bottom of the ranking loop re-admits exactly
+    those candidates. A reviewer re-took the same sweep and got a different
+    count from mine, which is the point — the count depends on the sweep's step
+    and reset shapes, so it is stated as WHERE rather than HOW MANY.
     """
     if (
         active_headroom <= SPENT_HEADROOM_PCT
@@ -1108,11 +1114,32 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         consume_first = settings.strategy == "consume-first"
-        ordered, any_known, active_reset_ts = self._rank_candidates(
+
+        def _rank(**kw):
+            """Rank with the no-return bar, and WITHOUT it if that empties.
+
+            The bar has no release of its own — `lastSwitchFrom` is rewritten
+            only by a successful switch — so a bar that leaves nothing is
+            permanent, not anti-flap. Two predicates that tried to predict
+            emptiness both landed a gate short of the loop (see
+            `_no_return_account`), so the question is put to the ranking
+            itself. Exact by construction, and it cannot fall behind the gates
+            because it is not a second copy of them.
+
+            Cheap: the retry runs only when the barred list came back empty,
+            which is the tick that was about to do nothing anyway.
+            """
+            ranked = self._rank_candidates(no_return=no_return, **kw)
+            if no_return is not None and not ranked[0]:
+                unbarred = self._rank_candidates(no_return=None, **kw)
+                if unbarred[0]:
+                    return unbarred
+            return ranked
+
+        ordered, any_known, active_reset_ts = _rank(
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
-            no_return=no_return,
             usage=usage,
             headroom=headroom,
             current=current,
@@ -1139,11 +1166,10 @@ class AutoSwitchEngine:
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
-            ordered, any_known, active_reset_ts = self._rank_candidates(
+            ordered, any_known, active_reset_ts = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
-                no_return=no_return,
                 usage=usage,
                 headroom=headroom,
                 current=current,
@@ -1318,23 +1344,38 @@ class AutoSwitchEngine:
         anti-flap margin uses: that is not the flip this bars, it is a move the
         outbound leg would have made on its own merits.
 
-        And released when the bar would leave NOTHING to choose. Identity has
-        no release condition of its own — `lastSwitchFrom` is rewritten only by
-        a successful switch, the one it prevents — so on a 2-account fleet it
-        was permanent: measured, one ordinary proactive move then 20 ticks of
-        `no-candidates` with the peer at 0%, surviving a restart. The ratio
-        release does not cover it, because `left >= active x 2` is
-        unsatisfiable for any active headroom above 50 and consume-first fires
-        exactly there: measured, active 70 pts against a peer at 100 pts,
-        locked out for 10h and still locked after seven days of wall clock.
-        A bar that leaves the engine nothing is not anti-flap, it is a stall.
+        THE LEAVES-NOTHING RELEASE IS NOT HERE. It used to be, and it was
+        rewritten twice for the same reason both times: this function cannot
+        see the gates that decide. `lastSwitchFrom` is rewritten only by a
+        successful switch — the one thing the bar prevents — so a bar that
+        empties the ranking is permanent, and each attempt to predict emptiness
+        landed one gate short of the ranking loop:
+
+            all(n == barred ...)              "does another account EXIST"
+            (headroom.get(n) or 0.0) > 0.0    "is another account not at its limit"
+
+        The loop also applies the threshold, `h >= active x HORIZON_HEADROOM_
+        RATIO`, the spent fallback's `h >= active` plus a sooner reset, and the
+        recovery hysteresis. A third account on ONE point clears both
+        predicates above and none of those, so the n=2 stall came back at n>=3
+        and then again one point up. Measured: barred peer 3.5 pts / back in
+        10h, active 2 pts / 500h out, third 1 pt — 30 ticks all BLOCKED, and
+        the same fleet with `lastSwitchFrom` popped switches on the first.
+
+        `_tick_inner` now ASKS the ranking instead: it ranks with the bar, and
+        re-ranks without it when the result is empty. That is exact by
+        construction, covers the recovery axis this predicate never could, and
+        cannot be one gate behind because it is not a separate copy of the
+        gates.
         """
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
             return None
+        # No membership check on `oauth_candidates`: the loop compares
+        # `num == no_return` while iterating that same list, so naming an
+        # account that is not in it bars nothing. The check was a no-op and
+        # nothing killed it under mutation.
         barred = str(came_from)
-        if barred not in oauth_candidates:
-            return None
         left_headroom = headroom.get(barred)
         if (
             left_headroom is not None
@@ -1342,23 +1383,6 @@ class AutoSwitchEngine:
             and left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO
         ):
             return None                      # beats us outright; not a flip
-        # CHOOSABLE, not merely present. `all(n == barred ...)` asked whether
-        # any OTHER account exists — and a third account that exists but can
-        # never qualify (spent, or headroom unknown) answered yes while
-        # offering the ranking nothing. Measured, one ordinary proactive move
-        # and no seeded state: active on 2 pts, the barred peer on 3, a third
-        # at its limit — 30 ticks / 30h all BLOCKED, and the same fleet with
-        # the bar cleared switches on the first one. The n=2 stall the release
-        # was added for simply moved to n>=3.
-        #
-        # A candidate the loop would skip anyway (`h is None` or `h <= 0`) is
-        # not an alternative, so barring on its account is still barring on
-        # nothing.
-        if not any(
-            n != barred and (headroom.get(n) or 0.0) > 0.0
-            for n in oauth_candidates
-        ):
-            return None                      # barring it leaves nothing
         return barred
 
     def _rank_candidates(
