@@ -120,6 +120,21 @@ def _impl() -> ModuleType:
     return importlib.import_module("cswap_pin.proxy")
 
 
+# Both display helpers (is_available/pinned_email) are called on every TUI
+# RENDER — AccountsPanel.render, AccountCard.render, and twice per
+# dashboard._root_entries — not just on the poll. Measured: 0.168ms/call for
+# _live_impl's invalidate_caches()+find_spec with the extra absent and a
+# 6-entry sys.path, scaling with sys.path length. A TTL well under the TUI's
+# poll cadence (POLL_INTERVAL_S = 3.0 in tui/app.py) removes that from every
+# render while still noticing a mid-session install: dashboard.refresh_root_menu
+# re-renders on every poll tick, so a cache younger than one poll interval is
+# stale for at most one render, never for the rest of the session — no
+# restart required. Tests must reset this between runs (see conftest.py); it
+# is bare module state so nothing else has to plumb a cache handle through.
+_LIVE_IMPL_CACHE_TTL_S = 1.0
+_live_impl_cache: tuple[float, ModuleType | None] = (float("-inf"), None)
+
+
 def _live_impl() -> ModuleType | None:
     """The implementation if it is usable RIGHT NOW, else None. Never raises.
 
@@ -133,14 +148,26 @@ def _live_impl() -> ModuleType | None:
     Measured: usually visible immediately, but an install landing inside the
     same mtime tick is not — which is exactly the "I installed it and the menu
     is still missing" report.
+
+    Cached for ``_LIVE_IMPL_CACHE_TTL_S`` (see the module-level comment) so a
+    render burst pays for the resolution once, not once per widget.
     """
     import importlib
+    import time as _time
+
+    global _live_impl_cache
+    cached_at, cached = _live_impl_cache
+    now = _time.monotonic()
+    if now - cached_at < _LIVE_IMPL_CACHE_TTL_S:
+        return cached
 
     importlib.invalidate_caches()
     try:
-        return _impl()
+        resolved = _impl()
     except Exception:  # noqa: BLE001
-        return None
+        resolved = None
+    _live_impl_cache = (now, resolved)
+    return resolved
 
 
 def is_available() -> bool:
@@ -411,6 +438,11 @@ def _safe(exc: object) -> str:
     carrying ``user:secret@host`` in a message would reach the screen
     verbatim. No path in this PR builds one; the scrub is here because the
     seam has no way to promise none ever will.
+
+    USERINFO ONLY. This is not general redaction: a bearer token in a header
+    dump or a ``password 'x'`` embedded in a package's own message passes
+    through untouched. Only ``scheme://user:pass@host`` is recognized and
+    scrubbed.
     """
     import re
 
