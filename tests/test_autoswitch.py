@@ -4735,6 +4735,110 @@ class TestHorizonAxisDoesNotFlap:
             "proactive tick"
         )
 
+    def test_a_failover_departure_still_unreadable_does_not_crash_or_release(
+        self, temp_home
+    ):
+        """The barred peer staying unreadable after a failover must hold cleanly.
+
+        `_left_account_recovered`'s `(None, None)` branch reads the barred
+        account's CURRENT headroom to tell "still unmeasurable" from
+        "measurable again". `headroom.get(barred)` is `None` when the peer is
+        still unreadable, and a comparison against that (`None >= 97.0`)
+        raises `TypeError` in Python 3 rather than silently doing the wrong
+        thing — so a guard that drops the `is not None` check is not a subtle
+        release-too-early bug, it is a crash on every tick this shape
+        produces. Guard against both: no exception, and no release on
+        no-evidence-either-way.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = None
+        for _ in range(3):  # unhealthy_ticks default is 3
+            outcome = h.tick_with_usage({
+                "1": None,                              # unreadable -> failover
+                "2": _usage(4, self._days_out(h, 400)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.clock.advance(301.0)
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                "1": None,                                    # still unreadable
+                "2": _usage(98, self._days_out(h, 400)),       # active, burnt down
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.ERROR not in outcomes, (
+            f"{[o.name for o in outcomes]} — comparing the barred peer's "
+            "unreadable (`None`) headroom against the release threshold must "
+            "not raise; a bare `h >= ...` with no `is not None` guard does"
+        )
+        assert TickOutcome.SWITCHED not in outcomes, (
+            f"{[o.name for o in outcomes]} — the barred peer never became "
+            "readable; that is 'still unmeasurable', not a recovery"
+        )
+
+    def test_a_failover_departure_releases_once_the_peer_is_readable_again(
+        self, temp_home
+    ):
+        """`(None, None)` must not be a PERMANENT lockout once the peer heals.
+
+        The sibling test above holds the bar while the failed-over peer is
+        STILL unreadable or still poor — correct, and the flap 0b369e0 fixed.
+        But `_left_account_recovered`'s original fix (`return False`
+        unconditionally on `(None, None)`) held it forever: nothing in that
+        branch ever looked at the peer's CURRENT state, so a peer that went
+        unreadable -> readable at full quota with a near reset could never
+        release the proactive/consume-first bar. On a 2-account fleet there
+        is no third account to switch to, so that is a permanent proactive
+        lockout, not anti-flap.
+
+        Same failover setup as the sibling test, but this time account 1
+        comes back READABLE at full quota with a near reset while the active
+        burns below the threshold — a real change of state, not a flap.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = None
+        for _ in range(3):  # unhealthy_ticks default is 3
+            outcome = h.tick_with_usage({
+                "1": None,                              # unreadable -> failover
+                "2": _usage(4, self._days_out(h, 400)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.engine._read_state()
+        assert state.get("leftHeadroom") is None and state.get(
+            "leftRecoveryAt"
+        ) is None, "premise: a failover snapshot, keys present, values null"
+
+        h.clock.advance(301.0)
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(0, self._days_out(h, 10)),    # READABLE, full, near reset
+                "2": _usage(95, self._days_out(h, 400)),  # active below threshold
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} — peer 1 went unreadable -> "
+            "readable at full quota with a near reset while the active fell "
+            "below the threshold. The engine stayed put: a permanent "
+            "proactive lockout, not the bounded hold this predicate should "
+            "produce."
+        )
+
     def test_a_failover_hold_still_escapes_at_limit(self, temp_home):
         """The failover hold blocks the PROACTIVE return, not every return.
 
