@@ -4145,16 +4145,19 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # comment is explicitly not describing (measured on both).
     #
     # `funcName` is chosen because a lineno key is BRITTLE, not because it
-    # cannot discriminate. Deliberately not quoting the numbers here: the two
-    # rounds that wrote and then revised this paragraph each moved a site it
-    # would key on — the lock WARNING 588 -> 633 -> 648 — by editing COMMENTS
-    # in `pin.py` and nothing else. Not every site and not every round: the
-    # getter site below has sat at one line since this class was written, and
-    # the round that de-numbered this passage moved nothing at all. One site
-    # moving twice under comment edits is the brittleness — a lineno key pins
-    # the
-    # guard to the file's current layout instead of to the fact it is about.
-    # `stacklevel=2` is what makes `funcName` the CALLER, which is that fact.
+    # cannot discriminate. This paragraph was written by `f361237` and revised
+    # by `f22197a`; only `f361237` moved a site — `f22197a` moved nothing
+    # (`6e03af7` also moved sites, but via the comment block above this
+    # paragraph, which it left unchanged). Measured across `f361237` and
+    # `6e03af7`: THREE sites moved twice, not one — the lock WARNING (588 ->
+    # 633 -> 648) and both members of `_PER_TICK_SITES`, `_wiring_present`
+    # (755 -> 800 -> 815) and `_wired_ports` (1067 -> 1112 -> 1127). Not every
+    # site and not every round: the getter site below has sat at 468 since
+    # `d343bfb`, the last round to change `pin.py`'s non-comment code. Both
+    # keyed-on sites moving twice under comment-only edits is the brittleness
+    # — a lineno key pins the guard to the file's current layout instead of to
+    # the fact it is about. `stacklevel=2` is what makes `funcName` the
+    # CALLER, which is that fact.
     _PER_TICK_SITES = ("_wiring_present", "_wired_ports")
 
     def _heal(self, tmp_path, monkeypatch, caplog, *, wired, removable=True):
@@ -4675,7 +4678,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         `os.mkdir` with `FileExistsError` for every uid including root and on
         win32, because directory-creation atomicity is the mutex — not a
         permission bit. Its mtime is inside `CONFIG_STALENESS_S`, so
-        `proper_lockfile`'s stale-takeover branch (`claude_locks.py:122`)
+        `proper_lockfile`'s stale-takeover branch (its `> staleness` test)
         never runs and cannot `rmdir` it; the budget expires and it raises
         `ClaudeCodeLockTimeout`. That is a real production shape, not a
         contrivance: it is a live Claude Code holding its own config lock
@@ -4730,7 +4733,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # landed in `clear_wiring`'s per-path `except Exception`, with
         # `proper_lockfile`
         # never once refused. `proper_lockfile` `rmdir`s in a `finally`
-        # (`claude_locks.py:161`), so the dir is gone whenever it acquired —
+        # (its `os.rmdir(lock_dir)`), so the dir is gone whenever it acquired —
         # it is still here only when it never could, which is this shape.
         assert lock.is_dir() and not changed and "could not be removed" in message, (
             "fixture did not reach the stranded shape: "
@@ -4848,7 +4851,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         it names its own errno.
 
         A DISCRIMINATOR OTHER THAN THE TYPE DOES EXIST — the lock dir's mtime
-        age, which `proper_lockfile` already stats (`claude_locks.py:119`) —
+        age, which `proper_lockfile` already stats (`os.stat(lock_dir)`) —
         so the refusal rests on COST, not on "nothing can tell them apart".
         Re-measured at BOTH cadences, because the old figure mixed them (a
         tight loop of 10 `heal()` calls priced the transient case while the
