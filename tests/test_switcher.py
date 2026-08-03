@@ -7224,6 +7224,82 @@ class TestStashAndRetentionStore:
         store._delete_account_credentials("1", "a@b.c")
         assert store._read_previous_backup("1", "a@b.c") == ""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_unreadable_current_backup_warns_instead_of_silent_no_op(
+        self, temp_home, caplog,
+    ):
+        """I-2: ``_retain_previous_backup`` used the plain reader, so an
+        UNREADABLE current backup (``.enc`` exists but cannot be read) and a
+        genuinely ABSENT one both hit ``if not current: return`` — the same
+        silent no-op. Retention is best-effort, but "the backup is intact
+        and merely unreadable this instant" must not look identical in the
+        logs to "there was never anything to retain".
+        """
+        import logging
+
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        store._write_account_credentials("1", "a@b.c", "gen-1")
+        enc = store._backup_enc_path("1", "a@b.c")
+
+        caplog.clear()
+        enc.chmod(0o000)
+        try:
+            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+                store._retain_previous_backup("1", "a@b.c", "gen-2")
+        finally:
+            enc.chmod(0o600)
+
+        assert store._read_previous_backup("1", "a@b.c") == "", (
+            "premise: an unreadable current backup cannot be copied to .prev"
+        )
+        assert any(
+            "could not be retained" in r.message.lower()
+            or "could not be read" in r.message.lower()
+            for r in caplog.records
+            if "retain" in r.message.lower()
+        ), (
+            "DEFECT: an unreadable current backup at retention time produced "
+            "no warning distinguishing it from a genuinely absent one"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_strict_clear_final_belt_fails_closed_on_unreadable_enc(
+        self, temp_home,
+    ):
+        """I-3: ``delete_account_credentials_strict``'s docstring says a
+        read-back "cannot provide" the fail-closed guarantee because "the
+        normal reader converts [read] errors to ``\"\"``, which conflates
+        'absent' with 'unreadable'". The final belt then called exactly
+        that normal reader. An unlink that appears to succeed (e.g. a stale
+        fd, a filesystem quirk) but leaves an unreadable ``.enc`` behind
+        must abort the commit, not report success.
+        """
+        from claude_swap.exceptions import CredentialError
+
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        store._write_account_credentials("1", "a@b.c", "live-material")
+        enc = store._backup_enc_path("1", "a@b.c")
+
+        with patch.object(type(enc), "unlink", return_value=None):
+            enc.chmod(0o000)
+            try:
+                with pytest.raises(CredentialError):
+                    store.delete_account_credentials_strict("1", "a@b.c")
+            finally:
+                enc.chmod(0o600)
+
+        assert enc.exists() and enc.stat().st_size > 0, (
+            "premise: the no-op'd unlink left material behind"
+        )
+
 
 class TestActiveRefreshProvenance:
     """_fetch_active_usage must not rotate-and-persist an unattributed
