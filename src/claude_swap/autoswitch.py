@@ -1317,6 +1317,19 @@ class AutoSwitchEngine:
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger)
             status = self._freshen_target(num, email)
+            if self._stop.is_set():
+                # `_freshen_target` POSTs the consume-gate refresh — the one
+                # mutation in this loop that can outlast a stop landing
+                # INSIDE it. The gate above only re-fires on the NEXT
+                # iteration, which does not exist for the LAST candidate: it
+                # used to fall out the bottom into the ungated diagnosis
+                # block below (misreporting ERROR "(network?)" for a plain
+                # stop) and, for invalid_grant/identity-conflict, into
+                # `_quarantine` — writing state for an account whose
+                # successor already owns the decision. Checked here, before
+                # any status branch acts, closes both: quarantine and the
+                # diagnosis block are both reached only past this point.
+                raise _EngineStopped()
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
                 # account — switching onto it would silently run the wrong
