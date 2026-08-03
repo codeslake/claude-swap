@@ -413,32 +413,37 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             # UNCONDITIONALLY stay at DEBUG; putting WARNING there is what
             # produced 12 lines per 6 ticks.
             #
-            # SELF-LIMITING ONLY WHEN THE REMOVAL SUCCEEDS, which is not the
-            # same as always. A wiring that can NEVER be removed — a
-            # read-only config dir, the OSError-30 case `switcher.py`
-            # documents — keeps `_wiring_is_stale` true forever, and that is
-            # the exact condition this WARNING exists to explain. Measured
-            # through the real CLI, 10 ticks each:
+            # IT IS NOT THE RECORD THAT EXPLAINS AN UNREMOVABLE WIRING. Four
+            # rounds of this comment claimed it was, and the claim is false in
+            # both directions. Measured, 10 `heal` ticks, read-only config dir
+            # with HOME perfectly resolvable — the flagship shape those rounds
+            # named:
             #
-            #   nothing wired               0 lines,    unwired
-            #   stale, removed on tick 1    1 line,     unwired
-            #   stale, unremovable         10 lines,    still wired
+            #   heal   : "…could not be removed (the config is locked) —
+            #             re-run `cswap pin --heal`", every tick
+            #   THIS site: never fires (nothing raises; both paths resolve)
             #
-            # 165 B/line x 43200 ticks/day = 6.80 MB/day, overwriting the 4 MB
-            # rotating history every 14.1 h — worse than the 4.2 MB/day and
-            # 22.7 h round 13 condemned.
+            # Getting it to fire needs `Path.home()` to raise as well, and
+            # then it names `get_default_global_config_path` while the STUCK
+            # config is the one `get_global_config_path` resolved fine. Put
+            # the wiring in the raising getter's own config instead and
+            # `_wiring_present` cannot see it either, so `heal` answers
+            # "Nothing to heal" and never reaches this function at all
+            # (measured, both shapes). There is no reachable shape where this
+            # WARNING names an unremovable wiring's cause.
             #
-            # KEPT ANYWAY, at WARNING. `cae7cfa` behaved identically and
-            # shipped; the churn is bounded to a machine that is genuinely
-            # broken, and there the user is being told "could not be removed
-            # — re-run `cswap pin --heal`" every tick with nothing naming the
-            # cause. A silent log is the worse failure.
+            # What does name it is the lock-failure WARNING at the bottom of
+            # this function, added for exactly that gap. This record's job is
+            # the narrower one it can actually do: a config that could not be
+            # LOCATED is missing from `paths`, and `clear_wiring`'s bool is a
+            # claim about every path it REACHED.
             #
-            # Narrowing it to fire only when `clear_wiring` is about to
-            # return False was the alternative and it buys nothing: measured,
-            # the unremovable case IS the False return, so all 10 lines
-            # survive the narrowing, and the only line it removes is the
-            # single one from the case that already self-limits.
+            # SO THE COST HERE IS ONE LINE, not the per-tick churn the old
+            # table charged it. Measured through the real `setup_logging`
+            # handler, 10 ticks, `Path.home()` raising and the removal
+            # succeeding: 1 line, 98 B — `_wiring_is_stale` goes false and
+            # this is never reached again. The 10-line column belongs to the
+            # bottom WARNING and is accounted for there.
             _log_unresolvable(get, exc, logging.WARNING)
             continue
         if path not in paths:
@@ -489,10 +494,44 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             ):
                 if _clear_wiring_locked(switcher, path):
                     changed = True
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # A lock we cannot take is a reason to skip THIS file, not to
             # abandon the other one — and on the launch path (sub-second
             # budget) a contended config must not fail the clear outright.
+            #
+            # BUT SAY WHICH FILE AND WHY. Skipping silently is what left the
+            # flagship failure with no record anywhere: measured on a
+            # read-only config dir with HOME perfectly resolvable, five `heal`
+            # ticks each told the user "could not be removed (the config is
+            # locked) — re-run `cswap pin --heal`" and produced ZERO log
+            # records at any level, while this line swallowed
+            # `PermissionError: [Errno 13] ... '<session>/.claude.json.lock'`
+            # — the one fact naming the cause. The getter WARNING above cannot
+            # cover it (see its comment): on this shape it does not fire.
+            #
+            # THE CHURN IS HERE, then. Measured through the real
+            # `setup_logging` handler, 10 `heal` ticks each:
+            #
+            #   nothing wired                       0 lines,  unwired
+            #   stale, removed on tick 1            0 lines,  unwired
+            #   stale, unremovable (read-only dir) 10 lines,  still wired
+            #
+            # A line is 97 B plus the config path twice (it appears once bare
+            # and once inside the lock path), so the cost is the user's own
+            # path length: 147 B for `/home/j.lee8/.claude.json` — 6.06
+            # MiB/day at 43200 ticks. The number that matters to someone
+            # reading the log is the ACTIVE file, `maxBytes=1024*1024`
+            # (`logging_config.py:47`): that wraps every 4.0 h, so a `tail`
+            # four hours late shows none of it. The 4 MiB across all
+            # `backupCount=3` rotations lasts 15.9 h.
+            #
+            # KEPT ANYWAY, at WARNING, and this is the site the "a silent log
+            # is the worse failure" argument was always about: it fires only
+            # on a machine where a wiring is genuinely stuck, it is the only
+            # record naming which config and which errno, and every one of
+            # those ticks is already printing an unexplained failure to the
+            # user's status line.
+            _logger.warning("%s could not be unwired: %s", path, exc)
             continue
     return changed
 
