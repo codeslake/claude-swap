@@ -510,7 +510,7 @@ def _wire_mark_of(raw: object) -> list | None:
     return ours if isinstance(ours, list) and ours else None
 
 
-def _wiring_present(switcher) -> bool:
+def _wiring_present(_switcher) -> bool:
     """Does either config still carry a pin wiring?
 
     The companion to :func:`clear_wiring`'s return value, which cannot answer
@@ -518,6 +518,13 @@ def _wiring_present(switcher) -> bool:
     lock was contended so this path was skipped", and only the second is a
     failure. Read without a lock — a stale read here costs a re-run, while
     waiting on the same lock that just failed costs the command.
+
+    ``_switcher`` is unused: both configs resolve from ``claude_swap.paths``,
+    not from the switcher instance. Kept (and underscore-prefixed rather than
+    dropped) so every call site stays symmetric with :func:`clear_wiring` and
+    :func:`_wired_port_is_serving`, which the pin CLI/TUI pass a switcher to
+    interchangeably — dropping it here alone would make this one predicate
+    look different from its siblings for no reason a caller could see.
     """
     # Imported here, as clear_wiring does: paths.py reads CLAUDE_CONFIG_DIR at
     # CALL time, and a module-scope import would freeze the resolution for a
@@ -708,7 +715,7 @@ def set_pin(
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
 
-def _wiring_is_stale(switcher, connect_timeout: float = 2.0) -> bool:
+def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     """Should this wiring be removed? Present AND not serving.
 
     THE VERDICT LIVES HERE, NOT AT EACH CALL SITE — the rule this file already
@@ -724,13 +731,18 @@ def _wiring_is_stale(switcher, connect_timeout: float = 2.0) -> bool:
 
     ``connect_timeout`` exists because the launch path has a sub-second budget
     and a black-holed port would otherwise blow it on the probe alone.
+
+    ``_switcher`` is unused (see :func:`_wiring_present`) but kept, and
+    underscore-prefixed, so this predicate stays call-compatible with its
+    sibling and every call site can keep passing the switcher it already has
+    on hand without checking which predicate needs it.
     """
-    return _wiring_present(switcher) and not _wired_port_is_serving(
-        switcher, connect_timeout=connect_timeout
+    return _wiring_present(_switcher) and not _wired_port_is_serving(
+        _switcher, connect_timeout=connect_timeout
     )
 
 
-def _wired_port_is_serving(switcher, connect_timeout: float = 2.0) -> bool:
+def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     """Is the port the CONFIG names actually answering?
 
     Asks the thing that is about to be removed, rather than any state file.
@@ -744,6 +756,9 @@ def _wired_port_is_serving(switcher, connect_timeout: float = 2.0) -> bool:
 
     False when nothing is wired, when the port is unreadable, or when it
     refuses — all of which mean "healing is allowed to proceed".
+
+    ``_switcher`` is unused (see :func:`_wiring_present`) but kept, and
+    underscore-prefixed, for the same call-compatibility reason.
     """
     import json as _json
     import socket
