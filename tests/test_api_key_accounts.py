@@ -9,6 +9,7 @@ display, the ``cswap run`` session guard, and export/import of raw keys.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -436,6 +437,75 @@ class TestAnUnreadableGlobalConfigIsNotAnEmptyOne:
             lambda d: d.__setitem__("primaryApiKey", API_KEY)
         )
         assert json.loads(cfg.read_text(encoding="utf-8"))["primaryApiKey"] == API_KEY
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_clear_managed_key_does_not_silently_skip_on_unreadable_config(
+        self, temp_home: Path, caplog
+    ):
+        """I-2: ``_clear_managed_key`` reads through the plain (non-strict)
+        ``_read_global_config``, which collapses ABSENT and UNREADABLE into
+        the same ``None``. ``if cfg is not None and cfg.get("primaryApiKey")
+        is not None:`` then treats an unreadable config exactly like one
+        that never had a key -- it skips the clear AND returns normally, so
+        the caller (``_write_credentials``, on an OAuth activation) sees no
+        error. A stale ``primaryApiKey`` survives in a file that becomes
+        readable again moments later, and Claude Code authenticates with a
+        live cross-account key that bills per token while it lies.
+
+        The fix must not raise (this stays best-effort, matching the
+        Keychain-delete arm two lines above), but it must not look
+        IDENTICAL in the logs to "there was no key to clear" either.
+        """
+        import logging
+
+        s = _linux_switcher()
+        cfg = get_global_config_path()
+        cfg.write_text(json.dumps({"primaryApiKey": API_KEY}), encoding="utf-8")
+        cfg.chmod(0o000)
+        try:
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+                s._store._clear_managed_key()  # must not raise
+        finally:
+            cfg.chmod(0o600)
+
+        assert json.loads(cfg.read_text(encoding="utf-8"))["primaryApiKey"] == API_KEY, (
+            "premise: the unreadable config's primaryApiKey must survive "
+            "untouched (never overwrite a file we could not read)"
+        )
+        assert any(
+            "unreadable" in r.message.lower() or "could not be read" in r.message.lower()
+            for r in caplog.records
+        ), (
+            "DEFECT: an unreadable global config at clear-time produced no "
+            "warning distinguishing it from a genuinely keyless profile -- "
+            "the caller cannot tell 'nothing to clear' from 'could not check'"
+        )
+
+    def test_clear_managed_key_control_absent_config_is_a_true_no_op(
+        self, temp_home: Path, caplog
+    ):
+        """CONTROL (opposite direction): a genuinely absent config must stay
+        a silent no-op -- no warning, no config file materialized."""
+        import logging
+
+        s = _linux_switcher()
+        cfg = get_global_config_path()
+        if cfg.exists():
+            cfg.unlink()
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            s._store._clear_managed_key()
+
+        assert not cfg.exists(), "a genuinely absent config must not be created"
+        assert not any(
+            "unreadable" in r.message.lower() or "could not be read" in r.message.lower()
+            for r in caplog.records
+        ), "CONTROL FAILED: a genuinely absent config must not warn"
 
 
 class TestATornConfigSurvivesAnOrdinarySwitch:

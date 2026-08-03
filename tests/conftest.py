@@ -17,7 +17,7 @@ from claude_swap import macos_keychain as _macos_keychain
 from claude_swap import paths as _paths
 
 
-class RealStoreWriteBlocked(PermissionError):
+class RealStoreWriteBlocked(Exception):
     """A test process tried to write the REAL account store.
 
     Raised from a process-global ``sys.addaudithook`` — installed once,
@@ -37,6 +37,16 @@ class RealStoreWriteBlocked(PermissionError):
     and ``credentials/*.enc`` were overwritten with the exact
     ``a@example.com``/``b@example.com`` pair ``EngineHarness.seed`` (this
     repo, ``tests/test_autoswitch.py``) writes.
+
+    I-3 (round 9): deliberately NOT a ``PermissionError``/``OSError``
+    subclass. ``pathlib.Path.mkdir(parents=True, exist_ok=True)`` catches
+    ``OSError`` internally and swallows it when the target already exists —
+    so an ``OSError``-based refusal into an EXISTING protected directory
+    (``cache.write_cache``, ``_atomic_b64_write``, ``_update_global_config``
+    all call ``mkdir(exist_ok=True)``) fired but never reached the caller.
+    A plain ``Exception`` cannot be caught by any ``except OSError:`` in the
+    stdlib or this codebase, so the refusal can no longer be absorbed by
+    the very shape it is meant to guard.
     """
 
 

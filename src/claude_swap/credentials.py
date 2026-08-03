@@ -770,6 +770,17 @@ class CredentialStore:
         ``customApiKeyResponses.approved`` untouched — ``removeApiKey`` doesn't clear
         it either, and removing it would force recovering ``key[-20:]`` from the
         Keychain for no benefit. A no-op (no config rewrite) when no key is present.
+
+        I-2 (round 9): ``_read_global_config`` collapses ABSENT and UNREADABLE
+        into the same ``None`` — without the distinction below, an unreadable
+        config (permissions, mid-unmount) reads exactly like a genuinely
+        keyless profile, so the clear is silently skipped. Best-effort stays
+        best-effort here (never raises — the write path this feeds must not
+        block on a transient read glitch), but a distinguishing warning
+        matters: a stale ``primaryApiKey`` surviving alongside a freshly
+        activated OAuth credential is a live cross-account key that bills
+        per token while it lies, and a caller/log reader must be able to
+        tell "nothing to clear" from "could not check".
         """
         if self._host.platform == Platform.MACOS:
             try:
@@ -780,6 +791,13 @@ class CredentialStore:
             except Exception:
                 pass  # best-effort; a down Keychain can't be cleaned now
         cfg = self._read_global_config()
+        if cfg is None and get_global_config_path().exists():
+            self._host._logger.warning(
+                "Could not clear primaryApiKey: the global config exists "
+                "but could not be read (unreadable, not absent) — leaving "
+                "it in place rather than overwriting it unread"
+            )
+            return
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
                 c.pop("primaryApiKey", None)
@@ -1320,6 +1338,14 @@ class CredentialStore:
         reference logs, another machine's synced roster, the unclaimed
         stash) instead of a silent absence indistinguishable from "there was
         never anything here".
+
+        C1-round-9: that checkpoint must never fire when a real ``.prev``
+        already exists — one holding a genuine previous generation from an
+        earlier, healthy overwrite. Overwriting it with a duplicate of the
+        incoming bytes destroys the one rollback target on the exact path
+        this function claims to protect, and the result is indistinguishable
+        from a legitimate ``.prev`` while carrying zero recovery value. A
+        checkpoint is only a net gain when there is nothing to lose.
         """
         try:
             current, unreadable = self._read_account_credentials_ex(account_num, email)
@@ -1333,8 +1359,8 @@ class CredentialStore:
                 "could not be read (not absent) — retaining the incoming "
                 "credential as .prev instead of the true previous generation"
             )
-            if not new_credentials:
-                return  # nothing to checkpoint either
+            if not new_credentials or self._read_previous_backup(account_num, email):
+                return  # nothing to checkpoint, or a real .prev already exists
             current = new_credentials
         elif not current or current == new_credentials:
             return

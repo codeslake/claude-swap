@@ -617,7 +617,7 @@ class ClaudeAccountSwitcher:
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
 
-    def _refuse_degraded_capture(self) -> None:
+    def _refuse_degraded_capture(self) -> str | None:
         """Refuse to CAPTURE bytes a degraded read produced.
 
         Both env-var branches of :meth:`_read_capture_credentials` pass
@@ -632,11 +632,15 @@ class ClaudeAccountSwitcher:
         ``add_account`` then cleared the dead-token strike — re-creating on the
         common path exactly the stale-consume this PR exists to prevent.
 
-        Kept as a separate guard rather than a replacement reader so
-        ``_read_credentials`` stays the single seam every caller (and test)
-        already binds to.
+        I-1 (round 9): returns the value THIS read produced so the caller
+        captures those exact bytes instead of reading again. The check-read
+        and a separate use-read are two independent Keychain reads — a
+        Keychain that answers the first and fails the second passes the
+        guard and then captures the possibly-stale plaintext fallback
+        anyway, which is precisely the outcome this guard exists to prevent.
         """
-        if self._read_active_credentials().degraded:
+        active = self._read_active_credentials()
+        if active.degraded:
             raise CredentialReadError(
                 "The macOS Keychain is unreadable right now (locked or no GUI "
                 "session), so the only readable credential is a plaintext "
@@ -644,6 +648,7 @@ class ClaudeAccountSwitcher:
                 "would file a spent refresh token against this slot. Retry "
                 "from a GUI terminal."
             )
+        return active.value
 
     def _read_capture_credentials(self) -> str | None:
         """Read the credential of the profile the environment points at.
@@ -709,8 +714,7 @@ class ClaudeAccountSwitcher:
             # ``primaryApiKey``. A miss here is what claude sees: logged out.
             return ""
         elif not config_dir:
-            self._refuse_degraded_capture()
-            return self._read_credentials()
+            return self._refuse_degraded_capture()
         else:
             creds = read_config_dir_credentials(config_dir, strict_keychain=True)
             if creds:
@@ -718,8 +722,7 @@ class ClaudeAccountSwitcher:
             if _same_directory(Path(config_dir), get_default_claude_config_home()):
                 # Safe only on this legacy path: the active store's env-following
                 # file backend and the default profile coincide here.
-                self._refuse_degraded_capture()
-                return self._read_credentials()
+                return self._refuse_degraded_capture()
         # Only this profile's own ``primaryApiKey`` — never the unsuffixed
         # "Claude Code" Keychain item, which belongs to the default profile
         # and would answer for a login that is not the one being added.
