@@ -1353,16 +1353,37 @@ class CredentialStore:
             self._host._logger.warning(f"Could not read backup for retention: {e}")
             return
         if unreadable:
+            # WITHDRAWN (round 10): rounds 8 and 9 tried to salvage this path by
+            # checkpointing the INCOMING bytes as `.prev`. Both attempts shipped
+            # a regression, each found by the next review:
+            #
+            #   r8  overwrote a real `.prev` holding a genuine previous
+            #       generation with a duplicate of the incoming bytes.
+            #   r9  guarded that with `_read_previous_backup`, which collapses
+            #       absent / unreadable / corrupt to `""` -- so on a LOCKED
+            #       Keychain (the very scenario this branch names) the guard
+            #       reads "" and fires anyway, writing a plaintext `.enc.prev`
+            #       that then WINS over the real Keychain `.prev` by the
+            #       .enc-wins rule and shadows it even after the lock clears.
+            #
+            # Measured, r9 tree, controls first:
+            #   readable + real .prev exists  -> wrote NOTHING  (guard works)
+            #   readable + no prior .prev     -> wrote kc        (checkpoint)
+            #   LOCKED   + real Keychain .prev-> wrote FILE      (SHADOWS IT)
+            #
+            # The honest position is that the true previous generation is
+            # unrecoverable here, and a checkpoint that can silently outrank a
+            # real one is worse than the absence it was meant to fill. Warn and
+            # decline. `upstream/main` has no `.prev` at all, so this is no
+            # worse there; what it is not is a cushion that lies.
             self._host._logger.warning(
                 f"Could not retain previous credential generation for "
                 f"account {account_num}: the current backup exists but "
-                "could not be read (not absent) — retaining the incoming "
-                "credential as .prev instead of the true previous generation"
+                "could not be read (not absent) — no .prev recovery copy "
+                "will exist for this write"
             )
-            if not new_credentials or self._read_previous_backup(account_num, email):
-                return  # nothing to checkpoint, or a real .prev already exists
-            current = new_credentials
-        elif not current or current == new_credentials:
+            return
+        if not current or current == new_credentials:
             return
         try:
             if self._use_keychain():
