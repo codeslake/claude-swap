@@ -723,6 +723,105 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         assert "○ cloud" not in account_card_text(acc, 80).plain
 
 
+class TestLiveImplIsCachedOffTheRenderPath:
+    """``_live_impl`` backs ``is_available``/``pinned_email``, both called on
+    every TUI render (AccountsPanel, AccountCard, dashboard._root_entries) —
+    not just on the poll. Measured: 0.168ms/call for
+    ``invalidate_caches()``+``find_spec`` with the extra absent, scaling with
+    ``sys.path`` length. A TTL well under the poll cadence removes that per
+    call while still catching a mid-session install."""
+
+    def test_repeated_calls_within_the_ttl_resolve_only_once(self, monkeypatch):
+        from claude_swap import pin
+
+        calls = []
+
+        def counted():
+            calls.append(1)
+            return object()
+
+        monkeypatch.setattr(pin, "_impl", counted)
+        for _ in range(5):
+            pin._live_impl()
+        assert len(calls) == 1, (
+            f"_impl() was resolved {len(calls)} times for 5 calls inside the "
+            "TTL — the render path is paying the resolution cost per widget"
+        )
+
+    def test_an_install_mid_session_is_still_seen_once_the_ttl_elapses(
+        self, monkeypatch
+    ):
+        """The cache must not make `cswap pin` need a TUI restart. Simulated
+        with a fake clock rather than a real sleep: the TTL only has to be
+        SHORTER than the poll cadence, not any particular wall-clock value,
+        and a real sleep would make this test's runtime hostage to that
+        constant."""
+        import time as _time
+
+        from claude_swap import pin
+
+        fake_now = [0.0]
+        monkeypatch.setattr(_time, "monotonic", lambda: fake_now[0])
+
+        installed = [False]
+
+        def resolves_once_installed():
+            if not installed[0]:
+                raise ClaudeSwitchError("not installed yet")
+            return object()
+
+        monkeypatch.setattr(pin, "_impl", resolves_once_installed)
+        assert pin._live_impl() is None, "resolved before the install happened"
+
+        installed[0] = True  # the install lands mid-TTL-window
+        assert pin._live_impl() is None, (
+            "a cache that resolves an install before its own TTL elapses is "
+            "answering from luck, not from the cache contract"
+        )
+
+        fake_now[0] += pin._LIVE_IMPL_CACHE_TTL_S + 0.01
+        assert pin._live_impl() is not None, (
+            "the extra was installed but the TUI still needs a restart to see it"
+        )
+
+    def test_the_ttl_stays_under_one_poll_interval(self):
+        """The mechanism-level test above expires the cache by construction —
+        it would pass even with a TTL of an hour. Pin the actual VALUE against
+        the TUI's poll cadence so a install is seen within one poll tick, not
+        eventually."""
+        from claude_swap.tui.app import CswapApp
+
+        from claude_swap import pin
+
+        assert pin._LIVE_IMPL_CACHE_TTL_S < CswapApp.POLL_INTERVAL_S, (
+            "the cache outlives a poll interval — a mid-session install would "
+            "need more than one refresh_root_menu tick to appear"
+        )
+
+
+class TestSafeRedaction:
+    """``_safe`` is the only security-relevant helper in this file, and
+    nothing pinned its behaviour: a prior diff replaced its whole regex with
+    ``str(exc)`` and every test stayed green."""
+
+    def test_url_userinfo_is_scrubbed(self):
+        from claude_swap.pin import _safe
+
+        exc = RuntimeError("could not reach http://user:secret@127.0.0.1:9901/health")
+        rendered = _safe(exc)
+        assert "user:secret@" not in rendered
+        assert "***@127.0.0.1:9901" in rendered
+
+    def test_a_bare_email_address_is_left_alone(self):
+        """The ``(?<=://)`` anchoring is the interesting part: a naive 'strip
+        anything before @' would also eat an email address that has nothing
+        to do with a URL."""
+        from claude_swap.pin import _safe
+
+        exc = RuntimeError("no account found for user@example.com")
+        assert _safe(exc) == str(exc)
+
+
 class TestTheRollbackVerdictIsNotFooledByShape:
     """The seam's reader and the package's writer must agree on shape.
 
