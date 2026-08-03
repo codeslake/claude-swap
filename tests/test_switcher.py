@@ -14,7 +14,7 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_RELOGIN_REQUIRED, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ClaudeSwitchError,
@@ -3898,6 +3898,43 @@ class TestDeadTokenQuarantine:
 
         run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_post_fetch_invalid_grant_on_active_slot_does_not_condemn_when_unreadable(
+        self, temp_home, monkeypatch
+    ):
+        """C1 (round 9) at the SECOND `_entry_token_dead` call site: a fetch
+        that just returned invalid_grant, on an ACTIVE slot, with the
+        Keychain locked, and the strike bound to a DIFFERENT generation than
+        the live credential (i.e. this exact fetch's failure doesn't confirm
+        the live bytes are the condemned ones -- the active-slot backup
+        might already hold a fresher, healthy generation we simply can't
+        see). Must not get USAGE_RELOGIN_REQUIRED -- same ambiguity as the
+        pre-fetch scan, just reached from the post-fetch branch."""
+        from claude_swap.usage_store import FetchRecord
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.MACOS
+        switcher._setup_directories()
+        live = self._dead_creds()  # the live credential the fetch POSTed
+        other_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-other", "refreshToken": "rt-other",
+            "expiresAt": 1}})
+        info = [(2, "test@example.com", "Org", "", True, live, "")]
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(other_gen),
+            )},
+        ):
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED, (
+            "C1 regression at the post-fetch call site: an ambiguous "
+            "unreadable read on an active slot was condemned, "
+            f"sentinel={entries['2'].sentinel!r}"
+        )
 
     def test_readd_clears_quarantine(self, temp_home):
         # Re-adding an account (fresh credential) must lift the quarantine, so
@@ -9964,6 +10001,149 @@ class TestStrikeUnbindsInCollector:
             "five_hour": {"pct": 12.0}
         }
 
+    def test_lock_free_heal_revoke_claim_false_preserves_a_live_claim(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """Isolates `revoke_claim=False` at the collector's own call site
+        (brief I-list item 3 / review IMPORTANT-2, mutation L): a live claim
+        pre-existing on the row BEFORE the lock-free heal runs must survive
+        the heal. Unlike the concurrent-claim repro above, `struckFingerprint`
+        never changes between the collector's read and its write here, so
+        `expected_fingerprints` matches trivially either way -- this isolates
+        `revoke_claim` specifically, which the other test's ordering could
+        not (E's own raw mutation there breaks the fingerprint match first,
+        so a `revoke_claim` mutation was masked)."""
+        from claude_swap.usage_store import FetchRecord as StoreRecord
+
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt-dead",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", dead)
+        identities = {"2": ("b@example.com", "")}
+        store = s._usage_store
+
+        # A DIFFERENT collector (E) wins a live claim FIRST, while the row
+        # is still unstruck -- `reserve()` refuses a struck row outright
+        # (`_row_eligible` gates on authDeadStrikes), so the claim must
+        # predate the strike, exactly as it would in the field (E started
+        # fetching before the strike landed).
+        live_claims = store.reserve(["2"], identities, respect_plans=False)
+        assert live_claims, "premise: E wins a live claim before the strike"
+
+        # The strike lands (a DIFFERENT fetch, or the same one failing) --
+        # write it directly under the row so E's still-live claim is left
+        # untouched by this step, mirroring `record()`'s own field-level
+        # writes without consuming E's claim.
+        store._mutate(identities, ["2"], lambda _n, row: row.update(
+            authDeadStrikes=1,
+            struckFingerprint=oauth.credential_fingerprint(dead),
+            backoffUntil=None, consecutiveFailures=0, lastError="invalid_grant",
+        ))
+        # Heal the credential (fresh lineage) so the collector's read sees a
+        # fingerprint-healed strike -- takes the `elif` heal branch.
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", fresh)
+
+        info = [(2, "b@example.com", "", "", False, fresh, "")]
+        s._collect_usage_entries(info, fetch=set())
+
+        # The pre-existing claim must still be honorable: record() using it
+        # must not be fenced out.
+        accepted = store.record(
+            {"2": StoreRecord(usage={"five_hour": {"pct": 7.0}})},
+            identities, live_claims,
+        )
+        assert accepted == {"2"}, (
+            f"accepted={accepted} -- revoke_claim mutated to True voided a "
+            "live claim the lock-free heal has no credential change of its "
+            "own to justify fencing"
+        )
+
+    def test_lock_free_heal_expected_fingerprints_skips_a_moved_row(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """Isolates `expected_fingerprints` at the collector's own call site
+        (brief I-list item 2 / review IMPORTANT-2, mutation K3): a strike
+        that changed generation BETWEEN the collector's lock-free `entries()`
+        read and its own `clear_dead_token` write must not be silently
+        overwritten by that now-stale decision. Simulated by mutating the
+        row's `struckFingerprint` to a DIFFERENT value directly on the
+        store, inside a patched `_read_account_credentials_ex` that fires
+        exactly once the collector's read has already happened -- so the
+        write sees a row whose fingerprint no longer matches what the
+        collector's decision was based on."""
+        from claude_swap.usage_store import FetchRecord as StoreRecord
+
+        sample_sequence_data["accounts"]["2"] = {
+            "email": "b@example.com", "uuid": "u2",
+            "organizationUuid": "", "organizationName": "",
+        }
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead = json.dumps({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "rt-dead",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", dead)
+        identities = {"2": ("b@example.com", "")}
+        store = s._usage_store
+        store.record(
+            {"2": StoreRecord(error="invalid_grant",
+                              struck_fp=oauth.credential_fingerprint(dead))},
+            identities,
+        )
+        # Heal the credential (fresh lineage) so the collector's OWN read
+        # sees a fingerprint-healed strike and decides to clear it.
+        fresh = json.dumps({
+            "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
+                              "expiresAt": 1000}})
+        s._write_account_credentials("2", "b@example.com", fresh)
+
+        # Between the collector's decision (made on its own lock-free
+        # `entries()` read, captured above) and its write, A DIFFERENT
+        # collector strikes the row again on a NEW generation -- landing in
+        # the exact gap `expected_fingerprints` exists to close. Intercept
+        # the write call itself (mirrors the concurrent-claim test's own
+        # pattern above) so the race lands exactly where the real one would.
+        new_strike_fp = "sha256:" + "f" * 64
+        real_clear = store.clear_dead_token
+
+        def strike_then_clear(nums, idents, **kw):
+            store._mutate(idents, list(nums), lambda _n, row: row.update(
+                authDeadStrikes=1, struckFingerprint=new_strike_fp,
+            ))
+            return real_clear(nums, idents, **kw)
+
+        store.clear_dead_token = strike_then_clear
+        try:
+            info = [(2, "b@example.com", "", "", False, fresh, "")]
+            s._collect_usage_entries(info, fetch=set())
+        finally:
+            store.clear_dead_token = real_clear
+
+        # The row must still carry the NEW strike -- the collector's
+        # stale-read heal must not have overwritten it.
+        post = store.entries(identities)["2"]
+        assert post.auth_dead_strikes >= 1, (
+            "expected_fingerprints dropped: a fresh strike landing between "
+            "the collector's read and its write was silently overwritten"
+        )
+        assert post.struck_fingerprint == new_strike_fp, (
+            f"struck_fingerprint={post.struck_fingerprint!r}, expected "
+            f"{new_strike_fp!r} to survive the stale-read heal"
+        )
+
     def test_the_heal_does_not_erase_a_live_server_backoff(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
@@ -10779,6 +10959,44 @@ class TestActiveSlotStrikeParity:
             "the condemned generation"
         )
 
+    def test_active_strike_healed_by_absent_backup_not_unreadable(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        """Mutation guard (review IMPORTANT-1 / brief I-list item 1): the
+        ABSENT direction of `bool(backup) and ...` must heal, not fail
+        closed. A GENUINELY ABSENT backup (never written -- rc-44 'not
+        found', `unreadable=False`) is not the same fact as an UNREADABLE
+        one; only the latter must survive the strike. Dropping
+        `bool(backup) and` collapses ABSENT into the same fail-closed path
+        as UNREADABLE -- this pins the opposite, correct behavior."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        old_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-old",
+                              "refreshToken": "rt-old", "expiresAt": 1000}})
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live", "expiresAt": 2000}})
+        # No backup ever written for slot 2 -- genuinely absent, not merely
+        # unreadable (Linux platform: _read_account_credentials_ex's
+        # `unreadable` axis is always False off macOS).
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            identities,
+        )
+        entry = s._usage_store.entries(identities, [])["2"]
+        result = s._entry_token_dead(entry, "2", "b@example.com", live, True)
+        assert result is False, (
+            "a genuinely ABSENT backup must heal the strike (fp(stored) "
+            f"already differs from struck_fingerprint), got {result}"
+        )
+
     def test_idle_slot_keeps_live_fp_heal_semantics(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict
@@ -10853,12 +11071,23 @@ class TestActiveSlotStrikeParity:
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, monkeypatch
     ):
-        """An UNREADABLE backup (locked/denied macOS Keychain) must not heal
-        an active slot's dead-token strike the way a genuinely ABSENT backup
-        does. `_read_account_credentials` collapses both to `""`;
-        `_entry_token_dead` must ask `_read_account_credentials_ex`, which
-        distinguishes them, and fail closed on `unreadable`. Nothing about
-        the backup itself changes between the control and the probe below —
+        """An UNREADABLE backup (locked/denied macOS Keychain) must not
+        SILENTLY HEAL an active slot's dead-token strike the way a
+        genuinely ABSENT backup does. `_read_account_credentials` collapses
+        both to `""`; `_entry_token_dead` must ask
+        `_read_account_credentials_ex`, which distinguishes them.
+
+        Round 9 correction: an unreadable backup is not, on its own,
+        evidence the strike still holds either -- it is equally consistent
+        with a backup that was ALREADY healed by a re-login whose new bytes
+        we simply can't see right now (round 9's C1 finding: guessing
+        `True` here condemned a healed slot). `_entry_token_dead` therefore
+        returns `None` (cannot determine) for this shape rather than
+        `True`. The property this test pins is the one round 8 actually
+        needs: unreadable must not silently HEAL (return `False`, the value
+        that would let the collector's healed-strike-clear branch erase the
+        strike) -- `None` is not `False`, so that never happens. Nothing
+        about the backup changes between the control and the probe below --
         only whether the read succeeds."""
         from claude_swap.usage_store import FetchRecord as FR
         sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
@@ -10889,11 +11118,198 @@ class TestActiveSlotStrikeParity:
 
         # PROBE: the identical backup, but the Keychain now raises
         # (locked/denied/timeout) instead of answering. Nothing about the
-        # backup changed -- only whether the read succeeded.
+        # backup changed -- only whether the read succeeded. This shape
+        # (unreadable + struck fp differing from `stored`) is
+        # OBSERVATIONALLY IDENTICAL to a genuinely healed slot, so the
+        # correct answer is "cannot determine" (None), not a guessed True.
         monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
-        assert s._entry_token_dead(entry, "2", "b@example.com", live, True), (
-            "an UNREADABLE backup must not heal the strike -- unreadable is "
-            "not evidence the dead generation was replaced"
+        result = s._entry_token_dead(entry, "2", "b@example.com", live, True)
+        assert result is not False, (
+            "an UNREADABLE backup must not silently HEAL the strike -- "
+            f"unreadable is not evidence the dead generation was replaced, got {result}"
+        )
+
+    def test_collector_does_not_condemn_healed_active_slot_on_locked_keychain(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """Collector-level guard for C1 (round 9): with the Keychain locked,
+        an active slot whose strike is bound to a generation that no longer
+        exists anywhere (already healed by a re-login) must NOT get
+        USAGE_RELOGIN_REQUIRED from `_collect_usage_entries` -- that
+        sentinel is what stops polling (`due_candidate`), marks the pin
+        broken (`pin_is_broken`), and authorizes `cswap import` to
+        overwrite without `--force`."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        old_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-old",
+                              "refreshToken": "rt-old", "expiresAt": 1000}})
+        new_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new",
+                              "refreshToken": "rt-new", "expiresAt": 2000}})
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            identities,
+        )
+        # Healed: backup rewritten to the new generation, bypassing
+        # clear_dead_token (mirrors a re-login outside cswap's own heal
+        # paths).
+        s._write_account_credentials("2", "b@example.com", new_gen)
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        # info tuple: (num, email, org_name, org_uuid, is_active, creds, alias)
+        # is_active=True; creds = the LIVE credential (also new_gen here).
+        info = [(2, "b@example.com", "", "", True, new_gen, "")]
+        with patch.object(s, "current_account_number", return_value="2"):
+            entries = s._collect_usage_entries(info, fetch=set())
+        assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED, (
+            "C1 regression: collector condemned an already-healed active "
+            f"slot on a locked Keychain, sentinel={entries['2'].sentinel!r}"
+        )
+
+    def test_collector_does_not_silently_heal_an_unresolved_strike_on_locked_keychain(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """Mutation guard for the `dead is None` branch: an ambiguous read
+        (unreadable backup, struck active slot, NOT actually healed -- the
+        live credential still matches the struck generation as far as
+        `stored` can tell, i.e. round 8's own scenario) must not be silently
+        auto-healed by falling through to the collector's fingerprint-healed
+        `elif` (which calls `clear_dead_token`). If it fell through, the
+        strike row would be wiped even though nothing confirmed the backup
+        actually changed -- reopening round 8's exact bug. Assert on the
+        STORE ROW surviving a second read, not just the sentinel (the
+        fallthrough sets no sentinel either, so a sentinel-only assertion
+        cannot see this)."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead_backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-dead",
+                              "refreshToken": "rt-dead", "expiresAt": 1000}})
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live", "expiresAt": 2000}})
+        s._write_account_credentials("2", "b@example.com", dead_backup)
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(dead_backup))},
+            identities,
+        )
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        info = [(2, "b@example.com", "", "", True, live, "")]
+        with patch.object(s, "current_account_number", return_value="2"):
+            s._collect_usage_entries(info, fetch=set())
+        # Re-read the row directly from the store: the strike must survive.
+        post = s._usage_store.entries(identities, [])["2"]
+        assert post.auth_dead_strikes >= 1, (
+            "C1/round-8 regression: an ambiguous (unreadable, unresolved) "
+            "strike was silently healed by the collector -- "
+            f"auth_dead_strikes={post.auth_dead_strikes}"
+        )
+
+    def test_active_strike_survives_unreadable_backup_already_healed(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """Round 9 C1: round 8's fail-closed guard must not condemn a
+        HEALED slot. Same struck generation as before, but the backup (and
+        live credential) have ALREADY been rewritten to a NEW generation by
+        a re-login -- the strike is bound to a generation that no longer
+        exists anywhere. A Keychain read failure on THIS process must not
+        turn that into "re-login needed" (`_entry_token_dead` returning
+        `True`): the slot is healthy and the strike is stale.
+
+        This is the mutation guard for round 9: reverting the fix (letting
+        `unreadable` return the raw `entry.token_dead()` -- i.e. `True`
+        whenever raw strikes are at threshold, exactly round 8's shipped
+        code) must fail this assertion."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        old_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-old",
+                              "refreshToken": "rt-old", "expiresAt": 1000}})
+        new_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new",
+                              "refreshToken": "rt-new", "expiresAt": 2000}})
+        # Strike bound to the OLD generation.
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            identities,
+        )
+        # HEAL: a re-login rewrote the backup to the NEW generation --
+        # bypassing `clear_dead_token` (mirrors a re-login through Claude
+        # Code itself, or `_resync_rotated_backup`'s write path, neither of
+        # which clears the strike row).
+        s._write_account_credentials("2", "b@example.com", new_gen)
+        entry = s._usage_store.entries(identities, [])["2"]
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        result = s._entry_token_dead(entry, "2", "b@example.com", new_gen, True)
+        assert result is not True, (
+            "C1 regression: an already-healed slot was condemned by an "
+            f"unreadable Keychain read, got {result}"
+        )
+
+
+    def test_slot_token_dead_coerces_ambiguous_to_not_dead(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """`_slot_token_dead`'s only caller (`cswap import`'s auto-heal) uses
+        it as a plain boolean gate: an ambiguous (`None`) verdict from
+        `_entry_token_dead` must coerce to `False` here, not `True` --
+        `True` would let `cswap import` silently overwrite a slot's
+        credentials without `--force`, on nothing more than a locked
+        Keychain."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        old_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-old",
+                              "refreshToken": "rt-old", "expiresAt": 1000}})
+        new_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new",
+                              "refreshToken": "rt-new", "expiresAt": 2000}})
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            identities,
+        )
+        s._write_account_credentials("2", "b@example.com", new_gen)
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "b@example.com", "accountUuid": "acct-2",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        s._store._write_active_credentials_file(new_gen)
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        assert s.current_account_number() == "2"
+        result = s._slot_token_dead("2", "b@example.com")
+        assert result is False, (
+            f"an ambiguous verdict must coerce to False (not dead), got {result}"
         )
 
 
