@@ -1021,6 +1021,23 @@ class ClaudeAccountSwitcher:
         with FileLock(self.lock_file):
             return self._swap_accounts_locked(first, second)
 
+    def _read_backup_or_abort(self, account_num: str, email: str) -> str:
+        """Backup read for swap/move's pre-mutation snapshot; raises on an
+        unreadable (not absent) backup.
+
+        Nothing has moved yet at the call sites, so an unreadable verdict
+        aborts here rather than committing a swap/move that silently drops
+        the slot's live refresh token in favor of an empty destination.
+        """
+        creds, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            raise ConfigError(
+                f"Account-{account_num}'s stored credential could not be "
+                "read (keychain unavailable?); nothing was changed. Retry "
+                "once it is readable again."
+            )
+        return creds
+
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
         """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
 
@@ -1059,9 +1076,12 @@ class ClaudeAccountSwitcher:
 
         # Read both slots' backup material up front so a read failure aborts
         # before anything has been moved. Missing material reads as "" (an
-        # api-key or never-backed-up slot) and stays missing after the swap.
-        creds_a = self._read_account_credentials(num_a, email_a)
-        creds_b = self._read_account_credentials(num_b, email_b)
+        # api-key or never-backed-up slot) and stays missing after the swap
+        # — but the plain reader answers that same "" for a backup that
+        # EXISTS and simply could not be read right now (locked Keychain,
+        # a permission glitch). See _read_backup_or_abort.
+        creds_a = self._read_backup_or_abort(num_a, email_a)
+        creds_b = self._read_backup_or_abort(num_b, email_b)
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
 
@@ -1474,8 +1494,11 @@ class ClaudeAccountSwitcher:
         self._ensure_no_live_session(num_src, email, "--move-account")
 
         # Read backup material up front so a read failure aborts before any
-        # move. Missing material reads as "" (api-key or never-backed-up slot).
-        creds = self._read_account_credentials(num_src, email)
+        # move. Missing material reads as "" (api-key or never-backed-up
+        # slot) — but the plain reader answers that same "" for a backup
+        # that EXISTS and simply could not be read right now. See
+        # _read_backup_or_abort.
+        creds = self._read_backup_or_abort(num_src, email)
         config = self._read_account_config(num_src, email)
 
         src_dir = self._session_dir(num_src, email)

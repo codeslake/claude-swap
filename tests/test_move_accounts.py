@@ -9,6 +9,7 @@ import pytest
 from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ConfigError,
     CredentialError,
     ValidationError,
 )
@@ -217,7 +218,15 @@ class TestMoveAccount:
         """macOS with a locked Keychain: deletion raises and the normal
         verification read reports "" (unreadable == absent in the best-effort
         reader). The strict clear must fail closed — abort the move rather
-        than commit with a stale Keychain item set to resurface on unlock."""
+        than commit with a stale Keychain item set to resurface on unlock.
+
+        With the source-side ``_read_account_credentials_ex`` guard (same
+        defect family, see ``TestMoveUnreadableSourceIsNotAbsent``), a
+        globally locked Keychain is now caught even earlier — at account 2's
+        OWN pre-move backup read, before the destination's strict clear is
+        ever reached — and raises ``ConfigError`` instead. The invariant
+        this test exists to pin (nothing committed, the stale item
+        survives) is unchanged; only which guard catches it first is."""
         from claude_swap.credentials import SECURITY_SERVICE
 
         switcher = ClaudeAccountSwitcher()
@@ -233,7 +242,7 @@ class TestMoveAccount:
         monkeypatch.setattr(macos_keychain, "get_password", locked)
         monkeypatch.setattr(macos_keychain, "delete_password", locked)
 
-        with pytest.raises(CredentialError, match="aborting before commit"):
+        with pytest.raises(ConfigError, match="could not be read"):
             switcher.move_account("2", "5")
         monkeypatch.undo()
 
@@ -461,3 +470,73 @@ class TestMoveAccount:
 
         with pytest.raises(ValidationError, match="out of range"):
             switcher.move_account("2", "151")
+
+
+class TestMoveUnreadableSourceIsNotAbsent:
+    """Same defect family as C1/C2: the plain reader's ``""`` means both
+    "no backup" and "the backup exists but could not be read right now".
+
+    The pre-move read (:1495) used the plain reader — a locked Keychain or
+    a permission glitch on the ``.enc`` read as "account 2 has no backup",
+    and the move committed a slot key holding NOTHING while the source's
+    live refresh token sat unread. Fixed with ``_read_account_credentials_ex``,
+    aborting BEFORE anything moves (mirroring the strict-clear guards this
+    same file already tests for the destination side).
+    """
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_unreadable_enc_aborts_the_move_before_anything_changes(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials("2", "account2@example.com", "live-rt")
+        switcher._write_account_credentials("1", "account1@example.com", "rt-1")
+
+        # CONTROL: a readable source moves cleanly (instrument says YES).
+        num_src, num_target, swapped = switcher.move_account("1", "5")
+        assert (num_src, num_target, swapped) == ("1", "5", False)
+        assert (
+            switcher._read_account_credentials("5", "account1@example.com")
+            == "rt-1"
+        )
+
+        enc = switcher._backup_enc_path("2", "account2@example.com")
+        enc.chmod(0o000)
+        try:
+            with pytest.raises(ConfigError, match="could not be read"):
+                switcher.move_account("2", "6")
+        finally:
+            if enc.exists():
+                enc.chmod(0o600)
+
+        # Nothing committed: account 2 is intact under its original number,
+        # holding its readable credential, and slot 6 was never claimed.
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "account2@example.com"
+        assert "6" not in data["accounts"]
+        assert (
+            switcher._read_account_credentials("2", "account2@example.com")
+            == "live-rt"
+        )
+
+    def test_absent_source_still_moves(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Control in the other direction: a genuinely unbacked slot (no
+        .enc at all) is not mistaken for unreadable and still moves."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+
+        num_src, num_target, swapped = switcher.move_account("2", "5")
+
+        assert (num_src, num_target, swapped) == ("2", "5", False)
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["5"]["email"] == "account2@example.com"
