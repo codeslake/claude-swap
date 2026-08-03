@@ -10306,6 +10306,74 @@ class TestUnreadableBackupIsNotAbsent:
             "an unprovable strike — correct there, destructive here"
         )
 
+    # -- C-2: `.value or ""` collapses a read ERROR into ABSENT -----------
+
+    def test_active_read_error_is_not_condemned_as_dead(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        """``ActiveCredentials.value`` is tri-state: ``""`` is genuinely
+        absent in every backend, ``None`` is a plaintext-file read ERROR.
+        ``_slot_token_dead``'s active branch used ``.value or ""``, which
+        collapses ``None`` into ``""``. ``credential_fingerprint("")`` is
+        None, and ``token_dead(stored_fp=None)`` skips the binding check
+        and binds UNCONDITIONALLY — so a live slot whose credential
+        momentarily could not be read was condemned as refresh-token-dead,
+        and ``import_accounts`` replaces it without ``--force``. Platform-
+        independent: the read error comes from the plaintext credentials
+        file, not the Keychain, so this is provable on Linux.
+        """
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        sample_sequence_data["accounts"]["1"]["email"] = "b@example.com"
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-dead", "refreshToken": "rt-dead",
+                              "expiresAt": 1000}})
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
+                              "expiresAt": 9999999999000}})
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "b@example.com", "accountUuid": "uuid-1",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        identities = {"1": ("b@example.com", "")}
+        for _ in range(6):
+            s._usage_store.record(
+                {"1": FetchRecord(error="invalid_grant",
+                                  struck_fp=oauth.credential_fingerprint(dead))},
+                identities,
+            )
+        assert s._usage_store.entries(identities, [])["1"].token_dead(), (
+            "premise: the row must be struck to begin with"
+        )
+
+        def verdict(active_value):
+            monkeypatch.setattr(
+                s._store, "_read_active_credentials",
+                lambda: ActiveCredentials(active_value, False, False),
+            )
+            return s._slot_token_dead("1", "b@example.com")
+
+        monkeypatch.setattr(s, "current_account_number", lambda: "1")
+
+        assert verdict(dead) is True, (
+            "control A broken: the instrument never says yes (matches struck)"
+        )
+        assert verdict(live) is False, (
+            "control B broken: the instrument never says no (replaced since)"
+        )
+        assert verdict(None) is False, (
+            "an active credential that could not be READ (plaintext-file "
+            "error) was condemned as refresh-token-dead; "
+            "credential_fingerprint('') is None, which token_dead() treats "
+            "as 'binds unconditionally', and import_accounts replaces the "
+            "slot's credential without --force"
+        )
+
 
 class TestSessionShellGuardCoversEveryMutator:
     """H-4: `_refuse_session_shell`'s docstring claims "a shared chokepoint
