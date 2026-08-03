@@ -197,11 +197,14 @@ class TestStrictRosterReadBranches:
         with pytest.raises(ConfigError, match="not a JSON object"):
             self._switcher(tmp_path)._read_json(p, strict=True)
 
+    # ONE condition, and the POSIX check must be INSIDE it. `skipif`'s argument
+    # is evaluated at COLLECTION, on every platform, so `os.geteuid()` in a
+    # second decorator runs before the win32 skip above it can apply — and
+    # Windows has no `geteuid`, so the module fails to import and the WHOLE
+    # suite is interrupted (1819 collected / 1 error), not just this test.
     @pytest.mark.skipif(
-        os.geteuid() == 0, reason="root reads through a 0000 mode"
-    )
-    @pytest.mark.skipif(
-        sys.platform == "win32", reason="POSIX mode semantics"
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="POSIX mode semantics; root reads through a 0000 mode",
     )
     def test_an_unreadable_roster_is_refused_not_read_as_empty(self, tmp_path):
         """The distinction the strict reader exists for: `None` here would be
