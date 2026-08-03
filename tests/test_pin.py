@@ -1753,3 +1753,209 @@ class TestTheVerdictHasExactlyOneImplementation:
             assert applied == [], "apply_pin ran without knowing the kind"
         finally:
             pin._impl = real_impl
+
+
+class TestHealADeadPin:
+    """A dead pin must not take the session with it.
+
+    MEASURED OUTAGE (2026-08-02, host-a): the pin daemon died, and its wiring
+    stayed in ``.claude.json``. Claude Code applies that env block at BOOT, so
+    every session — including new ones — dialled the dead port and showed
+    ``Unable to connect to API (ConnectionRefused) · attempt 6/300`` for hours,
+    while the proxies behind the pin were healthy the whole time. Nothing
+    recovered on its own because the recovery command did not exist: the status
+    line called ``cswap pin --heal`` every few seconds and argparse rejected it,
+    silently, every time.
+
+    The requirement these pin down: turning the pin off — or having it die —
+    must leave Claude working exactly as it did before the pin existed.
+    """
+
+    def _sw(self, tmp_path, wired=True, pinned="cloud@example.com"):
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": pinned}} if pinned else {})
+        )
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "HTTPS_PROXY": "http://127.0.0.1:36301",
+                        "CSWAP_PIN_PORT": "36301",
+                    },
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                }
+                if wired
+                else {"env": {}}
+            )
+        )
+        # _write_json is what the REAL switcher writes the config through; a
+        # stub without it makes _clear_wiring_locked raise AttributeError,
+        # which clear_wiring swallows into a bare False — so the unwire never
+        # happens and the test reads it as "nothing was wired".
+        return (
+            types.SimpleNamespace(
+                backup_dir=backup,
+                _write_json=lambda path, data: path.write_text(
+                    json.dumps(data, indent=2), encoding="utf-8"
+                ),
+            ),
+            cfg,
+        )
+
+    def _paths(self, monkeypatch, cfg):
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+    def test_heal_restarts_the_proxy_when_it_can(self, tmp_path, monkeypatch):
+        """Preferred outcome: the daemon comes back on the SAME port, so live
+        sessions — whose env is fixed at exec — reattach with no restart."""
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+        called = []
+
+        class _I:
+            def heal(self, backup_dir):
+                called.append(backup_dir)
+                return True
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _I())
+        changed, msg = pin.heal(sw)
+        assert changed, msg
+        assert "Restarted" in msg, msg
+        assert called == [sw.backup_dir]
+        # The wiring is CORRECT now — healing must not have torn it down.
+        assert "_cswapPinWiredKeys" in cfg.read_text()
+
+    def test_heal_unwires_when_the_proxy_cannot_be_restarted(
+        self, tmp_path, monkeypatch
+    ):
+        """THE OUTAGE. The daemon is gone and cannot come back. Leaving the
+        wiring wired to a dead port is what took every session down, so the
+        wiring must go — unpinned is a working session, wired-to-nothing is
+        not."""
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+
+        class _I:
+            def heal(self, backup_dir):
+                return False  # could not restart
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _I())
+        changed, msg = pin.heal(sw)
+        assert changed, msg
+        assert "fall back" in msg, msg
+        # Re-READ the file: the verdict must describe the state, not the call.
+        raw = json.loads(cfg.read_text())
+        assert "_cswapPinWiredKeys" not in raw
+        assert not (raw.get("env") or {}).get("HTTPS_PROXY")
+
+    def test_heal_unwires_with_no_package_at_all(self, tmp_path, monkeypatch):
+        """The half that matters MOST when the extra is missing or broken.
+        A user whose `cswap-pin` install went bad cannot restart anything —
+        but they can still be stranded by its leftover wiring, and that is
+        precisely when they can least afford it."""
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)  # no usable extra
+        changed, msg = pin.heal(sw)
+        assert changed, msg
+        assert "_cswapPinWiredKeys" not in json.loads(cfg.read_text())
+
+    def test_heal_does_not_claim_success_when_the_unwire_failed(
+        self, tmp_path, monkeypatch
+    ):
+        """The verdict must come from the unwire's own result, not from having
+        reached the call. A contended `.claude.json` lock makes clear_wiring
+        return False with the wiring INTACT — reporting "sessions fall back"
+        there tells the user the outage is over while every session is still
+        dialling the dead port, which is the failure this whole path exists to
+        end. (This is the mutation the file-content assertions do not catch:
+        `clear_wiring(...) or True` leaves them all green.)"""
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        monkeypatch.setattr(pin, "clear_wiring", lambda *a, **k: False)
+        changed, msg = pin.heal(sw)
+        assert not changed, msg
+        assert "fall back" not in msg, msg
+        # And the state agrees with the verdict: still wired.
+        assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+
+    def test_heal_is_a_no_op_when_nothing_is_wired(self, tmp_path, monkeypatch):
+        """Called from the status line every few seconds. The healthy case must
+        cost nothing and must not claim to have done something."""
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path, wired=False)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        changed, msg = pin.heal(sw)
+        assert not changed
+        assert msg == "Nothing to heal"
+
+    def test_heal_never_raises(self, tmp_path, monkeypatch):
+        """The status line calls this on a timer; an exception there breaks the
+        prompt itself, which is worse than the fault it is reporting."""
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+
+        class _I:
+            def heal(self, backup_dir):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _I())
+        monkeypatch.setattr(
+            pin, "_wiring_present", lambda *a: (_ for _ in ()).throw(OSError("nope"))
+        )
+        changed, msg = pin.heal(sw)  # must not raise
+        assert not changed
+        assert "Could not heal" in msg, msg
+
+    def test_cli_accepts_heal(self, monkeypatch):
+        """The whole outage was unrecoverable because argparse REJECTED the
+        flag the status line was already shipping. Assert the flag parses and
+        reaches run(), not merely that a function named heal exists."""
+        import claude_swap.cli as cli
+
+        seen = {}
+
+        def _run(switcher, account, clear=False, heal_only=False):
+            seen.update(account=account, clear=clear, heal_only=heal_only)
+            return 0
+
+        monkeypatch.setattr("claude_swap.pin.run", _run)
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **k: object())
+        monkeypatch.setattr(cli, "_guard_root", lambda s: None)
+        with pytest.raises(SystemExit) as e:
+            cli._pin_command(["--heal"])
+        assert e.value.code == 0
+        assert seen == {"account": None, "clear": False, "heal_only": True}
+
+    def test_heal_runs_before_the_package_is_required(self, tmp_path, monkeypatch):
+        """`run(--heal)` must not go through _impl(): the missing-package error
+        would abort exactly the users who most need the wiring removed."""
+        from claude_swap import pin
+
+        sw, _cfg = self._sw(tmp_path)
+        monkeypatch.setattr(
+            pin, "_impl", lambda: (_ for _ in ()).throw(ClaudeSwitchError("no extra"))
+        )
+        monkeypatch.setattr(pin, "heal", lambda s: (True, "Removed a stale wiring"))
+        assert pin.run(sw, None, heal_only=True) == 0

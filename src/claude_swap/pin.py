@@ -665,10 +665,67 @@ def set_pin(
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
 
-def run(switcher, account: str | None, clear: bool = False) -> int:
+def heal(switcher) -> tuple[bool, str]:
+    """Make the pin serving again, or make it harmless. ``(changed, message)``.
+
+    A DEAD PIN MUST NOT TAKE THE SESSION WITH IT. Everything else here reacts
+    to a launch, so when the daemon dies while sessions are up nothing brings
+    it back — and the stale wiring in ``.claude.json`` is applied at BOOT, so
+    new sessions inherit the dead port too and cannot start either. Measured on
+    this machine: every session on the box showed ``Unable to connect to API
+    (ConnectionRefused) · attempt 6/300`` for hours, while the proxies behind
+    the pin (CCF on 9901, privoxy on 8118) were healthy the whole time. A human
+    had to re-pin by hand.
+
+    Two outcomes, in order of preference:
+
+    1. Restart the daemon on the SAME port. Live sessions are already wired to
+       that address and their env is fixed at exec, so a daemon returning to it
+       is picked up with no restart and nothing to reconnect.
+    2. Failing that, REMOVE THE WIRING. Unpinned is a working session; wired to
+       a dead port is not. The fallback the shell provides (the corporate proxy,
+       or nothing) is what the user had before they ever pinned.
+
+    Never raises: this is called from the status line every few seconds, and a
+    health check that can break the prompt is worse than the fault it reports.
+    """
+    impl = _live_impl()
+    if impl is not None:
+        try:
+            if impl.heal(switcher.backup_dir):
+                return True, "Restarted the cloud pin proxy"
+        except Exception:  # noqa: BLE001 — fall through to the safe outcome
+            pass
+    # No package, or the restart failed. Either way the wiring must not outlive
+    # the daemon it points at. clear_wiring works WITHOUT the package on
+    # purpose — the wiring is cswap's own record, and the case where the extra
+    # is broken is exactly when a user cannot afford to be stranded.
+    try:
+        if _wiring_present(switcher) and clear_wiring(
+            switcher, timeout=_LAUNCH_LOCK_BUDGET_S
+        ):
+            return True, (
+                "Removed a cloud pin wiring whose proxy was gone — "
+                "sessions fall back to the proxy they had before the pin"
+            )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Could not heal the cloud pin ({_safe(exc)})"
+    return False, "Nothing to heal"
+
+
+def run(switcher, account: str | None, clear: bool = False, heal_only: bool = False) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
     from claude_swap.printer import accent, dimmed, warning
+
+    if heal_only:
+        # Deliberately BEFORE _impl(): healing must work when the package is
+        # missing or broken, because removing a stale wiring is the half that
+        # matters most then. Exit 0 either way — the status line calls this on
+        # a timer and a non-zero exit for "nothing was wrong" is noise.
+        changed, msg = heal(switcher)
+        print(msg if changed else dimmed(msg))
+        return 0
 
     if clear:
         # Works WITHOUT the package on purpose: ``--clear`` is what a user
