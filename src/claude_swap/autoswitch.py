@@ -981,11 +981,33 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        # No re-check here: `_collect_scheduled_usage` opens with its own
-        # gate (below, before its first fetch) and nothing between here and
-        # there emits or mutates — a probe landing a stop mid-emit right
-        # above reaches that gate exactly the same way. Confirmed redundant:
-        # deleting this one left `engine-stopped` reported unchanged.
+        # RE-CHECK BEFORE THE COLLECTION, and it is not redundant with the gate
+        # inside `_collect_scheduled_usage`. That one sits at the first NETWORK
+        # fetch; the method's first statement, above it, is
+        # `usage_entries_by_account(fetch=set())` — no network, but NOT no
+        # write. It reaches `switcher._collect_usage_entries` ->
+        # `usage_store.clear_dead_token`, which nulls `claimId` and calls
+        # `_mutate` -> `_write_rows`.
+        #
+        # Nulling `claimId` is the harm, not the write itself: `record()` fences
+        # on that field (`row.get("claimId") != expected -> continue`), so a
+        # stopped predecessor DISCARDS a successor's in-flight fetch.
+        #
+        # This gate was deleted once as "redundant", on a census that asked
+        # whether anything between here and there EMITS or FETCHES. Measured
+        # with the gate absent, stop landing in the unquarantine emit (exempt
+        # from `stop()`'s wait by design, so the tick runs on):
+        #
+        #     usage_entries_by_account calls  [set()]      restored: []
+        #     _write_rows calls               1            restored: 0
+        #     usage.json MUTATED AFTER STOP   True         restored: False
+        #
+        # `tick_with_usage` PATCHES OUT `usage_entries_by_account`, so any test
+        # written through that helper spies on a mock and cannot see this. The
+        # repro drives `engine.tick()` directly with a pass-through spy.
+        if self._stop.is_set():
+            raise _EngineStopped()
+
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
