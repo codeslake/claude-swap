@@ -10849,6 +10849,53 @@ class TestActiveSlotStrikeParity:
             s._fetch_active_usage("2", "b@example.com", fresh)
         resync.assert_not_called()
 
+    def test_active_strike_survives_unreadable_backup_not_absent(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """An UNREADABLE backup (locked/denied macOS Keychain) must not heal
+        an active slot's dead-token strike the way a genuinely ABSENT backup
+        does. `_read_account_credentials` collapses both to `""`;
+        `_entry_token_dead` must ask `_read_account_credentials_ex`, which
+        distinguishes them, and fail closed on `unreadable`. Nothing about
+        the backup itself changes between the control and the probe below —
+        only whether the read succeeds."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead_backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-dead",
+                              "refreshToken": "rt-dead", "expiresAt": 1000}})
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live", "expiresAt": 2000}})
+        s._write_account_credentials("2", "b@example.com", dead_backup)
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(dead_backup))},
+            identities,
+        )
+        entry = s._usage_store.entries(identities, [])["2"]
+
+        # CONTROL: the backup is readable and still stores the struck
+        # generation -- the strike must hold.
+        assert s._entry_token_dead(entry, "2", "b@example.com", live, True), (
+            "control: a readable, still-struck backup must read dead"
+        )
+
+        # PROBE: the identical backup, but the Keychain now raises
+        # (locked/denied/timeout) instead of answering. Nothing about the
+        # backup changed -- only whether the read succeeded.
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        assert s._entry_token_dead(entry, "2", "b@example.com", live, True), (
+            "an UNREADABLE backup must not heal the strike -- unreadable is "
+            "not evidence the dead generation was replaced"
+        )
+
 
 class TestUltraReviewCoverageGaps:
     """Ultra-review test-coverage findings: demotion re-read branch,

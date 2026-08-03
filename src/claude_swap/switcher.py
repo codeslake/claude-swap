@@ -4225,12 +4225,24 @@ class ClaudeAccountSwitcher:
         every pass whenever the two lineages differ — the strike/heal/re-POST
         loop that keeps a dead backup out of quarantine forever. The strike
         holds while ANY stored source still matches the struck generation.
+
+        The backup read must distinguish ABSENT from UNREADABLE (macOS
+        Keychain locked/denied/timeout): ``_read_account_credentials``
+        collapses both to ``""``, which would read an unreadable backup as
+        healed — reopening the exact strike/heal/re-POST loop this method
+        exists to close, just retriggered by a locked Keychain instead of a
+        rotated credential. ``entry.token_dead()`` with no ``stored_fp``
+        answers "is this row struck at all" on the raw count alone (skips
+        the fingerprint compare), so an unstruck row is never affected by an
+        unreadable read — only a struck one fails closed.
         """
         if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
             return True
         if not is_active:
             return False
-        backup = self._read_account_credentials(num, email)
+        backup, unreadable = self._read_account_credentials_ex(num, email)
+        if unreadable:
+            return entry.token_dead()
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )
