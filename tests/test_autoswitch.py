@@ -4046,7 +4046,7 @@ def test_repro_usage_json_written_after_stop(harness: EngineHarness):
 
     print(f"\nA outcome={r['outcome']} events={r['events']}")
     print(f"A usage_entries_by_account calls = {r['fetch_calls']}   "
-          f"(gate absent -> [set()], the :1552 pre-read; restored -> [])")
+          f"(gate absent -> [set()], the :1574 pre-read; restored -> [])")
     print(f"A _write_rows calls = {r['store_writes']}   network fetches = {r['network']}")
     print(f"A before: strikes={b['authDeadStrikes']} fp={b['struckFingerprint']!r} "
           f"failures={b['consecutiveFailures']} backoffUntil={b['backoffUntil']}")
@@ -4056,8 +4056,8 @@ def test_repro_usage_json_written_after_stop(harness: EngineHarness):
 
     assert r["before"] == r["after"], (
         "a stopped engine wrote usage.json -- clear_dead_token ran below the "
-        "deleted gate, reached via the pre-read at autoswitch.py:1552 which "
-        "sits ABOVE _collect_scheduled_usage's own gate at :1606"
+        "deleted gate, reached via the pre-read at autoswitch.py:1574 which "
+        "sits ABOVE _collect_scheduled_usage's own gate at :1628"
     )
 
 
@@ -4108,7 +4108,7 @@ class TestStoppedEngineDoesNotAct:
 
             outcome=SWITCHED exit_code=0 active=1 events=['PollEvent']
 
-        `cli.py:702` is `sys.exit(engine.tick().value)`, so a cron wrapper
+        `cli.py:703` is `sys.exit(engine.tick().value)`, so a cron wrapper
         keying on exit 0 records a successful switch that did not occur, the
         one-time grant is already spent, and the successor inherits a burned
         generation. The SwitchEvent that would have said `dryRun: true` never
@@ -4150,11 +4150,59 @@ class TestStoppedEngineDoesNotAct:
             "abandoned itself with no reason line"
         )
 
+    def test_stop_between_freshen_and_perform_reports_no_switch(self, harness):
+        """Gate :1702, `_perform`'s own entry re-check, is not
+        mutation-covered by anything else in the suite -- deleting it alone
+        still leaves every other test passing (measured: full suite green
+        with it disabled).
+
+        `test_a_stop_in_the_refresh_post_does_not_report_a_switch` (above)
+        lands its `stop()` INSIDE `_freshen_target`, which the freshen
+        loop's OWN gate at :1336 catches immediately on the way back out --
+        `_perform` is never even reached, so :1702 does nothing there.
+
+        This lands `stop()` strictly AFTER `_freshen_target` returns "ok"
+        and the loop's :1336 re-check has already passed -- in the one-
+        statement gap between `return self._perform(...)` being called and
+        `_perform`'s own first line running. `stop()` flips BOTH `_stop`
+        and (moments later, under its own lock) `dry_run = True`; without
+        :1702 as the FIRST statement in `_perform`, execution falls straight
+        to `if self.dry_run:`, now True, and reports a fake dry-run SWITCHED
+        for a switch that never ran on this now-dead engine.
+        """
+        harness.seed(2, "b@example.com")
+        engine = harness.engine
+        assert not engine.dry_run, "premise: this engine is LIVE"
+
+        real_perform = engine._perform
+
+        def perform_after_stop(number, email, trigger):
+            engine.stop()  # lands in the gap before _perform's own gate
+            return real_perform(number, email, trigger)
+
+        engine._perform = perform_after_stop
+        harness.events.clear()
+        outcome = harness.tick_with_usage({"1": _usage(99), "2": _usage(5)})
+
+        assert harness.active_number() == 1, "premise: nothing switched"
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"exit {outcome.value} = SWITCHED while the active account is "
+            f"still {harness.active_number()} — a cron wrapper records a "
+            "switch that did not happen"
+        )
+        assert any(
+            getattr(e, "reason", None) == "engine-stopped"
+            for e in harness.events
+        ), (
+            f"events {[type(e).__name__ for e in harness.events]} — the tick "
+            "abandoned itself with no reason line"
+        )
+
     def test_the_last_candidates_stop_is_diagnosed_as_a_stop(self, harness):
-        """C-1: the loop-top gate (:1288) only re-fires on the NEXT
+        """C-1: the loop-top gate (:1304) only re-fires on the NEXT
         iteration. With exactly ONE candidate there is no next iteration —
         the loop falls out the bottom into the diagnosis block at
-        :1342-1361, which has no gate of its own.
+        :1371-1391, which has no gate of its own.
 
         Measured before the fix, one candidate, stop landing inside
         `_freshen_target` with status "transient":
@@ -4223,15 +4271,69 @@ class TestStoppedEngineDoesNotAct:
             "account on behalf of a successor that already owns LIVE"
         )
 
+    def test_stop_between_candidates_freshens_no_further_candidate(
+        self, harness
+    ):
+        """Gate :1304 (the loop-top gate, BETWEEN candidates) is not
+        mutation-covered by anything else in the suite -- deleting it alone
+        still leaves every other test passing. Every existing stop test in
+        this loop lands the stop INSIDE `_freshen_target` for the LAST
+        candidate (C-1's shape), which the OTHER gate at :1336 catches
+        immediately -- :1304 never even gets exercised.
+
+        `engine._stop.set()` directly, NOT `engine.stop()`: `stop()` sets
+        `_stop` first and only THEN flips `dry_run = True` under its own
+        lock, a two-statement window a concurrent reader can observe between
+        them. Calling `stop()` here collapses that window in-process --
+        `dry_run` flips too, and the loop's OWN `if self.dry_run:` check
+        (right after this gate) would mask a deleted :1304, freshening
+        nothing regardless of the gate. `_stop.set()` alone reproduces
+        exactly the window :1304 exists to close: `_stop` observed True,
+        `dry_run` still False.
+
+        Three candidates, most headroom first ("3" then "2"): "3"'s freshen
+        fails with `invalid_grant`, quarantines (stop lands here), then
+        `continue`s to the loop top for "2". With the gate present,
+        `_freshen_target` is called once, for "3" only. Deleted, the loop
+        proceeds to freshen "2" too -- a network POST for a successor that
+        already owns LIVE.
+        """
+        harness.seed(4, "d@example.com")
+        engine = harness.engine
+        calls: list[str] = []
+        real_quarantine = engine._quarantine
+
+        def freshen(number, email):
+            calls.append(number)
+            return "invalid_grant" if number == "3" else "ok"
+
+        def quarantine_then_stop(number, email, reason):
+            real_quarantine(number, email, reason)
+            engine._stop.set()  # lands right before the loop's `continue`
+
+        engine._freshen_target = freshen
+        engine._quarantine = quarantine_then_stop
+        harness.events.clear()
+        assert not engine.dry_run, "premise: this engine is LIVE"
+        harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(50), "3": _usage(10), "4": _usage(80),
+        })
+
+        assert calls == ["3"], (
+            f"_freshen_target calls={calls} -- a stopped engine freshened a "
+            "candidate past the one that triggered the stop, for a "
+            "successor that already owns LIVE"
+        )
+
     def test_a_stop_before_the_collection_writes_no_usage_store_row(
         self, harness
     ):
-        """The deleted gate at :992 was NOT redundant, and the census that
-        called it redundant asked the wrong question.
+        """The deleted gate, restored at :1008, was NOT redundant, and the
+        census that called it redundant asked the wrong question.
 
         The reasoning was "nothing between here and `_collect_scheduled_usage`'s
-        own gate emits or mutates". That gate is at :1606, but the method's
-        FIRST statement is at :1552 --
+        own gate emits or mutates". That gate is at :1628, but the method's
+        FIRST statement is at :1574 --
 
             pre = self.switcher.usage_entries_by_account(fetch=set())
 
@@ -4251,11 +4353,19 @@ class TestStoppedEngineDoesNotAct:
         deleted gate used to catch it.
         """
         engine = harness.engine
-        # Spy on the WRITE, not on clear_dead_token: reaching that particular
-        # mutator needs `auth_dead_strikes and token_dead()`, which this
-        # harness never sets, so a spy on it is vacuous -- it reports zero
-        # calls whether or not the gate exists. `_write_rows` is the point
-        # every usage-store mutation funnels through, so it catches the class.
+        # A REAL strike, not `tick_with_usage`'s canned entries: reaching
+        # `clear_dead_token` needs `auth_dead_strikes and token_dead()`,
+        # which the plain harness never sets, so a spy on `_write_rows` was
+        # vacuous when the fetch that reaches it was stubbed out too --
+        # zero calls whether or not the gate exists. `tick_with_usage`
+        # PATCHES OUT `usage_entries_by_account` (returns canned entries
+        # directly), so it never reaches `switcher._collect_usage_entries`
+        # at all; this drives `engine.tick()` with a PASS-THROUGH spy
+        # instead, the same shape the real repro
+        # (`test_repro_usage_json_written_after_stop`, above) uses.
+        _seed_healed_strike(harness, "2", "b@example.com")
+        _seed_stale_quarantine(harness, "3", "c@example.com")
+
         writes: list[str] = []
         store = engine.switcher._usage_store
         real_write = store._write_rows
@@ -4275,7 +4385,8 @@ class TestStoppedEngineDoesNotAct:
 
         engine._release_recovered_quarantines = release_then_stop
         harness.events.clear()
-        harness.tick_with_usage({"1": _usage(95), "2": _usage(5)})
+        with patch.object(harness.switcher, "_run_usage_fetches", return_value={}):
+            engine.tick()
 
         assert writes == [], (
             f"a stopped engine ran {writes} -- a usage-store write for a "
@@ -4286,7 +4397,7 @@ class TestStoppedEngineDoesNotAct:
     def test_stop_inside_phase1_fetch_blocks_the_escalation_refetch(
         self, harness
     ):
-        """Gate :1647 (escalation refetch) is not mutation-covered by
+        """Gate :1676 (escalation refetch) is not mutation-covered by
         anything else in the suite — deleting it alone still leaves every
         other test passing.
 
@@ -4332,10 +4443,10 @@ class TestStoppedEngineDoesNotAct:
     def test_stop_inside_phase1_fetch_blocks_the_consume_first_recheck(
         self, harness
     ):
-        """Gate :1180 (consume-first two-phase-commit refetch) is not
+        """Gate :1196 (consume-first two-phase-commit refetch) is not
         mutation-covered by anything else in the suite either — deleting it
         alone still leaves every other test passing. The sibling test above
-        pins :1647; this pins the OTHER unmutated gate the same measurement
+        pins :1676; this pins the OTHER unmutated gate the same measurement
         names.
 
         `test_the_freshen_loop_names_the_stop_not_a_stale_fetch` pins the
@@ -4345,7 +4456,7 @@ class TestStoppedEngineDoesNotAct:
 
         A stop landing inside `_collect_scheduled_usage`'s OWN phase-1
         fetch is far below the escalation band here (so that collection
-        returns normally without ever reaching :1647), and surfaces only
+        returns normally without ever reaching :1676), and surfaces only
         when the two-phase commit re-checks before spending its own
         refetch. Measured (active well below threshold, one sooner-resetting
         candidate):
@@ -4505,6 +4616,72 @@ class TestStoppedEngineDoesNotAct:
         sw.assert_not_called()
         assert outcome is TickOutcome.NO_ACTION
         assert harness.active_number() == 1
+
+    def test_next_delay_after_a_mid_tick_stop_writes_no_usage_store_row(
+        self, harness
+    ):
+        """A third `fetch=set()` door, outside `tick()` entirely.
+
+        `run_loop` calls `_next_delay(outcome)` AFTER `tick()` returns, and
+        `_next_delay` -> `_respect_poll_plan` makes its OWN
+        `usage_entries_by_account(fetch=set())` call at :2089 -- none of
+        `tick()`'s nine `_stop` checkpoints (including the :1008 gate this
+        defect family already fixed once) sit anywhere near it, because it
+        is not inside `tick()` at all.
+
+        The stop must land MID-TICK, in the `account-unquarantined` emit
+        (exempt from `stop()`'s wait by design), not after a completed tick:
+        a completed tick already healed the strike, and `_next_delay` would
+        find nothing left to do -- proving nothing about this call site.
+        `tick()` then raises `_EngineStopped` and returns NO_ACTION with the
+        strike still present, exactly as `run_loop` drives it.
+
+        Driven with a PASS-THROUGH spy on `usage_entries_by_account`, not a
+        stub: `tick_with_usage` patches that method out entirely, which is
+        why the sibling test at :1008 could not see this class of defect
+        either (Minor-1 in the same review).
+        """
+        _seed_healed_strike(harness, "2", "b@example.com")
+        _seed_stale_quarantine(harness, "3", "c@example.com")
+        path = harness.switcher._usage_store.path
+        before = json.loads(path.read_text())
+
+        engine = harness.engine
+        assert not engine.dry_run, "premise: this engine is LIVE"
+
+        writes: list[str] = []
+        store = engine.switcher._usage_store
+        real_write = store._write_rows
+
+        def spy_write(rows):
+            writes.append("_write_rows")
+            return real_write(rows)
+
+        store._write_rows = spy_write
+
+        def on_event(ev) -> None:
+            if ev.kind == "account-unquarantined":
+                engine._stop.set()  # SIGTERM lands mid-tick, same site the
+                                     # in-tree repro for :1008 uses
+
+        engine.on_event = on_event
+        with patch.object(
+            harness.switcher, "_run_usage_fetches", return_value={}
+        ):
+            outcome = engine.tick()
+            # run_loop's own next step -- outside every `tick()` checkpoint.
+            engine._next_delay(outcome)
+
+        after = json.loads(path.read_text())
+        b, a = before["accounts"]["2"], after["accounts"].get("2", {})
+        assert writes == [], (
+            f"a stopped engine's _next_delay -> _respect_poll_plan wrote "
+            f"{writes} to usage.json -- clear_dead_token nulls claimId, the "
+            f"field record() fences on, for a successor that already owns "
+            f"LIVE. strikes {b.get('authDeadStrikes')} -> "
+            f"{a.get('authDeadStrikes')}, claimId {b.get('claimId')!r} -> "
+            f"{a.get('claimId')!r}"
+        )
 
 class TestFreshenRoutesThroughGate:
     """M2: autoswitch's freshen no longer POSTs a raw snapshot — it routes
