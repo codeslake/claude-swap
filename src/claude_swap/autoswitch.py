@@ -1114,9 +1114,15 @@ class AutoSwitchEngine:
                 kw["active_headroom"],
                 kw["settings"],
                 kw["now"],
+                kw["current"],
             )
             no_return = self._no_return_account(
-                trigger, state, kw["headroom"], kw["active_headroom"], recovered
+                trigger,
+                state,
+                kw["headroom"],
+                kw["active_headroom"],
+                recovered,
+                kw["settings"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1321,6 +1327,7 @@ class AutoSwitchEngine:
         headroom: dict[str, float | None],
         active_headroom: float | None,
         recovered: bool,
+        settings: AutoSwitchSettings | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1390,12 +1397,19 @@ class AutoSwitchEngine:
         if not recovered:
             return barred        # the ratio below burns true on its own; see above
         left_headroom = headroom.get(barred)
-        if (
-            left_headroom is not None
-            and active_headroom is not None
-            and left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO
-        ):
-            return None                      # beats us outright; not a flip
+        if left_headroom is not None:
+            if active_headroom is not None:
+                if left_headroom >= active_headroom * HORIZON_HEADROOM_RATIO:
+                    return None               # beats us outright; not a flip
+            elif (
+                settings is not None
+                and left_headroom > 100.0 - settings.threshold
+            ):
+                # F6 (round-6 review): an unreadable active must not be
+                # silently scored as "the peer does not beat it" -- same
+                # landing-eligible fallback `_left_account_recovered` uses
+                # when it, too, has no active to compare against.
+                return None
         return barred
 
     def _left_account_recovered(
@@ -1406,6 +1420,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
+        current: str | None = None,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -1430,26 +1445,36 @@ class AutoSwitchEngine:
         past the boundary this branch's own sibling test already sits on).
         A `(None, None)` snapshot means severity was genuinely unmeasured at
         departure — there is no `leftHeadroom` to diff against and never was
-        — so the only signal left that does not depend on the active's LIVE
-        state is whether the peer, right now, would itself be a healthy place
+        — so the two signals that do not depend on the active's LIVE state
+        are (1) whether the peer, right now, would itself be a healthy place
         to land: `h > 100 - settings.threshold`, the same "would the ranking
         accept this as a landing spot" test `_rank_candidates` already runs
         (`:1617`) on every candidate, reused rather than inventing a fresh
-        constant. It cannot tell "genuinely recovered" from "was already this
-        good" — there is nothing recorded to tell them apart — so R-A and R-B
-        collapse onto the same answer here. Measured which side that answer
-        should land on: MREL-sweeping this same leg for the ordinary path
-        (round 5 review, F3) showed an absolute floor is silently
-        reintroducible with a green suite, so this is not free of that risk
-        either — the difference is this constant is `settings.threshold`, not
-        a hardcoded number, so a user's OWN policy decides how conservative
+        constant; and (2), when the landing floor cannot answer, whether the
+        peer's own binding reset is meaningfully sooner than the active's
+        (C1, round-6 review). The landing floor is the exact complement of
+        `_every_account_above_threshold`, so it is UNSATISFIABLE whenever the
+        fleet is all-spent — the recovery leg is what keeps the hold from
+        becoming unconditional in exactly that regime. Neither leg can tell
+        "genuinely recovered" from "was already this good" — there is
+        nothing recorded to tell them apart — so R-A and R-B collapse onto
+        the same answer here. Measured which side the landing floor should
+        land on: MREL-sweeping this same leg for the ordinary path (round 5
+        review, F3) showed an absolute floor is silently reintroducible with
+        a green suite, so this is not free of that risk either — the
+        difference is this constant is `settings.threshold`, not a
+        hardcoded number, so a user's OWN policy decides how conservative
         the hold is, and it moves when they change it (pinned directly,
         below). Deliberately MORE conservative than the ordinary path below:
         a peer sitting at 4 points held through the whole walk that broke
         round 5's dominance leg, with no upper bound short of the peer
-        crossing the threshold itself. Bounded, not permanent — at-limit
-        still escapes untouched (`_no_return_account` scopes this trigger
-        out entirely), so the worst case is one bounded hold, not a lockout.
+        crossing the threshold itself OR its binding reset pulling
+        meaningfully ahead of the active's. Bounded, not permanent —
+        at-limit still escapes untouched (`_no_return_account` scopes this
+        trigger out entirely), and the recovery leg means the bound is no
+        longer just "the active reaches its own hard limit" (round-6
+        review, C1/M4): a peer that resets first releases the hold on its
+        own schedule, without the active ever needing to burn down to it.
 
         THE ORDINARY PATH HAS A REAL BASELINE (`leftHeadroom` is a number,
         not null), so it gets three legs, checked in this order, each with
@@ -1496,6 +1521,11 @@ class AutoSwitchEngine:
         """
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
+            # M2 (round-6 review): this return value is unreachable through
+            # `_no_return_account`, the only caller -- it returns `None` at
+            # its own `came_from is None` check before `recovered` is ever
+            # read. Kept `True` (not load-bearing) so a future direct caller
+            # gets "no evidence, release" rather than a silent hold.
             return True
         barred = str(came_from)
         if "leftHeadroom" not in state:
@@ -1507,21 +1537,56 @@ class AutoSwitchEngine:
             # Failover: real departure, severity unmeasured at the time --
             # not absence of evidence, and there is no baseline to diff
             # against (that is exactly what "unmeasured" means), so this
-            # cannot use the active at all -- see docstring for why that is
-            # what round 5 got wrong and the walk that proved it.
-            return h is not None and h > 100.0 - settings.threshold
+            # cannot use the active's HEADROOM at all -- see docstring for
+            # why that is what round 5 got wrong and the walk that proved
+            # it. Two legs, both read-only against CURRENT state (no
+            # departure baseline exists to diff against):
+            #
+            #   landing   `h > 100 - settings.threshold` -- would the
+            #             ranking accept this peer as a landing spot right
+            #             now (`_rank_candidates`, :1636)?
+            #   recovery  the peer's binding reset is meaningfully sooner
+            #             than the ACTIVE's binding reset -- the same axis
+            #             `_recovery_is_useful` switches to once headroom
+            #             stops being informative. Needed because `landing`
+            #             is the exact complement of `_every_account_above_
+            #             threshold` (C1, round-6 review): whenever the
+            #             fleet is all-spent, `landing` is unsatisfiable by
+            #             construction, no matter how soon the peer's own
+            #             window resets, and that regime is precisely where
+            #             the recovery axis is the one the engine trusts.
+            #
+            # Burn cannot fake the recovery leg: a reset moves nearer only
+            # when a nearer window starts binding, never as a side effect
+            # of the active spending down (round 5's failure mode, guarded
+            # against directly by `MF-round5` in the mutation table).
+            if h is not None and h > 100.0 - settings.threshold:
+                return True
+            peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
+            active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
+            return peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
         # Dominance over the ACTIVE, only reached once a real baseline is
         # confirmed to exist above -- a peer that was already miles ahead of
         # the active at departure (moved for a DIFFERENT reason -- e.g.
         # consume-first's reset ordering, not headroom) never "improves" on
         # its own baseline and would stall on self-improvement alone despite
         # dominating throughout.
-        if (
-            h is not None
-            and active_headroom is not None
-            and h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT
-        ):
-            return True
+        #
+        # `active_headroom is None` (F6, round-6 review) means "we could not
+        # read the active this tick" -- reachable through the consume-first
+        # two-phase commit, which reassigns `active_headroom` from a fresh
+        # refetch without re-classifying the trigger. That is a DIFFERENT
+        # state from "readable, but does not dominate" and must not answer
+        # the same way: fall back to the landing-eligible test the failover
+        # branch above uses when IT has no baseline to compare against
+        # either, rather than silently treating "unreadable" as "no
+        # dominance".
+        if h is not None:
+            if active_headroom is not None:
+                if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
+                    return True
+            elif h > 100.0 - settings.threshold:
+                return True
         if (
             isinstance(left_headroom, (int, float))
             and h is not None
