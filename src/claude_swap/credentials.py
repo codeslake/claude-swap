@@ -1025,11 +1025,17 @@ class CredentialStore:
         try:
             # Python 3.12's Path.exists() raises on an unsearchable directory
             # where 3.13+ returns False — normalize to "missing" so every
-            # version takes the same best-effort path. Failing closed on
-            # unreadable stores is the strict pre-commit clear's job, not the
-            # reader's.
+            # version takes the same best-effort path.
             enc_present = enc_file.exists()
         except OSError as e:
+            # The directory itself could not be searched (permissions, a
+            # mid-unmount, ...) — a real read failure, same as the arm below
+            # that fires once the file is known to exist. Not marking
+            # `failed` here makes an unsearchable dir byte-identical to a
+            # genuinely absent backup, which is exactly what C1 fixed for
+            # the file itself six lines below.
+            if failed is not None:
+                failed.append(True)
             self._host._logger.warning(f"Failed to read credentials file: {e}")
             enc_present = False
         if enc_present:
