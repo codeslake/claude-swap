@@ -412,12 +412,25 @@ class TestTheWiringCanAlwaysBeRemoved:
         The total must still be bounded (that budget is real, and the launch
         path depends on it), so the fix is a fair SHARE of what remains per
         path, not the whole remaining budget going to whichever path is
-        first."""
+        first.
+
+        RED ON WINDOWS CI (2a01e24), green on Linux 30/30: a 0.5s total
+        budget split two ways gave each path 0.25s — no larger than ONE
+        jittered retry sleep in `proper_lockfile` (``0.25 + random()*0.25``).
+        One sleep could consume the whole remaining budget, starving the free
+        second path. The budget is now sized against that constant rather
+        than tuned to one platform. NOT verified on Windows — no access.
+        """
         import time
 
         import claude_swap.paths as paths
         from claude_swap import pin
         from claude_swap.switcher import ClaudeAccountSwitcher
+
+        # Comfortably larger than proper_lockfile's own retry-sleep floor
+        # (0.25s-0.5s jittered) so a fair per-path SHARE of it cannot be
+        # swallowed by one retry cycle's syscall overhead, on any runner.
+        BUDGET_S = 3.0
 
         session = self._wired(tmp_path / "session")
         default = self._wired(tmp_path / "home")
@@ -430,12 +443,19 @@ class TestTheWiringCanAlwaysBeRemoved:
         held.mkdir()
         try:
             start = time.monotonic()
-            changed = pin.clear_wiring(ClaudeAccountSwitcher(), timeout=0.5)
+            changed = pin.clear_wiring(ClaudeAccountSwitcher(), timeout=BUDGET_S)
             elapsed = time.monotonic() - start
         finally:
             held.rmdir()
 
-        assert elapsed < 2.0, f"blew well past the 0.5s budget: {elapsed:.2f}s"
+        # Loose: only guards against the total blowing way past its own
+        # budget (e.g. a regression back to a PER-path timeout). The
+        # starvation bug itself does not violate this — reinstating
+        # `share = left` still finishes within BUDGET_S, it just starves
+        # the second path while doing so, which the assertions below catch.
+        assert elapsed < BUDGET_S * 2, (
+            f"blew well past the {BUDGET_S}s budget: {elapsed:.2f}s"
+        )
         assert changed is True, (
             "the free default profile was starved by the contended session "
             "lock — clear_wiring reported nothing removed"
@@ -3975,3 +3995,39 @@ class TestTheSiblingGettersGuardTheirPathGettersToo:
         # Must not raise: a config this call cannot even locate is "nothing
         # to remove there", not a crash.
         assert pin.clear_wiring(sw, timeout=0.1) is False
+
+    def test_an_unresolvable_path_is_logged_not_silently_dropped(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A getter that raises is "no opinion" about ONE config — correct —
+        but `clear_wiring`'s collector swallowed that exception with a bare
+        ``except Exception: continue`` and no record of it anywhere. That
+        makes "could not even be LOCATED" and "located, nothing wired" the
+        same silence from outside — and `clear_wiring`'s bool is a claim
+        about every path it REACHED, not that every path was reachable.
+        Skipping is correct; the missing record is the bug.
+        """
+        import logging
+
+        from claude_swap import pin
+
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        self._no_home(monkeypatch)
+
+        import types
+
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            pin.clear_wiring(sw, timeout=0.1)
+
+        assert any(
+            "get_default_global_config_path" in r.getMessage()
+            for r in caplog.records
+        ), (
+            "an unresolvable path getter was swallowed with no record — "
+            "indistinguishable from a config that resolved and had nothing "
+            f"wired. Records: {[r.getMessage() for r in caplog.records]}"
+        )

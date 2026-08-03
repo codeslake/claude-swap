@@ -23,9 +23,12 @@ dependency is imported lazily inside the entry points, exactly as
 from __future__ import annotations
 
 import json
+import logging
 from types import ModuleType
 
 from claude_swap.exceptions import ClaudeSwitchError, ConfigError
+
+_logger = logging.getLogger("claude-swap")
 
 def _install_how() -> str:
     """The install COMMAND for this install method, on its own.
@@ -334,11 +337,20 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # which raises `RuntimeError` with no HOME and no `/etc/passwd` entry. A
     # config this call cannot even locate has nothing to clear there — that
     # is a fact about ONE config, not a reason to abandon the other.
+    #
+    # LOGGED, not just skipped: a config that could not be RESOLVED and one
+    # that resolved with nothing wired both leave this loop silently short a
+    # path, and `clear_wiring`'s bool is a claim about every path it reached
+    # — not a claim that every path was reachable. Without a record, "the
+    # default profile was never attempted because HOME could not be found"
+    # and "the default profile was attempted and had nothing wired" are the
+    # same silence from the outside.
     paths = []
     for get in (get_global_config_path, get_default_global_config_path):
         try:
             path = get()
-        except Exception:  # noqa: BLE001 — unresolvable: no opinion
+        except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
+            _logger.warning("%s could not be resolved: %s", get.__name__, exc)
             continue
         if path not in paths:
             paths.append(path)
