@@ -136,7 +136,14 @@ def _is_write_open(mode: str | None, flags: int) -> bool:
     """
     if mode is not None:
         return any(c in mode for c in ("w", "a", "x", "+"))
-    if (flags & os.O_ACCMODE) != os.O_RDONLY:
+    # `os.O_ACCMODE` is POSIX-only — it does not exist on Windows, where this
+    # raised AttributeError from inside the hook and took pytest down at
+    # collection with an INTERNALERROR (measured: CI test-windows on a5c4b61,
+    # while the same tree was 1845-green on Linux). Derive the mask from
+    # O_WRONLY|O_RDWR, both of which every platform defines, instead of
+    # importing a constant only some platforms have.
+    _accmode = os.O_WRONLY | os.O_RDWR
+    if (flags & _accmode) != os.O_RDONLY:
         return True
     return bool(flags & (os.O_CREAT | os.O_TRUNC | os.O_APPEND))
 
