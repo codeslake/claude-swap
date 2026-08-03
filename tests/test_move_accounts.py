@@ -179,10 +179,16 @@ class TestMoveAccount:
     def test_move_strict_clear_fails_closed_on_unreadable_dir(
         self, temp_home: Path, sample_sequence_data: dict
     ):
-        """`Path.exists()` returns False on an inaccessible directory,
-        conflating "missing" with "couldn't inspect" — the required clear
-        must unlink unconditionally and let the permission error abort the
-        move, not skip the delete and commit over a hidden stale key."""
+        """`Path.exists()` raises on an inaccessible directory. A whole-dir
+        permission fault makes every read through it fail, including the
+        SOURCE account's own backup read at the top of `_relocate_locked` —
+        `_read_backup_or_abort` now catches that first and aborts before any
+        deletion is attempted (a C2 fix: the ``.exists()`` OSError arm used
+        to swallow into "absent" without marking the read failed, so this
+        exact scenario used to fall through and only abort later, by luck,
+        when the target's strict clear also hit the same unreadable dir —
+        a gap through which the source's own live refresh token could have
+        been silently treated as absent and dropped)."""
         if sys.platform == "win32" or os.geteuid() == 0:
             pytest.skip("needs POSIX permission semantics (non-root)")
         switcher = ClaudeAccountSwitcher()
@@ -193,7 +199,7 @@ class TestMoveAccount:
 
         switcher.credentials_dir.chmod(0o000)
         try:
-            with pytest.raises(CredentialError, match="aborting before commit"):
+            with pytest.raises(ConfigError, match="could not be read"):
                 switcher.move_account("2", "5")
         finally:
             switcher.credentials_dir.chmod(0o700)

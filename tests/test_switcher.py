@@ -8628,6 +8628,53 @@ class TestEncPermissionDeniedIsUnreadable:
         )
 
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_unsearchable_credentials_dir_is_not_absent(self, temp_home: Path):
+        """C2: the third instance, six lines above C1's fix. The
+        ``enc_file.exists()`` probe's own ``OSError`` arm (an unsearchable
+        ``credentials/`` dir — permissions, an NFS/SMB blip, a mid-unmount)
+        swallowed into ``enc_present = False`` without ever touching
+        ``failed``, so it produced the byte-identical ``("", False)`` C1 just
+        fixed for the file itself.
+        """
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        num, email = "3", "c@example.com"
+        s._write_account_credentials(num, email, '{"access_token":"live"}')
+        cred_dir = s._store._host.credentials_dir
+
+        # CONTROL A: readable -> value, not unreadable (instrument says YES)
+        v_a, unread_a = s._store._read_account_credentials_ex(num, email)
+        assert v_a and unread_a is False, f"control A broken: {(bool(v_a), unread_a)}"
+
+        # CONTROL B (C1's fixed arm): .enc unreadable -> unread=True, proves
+        # the instrument CAN say unreadable.
+        enc = s._backup_enc_path(num, email)
+        enc.chmod(0o000)
+        try:
+            v_b, unread_b = s._store._read_account_credentials_ex(num, email)
+        finally:
+            enc.chmod(0o600)
+        assert unread_b is True, f"control B broken: {(v_b, unread_b)}"
+
+        # THE PROBE: the dir itself is unsearchable.
+        cred_dir.chmod(0o000)
+        try:
+            v_c, unread_c = s._store._read_account_credentials_ex(num, email)
+        finally:
+            cred_dir.chmod(0o700)
+
+        assert unread_c is True, (
+            f"({v_c!r}, {unread_c}) is byte-identical to a genuinely ABSENT "
+            "backup — an unsearchable credentials/ dir must not be condemned "
+            "as 'there is no backup'"
+        )
+
+
 class TestBackupUnreadableDisplay:
     """M1: an idle slot whose backup is keychain-unreadable shows
     'keychain unavailable', never 'no credentials' (which nudges re-add)."""
