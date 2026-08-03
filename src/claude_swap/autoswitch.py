@@ -1439,8 +1439,10 @@ class AutoSwitchEngine:
         the key is PRESENT with unknown values, which is real evidence that
         the departure's severity could not be measured, not an absence of
         evidence. The conservative default for unknown severity is to HOLD the
-        bar, not release it - the recovery leg or the ratio release in
-        `_no_return_account` can still lift it once real evidence shows up.
+        bar - but only on the proactive/consume-first return this predicate
+        gates. `_no_return_account` scopes at-limit and failover out of the
+        bar by design, so either trigger still escapes the account untouched,
+        and the next successful switch overwrites the snapshot outright.
         """
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
