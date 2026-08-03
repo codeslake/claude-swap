@@ -56,19 +56,6 @@ def _install_hint() -> str:
     return f"The cloud pin requires 'cswap-pin'. Install with: {_install_how()}"
 
 
-# The FLOOR is a correctness bound, not packaging hygiene. 0.1.0 is the release
-# that hands a REFUSED swap to the client instead of retrying it unswapped, and
-# Claude Code treats 401/403/404 as terminal (SSETransport sets state="closed"
-# and never reconnects), so one misrouted request ends that session's Remote
-# Control for the life of the process.
-#
-# pyproject's `pin = ["cswap-pin>=0.1.1"]` binds a FRESH resolve only. Anyone
-# who installed cswap-pin before 0.1.1 and later upgrades claude-swap WITHOUT
-# the extra keeps 0.1.0 — and nothing here noticed, because the seam only ever
-# asked "does it import".
-_MIN_PIN_VERSION = (0, 1, 1)
-
-
 def _impl() -> ModuleType:
     """The pin implementation, or a clean error naming the fix.
 
@@ -115,31 +102,22 @@ def _impl() -> ModuleType:
         found = False
     if not found:
         raise ClaudeSwitchError(_install_hint())
-    mod = importlib.import_module("cswap_pin.proxy")
-
-    # A RUNTIME floor, because pyproject's only binds a fresh resolve. Refusing
-    # is right rather than warning: below the floor a refused swap reaches the
-    # client and ends that session's Remote Control permanently, which is worse
-    # than not pinning at all. An unparseable or absent version is NOT treated
-    # as too old — that would break a dev checkout over a guess.
+    # NO RUNTIME VERSION FLOOR. The extra's floor lives in ONE place, the
+    # `pin = ["cswap-pin>=X"]` requirement, exactly as the menubar extra
+    # declares `rumps>=0.4.0` and then only asks whether the import works.
     #
-    # Read off the PACKAGE, not `proxy`: measured against the installed 0.1.1,
-    # cswap_pin.__version__ is "0.1.1" and cswap_pin.proxy.__version__ does not
-    # exist. Reading the wrong one makes this check dead code that passes for
-    # every version, which is the failure it exists to prevent.
-    raw = getattr(sys.modules.get("cswap_pin"), "__version__", "")
-    try:
-        got = tuple(int(p) for p in str(raw).split(".")[:3])
-    except ValueError:
-        got = ()
-    if got and got < _MIN_PIN_VERSION:
-        want = ".".join(str(p) for p in _MIN_PIN_VERSION)
-        raise ClaudeSwitchError(
-            f"cswap-pin {raw} is too old (need >= {want}): it hands a refused "
-            f"swap to the client, which ends that session's Remote Control. "
-            f"{_install_hint()}"
-        )
-    return mod
+    # A hardcoded tuple here was the alternative, and it does not survive
+    # contact with the release cycle: cswap-pin ships on its own schedule, so
+    # every release of it would need a matching pull request against THIS
+    # project just to raise a constant. A gate whose maintenance depends on
+    # someone else's release cadence is a gate that goes stale, and a stale
+    # floor is worse than none — it refuses a package the installer has just
+    # chosen, with a message blaming the user's version.
+    #
+    # Keeping a released version out is an INSTALL-time job (the requirement,
+    # and whatever provisioning runs it), not something the seam re-litigates
+    # on every call.
+    return importlib.import_module("cswap_pin.proxy")
 
 
 def _live_impl() -> ModuleType | None:
