@@ -2506,3 +2506,76 @@ class TestHealNeverTearsDownAServingPin:
         assert "could not be removed" in msg, msg
         # The wiring really did survive — the message is describing reality.
         assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+
+    def test_a_serving_but_OBSOLETE_daemon_still_reaches_the_recycle(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard protects against TEARDOWN, not against repair.
+
+        `heal` used to return on `serving` before `impl.heal()` ran at all,
+        which made a whole class of repair unreachable: a daemon SERVING its
+        wired port while running code we no longer ship is exactly the state an
+        upgrade leaves behind, and every status-line tick declined to touch it.
+
+        MEASURED across three machines after installing a new release: two had
+        daemons serving their own wired port, 24h old, running the previous
+        version, and `cswap pin --heal` answered "Nothing to heal" forever. The
+        third recycled only because its wiring named a DEAD port — the right
+        outcome for the wrong reason.
+
+        The package's `heal` is safe to call in the serving case by
+        construction: it returns False for "serving, wired, and current" and
+        recycles only when the fingerprint says the daemon predates the
+        installed code, rebinding the SAME port.
+        """
+        from claude_swap import pin
+
+        srv, port = self._serving()
+        try:
+            sw, cfg = self._wired_to(tmp_path, port)
+            self._paths(monkeypatch, cfg)
+            calls = []
+
+            class _Obsolete:
+                def heal(self, backup_dir):
+                    calls.append(backup_dir)
+                    return True  # the package recycled it onto the same port
+
+            monkeypatch.setattr(pin, "_live_impl", lambda: _Obsolete())
+            changed, msg = pin.heal(sw)
+            assert calls, (
+                "the package's recycle was never reached — a serving-but-stale "
+                "daemon can never be upgraded"
+            )
+            assert changed and msg == "Restored the cloud pin", msg
+            # And the wiring survives: a recycle rebinds, it does not unpin.
+            assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+        finally:
+            srv.close()
+
+    def test_a_serving_pin_survives_with_no_package_at_all(self, tmp_path, monkeypatch):
+        """Moving the restart ahead of the guard must not lose the guard.
+
+        With the extra absent nothing can restart OR recycle, and removing the
+        wiring would unpin a healthy session. That is the case where a user can
+        least afford a wrong answer, so it gets its own test rather than
+        riding on the branch above.
+        """
+        from claude_swap import pin
+
+        srv, port = self._serving()
+        try:
+            sw, cfg = self._wired_to(tmp_path, port)
+            self._paths(monkeypatch, cfg)
+            monkeypatch.setattr(pin, "_live_impl", lambda: None)
+            monkeypatch.setattr(
+                pin,
+                "clear_wiring",
+                lambda *a, **k: pytest.fail("unwired a SERVING pin"),
+            )
+            changed, msg = pin.heal(sw)
+            assert not changed
+            assert msg == "Nothing to heal", msg
+            assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+        finally:
+            srv.close()
