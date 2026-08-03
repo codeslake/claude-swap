@@ -1445,7 +1445,7 @@ class AutoSwitchEngine:
         if (
             isinstance(left_headroom, (int, float))
             and h is not None
-            and h >= left_headroom + SPENT_HEADROOM_PCT
+            and h >= min(left_headroom + SPENT_HEADROOM_PCT, 100.0)
         ):
             return True
         # `None` is the JSON-safe spelling of "unknown or already past", which
