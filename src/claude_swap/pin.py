@@ -817,27 +817,32 @@ def heal(switcher) -> tuple[bool, str]:
     Never raises: this is called from the status line every few seconds, and a
     health check that can break the prompt is worse than the fault it reports.
     """
-    # A SERVING PIN IS NEVER HEALED. Ask the wiring itself first, because the
-    # restart below CANNOT tell us this: ``impl.heal()`` returns False both for
-    # "could not restart" and for "already serving, nothing to do", and reading
-    # the second as the first tears down a working pin. Measured: run against a
-    # live daemon (pid alive, port answering), this stripped the env block and
-    # unpinned the user's healthy session.
+    # A SERVING PIN IS NEVER **TORN DOWN**. That is what the guard protects,
+    # and the destructive operation is `clear_wiring` at the bottom — not the
+    # restart. This used to return here on `serving`, before `impl.heal()` ran
+    # at all, and that made a whole class of repair unreachable:
     #
-    # The port the WIRING names is the right question, not any state file:
-    # `_spawn_daemon` unlinks proxy.json as its first act, so a missing record
-    # is not proof of death while the original daemon is still serving.
-    if _wired_port_is_serving(switcher):
-        return False, "Nothing to heal"
-
+    #   a daemon SERVING its wired port while running code we no longer ship
+    #
+    # is exactly the state an upgrade leaves behind, and it answered "Nothing
+    # to heal" forever. Measured across three machines after installing a new
+    # release: two had daemons serving their own wired port, 24h old, running
+    # the previous version, and every tick declined to touch them. The third
+    # recycled only because its wiring named a DEAD port — the right outcome
+    # for the wrong reason.
+    #
+    # So the restart runs FIRST and the serving check gates only the unwire.
+    # `impl.heal` is safe to call in the serving case by construction: it
+    # returns False for "serving, wired, and current" and recycles only when
+    # the fingerprint says the daemon predates the installed code — rebinding
+    # the SAME port, so live sessions never see the swap.
     impl = _live_impl()
     if impl is not None:
         try:
-            # Covers BOTH halves: restart a daemon that died, and re-wire a
-            # daemon that is serving while the config names nothing. The second
-            # is the state a recovery leaves behind — the wiring was removed to
-            # save the session, and without this the pin never comes back on
-            # its own.
+            # Covers THREE halves now: restart a daemon that died, re-wire a
+            # daemon that is serving while the config names nothing, and
+            # recycle one that is serving but obsolete. The second is the state
+            # a recovery leaves behind; the third is the state an upgrade does.
             if impl.heal(switcher.backup_dir):
                 return True, "Restored the cloud pin"
         except Exception:  # noqa: BLE001 — fall through to the safe outcome
@@ -847,6 +852,16 @@ def heal(switcher) -> tuple[bool, str]:
         # pin that just came back is the same damage as unwiring a live one.
         if _wired_port_is_serving(switcher):
             return False, "Nothing to heal"
+    elif _wired_port_is_serving(switcher):
+        # No package, so nothing can restart OR recycle — but a serving pin is
+        # still a working one, and removing its wiring would unpin a healthy
+        # session. The guard has to survive the package being absent, which is
+        # exactly when a user can least afford a wrong answer.
+        #
+        # The port the WIRING names is the right question, not any state file:
+        # `_spawn_daemon` unlinks proxy.json as its first act, so a missing
+        # record is not proof of death while the original daemon still serves.
+        return False, "Nothing to heal"
     # No package, or the restart failed. Either way the wiring must not outlive
     # the daemon it points at. clear_wiring works WITHOUT the package on
     # purpose — the wiring is cswap's own record, and the case where the extra
