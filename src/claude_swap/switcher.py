@@ -50,6 +50,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
+from claude_swap.fsutil import read_text_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -458,7 +459,7 @@ class ClaudeAccountSwitcher:
         if not path.exists():
             return None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(read_text_with_retry(path))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self._logger.warning(f"Invalid JSON in {path}")
             if strict:
