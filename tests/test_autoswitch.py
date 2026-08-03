@@ -3217,10 +3217,14 @@ class TestHorizonAxisDoesNotFlap:
 
         Refusing the account we most recently left bounds it — but identity
         alone has no release, and on a 2-account fleet that is a permanent
-        proactive lockout (see the sibling test). Released by the same ratio
-        the anti-flap margin uses, the walk is still BOUNDED: measured over
-        24 / 120 / 400 ticks, [1,2,1] then [1,2,1,2] and no further, because
-        each return has to clear 2x and burn makes that harder every time.
+        proactive lockout (see the sibling test). Released by asking the
+        ranking, the walk is still BOUNDED: it ends, because each return has to
+        clear the margin and burn makes that harder every time.
+
+        A trace of the exact moves used to sit here. It has been re-taken three
+        times and come back different every time — the walk depends on the
+        release, and the release has changed in every round that quoted it. The
+        assertion is on SETTLING for the same reason.
 
         So this asserts a BOUND, not zero returns. Zero was a property of the
         release-less filter, and that property is what made the lockout
@@ -3229,8 +3233,8 @@ class TestHorizonAxisDoesNotFlap:
         """
         pct = {"1": 92.0, "2": 92.0}
         seen = []
-        # 60, not 24: the settling point moves with fleet size (measured 3 /
-        # 6 / 8 / 10 moves at n = 2 / 3 / 4 / 5) and 24 ticks caught this
+        # 60, not 24: the settling point moves with fleet size — a longer
+        # ring walks further before it comes back — and 24 ticks caught this
         # shape mid-walk.
         for _ in range(60):
             harness.tick_with_usage({
@@ -3244,13 +3248,14 @@ class TestHorizonAxisDoesNotFlap:
 
         moves = [n for i, n in enumerate(seen) if i == 0 or n != seen[i - 1]]
         # SETTLING is the property, not a move count. `len(moves) <= 4` was
-        # true of this 2-account shape and false of every other: measured over
-        # 120 ticks with the fleet grown, 3 / 6 / 8 / 10 moves at n = 2 / 3 /
-        # 4 / 5 — the bar refuses only the ONE account left last, so a longer
-        # ring walks further before it comes back. All four settle.
+        # true of this 2-account shape and false of every other — the bar
+        # refuses only the ONE account left last, so a longer ring walks
+        # further before it comes back, and every fleet size settles.
         #
-        # A count that holds for one fleet size reads as a bound and is not
-        # one. What the walk has to do is END.
+        # The per-size counts that used to be quoted here did not re-measure
+        # after the release changed. A count that holds for one fleet size and
+        # one release reads as a bound and is neither. What the walk has to do
+        # is END.
         assert len(set(seen[-8:])) == 1, (
             f"move sequence {moves} — the walk was still moving in the last "
             "eight ticks, so it does not settle at all"
@@ -3540,6 +3545,230 @@ class TestHorizonAxisDoesNotFlap:
             f"30 ticks of {[o.name for o in outcomes[:6]]}… — the only "
             "choosable peer was barred and the third account is at its limit, "
             "so the bar left the engine nothing"
+        )
+
+    def test_the_bar_lifts_for_an_alternative_the_ranking_would_reject(
+        self, temp_home
+    ):
+        """Not-at-its-limit is not the same as rankable.
+
+        The predicate above was `(headroom.get(n) or 0.0) > 0.0` — "has any
+        points left". That is only the FIRST of the gates a candidate must
+        clear: past the horizon it also needs `h >= active x HORIZON_HEADROOM_
+        RATIO`, or the spent fallback's `h >= active` with a meaningfully
+        sooner reset. A third account holding ONE point clears `> 0.0` and
+        clears nothing else, so the release stayed shut and the n>=3 stall the
+        release above was written for came straight back one point up.
+
+        Measured, one ordinary proactive move and no seeded state: barred peer
+        3.5 pts / back in 10h, active 2 pts / 500h out, third 1 pt — 30 ticks
+        all BLOCKED. The control below is the same fleet with `lastSwitchFrom`
+        popped and switches on the first tick, so the bar is the cause.
+
+        This is the third time this release has been fixed one step short of
+        the gate that actually decides (present -> not-at-limit -> rankable),
+        which is why the fix is no longer a predicate that PREDICTS the
+        ranking: `_tick_inner` now asks the ranking itself and re-ranks unbarred
+        when the bar empties the list.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+            "3": _usage(99, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(301.0)
+
+        outcomes = []
+        for _ in range(30):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(96.5, self._days_out(h, 10)),   # barred, 3.5 pts
+                "2": _usage(98, self._days_out(h, 500)),    # active, 2 pts
+                "3": _usage(99, self._days_out(h, 300)),    # 1 pt: > 0, unrankable
+            }))
+            h.clock.advance(3601.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"30 ticks of {[o.name for o in outcomes[:6]]}… — the third "
+            "account holds one point, which passes `> 0.0` and no ranking "
+            "gate, so the bar left the engine nothing"
+        )
+
+    def test_an_unreadable_barred_account_does_not_crash_the_tick(
+        self, harness
+    ):
+        """`headroom.get(barred)` is None when that slot's usage is unreadable.
+
+        The ratio release compares it against `active_headroom * RATIO`, so
+        without the None check the tick raises `TypeError: '>=' not supported
+        between instances of 'NoneType' and 'float'` — inside `_tick_inner`,
+        on an ordinary proactive tick, whenever the account we just left has
+        no readable usage. Measured: dropping `left_headroom is not None` left
+        the whole suite green, so nothing pinned it.
+
+        Asserts the CALL returns rather than the tick outcome: which account
+        wins is the ranking's business, and a crash is the defect.
+        """
+        state = {"lastSwitchFrom": 1}
+        headroom = {"2": 10.0, "3": 40.0}       # slot 1 unreadable — absent
+        assert harness.engine._no_return_account(
+            "proactive", state, headroom, 10.0, ["1", "3"]
+        ) == "1", (
+            "an unreadable barred account must still bar — unknown headroom "
+            "is not evidence it beats us"
+        )
+
+    def test_the_bar_lifts_for_a_peer_returning_inside_the_horizon(
+        self, temp_home
+    ):
+        """The release had no condition on the RECOVERY axis at all.
+
+        Its only release was `left >= active x HORIZON_HEADROOM_RATIO`, a pure
+        headroom test — while `_recovery_is_useful` deliberately ranks by RESET
+        when a candidate returns inside the horizon, and this module's own
+        docstring names that case as the one the horizon exists to preserve:
+        a weekly-bound active days out against a peer back in minutes.
+
+        A barred peer in exactly that state was refused, because 4 points
+        against an active on 3 misses `4 >= 3 x 2`. Measured on the predicate
+        form: barred peer back in 1h, active 200h out — 10 ticks all BLOCKED.
+
+        Asking the ranking covers it without a third predicate: barring the
+        only account the reset axis would pick empties the list, so the retry
+        opens. That is the point of not predicting — the release now follows
+        every axis the ranking has, including ones added later.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(301.0)
+
+        outcomes = []
+        for _ in range(10):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(96, self._at(h, 3600)),      # barred, back in 1h
+                "2": _usage(97, self._days_out(h, 200)),  # active, 200h out
+            }))
+            h.clock.advance(1801.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} — the bar refused the only peer "
+            "returning inside the horizon, so the engine holds an account 200h "
+            "out while a peer is back in one"
+        )
+
+    def test_the_same_fleet_moves_with_the_bar_cleared(self, temp_home):
+        """The control for the test above: identical state, no bar.
+
+        Without this, a stall could be the fleet's own numbers rather than the
+        bar, and the assertion above would be measuring nothing. Same seeds,
+        same usage, same clock — only `lastSwitchFrom` is popped.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+            "3": _usage(99, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED
+        h.clock.advance(301.0)
+        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+
+        assert h.tick_with_usage({
+            "1": _usage(96.5, self._days_out(h, 10)),
+            "2": _usage(98, self._days_out(h, 500)),
+            "3": _usage(99, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED, (
+            "the control blocked too — the stall above is the fleet's numbers, "
+            "not the bar, and that assertion is measuring nothing"
+        )
+
+    def test_the_bar_reaches_the_ranking_through_tick(self, temp_home):
+        """The bar's production WIRING, which nothing pinned.
+
+        `_no_return_account` is computed in `_tick_inner` and threaded into
+        both `_rank_candidates` calls. Measured: replacing that computation
+        with `no_return = None` — the whole feature off in production — left
+        the FULL suite at 1732 passed. The only test of the bar's effect drives
+        `_rank_candidates` directly and passes `no_return` by hand, so the unit
+        was pinned and the integration was not: any refactor that drops the
+        kwarg reverts the anti-flap bound silently.
+
+        Asserts a DIFFERENT DESTINATION, not a block: the leaves-nothing
+        release is now answered by the ranking itself, so a bar that empties
+        the list re-ranks unbarred and the engine moves anyway. A fleet where
+        the bar blocks therefore proves nothing about the wiring — the only
+        observable left is the engine landing somewhere else.
+
+        ON THE RECOVERY AXIS, which is the only axis where the bar can change
+        an answer at all. Past the horizon the release (`left >= active x
+        RATIO` -> not barred) and the ranking gate (`h >= active x RATIO` ->
+        qualifies) are the SAME inequality, so anything the bar could remove
+        the loop had already dropped: swept 18 headroom combinations, every one
+        `unbarred == barred`. Inside the horizon the ranking sorts by reset
+        time instead, the two stop agreeing, and the bar bites — 162 of the
+        swept combinations differ. Both peers are back within the hour here,
+        which is what puts the tick on that axis.
+
+        ONE fleet, ticked twice: `temp_home` is a single home and a second
+        `EngineHarness` over it inherits the first run's roster, so the control
+        comes from popping `lastSwitchFrom`, not from a fresh box.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        assert h.tick_with_usage({
+            "1": _usage(92, self._days_out(h, 500)),
+            "2": _usage(10, self._days_out(h, 400)),
+            "3": _usage(50, self._days_out(h, 300)),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(301.0)
+        assert h.engine._read_state().get("lastSwitchFrom") is not None, (
+            "premise: the move recorded what it left"
+        )
+
+        second = {
+            "1": _usage(99, self._at(h, 1800)),      # left; back in 30 min
+            "2": _usage(99, self._at(h, 7200)),      # active, spent, back in 2h
+            "3": _usage(99, self._at(h, 3600)),      # back in 1h
+        }
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "the bar never reached the ranking through tick() — the engine "
+            "went back to the account it had just left, which returns sooner "
+            "than the peer it should have taken"
+        )
+
+        # Control: same numbers, the bar removed — the soonest return wins.
+        # The clock advances past the post-switch cooldown, and `second`'s
+        # resets are relative to the ORIGINAL now, so both peers are still
+        # ahead of the active by the same margins.
+        h.make_live("b@example.com", 2)
+        h.clock.advance(301.0)
+        h.engine._mutate_state(lambda st: st.pop("lastSwitchFrom", None))
+        assert h.tick_with_usage(second) is TickOutcome.SWITCHED
+        assert h.active_number() == 1, (
+            "premise: unbarred, the account we left returns soonest and IS the "
+            "pick — without this the assertion above would pass on a fleet "
+            "where 3 wins for its own reasons"
         )
 
     def test_the_fallback_never_outranks_a_real_qualifier(self, harness):
