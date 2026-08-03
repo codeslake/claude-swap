@@ -4060,8 +4060,28 @@ class ClaudeAccountSwitcher:
                 continue
             entry = entries[num]
             _i = info_by_num[num]
-            if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
+            dead = self._entry_token_dead(entry, num, _i[1], _i[5], _i[4])
+            if dead:
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
+            elif dead is None:
+                # Cannot determine (unreadable backup on a struck active
+                # slot): neither confirm the strike (would condemn an
+                # already-healed slot, this round's regression) nor heal it
+                # below (would erase a strike that may still hold, reopening
+                # round 8's). Setting a sentinel here — even
+                # USAGE_KEYCHAIN_UNAVAILABLE — would override
+                # decision_value()'s normal last_good serving (measured: it
+                # makes account_headroom() see None, which still drives the
+                # unhealthy-ticks counter to eventual failover — no better
+                # than guessing True). Set NO sentinel and fall through: the
+                # active credential itself is fine (it already cleared the
+                # first fingerprint check above), so a live measurement
+                # still serves from the entry's own last_good if fresh, or
+                # this account stays a normal fetch candidate — a real,
+                # successful fetch resets authDeadStrikes on its own
+                # (UsageStore.record's success path), the legitimate way
+                # this strike heals.
+                pass
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -4159,10 +4179,14 @@ class ClaudeAccountSwitcher:
             # slot looking merely refresh-failed until the next refresh notices.
             for num in accepted:
                 _i = info_by_num[num]
-                if self._entry_token_dead(
+                dead = self._entry_token_dead(
                     entries[num], num, _i[1], _i[5], _i[4]
-                ):
+                )
+                if dead:
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
+                # dead is None: same ambiguity as the pre-fetch scan above
+                # (unreadable backup on a struck active slot) — set no
+                # sentinel, see that scan's comment for why.
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
@@ -4183,6 +4207,14 @@ class ClaudeAccountSwitcher:
         backup — as the import used to — leaves an active slot struck on its
         live generation unhealable, and that is the slot most likely to be
         quarantined in the first place.
+
+        ``_entry_token_dead`` can also answer ``None`` — cannot determine,
+        an unreadable backup on a struck active slot. This method's only
+        caller (`cswap import`'s auto-heal) uses it as a plain boolean gate
+        between "replace" and "already exists, use --force": ``None``
+        coerces to ``False`` here, the conservative direction — an ambiguous
+        read must not silently authorize an overwrite the user never
+        confirmed with ``--force``.
         """
         # The org uuid is part of the row identity (UsageStore._matches
         # compares it for EQUALITY), so an empty one silently matches nothing:
@@ -4205,7 +4237,9 @@ class ClaudeAccountSwitcher:
             if is_active
             else (self._read_account_credentials(num, email) or "")
         )
-        return self._entry_token_dead(entry, num, email, stored, is_active)
+        return bool(
+            self._entry_token_dead(entry, num, email, stored, is_active)
+        )
 
     def _entry_token_dead(
         self,
@@ -4214,7 +4248,7 @@ class ClaudeAccountSwitcher:
         email: str,
         stored: str,
         is_active: bool,
-    ) -> bool:
+    ) -> bool | None:
         """Fingerprint-bound dead verdict against EVERY stored source.
 
         For an idle slot ``info[5]`` is the backup, the only source a strike
@@ -4226,15 +4260,34 @@ class ClaudeAccountSwitcher:
         loop that keeps a dead backup out of quarantine forever. The strike
         holds while ANY stored source still matches the struck generation.
 
-        The backup read must distinguish ABSENT from UNREADABLE (macOS
-        Keychain locked/denied/timeout): ``_read_account_credentials``
-        collapses both to ``""``, which would read an unreadable backup as
-        healed — reopening the exact strike/heal/re-POST loop this method
-        exists to close, just retriggered by a locked Keychain instead of a
-        rotated credential. ``entry.token_dead()`` with no ``stored_fp``
-        answers "is this row struck at all" on the raw count alone (skips
-        the fingerprint compare), so an unstruck row is never affected by an
-        unreadable read — only a struck one fails closed.
+        Returns ``True`` (confirmed dead), ``False`` (confirmed not dead —
+        no stored source, seen or fingerprint-matched, still holds the
+        struck generation), or ``None`` — cannot determine.
+
+        ``None`` is not a corner case, it is a real third answer. When the
+        backup is UNREADABLE (macOS Keychain locked/denied/timeout) and the
+        row is otherwise struck, "genuinely still struck, unhealed" and
+        "genuinely healed by a re-login, just unseen right now" are
+        OBSERVATIONALLY IDENTICAL to this method — both produce the same
+        ``(backup="", unreadable=True)`` regardless of what the real bytes
+        say. No local read distinguishes them, so guessing either boolean is
+        wrong for the other case: guessing ``True`` condemns an already-
+        healed slot (this round's regression); guessing ``False`` would let
+        the collector's own healed-strike-clear branch (the ``elif`` beside
+        this call) permanently erase a strike that may still hold (round
+        8's regression, reopened). ``None`` refuses to guess — callers must
+        treat it as neither confirmed-dead nor confirmed-healed. The
+        collector sets NO sentinel for it: even the existing
+        ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel overrides
+        ``decision_value()``'s normal last-good serving, which still drives
+        the auto engine's unhealthy-ticks counter toward the same failover
+        this fix exists to stop (measured) — no better than guessing
+        ``True``. Leaving the row unsentineled lets it keep serving its
+        last-good measurement (or become a normal fetch candidate, whose
+        success legitimately heals the strike via ``UsageStore.record``).
+
+        An unstruck row is never affected by an unreadable read (``False``
+        either way) — only a struck one goes ambiguous.
         """
         if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
             return True
@@ -4242,7 +4295,7 @@ class ClaudeAccountSwitcher:
             return False
         backup, unreadable = self._read_account_credentials_ex(num, email)
         if unreadable:
-            return entry.token_dead()
+            return None if entry.token_dead() else False
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )
