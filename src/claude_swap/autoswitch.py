@@ -981,17 +981,11 @@ class AutoSwitchEngine:
             "email": "",
         }
 
-        # RE-CHECK BEFORE THE FETCH. `_tick_inner`'s gate fires at tick START;
-        # the next one is the freshen loop, and between them sits the usage
-        # collection — the path that POSTs one-time refresh grants. A worker
-        # parked in an earlier `_emit` (the unquarantine notices above) is
-        # exempt from `stop()`'s wait by design, so `stop()` returns, LIVE is
-        # released, and the worker then wakes and fetches for a successor that
-        # already owns the lock. Measured: `usage fetches AFTER LIVE was
-        # released: [['2']]`.
-        if self._stop.is_set():
-            raise _EngineStopped()
-
+        # No re-check here: `_collect_scheduled_usage` opens with its own
+        # gate (below, before its first fetch) and nothing between here and
+        # there emits or mutates — a probe landing a stop mid-emit right
+        # above reaches that gate exactly the same way. Confirmed redundant:
+        # deleting this one left `engine-stopped` reported unchanged.
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
