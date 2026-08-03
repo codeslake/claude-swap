@@ -571,8 +571,8 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             # the 32 the prose used to claim (32 corresponds to a 44-char
             # path). It DECAYS with path length, and past 76 chars it INVERTS
             # — the timeout becomes the cheaper line. At 43200 ticks: 6.06 MiB/day
-            # and 8.16 MiB/day respectively, against `maxBytes=1024*1024`
-            # (`logging_config.py:47`), so a `tail` three hours late shows
+            # and 8.16 MiB/day respectively, against `logging_config.py`'s
+            # `maxBytes=1024 * 1024`, so a `tail` three hours late shows
             # none of it; the 4 MiB across all `backupCount=3` rotations
             # lasts 15.9 h / 11.8 h.
             #
@@ -599,10 +599,10 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             #
             # A DISCRIMINATOR DOES EXIST, though earlier versions of this
             # comment said none did. The lock dir's mtime age tells them apart
-            # at the moment of the raise, and `proper_lockfile` already stats
-            # it (`claude_locks.py:119`) and already compares it against
-            # `CONFIG_STALENESS_S` (`:122`). Measured, ~4 lines, and `os.stat`
-            # works fine on a `0o500` dir:
+            # at the moment of the raise, and `proper_lockfile` already does
+            # both: `os.stat(lock_dir).st_mtime`, then `> staleness` against
+            # `CONFIG_STALENESS_S`. Measured, ~4 lines, and `os.stat` works
+            # fine on a `0o500` dir:
             #
             #   LIVE competitor (fresh mtime)  Timeout | age    0.3s TRANSIENT
             #   ORPHAN + read-only parent      Timeout | age 3600.3s PERMANENT
