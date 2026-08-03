@@ -4220,7 +4220,37 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
             f"{[(r.funcName, r.levelname, r.getMessage()) for r in loud]}"
         )
 
-    @pytest.mark.parametrize("removable", [True, False])
+    @pytest.mark.parametrize(
+        "removable",
+        [
+            True,
+            # `removable=False` makes the config's DIRECTORY read-only, which
+            # is a POSIX mechanism: on win32 a read-only directory does not
+            # stop a write, and root ignores the mode bit, so the lock never
+            # fails and the unwire WARNING this case exists to observe never
+            # fires. Measured on the Windows runner (test-windows red at
+            # d343bfb, green on Linux and macOS):
+            #
+            #   Expected: [('clear_wiring','resolve',30),
+            #              ('clear_wiring','unwire',30)]
+            #   Got:      [('clear_wiring','resolve',30)]
+            #
+            # Same skip condition as
+            # `TestTheLockFailureThatStrandsTheWiringIsNamed`, which pins the
+            # same mechanism and already carried it. The REMOVABLE half runs
+            # everywhere, so the platform-independent claim keeps its coverage.
+            pytest.param(
+                False,
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32" or os.geteuid() == 0,
+                    reason="needs POSIX permission semantics (non-root): a "
+                    "read-only dir does not block a write on win32, and root "
+                    "writes into a 0o500 dir regardless, so the lock never "
+                    "fails and the second WARNING never fires",
+                ),
+            ),
+        ],
+    )
     def test_a_tick_with_work_warns_only_from_clear_wirings_own_two_sites(
         self, removable, tmp_path, monkeypatch, caplog
     ):
