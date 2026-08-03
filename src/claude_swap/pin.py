@@ -549,15 +549,32 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             #
             # `PermissionError` renders the LOCK path (the config path plus
             # `.lock`), so the config path appears twice and the old
-            # `97 B + 2*len(path)` model is exact for it. `ClaudeCodeLockTimeout`
-            # names only `lock_dir.name`, so the path appears ONCE — but its
-            # fixed sentence ("Could not acquire … Claude Code appears to be
-            # refreshing credentials. Retry in a few seconds.") is longer than
-            # the path it drops, and the model UNDERCOUNTS it by 32 B. At
-            # 43200 ticks: 6.06 MiB/day and 8.16 MiB/day respectively, against
-            # `maxBytes=1024*1024` (`logging_config.py:47`), so a `tail` three
-            # hours late shows none of it; the 4 MiB across all
-            # `backupCount=3` rotations lasts 15.9 h / 11.8 h.
+            # `97 B + 2*len(path)` model is exact for it — at every length
+            # measured, 22 through 140 chars, diff 0.
+            #
+            # `ClaudeCodeLockTimeout` names only `lock_dir.name`, so the path
+            # appears ONCE, and the model does not fit it AT ALL — the miss is
+            # not a constant. Its fixed sentence ("Could not acquire … Claude
+            # Code appears to be refreshing credentials. Retry in a few
+            # seconds.") is paid whatever the path costs, so the difference
+            # between the two kinds is `76 - len(path)`: measured exact at
+            # every length tested.
+            #
+            #   len(path)   PermErr    Timeout    gap    76-len
+            #          25       147        198     51        51   <- documented
+            #          71       239        244      5         5
+            #          78       253        251     -2        -2
+            #         140       377        313    -64       -64
+            #
+            # The first row is the table above, measured at exactly the
+            # documented path rather than extrapolated: the gap is 51 B, NOT
+            # the 32 the prose used to claim (32 corresponds to a 44-char
+            # path). It DECAYS with path length, and past 76 chars it INVERTS
+            # — the timeout becomes the cheaper line. At 43200 ticks: 6.06 MiB/day
+            # and 8.16 MiB/day respectively, against `maxBytes=1024*1024`
+            # (`logging_config.py:47`), so a `tail` three hours late shows
+            # none of it; the 4 MiB across all `backupCount=3` rotations
+            # lasts 15.9 h / 11.8 h.
             #
             # THE WORST CASE IS THE TIMEOUT, and it is also the one that never
             # stops. An ORPHANED lock dir (a holder killed -9) inside a config
@@ -573,17 +590,45 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             # user's status line.
             #
             # SPLITTING `ClaudeCodeLockTimeout` DOWN TO DEBUG WAS PROPOSED AND
-            # MEASURED WRONG. It reads as "transient contention is a Tuesday,
-            # a stuck machine is the emergency" — but the two are the SAME
-            # TYPE here. Measured: a live competitor holding the lock raises
-            # `ClaudeCodeLockTimeout`, and so does the permanently-orphaned
-            # lock dir above. The split would silence exactly the machine this
-            # WARNING exists for and keep only `PermissionError`, which is the
-            # kind that does NOT need help — it names its own errno. What
-            # separates transient from permanent is not the type but whether
-            # it clears: measured, a 3s competitor costs 10 lines and the very
-            # next free tick unwires the config, while the orphan case is on
-            # line 10 with nothing changed.
+            # REFUSED — ON COST, which is the only ground that holds. The type
+            # does not separate the two cases: a live competitor raises
+            # `ClaudeCodeLockTimeout` and so does the permanently-orphaned lock
+            # dir above, so a type-keyed split silences the stuck machine this
+            # WARNING exists for and keeps only `PermissionError`, the kind
+            # that already names its own errno.
+            #
+            # A DISCRIMINATOR DOES EXIST, though earlier versions of this
+            # comment said none did. The lock dir's mtime age tells them apart
+            # at the moment of the raise, and `proper_lockfile` already stats
+            # it (`claude_locks.py:119`) and already compares it against
+            # `CONFIG_STALENESS_S` (`:122`). Measured, ~4 lines, and `os.stat`
+            # works fine on a `0o500` dir:
+            #
+            #   LIVE competitor (fresh mtime)  Timeout | age    0.3s TRANSIENT
+            #   ORPHAN + read-only parent      Timeout | age 3600.3s PERMANENT
+            #   LIVE competitor + ro parent    Timeout | age    0.3s TRANSIENT
+            #   CC holder, mtime 4s old        Timeout | age    4.3s TRANSIENT
+            #   no lock dir + ro parent        PermErr | age   None  PERMANENT
+            #
+            # Right on all five shapes. So the refusal cannot rest on "nothing
+            # can tell them apart". It rests on the transient case being too
+            # cheap to be worth the code.
+            #
+            # AND THE OLD "10 LINES" FIGURE MIXED TWO CADENCES. It came from a
+            # tight loop of 10 `heal()` calls back to back, while the permanent
+            # case was priced at the real ~2s statusline cadence (43200
+            # ticks/day) — the comparison ran in the direction that made its
+            # own refusal look weaker. Re-measured, a 3s competitor, both
+            # cadences on the same fixture:
+            #
+            #   tight loop (no sleep)   11 unwire lines, cleared on tick 12
+            #   real ~2s statusline      2 unwire lines, cleared on tick 3
+            #
+            # TWO LINES, once, against 43200/day forever. That is what four
+            # lines of mtime arithmetic would buy, and it is not worth it. The
+            # transient case is self-limiting by construction: the competitor
+            # lets go and the very next free tick unwires the config, while
+            # the orphan is still on line 43200 with nothing changed.
 
             _logger.warning("%s could not be unwired: %s", path, exc)
             continue

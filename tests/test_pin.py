@@ -4130,12 +4130,20 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # absent: `heal` reaches it only through `_wiring_is_stale`.
     #
     # BOTH TESTS BELOW KEY ON `record.funcName`, NOT ON LEVEL, and not on
-    # `lineno`/`pathname` either. Every one of these records is emitted from
-    # the SAME line of the SAME file (`_log_unresolvable`'s `_logger.log`), so
-    # a filter written on the record's location cannot tell the churning call
-    # sites from the self-limiting one and is the same guard-that-passes-for-
-    # the-wrong-reason in a new disguise. `stacklevel=2` on that `log` call
-    # makes `funcName` the CALLER, which is the fact these tests are about.
+    # `lineno`/`pathname` either. `pathname` is useless — every record comes
+    # from `pin.py`. `lineno` is NOT useless, and the claim that it was is
+    # wrong: `stacklevel=2` moves it to the caller exactly as it moves
+    # `funcName`, so the unremovable tick yields THREE distinct linenos —
+    # one per `_log_unresolvable` call site plus the lock WARNING, including
+    # the two that share `funcName == "clear_wiring"`.
+    #
+    # `funcName` is chosen because a lineno key is BRITTLE, not because it
+    # cannot discriminate. Deliberately not quoting the numbers here: the
+    # round that wrote this comment moved two of them (588 -> 633, 1067 ->
+    # 1112) by editing COMMENTS in `pin.py` and nothing else. That is the
+    # brittleness, demonstrated on this very sentence — a lineno key pins the
+    # guard to the file's current layout instead of to the fact it is about.
+    # `stacklevel=2` is what makes `funcName` the CALLER, which is that fact.
     _PER_TICK_SITES = ("_wiring_present", "_wired_ports")
 
     def _heal(self, tmp_path, monkeypatch, caplog, *, wired, removable=True):
@@ -4312,12 +4320,15 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # tell the getter site from the lock site — it can only count them.
         # The MESSAGE is what separates them, and it is the same text the user
         # reads in the log, so a format change that made the two
-        # indistinguishable there fails here too. `lineno` would also separate
-        # these two, but it is the wrong axis for the same reason the comment
-        # above gives: every `_log_unresolvable` record shares one line, so
-        # `lineno` cannot tell the THREE getter call sites apart, and a key
-        # that works for one half of this assertion and not the other is the
-        # guard-that-passes-for-the-wrong-reason again.
+        # indistinguishable there fails here too. `lineno` WOULD also separate
+        # them — and, contrary to what this comment used to say, it separates
+        # the getter sites too: `stacklevel=2` moves `lineno` to the caller
+        # just as it moves `funcName`, giving three distinct values. It is
+        # rejected for being BRITTLE, not blind — see the class-level comment
+        # above, where editing `pin.py`'s COMMENTS alone renumbered two of
+        # them. The message axis has an independent merit besides: it is the
+        # text the user actually reads, so it catches a site-swap that leaves
+        # the counting key identical.
         #
         # The ORDER the equality pins is deterministic: the getter record is
         # emitted from the `paths` loop, the lock record from the loop below
@@ -4620,7 +4631,99 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
     (via `stacklevel=2`) is the only thing that tells the call sites apart.
     A new record on `heal`'s path that is not attributable the same way
     cannot be distinguished from a per-tick regression.
+
+    THE FIRST TEST BELOW NEEDS NO PERMISSION BITS, and that is why it is
+    first. The other two in this class, and the `removable=False` case in
+    `TestEveryCallSiteRecordsAnUnresolvableGetter`, all reach the lock failure
+    through a `0o500` directory — a POSIX non-root mechanism, so all three
+    carry the same skipif and all three vanish TOGETHER. Measured with the
+    three conditions forced true (the root-container shape `host-a`
+    runs, and the win32 runner):
+
+        control:           130 passed, 5 skipped
+        lock WARNING gone: 130 passed, 5 skipped     <-- SURVIVED
+
+    Deleting the record this PR exists for was green. CI's `ubuntu-latest` is
+    non-root so CI does cover it, but a green suite that says nothing about
+    the flagship guard is exactly the "passes for the wrong reason" this PR
+    has spent seven rounds on, and the skip made it silent rather than loud.
     """
+
+    def test_a_lock_already_held_names_the_config_without_any_permission_bits(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The lock WARNING, reached with no `chmod` anywhere.
+
+        A lock directory that ALREADY EXISTS with a FRESH mtime is refused by
+        `os.mkdir` with `FileExistsError` for every uid including root and on
+        win32, because directory-creation atomicity is the mutex — not a
+        permission bit. Its mtime is inside `CONFIG_STALENESS_S`, so
+        `proper_lockfile`'s stale-takeover branch (`claude_locks.py:122`)
+        never runs and cannot `rmdir` it; the budget expires and it raises
+        `ClaudeCodeLockTimeout`. That is a real production shape, not a
+        contrivance: it is a live Claude Code holding its own config lock
+        through a credential refresh.
+
+        NOT MONKEYPATCHED. `proper_lockfile` could be made to raise directly,
+        but a test that patches the thing it claims to observe would pass over
+        a `clear_wiring` that no longer calls it at all. This drives the real
+        lock through the real `heal`.
+
+        Measured as a real euid 0 (via `unshare -r`), both mechanisms on the
+        same tree:
+
+            0o500 parent (the other tests):  heal -> "Removed a cloud pin
+                                             wiring…", WARNING never fires
+            lock dir exists, fresh mtime:    heal -> "could not be removed…",
+                                             WARNING fires
+
+        so this one survives precisely the runner the others skip on.
+        """
+        import logging
+        import types
+
+        from claude_swap import pin
+
+        cfg = _cfg(tmp_path, "session", _dead_port())
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg.parent))
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        # No `_write_json`: the lock fails before anything is written, so the
+        # sibling tests' copy of it is dead on this path (measured — never
+        # called). A stub that is never invoked describes a write this shape
+        # does not do.
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+
+        # Fresh mtime by construction (just created), so the takeover path is
+        # NOT the one exercised — the mtime is the only thing keeping this
+        # from being the orphan case the test below covers.
+        os.mkdir(cfg.parent / (cfg.name + ".lock"))
+
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            changed, message = pin.heal(sw)
+
+        assert not changed and "could not be removed" in message, (
+            f"fixture did not reach the stranded shape: {(changed, message)}"
+        )
+
+        named = [
+            r
+            for r in caplog.records
+            if r.funcName == "clear_wiring" and r.levelno >= logging.WARNING
+        ]
+        # Same two facts the POSIX tests pin — WHICH config and WHY — and
+        # "Could not acquire" is written at exactly one place in the codebase
+        # (`claude_locks.proper_lockfile`'s raise), so it proves the shape
+        # arrived as `ClaudeCodeLockTimeout` rather than as something else.
+        assert any(
+            str(cfg) in r.getMessage() and "Could not acquire" in r.getMessage()
+            for r in named
+        ), (
+            "heal told the user the wiring could not be removed and nothing "
+            "logged WHICH config or WHY — and this is the ONE test of that "
+            "record that a root or win32 runner still runs. Records: "
+            f"{[(r.funcName, r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
@@ -4711,9 +4814,20 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
 
         So the split silences precisely the machine the WARNING exists for,
         and keeps only `PermissionError` — the kind that least needs it, since
-        it names its own errno. What separates transient from permanent is not
-        the type but whether it CLEARS: measured, a 3s competitor costs 10
-        lines and the very next free tick unwires the config.
+        it names its own errno.
+
+        A DISCRIMINATOR OTHER THAN THE TYPE DOES EXIST — the lock dir's mtime
+        age, which `proper_lockfile` already stats (`claude_locks.py:119`) —
+        so the refusal rests on COST, not on "nothing can tell them apart".
+        Re-measured at BOTH cadences, because the old figure mixed them (a
+        tight loop of 10 `heal()` calls priced the transient case while the
+        permanent one was priced at the real statusline cadence):
+
+            tight loop (no sleep)   11 unwire lines, cleared on tick 12
+            real ~2s statusline      2 unwire lines, cleared on tick 3
+
+        Two lines once, against 43200/day forever. `clear_wiring`'s own call
+        site carries the full arithmetic.
         """
         import logging
         import time
