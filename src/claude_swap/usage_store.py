@@ -145,16 +145,22 @@ BACKOFF_MAX_SHIFT = 32
 #
 # Honoring it EXACTLY is not enough: the retry lands ON the deadline, where
 # the server is not reliably ready. Measured over this machine's whole log
-# (re-measured 2026-08-03; these figures age as the log grows — re-derive
-# rather than trust them verbatim, using the method below), 21 of 36 lapses
-# re-blocked within 900s of their own deadline (+2s..+887s), each earning a
-# fresh full hour; the next one is +1004s, so the distribution is bimodal and
-# 900s is the edge of the band — with only 13s of clearance (900 - 887), not
-# the 185s an earlier, wrong figure implied. ("21 of 36", not "of 38": the
-# denominator is restricted to the 36 POSITIVE lapse gaps, matching the
-# numerator — 2 of the 38 raw gaps are negative, a clock/ordering artifact
-# of the block-clustering method, not a real re-block observation, and mixing
-# them into an "of 38" denominator understates the fraction.) The margin is
+# (re-measured 2026-08-03, round 8 — the round-7 "21 of 36"/"2 of 38" figures
+# did not reproduce under the method below AS WRITTEN and are corrected here;
+# these figures age as the log grows — re-derive rather than trust them
+# verbatim, using the method below), 20 of 35 lapses re-blocked within 900s
+# of their own deadline (+2s..+887s), each earning a fresh full hour; the
+# next one is +1004s, so the distribution is bimodal and 900s is the edge of
+# the band — with only 13s of clearance (900 - 887), not the 185s an earlier,
+# wrong figure implied. ("20 of 35", not "of 38": the denominator is
+# restricted to the 35 POSITIVE lapse gaps, matching the numerator — 3 of the
+# 38 raw gaps are negative, and mixing them into an "of 38" denominator
+# understates the fraction. The negative gaps are NOT a clock/ordering
+# artifact: each traces to the server revising a block's deadline FORWARD
+# while the block was still running, so a new block's opening observation
+# lands before the prior block's own opening deadline — a real event, just
+# not a lapse to measure. Excluding them from a lapse-gap analysis is still
+# correct: a block that never lapsed has no lapse gap.) The margin is
 # ABSOLUTE, not a fraction of the ask: Retry-After counts down to a fixed
 # deadline, so a machine polling into a block another one opened sees only
 # the remainder, and a fraction of that shrinks toward zero exactly when it
@@ -170,7 +176,13 @@ BACKOFF_MAX_SHIFT = 32
 # the deadline jumps forward past a tolerance — stable for any tolerance from
 # 5s to 300s). 41 blocks result, 40 of them opened at exactly K=3600; 34 of
 # 75 observations land mid-block (not block-opening); the lapse gap is each
-# block's next observation's timestamp minus the PRIOR block's deadline.
+# block's next observation's timestamp minus the PRIOR block's deadline —
+# where a block has more than one observation (a mid-block deadline
+# revision), "the block's deadline" means its OPENING observation's deadline,
+# the same one "40 of them opened at exactly K=3600" reads. Picking the
+# block's LAST observation's deadline instead reproduces neither the "21 of
+# 36" nor the "2 of 38" figures this comment used to carry — that pairing was
+# never disclosed and does not reproduce from the method as stated.
 RETRY_AFTER_MARGIN_S = 900.0
 # Bounds Retry-After + MARGIN_S, so a pathological header still cannot park an
 # account for hours. Sized to clear the measured shape: 40 of 41 observed
@@ -593,10 +605,14 @@ def _failure_backoff_s(
     # it is capped against (`RETRY_AFTER_FLOOR_CAP_S` / `TRUST_MAX_AGE_S`) is
     # an AGE measured from the last SUCCESS (`fetchedAt`), which `entries()`
     # actually uses. Those agree only when the row was already fresh (age 0)
-    # at the moment it failed — the blind window otherwise equals the row's
-    # AGE AT FAILURE, up to the whole park. Measured end-to-end through
-    # `store.record()` / `entries().decision_value()`, with a control (row
-    # already fresh at failure -> no gap):
+    # at the moment it failed. On the arm measured directly below (non-429,
+    # whose park cap equals the trust ceiling it is checked against) the gap
+    # reduces to the row's AGE AT FAILURE, up to the whole park — but that is
+    # an ARM-SPECIFIC coincidence, not the general rule: see the general
+    # closed form and the 429-arm numbers further down, where cap and
+    # ceiling are different constants and the identity does not hold.
+    # Measured end-to-end through `store.record()` / `entries().decision_
+    # value()`, with a control (row already fresh at failure -> no gap):
     #
     #  age@fail     ask    park   blind  starts  verdict
     #         0    5000    3600       0    None  ok      <- CONTROL
@@ -610,34 +626,62 @@ def _failure_backoff_s(
     #       300     600     600       0    None  ok
     #
     # Blind = the row is in backoff (un-pollable) AND `decision_value()` is
-    # None (unknown) at the same instant. The blind window equals the age at
-    # failure, up to the whole park. Every row above is the non-429
+    # None (unknown) at the same instant. Every row above is the non-429
     # (`rate_limited=False`) arm, where the park cap equals TRUST_MAX_AGE_S
     # (3600) exactly — the ask=4000/3600 rows show the SAME park (3600) as
     # ask=5000 once the ask exceeds the ceiling, and ask=600 shows a park
     # shorter than the ceiling never goes blind at all (its own curve is the
-    # binding constraint, not the ceiling).
+    # binding constraint, not the ceiling). On THIS ARM, and only this arm,
+    # "the blind window equals the age at failure" holds — because the cap
+    # (TRUST_MAX_AGE_S) and the trust ceiling `entries()` actually reads
+    # against (also TRUST_MAX_AGE_S) are the SAME constant, so they cancel.
+    # General form, both arms: `blind = age_at_fail - (ceiling - park)`,
+    # where `ceiling` is RATE_LIMIT_TRUST_MAX_AGE_S (7200) on the 429 arm and
+    # TRUST_MAX_AGE_S (3600) on the non-429 arm above. It equals the age at
+    # failure only where `ceiling == park`, which is true on the non-429 arm
+    # (3600 == 3600) and false on the 429 arm (7200 != 4500).
     #
-    # THIS IS PRE-EXISTING, not a regression this PR introduced: the
-    # orchestrator ran the identical probe against a real upstream/main
-    # worktree and got a byte-identical table. Upstream's
-    # RETRY_AFTER_FLOOR_CAP_S also equalled TRUST_MAX_AGE_S (3600), so the
-    # coincidence only ever hid this for a FIRST failure at age 0 — never in
-    # general. `autoswitch.py` reads a blind row as `active_headroom is None`
-    # and turns it into failover pressure — the exact downstream consequence
-    # round 6 was written to remove, and did not.
+    # CORRECTED 2026-08-03 (round 8) — the paragraph that used to sit here
+    # said this is "PRE-EXISTING, not a regression this PR introduced",
+    # backed by a byte-identical table against a real upstream/main
+    # worktree. Both halves are true and together prove nothing about this
+    # PR: the table above is entirely the non-429 arm, whose cap
+    # (TRUST_MAX_AGE_S = 3600) this PR does not touch — of course it is
+    # byte-identical to upstream, whose non-429 cap is also 3600. The arm
+    # this PR DOES change is the 429 arm (RETRY_AFTER_FLOOR_CAP_S: upstream
+    # 3600 -> this PR's 4500), and there the blind window regresses. Same
+    # probe, `error="http-429"`, ask=3600 (so the margin-adjusted ask always
+    # exceeds the cap on both trees):
     #
-    # DECISION: left open in this PR, not closed. The honest fix is
-    # `min(asked, ceiling - age_at_failure)`, which needs `_failure_backoff_s`
-    # to know the row's age at the moment it failed — a real signature
-    # change. `record()` is its only production caller, but well over a
-    # dozen tests across this file and `tests/test_autoswitch.py` call
-    # `_failure_backoff_s` directly against its current two-positional-plus-
-    # `rate_limited` shape, so widening it ripples well past this bound.
-    # This round's charge is comment accuracy and test rigor, not a new
-    # defect fix riding on an already-narrow, already-reviewed PARK BOUND
-    # change; conflating the two works against reviewability. Tracked as a
-    # follow-up, not fixed here.
+    #  age@fail   PR park  PR blind   upstream park  upstream blind
+    #         0      4500         0            3600               0
+    #      2701      4500         1            3600               0   <- +1s
+    #      3600      4500       900            3600               0   <- +900s
+    #      5000      4500      2300            3600            1400   <- +900s
+    #
+    # Onset moves from age 3600 (upstream) to age 2700 (this PR) — 900s
+    # earlier — and every age past onset is a flat +900s worse than
+    # upstream. This is reachable with no contrived staleness: after one 429
+    # block the row's age at the next failure IS the park length, so a real
+    # chain of blocks compounds it (see `test_park_bound_blind_window_
+    # equals_age_at_failure`'s 429-arm cases and the DECISION note below).
+    # `autoswitch.py` reads a blind row as `active_headroom is None` and
+    # turns it into failover pressure — the exact downstream consequence
+    # round 6 was written to remove, and on the 429 arm this PR makes it
+    # worse than upstream, not merely pre-existing.
+    #
+    # DECISION: left open in this PR, not closed, WITH the true 429 numbers
+    # above (not the ones an earlier round of this comment cited). The
+    # honest fix is `min(asked, ceiling - age_at_failure)`, which needs
+    # `_failure_backoff_s` to know the row's age at the moment it failed — a
+    # real signature change. `record()` is its only production caller, but
+    # well over a dozen tests across this file and `tests/test_autoswitch.py`
+    # call `_failure_backoff_s` directly against its current
+    # two-positional-plus-`rate_limited` shape, so widening it ripples well
+    # past this bound. This round's charge is comment accuracy and test
+    # rigor, not a new defect fix riding on an already-narrow,
+    # already-reviewed PARK BOUND change; conflating the two works against
+    # reviewability. Tracked as a follow-up, not fixed here.
     asked = min(asked, RETRY_AFTER_FLOOR_CAP_S if rate_limited else TRUST_MAX_AGE_S)
     # NO TRUST TRIM AGAINST THE SERVER'S DEADLINE. Cutting a 429 wait back to
     # the deadline when the stored trust expires first cannot salvage that
@@ -645,10 +689,11 @@ def _failure_backoff_s(
     # `wait >= ask`, so the row is untrusted at release either way (measured:
     # fired 35 of 180 offsets, salvaged 0). It only lands us on the deadline,
     # where 10 of 19 lapses re-block for a fresh hour (as measured when this
-    # was derived — the re-block fraction has since moved to 21 of 36
-    # (re-measured 2026-08-03, corrected method: see RETRY_AFTER_MARGIN_S);
-    # the episode model below is not re-derived at the new fraction, since it
-    # concerns the removed 429 trust-trim and is out of the live path).
+    # was derived — the re-block fraction has since moved to 20 of 35
+    # (re-measured 2026-08-03, method corrected round 8: see
+    # RETRY_AFTER_MARGIN_S); the episode model below is not re-derived at the
+    # new fraction, since it concerns the removed 429 trust-trim and is out
+    # of the live path).
     # Episode model on the original number, 3600 runs:
     #
     #     with the trim    blind 1148s   requests 1.21

@@ -398,15 +398,18 @@ class TestBackoff:
     def test_hour_scale_margin_clears_the_measured_re_block_band(self):
         # Honoring Retry-After *exactly* puts the retry on the deadline itself,
         # where the server is not reliably ready: measured over this machine's
-        # log (re-measured 2026-08-03, method in the RETRY_AFTER_MARGIN_S
-        # comment), 21 of 36 block lapses re-blocked within 900s of their own
-        # deadline (+2s … +887s) and each cost a fresh full hour, while the
-        # next one after that is +1004s. ("21 of 36", not "of 38": 2 of the 38
-        # raw gaps are negative, a clock/ordering clustering artifact excluded
-        # from both numerator and denominator so the fraction stays
-        # apples-to-apples.) On the hour-scale block that produced that
-        # evidence, the margin must clear the whole 900s band (13s of
-        # clearance: 900 - 887).
+        # log (re-measured 2026-08-03, round 8, method in the
+        # RETRY_AFTER_MARGIN_S comment), 20 of 35 block lapses re-blocked
+        # within 900s of their own deadline (+2s … +887s) and each cost a
+        # fresh full hour, while the next one after that is +1004s. ("20 of
+        # 35", not "of 38": 3 of the 38 raw gaps are negative — the server
+        # revising a block's deadline forward mid-block, not a clock/ordering
+        # artifact — excluded from both numerator and denominator so the
+        # fraction stays apples-to-apples; the prior "21 of 36"/"2 of 38"
+        # figures here did not reproduce under the method as stated and are
+        # corrected.) On the hour-scale block that produced that evidence,
+        # the margin must clear the whole 900s band (13s of clearance:
+        # 900 - 887).
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 >= 900.0
 
     def test_a_short_accurate_block_is_not_inflated(self):
@@ -436,7 +439,8 @@ class TestBackoff:
         # The budget is account-scoped, so a second machine polling into a block
         # another one opened sees only the remainder: that is the normal case,
         # not an edge (34 of 75 observed 429s were mid-block, re-measured
-        # 2026-08-03, method in the RETRY_AFTER_MARGIN_S comment). A margin
+        # 2026-08-03, round 8, method in the RETRY_AFTER_MARGIN_S comment).
+        # A margin
         # computed as a FRACTION of the remainder shrinks toward zero as the
         # deadline nears — the 0.25 fraction this replaces made a 1800s
         # remainder land +450s and a 900s remainder land +225s, both inside
@@ -464,10 +468,10 @@ class TestBackoff:
         What it did do is drop the wait onto the deadline, which is where the
         measured evidence says we re-block 10 of 19 times for a fresh hour (as
         measured when this was derived — the re-block fraction has since
-        moved to 21 of 36, re-measured 2026-08-03, corrected method; this
-        episode model concerns the removed 429 trust-trim, out of the live
-        path, and is not re-derived at the new fraction). Episode model on
-        the original number, 3600 runs:
+        moved to 20 of 35, re-measured 2026-08-03, method corrected round 8;
+        this episode model concerns the removed 429 trust-trim, out of the
+        live path, and is not re-derived at the new fraction). Episode model
+        on the original number, 3600 runs:
 
             with the trim    blind 1148s   requests 1.21
             without it       blind  550s   requests 1.00
@@ -783,16 +787,31 @@ class TestBackoff:
         non-429 arm where the park cap equals TRUST_MAX_AGE_S (3600)
         exactly, so the gap is the whole story rather than diluted by 429
         trust's extra slack. `age_at_fail=0` is the CONTROL: no gap.
+
+        The non-429 rows below are also the CONTROL for the 429-arm rows
+        that follow: identical harness, only `error` differs, so any drift
+        here would show the probe itself moved rather than the arm under
+        test. On the 429 arm (`RETRY_AFTER_FLOOR_CAP_S` 4500 vs the non-429
+        arm's `TRUST_MAX_AGE_S` 3600, both bounded by
+        `RATE_LIMIT_TRUST_MAX_AGE_S` 7200) the identity `blind ==
+        age_at_fail` does NOT hold -- the cap and the trust ceiling are
+        different constants there, so
+        `blind = age_at_fail - (ceiling - park) = age_at_fail - 2700`. This
+        PR raises the 429 cap 3600 -> 4500, which moves the 429 blind onset
+        900s earlier (age 3600 -> 2700) and adds a flat +900s at every age
+        past that, compared to upstream. See the PARK BOUND comment.
         """
         IDENT_1 = {"1": ("a@example.com", "")}
 
-        def blind_window(age_at_fail: float, ask: float) -> float:
+        def blind_window(age_at_fail: float, ask: float, error: str = "http-500") -> float:
             clock = FakeClock()
-            store = UsageStore(tmp_path / f"cache-{age_at_fail}-{ask}", clock=clock)
+            store = UsageStore(
+                tmp_path / f"cache-{error}-{age_at_fail}-{ask}", clock=clock
+            )
             store.record({"1": FetchRecord(usage={"five_hour": {"pct": 1.0}})}, IDENT_1)
             clock.advance(age_at_fail)
             store.record(
-                {"1": FetchRecord(error="http-500", retry_after_s=ask)}, IDENT_1
+                {"1": FetchRecord(error=error, retry_after_s=ask)}, IDENT_1
             )
             park_end = store.entries(IDENT_1)["1"].backoff_until
             assert park_end is not None
@@ -808,7 +827,8 @@ class TestBackoff:
             clock.now = park_end
             return 0.0 if blind_start is None else park_end - blind_start
 
-        # (age_at_fail, ask, expected blind window)
+        # (age_at_fail, ask, expected blind window) -- non-429 arm, also the
+        # CONTROL for the 429-arm cases below.
         cases = [
             (0.0, 5000.0, 0.0),  # CONTROL: fresh at failure, no gap
             (1.0, 5000.0, 1.0),
@@ -825,6 +845,25 @@ class TestBackoff:
             assert blind == pytest.approx(expected, abs=2.0), (
                 f"age@fail={age_at_fail:.0f} ask={ask:.0f}: blind window "
                 f"{blind:.0f}s, expected {expected:.0f}s"
+            )
+
+        # 429 ARM (rate_limited) -- `blind = age_at_fail - 2700`, clamped to
+        # [0, park]. `ask=5000` (not 3600) is deliberate: at ask=3600 the
+        # margin-adjusted ask (4500) already sits exactly on
+        # RETRY_AFTER_FLOOR_CAP_S, so the row would read the same whether the
+        # cap were 4500 or 7200 -- an ask above 3600 is needed for the cap to
+        # actually bind and for mutation M5 (cap -> 7200) to move this test.
+        rate_limited_cases = [
+            (0.0, 5000.0, 0.0),  # CONTROL: fresh at failure, no gap
+            (2701.0, 5000.0, 1.0),
+            (3600.0, 5000.0, 900.0),
+            (5000.0, 5000.0, 2300.0),
+        ]
+        for age_at_fail, ask, expected in rate_limited_cases:
+            blind = blind_window(age_at_fail, ask, error="http-429")
+            assert blind == pytest.approx(expected, abs=2.0), (
+                f"[429 arm] age@fail={age_at_fail:.0f} ask={ask:.0f}: blind "
+                f"window {blind:.0f}s, expected {expected:.0f}s"
             )
 
 

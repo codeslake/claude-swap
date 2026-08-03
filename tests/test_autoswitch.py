@@ -184,6 +184,46 @@ def harness(temp_home: Path) -> EngineHarness:
     return h
 
 
+class TestEngineHarnessIsolation:
+    """Pins the guarantee `EngineHarness.__init__`'s per-instance
+    `XDG_DATA_HOME` scoping exists for (see its docstring): two harnesses
+    built against the SAME `temp_home` must not resolve to the same store.
+
+    I2 (round-8 review): the prior form of this guard had no test that could
+    kill it — reverting the scoping left the full suite green (round-7's
+    `test_a_non_429_recorded_through_record_does_not_take_the_margin` no
+    longer depends on it; that test's premise now stands on its own
+    `record()` call). Without a test, a future cleanup could delete the
+    `patch.dict` silently, and the next multi-harness test would alias two
+    accounts' stores into one without any assertion noticing.
+    """
+
+    def test_two_harnesses_on_one_temp_home_get_distinct_stores(self, temp_home):
+        # Two DIFFERENT subtrees of the same temp_home, matching the
+        # existing multi-harness usage pattern (see decision_at() in
+        # TestAdaptiveScheduler) — EngineHarness scopes XDG_DATA_HOME off
+        # the exact temp_home argument it is given, not off a shared
+        # ambient one, so distinct subtrees are what the guard promises to
+        # keep separate.
+        h1 = EngineHarness(temp_home / "h1")
+        h2 = EngineHarness(temp_home / "h2")
+        assert h1.switcher.backup_dir != h2.switcher.backup_dir, (
+            f"both harnesses resolved to {h1.switcher.backup_dir} — "
+            "EngineHarness.__init__'s XDG_DATA_HOME scoping is not doing "
+            "its job, so two harnesses alias each other's sequence.json/"
+            "credentials/cache"
+        )
+
+        h1.seed(1, "a@example.com")
+        h2.seed(1, "z@example.com")
+        assert h1.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "a@example.com"
+        ), "h2's seed() bled into h1's store"
+        assert h2.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "z@example.com"
+        ), "h1's seed() bled into h2's store"
+
+
 class TestDecisionTable:
     def test_below_threshold_is_no_action(self, harness):
         outcome = harness.tick_with_usage({
@@ -1020,9 +1060,11 @@ class TestAdaptiveScheduler:
         Measured, the trim never salvaged the trust — the row is unknown at
         release either way (see
         `test_a_429_wait_is_the_deadline_plus_the_margin`) — while landing on
-        the deadline re-blocks 21 of 36 times for a fresh hour (re-measured
-        2026-08-03; of 36, not 38 raw gaps — 2 are negative clock/ordering
-        artifacts, excluded from both numerator and denominator).
+        the deadline re-blocks 20 of 35 times for a fresh hour (re-measured
+        2026-08-03, round 8; of 35, not 38 raw gaps — 3 are negative, the
+        server revising a block's deadline forward mid-block rather than a
+        clock/ordering artifact, excluded from both numerator and
+        denominator).
 
         So the wait stays deadline + margin whatever the scoped window says.
         What the scoped window still decides is whether the row SERVES its
@@ -1119,7 +1161,7 @@ class TestAdaptiveScheduler:
         )
         assert landed >= block_s + RETRY_AFTER_MARGIN_S, (
             f"the last retry lands at deadline+{landed - block_s:.0f}s, inside "
-            f"the +2..{RETRY_AFTER_MARGIN_S:.0f}s band where 21 of 36 measured "
+            f"the +2..{RETRY_AFTER_MARGIN_S:.0f}s band where 20 of 35 measured "
             "lapses re-blocked for a fresh hour"
         )
 
@@ -1130,8 +1172,11 @@ class TestAdaptiveScheduler:
         # exactly ON `RETRY_AFTER_FLOOR_CAP_S`, so the loop above passes
         # identically whether the PARK BOUND is applied or not — confirmed by
         # mutation (removing the PARK BOUND entirely still leaves this test
-        # green; orchestrator's own measurement: exactly 1 test in the full
-        # suite dies without it, and this was not that test). An ask
+        # green; re-measured 2026-08-03: 9 tests in the full suite die
+        # without it, INCLUDING this test's own second assertion below — so
+        # "and this was not that test" no longer holds; the loop above is
+        # still one of the 9 that stays green without the bound, which is
+        # exactly why this second assertion earns its keep). An ask
         # genuinely past the cap (4000s: 4000 + 900 = 4900, uncapped) is
         # needed to tell the two apart.
         from claude_swap.usage_store import (
@@ -1151,10 +1196,11 @@ class TestAdaptiveScheduler:
         """A 429 wait must clear the WHOLE measured re-block band, not just
         avoid landing inside a window sized by the very margin under test.
 
-        RETRY_AFTER_MARGIN_S is 900 because 21 of 36 measured lapses
+        RETRY_AFTER_MARGIN_S is 900 because 20 of 35 measured lapses
         re-blocked at +2s..+887s past their own deadline (re-measured
-        2026-08-03; "of 36" not "of 38": 2 of the 38 raw gaps are negative
-        clock/ordering clustering artifacts, excluded from both numerator and
+        2026-08-03, round 8; "of 35" not "of 38": 3 of the 38 raw gaps are
+        negative — the server revising a block's deadline forward mid-block,
+        not a clock/ordering artifact — excluded from both numerator and
         denominator), each earning a fresh hour. So `(deadline, deadline +
         900)` — the MEASURED band, a literal, independent of whatever
         `RETRY_AFTER_MARGIN_S` happens to be configured to — is the interval
