@@ -753,8 +753,13 @@ def heal(switcher) -> tuple[bool, str]:
     impl = _live_impl()
     if impl is not None:
         try:
+            # Covers BOTH halves: restart a daemon that died, and re-wire a
+            # daemon that is serving while the config names nothing. The second
+            # is the state a recovery leaves behind — the wiring was removed to
+            # save the session, and without this the pin never comes back on
+            # its own.
             if impl.heal(switcher.backup_dir):
-                return True, "Restarted the cloud pin proxy"
+                return True, "Restored the cloud pin"
         except Exception:  # noqa: BLE001 — fall through to the safe outcome
             pass
         # The restart may have succeeded while returning False (it also uses
