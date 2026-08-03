@@ -4145,11 +4145,14 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # comment is explicitly not describing (measured on both).
     #
     # `funcName` is chosen because a lineno key is BRITTLE, not because it
-    # cannot discriminate. Deliberately not quoting the numbers here: EVERY
-    # round that has edited this comment moved the two sites it would key on,
-    # by editing COMMENTS in `pin.py` and nothing else — twice in the two
-    # rounds that wrote and then revised this very paragraph. That is the
-    # brittleness, demonstrated on this sentence — a lineno key pins the
+    # cannot discriminate. Deliberately not quoting the numbers here: the two
+    # rounds that wrote and then revised this paragraph each moved a site it
+    # would key on — the lock WARNING 588 -> 633 -> 648 — by editing COMMENTS
+    # in `pin.py` and nothing else. Not every site and not every round: the
+    # getter site below has sat at one line since this class was written, and
+    # the round that de-numbered this passage moved nothing at all. One site
+    # moving twice under comment edits is the brittleness — a lineno key pins
+    # the
     # guard to the file's current layout instead of to the fact it is about.
     # `stacklevel=2` is what makes `funcName` the CALLER, which is that fact.
     _PER_TICK_SITES = ("_wiring_present", "_wired_ports")
@@ -4574,8 +4577,9 @@ class TestTheSelfLimitingCallSiteStillWarns:
     THE SELF-LIMITATION IS CONDITIONAL, and it is the condition the WARNING
     exists to explain. Measured through the real CLI, 10 ticks each: nothing
     wired 0 lines; stale and removed on tick 1, 1 line; stale and UNREMOVABLE
-    (read-only config dir) 10 lines and still wired — 8.16 MiB/day at 198 B a
-    line, the `ClaudeCodeLockTimeout` shape (`pin.py` carries the derivation). Kept at
+    (read-only config dir) 10 lines and still wired — 6.06 MiB/day at 147 B a
+    line, the `PermissionError` shape, since a read-only dir with no lock dir
+    fails at `mkdir` (`pin.py` carries both rows and the derivation). Kept at
     WARNING anyway: that is a genuinely broken machine, and telling the user
     nothing is the worse failure. `clear_wiring`'s own call site carries the
     arithmetic.
