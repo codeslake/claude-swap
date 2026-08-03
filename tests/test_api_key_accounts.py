@@ -506,6 +506,190 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         assert salvage[0].read_text(encoding="utf-8") == torn_bytes
 
 
+class TestATornRosterDoesNotDestroyBackups:
+    """`_get_sequence_data` answers None for ABSENT and for TORN alike.
+
+    27 sites write the result back through `or {}`, so a torn `sequence.json`
+    read as "no accounts" and the next write rebuilt the roster from nothing.
+    """
+
+    def test_add_account_refuses_instead_of_overwriting_a_live_backup(
+        self, temp_home: Path
+    ):
+        """Measured: the backup was destroyed BEFORE the crash, not by it.
+
+        `_get_next_account_number` collapsed to 1, `_write_account_credentials`
+        landed at switcher.py:2934, and only THEN did `data["accounts"][num]`
+        raise `TypeError` at :2941 — which `cli.py`'s `except
+        ClaudeSwitchError` does not catch, so `--json` emitted no envelope.
+
+            before  sha256:296e3
+            raised  TypeError    is_ClaudeSwitchError=False
+            after   sha256:6aabc
+
+        Asserts the BACKUP survives, not the exception type: a refusal that
+        still overwrote it would satisfy `pytest.raises` and lose the token.
+        """
+        s = _linux_switcher()
+        s._write_account_credentials("1", "shared@example.com", OAUTH_JSON)
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        data["accounts"]["1"] = {
+            "email": "shared@example.com", "uuid": "u1",
+            "organizationUuid": "org-A", "organizationName": "A",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        data["sequence"] = [1]
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        before = s._read_account_credentials("1", "shared@example.com")
+        assert before, "premise: slot 1 has a credential backup"
+
+        s.sequence_file.write_text(
+            s.sequence_file.read_text(encoding="utf-8")[:-12], encoding="utf-8"
+        )
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(s.sequence_file.read_text(encoding="utf-8"))
+
+        # A live login for the SAME email under a different org — what makes
+        # the collapsed slot number land on top of the resident one.
+        get_credentials_path().parent.mkdir(parents=True, exist_ok=True)
+        get_credentials_path().write_text(OAUTH_JSON, encoding="utf-8")
+        get_global_config_path().write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.com",
+                             "accountUuid": "u2",
+                             "organizationUuid": "org-B"},
+        }), encoding="utf-8")
+
+        with pytest.raises(ClaudeSwitchError):
+            s.add_account()
+
+        assert s._read_account_credentials("1", "shared@example.com") == before, (
+            "slot 1's credential backup was overwritten before the failure; "
+            "the torn roster read as an empty one"
+        )
+
+
+class TestTheSalvageKeepsItsPromise:
+    """"The bytes survive and the user knows" — three ways it did not."""
+
+    def _torn(self, s):
+        cfg = get_global_config_path()
+        real = {
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"},
+            "projects": {"/work": {"allowedTools": []}},
+            "primaryApiKey": API_KEY,
+        }
+        cfg.write_text(json.dumps(real, indent=2)[:-14], encoding="utf-8")
+        return cfg
+
+    def _seed_two(self, s):
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_config(str(num), email, json.dumps({
+                "oauthAccount": {"emailAddress": email,
+                                 "accountUuid": f"uuid-{num}"}}))
+        data = s._get_sequence_data() or {
+            "activeAccountNumber": None, "lastUpdated": "",
+            "sequence": [], "accounts": {},
+        }
+        for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+            data["accounts"][str(num)] = {
+                "email": email, "uuid": f"uuid-{num}",
+                "organizationUuid": "", "organizationName": "",
+                "added": "2024-01-01T00:00:00Z",
+            }
+            if num not in data["sequence"]:
+                data["sequence"].append(num)
+        data["sequence"].sort()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+    def test_the_salvage_does_not_widen_the_config_mode(self, temp_home: Path):
+        """`copy2` preserves the SOURCE mode, and the source is often 0644.
+
+        Measured before this: the replacement got 0600 from `_write_json` while
+        the salvage kept 0644 and held `primaryApiKey` — cswap created a
+        world-readable copy of the user's secret. Asserts the MODE, because a
+        salvage that exists and leaks is worse than none.
+        """
+        s = _linux_switcher()
+        self._seed_two(s)
+        cfg = self._torn(s)
+        cfg.chmod(0o644)
+
+        s.switch_to("2", json_output=True)
+
+        salvage = [
+            q for q in cfg.parent.iterdir()
+            if q.name.startswith(f"{cfg.name}.unreadable-")
+        ]
+        assert len(salvage) == 1
+        # The torn file is truncated mid-key, so the FULL key is not in it.
+        # Match the prefix instead: what matters is that secret material is
+        # present, not that it survived intact.
+        assert "sk-ant-api03-" in salvage[0].read_text(encoding="utf-8"), (
+            "premise: the salvage holds secret material"
+        )
+        assert salvage[0].stat().st_mode & 0o777 == 0o600, (
+            f"salvage is {oct(salvage[0].stat().st_mode & 0o777)} — the secret "
+            "is readable by anyone on the box"
+        )
+
+    def test_a_second_failure_does_not_overwrite_the_first_salvage(
+        self, temp_home: Path
+    ):
+        """`get_timestamp()` is second-resolution and `copy2` overwrites.
+
+        Two failed switches inside one second left ONE file, so the FIRST
+        user's data was unrecoverable — and a retry is exactly what a user does
+        next. Both copies must survive.
+        """
+        s = _linux_switcher()
+        self._seed_two(s)
+        cfg = self._torn(s)
+        first_bytes = cfg.read_text(encoding="utf-8")
+
+        s.switch_to("2", json_output=True)
+        cfg.write_text(json.dumps({"second": True})[:-2], encoding="utf-8")
+        s.switch_to("1", json_output=True)
+
+        salvage = sorted(
+            q for q in cfg.parent.iterdir()
+            if q.name.startswith(f"{cfg.name}.unreadable-")
+        )
+        assert len(salvage) == 2, (
+            f"{len(salvage)} salvage file(s) — the retry overwrote the first"
+        )
+        assert any(
+            q.read_text(encoding="utf-8") == first_bytes for q in salvage
+        ), "the FIRST failure's bytes are gone"
+
+    def test_human_mode_is_told_the_config_was_salvaged(
+        self, temp_home: Path, capsys
+    ):
+        """`warnings_out` is rendered only by the JSON envelope.
+
+        In human mode the user saw "Activated Account-2" and nothing else while
+        `projects` was gone from the live config. Every other
+        `warnings_out.append` in `_perform_switch` is paired with an
+        `if emit_output: warning(msg)`.
+        """
+        s = _linux_switcher()
+        self._seed_two(s)
+        self._torn(s)
+
+        s.switch_to("2")                      # human mode: json_output False
+        out = capsys.readouterr()
+        assert "could not be parsed" in (out.out + out.err), (
+            f"stdout={out.out!r} stderr={out.err!r} — nothing told the user a "
+            "copy was kept"
+        )
+
+
 class TestADeniedKeychainSurvivesAnUnreadableFallbackFile:
     """Keychain denied AND the fallback file unreadable is the MOST unreadable
     state there is, and it reported as a clean slot.
