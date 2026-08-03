@@ -4066,11 +4066,16 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     swallow a raise with no record — `clear_wiring` logged, `_wiring_present`
     and `_wired_ports` said nothing.
 
-    The record is at DEBUG, not WARNING, and there is no cap. See
-    `_warn_unresolvable_once`: a once-per-PROCESS cap suppresses nothing when
-    every statusline tick is a fresh `cswap pin --heal`, and a WARNING on the
-    two getters `heal` calls unconditionally turned "1 line ever" into "1 line
-    per tick" — measured through the real CLI, 0 -> 6 lines over 6 ticks.
+    THE LEVEL IS PER CALL SITE, and there is no cap. A once-per-PROCESS cap
+    suppresses nothing when every statusline tick is a fresh `cswap pin
+    --heal`, and a WARNING on the two getters `heal` calls unconditionally
+    turned "1 line ever" into "1 line per tick" — measured through the real
+    CLI, 0 -> 6 lines over 6 ticks. So those two record at DEBUG.
+
+    `clear_wiring` is the exception and warns: `heal` reaches it only through
+    `_wiring_is_stale`, and it is the only place naming WHY a wiring could not
+    be removed. Dropping it to DEBUG with the other two is the round-13
+    overcorrection `TestTheSelfLimitingCallSiteStillWarns` exists to catch.
     """
 
     def _no_home(self, monkeypatch):
@@ -4111,14 +4116,31 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
             for r in caplog.records
         ), f"{name} swallowed an unresolvable getter with no record at all"
 
-    def test_no_call_site_emits_a_WARNING(self, tmp_path, monkeypatch, caplog):
-        """The level is the whole point: WARNING here is per-tick log churn."""
+    # The two getters `heal` calls UNCONDITIONALLY, on every tick. Their level
+    # is what the churn measurement is about. `clear_wiring` is deliberately
+    # absent: `heal` reaches it only through `_wiring_is_stale`.
+    #
+    # BOTH TESTS BELOW KEY ON `record.funcName`, NOT ON LEVEL, and not on
+    # `lineno`/`pathname` either. Every one of these records is emitted from
+    # the SAME line of the SAME file (`_log_unresolvable`'s `_logger.log`), so
+    # a filter written on the record's location cannot tell the churning call
+    # sites from the self-limiting one and is the same guard-that-passes-for-
+    # the-wrong-reason in a new disguise. `stacklevel=2` on that `log` call
+    # makes `funcName` the CALLER, which is the fact these tests are about.
+    _PER_TICK_SITES = ("_wiring_present", "_wired_ports")
+
+    def _heal(self, tmp_path, monkeypatch, caplog, *, wired):
+        """One `heal` tick with an unresolvable `Path.home()`, wired or not."""
         import logging
         import types
 
         from claude_swap import pin
 
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+        # `_cfg`, not a hand-rolled dict: it is the one place that decides the
+        # marker list, and a fixture writing `[]` describes a config the code
+        # never looks at twice (see its docstring).
+        cfg_dir = _cfg(tmp_path, "session", _dead_port()).parent if wired else tmp_path
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
         self._no_home(monkeypatch)
         monkeypatch.setattr(pin, "_live_impl", lambda: None)
         sw = types.SimpleNamespace(
@@ -4127,18 +4149,71 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         )
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
             pin.heal(sw)
+        return caplog.records
 
+    def test_the_per_tick_getters_stay_below_INFO(self, tmp_path, monkeypatch, caplog):
+        """The level is the whole point: WARNING here is per-tick log churn."""
+        import logging
+
+        records = self._heal(tmp_path, monkeypatch, caplog, wired=False)
+
+        per_tick = [r for r in records if r.funcName in self._PER_TICK_SITES]
+        # NOT VACUOUS. An origin filter that matches nothing passes for free,
+        # which is precisely how the level-only version of this test passed:
+        # with nothing wired, `_wiring_is_stale` is False and `heal` never
+        # calls `clear_wiring` at all, so the assertion below was never once
+        # applied to the call site whose level it was written to pin.
+        assert per_tick, (
+            "no unresolvable-getter record came from "
+            f"{self._PER_TICK_SITES} — this tick never reached them, so the "
+            f"level assertion below proves nothing. Origins seen: "
+            f"{sorted({r.funcName for r in records})}"
+        )
         # BELOW INFO, not merely below WARNING. The logger sits at INFO by
         # default (`logging_config.setup_logging`), so an INFO record reaches
         # the rotating file on every tick exactly as the WARNING did —
         # measured: `debug` -> `info` passes all 128 tests while the real CLI
         # writes 12 lines over 6 ticks. A guard keyed on WARNING lets the
         # regression land again with CI green.
-        loud = [r for r in caplog.records if r.levelno >= logging.INFO]
+        loud = [r for r in per_tick if r.levelno >= logging.INFO]
         assert not loud, (
-            "an unresolvable getter logged at or above INFO — the default "
-            f"logger level, so this reaches the file every tick: "
-            f"{[(r.levelname, r.getMessage()) for r in loud]}"
+            "a getter `heal` calls unconditionally logged at or above INFO — "
+            "the default logger level, so this reaches the file every tick: "
+            f"{[(r.funcName, r.levelname, r.getMessage()) for r in loud]}"
+        )
+
+    def test_a_tick_with_work_warns_once_and_only_from_clear_wiring(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The other direction, on the ordinary shape when `heal` has work.
+
+        The unwired tick above cannot see this: it never reaches
+        `clear_wiring`. Harden its fixture with a wiring — a natural
+        improvement — and the level-only assertion went red on this PR's own
+        intended WARNING, which reads as "the WARNING is wrong" and invites
+        the all-DEBUG regression back.
+        """
+        import logging
+
+        records = self._heal(tmp_path, monkeypatch, caplog, wired=True)
+
+        # EVERY record at INFO+, not just the pin's own call sites: churn is
+        # origin-agnostic, and any INFO+ line on `heal`'s path is paid 43200
+        # times a day. So one assertion covers both halves — `clear_wiring`
+        # warns exactly once, and nothing else on the tick does.
+        #
+        # KEYED ON ORIGIN so it cannot blame the wrong code for the extra.
+        # `claude_locks` logs to this same logger and `proper_lockfile`'s
+        # release WARNING lands in this same window (`clear_wiring` takes that
+        # lock). Measured with the release `rmdir` forced to fail: the
+        # level-only assertion reported it as "an unresolvable getter logged
+        # at or above INFO", while this one reports
+        # `[('clear_wiring', 30), ('proper_lockfile', 30)]` and names it.
+        loud = [(r.funcName, r.levelno) for r in records if r.levelno >= logging.INFO]
+        assert loud == [("clear_wiring", logging.WARNING)], (
+            "a tick with work to do must warn exactly once, from the ONE call "
+            "site gated behind `_wiring_is_stale` — it is the only place "
+            f"naming WHY a wiring could not be removed. Got: {loud}"
         )
 
 
@@ -4332,11 +4407,11 @@ class TestTheWarningDoesNotFireOnEveryTick:
 class TestTheSelfLimitingCallSiteStillWarns:
     """`clear_wiring` is the ONE call site where WARNING was always correct.
 
-    `heal` reaches it only through `_wiring_is_stale`, which goes false the
-    moment the wiring is removed — so it logs once and goes quiet. The two
-    getters `heal` calls UNCONDITIONALLY (`_wiring_present`, `_wired_ports`)
-    are what produced per-tick churn when I put WARNING on them: 12 lines
-    over 6 ticks through the real CLI.
+    `heal` reaches it only through `_wiring_is_stale`, which goes false ONCE
+    THE REMOVAL SUCCEEDS — so it logs once and goes quiet. The two getters
+    `heal` calls UNCONDITIONALLY (`_wiring_present`, `_wired_ports`) are what
+    produced per-tick churn when I put WARNING on them: 12 lines over 6 ticks
+    through the real CLI.
 
     Dropping everything to DEBUG fixed the churn and threw this away with it.
     A user whose `~/.claude` becomes unreadable then gets "could not be
@@ -4344,9 +4419,13 @@ class TestTheSelfLimitingCallSiteStillWarns:
     the log naming the cause. Before the regression, one WARNING named the
     getter and the errno.
 
-    Measured for the split: 0 lines/tick in the ordinary case, and in the
-    pathological one (raising getter AND a wiring that cannot be removed) 6
-    over 6 ticks — which is a condition a human genuinely needs to see.
+    THE SELF-LIMITATION IS CONDITIONAL, and it is the condition the WARNING
+    exists to explain. Measured through the real CLI, 10 ticks each: nothing
+    wired 0 lines; stale and removed on tick 1, 1 line; stale and UNREMOVABLE
+    (read-only config dir) 10 lines and still wired — 6.80 MB/day. Kept at
+    WARNING anyway: that is a genuinely broken machine, and telling the user
+    nothing is the worse failure. `clear_wiring`'s own call site carries the
+    arithmetic.
     """
 
     def test_clear_wiring_warns_when_it_cannot_resolve_a_config(
