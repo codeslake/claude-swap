@@ -314,8 +314,7 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # ``timeout`` is a TOTAL, not a per-file allowance. Passing it to each
     # acquisition made the real worst case a multiple of the number of
     # configs, so the launch path's sub-second cap silently became ~2x that
-    # (measured: 1.37-1.64s against a documented 0.5s). The second file gets
-    # whatever the first left.
+    # (measured: 1.37-1.64s against a documented 0.5s).
     import time as _time
 
     # An UNTIMED call still gets a total. Leaving `None` meant each config
@@ -329,13 +328,26 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
         timeout = DEFAULT_TIMEOUT_S
     deadline = _time.monotonic() + timeout
     changed = False
-    for path in paths:
+    for i, path in enumerate(paths):
         left = deadline - _time.monotonic()
         if left <= 0:
             continue  # budget spent; the next launch heals what is left
+        # FAIR SHARE of what remains, not "however much is left". Handing the
+        # first path the whole remaining budget let a config that stayed
+        # contended for the entire call consume it all, so a SECOND path
+        # whose lock was completely free was skipped by the `left <= 0` check
+        # above without ever being tried. Measured: session lock held for the
+        # full 0.5s budget, `clear_wiring` returned False with BOTH configs
+        # still wired.
+        #
+        # Dividing by how many paths are still untried gives each one at
+        # least an equal slice of whatever time remains when its turn comes,
+        # while the running total can still never exceed `timeout` — each
+        # share is carved out of `left`, never added to it.
+        share = left / (len(paths) - i)
         try:
             with proper_lockfile(
-                path.parent / (path.name + ".lock"), timeout=left
+                path.parent / (path.name + ".lock"), timeout=share
             ):
                 if _clear_wiring_locked(switcher, path):
                     changed = True
