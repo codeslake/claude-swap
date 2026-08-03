@@ -168,11 +168,13 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
 # would lie to the caller. The other two are excluded deliberately: a REMOVED
 # slot has nothing left to activate, and a CAS CONFLICT left the slot holding
 # a racing writer's newer valid lineage — freshened, which is the opposite of
-# what this demotion denies.
+# what this demotion denies. An UNREADABLE store is neither: the CAS could not
+# be evaluated at all, so the slot may still hold the spent generation.
 _DEMOTING_STASH_REASONS = (
     "consume-gate-persist-failed",
     "consume-gate-persist-lock-failed",
     "consume-gate-unpersisted",
+    "consume-gate-store-unreadable",
 )
 
 ERROR_NOTES = {
@@ -2141,10 +2143,25 @@ class ClaudeAccountSwitcher:
         try:
             try:
                 with FileLock(self.lock_file):
-                    store_now = self._read_account_credentials(
-                        account_num, email
+                    store_now, store_unreadable = (
+                        self._read_account_credentials_ex(account_num, email)
                     )
-                    if not store_now:
+                    if store_unreadable:
+                        # The Keychain locked during the POST (macOS screen
+                        # lock is ~1s away at any moment). The CAS cannot be
+                        # evaluated: writing back could clobber a racing
+                        # writer, and the plain reader's `""` would otherwise
+                        # be read as "the slot was emptied", whose reason is
+                        # deliberately NOT demoting. The grant IS spent and
+                        # the slot may still hold the generation that spent
+                        # it, so this must stash AND demote.
+                        stash_successor(
+                            "consume-gate-store-unreadable",
+                            "Account %s's stored credential was unreadable "
+                            "(keychain) after a refresh POST; successor "
+                            "stashed, nothing rewritten.",
+                        )
+                    elif not store_now:
                         # The slot was emptied mid-POST (remove-account):
                         # writing the successor back would resurrect
                         # credentials the user just deleted. Park it
@@ -4361,12 +4378,25 @@ class ClaudeAccountSwitcher:
         if entry is None:
             return False
         is_active = num == self.current_account_number()
+        # The backup is a stored source on BOTH paths — directly when idle,
+        # and as _entry_token_dead's second source when active. An unreadable
+        # one is not an absent one, and here the difference is destructive in
+        # both directions: on the idle path `credential_fingerprint("")` is
+        # None, `token_dead` skips its binding check entirely on a None
+        # stored_fp and the slot reads DEAD; on the active path
+        # _entry_token_dead deliberately HOLDS the strike it cannot disprove,
+        # which is right for the collectors and wrong here. Both land on
+        # `import_accounts` replacing a healthy slot's credential without
+        # --force. We cannot see the generation, so we cannot condemn it.
+        backup, unreadable = self._read_account_credentials_ex(num, email)
+        if unreadable:
+            return False
         # The stored source, as _build_accounts_info reports it: the LIVE
         # credential for the active slot, the backup otherwise.
         stored = (
             (self._store._read_active_credentials().value or "")
             if is_active
-            else (self._read_account_credentials(num, email) or "")
+            else backup
         )
         return self._entry_token_dead(entry, num, email, stored, is_active)
 
@@ -4393,7 +4423,18 @@ class ClaudeAccountSwitcher:
             return True
         if not is_active:
             return False
-        backup = self._read_account_credentials(num, email)
+        backup, unreadable = self._read_account_credentials_ex(num, email)
+        if unreadable:
+            # The second source cannot be seen, so "no stored source matches
+            # the struck generation" is unproven — and the caller's `elif`
+            # spends that answer on `clear_dead_token`, which zeroes
+            # authDeadStrikes AND struckFingerprint in the PERSISTED store.
+            # One momentary lock would un-quarantine a genuinely dead account
+            # permanently and resume POSTing its dead grant. Holding the
+            # strike costs one pass of "re-login needed" on a row that
+            # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
+            # the quarantine itself.
+            return True
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )
