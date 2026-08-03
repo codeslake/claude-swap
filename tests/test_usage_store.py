@@ -398,16 +398,18 @@ class TestBackoff:
     def test_hour_scale_margin_clears_the_measured_re_block_band(self):
         # Honoring Retry-After *exactly* puts the retry on the deadline itself,
         # where the server is not reliably ready: measured over this machine's
-        # log, 10 of 19 post-fix block lapses re-blocked within 900s of their
-        # own deadline (+2s … +716s) and each cost a fresh full hour, while the
-        # next one after that is +3853s. On the hour-scale block that produced
-        # that evidence, the margin must clear the whole 900s band.
+        # log (re-measured 2026-08-03), 10 of 23 block lapses re-blocked
+        # within 900s of their own deadline (+2s … +715s) and each cost a
+        # fresh full hour, while the next one after that is +1004s. On the
+        # hour-scale block that produced that evidence, the margin must clear
+        # the whole 900s band.
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 >= 900.0
 
     def test_a_short_accurate_block_is_not_inflated(self):
-        # The re-block evidence is entirely hour-scale (37 of 39 blocks opened
-        # at exactly 3600), while short blocks were separately measured as
-        # accurate — Retry-After 300 meant a 300s block. Inflating those on no
+        # The re-block evidence is entirely hour-scale (40 of 42 blocks
+        # opened at exactly 3600, re-measured 2026-08-03), while short blocks
+        # were separately measured as accurate — Retry-After 300 meant a
+        # 300s block. Inflating those on no
         # evidence is still wrong; the margin now stays off them by applying
         # only ABOVE BACKOFF_CAP_S (strictly — an ask OF exactly that is what
         # the saturated curve already waits) rather than by scaling with the ask.
@@ -429,8 +431,9 @@ class TestBackoff:
         # countdown to it — so what the server reports depends on WHEN we ask.
         # The budget is account-scoped, so a second machine polling into a block
         # another one opened sees only the remainder: that is the normal case,
-        # not an edge (35 of 72 observed 429s were mid-block). A margin computed
-        # as a FRACTION of the remainder shrinks toward zero as the deadline
+        # not an edge (33 of 75 observed 429s were mid-block, re-measured
+        # 2026-08-03). A margin computed as a FRACTION of the remainder
+        # shrinks toward zero as the deadline
         # nears — the 0.25 fraction this replaces made a 1800s remainder land
         # +450s and a 900s remainder land +225s, both inside the measured
         # +2s..+716s re-block band. An absolute margin does not decay.
@@ -454,8 +457,11 @@ class TestBackoff:
         BOTH waits released with the row unknown.
 
         What it did do is drop the wait onto the deadline, which is where the
-        measured evidence says we re-block 10 of 19 times for a fresh hour.
-        Episode model on that number, 3600 runs:
+        measured evidence says we re-block 10 of 19 times for a fresh hour (as
+        measured when this was derived — the re-block fraction has since
+        moved to 10 of 23; this episode model concerns the removed 429
+        trust-trim, out of the live path, and is not re-derived at the new
+        fraction). Episode model on the original number, 3600 runs:
 
             with the trim    blind 1148s   requests 1.21
             without it       blind  550s   requests 1.00
@@ -492,10 +498,10 @@ class TestBackoff:
         `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
 
         That leaves 2700s of slack in which the constant can drift silently, so
-        the arithmetic identity its comment states ("37 of 39 observed blocks
-        opened at exactly 3600, and 3600 + 900 = this") is pinned outright
-        below. The inequality stays as the invariant that explains WHY the
-        margin is 429-only.
+        the arithmetic identity its comment states ("40 of 42 observed blocks
+        opened at exactly 3600, and 3600 + 900 = this" — re-measured
+        2026-08-03) is pinned outright below. The inequality stays as the
+        invariant that explains WHY the margin is 429-only.
 
         The same bound neutralises `Retry-After: inf`, which reaches
         `min(inf + 900, cap)` and is finite only because of it.
