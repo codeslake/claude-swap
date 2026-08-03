@@ -9,6 +9,7 @@ display, the ``cswap run`` session guard, and export/import of raw keys.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -608,6 +609,9 @@ class TestTheSalvageKeepsItsPromise:
         data["activeAccountNumber"] = 1
         s._write_json(s.sequence_file, data)
 
+    @pytest.mark.skipif(
+        sys.platform == "win32", reason="File permissions work differently on Windows"
+    )
     def test_the_salvage_does_not_widen_the_config_mode(self, temp_home: Path):
         """`copy2` preserves the SOURCE mode, and the source is often 0644.
 
@@ -615,6 +619,12 @@ class TestTheSalvageKeepsItsPromise:
         the salvage kept 0644 and held `primaryApiKey` — cswap created a
         world-readable copy of the user's secret. Asserts the MODE, because a
         salvage that exists and leaks is worse than none.
+
+        POSIX only, matching the six sibling mode assertions in this suite
+        (test_session, test_switcher, test_settings, test_transfer,
+        test_swap_accounts, test_paths). `_salvage_unreadable` skips the chmod
+        off POSIX for the same reason those skip the assertion: Windows has no
+        mode bits to set, and CI reported the salvage at 0o666.
         """
         s = _linux_switcher()
         self._seed_two(s)
