@@ -1771,6 +1771,24 @@ class TestHealADeadPin:
     must leave Claude working exactly as it did before the pin existed.
     """
 
+    @staticmethod
+    def _dead_port():
+        """A port nothing is listening on, obtained by binding and closing.
+
+        NOT a hardcoded number. These tests once used 36301, which is the port
+        a real pin daemon uses — so on a machine where the pin was actually
+        running they described a LIVE wiring while claiming to describe a dead
+        one, and every assertion about healing was inverted. Asking the OS for
+        a port and releasing it is the only way to be sure it is closed.
+        """
+        import socket
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
     def _sw(self, tmp_path, wired=True, pinned="cloud@example.com"):
         import types
 
@@ -1780,12 +1798,13 @@ class TestHealADeadPin:
             json.dumps({"remoteControl": {"pinnedEmail": pinned}} if pinned else {})
         )
         cfg = tmp_path / ".claude.json"
+        dead = self._dead_port()
         cfg.write_text(
             json.dumps(
                 {
                     "env": {
-                        "HTTPS_PROXY": "http://127.0.0.1:36301",
-                        "CSWAP_PIN_PORT": "36301",
+                        "HTTPS_PROXY": f"http://127.0.0.1:{dead}",
+                        "CSWAP_PIN_PORT": str(dead),
                     },
                     "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
                 }
@@ -1959,3 +1978,179 @@ class TestHealADeadPin:
         )
         monkeypatch.setattr(pin, "heal", lambda s: (True, "Removed a stale wiring"))
         assert pin.run(sw, None, heal_only=True) == 0
+
+
+class TestHealNeverTearsDownAServingPin:
+    """`heal` must ask the WIRING, not the restart's return value.
+
+    MEASURED REGRESSION: `impl.heal()` returns False for BOTH "could not
+    restart" and "already serving, nothing to do". Reading the second as the
+    first unwired a HEALTHY pin — run against a live daemon (pid alive, port
+    answering), it stripped the env block and unpinned a working session. That
+    is the same damage as the outage heal exists to fix, in the other
+    direction, and it is this codebase's signature defect: a verdict inferred
+    from a call's return instead of re-read from the state.
+    """
+
+    def _wired_to(self, tmp_path, port):
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir(exist_ok=True)
+        (backup / "settings.json").write_text(
+            json.dumps({"remoteControl": {"pinnedEmail": "c@e.com"}})
+        )
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                        "CSWAP_PIN_PORT": str(port),
+                    },
+                    "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                }
+            )
+        )
+        return (
+            types.SimpleNamespace(
+                backup_dir=backup,
+                _write_json=lambda p, d: p.write_text(
+                    json.dumps(d, indent=2), encoding="utf-8"
+                ),
+            ),
+            cfg,
+        )
+
+    def _paths(self, monkeypatch, cfg):
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+    def test_a_live_wired_port_is_never_unwired(self, tmp_path, monkeypatch):
+        """A REAL listening socket, not a mock: 'is the pin serving' is a
+        question about the network, and a mocked answer would pass while the
+        real one tore the user's session down."""
+        import socket
+
+        from claude_swap import pin
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        port = srv.getsockname()[1]
+        try:
+            sw, cfg = self._wired_to(tmp_path, port)
+            self._paths(monkeypatch, cfg)
+
+            class _AlreadyServing:
+                # False here means "nothing to do", NOT "I failed".
+                def heal(self, backup_dir):
+                    return False
+
+            monkeypatch.setattr(pin, "_live_impl", lambda: _AlreadyServing())
+            # clear_wiring must never even be REACHED. Asserting only on the
+            # file lets the guard be deleted while a failing unwire keeps the
+            # test green — the wiring survives for the wrong reason.
+            monkeypatch.setattr(
+                pin,
+                "clear_wiring",
+                lambda *a, **k: pytest.fail(
+                    "clear_wiring was called against a SERVING pin"
+                ),
+            )
+            changed, msg = pin.heal(sw)
+            assert not changed, msg
+            assert msg == "Nothing to heal", msg
+            # Re-READ: the wiring must still be there.
+            assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+        finally:
+            srv.close()
+
+    def test_a_restart_that_worked_is_not_then_unwired(self, tmp_path, monkeypatch):
+        """The SECOND guard. `impl.heal()` uses False for 'already serving' as
+        well as for 'failed', so a restart that genuinely brought the daemon
+        back still returns False — and without a re-read after it, the very
+        next line tears down the pin it just revived."""
+        import socket
+
+        from claude_swap import pin
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()  # dead at entry, so the serving guard lets us through
+
+        sw, cfg = self._wired_to(tmp_path, port)
+        self._paths(monkeypatch, cfg)
+        revived = {}
+
+        class _Reviver:
+            def heal(self, backup_dir):
+                # Bind the SAME port: this is what a real revival looks like,
+                # and it is why the outcome must be re-read rather than taken
+                # from the return value.
+                srv = socket.socket()
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("127.0.0.1", port))
+                srv.listen(2)
+                revived["srv"] = srv
+                return False  # "nothing to report" — NOT failure
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _Reviver())
+        monkeypatch.setattr(
+            pin,
+            "clear_wiring",
+            lambda *a, **k: pytest.fail("unwired a pin that had just come back"),
+        )
+        try:
+            changed, msg = pin.heal(sw)
+            assert not changed, msg
+            assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+        finally:
+            if "srv" in revived:
+                revived["srv"].close()
+
+    def test_a_dead_wired_port_still_gets_unwired(self, tmp_path, monkeypatch):
+        """The guard above must not disable healing — bind then close, so the
+        port is genuinely refusing."""
+        import socket
+
+        from claude_swap import pin
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        dead = s.getsockname()[1]
+        s.close()
+
+        sw, cfg = self._wired_to(tmp_path, dead)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        changed, msg = pin.heal(sw)
+        assert changed, msg
+        assert "_cswapPinWiredKeys" not in json.loads(cfg.read_text())
+
+    def test_the_serving_check_needs_no_package(self, tmp_path, monkeypatch):
+        """It is a loopback connect, not an import. The uninstalled case is
+        exactly when a wrong answer costs the most, in either direction."""
+        import socket
+
+        from claude_swap import pin
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        try:
+            sw, cfg = self._wired_to(tmp_path, port)
+            self._paths(monkeypatch, cfg)
+            monkeypatch.setattr(pin, "_live_impl", lambda: None)  # no extra
+            assert pin._wired_port_is_serving(sw) is True
+            changed, _ = pin.heal(sw)
+            assert not changed
+            assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+        finally:
+            srv.close()

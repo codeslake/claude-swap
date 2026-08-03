@@ -665,6 +665,54 @@ def set_pin(
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
 
+def _wired_port_is_serving(switcher) -> bool:
+    """Is the port the CONFIG names actually answering?
+
+    Asks the thing that is about to be removed, rather than any state file.
+    ``proxy.json`` is unlinked at the START of a respawn, so its absence is not
+    proof of death while the original daemon is still serving — deciding from
+    the record alone has already unwired a live pin once.
+
+    Works with the extra absent or broken: it is a loopback connect, not an
+    import. That matters because the uninstalled case is exactly when a user
+    can least afford a wrong answer in either direction.
+
+    False when nothing is wired, when the port is unreadable, or when it
+    refuses — all of which mean "healing is allowed to proceed".
+    """
+    import json as _json
+    import socket
+
+    from claude_swap.paths import (
+        get_default_global_config_path,
+        get_global_config_path,
+    )
+
+    seen = set()
+    for get in (get_global_config_path, get_default_global_config_path):
+        try:
+            path = get()
+            if path in seen:
+                continue
+            seen.add(path)
+            env = _json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+            port = int(env.get("CSWAP_PIN_PORT") or 0)
+        except Exception:  # noqa: BLE001 — unreadable/unwired: not serving
+            continue
+        if not port:
+            continue
+        sock = socket.socket()
+        sock.settimeout(2)
+        try:
+            sock.connect(("127.0.0.1", port))
+            return True
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    return False
+
+
 def heal(switcher) -> tuple[bool, str]:
     """Make the pin serving again, or make it harmless. ``(changed, message)``.
 
@@ -689,6 +737,19 @@ def heal(switcher) -> tuple[bool, str]:
     Never raises: this is called from the status line every few seconds, and a
     health check that can break the prompt is worse than the fault it reports.
     """
+    # A SERVING PIN IS NEVER HEALED. Ask the wiring itself first, because the
+    # restart below CANNOT tell us this: ``impl.heal()`` returns False both for
+    # "could not restart" and for "already serving, nothing to do", and reading
+    # the second as the first tears down a working pin. Measured: run against a
+    # live daemon (pid alive, port answering), this stripped the env block and
+    # unpinned the user's healthy session.
+    #
+    # The port the WIRING names is the right question, not any state file:
+    # `_spawn_daemon` unlinks proxy.json as its first act, so a missing record
+    # is not proof of death while the original daemon is still serving.
+    if _wired_port_is_serving(switcher):
+        return False, "Nothing to heal"
+
     impl = _live_impl()
     if impl is not None:
         try:
@@ -696,6 +757,11 @@ def heal(switcher) -> tuple[bool, str]:
                 return True, "Restarted the cloud pin proxy"
         except Exception:  # noqa: BLE001 — fall through to the safe outcome
             pass
+        # The restart may have succeeded while returning False (it also uses
+        # False for "already serving"). Re-READ rather than infer: unwiring a
+        # pin that just came back is the same damage as unwiring a live one.
+        if _wired_port_is_serving(switcher):
+            return False, "Nothing to heal"
     # No package, or the restart failed. Either way the wiring must not outlive
     # the daemon it points at. clear_wiring works WITHOUT the package on
     # purpose — the wiring is cswap's own record, and the case where the extra
