@@ -1786,6 +1786,43 @@ class TestTheUncoveredRound2Fixes:
         pin.wire_launch_env(sw, {"A": "1"})
         assert calls == ["unwired"], "the unwire never runs, even when free"
 
+    def test_the_broken_package_advice_does_not_promise_an_unconditional_clear(
+        self, tmp_path
+    ):
+        """Finding 3 makes a contended config lock a reachable reason
+        `clear_wiring` skips a config it never got to try. The catch-all
+        advice printed alongside a broken-package traceback must not tell the
+        user `--clear` unconditionally 'still works and removes the wiring' —
+        that promises an outcome the code cannot guarantee under a held lock.
+        """
+        import subprocess
+        import textwrap
+        from pathlib import Path
+
+        src = str(Path(__file__).resolve().parent.parent / "src")
+        code = textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {src!r})
+            from claude_swap import pin
+            pin.run = lambda *a, **k: (_ for _ in ()).throw(
+                ImportError("No module named 'cryptography'", name="cryptography"))
+            from claude_swap import cli
+            sys.argv = ["cswap", "pin", "2"]
+            try:
+                cli._pin_command(["2"])
+            except SystemExit as e:
+                print("EXIT", e.code)
+            """
+        )
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+        combined = r.stdout + r.stderr
+        assert "--clear" in combined, combined[-500:]
+        assert "still works and removes the wiring." not in combined, (
+            "the advice still promises an unconditional outcome: "
+            f"{combined[-500:]}"
+        )
+
 
 class TestTheVerdictHasExactlyOneImplementation:
     """The invariant an earlier commit CLAIMED and did not have.
