@@ -296,3 +296,17 @@ def _reset_pin_live_impl_cache():
     from claude_swap import pin
 
     pin._live_impl_cache = (float("-inf"), None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_pin_unresolvable_warned():
+    """``pin._warn_unresolvable_once`` logs a raising path getter once PER
+    PROCESS (Task 3/4: `heal` polls every ~2s and the condition is
+    persistent, so logging every tick overwrites the whole rotating log
+    history within a day). Same leak shape as the live-impl cache above: one
+    test exercising the no-HOME path marks the getter warned, and without a
+    reset the next test in the same process sees no record at all — not a
+    regression, just the cap doing its job across a boundary it can't see."""
+    from claude_swap import pin
+
+    pin._unresolvable_warned = set()
