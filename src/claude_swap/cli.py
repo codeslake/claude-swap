@@ -164,7 +164,11 @@ Examples:
         # as a 6-frame traceback. Measured on work-mac, and this command is the
         # one that has to stay usable when the pin does not.
         error(f"Error: the cloud pin is installed but not usable: {e}")
-        error("  `cswap pin --clear` still works and removes the wiring.")
+        # NOT an unconditional promise: `cswap pin --clear` works without the
+        # package, but a contended config lock can still make it skip a
+        # config it never got to try (see clear_wiring's budget) — reword
+        # rather than promise an outcome the code cannot guarantee.
+        error("  `cswap pin --clear` still works, and removes the wiring unless the config is locked.")
         sys.exit(1)
 
 
