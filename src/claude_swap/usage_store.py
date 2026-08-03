@@ -480,10 +480,31 @@ def _failure_backoff_s(
         # that resets before the ceiling ends trust first, so the 4500s wait
         # does NOT always sit inside its own trust: an earlier reset can leave
         # the row un-pollable (still in backoff) and unknown (trust expired)
-        # for the remainder of the wait. That blind gap is a deliberate,
-        # bounded tradeoff this margin makes in exchange for fewer requests —
-        # not a bug — see `test_a_soon_resetting_window_can_end_trust_before_
-        # the_429_wait_releases` for a case that hits it.
+        # for the remainder of the wait — see
+        # `test_a_soon_resetting_window_can_end_trust_before_the_429_wait_releases`.
+        #
+        # AND THE EARLY RESET IS ONLY ONE WAY IN. The age-ceiling half opens
+        # the same gap with no early reset at all, because `record()` writes
+        # `fetchedAt` on SUCCESS only: a chain of failed blocks keeps measuring
+        # trust from the first success while each block adds another full wait.
+        # Measured with far-future resets only, so only the ceiling can bind:
+        #
+        #     block 1  wait [    0,  4500]  trust ends 7200  blind      0s
+        #     block 2  wait [ 4500,  9000]  trust ends 7200  blind   1800s
+        #     block 3  wait [ 9000, 13500]  trust ends 7200  blind   4500s
+        #
+        # So the gap is bounded PER BLOCK and not across a chain — by block 3
+        # the row is blind for the whole wait. That is the tradeoff this margin
+        # makes in exchange for fewer requests, and it is worth stating at its
+        # true size rather than as a single-block figure.
+        #
+        # WHAT ACTUALLY BOUNDS IT is the identity `cap == 3600 + MARGIN` in
+        # `test_the_cap_sits_inside_the_trust_it_relies_on`, NOT the
+        # `cap <= RATE_LIMIT_TRUST_MAX_AGE_S` inequality that test also states.
+        # The inequality admits [4500, 7200], and at 7200 the same three blocks
+        # go blind 14400s (2.3x). Reason about this from blind time; the
+        # constant comparison does not imply it. Pinned by
+        # `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
         #
         # Every other failure falls back to TRUST_MAX_AGE_S = 3600s — and
         # `_classify_usage_error` parses Retry-After for ANY HTTPError code,

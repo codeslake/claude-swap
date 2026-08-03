@@ -480,7 +480,14 @@ class TestBackoff:
         with "a 4500s wait sits comfortably inside its own trust"
         (RATE_LIMIT_TRUST_MAX_AGE_S = 7200). Nothing asserted it. Measured on
         this tree by mutating the constant and running the full suite, the
-        inequality below admits `[4500, 7200]` — 4499 fails 9, 7201 fails 1.
+        inequality below admits `[4500, 7200]` — 4499 fails 11, 7201 fails 1.
+
+        The inequality is NOT what bounds blind time. It compares two
+        constants; raising the cap to 7200 satisfies it while more than
+        doubling the blind window over consecutive blocks (6300s -> 14400s,
+        measured). The IDENTITY assertion below is what actually stops that
+        drift, and it is the reason this test still fails at 7200. See
+        `test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success`.
 
         That leaves 2700s of slack in which the constant can drift silently, so
         the arithmetic identity its comment states ("37 of 39 observed blocks
@@ -571,6 +578,97 @@ class TestBackoff:
         entry = store.entries(IDENT)["1"]
         assert not entry.in_backoff(clock.now)
         assert entry.decision_value() is None
+
+    def test_consecutive_blocks_go_blind_because_fetchedAt_only_moves_on_success(
+        self,
+    ):
+        """The blind gap is bounded PER BLOCK, never across a chain of them.
+
+        The 429 comment presents the un-pollable-and-unknown window as caused
+        by "a window that resets before the ceiling". That is one way in. The
+        age-ceiling half opens the same gap with NO early reset at all, because
+        `record()` writes `fetchedAt` only when `rec.error is None`
+        (usage_store.py, the success branch) — a chain of failed blocks never
+        refreshes it, so trust keeps expiring against the FIRST success while
+        each new block adds another full wait.
+
+        Measured here with far-future resets only, so `_earliest_reset` can
+        never bind and only the ceiling can:
+
+            block 1  wait [    0,  4500]  trust ends 7200  blind      0s
+            block 2  wait [ 4500,  9000]  trust ends 7200  blind   1800s
+            block 3  wait [ 9000, 13500]  trust ends 7200  blind   4500s
+
+        By block 3 the row is blind for the ENTIRE wait. `cap <= TRUST` says
+        nothing about this: it bounds ONE wait against the ceiling, and the
+        ceiling does not move.
+
+        WHY THIS IS A TEST AND NOT A COMMENT FIX. The inequality in
+        `test_the_cap_sits_inside_the_trust_it_relies_on` admits [4500, 7200],
+        and at 7200 the same three blocks go blind 14400s — 2.3x. What
+        actually stops that drift is the IDENTITY assertion
+        (`cap == 3600 + MARGIN`) in that same test, not the inequality the
+        comment reasons from. Pin the consequence directly so the bound is
+        argued from blind time rather than from a constant comparison that
+        does not imply it.
+        """
+        import datetime
+
+        def iso(t):
+            return (
+                datetime.datetime.fromtimestamp(t, tz=datetime.timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        far = 10 ** 9
+        last_good = {
+            "five_hour": {"pct": 25.0, "resets_at": iso(far)},
+            "seven_day": {"pct": 10.0, "resets_at": iso(far)},
+        }
+        # NON-VACUITY: with an empty window list every trust question answers
+        # the same way and the test proves nothing. The schema key is `pct`,
+        # not `utilization` — a probe using the wrong one returned [] here and
+        # read as green.
+        assert oauth.relevant_windows(last_good, ()) != []
+        assert usage_store._earliest_reset(last_good) is not None
+
+        wait = usage_store._failure_backoff_s(1, 3600.0, rate_limited=True)
+        assert wait == pytest.approx(4500.0)
+
+        # fetchedAt stays at the last SUCCESS (t=0): `record()` writes it only
+        # when `rec.error is None`, so a chain of failed blocks never moves it.
+        fetched_at = 0.0
+        t = 0.0
+        blind_per_block = []
+        for _ in range(3):
+            end = t + wait
+            # Ask the REAL predicate at each second-boundary of this block.
+            blind = 0.0
+            probe = max(t, 0.0)
+            while probe < end:
+                age = probe - fetched_at
+                if not usage_store._rate_limited_trust_ok(
+                    last_good, age, probe
+                ):
+                    blind = end - probe
+                    break
+                probe += 60.0
+            blind_per_block.append(blind)
+            t = end
+
+        assert blind_per_block[0] == 0.0, (
+            "the first block is supposed to sit inside its trust — if this "
+            "fires, the single-block claim itself is wrong"
+        )
+        assert blind_per_block[1] > 0.0, (
+            "a second consecutive block must show the gap the comment "
+            "attributes only to an early reset"
+        )
+        assert blind_per_block[2] == pytest.approx(wait), (
+            f"by the third block the row should be blind for the whole wait; "
+            f"got {blind_per_block[2]}"
+        )
 
     def test_the_margin_never_lifts_the_floor_cap(self):
         """`RETRY_AFTER_FLOOR_CAP_S` bounds how long a server ask can park us.
