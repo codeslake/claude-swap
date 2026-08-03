@@ -3996,6 +3996,79 @@ class TestStoppedEngineDoesNotAct:
             "abandoned itself with no reason line"
         )
 
+    def test_the_last_candidates_stop_is_diagnosed_as_a_stop(self, harness):
+        """C-1: the loop-top gate (:1288) only re-fires on the NEXT
+        iteration. With exactly ONE candidate there is no next iteration —
+        the loop falls out the bottom into the diagnosis block at
+        :1342-1361, which has no gate of its own.
+
+        Measured before the fix, one candidate, stop landing inside
+        `_freshen_target` with status "transient":
+
+            outcome=ERROR reason=None
+            message='could not freshen any candidate (network?)'
+
+        against the `engine-stopped` NO_ACTION every other stop path
+        reports. A `cswap auto --once` SIGTERMed mid-refresh on a
+        2-account machine would exit 1 and send the operator to check
+        their network for a problem that is not there.
+        """
+        engine = harness.engine
+
+        def freshen_then_stop(number, email):
+            engine.stop()          # the SIGTERM lands inside the refresh POST
+            return "transient"     # ... which failed for an unrelated reason
+
+        engine._freshen_target = freshen_then_stop
+        harness.events.clear()
+        # Only "2" ranks as a candidate: "3" carries no usage entry this
+        # tick, so `_rank_candidates` never sees it as known.
+        outcome = harness.tick_with_usage({"1": _usage(95), "2": _usage(5)})
+
+        assert outcome is not TickOutcome.ERROR, (
+            f"outcome={outcome!r} — a stopped engine reported ERROR "
+            "('could not freshen any candidate (network?)') for a tick "
+            "that simply stopped"
+        )
+        reasons = [
+            getattr(e, "reason", None) for e in harness.events
+            if isinstance(e, NoSwitchEvent)
+        ]
+        assert reasons == ["engine-stopped"], (
+            f"reasons={reasons} — a stopped engine blamed a network "
+            "problem that never happened"
+        )
+
+    def test_the_last_candidates_stop_writes_no_quarantine(self, harness):
+        """C-1's second harm: `_quarantine` runs on the LAST candidate's
+        status before the loop-top gate ever gets a chance to fire again.
+
+        Measured before the fix, one candidate, stop landing inside
+        `_freshen_target` with status "invalid_grant":
+
+            {'2': {'email': 'b@example.com', 'reason': 'invalid_grant', ...}}
+
+        written to disk AFTER `stop()` released LIVE — contradicting
+        `test_a_stopped_engine_writes_no_state_at_all`'s invariant one
+        branch over. The successor inherits a quarantine its predecessor
+        wrote after handover: an account barred by a process that no
+        longer owns the decision.
+        """
+        engine = harness.engine
+
+        def freshen_then_stop(number, email):
+            engine.stop()
+            return "invalid_grant"
+
+        engine._freshen_target = freshen_then_stop
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(95), "2": _usage(5)})
+
+        assert harness.state().get("quarantine", {}) == {}, (
+            f"state={harness.state()} — a stopped engine quarantined an "
+            "account on behalf of a successor that already owns LIVE"
+        )
+
     def test_every_event_class_survives_a_stop(self, harness):
         """`_emit`'s stop gate exempted `.reason == "engine-stopped"`.
 
