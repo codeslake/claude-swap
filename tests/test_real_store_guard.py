@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 
 from claude_swap import paths
+from claude_swap.models import Platform
 from tests import conftest
 
 
@@ -267,9 +268,15 @@ def test_frozen_specs_ignore_a_developer_exported_claude_config_dir(
 ):
     """M12: removing the env-neutralization inside ``_freeze_real_store_specs``
     survived because no test exports ``CLAUDE_CONFIG_DIR`` around the call —
-    a developer with it set in their normal shell would otherwise get the
-    override path protected instead of the genuinely-default ``~/.claude``,
-    silently dropping real ``~/.claude`` protection."""
+    a developer with it set in their normal shell would otherwise get ONLY the
+    override path protected, silently dropping real ``~/.claude`` protection
+    (the env-neutralization is what produces the separate DEFAULT snapshot at
+    all). Both roots must be protected now: the override IS also a real
+    account-store location for a developer who has it exported (the same
+    both-must-be-protected reasoning the XDG_DATA_HOME fix applies) — this
+    updated assertion reflects that; only the default-snapshot regression
+    (dropping ``~/.claude``) is what the mutation below still needs to kill.
+    """
     home = tmp_path / "home"
     home.mkdir()
     (home / ".claude").mkdir()
@@ -285,6 +292,78 @@ def test_frozen_specs_ignore_a_developer_exported_claude_config_dir(
         "the genuinely-default ~/.claude must still be protected even with "
         "CLAUDE_CONFIG_DIR exported"
     )
-    assert elsewhere not in non_recursive_roots, (
-        "the override path must not leak into the frozen specs"
+    assert elsewhere in non_recursive_roots, (
+        "the override path must ALSO be protected — a developer with "
+        "CLAUDE_CONFIG_DIR exported has their real config home there"
     )
+
+
+def test_frozen_specs_include_the_ambient_xdg_override_backup_root(
+    monkeypatch, tmp_path
+):
+    """`_freeze_real_store_specs` clears XDG_DATA_HOME before resolving, so on
+    a machine where it's exported OUTSIDE $HOME, the real account store lives
+    at the override path and this snapshot never included it — the defaults
+    snapshot alone is not enough. The frozen set must ALSO contain the root
+    `claude_swap.paths` resolves to under the environment as it actually is."""
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg = tmp_path / "xdg-outside-home"  # deliberately NOT under `home`
+    xdg.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    specs = conftest._freeze_real_store_specs()
+    recursive_roots = {root for root, recursive in specs if recursive}
+
+    assert xdg / "claude-swap" in recursive_roots, (
+        "the XDG-override backup root must be protected, not only the "
+        "cleared-env default ~/.local/share/claude-swap"
+    )
+    assert home / ".local" / "share" / "claude-swap" in recursive_roots, (
+        "the genuinely-default root must still be protected too"
+    )
+
+
+def test_layout_a_runtime_real_store_is_refused_and_unrelated_tmp_still_writes(
+    monkeypatch, tmp_path
+):
+    """The mandatory YES/NO probe from the finding: under layout A (XDG_DATA_HOME
+    exported outside $HOME), a write to the RUNTIME real store (what
+    `paths.get_backup_root()` actually resolves to under this environment)
+    must be refused (YES-arm) while a write to an unrelated tmp path must
+    still succeed (NO-arm) — a guard that refuses everything is not a fix.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg = tmp_path / "xdg-outside-home"
+    xdg.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    # Install the specs a real conftest import would freeze under THIS
+    # (simulated) ambient environment — this is what the fix under test
+    # changes; the live audit hook reads `conftest._REAL_STORE_SPECS` by
+    # module-global lookup at call time, so this patch governs its behavior.
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", conftest._freeze_real_store_specs())
+
+    runtime_real_store = paths.get_backup_root()
+    assert runtime_real_store == xdg / "claude-swap"  # sanity: the hole's target
+
+    # YES-arm: the runtime real store must be refused.
+    yes_target = runtime_real_store / "sequence.json"
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        yes_target.parent.mkdir(parents=True, exist_ok=True)
+        yes_target.write_text("{}", encoding="utf-8")
+    assert not yes_target.exists()
+
+    # NO-arm: an unrelated tmp path must still succeed (the guard isn't a
+    # blanket refuse-everything).
+    no_target = tmp_path / "unrelated" / "file.txt"
+    no_target.parent.mkdir(parents=True, exist_ok=True)
+    no_target.write_text("ok", encoding="utf-8")
+    assert no_target.read_text(encoding="utf-8") == "ok"
