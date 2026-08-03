@@ -379,6 +379,26 @@ class TestBackoff:
             assert entry.backoff_until == pytest.approx(clock.now + want)
             clock.advance(want + 1)
 
+    def test_a_non_429_retry_after_zero_does_not_take_the_saturated_edge(
+        self, store, clock
+    ):
+        """I-4 (round-10 review): `retry_after_s == 0` used to return before
+        the `rate_limited` arm split, so ANY error carrying `Retry-After: 0`
+        (e.g. a Cloudflare 503 "retry now") took the 429-only saturated-edge
+        floor (EDGE_BACKOFF_S=300s) meant for a rate-limited token's full
+        rolling hour. `_classify_usage_error` (oauth.py) parses Retry-After
+        for any HTTPError code, not just 429, so this is reachable. A 503
+        asking to be retried immediately should fall through to the plain
+        exponential curve instead, same as no Retry-After header at all.
+        """
+        store.record(
+            {"1": FetchRecord(error="http-503", retry_after_s=0.0)}, IDENT
+        )
+        entry = store.entries(IDENT)["1"]
+        # 30s: BACKOFF_BASE_S at failures=1, the plain curve — NOT 300s
+        # (EDGE_BACKOFF_S), which is the 429-only saturated-edge floor.
+        assert entry.backoff_until == pytest.approx(clock.now + 30.0)
+
     def test_retry_after_floor_is_capped(self):
         # A pathological Retry-After can never park an account for hours.
         assert usage_store._failure_backoff_s(1, 50000.0) == pytest.approx(

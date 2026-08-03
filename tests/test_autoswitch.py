@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -76,19 +77,25 @@ class EngineHarness:
 
     def __init__(self, temp_home: Path, **settings_kwargs):
         self.temp_home = temp_home
-        # get_backup_root() (switcher.py) resolves via Path.home(), not via
-        # the pytest `temp_home` fixture's own patched $HOME — that fixture
-        # patches Path.home() once for the whole test, so every EngineHarness
-        # in a test process would otherwise share one store (all pointing at
-        # the same patched home) and alias each other's rows. Scoping
-        # `Path.home()` to this instance's own subtree for construction only
-        # (backup_dir is resolved once, in __init__, and cached) gives each
-        # harness its own sequence.json/credentials/cache — on every
-        # platform, since get_backup_root()'s XDG branch AND its legacy
-        # `get_legacy_backup_root()` fallback both honour Path.home()
-        # (paths.py:101-108), unlike `$XDG_DATA_HOME`, which only LINUX/WSL
-        # consult.
-        with patch("pathlib.Path.home", return_value=self.temp_home):
+        # get_backup_root() (switcher.py) resolves via Path.home() on every
+        # platform (both its XDG branch and its legacy
+        # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
+        # but on LINUX/WSL, $XDG_DATA_HOME takes precedence over Path.home()
+        # when set (paths.py:102-106). Patching Path.home() alone is not a
+        # superset of patching $XDG_DATA_HOME alone: a developer/CI with
+        # XDG_DATA_HOME exported would have every EngineHarness's XDG branch
+        # resolve to that ONE ambient value regardless of Path.home(),
+        # aliasing all harnesses in the process onto one store (round-10
+        # review, I-1). Keep BOTH patches — neither mechanism dominates the
+        # other, and each covers the platforms/environments where the other
+        # is silent.
+        with (
+            patch("pathlib.Path.home", return_value=self.temp_home),
+            patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": str(self.temp_home / ".local" / "share")},
+            ),
+        ):
             self.switcher = ClaudeAccountSwitcher()
             self.switcher.platform = Platform.LINUX
             self.switcher._setup_directories()
@@ -210,6 +217,21 @@ class TestEngineHarnessIsolation:
     (both its XDG branch and its `get_legacy_backup_root()` fallback —
     paths.py:101-108), so scoping there instead makes the guard, and this
     test, load-bearing everywhere and lets the skipif be deleted.
+
+    A "distinct subtree" harness (`EngineHarness(temp_home / "h1")`, the
+    pattern this test and `decision_at()` in `TestAdaptiveScheduler` use)
+    supports ONLY `seed()` and other `backup_dir`-scoped switcher calls.
+    `Path.home()` is patched for `EngineHarness.__init__` only, not for the
+    harness's lifetime, so after construction it reverts to whatever the
+    ambient fixture set (the `temp_home` ROOT, not the subtree) — meaning
+    `switcher.home` (cached at construction, `switcher.py:272`) disagrees
+    with what any later `paths.*` call resolves. `make_live()` writes under
+    `self.temp_home` (the subtree) and raises `FileNotFoundError` there
+    (the subtree's `.claude/` is never created), and even if it didn't, the
+    file would land somewhere production's own path resolution would not
+    read. Do NOT call `make_live()` — or anything else that reads
+    `paths.*` after construction — on a subtree harness; build it on
+    `temp_home` directly instead (see `harness` fixture / `TestDecisionTable`).
     """
 
     @pytest.mark.parametrize(
@@ -236,6 +258,39 @@ class TestEngineHarnessIsolation:
             f"both harnesses ({platform}) resolved to {h1.switcher.backup_dir} "
             "— EngineHarness.__init__'s isolation is not doing its job, so "
             "two harnesses alias each other's sequence.json/credentials/cache"
+        )
+
+        h1.seed(1, "a@example.com")
+        h2.seed(1, "z@example.com")
+        assert h1.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "a@example.com"
+        ), "h2's seed() bled into h1's store"
+        assert h2.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "z@example.com"
+        ), "h1's seed() bled into h2's store"
+
+    def test_two_harnesses_with_xdg_data_home_set_get_distinct_stores(
+        self, temp_home, monkeypatch
+    ):
+        """I-1 (round-10 review): round 9's `Path.home()` rescoping is NOT a
+        superset of round 8's `$XDG_DATA_HOME` scoping. `get_backup_root()`
+        gives `$XDG_DATA_HOME` precedence over `Path.home()` on Linux/WSL
+        (paths.py:101-107) -- so a developer/CI with `XDG_DATA_HOME` exported
+        still gets two harnesses colliding on ONE store, even though each
+        harness's `Path.home()` differs. The prior test above cannot see this
+        because the autouse `_isolate_real_home` fixture unconditionally
+        `delenv`s `XDG_DATA_HOME`, so it must be re-set here, after that
+        fixture has already run, to reproduce the defect at all.
+        """
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+        shared_xdg = temp_home / "shared-xdg"
+        monkeypatch.setenv("XDG_DATA_HOME", str(shared_xdg))
+        h1 = EngineHarness(temp_home / "h1")
+        h2 = EngineHarness(temp_home / "h2")
+        assert h1.switcher.backup_dir != h2.switcher.backup_dir, (
+            f"both harnesses collapsed onto {h1.switcher.backup_dir} with "
+            "XDG_DATA_HOME set -- Path.home() scoping alone does not "
+            "override XDG_DATA_HOME's precedence on Linux/WSL"
         )
 
         h1.seed(1, "a@example.com")

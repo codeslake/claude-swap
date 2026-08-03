@@ -504,6 +504,13 @@ def _failure_backoff_s(
     if retry_after_s is None:
         return computed
     if retry_after_s == 0:
+        if not rate_limited:
+            # `Retry-After: 0` on a non-429 (e.g. a Cloudflare 503 saying
+            # "retry now") is not the saturated-budget edge — that rule was
+            # measured on the usage endpoint's 429s only (poll_policy
+            # docstring; see the ceiling discussion above). Fall through to
+            # the plain exponential curve, same as no header at all.
+            return computed
         # Saturated-budget edge: wait before probing again.
         return min(max(computed, EDGE_BACKOFF_S), BACKOFF_CAP_S)
     # Burst rule: the server's ask plus a margin (bounded by the cap); our own
@@ -686,17 +693,43 @@ def _failure_backoff_s(
     # worse than upstream, not merely pre-existing.
     #
     # DECISION: left open in this PR, not closed, WITH the true 429 numbers
-    # above (not the ones an earlier round of this comment cited). The
-    # honest fix is `min(asked, ceiling - age_at_failure)`, which needs
-    # `_failure_backoff_s` to know the row's age at the moment it failed — a
-    # real signature change. `record()` is its only production caller, but
-    # well over a dozen tests across this file and `tests/test_autoswitch.py`
-    # call `_failure_backoff_s` directly against its current
-    # two-positional-plus-`rate_limited` shape, so widening it ripples well
-    # past this bound. This round's charge is comment accuracy and test
-    # rigor, not a new defect fix riding on an already-narrow,
-    # already-reviewed PARK BOUND change; conflating the two works against
-    # reviewability. Tracked as a follow-up, not fixed here.
+    # above (not the ones an earlier round of this comment cited).
+    #
+    # CORRECTED 2026-08-03 (round 10) — this block used to defer the fix on
+    # the claim that it "needs `_failure_backoff_s` to know the row's age at
+    # the moment it failed — a real signature change" that "ripples well
+    # past this bound". That is false, measured: `record()` already computes
+    # `row["backoffUntil"] = now + _failure_backoff_s(...)` at the one call
+    # site (usage_store.py, in `record()`'s failure branch) and already
+    # holds `fetchedAt` in the same row. Clamping the PRODUCT there —
+    # `min(now + _failure_backoff_s(...), fetchedAt + ceiling)` — needs no
+    # change to this function's signature and touches none of the tests that
+    # call it directly:
+    #
+    #   as shipped                                       :  park 4500s  blind  900s
+    #   call-site clamp min(now+wait, fetchedAt+ceiling)  :  park 3600s  blind    0s
+    #   _failure_backoff_s signature UNCHANGED             :  4500s still returned
+    #
+    # The real reason to keep this open is the one below, not the signature
+    # claim: that call-site clamp is the SAME trim NO TRUST TRIM AGAINST THE
+    # SERVER'S DEADLINE (a few lines down) spent a full section arguing
+    # against removing — it bounds `backoffUntil` against
+    # `fetchedAt + ceiling`, exactly the quantity that section calls a no-op-
+    # or-futile clip. Measured driving one 3600s block at three row ages:
+    #
+    #   age@open=0     AS SHIPPED 1 request, lands deadline+900s
+    #                  CLAMPED    1 request, lands deadline+900s   <- no-op, matches the trim's own finding
+    #   age@open=3600  AS SHIPPED 1 request, lands deadline+900s
+    #                  CLAMPED    1 request, lands deadline+0s     <- lands ON the deadline: the defect this PR fixes
+    #   age@open=7000  AS SHIPPED 1 request, lands deadline+900s
+    #                  CLAMPED    many requests, does not cleanly converge  <- the request storm the trim section measured
+    #
+    # So the clamp is not a smaller, safer version of the removed trim — past
+    # the ceiling it reproduces the same request-storm failure mode that trim
+    # was measured to cause, with the same ceiling. A follow-up landing this
+    # needs the same episode measurement the trim section did before it can
+    # ship, not merely a signature check. Tracked as a follow-up, not fixed
+    # here.
     asked = min(asked, RETRY_AFTER_FLOOR_CAP_S if rate_limited else TRUST_MAX_AGE_S)
     # NO TRUST TRIM AGAINST THE SERVER'S DEADLINE. Cutting a 429 wait back to
     # the deadline when the stored trust expires first cannot salvage that
