@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from claude_swap import usage_store
+from claude_swap import oauth, usage_store
 from claude_swap.usage_store import (
     BACKOFF_BASE_S,
     BACKOFF_CAP_S,
@@ -413,9 +413,13 @@ class TestBackoff:
         # the saturated curve already waits) rather than by scaling with the ask.
         assert usage_store._failure_backoff_s(1, 300.0) == 300.0
         assert usage_store._failure_backoff_s(1, 3600.0) - 3600.0 == 900.0
-        # The boundary itself, both sides. Without this the > / >= mutation
-        # survives this whole file and only trips an unrelated scheduler test,
-        # whose failure message says nothing about backoff.
+        # The boundary itself, both sides. The > / >= mutation at
+        # BACKOFF_CAP_S is caught by two tests: this boundary check (which is
+        # why it earns its keep — a direct failure here says exactly what
+        # broke) and, independently,
+        # TestAdaptiveScheduler::test_consume_first_stale_target_holds_then_switches
+        # — an unrelated scheduler test whose failure message says nothing
+        # about backoff.
         cap = usage_store.BACKOFF_CAP_S
         assert usage_store._failure_backoff_s(1, cap) == cap
         assert usage_store._failure_backoff_s(1, cap + 1.0) == cap + 1.0 + 900.0
@@ -508,6 +512,65 @@ class TestBackoff:
             assert wait <= usage_store.RATE_LIMIT_TRUST_MAX_AGE_S, (
                 f"ask {ask} produced a {wait}s wait, past the trust ceiling"
             )
+
+    def test_a_soon_resetting_window_can_end_trust_before_the_429_wait_releases(
+        self, store, clock
+    ):
+        """The other half of the bound: `min(earliest reset, age-ceiling)`.
+
+        `test_the_cap_sits_inside_the_trust_it_relies_on` only pins the
+        age-ceiling half (RATE_LIMIT_TRUST_MAX_AGE_S = 7200) — it never gives
+        `last_good` a `resets_at`, so `_earliest_reset` is always None there
+        and only the ceiling can bind. Trust actually ends at
+        `min(earliest reset, fetched_at + ceiling)`, and a 5h window that
+        resets sooner than that ends it first.
+
+        Retry-After 3600 -> a 429 wait released at +4500s (measured in
+        `test_hour_scale_retry_after_honored`). Here the 5h window resets at
+        +3600s, before that release: the row goes untrusted while still in
+        backoff (un-pollable AND unknown at once) — a blind gap that exists
+        and is bounded, not the "sits comfortably inside its own trust" the
+        old comment claimed.
+        """
+        from datetime import datetime, timezone
+
+        def iso(ahead):
+            return (
+                datetime.fromtimestamp(clock.now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        usage = {
+            "five_hour": {"pct": 25.0, "resets_at": iso(3600.0)},
+            "seven_day": {"pct": 10.0, "resets_at": iso(100 * 3600.0)},
+        }
+        # Schema gotcha: the window key is "pct", not "utilization" — confirm
+        # the fixture actually produces relevant windows before trusting
+        # anything measured against it.
+        assert oauth.relevant_windows(usage, ()) != []
+
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, IDENT
+        )
+        wait = usage_store._failure_backoff_s(1, 3600.0, rate_limited=True)
+        assert wait == pytest.approx(4500.0)
+
+        clock.advance(3599.0)  # just before the 5h reset
+        entry = store.entries(IDENT)["1"]
+        assert entry.in_backoff(clock.now)
+        assert entry.decision_value() == usage
+
+        clock.advance(2.0)  # just past the 5h reset, still well inside backoff
+        entry = store.entries(IDENT)["1"]
+        assert entry.in_backoff(clock.now)  # still can't be re-polled...
+        assert entry.decision_value() is None  # ...and already unknown
+
+        clock.advance(wait - 3601.0)  # past the wait's release
+        entry = store.entries(IDENT)["1"]
+        assert not entry.in_backoff(clock.now)
+        assert entry.decision_value() is None
 
     def test_the_margin_never_lifts_the_floor_cap(self):
         """`RETRY_AFTER_FLOOR_CAP_S` bounds how long a server ask can park us.

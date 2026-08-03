@@ -392,10 +392,10 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
 
     The soonest one is what matters: once it resets, usage there is zeroed and
     the whole snapshot is obsolete, so a later window cannot rescue it. Windows
-    carrying no ``resets_at`` contribute nothing rather than a guess.
+    carrying no ``resets_at`` contribute nothing rather than a guess. A
+    non-dict ``last_good`` needs no guard here: ``oauth.relevant_windows``
+    already returns ``[]`` for any non-dict input.
     """
-    if not isinstance(last_good, dict):
-        return None
     resets = [
         ts
         for _, _, resets_at in oauth.relevant_windows(last_good, models)
@@ -475,8 +475,15 @@ def _failure_backoff_s(
     if retry_after_s > BACKOFF_CAP_S and rate_limited:
         # THE MARGIN IS 429-ONLY, and the ceiling is why. It was measured on
         # usage-endpoint blocks, whose stale data stays decision-trusted until
-        # the window resets (or RATE_LIMIT_TRUST_MAX_AGE_S = 7200s), so a
-        # 4500s wait sits comfortably inside its own trust.
+        # `min(earliest relevant-window reset, fetched_at +
+        # RATE_LIMIT_TRUST_MAX_AGE_S)` — not the age-ceiling alone. A window
+        # that resets before the ceiling ends trust first, so the 4500s wait
+        # does NOT always sit inside its own trust: an earlier reset can leave
+        # the row un-pollable (still in backoff) and unknown (trust expired)
+        # for the remainder of the wait. That blind gap is a deliberate,
+        # bounded tradeoff this margin makes in exchange for fewer requests —
+        # not a bug — see `test_a_soon_resetting_window_can_end_trust_before_
+        # the_429_wait_releases` for a case that hits it.
         #
         # Every other failure falls back to TRUST_MAX_AGE_S = 3600s — and
         # `_classify_usage_error` parses Retry-After for ANY HTTPError code,
