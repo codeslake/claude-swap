@@ -1241,8 +1241,15 @@ class CredentialStore:
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit: {e}"
             ) from e
-        # Final belt: catches any backend view the deletes above missed.
-        if self._read_account_credentials(account_num, email):
+        # Final belt: catches any backend view the deletes above missed. The
+        # plain reader cannot serve this — it is the exact reader this
+        # docstring says "conflates absent with unreadable" — so an
+        # unreadable-but-present view (a locked Keychain, a permission
+        # glitch on the .enc) would pass verification and resurface later.
+        # `_ex` distinguishes the two; either a served value OR an
+        # unreadable verdict aborts the commit.
+        value, unreadable = self._read_account_credentials_ex(account_num, email)
+        if value or unreadable:
             raise CredentialError(
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit"
@@ -1293,9 +1300,23 @@ class CredentialStore:
     ) -> None:
         """Retain the slot's current backup as ``.prev`` before it is replaced."""
         try:
-            current = self._read_account_credentials(account_num, email)
+            current, unreadable = self._read_account_credentials_ex(account_num, email)
         except Exception as e:  # pragma: no cover - _read swallows its own errors
             self._host._logger.warning(f"Could not read backup for retention: {e}")
+            return
+        if unreadable:
+            # The plain reader's `""` here is indistinguishable from "no
+            # backup exists" — but this one FAILED to read, so treating it
+            # as "nothing to retain" silently drops the only recovery copy a
+            # fail-open write (e.g. the switch-time `unresolved` branch)
+            # depends on. Loud, not fatal: retention has always been
+            # best-effort defense in depth, not a transactional guard.
+            self._host._logger.warning(
+                f"Could not retain previous credential generation for "
+                f"account {account_num}: the current backup exists but "
+                "could not be read (not absent) — no .prev recovery copy "
+                "will exist for this write"
+            )
             return
         if not current or current == new_credentials:
             return
