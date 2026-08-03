@@ -8597,6 +8597,53 @@ class TestSwitchUnreadableBackup:
         assert "keychain" in msg
         assert "add-account" not in msg   # the remedy must not be a re-add
 
+    def test_normal_path_switch_to_unreadable_backup_says_keychain(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+        block_real_keychain,
+    ):
+        """The SAME promise on the ordinary `cswap switch`.
+
+        _perform_switch has two target-read sites. The M1 test above lands on
+        the DIRECT-ACTIVATION branch, because its fixture's live identity
+        (test@example.com) matches no slot, so `current_account is None`. That
+        is the fresh-machine / post-import / --force path. Every ordinary
+        switch on a working install — a live login that DOES resolve to a slot
+        — takes the NORMAL branch, which still sends the user to a re-add.
+        """
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        # A live login that resolves to slot 1, so the switch takes the
+        # normal (back-up-current-then-activate) branch.
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "account1@example.com",
+            "accountUuid": "uuid-1",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        # Readable from the plaintext fallback, so slot 1 resolves even with
+        # every Keychain read denied.
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 9999999999000}})
+        s._store._write_active_credentials_file(live)
+        s._write_account_credentials("2", "account2@example.com", live)
+        s._write_account_config("2", "account2@example.com", json.dumps(
+            {"oauthAccount": {"emailAddress": "account2@example.com",
+                              "accountUuid": "uuid-2",
+                              "organizationUuid": "",
+                              "organizationName": ""}}))
+        assert s.current_account_number() == "1"
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        with pytest.raises(SwitchError) as exc:
+            s.switch_to("2")
+        msg = str(exc.value).lower()
+        assert "keychain" in msg
+        assert "add-account" not in msg   # the remedy must not be a re-add
+
 
 class TestConsumeGate:
     """M2: every backup-refresh-token POST goes through consume_backup_grant —
