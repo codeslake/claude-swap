@@ -552,7 +552,7 @@ class TestAddAccountRefresh:
             return stored.get("creds", "")
 
         # First add
-        with patch.object(switcher, "_read_credentials", return_value=old_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(old_creds, False)), \
              patch.object(switcher, "_write_account_credentials", side_effect=mock_write_creds):
             switcher.add_account()
 
@@ -563,7 +563,7 @@ class TestAddAccountRefresh:
         assert "old-token" in stored["creds"]
 
         # Re-add same account with new credentials
-        with patch.object(switcher, "_read_credentials", return_value=new_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(new_creds, False)), \
              patch.object(switcher, "_write_account_credentials", side_effect=mock_write_creds):
             switcher.add_account()
 
@@ -3911,7 +3911,7 @@ class TestDeadTokenQuarantine:
             "emailAddress": "user@example.com", "accountUuid": "u",
             "organizationUuid": "org-A", "organizationName": "Acme",
         }}))
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
@@ -3935,7 +3935,7 @@ class TestAddAccountOrgFields:
             }
         }))
         switcher = ClaudeAccountSwitcher()
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
@@ -3945,7 +3945,7 @@ class TestAddAccountOrgFields:
                 "accountUuid": "user-uuid",
             }
         }))
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
@@ -3970,7 +3970,7 @@ class TestAddAccountOrgFields:
         }
         config_path.write_text(json.dumps(org_config))
         switcher = ClaudeAccountSwitcher()
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
@@ -3979,7 +3979,7 @@ class TestAddAccountOrgFields:
         f = io.StringIO()
         config_path.write_text(json.dumps(org_config))
         with redirect_stdout(f), \
-             patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
         assert "Updated credentials" in f.getvalue()
@@ -4002,7 +4002,7 @@ class TestAddAccountOrgFields:
             }
         }))
         switcher = ClaudeAccountSwitcher()
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
@@ -4354,7 +4354,7 @@ class TestAddAccountSlot:
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._make_switcher(temp_home)
 
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account(slot=5)
 
@@ -4370,7 +4370,7 @@ class TestAddAccountSlot:
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._make_switcher(temp_home)
 
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account()
 
@@ -4383,13 +4383,13 @@ class TestAddAccountSlot:
 
         # Add account A to slot 3
         switcher = self._make_switcher(temp_home, email="a@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account(slot=3)
 
         # Try to add account B to slot 3, answer "n"
         switcher = self._make_switcher(temp_home, email="b@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch("builtins.input", return_value="n"):
             switcher.add_account(slot=3)
@@ -4405,14 +4405,14 @@ class TestAddAccountSlot:
 
         # Add account A to slot 3
         switcher = self._make_switcher(temp_home, email="a@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(slot=3)
 
         # Add account B to slot 3, answer "y"
         switcher = self._make_switcher(temp_home, email="b@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"), \
              patch("builtins.input", return_value="y"):
@@ -4429,7 +4429,7 @@ class TestAddAccountSlot:
 
         # Add account to slot 1 (auto)
         switcher = self._make_switcher(temp_home, email="user@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account()
@@ -4438,7 +4438,7 @@ class TestAddAccountSlot:
         assert "1" in data["accounts"]
 
         # Move to slot 5
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(slot=5)
@@ -4458,19 +4458,19 @@ class TestAddAccountSlot:
 
         # Add account A to slot 1
         switcher = self._make_switcher(temp_home, email="a@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account(slot=1)
 
         # Add account B to slot 3
         switcher = self._make_switcher(temp_home, email="b@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account(slot=3)
 
         # Try to move A from slot 1 → slot 3, cancel
         switcher = self._make_switcher(temp_home, email="a@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch("builtins.input", return_value="n"):
             switcher.add_account(slot=3)
@@ -4486,7 +4486,7 @@ class TestAddAccountSlot:
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._make_switcher(temp_home)
 
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              pytest.raises(ConfigError, match="must be >= 1"):
             switcher.add_account(slot=0)
 
@@ -4496,13 +4496,13 @@ class TestAddAccountSlot:
 
         # Add to slot 5
         switcher = self._make_switcher(temp_home, email="a@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account(slot=5)
 
         # Add to slot 2
         switcher = self._make_switcher(temp_home, email="b@example.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"):
             switcher.add_account(slot=2)
 
@@ -6123,6 +6123,103 @@ class TestMacosKeychainFallback:
         assert s._store._read_previous_backup("1", "a@example.com") == "gen-2", (
             "the true previous generation is unrecoverable here, so the "
             "incoming credential is retained as a checkpoint instead"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_prev_checkpoint_never_clobbers_a_real_previous_generation(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        """C1-round-9: ``_retain_previous_backup`` checkpoints the INCOMING
+        credential on an unreadable current read, but round 8 never checked
+        whether a real ``.prev`` (holding genuine recovery value from an
+        earlier, healthy overwrite) already exists. When it does, the
+        checkpoint overwrites it with a byte-identical copy of the credential
+        being written -- destroying the one rollback target on the exact path
+        C1 claims to protect, and leaving a ``.prev`` that LOOKS legitimate
+        while carrying zero recovery value.
+
+        Three rows, row A is the regression, B and C are controls that must
+        keep their current (round-8) behaviour:
+
+          A) a real .prev already exists + current read FAILS
+             -> .prev must stay 'TRUE-PREV-gen1' (not be clobbered)
+          B) CONTROL: current read succeeds (normal overwrite)
+             -> .prev becomes the outgoing readable generation, as always
+          C) CONTROL: no prior .prev + current read FAILS
+             -> round 8's checkpoint still fires (nothing to lose)
+        """
+        # Each row uses its own account number: .prev/backup Keychain items
+        # are keyed by (account_num, email), and block_real_keychain.data is
+        # shared across every switcher instance in this test -- reusing one
+        # account_num would let one row's leftover .prev / capability-cache
+        # state leak into the next row's premise.
+        def flaky_get_password_for(account_num: str):
+            backup_acct = ("claude-swap", f"account-{account_num}-a@example.com")
+
+            def flaky_get_password(service: str, account: str):
+                if (service, account) == backup_acct:
+                    raise KeychainError("locked")
+                return block_real_keychain.data.get((service, account))
+
+            return flaky_get_password
+
+        # -- row B (control): plain healthy overwrite.
+        s_b = self._macos_switcher()
+        s_b._kc_write_backup("2", "a@example.com", "gen2")
+        s_b._write_account_credentials("2", "a@example.com", "gen3")
+        assert s_b._store._read_previous_backup("2", "a@example.com") == "gen2", (
+            "CONTROL B must be unaffected: a readable current generation is "
+            "still retained as .prev"
+        )
+
+        # -- row A: seed a REAL .prev via a genuine healthy overwrite first,
+        # then force the SECOND write's current-generation read to fail.
+        s_a = self._macos_switcher()
+        s_a._kc_write_backup("1", "a@example.com", "TRUE-PREV-gen1")
+        s_a._write_account_credentials("1", "a@example.com", "gen2")
+        assert s_a._store._read_previous_backup("1", "a@example.com") == "TRUE-PREV-gen1", (
+            "premise: a real .prev with recovery value must exist before the "
+            "probe write"
+        )
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky_get_password_for("1"))
+        try:
+            value, unreadable = s_a._store._read_account_credentials_ex(
+                "1", "a@example.com"
+            )
+            assert unreadable is True, (
+                f"premise: the current-generation read must FAIL, got {(value, unreadable)}"
+            )
+            s_a._write_account_credentials("1", "a@example.com", "INCOMING-gen3")
+        finally:
+            monkeypatch.setattr(macos_keychain, "get_password", block_real_keychain.get_password)
+
+        assert s_a._store._read_previous_backup("1", "a@example.com") == "TRUE-PREV-gen1", (
+            "DEFECT: the checkpoint overwrote a .prev that already held a "
+            "real previous generation with a duplicate of the incoming "
+            "bytes -- the true previous generation is now unrecoverable"
+        )
+
+        # -- row C (control, round 8's own case): unreadable current read,
+        # NO prior .prev -- the checkpoint must still fire (nothing to lose).
+        s_c = self._macos_switcher()
+        store_c = s_c._store
+        store_c._write_backup_enc("3", "a@example.com", "gen-1")
+        enc = store_c._backup_enc_path("3", "a@example.com")
+        enc.chmod(0o000)
+        try:
+            value, unreadable = store_c._read_account_credentials_ex("3", "a@example.com")
+            assert unreadable is True, f"premise: the .enc read must FAIL, got {(value, unreadable)}"
+            s_c._write_account_credentials("3", "a@example.com", "INCOMING-gen3")
+        finally:
+            if enc.exists():
+                enc.chmod(0o600)
+        assert s_c._store._read_previous_backup("3", "a@example.com") == "INCOMING-gen3", (
+            "CONTROL C must be unaffected: round 8's checkpoint still fires "
+            "when there is no prior .prev to lose"
         )
 
     # -- healthy-Mac no-op guard & follow-up ------------------------------
@@ -7989,7 +8086,7 @@ class TestRemoveAccountPrunesMappings:
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
 
         switcher = self._config_switcher(temp_home, "a@x.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(slot=3)
@@ -7998,7 +8095,7 @@ class TestRemoveAccountPrunesMappings:
         store.set(temp_home, "a@x.com", "")
 
         switcher = self._config_switcher(temp_home, "b@x.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"), \
              patch("builtins.input", return_value="y"):
@@ -8013,7 +8110,7 @@ class TestRemoveAccountPrunesMappings:
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
 
         switcher = self._config_switcher(temp_home, "a@x.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account()  # lands in slot 1
@@ -8021,7 +8118,7 @@ class TestRemoveAccountPrunesMappings:
         store = MappingStore(switcher.backup_dir)
         store.set(temp_home, "a@x.com", "")
 
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(slot=5)  # same identity, new slot
@@ -8112,7 +8209,7 @@ class TestAddAccountAlias:
     def test_add_account_sets_alias(self, temp_home: Path):
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._config_switcher(temp_home, "a@x.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(alias="dev")
@@ -8125,7 +8222,7 @@ class TestAddAccountAlias:
         wipe a previously set alias."""
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._config_switcher(temp_home, "a@x.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(alias="dev")
@@ -8137,7 +8234,7 @@ class TestAddAccountAlias:
     def test_readd_refresh_in_place_applies_new_alias(self, temp_home: Path):
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._config_switcher(temp_home, "a@x.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account()
@@ -8151,7 +8248,7 @@ class TestAddAccountAlias:
         alias forward instead of dropping it."""
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         switcher = self._config_switcher(temp_home, "a@x.com")
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             switcher.add_account(alias="dev")  # lands in slot 1
@@ -8172,7 +8269,7 @@ class TestAddAccountAlias:
         data["sequence"] = [9]
         switcher._write_json(switcher.sequence_file, data)
 
-        with patch.object(switcher, "_read_credentials", return_value=fake_creds), \
+        with patch.object(switcher, "_read_active_credentials", return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_delete_account_credentials"):
             with pytest.raises(ValidationError):
@@ -9298,6 +9395,78 @@ class TestStoreResolutionParity:
         s._setup_directories()
 
         assert s._read_capture_credentials() != "sk-ant-api-PROFILE-A"
+
+    def test_refuse_degraded_capture_is_not_a_toctou(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        """I-1: ``_refuse_degraded_capture`` reads the active credential to
+        CHECK it, then the plain default path (``CLAUDE_CONFIG_DIR`` unset)
+        reads it AGAIN via ``_read_credentials()`` to CAPTURE it. Those are
+        two separate Keychain reads. A Keychain that answers on the guard's
+        read and fails on the capture's read passes the guard and still
+        captures the possibly-stale plaintext fallback -- exactly what the
+        guard's docstring says it prevents.
+
+        Driven without patching the seam itself: only
+        ``macos_keychain.get_password`` is made flaky (healthy once, then
+        locked), the wrapper's own documented failure mode.
+        """
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("STALE-FALLBACK-PLAINTEXT")
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+
+        calls = {"n": 0}
+        healthy_value = '{"claudeAiOauth":{"refreshToken":"HEALTHY-RT"}}'
+
+        def flaky_get_password(service, account):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # first Keychain read: healthy, answers with a real
+                # credential -- ActiveCredentials.degraded is False.
+                return healthy_value
+            raise KeychainError("locked")  # any SECOND read: now locked
+
+        monkeypatch.setattr(macos_keychain, "get_password", flaky_get_password)
+
+        captured = s._read_capture_credentials()
+        assert captured == healthy_value, (
+            "DEFECT: the guard-check and the capture-use must be the SAME "
+            "read. A second, independent Keychain read that can fail after "
+            "a healthy first read is a TOCTOU -- the captured value must be "
+            f"the bytes the guard itself verified, not {captured!r} (a stale "
+            "fallback file reached only because a SECOND read failed)"
+        )
+        assert calls["n"] == 1, (
+            "premise: exactly ONE Keychain read backs both the guard's "
+            "verdict and the captured value -- a second call means the "
+            "TOCTOU window is still open"
+        )
+
+    def test_refuse_degraded_capture_control_persistently_locked(
+        self, temp_home: Path, monkeypatch, block_real_keychain
+    ):
+        """CONTROL (opposite direction): a Keychain locked on EVERY read must
+        still be refused -- the guard is armed on this construction, so I-1's
+        finding is about the TOCTOU window, not a guard that never fires."""
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        cred = get_credentials_path()
+        cred.parent.mkdir(parents=True, exist_ok=True)
+        cred.write_text("STALE-FALLBACK-PLAINTEXT")
+        monkeypatch.setattr("claude_swap.credentials._ACTIVE_READ_RETRY_DELAY", 0)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+
+        with pytest.raises(CredentialReadError):
+            s._read_capture_credentials()
 
 
 class TestConsumeGateLockFailures:

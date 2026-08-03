@@ -72,7 +72,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
     try:
         real_marker.write_text("probe\n", encoding="utf-8")
         outcome_main["wrote"] = True
-    except PermissionError as e:
+    except conftest.RealStoreWriteBlocked as e:
         outcome_main["wrote"] = False
         outcome_main["error"] = e
 
@@ -100,7 +100,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
         try:
             target.write_text("probe\n", encoding="utf-8")
             outcome_thread["wrote"] = True
-        except PermissionError as e:
+        except conftest.RealStoreWriteBlocked as e:
             outcome_thread["wrote"] = False
             outcome_thread["error"] = e
 
@@ -580,3 +580,45 @@ def test_derived_hints_exclude_the_bare_home_root_basename():
     # Sanity: the bare-home root's real protected children still match via
     # the unconditional '.claude' floor hint.
     assert any(hint in str(home / ".claude.json") for hint in hints)
+
+
+def test_mkdir_exist_ok_true_does_not_swallow_the_refusal(
+    tmp_path: Path, monkeypatch
+):
+    """I-3: ``RealStoreWriteBlocked`` subclasses ``PermissionError`` (an
+    ``OSError``), so ``pathlib.Path.mkdir(parents=True, exist_ok=True)``
+    catches it via its own ``except OSError:`` (when the directory already
+    exists) and returns normally instead of propagating -- the guard fired,
+    but the caller ate the refusal and proceeded as if nothing happened.
+    That is the exact shape ``cache.write_cache`` / ``_atomic_b64_write`` /
+    ``_update_global_config`` all use.
+
+    A absent-dir: refuses and raises (mkdir's own bootstrap case).
+    B existing-dir: must ALSO raise -- today it is swallowed instead.
+    C control: a plain file write into the same protected dir is still
+       refused, proving the guard itself is armed on this root (this is
+       "the hook fired and the caller ate it", not "the hook is off").
+    """
+    stand_in_root = tmp_path / "claude-swap"
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    # A: absent dir -- mkdir(exist_ok=True) must refuse and raise.
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        stand_in_root.mkdir(parents=True, exist_ok=True)
+    assert not stand_in_root.exists()
+
+    # Seed the dir OUTSIDE the guard's view (os.mkdir is unguarded here only
+    # via direct filesystem bootstrap, matching how the real backup root
+    # exists on every developer machine before cswap ever runs in-process).
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ())
+    stand_in_root.mkdir(parents=True)
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+
+    # B: existing dir -- must ALSO refuse and raise, not swallow.
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        stand_in_root.mkdir(parents=True, exist_ok=True)
+
+    # C: control -- a plain write into the same root is still refused,
+    # proving the guard is armed (isolates "swallowed" from "never fired").
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
