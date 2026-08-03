@@ -4385,15 +4385,13 @@ class ClaudeAccountSwitcher:
             return False
         is_active = num == self.current_account_number()
         # The backup is a stored source on BOTH paths — directly when idle,
-        # and as _entry_token_dead's second source when active. An unreadable
-        # one is not an absent one, and here the difference is destructive in
-        # both directions: on the idle path `credential_fingerprint("")` is
-        # None, `token_dead` skips its binding check entirely on a None
-        # stored_fp and the slot reads DEAD; on the active path
-        # _entry_token_dead deliberately HOLDS the strike it cannot disprove,
-        # which is right for the collectors and wrong here. Both land on
-        # `import_accounts` replacing a healthy slot's credential without
-        # --force. We cannot see the generation, so we cannot condemn it.
+        # and as _entry_token_dead's second source when active — and each
+        # turns an unreadable one into "dead" by a different route: an empty
+        # fingerprint skips token_dead's binding check, and the active path
+        # deliberately HOLDS a strike it cannot disprove (right for the
+        # collectors, wrong here). Both end in `import_accounts` replacing a
+        # healthy slot without --force. We cannot see it, so we cannot
+        # condemn it.
         backup, unreadable = self._read_account_credentials_ex(num, email)
         if unreadable:
             return False

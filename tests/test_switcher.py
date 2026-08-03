@@ -9574,6 +9574,34 @@ class TestGateUltraReviewFixes:
             "the re-added backup, not the presumed-stale profile"
         )
 
+    # -- the consume lock must not leak (M-8) ----------------------------
+
+    def test_the_consume_lock_is_released_even_when_the_post_raises(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A leaked consume lock wedges the slot: every later gate pass
+        returns `consume-busy` for the rest of the process, so the collector
+        silently stops refreshing that account.
+
+        Deliberately the RAISING path, not the happy one. A happy-path
+        version of this test passes with the `finally` removed — the
+        `consume_lock` local goes out of scope, refcounting closes the fd,
+        and flock releases on close. The raised exception keeps the frame
+        (and the lock) alive, which is both the case that actually leaks and
+        the only one that can see the guard.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError):
+                s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)):
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+        assert out.error != "consume-busy"
+
     # -- session-profile precedence: the other three conjuncts -----------
 
     def test_a_foreign_profile_never_supersedes_the_backup(
