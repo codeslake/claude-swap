@@ -4841,6 +4841,162 @@ class TestHorizonAxisDoesNotFlap:
             "premise: the unclamped threshold is unsatisfiable at h=100.0"
         )
 
+    def test_the_dominance_leg_does_not_silently_read_an_unreadable_active_as_no_dominance(
+        self, harness
+    ):
+        """F6 (round-6 review): `active_headroom is None` must not collapse
+        onto the same answer as "the peer genuinely does not dominate".
+
+        The consume-first two-phase commit reassigns `active_headroom` from
+        an escalated refetch WITHOUT re-classifying the trigger
+        (`autoswitch.py:1152-1168`) -- so a phase-2 refetch that cannot read
+        the active reaches this predicate with `trigger in ("proactive",
+        "consume-first")` (in scope for the bar) and `active_headroom is
+        None`. Before the fix, the dominance leg's own `active_headroom is
+        not None` guard silently turned "cannot compare" into "does not
+        dominate", identical to a peer that genuinely fails the ratio test.
+
+        Same peer (frozen at 40 pts, well past the round-5e `+SPENT_
+        HEADROOM_PCT` margin at any active this small) with only the
+        active's readability changed:
+
+            active_headroom=2.0   (readable)   -> True
+            active_headroom=None  (unreadable) -> must ALSO be True
+
+        Measured pre-fix: readable gave True (`40 > 2*2+3`), unreadable gave
+        False -- same peer, same reality, opposite answers, purely from
+        losing the ability to read a THIRD account.
+        """
+        state = {"lastSwitchFrom": "2", "leftHeadroom": 40.0, "leftRecoveryAt": None}
+        usage = {"2": _usage(60.0)}  # peer frozen at 40 pts headroom
+        readable = harness.engine._left_account_recovered(
+            state, usage, {"2": 40.0}, 2.0, harness.settings, harness.clock(), "1",
+        )
+        unreadable = harness.engine._left_account_recovered(
+            state, usage, {"2": 40.0}, None, harness.settings, harness.clock(), "1",
+        )
+        assert readable is True, "premise: a readable, dominant active releases"
+        assert unreadable is True, (
+            f"readable={readable} unreadable={unreadable} -- the SAME peer, "
+            "unchanged, must not flip to HOLD purely because the active "
+            "became unreadable; that silently scores 'cannot read' the same "
+            "as 'does not dominate'"
+        )
+
+    def test_no_return_account_does_not_re_bar_an_already_recovered_peer_when_the_active_is_unreadable(
+        self, harness
+    ):
+        """F6, measured directly against `_no_return_account`: with `recovered`
+        already established True, the function's OWN ratio leg has the same
+        `active_headroom is None` ambiguity as the predicate that feeds it --
+        an unreadable active must not re-impose the bar on a peer already
+        judged recovered.
+
+        `recovered=True` is fixed on both calls (this isolates
+        `_no_return_account`'s own leg from the fix already applied to
+        `_left_account_recovered`). Same barred peer at 40 pts, dominating a
+        2-pt active by 20x -- readable releases (`None`); measured pre-fix
+        that unreadable stayed barred (`'2'`) for the identical peer, purely
+        because the second, redundant ratio check inside `_no_return_account`
+        could not confirm dominance without a readable active.
+        """
+        state = {"lastSwitchFrom": "2", "leftHeadroom": 40.0, "leftRecoveryAt": None}
+        headroom = {"2": 40.0}
+        for trigger in ("proactive", "consume-first"):
+            readable = harness.engine._no_return_account(
+                trigger, state, headroom, 2.0, recovered=True, settings=harness.settings
+            )
+            unreadable = harness.engine._no_return_account(
+                trigger, state, headroom, None, recovered=True, settings=harness.settings
+            )
+            assert readable is None, f"premise: {trigger} releases when readable"
+            assert unreadable is None, (
+                f"trigger={trigger} readable={readable!r} "
+                f"unreadable={unreadable!r} -- the same already-recovered peer "
+                "must not be re-barred purely because the active became "
+                "unreadable"
+            )
+
+    def test_the_all_spent_recovery_leg_carries_its_own_hysteresis(
+        self, temp_home
+    ):
+        """MC1-nohyst: the new failover recovery leg (C1) needs a margin too.
+
+        Without `RECOVERY_HYSTERESIS_S`, any reset that drifts a second
+        nearer than the active's reads as "the barred peer recovered" --
+        the same drift-is-not-recovery hole the ordinary path's recovery
+        leg already guards against (`test_a_reset_that_crept_nearer_is_not_
+        a_recovery`), but on the failover leg added for C1. Both accounts
+        sit inside the all-spent band (peer 5 pts, active 2 pts, threshold
+        90 -> floor 10) so the landing leg cannot fire and only the
+        recovery leg decides; the peer's reset is 60s sooner than the
+        active's, well inside the 300s margin, so this must NOT release.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        state = {"lastSwitchFrom": "1", "leftHeadroom": None, "leftRecoveryAt": None}
+        usage = {
+            "1": _usage(95.0, self._at(h, 3600.0)),        # 5 pts, back in 1h
+            "2": _usage(98.0, self._at(h, 3660.0)),        # 2 pts, back in 1h+60s
+        }
+        recovered = h.engine._left_account_recovered(
+            state, usage, {"1": 5.0}, 2.0, h.settings, h.clock(), "2",
+        )
+        assert recovered is False, (
+            "the peer's reset is only 60s sooner than the active's, well "
+            "inside RECOVERY_HYSTERESIS_S (300s) -- without the margin any "
+            "drift in resets_at releases the all-spent failover hold"
+        )
+
+    def test_the_dominance_fallback_does_not_fire_below_its_own_floor(
+        self, harness
+    ):
+        """MF6a-always: the F6 fallback (unreadable active) still has a
+        floor -- it is not an unconditional release once the active goes
+        unreadable.
+
+        Ordinary-path snapshot (`leftHeadroom` a real baseline), active
+        unreadable, and the peer currently BELOW the landing floor
+        (`h=5 < 100-90=10`). None of the other legs can fire either (peer
+        far under `left_headroom + SPENT_HEADROOM_PCT`, and no reset info
+        at all so the recovery leg's `inf < inf - 300` is false), so a
+        correct predicate holds.
+        """
+        state = {"lastSwitchFrom": "2", "leftHeadroom": 40.0, "leftRecoveryAt": None}
+        usage = {"2": _usage(95.0)}  # 5 pts, no resets_at at all
+        recovered = harness.engine._left_account_recovered(
+            state, usage, {"2": 5.0}, None, harness.settings, harness.clock(), "1",
+        )
+        assert recovered is False, (
+            "the peer is unreadable-active-fallback-eligible in shape only -- "
+            "at 5 pts it is BELOW the landing floor (10), so the F6 fallback "
+            "must not release it just because the active went unreadable"
+        )
+
+    def test_no_return_accounts_unreadable_active_fallback_has_a_floor_too(
+        self, harness
+    ):
+        """MF6b-always: `_no_return_account`'s own F6 fallback leg needs the
+        same floor as the predicate that feeds it -- not an unconditional
+        release once the active is unreadable.
+
+        `recovered=True` fixed (isolates this leg). Barred peer at 5 pts,
+        active unreadable -- 5 is BELOW the landing floor (10 at the
+        default threshold), so the bar must still apply.
+        """
+        state = {"lastSwitchFrom": "2"}
+        headroom = {"2": 5.0}
+        no_return = harness.engine._no_return_account(
+            "proactive", state, headroom, None, recovered=True,
+            settings=harness.settings,
+        )
+        assert no_return == "2", (
+            "the barred peer at 5 pts is below the landing floor (10); an "
+            "unreadable active must not unconditionally release it"
+        )
+
     def test_a_reset_that_crept_nearer_is_not_a_recovery(self, temp_home):
         """The recovery leg carries `RECOVERY_HYSTERESIS_S`, and it must.
 
@@ -5257,6 +5413,106 @@ class TestHorizonAxisDoesNotFlap:
             "35x the active's 2 points, and the engine never returned. The "
             "release floor is absolute (h >= 97), so any peer past 3% of its "
             "weekly window is held until the active hits its own limit."
+        )
+
+    def test_a_failover_departure_releases_when_the_peer_resets_first_in_the_all_spent_regime(
+        self, temp_home
+    ):
+        """C1 (round-6 review): the failover floor is the exact complement of
+        all-spent, so a peer that resets first can never release the bar.
+
+        `_every_account_above_threshold` is True exactly when every account,
+        active included, sits at or under `100 - threshold`. The failover
+        release floor at `_left_account_recovered` demands the barred peer
+        sit STRICTLY ABOVE `100 - threshold` -- the exact complement of the
+        same quantity. So whenever the fleet is all-spent, the floor cannot
+        be cleared by any measured headroom, independent of how soon the
+        peer's own binding window resets -- which is exactly the axis
+        `TestAllSpentGoesToTheSoonestReset` says should decide once headroom
+        stops being informative.
+
+        Same failover setup as the sibling tests above, but both accounts
+        now sit inside the all-spent band (peer 2.5 pts, active 2.0 pts --
+        both under the default floor of 10) and the peer's binding reset is
+        5 minutes away against the active's 400 hours out. See the sibling
+        test below for the snapshot-stripped control proving this exact
+        fleet is choosable, so a stall here is the floor, not the ranking.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = None
+        for _ in range(3):  # unhealthy_ticks default is 3
+            outcome = h.tick_with_usage({
+                "1": None,                              # unreadable -> failover
+                "2": _usage(4, self._at(h, 400 * 3600)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.engine._read_state()
+        assert state.get("leftHeadroom") is None and state.get(
+            "leftRecoveryAt"
+        ) is None, "premise: a failover snapshot, keys present, values null"
+
+        h.clock.advance(301.0)
+        outcomes = []
+        for _ in range(8):
+            outcomes.append(h.tick_with_usage({
+                "1": _usage(97.5, self._at(h, 300.0)),      # 2.5 pts, 5 min out
+                "2": _usage(98.0, self._days_out(h, 400)),  # 2.0 pts, 400h out
+            }))
+            h.clock.advance(301.0)
+
+        assert TickOutcome.SWITCHED in outcomes, (
+            f"{[o.name for o in outcomes]} -- peer 1 sits inside the "
+            "all-spent band at 2.5 pts and resets in 5 minutes against the "
+            "active's 2.0 pts / 400h out; the floor `h > 100 - threshold` is "
+            "the complement of all-spent so it can never release here "
+            "however soon the peer returns"
+        )
+
+    def test_the_all_spent_stall_above_is_the_floor_not_the_fleet(
+        self, temp_home
+    ):
+        """Control for the test above: strip the failover snapshot to the
+        pre-upgrade shape on the IDENTICAL fleet, and it switches on the very
+        next tick -- proving the stall above comes from the floor being the
+        complement of all-spent, not from the fleet having nowhere to go.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = None
+        for _ in range(3):
+            outcome = h.tick_with_usage({
+                "1": None,
+                "2": _usage(4, self._at(h, 400 * 3600)),
+            })
+            h.clock.advance(60.0)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        # Strip to the pre-upgrade shape: barred is named, no departure
+        # evidence recorded at all -- absence releases (R6), by design.
+        h.engine._mutate_state(lambda st: st.pop("leftHeadroom", None))
+        h.engine._mutate_state(lambda st: st.pop("leftRecoveryAt", None))
+        assert "leftHeadroom" not in h.engine._read_state()
+
+        h.clock.advance(301.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(97.5, self._at(h, 300.0)),
+            "2": _usage(98.0, self._days_out(h, 400)),
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "the identical fleet with no departure snapshot recorded "
+            "switches on the very next tick -- the fleet is choosable, so "
+            "the failover-shaped stall in the sibling test is the floor's "
+            "own construction, not a property of the ranking"
         )
 
     def test_a_failover_hold_still_escapes_at_limit(self, temp_home):
@@ -5725,12 +5981,13 @@ class TestAcceptance204eR1toR7:
         state = {"lastSwitchFrom": "2"}
         headroom = {"1": 0.0, "2": 100.0}
         for active in (0.0, None):
-            assert harness.engine._no_return_account(
-                "at-limit", state, headroom, active, ["1", "2"]
-            ) is None, (
-                "at-limit must escape the bar regardless of active_headroom "
-                "or the recovered predicate's answer"
-            )
+            for recovered in (True, False):
+                assert harness.engine._no_return_account(
+                    "at-limit", state, headroom, active, recovered
+                ) is None, (
+                    "at-limit must escape the bar regardless of "
+                    "active_headroom or the recovered predicate's answer"
+                )
 
 
 class TestAllSpentGoesToTheSoonestReset:
