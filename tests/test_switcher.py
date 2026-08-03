@@ -8708,6 +8708,53 @@ class TestBackupUnreadableDisplay:
         info = (2, "b@example.com", "", "", False, "", "")
         assert s._static_usage_sentinel(info) == USAGE_NO_CREDENTIALS
 
+    # -- I-1: the active-slot branch collapses the same tri-state on Linux --
+
+    def test_active_slot_unreadable_credential_shows_keychain_unavailable_on_linux(
+        self, temp_home: Path,
+    ):
+        """``_static_usage_sentinel``'s active branch used
+        ``self._active_keychain_unavailable`` alone, which is False on
+        Linux/WSL/Windows even when the plaintext ``.credentials.json`` read
+        outright FAILED (``credentials.py:527`` sets
+        ``keychain_failed = keychain_failed`` — always False off macOS).
+        ``ActiveCredentials.value is None`` is the only surviving signal
+        there; ``.value or ""`` at the call site discards it before it ever
+        reaches here, so the info row's ``creds`` looks genuinely empty.
+        Platform-independent reproduction: the read error comes from the
+        plaintext file, not the Keychain.
+        """
+        from claude_swap.json_output import USAGE_KEYCHAIN_UNAVAILABLE
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+
+        live = json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        cred_path = temp_home / ".claude" / ".credentials.json"
+        cred_path.write_text(live, encoding="utf-8")
+
+        # CONTROL: readable -> no sentinel (a real credential to fetch).
+        active = s._store._read_active_credentials()
+        s._record_active_verdict(active)
+        info_ok = (1, "a@example.com", "", "", True, active.value or "", "")
+        assert s._static_usage_sentinel(info_ok) is None, "control broken"
+
+        # PROBE: unreadable (mode 000) -> keychain unavailable, not "no
+        # credentials" (which would nudge the user into an unneeded re-add).
+        cred_path.chmod(0o000)
+        try:
+            active_bad = s._store._read_active_credentials()
+        finally:
+            cred_path.chmod(0o600)
+        assert active_bad.value is None, "premise: unreadable file gives value=None"
+        assert active_bad.keychain_unavailable is False, (
+            "premise: Linux never sets this True"
+        )
+        s._record_active_verdict(active_bad)
+        info_bad = (1, "a@example.com", "", "", True, active_bad.value or "", "")
+        assert s._static_usage_sentinel(info_bad) == USAGE_KEYCHAIN_UNAVAILABLE
+
 
 class TestSwitchUnreadableBackup:
     """M1: switching to a slot whose backup is keychain-unreadable errors
