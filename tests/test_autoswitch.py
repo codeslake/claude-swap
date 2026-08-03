@@ -4322,14 +4322,14 @@ class TestHorizonAxisDoesNotFlap:
         for trigger in ("at-limit", "failover"):
             for active in (10.0, None):
                 assert harness.engine._no_return_account(
-                    trigger, state, headroom, active, ["1", "3"]
+                    trigger, state, headroom, active, ["1", "3"], harness.settings
                 ) is None, (
                     f"trigger={trigger} active_headroom={active} barred the "
                     "account we left; an escape must reach every candidate"
                 )
         # The control: the SAME state bars on a proactive tick.
         assert harness.engine._no_return_account(
-            "proactive", state, headroom, 10.0, ["1", "3"]
+            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
         ) == "1", "premise: these inputs are barred when the trigger allows it"
 
     def test_the_bar_actually_removes_the_account_from_the_ranking(
@@ -4489,7 +4489,7 @@ class TestHorizonAxisDoesNotFlap:
         state = {"lastSwitchFrom": 1}
         headroom = {"2": 10.0, "3": 40.0}       # slot 1 unreadable — absent
         assert harness.engine._no_return_account(
-            "proactive", state, headroom, 10.0, ["1", "3"]
+            "proactive", state, headroom, 10.0, ["1", "3"], harness.settings
         ) == "1", (
             "an unreadable barred account must still bar — unknown headroom "
             "is not evidence it beats us"
@@ -5474,6 +5474,130 @@ class TestHorizonAxisDoesNotFlap:
             "however soon the peer returns"
         )
 
+    def test_c1_recovery_leg_requires_the_actives_reset_to_be_known_not_merely_absent(
+        self, temp_home
+    ):
+        """R7 review C-1: `_binding_recovery_ts` returns `inf` for FIVE
+        states, only two of which mean "never" (unreadable, token-expired
+        sentinel) -- unknown resets_at and a stale/past resets_at both also
+        return `inf` but mean "we do not know", not "never". The old
+        predicate `peer < active - HYST` treats all of them alike, so an
+        active whose `resets_at` is simply unreported reads as WORSE than a
+        peer that is finite but arbitrarily far out (400h), and the bar
+        releases onto it on no evidence at all.
+
+        Same failover setup as the sibling C1 tests above (peer barred at
+        departure, active burns down), then a single tick with three
+        variants of the active's reset -- only the active's `resets_at`
+        differs across rows:
+
+            active reset UNREPORTED  -> must BLOCK (hold: unknown != never)
+            active resets in 500h    -> must SWITCH (intended release, C1)
+            active resets in 10min   -> must BLOCK (guard still works)
+        """
+        cases = [
+            (
+                "active reset UNREPORTED (no resets_at)",
+                lambda h: _usage(98.0),
+                TickOutcome.BLOCKED,
+                2,
+            ),
+            (
+                "CONTROL active resets in 500h (finite, still later than peer)",
+                lambda h: _usage(98.0, self._days_out(h, 500)),
+                TickOutcome.SWITCHED,
+                1,
+            ),
+            (
+                "CONTROL active resets in 10min (finite, sooner than peer)",
+                lambda h: _usage(98.0, self._at(h, 600)),
+                TickOutcome.BLOCKED,
+                2,
+            ),
+        ]
+        for label, active_row, expected_outcome, expected_active in cases:
+            h = EngineHarness(temp_home)
+            h.seed(1, "a@example.com")
+            h.seed(2, "b@example.com")
+            h.make_live("a@example.com", 1)
+
+            outcome = None
+            for _ in range(3):  # unhealthy_ticks default is 3
+                outcome = h.tick_with_usage({
+                    "1": None,                              # unreadable -> failover
+                    "2": _usage(4, self._at(h, 400 * 3600)),
+                })
+                h.clock.advance(60.0)
+            assert outcome is TickOutcome.SWITCHED
+            assert h.active_number() == 2
+
+            h.clock.advance(301.0)
+            out = h.tick_with_usage({
+                "1": _usage(97.5, self._at(h, 400 * 3600)),  # barred peer, 400h out
+                "2": active_row(h),                            # active
+            })
+            assert out is expected_outcome and h.active_number() == expected_active, (
+                f"{label}: got {out.name}/active={h.active_number()}, want "
+                f"{expected_outcome.name}/active={expected_active}"
+            )
+
+    def test_i3_left_snapshot_uses_the_ranking_now_not_a_fresh_clock_read(
+        self, temp_home
+    ):
+        """R7 review I-3: `left_snapshot` used to re-read `self.clock()`
+        AFTER the ranking had already decided on a `now`, instead of reusing
+        that same value. On a fake, non-advancing clock the two reads are
+        identical, so no existing test could see the difference -- on a real
+        wall clock any elapsed time between the two reads (however small) can
+        tip a reset that was still in the future at ranking time into the
+        past by the second read, turning a real `leftRecoveryAt` into `null`.
+
+        Drives that divergence directly with a scripted clock: the value
+        returned to the ranking's `now=self.clock()` sits BEFORE the active's
+        binding reset; the value that a SECOND, independent `self.clock()`
+        call would see (what the old code did) sits AFTER it. The recorded
+        `leftRecoveryAt` must reflect the ranking-time read.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        ranking_now = 1_000_000.0
+        reset_at = self._iso_at(ranking_now + 100.0)   # future at ranking_now
+        stale_reread = ranking_now + 200.0             # past reset_at
+
+        # Enough values for the OLD code's clock() call order (pre-tick
+        # check, ranking now, left_snapshot re-read, freshen expiry check,
+        # _perform's lastSwitchAt) with a couple of spares so neither code
+        # path can exhaust the sequence.
+        clock_values = iter([
+            ranking_now, ranking_now, stale_reread,
+            stale_reread, stale_reread, stale_reread,
+        ])
+        with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
+            outcome = h.tick_with_usage({
+                "1": _usage(95, reset_at),
+                "2": _usage(10),
+            })
+        assert outcome is TickOutcome.SWITCHED
+        state = h.engine._read_state()
+        assert state.get("leftRecoveryAt") == ranking_now + 100.0, (
+            f"leftRecoveryAt={state.get('leftRecoveryAt')!r} -- a SECOND, "
+            "independent clock() read after the ranking already decided "
+            "would see the reset as already past and record None; the "
+            "snapshot must use the value the ranking itself decided on"
+        )
+
+    def _iso_at(self, epoch_seconds):
+        from datetime import datetime, timezone
+
+        return (
+            datetime.fromtimestamp(epoch_seconds, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
     def test_the_all_spent_stall_above_is_the_floor_not_the_fleet(
         self, temp_home
     ):
@@ -5983,7 +6107,7 @@ class TestAcceptance204eR1toR7:
         for active in (0.0, None):
             for recovered in (True, False):
                 assert harness.engine._no_return_account(
-                    "at-limit", state, headroom, active, recovered
+                    "at-limit", state, headroom, active, recovered, harness.settings
                 ) is None, (
                     "at-limit must escape the bar regardless of "
                     "active_headroom or the recovered predicate's answer"
