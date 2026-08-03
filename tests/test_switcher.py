@@ -3052,6 +3052,13 @@ class TestPerformSwitchPostDisplay:
         def read_creds(num, email):
             return creds_store.get((str(num), email), "")
 
+        def read_creds_ex(num, email):
+            # The in-memory store IS the backup here, so it is never
+            # "unreadable" — but it must answer the strict reader too, or
+            # every caller that asks absent-vs-unreadable bypasses the
+            # double and reads the real (empty) store instead.
+            return creds_store.get((str(num), email), ""), False
+
         def write_creds(num, email, creds):
             creds_store[(str(num), email)] = creds
 
@@ -3069,6 +3076,9 @@ class TestPerformSwitchPostDisplay:
 
         patches = [
             patch.object(switcher, "_read_account_credentials", side_effect=read_creds),
+            patch.object(
+                switcher, "_read_account_credentials_ex", side_effect=read_creds_ex
+            ),
             patch.object(switcher, "_write_account_credentials", side_effect=write_creds),
             patch.object(switcher, "_read_account_config", side_effect=read_cfg),
             patch.object(switcher, "_write_account_config", side_effect=write_cfg),
@@ -9151,9 +9161,18 @@ class TestGateUltraReviewFixes:
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
-        # The gate's ONE store read happens after the POST, under the slot
-        # lock: a third party replaced the lineage while we were in flight.
+        # Both gate store reads ask the strict reader (absent must stay
+        # distinguishable from unreadable). The pre-POST read sees the
+        # generation we consume; a third party replaces the lineage while we
+        # are in flight, so the post-POST CAS re-read sees THIRD.
+        reads = iter([(self._OLD, False)])
+
+        def read_ex(num, email):
+            return next(reads, (THIRD, False))
+
         with patch.object(s, "_read_account_credentials", return_value=THIRD), \
+             patch.object(s, "_read_account_credentials_ex",
+                          side_effect=read_ex), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(self._NEW, None)):
             out = s.consume_backup_grant("1", "test@example.com", self._OLD)
@@ -9818,3 +9837,215 @@ class TestUltraReviewCoverageGaps:
         assert out.credentials == new
         write_live.assert_not_called()
         assert s._read_account_credentials("1", "test@example.com") == new
+
+
+class TestUnreadableBackupIsNotAbsent:
+    """The three sites this PR added or modified that still read the PLAIN
+    reader's ``""`` as ABSENT.
+
+    ``_read_account_credentials`` answers ``""`` for both "this slot has no
+    credential" and "the Keychain would not let me read it". Every decision
+    below is destructive in one direction or the other, so an unreadable
+    backup must license neither.
+    """
+
+    _OLD = json.dumps({
+        "claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-old",
+                          "expiresAt": 1000}})
+    _NEW = json.dumps({
+        "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new",
+                          "expiresAt": 9999999999000}})
+
+    def _macos_switcher(self, sample_sequence_data, email="test@example.com"):
+        sample_sequence_data["accounts"]["1"]["email"] = email
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    # -- C-1: the consume gate's POST-POST CAS re-read -------------------
+
+    def test_backup_unreadable_after_post_is_not_a_removed_slot(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+        block_real_keychain,
+    ):
+        """A Keychain that locks during the ~1s refresh POST must not be
+        reported as "freshened, safe to activate".
+
+        The PRE-POST read at the top of the gate uses ``_ex`` and defers on
+        unreadable. The POST-POST CAS re-read uses the plain reader, so the
+        same lock reads as "the slot was emptied mid-POST (remove-account)"
+        — a reason deliberately excluded from ``_DEMOTING_STASH_REASONS``
+        because a REMOVED slot has nothing left to activate. The grant IS
+        spent and the slot still holds the generation that spent it, so
+        ``error=None`` sends ``autoswitch._freshen_target`` and
+        ``session.setup_session`` onto a credential whose first refresh gets
+        ``invalid_grant``.
+        """
+        s = self._macos_switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+        def refresh_then_lock(credentials, **kw):
+            # The screen locks while the POST is in flight.
+            monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=refresh_then_lock):
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        reasons = [
+            m.get("reason") for m in s.list_unclaimed_credentials().values()
+        ]
+        assert reasons, "the consumed successor must still be stashed"
+        assert "consume-gate-slot-removed" not in reasons, (
+            "an unreadable Keychain is not a removed slot"
+        )
+        assert out.error is not None, (
+            "the slot still holds the generation whose grant was just spent, "
+            "so `error is None` tells every caller it is safe to activate"
+        )
+
+    # -- C-2: the dead-token second-source check -------------------------
+
+    def test_unreadable_backup_never_erases_a_live_dead_token_strike(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+        block_real_keychain,
+    ):
+        """One transient lock must not zero a persisted quarantine.
+
+        ``_entry_token_dead``'s second-source check reads the active slot's
+        backup with the plain reader, so an unreadable backup is
+        ``bool("") is False`` and the strike is dropped.
+        ``_collect_usage_entries`` then takes its
+        ``elif entry.auth_dead_strikes and entry.token_dead():`` branch and
+        calls ``clear_dead_token``, which zeroes ``authDeadStrikes`` AND
+        ``struckFingerprint`` in the PERSISTED store. A genuinely dead
+        account is un-quarantined by one momentary lock and never says
+        "re-login needed" again.
+        """
+        s = self._macos_switcher(sample_sequence_data, email="b@example.com")
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live",
+                              "expiresAt": 9999999999000}})
+        dead_backup = self._OLD
+        s._write_account_credentials("1", "b@example.com", dead_backup)
+        identities = {"1": ("b@example.com", "")}
+        # The strike is bound to the BACKUP generation; the live credential
+        # has since rotated onto a different one.
+        s._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(dead_backup))},
+            identities,
+        )
+        for _ in range(5):
+            s._usage_store.record(
+                {"1": FetchRecord(
+                    error="invalid_grant",
+                    struck_fp=oauth.credential_fingerprint(dead_backup))},
+                identities,
+            )
+        entry = s._usage_store.entries(identities, [])["1"]
+        assert entry.token_dead(), "the row must be struck to begin with"
+
+        info = [(1, "b@example.com", "", "", True, live, "")]
+        assert s._entry_token_dead(entry, "1", "b@example.com", live, True), (
+            "with a readable backup the backup-bound strike holds"
+        )
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        s._collect_usage_entries(info, fetch=set())
+
+        after = s._usage_store.entries(identities, [])["1"]
+        assert after.auth_dead_strikes > 0, (
+            "one unreadable pass erased the persisted strike count"
+        )
+        assert after.struck_fingerprint is not None, (
+            "one unreadable pass erased the persisted struck fingerprint"
+        )
+
+    # -- C-3: the import auto-heal's verdict -----------------------------
+
+    def test_unreadable_backup_is_not_a_dead_slot_for_import(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+        block_real_keychain,
+    ):
+        """``cswap import`` must not overwrite a healthy slot it cannot read.
+
+        ``_slot_token_dead``'s ``stored`` read is plain. Unreadable → ``""``
+        → ``credential_fingerprint("")`` is None → ``token_dead`` skips the
+        binding check entirely (``stored_fp is not None and …``) → True.
+        ``import_accounts`` then takes the "quarantined: refresh token dead"
+        branch and REPLACES the slot's credential without ``--force``.
+        """
+        s = self._macos_switcher(sample_sequence_data, email="b@example.com")
+        # The strike is bound to a generation the slot no longer stores, so
+        # the correct verdict is "healed / not dead".
+        s._write_account_credentials("1", "b@example.com", self._NEW)
+        identities = {"1": ("b@example.com", "")}
+        for _ in range(6):
+            s._usage_store.record(
+                {"1": FetchRecord(error="invalid_grant",
+                                  struck_fp="sha256:condemnedgen")},
+                identities,
+            )
+        assert s._usage_store.entries(identities, [])["1"].token_dead()
+        assert not s._slot_token_dead("1", "b@example.com"), (
+            "with a readable backup the strike is healed by the fingerprint"
+        )
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        assert not s._slot_token_dead("1", "b@example.com"), (
+            "an unreadable backup skips the fingerprint binding entirely, so "
+            "a healthy slot reads as dead and a plain import replaces it"
+        )
+
+    def test_an_active_slot_with_an_unreadable_backup_is_not_dead_for_import(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch, block_real_keychain,
+    ):
+        """The ACTIVE half of the same question, which has the opposite
+        safe default from the collectors'.
+
+        On an active slot ``_slot_token_dead`` delegates to
+        ``_entry_token_dead``, whose backup read is the SECOND source. There,
+        an unreadable backup must HOLD the strike (C-2: erasing it zeroes the
+        persisted quarantine). Here the same True means "replace this slot's
+        credential without --force". So the import's own read has to answer
+        before the delegation, or fixing C-2 re-opens C-3 on the active path.
+        """
+        s = self._macos_switcher(sample_sequence_data, email="b@example.com")
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live",
+                              "expiresAt": 9999999999000}})
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "b@example.com", "accountUuid": "uuid-1",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        s._store._write_active_credentials_file(live)
+        s._write_account_credentials("1", "b@example.com", self._NEW)
+        assert s.current_account_number() == "1"
+
+        identities = {"1": ("b@example.com", "")}
+        # Struck on a generation NEITHER stored source holds — healed.
+        for _ in range(6):
+            s._usage_store.record(
+                {"1": FetchRecord(error="invalid_grant",
+                                  struck_fp="sha256:condemnedgen")},
+                identities,
+            )
+        assert s._usage_store.entries(identities, [])["1"].token_dead()
+        assert not s._slot_token_dead("1", "b@example.com")
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        assert not s._slot_token_dead("1", "b@example.com"), (
+            "the active path delegates to the collectors' rule, which holds "
+            "an unprovable strike — correct there, destructive here"
+        )
