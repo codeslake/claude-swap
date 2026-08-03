@@ -768,7 +768,26 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
         get_global_config_path,
     )
 
+    # EVERY WIRED CONFIG MUST SERVE, not merely one of them.
+    #
+    # This used to return True on the first config that answered, and the two
+    # are written asymmetrically: `cswap_pin.wire_global_config` writes only
+    # the session config, while this reads both — the same asymmetry
+    # `clear_wiring` documents as its reason for clearing both. So a live
+    # session config masked a DEAD default config, and a user launching plain
+    # `claude` from a terminal booted against the dead one while `--heal`
+    # answered "Nothing to heal" every tick. Measured:
+    #
+    #     session cfg -> 42967 (LIVE)   default cfg -> 39967 (DEAD)
+    #     _wired_port_is_serving : True      <- OR over both
+    #     heal()                 : (False, "Nothing to heal")
+    #     default cfg still names the dead port: True
+    #
+    # An unwired config is not a counter-example — it sends nobody anywhere.
+    # Only a config that NAMES a port has an opinion, and every such opinion
+    # has to be right for the pin to be serving.
     seen = set()
+    any_wired = False
     for get in (get_global_config_path, get_default_global_config_path):
         try:
             path = get()
@@ -781,16 +800,16 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
             continue
         if not port:
             continue
+        any_wired = True
         sock = socket.socket()
         sock.settimeout(connect_timeout)
         try:
             sock.connect(("127.0.0.1", port))
-            return True
         except OSError:
-            pass
+            return False  # a config names a port nothing serves
         finally:
             sock.close()
-    return False
+    return any_wired
 
 
 def heal(switcher) -> tuple[bool, str]:
@@ -843,7 +862,21 @@ def heal(switcher) -> tuple[bool, str]:
             # daemon that is serving while the config names nothing, and
             # recycle one that is serving but obsolete. The second is the state
             # a recovery leaves behind; the third is the state an upgrade does.
-            if impl.heal(switcher.backup_dir):
+            # RE-READ THE TRUE AS WELL AS THE FALSE. The branch below already
+            # refuses to infer an outage from a False; trusting a True was the
+            # same mistake pointing the other way, and this function's whole
+            # thesis is that a verdict comes from the state, not from a call.
+            #
+            # It matters because the package is a PEER on its own release
+            # schedule (see _impl): the seam cannot promise what a future
+            # version returns. Measured with an impl that returns True while
+            # binding nothing —
+            #     heal() -> (True, "Restored the cloud pin")
+            #     the wired port actually serving? False
+            # and the status line, which calls this on a timer, would show
+            # healthy while every session still dialled a dead port. That is
+            # the failure this file names as its signature defect.
+            if impl.heal(switcher.backup_dir) and _wired_port_is_serving(switcher):
                 return True, "Restored the cloud pin"
         except Exception:  # noqa: BLE001 — fall through to the safe outcome
             pass
