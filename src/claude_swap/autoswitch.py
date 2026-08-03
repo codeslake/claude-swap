@@ -1447,11 +1447,7 @@ class AutoSwitchEngine:
         # to sit here too and inverted monotonicity; removing it is what let
         # the fallback do the job.
         best_candidate_headroom = max(
-            (
-                h
-                for h in (headroom.get(n) for n in oauth_candidates)
-                if h is not None
-            ),
+            (h for h in map(headroom.get, oauth_candidates) if h is not None),
             default=0.0,
         )
         active_recovery_ts = (
