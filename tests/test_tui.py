@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
+from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -1854,6 +1854,106 @@ class TestAutoStartLive:
         AutoScreen._on_live_confirm(view, True)
         assert persisted == [True]
 
+
+    def test_a_self_promotion_persists_the_consent_the_user_sees(self, tmp_path):
+        """The mirror of the demotion bug: the demotion correctly records
+        nothing, and so does the LATER GRANT.
+
+        `_persist_auto_start_live` has exactly two call sites, both inside
+        `action_toggle_live` / `_on_live_confirm`. `_retry_live_promotion`
+        runs on the ENGINE thread and only emits a `ConfigWarningEvent`, and
+        nothing in the TUI reads `config-warning`. So:
+
+            TUI#2 presses `l`      demoted (TUI#1 holds the lock)
+            TUI#2 writes nothing   correct — the refusal is about the lock
+            TUI#1 exits            the lock is free
+            TUI#2 promotes itself  badge flips to ` LIVE `
+            restart TUI#2          DRY-RUN
+
+        contradicting what the user last saw. Asserts on the ENGINE state the
+        badge is rendered from, not on the event kind: keying the persist on
+        `config-warning` would be the same opt-in defect one layer down.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.autoview import AutoScreen
+
+        assert load_settings(tmp_path).auto_start_live is False, "premise"
+
+        view = AutoScreen.__new__(AutoScreen)
+        view._settings = load_settings(tmp_path)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        view._update_badge = lambda: None
+        view.query_one = MagicMock()
+        from claude_swap.tui.theme import CSWAP_DARK
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK     # Palette.from_theme reads real fields
+
+        promoted = MagicMock()
+        promoted.dry_run = False           # it took the lock mid-run
+        promoted.demoted_from_live = False
+        view._engine = promoted
+
+        with patch.object(
+            AutoScreen, "is_attached", property(lambda self: True)
+        ), patch.object(AutoScreen, "app", property(lambda self: app)):
+            AutoScreen._on_engine_event(
+                view,
+                ConfigWarningEvent(
+                    message="the LIVE holder released the lock — this engine "
+                            "is now LIVE"
+                ),
+            )
+
+        assert persisted == [True], (
+            f"persisted {persisted} — the badge reads LIVE but a restart "
+            "comes back dry-run, contradicting what the user last saw"
+        )
+
+    def test_a_dry_run_engine_still_writes_nothing(self, tmp_path):
+        """The persist must stay one-directional.
+
+        `autoStartLive` is one shared setting: writing `false` from a
+        dry-run engine revokes the LIVE holder's consent, which is the
+        demotion bug this PR already fixed. A grant is consent; dry-run is
+        not a revocation.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.autoview import AutoScreen
+
+        view = AutoScreen.__new__(AutoScreen)
+        view._settings = load_settings(tmp_path)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        view._update_badge = lambda: None
+        view.query_one = MagicMock()
+        from claude_swap.tui.theme import CSWAP_DARK
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK     # Palette.from_theme reads real fields
+
+        demoted = MagicMock()
+        demoted.dry_run = True
+        demoted.demoted_from_live = True
+        view._engine = demoted
+
+        with patch.object(
+            AutoScreen, "is_attached", property(lambda self: True)
+        ), patch.object(AutoScreen, "app", property(lambda self: app)):
+            AutoScreen._on_engine_event(
+                view,
+                ConfigWarningEvent(
+                    message="another LIVE auto-switch engine is already running"
+                ),
+            )
+
+        assert persisted == [], (
+            f"persisted {persisted} — a dry-run engine wrote over the LIVE "
+            "holder's consent"
+        )
 
 class TestUnswitchableRowsAreListed:
     """A slot you cannot switch to must still appear, with the reason.

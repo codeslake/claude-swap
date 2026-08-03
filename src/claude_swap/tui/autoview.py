@@ -265,6 +265,26 @@ class AutoScreen(Screen):
         # live engine — worse than the stuck-dry-run it fixes, because now the
         # display disagrees with what is actually switching accounts.
         self._update_badge()
+        # AND THE CONSENT WITH THE BADGE. `_persist_auto_start_live` was only
+        # reachable from the two toggle paths, so a self-promotion flipped the
+        # badge to ` LIVE ` and wrote nothing: restart, and the TUI comes back
+        # dry-run contradicting what the user last saw. Mirror of the demotion
+        # bug — the refusal correctly records nothing, and so did the later
+        # grant.
+        #
+        # Keyed on the engine BEING live, the same fact the badge above is
+        # rendered from, not on the event kind that happened to announce it: a
+        # `config-warning` test here would be a per-kind opt-in the next event
+        # is not on. One-directional on purpose — `autoStartLive` is one
+        # shared setting, so writing False from a dry-run engine would revoke
+        # the LIVE holder's consent, which is exactly the demotion bug.
+        engine = self._engine
+        if (
+            engine is not None
+            and not engine.dry_run
+            and not self._settings.auto_start_live
+        ):
+            self._persist_auto_start_live(True)
         if event.kind == "switch":
             self.app.request_refresh()
 
