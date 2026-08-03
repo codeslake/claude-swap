@@ -2065,7 +2065,23 @@ class AutoSwitchEngine:
         Only ever shortens, never below the planner's floor: the 429 budget
         lives in the plan, and this makes the loop obey it rather than
         override it. Best-effort — the unshortened delay is always safe.
+
+        A THIRD `fetch=set()` DOOR, OUTSIDE `tick()` ENTIRELY. `run_loop`
+        calls this (via `_next_delay`) AFTER `tick()` has already returned,
+        so none of `tick()`'s own `_stop` checkpoints — including the one
+        guarding the sibling `fetch=set()` pre-read at :1574 — sit anywhere
+        near it. `fetch=set()` is no-NETWORK, but not no-WRITE: it still
+        reaches `switcher._collect_usage_entries`'s strike-heal branch ->
+        `usage_store.clear_dead_token` -> `_mutate` -> `_write_rows`, nulling
+        `claimId` (the field `record()` fences on) for a successor that
+        already owns LIVE. Guarded here, at the engine's own call site, not
+        deeper in the switcher: every other `fetch=set()` caller (the TUI's
+        `accounts_snapshot`, `list_accounts`) is a plain store-only read with
+        no engine or `_stop` concept at all, and legitimately wants the heal
+        write to happen.
         """
+        if self._stop.is_set():
+            return delay
         try:
             current = self.switcher.current_account_number()
             if current is None:
