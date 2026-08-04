@@ -143,8 +143,10 @@ class TestListSessions:
             lambda p: p.write_bytes(b"\xff\xfe{\"pid\": 1}"),
             lambda p: p.write_text(json.dumps({"pid": 2**31}), encoding="utf-8"),
             lambda p: p.write_text("[" * 2000 + "]" * 2000, encoding="utf-8"),
+            lambda p: p.write_text("[]", encoding="utf-8"),
         ],
-        ids=["invalid_json", "invalid_utf8", "pid_overflows_c_long", "json_nested_too_deep"],
+        ids=["invalid_json", "invalid_utf8", "pid_overflows_c_long",
+             "json_nested_too_deep", "json_is_an_array"],
     )
     def test_corrupt_session_file_is_skipped(self, tmp_path, write_bad_file):
         sessions_dir = tmp_path / "sessions"
@@ -260,8 +262,10 @@ class TestListIdeInstances:
             lambda p: p.write_text("broken", encoding="utf-8"),
             lambda p: p.write_text(json.dumps({"pid": 2**31}), encoding="utf-8"),
             lambda p: p.write_text("[" * 2000 + "]" * 2000, encoding="utf-8"),
+            lambda p: p.write_text("[]", encoding="utf-8"),
         ],
-        ids=["invalid_json", "pid_overflows_c_long", "json_nested_too_deep"],
+        ids=["invalid_json", "pid_overflows_c_long", "json_nested_too_deep",
+             "json_is_an_array"],
     )
     def test_corrupt_json(self, tmp_path, write_bad_file):
         ide_dir = tmp_path / "ide"

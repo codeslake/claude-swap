@@ -112,6 +112,12 @@ def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
             json.JSONDecodeError,   # malformed JSON
             KeyError,               # required field missing
             TypeError,              # field has the wrong type (e.g. pid not an int)
+            AttributeError,         # valid JSON that is not an object: a
+                                    # top-level array reaches `.get` as a list.
+                                    # Also how a too-deep nesting lands where
+                                    # the parser's recursion limit is high
+                                    # enough not to raise -- it differs per
+                                    # machine, so BOTH outcomes must be inert.
             ValueError,             # includes UnicodeDecodeError from read_text
             OverflowError,          # pid too large for os.kill's C long (is_pid_alive)
             RecursionError,         # pathologically nested JSON in json.loads
@@ -145,6 +151,12 @@ def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
             json.JSONDecodeError,   # malformed JSON
             KeyError,               # required field missing
             TypeError,              # field has the wrong type (e.g. pid not an int)
+            AttributeError,         # valid JSON that is not an object: a
+                                    # top-level array reaches `.get` as a list.
+                                    # Also how a too-deep nesting lands where
+                                    # the parser's recursion limit is high
+                                    # enough not to raise -- it differs per
+                                    # machine, so BOTH outcomes must be inert.
             ValueError,             # includes UnicodeDecodeError from read_text
             OverflowError,          # pid too large for os.kill's C long (is_pid_alive)
             RecursionError,         # pathologically nested JSON in json.loads
