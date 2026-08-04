@@ -2702,7 +2702,21 @@ class ClaudeAccountSwitcher:
             return
         delete_macos_keychain_entry(session_dir)
         shutil.rmtree(session_dir, ignore_errors=True)
-        clear_session_stale(session_dir)
+        cleared = clear_session_stale(session_dir)
+        if session_dir.exists() or not cleared:
+            # Both removals tolerate a denied dir, which is right -- the
+            # caller has already deleted the credentials and must reach the
+            # roster write. But it arrives there with the profile still on
+            # disk, so an INFO saying it was removed is the only record, and
+            # it is wrong. The surviving stale marker also makes the next
+            # run's stale arm re-fire on this slot forever.
+            self._logger.warning(
+                "Could not fully remove account %s's session profile at %s; "
+                "credentials are gone but the profile dir and/or its stale "
+                "marker survive (check permissions on it and its parent).",
+                account_num, session_dir,
+            )
+            return
         self._logger.info(
             f"Removed session profile for account {account_num} at {session_dir}"
         )

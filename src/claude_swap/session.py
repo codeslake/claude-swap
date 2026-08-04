@@ -143,7 +143,7 @@ def is_session_stale(session_dir: Path) -> bool:
     )
 
 
-def clear_session_stale(session_dir: Path) -> None:
+def clear_session_stale(session_dir: Path) -> bool:
     """Drop a profile's stale flag from both marker locations.
 
     Both are unlinked under their own ``try/except OSError``, not just
@@ -152,17 +152,21 @@ def clear_session_stale(session_dir: Path) -> None:
     ``rmtree(ignore_errors=True)``) runs into the same denial again here --
     on the sibling location (``stale_marker_for``, a denied PARENT) as much
     as the legacy CHILD location. Each unlink still runs first, so the
-    happy-path removal is unaffected; only the resulting OSError is
-    swallowed.
+    happy-path removal is unaffected.
+
+    Returns whether every marker is gone, the way ``mark_session_stale``
+    reports its own landing. Tolerating the fault is right; reporting a
+    removal that did not happen is not -- the caller logs the profile as
+    removed while a marker survives, and the next run's stale arm re-fires
+    on it forever, POSTing a refresh grant each time.
     """
-    try:
-        stale_marker_for(session_dir).unlink(missing_ok=True)
-    except OSError:
-        pass
-    try:
-        (session_dir / STALE_MARKER).unlink(missing_ok=True)
-    except OSError:
-        pass
+    cleared = True
+    for marker in (stale_marker_for(session_dir), session_dir / STALE_MARKER):
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            cleared = False
+    return cleared
 
 
 def mark_session_stale(session_dir: Path) -> bool:

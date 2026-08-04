@@ -1420,7 +1420,7 @@ class TestGuards:
         ],
     )
     def test_delete_session_profile_survives_a_denied_dir_with_legacy_marker(
-        self, seeded_switcher, deny, marker
+        self, seeded_switcher, caplog, deny, marker
     ):
         """`clear_session_stale` unlinks two marker locations: a legacy CHILD
         of the profile dir, and the SIBLING (in the profile dir's PARENT)
@@ -1443,14 +1443,34 @@ class TestGuards:
         denied_dir = session_dir if deny == "child" else session_dir.parent
         if deny:
             denied_dir.chmod(0o500)
-        try:
-            seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
-        finally:
-            if deny:
-                try:
-                    denied_dir.chmod(0o700)
-                except OSError:
-                    pass
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            try:
+                seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
+            finally:
+                if deny:
+                    try:
+                        denied_dir.chmod(0o700)
+                    except OSError:
+                        pass
+
+        # Tolerating the fault is the point; reporting the removal anyway is
+        # not. Whatever survived on disk must be named at WARNING+, because
+        # the caller (`remove_account`) has already deleted the credentials
+        # and goes on to write the roster -- a slot recorded as gone with its
+        # profile still there is the state nothing else looks for.
+        leftovers = [
+            pth
+            for pth in (session_dir, stale_marker_for(session_dir),
+                        session_dir / session_mod.STALE_MARKER)
+            if pth.exists()
+        ]
+        warned = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not leftovers or warned, (
+            f"reported removal while {[str(x) for x in leftovers]} survived, "
+            "and said nothing at WARNING+"
+        )
 
     @pytest.mark.skipif(
         sys.platform == "win32" or os.geteuid() == 0,
