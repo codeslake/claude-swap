@@ -347,7 +347,7 @@ class TestLaunchIsNeverBlocked:
 
         # `tmp_path`, not a literal "/tmp/..." — a POSIX path literal renders as
         # `\tmp\pin-ca.pem` on Windows and the equality fails there while
-        # passing here. Measured: this test was the whole of PR #210's first
+        # passing here. this test was the whole of the first
         # red CI, on test-windows only.
         ca = tmp_path / "pin-ca.pem"
         impl = types.SimpleNamespace(
@@ -470,7 +470,7 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_a_contended_first_path_does_not_starve_a_free_second(
         self, tmp_path, monkeypatch
     ):
-        """MEASURED (reviewer, only the session lock held, at the REAL
+        """Only the session lock held, at the REAL
         production budget ``_LAUNCH_LOCK_BUDGET_S = 0.5``): `clear_wiring`
         returned False with BOTH configs still wired. The first path waited
         the WHOLE budget on a lock nobody released, so `left <= 0` by the
@@ -479,7 +479,7 @@ class TestTheWiringCanAlwaysBeRemoved:
 
         ASSERTS THE OBSERVABLE PROPERTY, not a wall clock. A prior version of
         this test asserted `elapsed < BUDGET_S * 2` at an inflated 3.0s
-        test-only budget. Two measured facts killed that version: deleting
+        test-only budget. Two facts killed that version: deleting
         its `elapsed` assertion changed nothing (the mutant this test names,
         `share = left / (len(paths) - i)` -> `share = left`, survives it and
         is killed by a different test), and starvation is directly
@@ -511,7 +511,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         # long enough to exceed a 0.25s fair share, so an unclamped sleep
         # (the very mutant this test exists to kill — see the reinstate-and
         # -show-red proof in the task report) starves path 2 on some runs and
-        # not others: measured 5/5 green with the mutant in and the jitter
+        # not others: 5/5 green with the mutant in and the jitter
         # left to chance. Forcing `random.random() == 1.0` makes every retry
         # sleep exactly 0.5s — the full budget on the FIRST path alone — so
         # the unclamped mutant fails every time, not by luck of the draw.
@@ -563,7 +563,7 @@ class TestTheWiringCanAlwaysBeRemoved:
     def test_the_untimed_deadline_is_a_total_not_a_per_path_allowance(
         self, tmp_path, monkeypatch
     ):
-        """MEASURED (reviewer, two live-held locks): 9.29s unmutated vs 18.03s
+        """Two live-held locks: 9.29s unmutated vs 18.03s
         with ``timeout = DEFAULT_TIMEOUT_S * len(paths)`` — exactly the 2x
         regression the shared-deadline comment says this was added to fix, on
         the UNTIMED call (``clear_wiring(sw)``, no explicit ``timeout``).
@@ -605,7 +605,7 @@ class TestTheWiringCanAlwaysBeRemoved:
 
         assert not changed, "fixture invalid: nothing should have been removed"
         # 1x the (shrunk) default plus slack, never 2x it — the doubled
-        # mutation reliably clears this bar (measured ~2.2s against a 1.0s
+        # mutation reliably clears this bar (~2.2s against a 1.0s
         # DEFAULT_TIMEOUT_S here; the fix stays under ~1.3s).
         assert elapsed < 1.9, (
             f"the untimed deadline behaved as a PER-PATH allowance, not a "
@@ -632,7 +632,7 @@ class TestTheWiringCanAlwaysBeRemoved:
         )
 
         # The same name clear_wiring derives, held for real. Nothing is
-        # patched here: a monkeypatch of config_lock_dir used to sit in this
+        # patched here: a monkeypatch of config_lock_dir in this
         # test and was dead — clear_wiring stopped calling it, and the test
         # stayed green with that function rigged to raise on call.
         held = cfg.parent / (cfg.name + ".lock")
@@ -861,7 +861,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         """A TUI open across an install must start offering the pin.
 
         A long-lived process caches each sys.path directory by mtime, so a
-        package installed after start can stay invisible — measured, usually
+        package installed after start can stay invisible — usually
         visible but not when the install lands inside the same mtime tick.
         That is the "I installed it and the menu is still missing" report,
         and invalidate_caches is what closes it.
@@ -884,8 +884,8 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             # is_available is False there no matter what gets installed —
             # a cross-platform claim cannot be tested through a
             # platform-gated function. Assert on the resolution step, which
-            # is what invalidate_caches actually affects. (Measured: this is
-            # why the Windows runner failed while linux and macos passed.)
+            # is what invalidate_caches actually affects — the axis on
+            # which Windows differs from linux and macos here.
             import importlib, importlib.util
             def resolvable():
                 importlib.invalidate_caches()
@@ -913,7 +913,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         The METHOD only — that something fires it is asserted by driving a real
         snapshot through a real app in
         ``test_tui_pin.py::test_a_snapshot_actually_rebuilds_the_root_menu``.
-        This used to grep ``on_mount``'s source for the name, which a comment
+        Grepping ``on_mount``'s source for the name is satisfied by a comment
         satisfies: deleting the subscription and leaving the word behind kept
         the suite green while the pin row could no longer appear.
         """
@@ -972,7 +972,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
 
         Grepping the module for "pin-menu" passes with the row deleted — the
         action handler still contains the string — so the row can vanish while
-        the check stays green. Measured. Call _root_entries and look at the
+        the check stays green. Call _root_entries and look at the
         ids it actually returns.
         """
         import types
@@ -1011,7 +1011,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         asserted `"cloud_pinned" in inspect.signature(...)` plus
         `"○ cloud" in inspect.getsource(...)`, and both are satisfiable with
         the feature gone: a parameter can exist and be ignored, and the glyph
-        also appears in a comment. Measured — with the minimised renderer's
+        also appears in a comment: with the minimised renderer's
         badge block changed to `if False and cloud_pinned:`, the whole TUI
         suite stayed green.
         """
@@ -1033,7 +1033,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
     ):
         """Same assertion for the third renderer, which had only a source grep.
 
-        Measured: deleting the badge block from `_candidates_text` and leaving
+        Deleting the badge block from `_candidates_text` and leaving
         the glyph in a comment kept the suite green.
         """
         import types
@@ -1084,7 +1084,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         is the one place not admitting it no longer does.
 
         `pin_is_broken` was unit-tested, but nothing asserted its result ever
-        reached TEXT — measured: with both `(not applying)` renders changed to
+        reached TEXT — with both `(not applying)` renders changed to
         `if False and pin_is_broken(acc):`, the whole TUI suite stayed green.
         """
         import dataclasses
@@ -1127,7 +1127,7 @@ class TestTheTuiSurfaceSurvivesTheSplit:
 class TestLiveImplIsCachedOffTheRenderPath:
     """``_live_impl`` backs ``is_available``/``pinned_email``, both called on
     every TUI render (AccountsPanel, AccountCard, dashboard._root_entries) —
-    not just on the poll. Measured: 0.168ms/call for
+    not just on the poll. 0.168ms/call for
     ``invalidate_caches()``+``find_spec`` with the extra absent, scaling with
     ``sys.path`` length. A TTL well under the poll cadence removes that per
     call while still catching a mid-session install."""
@@ -1280,7 +1280,7 @@ class TestTheRollbackVerdictIsNotFooledByShape:
         assert "the previous pin is unchanged" in msg, msg
 
     def test_a_rollback_that_does_not_land_says_so(self, tmp_path):
-        """The MEASURED case, not the shape mismatch above: the rollback
+        """The real case, not the shape mismatch above: the rollback
         ATTEMPT itself fails to reach the proxy, so the record never moves
         off the failed pin. `_restore_pin`'s verdict must come from re-reading
         the file, not from having made the call — mutating its last line to
@@ -1783,7 +1783,7 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
 class TestTheExtraIsGatedByOneFloorOnly:
     """The extra's version floor lives in pyproject, and NOWHERE else.
 
-    A hardcoded `_MIN_PIN_VERSION` tuple used to sit in `pin.py` and refuse an
+    A hardcoded `_MIN_PIN_VERSION` tuple in `pin.py` would refuse an
     older cswap-pin at import time. It was removed because it cannot survive
     the release cycle: cswap-pin ships on its own schedule, so every release of
     it needed a matching pull request against THIS project just to raise a
@@ -2088,7 +2088,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
 class TestTheVerdictIsSharedNotDuplicated:
     """clear_pin/set_pin are the one place the outcome is decided.
 
-    Three review rounds found the same shape: a fix landed on the CLI and the
+    One decision implemented twice diverges: a fix lands on the CLI and the
     TUI's sibling call site kept the old behaviour. These assert the shared
     functions themselves, so a future divergence needs someone to write a
     second copy rather than to forget a line.
@@ -2487,7 +2487,7 @@ class TestTheVerdictHasExactlyOneImplementation:
 class TestHealADeadPin:
     """A dead pin must not take the session with it.
 
-    MEASURED OUTAGE (2026-08-02, lmd42): the pin daemon died, and its wiring
+    OUTAGE (2026-08-02, lmd42): the pin daemon died, and its wiring
     stayed in ``.claude.json``. Claude Code applies that env block at BOOT, so
     every session — including new ones — dialled the dead port and showed
     ``Unable to connect to API (ConnectionRefused) · attempt 6/300`` for hours,
@@ -2668,12 +2668,12 @@ class TestHealADeadPin:
         """The status line calls this on a timer; an exception there breaks the
         prompt itself, which is worse than the fault it is reporting.
 
-        CORRECTED (Task 5): this docstring used to say it exercises
+        This docstring must not claim it exercises
         `_wired_port_is_serving` "OUTSIDE any try", asserting on a message
-        that call supposedly produced. The reviewer instrumented `Path.home()`
+        that call supposedly produced. Instrumenting `Path.home()`
         and captured the frames: that call's own `_wired_ports()` IS guarded
         (fixed the round before this one) and its raise is swallowed there,
-        contributing nothing to the outcome. The message this test used to
+        contributing nothing to the outcome. The message this test would
         assert on came from a SECOND raise, inside `_wiring_present`, which
         happens to sit inside the bottom `try` in `heal` — so it passed for
         a reason the docstring never named.
@@ -2682,7 +2682,7 @@ class TestHealADeadPin:
         and `clear_wiring` now guard their own path getters exactly as
         `_wired_ports` already did, so an unresolvable
         `get_default_global_config_path()` is "no opinion" everywhere, not a
-        caught exception anywhere. Measured with this fixture (own config
+        caught exception anywhere. With this fixture (own config
         resolvable via `CLAUDE_CONFIG_DIR` and wired to a genuinely dead
         port; `Path.home()` raising for the OTHER, unresolvable config):
         `heal` no longer falls back to "Could not heal" at all — it
@@ -2795,7 +2795,7 @@ class TestHealADeadPin:
 
         sw, _cfg = self._sw(tmp_path)  # only used for backup_dir/_write_json
 
-        # Hold the SESSION lock for real, exactly as the reviewer measured —
+        # Hold the SESSION lock for real, exactly as measurement showed —
         # a stub would not exercise clear_wiring's per-path skip logic.
         with proper_lockfile(session_cfg.parent / (session_cfg.name + ".lock"), timeout=5):
             changed, msg = pin.heal(sw)
@@ -2818,7 +2818,7 @@ class TestHealADeadPin:
 class TestHealNeverTearsDownAServingPin:
     """`heal` must ask the WIRING, not the restart's return value.
 
-    MEASURED REGRESSION: `impl.heal()` returns False for BOTH "could not
+    REGRESSION: `impl.heal()` returns False for BOTH "could not
     restart" and "already serving, nothing to do". Reading the second as the
     first unwired a HEALTHY pin — run against a live daemon (pid alive, port
     answering), it stripped the env block and unpinned a working session. That
@@ -2833,7 +2833,7 @@ class TestHealNeverTearsDownAServingPin:
 
         A bare ``listen(n)`` that never accepts is not "a serving port" — it is
         a port with n free backlog slots, and each probe consumes one for the
-        life of the test. Measured on Linux with ``listen(1)``: connect #1 OK,
+        life of the test. On Linux with ``listen(1)``: connect #1 OK,
         #2 OK, #3 times out. Windows CI is stricter and refused the SECOND
         connect, which is what made
         ``test_the_serving_check_needs_no_package`` red there while `test` and
@@ -3027,7 +3027,7 @@ class TestHealNeverTearsDownAServingPin:
         `cryptography` after an unrelated upgrade, a half-finished reinstall,
         an import error in a new release all land on that branch while the
         proxy on the port keeps answering every session already wired to it.
-        Measured before the fix: ONE `cswap run` in that state stripped the env
+        Without the fix: ONE `cswap run` in that state stripped the env
         block from a pin whose port was serving, and every session on the box
         lost it. Same damage as the outage `heal` exists to end, in the other
         direction, at the other call site.
@@ -3091,7 +3091,7 @@ class TestHealNeverTearsDownAServingPin:
         """`present and clear_wiring(...)` collapsed two outcomes into one.
 
         When the wiring is present, the port is dead, and the unwire fails
-        because the config lock is contended, control used to fall to the
+        because the config lock is contended, control falls to the
         healthy verdict — over an outage in progress. That path is routine, not
         exotic: the budget is 0.5s and Claude Code holds this lock during a
         credential refresh. And the status line calls `heal` on a timer, so the
@@ -3169,12 +3169,12 @@ class TestHealNeverTearsDownAServingPin:
     ):
         """The guard protects against TEARDOWN, not against repair.
 
-        `heal` used to return on `serving` before `impl.heal()` ran at all,
+        `heal` returning on `serving` before `impl.heal()` runs at all
         which made a whole class of repair unreachable: a daemon SERVING its
         wired port while running code we no longer ship is exactly the state an
         upgrade leaves behind, and every status-line tick declined to touch it.
 
-        MEASURED across three machines after installing a new release: two had
+        across three machines after installing a new release: two had
         daemons serving their own wired port, 24h old, running the previous
         version, and `cswap pin --heal` answered "Nothing to heal" forever. The
         third recycled only because its wiring named a DEAD port — the right
@@ -3238,14 +3238,14 @@ class TestHealNeverTearsDownAServingPin:
             srv.close()
 
     def test_heal_does_not_take_the_packages_TRUE_on_trust(self, tmp_path, monkeypatch):
-        """The False path re-reads; the True path used to be believed.
+        """The False path re-reads; the True path must not be believed.
 
         Same mistake, opposite direction. This function's whole thesis is that
         a verdict comes from the state rather than from a call — and it matters
         because `cswap-pin` is a PEER on its own release schedule, so the seam
         cannot promise what a future version returns.
 
-        Measured before the fix, with an impl returning True while binding
+        Without the re-read, an impl returning True while binding
         nothing: heal() -> (True, "Restored the cloud pin") while the wired
         port served nothing. The status line calls this on a timer, so the
         user's only signal said the outage was over.
@@ -3535,7 +3535,7 @@ class TestTheDeadPortCanBeInTheOtherConfig:
     makes this the COMMON case, not a corner one: the process that heals is
     normally the one whose own config is unwired.
 
-    MEASURED (real path getters, no monkeypatching of pin internals, package
+    (real path getters, no monkeypatching of pin internals, package
     uninstalled) — session config (this process's own) unwired, default
     config (~/.claude.json) wired to a dead port:
 
@@ -3546,7 +3546,7 @@ class TestTheDeadPortCanBeInTheOtherConfig:
         ~/.claude.json after  DEAD PORT SURVIVES
 
     The parent commit (0cff56c), before that per-config read was narrowed to
-    one file, measured True / (True, 'Removed a cloud pin wiring…') / {} for
+    one file, True / (True, 'Removed a cloud pin wiring…') / {} for
     the same scenario.
     """
 
@@ -3607,7 +3607,7 @@ class TestTheDeadPortCanBeInTheOtherConfig:
         self, tmp_path, monkeypatch
     ):
         """The other direction: a guard that ALWAYS fires whenever this
-        process's own config has no port reintroduces round 4's defect. When
+        process's own config has no port reintroduces the masked-dead-port defect. When
         the only port anywhere on the machine is actually serving, nothing is
         stale."""
         import socket
@@ -3650,7 +3650,7 @@ class TestTheGuardIsPerConfigNotPerMachine:
     same brief) deliberately made per-MACHINE: `_wiring_is_stale` gates a
     whole-machine `clear_wiring`, and bailing out on "MY config has no port"
     left a dead port sitting in the OTHER config permanently unreachable —
-    see `TestTheDeadPortCanBeInTheOtherConfig`. The test below used to assert
+    see `TestTheDeadPortCanBeInTheOtherConfig`. The test below must not assert
     the opposite (that a dead default must NOT make a portless session's
     wiring look stale); that assertion is what Task 1's fix legitimately
     overturns, so it is re-aimed rather than kept red.
@@ -3701,7 +3701,7 @@ class TestTheGuardIsPerConfigNotPerMachine:
             _wiring_is_stale   : True    <- machine-wide: something IS dead
             session still wired: False   <- cleared along with the default
 
-        This used to assert `is False`, on the theory that the session's
+        Asserting `is False` here assumes the session's
         portless wiring must never be judged by a different config's port.
         Task 1 overturns that: `_wiring_is_stale` gates `clear_wiring`, which
         already clears BOTH configs as one operation (its own docstring:
@@ -3740,14 +3740,14 @@ class TestTheMarkerGuardIsNotJustTheStalenessVerdict:
     went unremarked: `_wired_port_of` reads only the session config, so a
     port sitting in the OTHER config with NO `_cswapPinWiredKeys` marker at
     all (not cswap's wiring — a foreign `CSWAP_PIN_PORT`, or a future
-    `cswap-pin` that stops writing the marker) used to return None and block
+    `cswap-pin` that stops writing the marker) returns None and blocks
     right there. `_wired_ports()` reads both configs' ports and does not
     check the marker, so that block is gone: only `_wiring_present`
     (checked first, still gating the whole function) now stands between
     such a config and `clear_wiring`.
 
     Deleting the `if not _wiring_present(_switcher): return False` guard
-    SURVIVES the full suite (measured: 107 passed at the time this was
+    SURVIVES the full suite (107 passed when this was
     found). This class exists to make that mutation fail.
     """
 
@@ -3827,7 +3827,7 @@ class TestTheMarkerGuardIsNotJustTheStalenessVerdict:
 class TestOneConfigIsOneOpinion:
     """The two config getters resolve to the SAME file outside a session
     terminal, and `_wired_ports` de-dups on that. Nothing tested the de-dup:
-    deleting it left the whole suite green (measured, as a mutation), because
+    deleting it left the whole suite green (as a mutation), because
     every fixture that points both getters at one file also asserts on
     outcomes a doubled reading happens not to change.
 
@@ -3911,7 +3911,7 @@ class TestOneConfigIsOneOpinion:
 
         PRE-EXISTING GAP, not one this refactor introduced: mutating the final
         `return bool(ports)` (`return any_wired` before the shared walk) to
-        `return True` left the suite green at HEAD too — measured, 89 passed.
+        `return True` left the suite green at HEAD too — 89 passed.
 
         `_wiring_is_stale` is `wired and not serving`, so a serving probe that
         answers True unconditionally makes every stale wiring look healthy and
@@ -3963,7 +3963,7 @@ class TestNoFixtureNamesARealDaemonPort:
         )
 
     def test_a_same_named_class_in_another_file_is_not_exempted(self, tmp_path):
-        """The self-exemption used to key on the class name ALONE
+        """The self-exemption must not key on the class name ALONE
         (``n.name == self.__class__.__name__``), with no check that the
         matching class lives in the lint's OWN file. A routine rename of
         this class — or a copy of it landing in another test file, same
@@ -4005,7 +4005,7 @@ class TestNoFixtureNamesARealDaemonPort:
         )
 
     def test_an_unrelated_def_in_own_file_is_not_exempted(self, tmp_path):
-        """The own-file exemption used to be
+        """The own-file exemption must not be
         ``is_own_file and isinstance(n, (ast.ClassDef, ast.FunctionDef))``
         with no check on WHICH def — that exempts every class/function in
         own_file, not just the lint's own code (``own_names``). A genuine
@@ -4120,7 +4120,7 @@ class TestTheSiblingGettersGuardTheirPathGettersToo:
     its own `get()` calls in a `try`. `_wiring_present` and `clear_wiring`
     resolve the SAME two getters and were never given the same guard.
 
-    MEASURED (no HOME, `Path.home` raising) —
+    (no HOME, `Path.home` raising) —
 
         _wired_ports     guards its path getters: True   (returns [])
         _wiring_present  guards its path getters: False  (raises)
@@ -4211,14 +4211,14 @@ class TestTheSiblingGettersGuardTheirPathGettersToo:
 
 
 class TestEveryCallSiteRecordsAnUnresolvableGetter:
-    """All three call sites resolve the same two getters and all three used to
+    """All three call sites resolve the same two getters and all three would
     swallow a raise with no record — `clear_wiring` logged, `_wiring_present`
     and `_wired_ports` said nothing.
 
     THE LEVEL IS PER CALL SITE, and there is no cap. A once-per-PROCESS cap
     suppresses nothing when every statusline tick is a fresh `cswap pin
     --heal`, and a WARNING on the two getters `heal` calls unconditionally
-    turned "1 line ever" into "1 line per tick" — measured through the real
+    turns "1 line ever" into "1 line per tick" — through the real
     CLI, 0 -> 6 lines over 6 ticks. So those two record at DEBUG.
 
     `clear_wiring` is the exception and warns: `heal` reaches it only through
@@ -4311,7 +4311,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # reaches, of which the getter is the one that held.
     #
     # `_wiring_present`'s ABSENCE from the UNREMOVABLE funcName set is not
-    # because it "fires solely on the REMOVABLE shape" — measured false, it
+    # because it "fires solely on the REMOVABLE shape" — false, it
     # also fires on NOTHING-WIRED. It runs twice on a wired tick: once
     # inside `_wiring_is_stale` to gate the tick, once inside `heal` to
     # confirm `clear_wiring` worked. On UNREMOVABLE the marker survives the
@@ -4376,7 +4376,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # `_log_unresolvable`'s `log` call and `stacklevel=2` names the
         # wrapper instead of the caller: every record still fires, the filter
         # still empties, and the old message sent the reader looking for a
-        # fixture fault that is not there. Measured with that frame added:
+        # fixture fault that is not there. With that frame added:
         # `Origins seen: ['_log_unresolvable']` — the emitter itself, which
         # `stacklevel` exists to keep OUT of `funcName`.
         emitted = [r for r in records if "could not be resolved" in r.getMessage()]
@@ -4395,7 +4395,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # BELOW INFO, not merely below WARNING. The logger sits at INFO by
         # default (`logging_config.setup_logging`), so an INFO record reaches
         # the rotating file on every tick exactly as the WARNING did —
-        # measured: `debug` -> `info` passes all 128 tests while the real CLI
+        # `debug` -> `info` passes all 128 tests while the real CLI
         # writes 12 lines over 6 ticks. A guard keyed on WARNING lets the
         # regression land again with CI green.
         loud = [r for r in per_tick if r.levelno >= logging.INFO]
@@ -4413,7 +4413,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
             # is a POSIX mechanism: on win32 a read-only directory does not
             # stop a write, and root ignores the mode bit, so the lock never
             # fails and the unwire WARNING this case exists to observe never
-            # fires. Measured on the Windows runner (test-windows red at
+            # fires. On the Windows runner (test-windows red at
             # d343bfb, green on Linux and macOS):
             #
             #   Expected: [('clear_wiring','resolve',30),
@@ -4443,7 +4443,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
 
         The unwired tick above cannot see this: it never reaches
         `clear_wiring`. Harden its fixture with a wiring — a natural
-        improvement — and the level-only assertion went red on this PR's own
+        improvement — and the level-only assertion went red on this branch's own
         intended WARNING, which reads as "the WARNING is wrong" and invites
         the all-DEBUG regression back.
 
@@ -4451,7 +4451,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         the version of this test that ran only the removable one asserted
         something FALSE about the other. `clear_wiring` has two WARNING sites
         now — the getter at the top and the lock at the bottom — and on an
-        unremovable wiring they BOTH fire on the same tick. Measured, one
+        unremovable wiring they BOTH fire on the same tick. One
         tick, no HOME:
 
             REMOVABLE     [('clear_wiring', 'WARNING')]
@@ -4459,7 +4459,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
 
         so the old `== [("clear_wiring", WARNING)]` equality was False on the
         second — passing only because the fixture made the removal succeed,
-        which is the shape where the stranding this PR is about cannot happen.
+        which is the shape where the stranding cannot happen.
         """
         import logging
 
@@ -4475,7 +4475,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # KEYED ON ORIGIN so it cannot blame the wrong code for the extra.
         # `claude_locks` logs to this same logger and `proper_lockfile`'s
         # release WARNING lands in this same window (`clear_wiring` takes that
-        # lock). Measured with the release `rmdir` forced to fail: the
+        # lock). With the release `rmdir` forced to fail: the
         # level-only assertion reported it as "an unresolvable getter logged
         # at or above INFO", while this one reports
         # `[('clear_wiring', 30), ('proper_lockfile', 30)]` and names it.
@@ -4498,7 +4498,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # The MESSAGE is what separates them, and it is the same text the user
         # reads in the log, so a format change that made the two
         # indistinguishable there fails here too. `lineno` WOULD also separate
-        # them — and, contrary to what this comment used to say, it separates
+        # them — and it separates
         # the getter sites too: `stacklevel=2` moves `lineno` to the caller
         # just as it moves `funcName`, giving three distinct values. It is
         # rejected for being BRITTLE, not blind — see the class-level comment
@@ -4583,7 +4583,7 @@ class TestClearWiringDoesNotLockTheSameFileTwice:
     same call, and — because the fair-share arithmetic divides the budget by
     `len(paths)` — the launch path silently halves its own sub-second budget
     against a single file for no reason, exactly the "locked and cleared
-    twice" the task brief measured.
+    twice".
     """
 
     def test_one_config_is_locked_only_once(self, tmp_path, monkeypatch):
@@ -4638,7 +4638,7 @@ class TestTheWarningDoesNotFireOnEveryTick:
     daemon. So the module-level cap's lifetime IS one tick, and it can never
     suppress a line across ticks.
 
-    MEASURED through the real CLI with an unreadable `~/.claude` (a reachable
+    through the real CLI with an unreadable `~/.claude` (a reachable
     `PermissionError` from `get_default_global_config_path`), counting lines
     in the actual rotating log:
 
@@ -4741,7 +4741,7 @@ class TestTheSelfLimitingCallSiteStillWarns:
     getter and the errno.
 
     THE SELF-LIMITATION IS CONDITIONAL, and it is the condition the WARNING
-    exists to explain. Measured through the real CLI, 10 ticks each: nothing
+    exists to explain. Through the real CLI, 10 ticks each: nothing
     wired 0 lines; stale and removed on tick 1, 1 line; stale and UNREMOVABLE
     (read-only config dir) 10 lines and still wired — 6.06 MiB/day at 147 B a
     line, the `PermissionError` shape, since a read-only dir with no lock dir
@@ -4795,7 +4795,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
     The unresolvable-getter WARNING above is NOT this record. That one needs
     `Path.home()` to raise, and on the shape it fires it names
     `get_default_global_config_path` — a DIFFERENT config from the stuck one,
-    which resolves fine through `get_global_config_path`. Measured on the
+    which resolves fine through `get_global_config_path`. On the
     flagship shape the comments cite (read-only config dir, HOME perfectly
     resolvable): five `heal` ticks, the "could not be removed" message every
     time, ZERO log records at any level, and the swallowed cause was
@@ -4808,7 +4808,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
     KEYED ON ORIGIN, as the round-16 guards are — but NOT because `funcName`
     is the only axis that can tell the call sites apart, which is what this
     said for four rounds. `stacklevel=2` moves `lineno` to the caller exactly
-    as it moves `funcName`, so the sites differ on that axis too (measured:
+    as it moves `funcName`, so the sites differ on that axis too (
     the records come out at three distinct linenos, not one). `funcName` is
     chosen because a lineno key is BRITTLE — see the comment at
     `_PER_TICK_SITES`, where editing `pin.py`'s COMMENTS alone renumbered two
@@ -4819,16 +4819,16 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
     first. The other two in this class, and the `removable=False` case in
     `TestEveryCallSiteRecordsAnUnresolvableGetter`, all reach the lock failure
     through a `0o500` directory — a POSIX non-root mechanism, so all three
-    carry the same skipif and all three vanish TOGETHER. Measured with the
+    carry the same skipif and all three vanish TOGETHER. With the
     three conditions forced true (the root-container shape `lambda-docker`
     runs, and the win32 runner):
 
         control:           130 passed, 5 skipped
         lock WARNING gone: 130 passed, 5 skipped     <-- SURVIVED
 
-    Deleting the record this PR exists for was green. CI's `ubuntu-latest` is
+    Deleting the record this guard exists for stays green. CI's `ubuntu-latest` is
     non-root so CI does cover it, but a green suite that says nothing about
-    the flagship guard is exactly the "passes for the wrong reason" this PR
+    the flagship guard is exactly the "passes for the wrong reason" this branch
     has spent seven rounds on, and the skip made it silent rather than loud.
     """
 
@@ -4852,7 +4852,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         a `clear_wiring` that no longer calls it at all. This drives the real
         lock through the real `heal`.
 
-        Measured as a real euid 0 (via `unshare -r`), both mechanisms on the
+        As a real euid 0 (via `unshare -r`), both mechanisms on the
         same tree:
 
             0o500 parent (the other tests):  heal -> "Removed a cloud pin
@@ -4872,7 +4872,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg.parent))
         monkeypatch.setattr(pin, "_live_impl", lambda: None)
         # No `_write_json`: the lock fails before anything is written, so the
-        # sibling tests' copy of it is dead on this path (measured — never
+        # sibling tests' copy of it is dead on this path (never
         # called). A stub that is never invoked describes a write this shape
         # does not do.
         sw = types.SimpleNamespace(backup_dir=tmp_path)
@@ -4889,7 +4889,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # THE LOCK DIR SURVIVING IS THE GATE, not the message. `heal` returns
         # this same `(False, "…could not be removed…")` for ANY raise inside
         # `clear_wiring`'s per-path `try`, so the message alone does not say
-        # the lock was the thing that failed. Measured by deleting the
+        # the lock was the thing that failed. Deleting the
         # `os.mkdir` above: `1 failed, 133 passed` — the message assertion
         # still passed, because `sw` has no `_write_json` and
         # `_clear_wiring_locked` raised `AttributeError` INSIDE the lock and
@@ -4972,7 +4972,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         # THE CONFIG MUST BE NAMED INDEPENDENTLY OF THE ERRNO. `PermissionError`
         # renders the LOCK path, which contains the config path as a prefix, so
         # the naive `str(cfg) in message` passes on the exception text alone:
-        # measured, dropping `path` from the log call entirely still satisfied
+        # dropping `path` from the log call entirely still satisfied
         # it. Removing the lock path first makes the two facts separable, and
         # does it without pinning which order the message puts them in.
         assert any(
@@ -5006,7 +5006,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         lock dir (a holder killed -9) inside a config dir this process cannot
         write. `proper_lockfile`'s stale-takeover path `rmdir`s the dead
         holder's dir, and that `rmdir` needs write permission on the parent it
-        will never get, so this machine is stuck forever. Measured, 10 ticks:
+        will never get, so this machine is stuck forever. 10 ticks:
         10 lines, still wired, every tick identical.
 
         So the split silences precisely the machine the WARNING exists for,
@@ -5016,7 +5016,7 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
         A DISCRIMINATOR OTHER THAN THE TYPE DOES EXIST — the lock dir's mtime
         age, which `proper_lockfile` already stats (`os.stat(lock_dir)`) —
         so the refusal rests on COST, not on "nothing can tell them apart".
-        Re-measured at BOTH cadences, because the old figure mixed them (a
+        Counted at BOTH cadences, because one figure cannot serve both (a
         tight loop of 10 `heal()` calls priced the transient case while the
         permanent one was priced at the real statusline cadence):
 

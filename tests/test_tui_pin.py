@@ -224,7 +224,7 @@ class TestThePinTuiSurface:
     async def test_the_tui_pin_verdict_comes_from_pin_py(self, tmp_path):
         """The TUI must not re-implement the verdict.
 
-        Three review rounds found a fix on the CLI whose sibling here kept the
+        A fix on the CLI whose sibling here keeps the
         old behaviour. `_apply_pin` therefore delegates to `pin.set_pin` and
         only adds the note it alone can produce.
         """
@@ -301,7 +301,7 @@ class TestThePinTuiSurface:
     async def test_pin_actions_run_off_the_event_loop(self, tmp_path):
         """clear_wiring takes a 9s lock; inline it froze the dashboard.
 
-        Measured before the fix: 9.31s frozen, no toast, no keystrokes, while
+        Without the fix: 9.31s frozen, no toast, no keystrokes, while
         Claude Code held .claude.json.lock — routine during a credential
         refresh. Every sibling action in this file goes through
         app._start_action; these two did not, and nothing asserted it, so the
@@ -472,7 +472,7 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
 
         `refresh_root_menu` had a direct-call test, so its logic was covered —
         but nothing asserted that anything FIRES it. The old assertion grepped
-        `on_mount`'s source for the name, which a comment satisfies: measured,
+        `on_mount`'s source for the name, which a comment satisfies:
         deleting `self.watch(self.app, "snapshot", ...)` and leaving the name
         in a comment kept the whole suite green, while the pin row could no
         longer appear on a mid-session install. That is the exact behaviour the

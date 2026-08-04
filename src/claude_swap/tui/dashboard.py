@@ -224,7 +224,7 @@ class DashboardScreen(Screen):
 
         ClaudeSwitchError specifically: run_action catches only that and
         EOFError. A RuntimeError escaped to on_worker_state_changed and became
-        a `notify(severity="error")` — measured, MODALS [] — so the modal this
+        a `notify(severity="error")` — MODALS [] — so the modal this
         raise exists to open never opened and the message wore a doubled
         prefix.
         """
@@ -395,17 +395,14 @@ class DashboardScreen(Screen):
                     await self._pop_menu()
                     return
             snap = app.snapshot
-            # THE VERDICT COMES FROM pin.py, not from a second copy here.
-            # Three review rounds found the same shape: a fix landed on the CLI
-            # and this branch kept the old behaviour — the missing clear_wiring,
-            # the discarded apply_pin return, the rollback, the API-key refusal.
-            # Each was one decision implemented twice, so it is implemented once
-            # now and both sides render the result.
+            # THE VERDICT COMES FROM pin.py, not from a second copy here: one
+            # decision implemented twice is how this branch and the CLI drift
+            # apart. Implemented once, both sides render the result.
             #
             # THROUGH _start_action, like every sibling action in this file.
-            # clear_wiring takes a 9s lock; run inline it froze the dashboard
-            # for 9.31s with no toast and no keystrokes while Claude Code held
-            # .claude.json.lock — routine during a credential refresh.
+            # clear_wiring takes a 9s lock; run inline it freezes the dashboard
+            # for that long with no toast and no keystrokes while Claude Code
+            # holds .claude.json.lock — routine during a credential refresh.
             if target == "clear":
                 app._start_action(
                     "clear cloud pin",
