@@ -158,7 +158,7 @@ class TestSwapAccounts:
         assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
 
     def test_swap_same_email_partial_failure_rolls_back(
-        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
         """A write failure mid-swap must not destroy an overlapping backup.
 
@@ -181,12 +181,17 @@ class TestSwapAccounts:
                 raise OSError("disk full (injected)")
             return real_write(self, num, email, creds)
 
-        monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
-        )
-        with pytest.raises(OSError):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        # Scoped context, not the fixture's shared `monkeypatch`: that
+        # instance also carries the autouse colour/keychain/home scrubs, and
+        # `.undo()` on it would unwind those too (H-1) — restoring whatever
+        # FORCE_COLOR/NO_COLOR the developer's shell actually has exported
+        # for the rest of this test.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+            )
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
 
         # Both originals are back under their pre-swap keys, and the account
         # table was never renumbered.
@@ -197,7 +202,7 @@ class TestSwapAccounts:
         assert data["activeAccountNumber"] == 1
 
     def test_swap_same_email_persistent_failure_keeps_staged_copy(
-        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
         """When the restore writes fail too (persistent backend outage), the
         pre-swap material must survive on disk in the staged copies — not
@@ -217,12 +222,13 @@ class TestSwapAccounts:
                 raise OSError("disk full (injected, persistent)")
             return real_write(self, num, email, creds)
 
-        monkeypatch.setattr(
-            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
-        )
-        with pytest.raises(OSError):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        # Scoped context: see H-1 comment above.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+            )
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
 
         # Slot 1's stored copy was never touched; slot 2's store now holds
         # the wrong material (restore failed), but the staged copy has it.
@@ -233,7 +239,7 @@ class TestSwapAccounts:
             assert staged.stat().st_mode & 0o777 == 0o600
 
     def test_swap_same_email_rollback_restores_empty_slot(
-        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
         """Slot 2 was never backed up: after a failed swap, the shared key
         must read empty again — not keep account 1's credential under
@@ -246,10 +252,11 @@ class TestSwapAccounts:
         def failing_write_json(self, path, data):
             raise OSError("disk full (injected)")
 
-        monkeypatch.setattr(ClaudeAccountSwitcher, "_write_json", failing_write_json)
-        with pytest.raises(OSError):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        # Scoped context: see H-1 comment above.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ClaudeAccountSwitcher, "_write_json", failing_write_json)
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
 
         assert switcher._read_account_credentials("1", email) == "creds-org"
         assert switcher._read_account_credentials("2", email) == ""
@@ -259,7 +266,7 @@ class TestSwapAccounts:
         assert not list(switcher.credentials_dir.glob(".swap-staging-*"))
 
     def test_write_json_publishes_only_after_chmod(
-        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data: dict
     ):
         """chmod runs on the temp file, making the rename the final commit —
         a chmod failure must abort *without* publishing, otherwise callers
@@ -273,10 +280,11 @@ class TestSwapAccounts:
         def failing_chmod(path, mode):
             raise OSError("chmod denied (injected)")
 
-        monkeypatch.setattr("claude_swap.switcher.os.chmod", failing_chmod)
-        with pytest.raises(OSError):
-            switcher._write_json(switcher.sequence_file, {"x": 1})
-        monkeypatch.undo()
+        # Scoped context: see H-1 comment above.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("claude_swap.switcher.os.chmod", failing_chmod)
+            with pytest.raises(OSError):
+                switcher._write_json(switcher.sequence_file, {"x": 1})
 
         assert switcher.sequence_file.read_text(encoding="utf-8") == before
 
@@ -342,7 +350,7 @@ class TestSwapAccounts:
         assert data["accounts"]["1"]["organizationUuid"] == "org-uuid-5678"
 
     def test_swap_failed_required_clear_aborts_commit(
-        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
         """Same-email one-sided swap where the required clear fails: the swap
         must abort pre-commit and roll back, instead of committing with
@@ -359,10 +367,11 @@ class TestSwapAccounts:
                 raise OSError("permission denied (injected)")
             return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", failing_unlink)
-        with pytest.raises(CredentialError, match="aborting before commit"):
-            switcher.swap_accounts("1", "2")
-        monkeypatch.undo()
+        # Scoped context: see H-1 comment above.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(Path, "unlink", failing_unlink)
+            with pytest.raises(CredentialError, match="aborting before commit"):
+                switcher.swap_accounts("1", "2")
 
         # Table unrenumbered, slot 1's credential intact, and the rollback
         # reverted the half-written copy under the shared key.
