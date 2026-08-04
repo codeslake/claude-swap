@@ -1327,25 +1327,9 @@ class CredentialStore:
         C1: when the current generation can't be read (a locked Keychain, an
         unreadable ``.enc``), the caller's overwrite proceeds regardless — the
         write this retention protects is never conditional on retention
-        succeeding. Declining to write anything left ``.prev`` exactly as
-        empty as a slot that never had a backup, discarding the one recovery
-        cushion a misclassified fail-open (e.g. the switch-time
-        ``unresolved`` branch) depends on precisely when it's most likely to
-        be wrong. The true previous generation is unrecoverable by
-        definition here, so the incoming bytes are retained as a checkpoint
-        instead: not a real rollback target, but a ``.prev`` item that
-        exists and is discoverable, giving a human a thread to pull (cross-
-        reference logs, another machine's synced roster, the unclaimed
-        stash) instead of a silent absence indistinguishable from "there was
-        never anything here".
-
-        C1-round-9: that checkpoint must never fire when a real ``.prev``
-        already exists — one holding a genuine previous generation from an
-        earlier, healthy overwrite. Overwriting it with a duplicate of the
-        incoming bytes destroys the one rollback target on the exact path
-        this function claims to protect, and the result is indistinguishable
-        from a legitimate ``.prev`` while carrying zero recovery value. A
-        checkpoint is only a net gain when there is nothing to lose.
+        succeeding. No ``.prev`` is written in that case (see the WITHDRAWN
+        comment below for why a checkpoint of the incoming bytes was tried
+        and reverted).
         """
         try:
             current, unreadable = self._read_account_credentials_ex(account_num, email)
