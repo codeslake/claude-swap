@@ -121,12 +121,45 @@ elif keys or proxy:
     # request dials it.
     print("HALF", "keys=%s proxy=%s" % (bool(keys), bool(proxy)))
 else:
-    print("UNWIRED")
+    # UNWIRED is a claim about TWO things, and the probe only ever read one.
+    # Measured on via-work-mac: the wiring was cleared while the daemon kept
+    # serving on its recorded port (/health 200, lsof LISTEN), and this said
+    # "no wiring, no daemon". A serving daemon nobody is wired to is an
+    # ORPHAN -- it holds the port, so the next pin cannot bind it, and it goes
+    # on refreshing a token no session reaches. That is a different incident
+    # from an unpinned machine, and it needs a different fix, so the two must
+    # not print the same word.
+    #
+    # Read the port from the daemon's own log, not from the config that was
+    # just found empty.
+    orphan = ""
+    try:
+        import re, socket
+        for c in ("~/.claude-swap-backup/pin-proxy/daemon.log",
+                  "~/.local/share/claude-swap/pin-proxy/daemon.log"):
+            f = os.path.expanduser(c)
+            if not os.path.exists(f):
+                continue
+            hits = re.findall(r"serving on port (\d+)", open(f).read())
+            if not hits:
+                continue
+            s = socket.socket()
+            s.settimeout(1.0)
+            try:
+                if s.connect_ex(("127.0.0.1", int(hits[-1]))) == 0:
+                    orphan = hits[-1]
+            finally:
+                s.close()
+            break
+    except Exception:
+        pass                      # a probe that cannot look says UNWIRED
+    print("ORPHAN", orphan) if orphan else print("UNWIRED")
 PYEOF
 )
 case "$wire" in
   WIRED*)      say pin-wired OK "serving on 127.0.0.1:${wire#WIRED }" ;;
   UNWIRED)     say pin-wired OK "UNPINNED — no wiring, no daemon; sessions go out direct" ;;
+  ORPHAN*)     say pin-wired FAIL "a daemon still serves 127.0.0.1:${wire#ORPHAN } but nothing is wired to it — it holds the port against the next pin; recycle or heal it" ;;
   HALF*)       say pin-wired FAIL "half-wired, requests dial a port nothing serves — ${wire#HALF }" ;;
   UNREADABLE*) say pin-wired FAIL "~/.claude.json ${wire#UNREADABLE }" ;;
   '')          say pin-wired FAIL "the probe produced no verdict; stderr: $(errtail)" ;;
