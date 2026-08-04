@@ -745,6 +745,82 @@ class TestClearRunsWithTheExtraGone:
         assert raw["env"] == {"K": "v"}, "the wiring outlived the uninstall"
 
 
+class TestClearPinDoesNotCreditARemovalThatFailed:
+    """R15 I-2: `had_pin` was computed from `load_pin` BEFORE
+    `impl.apply_pin(...)` ran, and the broad `except Exception: pass` around
+    `apply_pin` swallowed its failure. So a raising removal still returned
+    `had_pin` (True), the CLI printed "Unpinned the cloud account" and exited
+    0, and the TUI notified "Cloud pin cleared" over a pin still recorded in
+    settings.json.
+
+    `apply_pin` raising is realistic: its clear path is `save_pin` ->
+    `wire_global_config(None, None)` -> unlink, and `save_pin` goes through
+    `atomic_write_json` (raises on a read-only or full backup dir) while
+    `wire_global_config` takes a lock it can fail to get.
+
+    The fake `impl` here is STATEFUL -- `apply_pin` really flips `pinned` to
+    False on success -- so the CONTROL rows are not free passes: a fake that
+    always reports "removed" would make the CONTROL-NOOP row lie too.
+    """
+
+    def _switcher(self, monkeypatch):
+        import types
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "clear_wiring", lambda sw: False)
+        return types.SimpleNamespace(backup_dir="/tmp/does-not-matter")
+
+    def _fake_impl(self, monkeypatch, *, pinned: bool, raises: bool):
+        import types
+
+        from claude_swap import pin
+
+        state = {"pinned": pinned}
+
+        def apply_pin(sw, email, org):
+            if raises:
+                raise OSError(30, "Read-only file system")
+            state["pinned"] = False  # the real one clears the record
+
+        impl = types.SimpleNamespace(
+            apply_pin=apply_pin,
+            load_pin=lambda d: ("a@b.c", None) if state["pinned"] else None,
+        )
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+        return state
+
+    def test_CONTROL_a_successful_clear_still_reports_success(self, monkeypatch):
+        from claude_swap import pin
+
+        sw = self._switcher(monkeypatch)
+        state = self._fake_impl(monkeypatch, pinned=True, raises=False)
+
+        assert pin.clear_pin(sw) is True
+        assert state["pinned"] is False, "CONTROL BROKEN: apply_pin never ran"
+
+    def test_CONTROL_clearing_nothing_reports_no_pin(self, monkeypatch):
+        from claude_swap import pin
+
+        sw = self._switcher(monkeypatch)
+        state = self._fake_impl(monkeypatch, pinned=False, raises=False)
+
+        assert pin.clear_pin(sw) is False
+        assert state["pinned"] is False
+
+    def test_a_raising_removal_does_not_report_success(self, monkeypatch):
+        from claude_swap import pin
+
+        sw = self._switcher(monkeypatch)
+        state = self._fake_impl(monkeypatch, pinned=True, raises=True)
+
+        assert pin.clear_pin(sw) is False, (
+            "clear_pin reported success for a pin apply_pin failed to remove "
+            f"(still pinned: {state['pinned']})"
+        )
+        assert state["pinned"] is True, "the fake itself flipped state — harness bug"
+
+
 class TestTheTuiClearReachesTheSameGuaranteeAsTheCli:
     """R13 I-3: the TUI's "Clear cloud pin" called only `impl.apply_pin(sw,
     None, None)` and notified "Cloud pin cleared". It never cleared the

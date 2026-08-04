@@ -830,8 +830,8 @@ class UsageStore:
         backoff must not survive it either. Only the collector's
         fingerprint-healed strike-clear passes ``strike_only=True``: that
         call is evidence a STRIKE healed, not that the server's throttle
-        lifted, and unconditionally zeroing ``backoffUntil`` there re-opens
-        a token still inside its own 429 block (round 7 C1) — the same
+        lifted, and unconditionally zeroing ``backoffUntil`` there would
+        re-open a token still inside its own 429 block — the same
         "no credential change of its own to fence" reasoning ``revoke_claim``
         already applies, extended to the throttle fields.
 
