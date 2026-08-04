@@ -305,11 +305,12 @@ def clear_pin(switcher) -> bool:
     the worst possible outcome for the one action whose job is to work when
     the pin does not.
     """
-    had_pin = False
+    cleared_pin = False
     try:
         impl = _impl()
         had_pin = impl.load_pin(switcher.backup_dir) is not None
         impl.apply_pin(switcher, None, None)
+        cleared_pin = had_pin  # credit it only once apply_pin has returned
     except Exception:  # noqa: BLE001
         pass
     # ALWAYS, not only when apply_pin failed. The package unwires through its
@@ -321,7 +322,7 @@ def clear_pin(switcher) -> bool:
     #
     # apply_pin cannot answer "was there anything to clear": it returns
     # whether a proxy is now serving, which on this path is always False.
-    return clear_wiring(switcher) or had_pin
+    return clear_wiring(switcher) or cleared_pin
 
 
 # -- command -----------------------------------------------------------------

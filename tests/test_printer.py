@@ -10,16 +10,6 @@ import pytest
 from claude_swap import printer
 
 
-@pytest.fixture(autouse=True)
-def _reset_color_cache():
-    """Reset the color detection cache before each test."""
-    printer._colors_enabled = None
-    printer._theme = "dark"
-    yield
-    printer._colors_enabled = None
-    printer._theme = "dark"
-
-
 class TestColorDetection:
     """Tests for color support detection."""
 

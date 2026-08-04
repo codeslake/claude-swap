@@ -3173,8 +3173,8 @@ class ClaudeAccountSwitcher:
         # Accumulated locally, published ONCE after the loop. Blanking the
         # instance attributes here and restoring them after
         # `_read_active_credentials()` opened a window the width of a Keychain
-        # read in which a concurrent pass read `False` — a value no read
-        # produced — and re-entered the condemn branch round 11 exists to skip.
+        # read in which a concurrent pass could read `False` — a value no
+        # read had actually produced — and re-enter the condemn branch on it.
         # The TUI's two refresh lanes and the auto engine's worker share one
         # switcher, so "the main thread writes it before the fetch pool starts"
         # was true of the fetch POOL and not of a second PASS. Published once,
@@ -4079,9 +4079,8 @@ class ClaudeAccountSwitcher:
             elif dead is None:
                 # Cannot determine (unreadable backup on a struck active
                 # slot): neither confirm the strike (would condemn an
-                # already-healed slot, this round's regression) nor heal it
-                # below (would erase a strike that may still hold, reopening
-                # round 8's). Setting a sentinel here — even
+                # already-healed slot) nor heal it below (would erase a
+                # strike that may still hold). Setting a sentinel here — even
                 # USAGE_KEYCHAIN_UNAVAILABLE — would override
                 # decision_value()'s normal last_good serving (measured: it
                 # makes account_headroom() see None, which still drives the
@@ -4101,8 +4100,8 @@ class ClaudeAccountSwitcher:
                 # next collect pass re-evaluates the fingerprint compare
                 # against real bytes and clears the strike via the `elif`
                 # below, or confirms it still holds. This recovery path is
-                # now also how a DEGRADED active read reaches a verdict
-                # (round 11 C1): `_entry_token_dead` skips the immediate
+                # now also how a DEGRADED active read reaches a verdict:
+                # `_entry_token_dead` skips the immediate
                 # fingerprint compare against the collector's own
                 # (possibly-stale) `creds` on a degraded read and falls
                 # through to this same backup-fallback machinery, so the
@@ -4129,8 +4128,8 @@ class ClaudeAccountSwitcher:
                 # (the fingerprint no longer matches), not evidence the
                 # server's own 429 throttle lifted — `backoffUntil` and
                 # `lastError` are the server's word, not this call's to
-                # erase (round 7 C1: an unconditional clear here re-opened
-                # a token still inside its own block).
+                # erase (an unconditional clear here would re-open a token
+                # still inside its own throttle block).
                 #
                 # expected_fingerprints re-checks the row UNDER THE LOCK
                 # against what THIS lock-free read just saw: the decision
@@ -4265,12 +4264,12 @@ class ClaudeAccountSwitcher:
         # credential_fingerprint("") is None, and token_dead(stored_fp=None)
         # skips the compare entirely, answering on the raw strike count
         # alone before _entry_token_dead's own None-machinery ever runs.
-        # Mirrors round 9's guard on the backup read: an unreadable OR
-        # degraded (possibly-stale) read coerces to "not dead" here, the
-        # same conservative direction the docstring above already commits
-        # to for _entry_token_dead's own None answer -- an ambiguous read
-        # must not silently authorize an overwrite the user never confirmed
-        # with --force.
+        # Mirrors the guard on the backup read elsewhere in this class: an
+        # unreadable OR degraded (possibly-stale) read coerces to "not dead"
+        # here, the same conservative direction the docstring above already
+        # commits to for _entry_token_dead's own None answer -- an ambiguous
+        # read must not silently authorize an overwrite the user never
+        # confirmed with --force.
         if is_active:
             active = self._store._read_active_credentials()
             if active.keychain_unavailable or active.degraded:
@@ -4330,11 +4329,11 @@ class ClaudeAccountSwitcher:
         ``(backup="", unreadable=True)`` regardless of what the real bytes
         say. No local read distinguishes them, so guessing either boolean is
         wrong for the other case: guessing ``True`` condemns an already-
-        healed slot (this round's regression); guessing ``False`` would let
-        the collector's own healed-strike-clear branch (the ``elif`` beside
-        this call) permanently erase a strike that may still hold (round
-        8's regression, reopened). ``None`` refuses to guess — callers must
-        treat it as neither confirmed-dead nor confirmed-healed. The
+        healed slot; guessing ``False`` would let the collector's own
+        healed-strike-clear branch (the ``elif`` beside this call)
+        permanently erase a strike that may still hold. ``None`` refuses to
+        guess — callers must treat it as neither confirmed-dead nor
+        confirmed-healed. The
         collector sets NO sentinel for it: even the existing
         ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel overrides
         ``decision_value()``'s normal last-good serving, which still drives
@@ -4374,8 +4373,8 @@ class ClaudeAccountSwitcher:
         # erases a strike bound to the LIVE generation (``refresh_input =
         # live`` on the active path) — the slot becomes reservable once
         # backoff lapses, the dead token is re-POSTed, and the re-login
-        # prompt never appears. Round 8's regression in the one shape the
-        # round-11 guard cannot observe.
+        # prompt never appears — exactly the shape this degraded-read guard
+        # exists to catch.
         if unreadable or active_read_degraded:
             return None if entry.token_dead() else False
         return False

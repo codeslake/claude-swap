@@ -285,6 +285,25 @@ def _deterministic_poll_jitter(monkeypatch):
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
 
 
+@pytest.fixture(autouse=True)
+def _reset_color_cache():
+    """Reset printer's process-global color-detection cache before/after each
+    test. printer.colors_enabled() memoises _detect_color_support() into a
+    module global that survives monkeypatch teardown (monkeypatch restores
+    sys.stdout, not the cache) -- a test that fakes isatty and renders styled
+    output leaves every later test on the same worker seeing ANSI in output it
+    expects to be plain. Moved here from tests/test_printer.py, which reset it
+    only for its own tests; a second copy is exactly the drift that let the
+    global stay unreset everywhere else."""
+    from claude_swap import printer
+
+    printer._colors_enabled = None
+    printer._theme = "dark"
+    yield
+    printer._colors_enabled = None
+    printer._theme = "dark"
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     """Pin every real-Keychain test to ONE xdist worker.
