@@ -33,14 +33,23 @@ CF="$R/tests/conftest.py"
 
 # A check is a predicate over a FILE, so the same code can be pointed at the
 # real tree and at a broken copy. `$1` is the path; prints nothing, returns 0/1.
+# The BEHAVIOUR, not the helper. This first named `_read_target_credentials`'s
+# `return ""` tail, because that is where #196 put the read. #199 deleted the
+# helper and inlined the read at both `_perform_switch` sites, so the shape was
+# gone from every branch while the semantics were intact -- and the check then
+# reported the regression it exists to catch on a tree that has none.
+#
+# What must survive is the LANDING: an empty target slot reaches
+# `_switch_to_empty_slot` rather than raising. A roster import syncs the account
+# LIST and not the credentials, so an empty slot is a destination, and the only
+# way to fill one is to be ON it and log in. Mutation-checked: making both arms
+# raise instead kills 6 tests; a whitespace NOOP on the same file kills none.
 absent_tail()  { python3 - "$1" <<'PY'
 import re, sys
 s = open(sys.argv[1], encoding="utf-8").read()
-i = s.find("    def _read_target_credentials")
-if i < 0:
-    sys.exit(1)                       # the function itself is gone
-j = s.index("\n    def ", i + 10)
-sys.exit(0 if 'return ""' in s[i:j] else 1)
+n = len(re.findall(
+    r"if not target_creds:\n\s+return self\._switch_to_empty_slot\(", s))
+sys.exit(0 if n >= 2 else 1)          # both _perform_switch read sites
 PY
 }
 perform_arity() { grep -q 'def perform_after_stop(\*args' "$1"; }
@@ -104,8 +113,8 @@ PY
   row "$name" OK "present, and the check rejects its absence"
 }
 
-check merge-absent-tail absent_tail "$SW" '\n *return ""' \
-  '_read_target_credentials lost its ABSENT-returns-"" tail: every empty slot becomes unreachable and the caller'"'"'s `if not target_creds:` branch is dead (PR #199)'
+check merge-absent-tail absent_tail "$SW" 'return self\._switch_to_empty_slot\(' \
+  'the empty-slot landing is gone: an ABSENT target slot raises instead of reaching _switch_to_empty_slot, so a roster-imported slot is unreachable and the only way to fill it (be on it and log in) is closed (PR #199)'
 
 check merge-perform-arity perform_arity "$TA" 'def perform_after_stop\(\*args' \
   'perform_after_stop takes #199'"'"'s 3-arg signature while the merged _perform takes #204'"'"'s 4 — TypeError at the stop-race test'
