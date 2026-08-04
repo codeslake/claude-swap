@@ -4145,19 +4145,30 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # comment is explicitly not describing (measured on both).
     #
     # `funcName` is chosen because a lineno key is BRITTLE, not because it
-    # cannot discriminate. This paragraph was written by `f361237` and revised
-    # by `f22197a`; only `f361237` moved a site — `f22197a` moved nothing
-    # (`6e03af7` also moved sites, but via the comment block above this
-    # paragraph, which it left unchanged). Measured across `f361237` and
-    # `6e03af7`: THREE sites moved twice, not one — the lock WARNING (588 ->
-    # 633 -> 648) and both members of `_PER_TICK_SITES`, `_wiring_present`
-    # (755 -> 800 -> 815) and `_wired_ports` (1067 -> 1112 -> 1127). Not every
-    # site and not every round: the getter site below has sat at 468 since
-    # `d343bfb`, the last round to change `pin.py`'s non-comment code. Both
-    # keyed-on sites moving twice under comment-only edits is the brittleness
-    # — a lineno key pins the guard to the file's current layout instead of to
-    # the fact it is about. `stacklevel=2` is what makes `funcName` the
-    # CALLER, which is that fact.
+    # cannot discriminate. This paragraph was written by `f361237` and
+    # revised by `f22197a` and `eb6dc53`; only `f361237` moved a site in
+    # `pin.py` — neither revision did (`6e03af7` also moved sites, but via
+    # the comment block above this paragraph, which it left unchanged).
+    # Measured across `f361237` and `6e03af7`: THREE sites moved twice, not
+    # one — the lock WARNING (588 -> 633 -> 648) and both members of
+    # `_PER_TICK_SITES`, `_wiring_present` (755 -> 800 -> 815) and
+    # `_wired_ports` (1067 -> 1112 -> 1127). Not every site and not every
+    # round: the getter site below has sat at 468 since `d343bfb`, which
+    # moved it there (447 -> 468) by editing a docstring, not code — the
+    # last commit to change `pin.py`'s executable code is `3e97cdd`,
+    # `d343bfb`'s parent, and every round since (`d343bfb` included) has
+    # changed zero (measured, comments and docstrings both excluded). Both
+    # keyed-on sites moving twice under comment-only edits is the
+    # brittleness — a lineno key pins the guard to the file's current
+    # layout instead of to the fact it is about. `stacklevel=2` is what
+    # makes `funcName` the CALLER, which is that fact.
+    #
+    # THREE HERE AND `two of them` IN THE OTHER TWO COPIES IS NOT A
+    # CONTRADICTION — they count different sets. Those two count the
+    # linenos the UNREMOVABLE shape produces, of which exactly two moved;
+    # this counts every site in the file, of which three did.
+    # `_wiring_present` is the difference: it is in this set and not in
+    # theirs, because it fires solely on the REMOVABLE shape.
     _PER_TICK_SITES = ("_wiring_present", "_wired_ports")
 
     def _heal(self, tmp_path, monkeypatch, caplog, *, wired, removable=True):
@@ -4323,7 +4334,7 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
         # costs 43200 lines a day whoever wrote them. Filtering to
         # `r.name == "claude-swap"` would not even remove the one reachable
         # intruder anyone worries about: `claude_locks` calls
-        # `getLogger("claude-swap")` too (claude_locks.py:63), so
+        # `logging.getLogger("claude-swap")` too, so
         # `proper_lockfile`'s release WARNING carries that same record name
         # and survives the filter. Origin is the only axis that separates
         # them, which is why this asserts on `funcName`.
