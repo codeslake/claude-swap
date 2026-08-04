@@ -146,14 +146,19 @@ def is_session_stale(session_dir: Path) -> bool:
 def clear_session_stale(session_dir: Path) -> None:
     """Drop a profile's stale flag from both marker locations.
 
-    The legacy location is a CHILD of ``session_dir``: a caller that just
-    tolerated EACCES on that same dir (``_delete_session_profile``'s
-    ``rmtree(ignore_errors=True)``) runs into it again here.
-    ``missing_ok=True`` only covers ENOENT, not EACCES, so a denied dir with
-    a legacy marker still inside it must not raise past a caller that
-    already expects this to be tolerant of that dir's state.
+    Both are unlinked under their own ``try/except OSError``, not just
+    ``missing_ok=True``: that only covers ENOENT, not EACCES/EROFS, and a
+    caller that just tolerated a denied dir (``_delete_session_profile``'s
+    ``rmtree(ignore_errors=True)``) runs into the same denial again here --
+    on the sibling location (``stale_marker_for``, a denied PARENT) as much
+    as the legacy CHILD location. Each unlink still runs first, so the
+    happy-path removal is unaffected; only the resulting OSError is
+    swallowed.
     """
-    stale_marker_for(session_dir).unlink(missing_ok=True)
+    try:
+        stale_marker_for(session_dir).unlink(missing_ok=True)
+    except OSError:
+        pass
     try:
         (session_dir / STALE_MARKER).unlink(missing_ok=True)
     except OSError:

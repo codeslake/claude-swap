@@ -141,8 +141,10 @@ class TestListSessions:
         [
             lambda p: p.write_text("not json{{{", encoding="utf-8"),
             lambda p: p.write_bytes(b"\xff\xfe{\"pid\": 1}"),
+            lambda p: p.write_text(json.dumps({"pid": 2**31}), encoding="utf-8"),
+            lambda p: p.write_text("[" * 2000 + "]" * 2000, encoding="utf-8"),
         ],
-        ids=["invalid_json", "invalid_utf8"],
+        ids=["invalid_json", "invalid_utf8", "pid_overflows_c_long", "json_nested_too_deep"],
     )
     def test_corrupt_session_file_is_skipped(self, tmp_path, write_bad_file):
         sessions_dir = tmp_path / "sessions"
@@ -252,10 +254,19 @@ class TestListIdeInstances:
     def test_missing_ide_dir(self, tmp_path):
         assert list_ide_instances(tmp_path) == []
 
-    def test_corrupt_json(self, tmp_path):
+    @pytest.mark.parametrize(
+        "write_bad_file",
+        [
+            lambda p: p.write_text("broken", encoding="utf-8"),
+            lambda p: p.write_text(json.dumps({"pid": 2**31}), encoding="utf-8"),
+            lambda p: p.write_text("[" * 2000 + "]" * 2000, encoding="utf-8"),
+        ],
+        ids=["invalid_json", "pid_overflows_c_long", "json_nested_too_deep"],
+    )
+    def test_corrupt_json(self, tmp_path, write_bad_file):
         ide_dir = tmp_path / "ide"
         ide_dir.mkdir()
-        (ide_dir / "9999.lock").write_text("broken", encoding="utf-8")
+        write_bad_file(ide_dir / "9999.lock")
 
         assert list_ide_instances(tmp_path) == []
 

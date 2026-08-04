@@ -108,7 +108,15 @@ def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
             ))
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+        except (
+            json.JSONDecodeError,   # malformed JSON
+            KeyError,               # required field missing
+            TypeError,              # field has the wrong type (e.g. pid not an int)
+            ValueError,             # includes UnicodeDecodeError from read_text
+            OverflowError,          # pid too large for os.kill's C long (is_pid_alive)
+            RecursionError,         # pathologically nested JSON in json.loads
+            OSError,
+        ) as exc:
             logger.debug("Skipping session file %s: %s", path, exc)
     return sessions
 
@@ -133,7 +141,15 @@ def list_ide_instances(claude_dir: Path | None = None) -> list[IdeInstance]:
                 ide_name=data.get("ideName", "Unknown IDE"),
                 workspace_folders=data.get("workspaceFolders", []),
             ))
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+        except (
+            json.JSONDecodeError,   # malformed JSON
+            KeyError,               # required field missing
+            TypeError,              # field has the wrong type (e.g. pid not an int)
+            ValueError,             # includes UnicodeDecodeError from read_text
+            OverflowError,          # pid too large for os.kill's C long (is_pid_alive)
+            RecursionError,         # pathologically nested JSON in json.loads
+            OSError,
+        ) as exc:
             logger.debug("Skipping IDE lockfile %s: %s", path, exc)
     return instances
 

@@ -36,6 +36,7 @@ from claude_swap.session import (
     session_dir_for,
     session_identity_drifted,
     slugify_email,
+    stale_marker_for,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -1402,38 +1403,52 @@ class TestGuards:
         reason="needs POSIX permission semantics (non-root)",
     )
     @pytest.mark.parametrize(
-        "denied, legacy_marker",
+        "deny, marker",
         [
-            (True, True),
-            (True, False),
-            (False, True),
+            ("child", "legacy"),
+            ("child", None),
+            (None, "legacy"),
+            ("parent", "sibling"),
+            ("parent", None),
         ],
-        ids=["denied_with_legacy_marker", "denied_no_marker", "writable_with_marker"],
+        ids=[
+            "denied_with_legacy_marker",
+            "denied_no_marker",
+            "writable_with_marker",
+            "denied_parent_with_sibling_marker",
+            "denied_parent_no_marker",
+        ],
     )
     def test_delete_session_profile_survives_a_denied_dir_with_legacy_marker(
-        self, seeded_switcher, denied, legacy_marker
+        self, seeded_switcher, deny, marker
     ):
-        """`clear_session_stale`'s legacy-location unlink is a CHILD of
-        the profile dir. The `rmtree(ignore_errors=True)` above it already
-        tolerates EACCES on that same dir -- `unlink` does not, so only the
-        COMBINATION (denied dir + a legacy marker inside it) raises, right
-        after `remove_account` has already deleted the credentials but
-        before it writes the roster."""
+        """`clear_session_stale` unlinks two marker locations: a legacy CHILD
+        of the profile dir, and the SIBLING (in the profile dir's PARENT)
+        that is where every marker is written today. The
+        `rmtree(ignore_errors=True)` right above it already tolerates EACCES
+        on the profile dir -- neither `unlink` does on its own, so only the
+        COMBINATION (a denied dir + a marker actually inside it) raises,
+        right after `remove_account` has already deleted the credentials but
+        before it writes the roster. Covers both marker locations and both
+        denied dirs (the profile dir itself, and its parent)."""
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         session_dir.mkdir(parents=True, exist_ok=True)
         (session_dir / "x.txt").write_text("keep", encoding="utf-8")
-        if legacy_marker:
+        if marker == "legacy":
             (session_dir / session_mod.STALE_MARKER).touch()
-        if denied:
-            session_dir.chmod(0o500)
+        elif marker == "sibling":
+            stale_marker_for(session_dir).touch()
+        denied_dir = session_dir if deny == "child" else session_dir.parent
+        if deny:
+            denied_dir.chmod(0o500)
         try:
             seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
         finally:
-            if denied:
+            if deny:
                 try:
-                    session_dir.chmod(0o700)
+                    denied_dir.chmod(0o700)
                 except OSError:
                     pass
 
