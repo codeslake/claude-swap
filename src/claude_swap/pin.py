@@ -34,48 +34,27 @@ def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> No
     """Record a path getter's raise, every time it happens. DEBUG by default.
 
     THE LEVEL IS THE CALLER'S, and only `clear_wiring` passes WARNING. No cap.
-    Both a cap and a blanket WARNING were wrong, and measured wrong through the
-    real CLI rather than reasoned about.
 
-    A once-per-PROCESS cap cannot suppress anything here: the statusline hook
-    spawns `cswap pin --heal` fresh on a ~2s cadence (`pin-ensure`), `heal`'s
-    only caller is `pin.run(..., heal_only=True)` from `cli.py`, and there is
-    no long-lived daemon. The cap's lifetime IS one tick.
+    A once-per-PROCESS cap cannot suppress anything here: `heal` runs as a
+    fresh short-lived process per tick, so the cap's lifetime IS one tick.
 
-    Worse, adding the warning to `_wiring_present` and `_wired_ports` — which
-    `heal` calls on EVERY tick regardless of wiring state — inverted the thing
-    it claimed to fix. Counting lines in the real rotating log with an
-    unreadable `~/.claude`:
+    DEBUG is the default because `heal` calls `_wiring_present` and
+    `_wired_ports` on EVERY tick regardless of wiring state; warning from
+    there costs ~4.2MB/day and overwrites the whole 4MB rotating history in
+    under a day. DEBUG keeps the record without paying for it every tick.
 
-        tick   before        after adding it
-        1      0             1
-        6      0             6
-
-    Before, the warning was reachable only from `clear_wiring`, gated behind
-    `_wiring_is_stale`, so it logged once and went quiet. After, ~4.2MB/day,
-    overwriting the whole 4MB history every ~22.7h — the damage the code
-    claimed to prevent, created by the code that claimed it.
-
-    So the default is DEBUG, for the two getters `heal` calls unconditionally.
-    It keeps the observability that was genuinely missing (both swallowed the
-    raise silently) without paying for it every tick: the rotating handler does
-    not record DEBUG by default, so the record is there for anyone who turns
-    the level up and costs nothing when nobody has. `clear_wiring` overrides to
-    WARNING because it is gated (see its call site), and because a config that
-    could not be LOCATED is the one fact its return value cannot carry: the
-    bool is a claim about every path it REACHED. Naming why a wiring could not
-    be REMOVED is a different record — the lock WARNING at the bottom of
-    `clear_wiring`, which is the site that fires on the stuck shape this one
-    cannot reach.
+    `clear_wiring` overrides to WARNING because it is gated by
+    `_wiring_is_stale`, and because a config that could not be LOCATED is the
+    one fact its return value cannot carry: the bool is a claim about every
+    path it REACHED. Why a wiring could not be REMOVED is a different record —
+    the lock WARNING at the bottom of `clear_wiring`.
     """
     # `stacklevel=2` ATTRIBUTES THE RECORD TO THE CALLER. Without it all three
     # call sites' records are identical in origin — same `funcName`, same
-    # `pathname`, same `lineno`, this line — so nothing downstream can tell the
-    # per-tick getters from the gated one. That is not academic: the guard on
-    # this split could only key on LEVEL, which made it pass on a fixture that
-    # never reached `clear_wiring` at all, and fail on the correct WARNING as
-    # soon as the fixture was hardened. With it, `record.funcName` is
-    # `_wiring_present` / `_wired_ports` / `clear_wiring`.
+    # `pathname`, same `lineno` — so nothing downstream can tell the per-tick
+    # getters from the gated one, and a guard on this split can only key on
+    # LEVEL. With it, `record.funcName` is `_wiring_present` / `_wired_ports` /
+    # `clear_wiring`.
     #
     # Production output is UNCHANGED: `logging_config` formats
     # "%(asctime)s - %(levelname)s - %(message)s" and never renders funcName,
@@ -145,9 +124,9 @@ def _impl() -> ModuleType:
         # find_spec has to IMPORT the parent package to read its __path__, so a
         # cswap_pin/__init__.py that raises surfaces here rather than below —
         # and swallowing it is what turns "your cryptography is broken" into
-        # "install the package you already have". Measured: a package root
-        # raising ImportError("No module named 'cryptography'") propagates out
-        # of find_spec, not out of import_module.
+        # "install the package you already have". A package root raising
+        # ImportError("No module named 'cryptography'") propagates out of
+        # find_spec, not out of import_module.
         #
         # e.name is what tells them apart: absent -> 'cswap_pin', broken root
         # -> whatever the package failed to import.
@@ -178,9 +157,9 @@ def _impl() -> ModuleType:
 
 # Both display helpers (is_available/pinned_email) are called on every TUI
 # RENDER — AccountsPanel.render, AccountCard.render, and twice per
-# dashboard._root_entries — not just on the poll. Measured: 0.168ms/call for
-# _live_impl's invalidate_caches()+find_spec with the extra absent and a
-# 6-entry sys.path, scaling with sys.path length. A TTL well under the TUI's
+# dashboard._root_entries — not just on the poll, and _live_impl's
+# invalidate_caches()+find_spec costs ~0.168ms/call with the extra absent,
+# scaling with sys.path length. A TTL well under the TUI's
 # poll cadence (POLL_INTERVAL_S = 3.0 in tui/app.py) removes that from every
 # render while still noticing a mid-session install: dashboard.refresh_root_menu
 # re-renders on every poll tick, so a cache younger than one poll interval is
@@ -200,10 +179,9 @@ def _live_impl() -> ModuleType | None:
     broken install is right for a badge and wrong for a command.
 
     ``invalidate_caches`` because a long-lived process caches each sys.path
-    directory by mtime, so a package installed after start can stay invisible.
-    Measured: usually visible immediately, but an install landing inside the
-    same mtime tick is not — which is exactly the "I installed it and the menu
-    is still missing" report.
+    directory by mtime, so an install landing inside the same mtime tick stays
+    invisible without it — the "I installed it and the menu is still missing"
+    case.
 
     Cached for ``_LIVE_IMPL_CACHE_TTL_S`` (see the module-level comment) so a
     render burst pays for the resolution once, not once per widget.
@@ -260,10 +238,10 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     installed, or when the proxy cannot be started: an optional feature must
     never be able to block a launch.
     """
-    # ONE guard around everything, including _impl(). A split try left the
+    # ONE guard around everything, including _impl(). A split try leaves the
     # resolution step uncovered, so anything raised there — a broken
-    # cryptography, a corrupt install — propagated out of a launch. Measured:
-    # the launch died instead of starting unpinned.
+    # cryptography, a corrupt install — kills the launch instead of starting
+    # it unpinned.
     try:
         pin = _impl()
     except Exception:  # noqa: BLE001 — never block the launch
@@ -273,47 +251,25 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
         #
         # ASK FIRST, LOCK ONLY IF THERE IS WORK. The budget is per PATH and
         # clear_wiring takes one lock per config, so a user who never installed
-        # the pin — the case this budget exists for — paid it twice: measured
-        # 1.37-1.64s with Claude Code holding the lock, against a documented
-        # cap of 0.5s. _wiring_present is lock-free and answers in ~1.5ms, and
-        # for that user the answer is always "nothing to remove".
+        # the pin — the case this budget exists for — would pay it twice
+        # (1.37-1.64s with Claude Code holding the lock, against a 0.5s cap).
+        # `_wiring_present` is lock-free, answers in ~1.5ms, and for that user
+        # the answer is always "nothing to remove".
         #
         # AND NOT SERVING. `_impl()` raising says nothing about the daemon: a
         # broken cryptography, a half-finished reinstall, an import error in a
         # new release all land here while the proxy on the port keeps answering
-        # every session already wired to it. This branch used to unwire on
-        # presence alone. Measured: with `_impl` raising and the port serving,
-        # one `cswap run` stripped the env block and unpinned a healthy pin —
-        # the same damage heal's own guard exists to prevent, at the other
-        # call site.
+        # every session already wired to it. Unwiring on presence alone strips
+        # the env block from a healthy pin.
         #
         # The probe is bounded well under the launch budget rather than given
         # the default 2s: a black-holed port must not turn a launch-path guard
         # into the stall it was written to avoid.
         #
-        # `clear_wiring`'s WARNINGs — there are TWO of them, the getter one at
-        # the top and the lock one at the bottom — are self-limiting HERE only
-        # in the same sense they are inside `heal` (see those call sites): the
-        # gate goes false when the removal succeeds, not otherwise. So an
-        # unremovable wiring logs per LAUNCH, and on the shape where both fire
-        # it logs TWICE per launch. Measured, 6 launches through this branch,
-        # counting only what the INFO-level logger actually writes:
-        #
-        #                                       259f598      HEAD
-        #   no HOME, unremovable (ro dir)      6 lines     12 lines  {getter 6, lock 6}
-        #   no HOME, REMOVABLE                 1 line       1 line
-        #   nothing wired                      0 lines      0 lines
-        #   HOME fine, ro dir, wired           0 lines      6 lines  {lock 6}
-        #
-        # THE BOTTOM ROW IS THE FIX WORKING, not a regression. That shape — a
-        # config dir this process cannot write, HOME perfectly resolvable — is
-        # the flagship stranding, and before the lock WARNING existed it went
-        # to the user's screen on every launch with ZERO records at any level
-        # naming which config or why. The getter WARNING cannot cover it: on
-        # this shape nothing raises and it never fires (row 4, left column).
-        #
-        # At human cadence six launches is negligible either way, which is why
-        # the churn arithmetic lives at the statusline call site and not here.
+        # `clear_wiring` logs at most twice per LAUNCH here (its getter WARNING
+        # and its lock WARNING), because the gate goes false only when the
+        # removal succeeds. At human launch cadence that is negligible, which
+        # is why the churn arithmetic lives at the statusline call site.
         try:
             if _wiring_is_stale(switcher, connect_timeout=_LAUNCH_PROBE_S):
                 clear_wiring(switcher, timeout=_LAUNCH_LOCK_BUDGET_S)
@@ -330,16 +286,14 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     # No proxy this launch, whether ensure_proxy said so or died saying it.
     # .claude.json's env block is applied at boot, so a wiring a previous
     # launch left behind would send this child at a port nothing answers.
-    # ONE tail, not one per branch: duplicating it ran the unwire twice when
-    # the None path's own unwire raised.
+    # ONE tail, not one per branch: duplicating it runs the unwire twice when
+    # the None path's own unwire raises.
     #
     # BOUNDED, like the no-package branch above. `unwire_if_dead` takes no
     # timeout and uses the package's own claude_config_lock(timeout=5), so a
-    # held .claude.json.lock made every `cswap run` wait 5.3s (measured, 5.19s
-    # of it inside the unwire) before returning the env unchanged — and Claude
-    # Code holds that lock routinely while refreshing credentials. The budget
-    # this path was given was only ever applied to the branch where the package
-    # is absent.
+    # held .claude.json.lock costs every `cswap run` 5.3s before it returns the
+    # env unchanged — and Claude Code holds that lock routinely while
+    # refreshing credentials.
     #
     # If the lock is not free right now, SKIP: the wiring is stale but the next
     # launch heals it, and a launch that blocks is worse than a launch that is
@@ -406,8 +360,8 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # from inside a session terminal wires that session's copy. Clearing only
     # the resolved path leaves the other wired, and `cswap pin --clear` then
     # prints "No cloud account pinned" over a config that still names a dead
-    # port — the exact stranding this function exists to prevent. Measured:
-    # the two paths diverge as soon as CLAUDE_CONFIG_DIR is set.
+    # port — the exact stranding this function exists to prevent. The two
+    # paths diverge as soon as CLAUDE_CONFIG_DIR is set.
     #
     # EACH GETTER CAN RAISE (see the same guard on `_wired_ports` and
     # `_wiring_present`): `get_default_global_config_path` calls `Path.home()`,
@@ -428,43 +382,25 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
             # WARNING HERE ONLY. `heal` reaches `clear_wiring` through
-            # `_wiring_is_stale`, which goes false ONCE THE REMOVAL SUCCEEDS
-            # — so this logs once and goes quiet, which is what `cae7cfa` did
-            # correctly before I broke it. The two getters `heal` calls
-            # UNCONDITIONALLY stay at DEBUG; putting WARNING there is what
-            # produced 12 lines per 6 ticks.
+            # `_wiring_is_stale`, which goes false ONCE THE REMOVAL SUCCEEDS,
+            # so this logs once and goes quiet. The two getters `heal` calls
+            # UNCONDITIONALLY stay at DEBUG (see `_log_unresolvable`).
             #
-            # IT IS NOT THE RECORD THAT EXPLAINS AN UNREMOVABLE WIRING. Four
-            # rounds of this comment claimed it was, and the claim is false in
-            # both directions. Measured, 10 `heal` ticks, read-only config dir
-            # with HOME perfectly resolvable — the flagship shape those rounds
-            # named:
+            # THIS RECORD DOES NOT EXPLAIN AN UNREMOVABLE WIRING, and must not
+            # be read as if it did. On the flagship shape — read-only config
+            # dir, HOME resolvable — nothing raises here and it never fires;
+            # what fires is `heal`'s own "the config is locked" message. Make
+            # `Path.home()` raise too and this names
+            # `get_default_global_config_path` while the STUCK config is the
+            # one the other getter resolved fine. Put the wiring in the raising
+            # getter's config and `_wiring_present` cannot see it either, so
+            # `heal` answers "Nothing to heal" and never reaches this function.
             #
-            #   heal   : "…could not be removed (the config is locked) —
-            #             re-run `cswap pin --heal`", every tick
-            #   THIS site: never fires (nothing raises; both paths resolve)
-            #
-            # Getting it to fire needs `Path.home()` to raise as well, and
-            # then it names `get_default_global_config_path` while the STUCK
-            # config is the one `get_global_config_path` resolved fine. Put
-            # the wiring in the raising getter's own config instead and
-            # `_wiring_present` cannot see it either, so `heal` answers
-            # "Nothing to heal" and never reaches this function at all
-            # (measured, both shapes). There is no reachable shape where this
-            # WARNING names an unremovable wiring's cause.
-            #
-            # What does name it is the lock-failure WARNING at the bottom of
-            # this function, added for exactly that gap. This record's job is
-            # the narrower one it can actually do: a config that could not be
-            # LOCATED is missing from `paths`, and `clear_wiring`'s bool is a
-            # claim about every path it REACHED.
-            #
-            # SO THE COST HERE IS ONE LINE, not the per-tick churn the old
-            # table charged it. Measured through the real `setup_logging`
-            # handler, 10 ticks, `Path.home()` raising and the removal
-            # succeeding: 1 line, 98 B — `_wiring_is_stale` goes false and
-            # this is never reached again. The 10-line column belongs to the
-            # bottom WARNING and is accounted for there.
+            # What names an unremovable wiring is the lock-failure WARNING at
+            # the bottom of this function. This record's job is the narrower
+            # one it can do: a config that could not be LOCATED is missing from
+            # `paths`, and `clear_wiring`'s bool is a claim about every path it
+            # REACHED.
             _log_unresolvable(get, exc, logging.WARNING)
             continue
         if path not in paths:
@@ -476,16 +412,15 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
     # and Claude Code, the whole-file clobber the lock exists to prevent.
     #
     # ``timeout`` is a TOTAL, not a per-file allowance. Passing it to each
-    # acquisition made the real worst case a multiple of the number of
-    # configs, so the launch path's sub-second cap silently became ~2x that
-    # (measured: 1.37-1.64s against a documented 0.5s).
+    # acquisition makes the worst case a multiple of the number of configs, so
+    # the launch path's sub-second cap silently becomes ~2x that (1.37-1.64s
+    # against a documented 0.5s).
     import time as _time
 
-    # An UNTIMED call still gets a total. Leaving `None` meant each config
-    # independently waited the lock's own default, so `cswap pin --clear`
-    # with both locks held froze for 2x that (measured: 18.18s against a 9s
-    # default) — the same multiple-of-the-configs bug this deadline was added
-    # to fix, on the branch that did not pass a timeout.
+    # An UNTIMED call still gets a total. Leaving `None` lets each config
+    # independently wait the lock's own default, so `cswap pin --clear` with
+    # both locks held freezes for 2x that (18.18s against a 9s default) — the
+    # same multiple-of-the-configs shape, on the branch with no timeout.
     if timeout is None:
         from claude_swap.claude_locks import DEFAULT_TIMEOUT_S
 
@@ -500,8 +435,8 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
         # first path the whole remaining budget let a config that stayed
         # contended for the entire call consume it all, so a SECOND path
         # whose lock was completely free was skipped by the `left <= 0` check
-        # above without ever being tried. Measured: session lock held for the
-        # full 0.5s budget, `clear_wiring` returned False with BOTH configs
+        # above without ever being tried: with the session lock held for the
+        # full 0.5s budget, `clear_wiring` returns False with BOTH configs
         # still wired.
         #
         # Dividing by how many paths are still untried gives each one at
@@ -520,131 +455,26 @@ def clear_wiring(switcher, timeout: float | None = None) -> bool:
             # abandon the other one — and on the launch path (sub-second
             # budget) a contended config must not fail the clear outright.
             #
-            # BUT SAY WHICH FILE AND WHY. Skipping silently is what left the
-            # flagship failure with no record anywhere: measured on a
-            # read-only config dir with HOME perfectly resolvable, five `heal`
-            # ticks each told the user "could not be removed (the config is
-            # locked) — re-run `cswap pin --heal`" and produced ZERO log
-            # records at any level, while this line swallowed
-            # `PermissionError: [Errno 13] ... '<session>/.claude.json.lock'`
-            # — the one fact naming the cause. The getter WARNING above cannot
-            # cover it (see its comment): on this shape it does not fire.
+            # BUT SAY WHICH FILE AND WHY. This is the ONLY record naming which
+            # config could not be unwired and what stopped it. Skipping
+            # silently leaves the flagship failure — a read-only config dir,
+            # HOME resolvable — telling the user "could not be removed (the
+            # config is locked)" every tick with zero records at any level.
+            # The getter WARNING above does not fire on that shape.
             #
-            # THE CHURN IS HERE, then. Measured through the real
-            # `setup_logging` handler, 10 `heal` ticks each:
+            # KEPT AT WARNING FOR BOTH REACHABLE KINDS. `PermissionError` and
+            # `ClaudeCodeLockTimeout` both land here, and the type does not
+            # separate transient from permanent: a live Claude Code credential
+            # refresh raises the timeout, and so does an orphaned lock dir
+            # inside a directory this process cannot write, which never
+            # resolves. Splitting on type would silence the stuck machine this
+            # WARNING exists for.
             #
-            #   nothing wired                       0 lines,  unwired
-            #   stale, removed on tick 1            0 lines,  unwired
-            #   stale, unremovable (read-only dir) 10 lines,  still wired
-            #
-            # A LINE'S SIZE DEPENDS ON WHICH EXCEPTION THIS CAUGHT, and there
-            # are two reachable kinds. `%s` renders the path once bare, and
-            # then whatever the exception's own message carries. Measured
-            # through the real formatter, then scaled to
-            # `/home/j.lee8/.claude.json` (25 chars):
-            #
-            #                          path appears   per line    active file
-            #   PermissionError          2x           147 B       wraps 3.96 h
-            #   ClaudeCodeLockTimeout    1x           198 B       wraps 2.94 h
-            #
-            # `PermissionError` renders the LOCK path (the config path plus
-            # `.lock`), so the config path appears twice and the old
-            # `97 B + 2*len(path)` model is exact for it — at every length
-            # measured, 22 through 140 chars, diff 0.
-            #
-            # `ClaudeCodeLockTimeout` names only `lock_dir.name`, so the path
-            # appears ONCE, and the model does not fit it AT ALL — the miss is
-            # not a constant. Its fixed sentence ("Could not acquire … Claude
-            # Code appears to be refreshing credentials. Retry in a few
-            # seconds.") is paid whatever the path costs, so the difference
-            # between the two kinds is `76 - len(path)`: measured exact at
-            # every length tested.
-            #
-            #   len(path)   PermErr    Timeout    gap    76-len
-            #          25       147        198     51        51   <- documented
-            #          71       239        244      5         5
-            #          78       253        251     -2        -2
-            #         140       377        313    -64       -64
-            #
-            # The first row is the table above, measured at exactly the
-            # documented path rather than extrapolated: the gap is 51 B, NOT
-            # the 32 the prose used to claim (32 corresponds to a 44-char
-            # path). It DECAYS with path length, and past 76 chars it INVERTS
-            # — the timeout becomes the cheaper line. At 43200 ticks: 6.06 MiB/day
-            # and 8.16 MiB/day respectively, against `logging_config.py`'s
-            # `maxBytes=1024 * 1024`, so a `tail` three hours late shows
-            # none of it; the 4 MiB across all `backupCount=3` rotations
-            # lasts 15.9 h / 11.8 h.
-            #
-            # THE WORST CASE IS THE TIMEOUT, and it is also the one that never
-            # stops. An ORPHANED lock dir (a holder killed -9) inside a config
-            # dir this process cannot write is permanent: the takeover path
-            # `rmdir`s the stale dir, that `rmdir` needs write permission on
-            # the parent, and it never gets it. Measured, 10 ticks: 10 lines,
-            # still wired, every tick identical.
-            #
-            # KEPT AT WARNING, BOTH KINDS, and this is the site the "a silent
-            # log is the worse failure" argument was always about: it is the
-            # only record naming which config and which cause, and every one
-            # of those ticks is already printing an unexplained failure to the
-            # user's status line.
-            #
-            # SPLITTING `ClaudeCodeLockTimeout` DOWN TO DEBUG WAS PROPOSED AND
-            # REFUSED — ON COST, which is the only ground that holds. The type
-            # does not separate the two cases: a live competitor raises
-            # `ClaudeCodeLockTimeout` and so does the permanently-orphaned lock
-            # dir above, so a type-keyed split silences the stuck machine this
-            # WARNING exists for and keeps only `PermissionError`, the kind
-            # that already names its own errno.
-            #
-            # A DISCRIMINATOR DOES EXIST, though earlier versions of this
-            # comment said none did. The lock dir's mtime age tells them apart
-            # at the moment of the raise, and `proper_lockfile` already does
-            # both: `os.stat(lock_dir).st_mtime`, then `> staleness` against
-            # `CONFIG_STALENESS_S`. Measured, ~4 lines, and `os.stat` works
-            # fine on a `0o500` dir:
-            #
-            #   LIVE competitor (fresh mtime)  Timeout | age    0.3s TRANSIENT
-            #   ORPHAN + read-only parent      Timeout | age 3600.3s PERMANENT
-            #   LIVE competitor + ro parent    Timeout | age    0.3s TRANSIENT
-            #   CC holder, mtime 4s old        Timeout | age    4.3s TRANSIENT
-            #   no lock dir + ro parent        PermErr | age   None  PERMANENT
-            #
-            # Right on all five shapes. So the refusal cannot rest on "nothing
-            # can tell them apart". It rests on the transient case being too
-            # cheap to be worth the code.
-            #
-            # AND THE OLD "10 LINES" FIGURE MIXED TWO CADENCES. It came from a
-            # tight loop of 10 `heal()` calls back to back, while the permanent
-            # case was priced at the real ~2s statusline cadence (43200
-            # ticks/day) — the comparison ran in the direction that made its
-            # own refusal look weaker. Re-measured, a 3s competitor, both
-            # cadences on the same fixture:
-            #
-            #   tight loop (no sleep)   11 unwire lines, cleared on tick 12
-            #   real ~2s statusline      2 unwire lines, cleared on tick 3
-            #
-            # THE 2 IS A FUNCTION OF THE COMPETITOR'S 3s, not a property of
-            # the transient case: the line count is however many ticks fit
-            # inside the hold. Same 2s cadence, competitor length moved:
-            #
-            #    3s competitor (above)         2 lines, cleared on tick 3
-            #   30s competitor                14 lines, cleared on tick 15
-            #   30s NON-TOUCHING holder        5 lines, cleared on tick 6
-            #
-            # The non-touching row caps at 5 because `CONFIG_STALENESS_S`
-            # (10.0) lets `proper_lockfile` take the lock over, so the
-            # unbounded shape is a LIVE holder that keeps touching — which is
-            # the first two rows, and is what a Claude Code credential
-            # refresh actually is.
-            #
-            # TWO LINES, once, against 43200/day forever. That is what four
-            # lines of mtime arithmetic would buy, and it is not worth it —
-            # 1:21600 at the documented 3s, still ~1:3000 at 30s. The
-            # transient case is self-limiting by construction: the competitor
-            # lets go and the very next free tick unwires the config, while
-            # the orphan is still on line 43200 with nothing changed.
-
+            # The lock dir's mtime age WOULD separate them (`proper_lockfile`
+            # already reads it against `CONFIG_STALENESS_S`), but the transient
+            # case is self-limiting — the competitor lets go and the next free
+            # tick unwires — so it costs ~2 lines once, against a permanent
+            # case that repeats forever. Not worth the arithmetic.
             _logger.warning("%s could not be unwired: %s", path, exc)
             continue
     return changed
@@ -700,8 +530,8 @@ def _safe(exc: object) -> str:
     into a TUI modal, into a MENU LABEL — and the text comes out of an
     optional third-party package the seam does not control. A proxy URL
     carrying ``user:secret@host`` in a message would reach the screen
-    verbatim. No path in this PR builds one; the scrub is here because the
-    seam has no way to promise none ever will.
+    verbatim. No path here builds one; the scrub exists because the seam has
+    no way to promise none ever will.
 
     USERINFO ONLY. This is not general redaction: a bearer token in a header
     dump or a ``password 'x'`` embedded in a package's own message passes
@@ -806,9 +636,9 @@ def _wiring_present(_switcher) -> bool:
         # `/etc/passwd` entry. `heal` survives that today only because this
         # function's own raise happens to land inside `heal`'s bottom `try`
         # — a refactor moving the call above it would reintroduce the
-        # traceback `heal` documents as never happening. Measured with no
-        # HOME: `_wired_ports()` guarded this and returned `[]`;
-        # `_wiring_present` had no such guard and raised.
+        # traceback `heal` documents as never happening. With no HOME,
+        # `_wired_ports()` returns `[]` because it guards; an unguarded
+        # `_wiring_present` raises instead.
         try:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
@@ -871,15 +701,14 @@ def _clear_wiring_locked(switcher, path) -> bool:
 
 # -- the operations, shared by the CLI and the TUI ---------------------------
 #
-# THE VERDICT LIVES HERE, NOT AT EACH CALL SITE. Three review rounds found the
-# same shape: a fix landed on the CLI and its sibling in tui/dashboard.py kept
-# the old behaviour — first the missing clear_wiring, then the discarded
-# apply_pin return, then the rollback and the API-key refusal. Each was a
-# separate bug report for one decision implemented twice.
+# THE VERDICT LIVES HERE, NOT AT EACH CALL SITE. One decision implemented twice
+# diverges: a fix lands on the CLI and its sibling in tui/dashboard.py keeps the
+# old behaviour, and the two front ends disagree without either looking wrong on
+# its own.
 #
-# So these return a (ok, message) the caller only has to render. A fourth
-# divergence now needs someone to write a second copy of the logic rather than
-# to forget a line.
+# So these return a (ok, message) the caller only has to render. A divergence
+# now needs someone to write a second copy of the logic rather than to forget a
+# line.
 
 
 def clear_pin(switcher) -> tuple[bool, str]:
@@ -1001,11 +830,10 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     places that forgot the serving half both tore down a working pin:
 
       * ``heal`` had the guard.
-      * ``wire_launch_env`` did not. Measured: with ``_impl()`` raising for a
-        reason unrelated to the daemon (a broken ``cryptography`` after an
-        unrelated upgrade — precisely the case ``_impl`` re-raises separately),
-        one ``cswap run`` unwired a pin whose port was answering, and every
-        session on the box lost it.
+      * ``wire_launch_env`` did not. With ``_impl()`` raising for a reason
+        unrelated to the daemon (a broken ``cryptography`` — precisely the case
+        ``_impl`` re-raises separately), one ``cswap run`` unwires a pin whose
+        port is answering, and every session on the box loses it.
 
     ``connect_timeout`` exists because the launch path has a sub-second budget
     and a black-holed port would otherwise blow it on the probe alone.
@@ -1030,13 +858,12 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     # either config and pointing at a dead port makes `_wiring_is_stale`
     # True with nothing of cswap's actually wired.
     #
-    # Measured with this line deleted: `_wiring_present=False`,
-    # `_wired_ports=[<dead>]`, `_wiring_is_stale=True`, and `heal()` reports
-    # "Removed a cloud pin wiring…" while the config is byte-for-byte
-    # unchanged — a false removal claim in the machine-readable channel the
-    # status line polls on a timer. `_clear_wiring_locked` itself still
-    # refuses to touch a markerless file, so nothing is ever mutated; the
-    # bug is entirely in the VERDICT this guard exists to keep honest.
+    # Without this line: `_wiring_present=False`, `_wired_ports=[<dead>]`,
+    # `_wiring_is_stale=True`, and `heal()` reports "Removed a cloud pin
+    # wiring…" over a byte-for-byte unchanged config — a false removal claim
+    # in the machine-readable channel the status line polls. Nothing is ever
+    # mutated (`_clear_wiring_locked` refuses a markerless file); the damage
+    # is entirely in the VERDICT this guard keeps honest.
     if not _wiring_present(_switcher):
         return False
     # "I CANNOT TELL" IS NOT "IT IS DEAD". `_wiring_present` keys on the
@@ -1060,11 +887,9 @@ def _wiring_is_stale(_switcher, connect_timeout: float = 2.0) -> bool:
     # wiring at all, and the status line hook inside that child is what calls
     # `heal` on a timer. So the process that heals is normally the one whose
     # own config has no port to name — and a dead port sitting in the OTHER
-    # config must still be reachable. Measured (real path getters, package
-    # uninstalled): own config unwired, ~/.claude.json wired to a dead port —
-    # the per-config read (own config only) was None, so this used to return
-    # False and `heal()` answered "Nothing to heal" over a dead port that
-    # survived.
+    # config must still be reachable. With the own config unwired and
+    # ~/.claude.json wired to a dead port, a per-config read sees None, returns
+    # False, and `heal()` answers "Nothing to heal" over a dead port.
     if not _wired_ports():
         return False
     return not _wired_port_is_serving(_switcher, connect_timeout=connect_timeout)
@@ -1112,15 +937,14 @@ def _wired_ports() -> list[int]:
     ports, seen = [], set()
     for get in (get_global_config_path, get_default_global_config_path):
         # THE GETTER ITSELF CAN RAISE. `get()` is not just "resolve a path and
-        # a set membership test" — a claim this file's own history made once
-        # and measured wrong: `get_default_global_config_path` calls
+        # a set membership test": `get_default_global_config_path` calls
         # `Path.home()`, which raises RuntimeError when HOME is unset and the
         # uid has no /etc/passwd entry (the standard rootless-container
         # shape). `heal`'s docstring promises "never raises" because the
         # status line calls it on a timer, and this function sits on the path
         # from `heal` through `_wired_port_is_serving` with no guard above it
-        # — a raise here reached the status line's caller directly. Measured:
-        # `pin.heal(sw)` raised RuntimeError instead of returning
+        # — an unguarded raise here reaches the status line's caller directly,
+        # so `pin.heal(sw)` raises RuntimeError instead of returning
         # ``(False, 'Could not heal…')``.
         try:
             path = get()
@@ -1158,13 +982,13 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
 
     # EVERY WIRED CONFIG MUST SERVE, not merely one of them.
     #
-    # This used to return True on the first config that answered, and the two
-    # are written asymmetrically: `cswap_pin.wire_global_config` writes only
-    # the session config, while this reads both — the same asymmetry
-    # `clear_wiring` documents as its reason for clearing both. So a live
-    # session config masked a DEAD default config, and a user launching plain
-    # `claude` from a terminal booted against the dead one while `--heal`
-    # answered "Nothing to heal" every tick. Measured:
+    # The two configs are written asymmetrically:
+    # `cswap_pin.wire_global_config` writes only the session config, while this
+    # reads both — the same asymmetry `clear_wiring` documents as its reason
+    # for clearing both. Answering on the FIRST config that serves lets a live
+    # session config mask a DEAD default config, so plain `claude` from a
+    # terminal boots against the dead one while `--heal` says "Nothing to
+    # heal":
     #
     #     session cfg -> 42967 (LIVE)   default cfg -> 39967 (DEAD)
     #     _wired_port_is_serving : True      <- OR over both
@@ -1193,11 +1017,10 @@ def heal(switcher) -> tuple[bool, str]:
     A DEAD PIN MUST NOT TAKE THE SESSION WITH IT. Everything else here reacts
     to a launch, so when the daemon dies while sessions are up nothing brings
     it back — and the stale wiring in ``.claude.json`` is applied at BOOT, so
-    new sessions inherit the dead port too and cannot start either. Measured on
-    this machine: every session on the box showed ``Unable to connect to API
-    (ConnectionRefused) · attempt 6/300`` for hours, while the proxies behind
-    the pin (CCF on 9901, privoxy on 8118) were healthy the whole time. A human
-    had to re-pin by hand.
+    new sessions inherit the dead port too and cannot start either: every
+    session on the box shows ``Unable to connect to API (ConnectionRefused)``
+    while the proxies behind the pin are healthy, and only a hand re-pin
+    clears it.
 
     Two outcomes, in order of preference:
 
@@ -1213,17 +1036,14 @@ def heal(switcher) -> tuple[bool, str]:
     """
     # A SERVING PIN IS NEVER **TORN DOWN**. That is what the guard protects,
     # and the destructive operation is `clear_wiring` at the bottom — not the
-    # restart. This used to return here on `serving`, before `impl.heal()` ran
-    # at all, and that made a whole class of repair unreachable:
+    # restart. Returning here on `serving`, before `impl.heal()` runs, makes a
+    # whole class of repair unreachable:
     #
     #   a daemon SERVING its wired port while running code we no longer ship
     #
-    # is exactly the state an upgrade leaves behind, and it answered "Nothing
-    # to heal" forever. Measured across three machines after installing a new
-    # release: two had daemons serving their own wired port, 24h old, running
-    # the previous version, and every tick declined to touch them. The third
-    # recycled only because its wiring named a DEAD port — the right outcome
-    # for the wrong reason.
+    # is exactly the state an upgrade leaves behind, and it answers "Nothing to
+    # heal" forever. A wiring that names a DEAD port recycles, but that is the
+    # right outcome for the wrong reason.
     #
     # So the restart runs FIRST and the serving check gates only the unwire.
     # `impl.heal` is safe to call in the serving case by construction: it
@@ -1244,13 +1064,10 @@ def heal(switcher) -> tuple[bool, str]:
             #
             # It matters because the package is a PEER on its own release
             # schedule (see _impl): the seam cannot promise what a future
-            # version returns. Measured with an impl that returns True while
-            # binding nothing —
-            #     heal() -> (True, "Restored the cloud pin")
-            #     the wired port actually serving? False
-            # and the status line, which calls this on a timer, would show
-            # healthy while every session still dialled a dead port. That is
-            # the failure this file names as its signature defect.
+            # version returns. An impl that returns True while binding
+            # nothing gives `heal() -> (True, "Restored the cloud pin")` with
+            # the wired port not serving, so the status line shows healthy
+            # while every session dials a dead port.
             if impl.heal(switcher.backup_dir) and _wired_port_is_serving(switcher):
                 return True, "Restored the cloud pin"
         except Exception:  # noqa: BLE001 — fall through to the safe outcome
@@ -1279,9 +1096,9 @@ def heal(switcher) -> tuple[bool, str]:
     # collapsed "there was nothing to remove" into "I could not remove it", and
     # fell through to the healthy verdict for both. The second is reachable and
     # routine: the budget here is 0.5s and Claude Code holds the config lock
-    # during a credential refresh. Measured with the lock held — wiring
-    # present, port dead — `heal` returned (False, "Nothing to heal") over an
-    # outage in progress, and the wiring survived.
+    # during a credential refresh. With the lock held, a wiring present and
+    # the port dead, `heal` answers (False, "Nothing to heal") over an outage
+    # in progress and the wiring survives.
     #
     # That is this file's signature defect, in the channel that matters most:
     # the status line calls `heal` on a timer, so during the exact failure it
@@ -1289,11 +1106,10 @@ def heal(switcher) -> tuple[bool, str]:
     #
     # RE-READ AFTER CLEAR_WIRING, exactly as clear_pin already does — its
     # bool is True when ANY of the two configs changed, not when BOTH did.
-    # Measured with the session config's lock held and the default config
-    # free: clear_wiring cleared the default, returned True for that one
-    # change, and `heal` reported "Removed a cloud pin wiring" while the
-    # session config still named the dead port — every new session from that
-    # terminal kept booting against it.
+    # With the session config's lock held and the default config free,
+    # clear_wiring clears the default and returns True for that one change,
+    # so `heal` reports "Removed a cloud pin wiring" while the session config
+    # still names the dead port.
     #
     # THE SAME QUESTION `_wiring_is_stale` ASKS, not `_wiring_present` alone.
     # `_wiring_present` keys on the marker only, so a config carrying the
@@ -1345,9 +1161,8 @@ def run(switcher, account: str | None, clear: bool = False, heal_only: bool = Fa
         # command whose job is to work when the pin does not.
         # READ THE RECORD OURSELVES, not through the package.
         #
-        # THE SAME clear_pin THE TUI CALLS. This branch used to carry its own
-        # copy of the logic, which is how the API-key refusal ended up in one
-        # front end and not the other for three review rounds. One decision,
+        # THE SAME clear_pin THE TUI CALLS. A second copy of this logic is how
+        # a refusal ends up in one front end and not the other. One decision,
         # one implementation, two renderings.
         ok, msg = clear_pin(switcher)
         if not ok:

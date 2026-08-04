@@ -157,18 +157,14 @@ Examples:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
     except Exception as e:  # noqa: BLE001
-        # A BROKEN PACKAGE ROOT is not a ClaudeSwitchError. `_impl` deliberately
-        # re-raises the underlying ImportError so "installed but unusable" is
-        # not conflated with "not installed" — but nothing between there and
-        # the shell rendered it, so a missing `cryptography` reached the user
-        # as a 6-frame traceback. Measured on work-mac, and this command is the
-        # one that has to stay usable when the pin does not.
-        # THROUGH THE SCRUBBER. `_safe` exists because every failure renderer
-        # here interpolates an exception built by an optional package, and the
-        # proxy's own URL carries `user:secret@`. This renderer was the one
-        # that did not use it, so a message naming the proxy printed the
-        # credential verbatim — measured: `http://svc:s3cr3t@127.0.0.1:9901/…`
-        # reached the screen, where `_safe` yields `http://***@127.0.0.1:9901/…`.
+        # A broken package root is not a ClaudeSwitchError: `_impl` re-raises
+        # the underlying ImportError so "installed but unusable" stays distinct
+        # from "not installed". Unrendered it reaches the user as a traceback,
+        # and this command has to stay usable when the pin does not.
+        #
+        # THROUGH `_safe`: the exception is built by an optional package and
+        # the proxy's own URL carries `user:secret@`, which would otherwise
+        # print verbatim (`_safe` yields `http://***@127.0.0.1:9901/…`).
         from claude_swap.pin import _safe
 
         error(f"Error: the cloud pin is installed but not usable: {_safe(e)}")
