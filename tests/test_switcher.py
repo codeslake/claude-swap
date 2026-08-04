@@ -10513,66 +10513,135 @@ class TestGateUltraReviewFixes:
                 "return credentials the slot does not hold"
             )
 
-    def test_a_failed_session_invalidation_never_unwinds_a_stored_credential(
-        self, tmp_path
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    @pytest.mark.parametrize(
+        "denied", [None, "session_dir", "session_dir_and_parent"]
+    )
+    def test_a_denied_session_dir_still_leaves_the_stale_marker(
+        self, temp_home: Path, sample_sequence_data: dict, denied: str | None,
+        caplog,
     ):
-        """`_write_account_credentials` is two steps: the store write ADVANCES
-        the slot, then session invalidation runs and can raise (EACCES on the
-        session dir, a read-only mount). A raise escaping the wrapper is read
-        by every caller as "the persist failed" for a slot that HOLDS the new
-        credential — so the post-POST arm stashes a row byte-identical to the
-        slot's live credential and demotes a successful refresh to `transient`,
-        and `cswap run` prints "Could not refresh the token" for a refresh that
-        worked.
+        """C-1: the fallback must not write into the directory whose EACCES
+        caused the raise.
 
-        The invalidation is housekeeping: its job is to stop a session profile
-        serving a superseded token, and `mark_session_stale` already exists for
-        the case where the profile cannot be touched now. Losing it costs a
-        re-bootstrap; losing the write's RETURN costs a live credential.
+        `_write_account_credentials` is two steps: the store write ADVANCES
+        the slot, then `_post_backup_write` invalidates the slot's session
+        profile and can fail on exactly the faults the wrapper's docstring
+        names — EACCES on the session dir, a read-only mount. A raise escaping
+        the wrapper is read by every caller as "the persist failed" for a slot
+        that HOLDS the new credential, so the write is contained and the
+        STALE_MARKER is what forces the re-bootstrap instead.
 
-        Parametrized against the succeeding control so the row that matters
-        cannot pass alone.
+        But the marker was a CHILD of the session dir, so the very fault that
+        denied the unlink also denied the marker's create, and
+        `mark_session_stale` swallows the OSError. `_is_session_valid` is a
+        LOCAL check (its own docstring), so a revoked-but-unexpired token
+        still passes it: without the marker `setup_session` returns early and
+        launches claude on the spent generation, with nothing recording it.
+
+        A REAL kernel fault (`chmod 0500`), not an injected raise — the
+        coupling between the failing unlink and the fallback's write target
+        IS the defect, and an injected raise cannot see it.
+
+        `denied=None` is the CONTROL: on a healthy dir the invalidation really
+        happens (old `.credentials.json` gone) and no marker is needed.
+
+        `session_dir_and_parent` is the CEILING of any marker location: the
+        whole `<backup>/sessions/` root is read-only, so the sibling cannot
+        land either (that is the docstring's "read-only mount"). No path fixes
+        the launch there, so what is required is that it is not SILENT — an
+        ERROR naming the account, never a warning implying the fallback worked.
         """
-        from claude_swap.session import STALE_MARKER
+        import logging
 
-        for invalidation_raises in (False, True):
-            sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
-            wrote = {}
-            sw._store = type("S", (), {
-                "_write_account_credentials":
-                    lambda self, n, e, c: wrote.__setitem__("creds", c),
-            })()
-            sess = tmp_path / f"sess-{invalidation_raises}"
-            sess.mkdir()
-            sw._session_dir = lambda n, e: sess
-            sw._live_session_pids = lambda n, e: []
+        from claude_swap.session import is_session_stale
 
-            def _invalidate(n, e, _raise=invalidation_raises):
-                if _raise:
-                    raise PermissionError(13, "Permission denied")
-                wrote["invalidated"] = True
+        s = self._switcher(sample_sequence_data)
+        sess = s._session_dir("1", "test@example.com")
+        sess.mkdir(parents=True, exist_ok=True)
+        (sess / ".credentials.json").write_text(self._OLD)
 
-            sw._invalidate_session_credentials = _invalidate
-            sw._logger = type("L", (), {"info": lambda *a, **k: None,
-                                        "warning": lambda *a, **k: None})()
+        chmodded = []
+        if denied in ("session_dir", "session_dir_and_parent"):
+            chmodded.append(sess)
+        if denied == "session_dir_and_parent":
+            chmodded.append(sess.parent)
+        caplog.clear()
+        try:
+            for d in chmodded:
+                d.chmod(0o500)
+            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+                s._write_account_credentials("1", "test@example.com", self._NEW)
+        finally:
+            for d in reversed(chmodded):
+                d.chmod(0o700)
 
-            sw._write_account_credentials("2", "a@b.c", "NEW-GENERATION")
-
-            assert wrote.get("creds") == "NEW-GENERATION", (
-                f"the store write did not happen "
-                f"(invalidation_raises={invalidation_raises})"
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW, (
+            "premise: the store write ADVANCED the slot"
+        )
+        if denied is None:
+            assert not (sess / ".credentials.json").exists(), (
+                "CONTROL: the invalidation really ran on a healthy dir"
             )
-            if invalidation_raises:
-                # The profile could not be invalidated now, so it must be
-                # MARKED — otherwise a profile whose access token is still
-                # unexpired keeps serving a spent refresh token and nothing
-                # forces the re-bootstrap.
-                assert (sess / STALE_MARKER).exists(), (
-                    "a swallowed invalidation left no stale marker: the "
-                    "profile will keep serving the superseded generation"
-                )
-            else:
-                assert wrote.get("invalidated"), "CONTROL: invalidation skipped"
+            assert not is_session_stale(sess), (
+                "CONTROL: nothing failed, so nothing to mark"
+            )
+            return
+
+        assert (sess / ".credentials.json").exists(), (
+            f"premise ({denied}): the unlink was denied, so the profile "
+            "still holds the superseded credential"
+        )
+        if denied == "session_dir":
+            assert is_session_stale(sess), (
+                "DEFECT: the invalidation was denied and NO stale marker "
+                "landed — the marker's own write target was the directory "
+                "that denied it. The profile's token is unexpired, so the "
+                "local reuse check passes and `cswap run` launches claude on "
+                "the spent generation, silently"
+            )
+        else:
+            # Ceiling: nothing under a read-only `sessions/` can be written.
+            assert not is_session_stale(sess), (
+                "premise: the whole sessions root is denied, so no marker "
+                "location under it can land"
+            )
+            assert any(
+                r.levelno >= logging.ERROR and "1" in r.getMessage()
+                for r in caplog.records
+            ), (
+                "DEFECT: the profile keeps serving the superseded generation "
+                "and nothing says so above WARNING — the fallback did not "
+                "work, so a warning claiming it did is worse than silence"
+            )
+
+    def test_the_suites_real_store_guard_is_not_absorbed_by_the_wrapper(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """I-1: the containment must be `except OSError`, not `except Exception`.
+
+        `tests/conftest.py`'s `RealStoreWriteBlocked` is deliberately NOT an
+        `OSError` subclass (its own docstring) precisely so that no
+        `except OSError` in this codebase can hide a real-store refusal. An
+        `except Exception` on the credential-persist path catches it and
+        disarms the guard for every write that routes through here.
+
+        The wrapper's whole documented fault list is EACCES on the session dir
+        and a read-only mount — both `OSError`. Nothing else belongs in it.
+        """
+        from tests import conftest
+
+        s = self._switcher(sample_sequence_data)
+
+        def blocked(*a, **kw):
+            raise conftest.RealStoreWriteBlocked("refused: the REAL store")
+
+        with patch.object(type(s), "_post_backup_write", blocked):
+            with pytest.raises(conftest.RealStoreWriteBlocked):
+                s._write_account_credentials("1", "test@example.com", self._NEW)
 
     @pytest.mark.parametrize("row_a_readable", [True, False])
     def test_an_unreadable_non_matching_row_does_not_abort_the_scan(

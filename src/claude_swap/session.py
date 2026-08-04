@@ -112,12 +112,56 @@ MCP_MIRROR_MARKER = ".cswap-mcp-mirror-v1"
 MCP_DISPLACED_STASH = ".cswap-mcp-displaced.json"
 
 
-def mark_session_stale(session_dir: Path) -> None:
-    """Flag a live session profile for re-bootstrap once it exits."""
+def stale_marker_for(session_dir: Path) -> Path:
+    """Where a profile's stale marker is WRITTEN: a SIBLING of the profile dir.
+
+    Not a child. One of the two writers is the fallback for a session-dir
+    invalidation that just failed, and the faults it exists for — EACCES on
+    the session dir, a read-only mount — are faults on that same directory.
+    A child marker therefore asks the very directory that denied the unlink
+    to accept a create; it refuses, ``mark_session_stale`` swallows the
+    OSError, and the profile goes on serving a superseded token with nothing
+    recording it. The parent (``<backup>/sessions/``) is ours and is not what
+    a per-profile EACCES denied.
+
+    Sibling of the DIR, so ``purge``'s ``iterdir()`` (dirs only) and
+    ``_delete_session_profile``'s ``rmtree`` both still see what they expect.
+    """
+    return session_dir.parent / f".{session_dir.name}{STALE_MARKER}"
+
+
+def is_session_stale(session_dir: Path) -> bool:
+    """Whether a profile is flagged for re-bootstrap.
+
+    Both locations: the child path is where the marker used to live, and a
+    profile marked by an older cswap on this machine has a pending
+    re-bootstrap that the move must not drop. Read, never written.
+    """
+    return (
+        stale_marker_for(session_dir).exists()
+        or (session_dir / STALE_MARKER).exists()
+    )
+
+
+def clear_session_stale(session_dir: Path) -> None:
+    """Drop a profile's stale flag from both marker locations."""
+    stale_marker_for(session_dir).unlink(missing_ok=True)
+    (session_dir / STALE_MARKER).unlink(missing_ok=True)
+
+
+def mark_session_stale(session_dir: Path) -> bool:
+    """Flag a live session profile for re-bootstrap once it exits.
+
+    Returns whether the marker landed. It can still fail — a read-only mount
+    denies the sibling as surely as the child — and the caller that reaches
+    here BECAUSE an invalidation failed has no other record of it, so the
+    answer is reported rather than swallowed.
+    """
     try:
-        (session_dir / STALE_MARKER).touch()
+        stale_marker_for(session_dir).touch()
+        return True
     except OSError:
-        pass  # best-effort; worst case the old reuse behavior applies
+        return False
 
 # Env vars that make claude bypass account OAuth entirely (verified against
 # claude 2.1.175). Dropped from the auth-status probe (they'd fake "logged in"
@@ -507,7 +551,7 @@ class SessionManager:
         # pass the local reuse check. Honored only when no session is live —
         # a second `cswap run` joining a live session must not invalidate
         # under the running claude (the marker survives for later).
-        stale = (session_dir / STALE_MARKER).exists() and not live_sessions_for(
+        stale = is_session_stale(session_dir) and not live_sessions_for(
             session_dir
         )
 
@@ -547,11 +591,11 @@ class SessionManager:
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
-            if (session_dir / STALE_MARKER).exists() and not live_sessions_for(
+            if is_session_stale(session_dir) and not live_sessions_for(
                 session_dir
             ):
                 self.switcher._invalidate_session_credentials(account_num, email)
-                (session_dir / STALE_MARKER).unlink(missing_ok=True)
+                clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid):
                 # Valid, but possibly not on the generation WE just paid for.
                 # The consume above runs outside this lock (it POSTs), so a
@@ -699,9 +743,11 @@ class SessionManager:
 
     def _cleanup_failed_session(self, session_dir: Path) -> None:
         # Keychain first: claude may have partially migrated the seed, and the
-        # hashed service name can't be recomputed once the dir is gone.
+        # hashed service name can't be recomputed once the dir is gone. The
+        # stale marker is a sibling, so rmtree does not take it.
         delete_macos_keychain_entry(session_dir)
         shutil.rmtree(session_dir, ignore_errors=True)
+        clear_session_stale(session_dir)
 
     # -- validation ------------------------------------------------------
 

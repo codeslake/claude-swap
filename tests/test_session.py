@@ -177,6 +177,14 @@ def make_live(session_dir: Path, pid: int | None = None) -> None:
     (pid_dir / f"{pid}.json").write_text(json.dumps({"pid": pid}))
 
 
+def _mark_stale(session_dir: Path, legacy_location: bool = False) -> None:
+    """Plant a stale marker, in the current (sibling) or pre-move (child) spot."""
+    if legacy_location:
+        (session_dir / session_mod.STALE_MARKER).touch()
+    else:
+        session_mod.mark_session_stale(session_dir)
+
+
 # ---------------------------------------------------------------------------
 # pure helpers
 # ---------------------------------------------------------------------------
@@ -454,37 +462,47 @@ class TestBootstrap:
 
         assert block_real_keychain.get_password(service, account) is None
 
+    @pytest.mark.parametrize("legacy_location", [False, True])
     def test_stale_marker_forces_rebootstrap_after_session_exits(
-        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        legacy_location: bool,
     ):
         """Backup creds updated while the session was live → after it exits,
         the next run must re-bootstrap from the fresh backup even though the
-        stale profile would still pass the local reuse check."""
+        stale profile would still pass the local reuse check.
+
+        `legacy_location=True` is the upgrade path: the marker moved to a
+        SIBLING of the profile dir (a child could not be written by the fault
+        that motivates it), and a profile marked by an older cswap on this
+        machine has a pending re-bootstrap that the move must not drop.
+        """
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / ".credentials.json").write_text("stale lineage")
-        (session_dir / session_mod.STALE_MARKER).touch()
+        _mark_stale(session_dir, legacy_location)
         # No live PID files → the session has exited.
 
         manager.setup_session("2", share=False)
 
         # Re-bootstrapped: fresh (refreshed) creds, marker cleared.
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
-        assert not (session_dir / session_mod.STALE_MARKER).exists()
+        assert not session_mod.is_session_stale(session_dir)
 
+    @pytest.mark.parametrize("legacy_location", [False, True])
     def test_stale_marker_preserved_while_session_still_live(
-        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        legacy_location: bool,
     ):
         """A second `cswap run` joining a live session must not invalidate
         under the running claude; the marker survives for later."""
         session_dir, _, _ = manager.setup_session("2", share=False)
         (session_dir / ".credentials.json").write_text("live lineage")
-        (session_dir / session_mod.STALE_MARKER).touch()
+        _mark_stale(session_dir, legacy_location)
         make_live(session_dir)
 
         manager.setup_session("2", share=False)
 
         assert (session_dir / ".credentials.json").read_text() == "live lineage"
-        assert (session_dir / session_mod.STALE_MARKER).exists()
+        assert session_mod.is_session_stale(session_dir)
 
     def test_rebootstrap_preserves_profile_history(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
@@ -1357,6 +1375,28 @@ class TestGuards:
         assert (session_dir / ".claude.json").exists()  # history preserved
         assert block_real_keychain.get_password(service, account) is None
 
+    def test_deleting_a_profile_takes_its_stale_marker_with_it(
+        self, seeded_switcher
+    ):
+        """The marker is a SIBLING of the profile dir, so `rmtree` no longer
+        removes it. A leftover marker outlives the profile it described, and
+        the next profile created for that same slot+email inherits a
+        re-bootstrap flag that nothing set for it."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        session_mod.mark_session_stale(session_dir)
+        assert session_mod.is_session_stale(session_dir), "premise: marked"
+
+        seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
+
+        assert not session_dir.exists(), "premise: the profile is gone"
+        assert not session_mod.is_session_stale(session_dir), (
+            "the marker outlived the profile: a freshly created profile for "
+            "this slot inherits a stale flag nothing set for it"
+        )
+
     def test_backup_credential_write_leaves_live_profile_alone_but_marks_stale(
         self, seeded_switcher
     ):
@@ -1372,7 +1412,7 @@ class TestGuards:
 
         # Live copy untouched, but flagged for re-bootstrap after exit.
         assert (session_dir / ".credentials.json").read_text() == "live session creds"
-        assert (session_dir / session_mod.STALE_MARKER).exists()
+        assert session_mod.is_session_stale(session_dir)
 
     def test_list_skips_refresh_for_live_session_accounts(
         self, seeded_switcher, monkeypatch

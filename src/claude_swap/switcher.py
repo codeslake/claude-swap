@@ -825,19 +825,38 @@ class ClaudeAccountSwitcher:
         invalidation would let it keep serving a superseded generation until it
         expires. ``STALE_MARKER`` is what forces the re-bootstrap regardless,
         and it is the same mechanism the live-session branch already relies on.
+
+        ``OSError``, not ``Exception``. EACCES on the session dir and a
+        read-only mount is the whole fault list above, and both are
+        ``OSError``; the suite's own real-store guard is deliberately NOT an
+        ``OSError`` subclass (``tests/conftest.py``) so that no containment in
+        this codebase can hide a write into the REAL store. Widening this to
+        ``Exception`` disarmed exactly that guard for every write routing
+        through here.
         """
         self._store._write_account_credentials(account_num, email, credentials)
         try:
             self._post_backup_write(account_num, email)
-        except Exception:  # noqa: BLE001 — see the docstring: never past the write
+        except OSError:
             from claude_swap.session import mark_session_stale
 
-            mark_session_stale(self._session_dir(account_num, email))
-            self._logger.warning(
-                "Stored account %s's credential but could not invalidate its "
-                "session profile; marked it stale so the next run "
-                "re-bootstraps.", account_num, exc_info=True,
-            )
+            if mark_session_stale(self._session_dir(account_num, email)):
+                self._logger.warning(
+                    "Stored account %s's credential but could not invalidate "
+                    "its session profile; marked it stale so the next run "
+                    "re-bootstraps.", account_num, exc_info=True,
+                )
+            else:
+                # Nothing recorded the superseded profile: the marker is what
+                # forces the re-bootstrap, and the local reuse check cannot
+                # see a revoked-but-unexpired token. Say so at ERROR rather
+                # than let a silent warning imply the fallback worked.
+                self._logger.error(
+                    "Stored account %s's credential but could NOT invalidate "
+                    "its session profile OR mark it stale; the profile may "
+                    "keep serving the superseded generation until its token "
+                    "expires.", account_num, exc_info=True,
+                )
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
@@ -2058,7 +2077,7 @@ class ClaudeAccountSwitcher:
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
-            STALE_MARKER,
+            is_session_stale,
             read_session_credentials,
             session_dir_for,
             session_identity_drifted,
@@ -2131,7 +2150,7 @@ class ClaudeAccountSwitcher:
                         # (backup changed under the live session — e.g. a
                         # deliberate re-add/import): never let it supersede
                         # the backup it is presumed stale against.
-                        and not (sdir / STALE_MARKER).exists()
+                        and not is_session_stale(sdir)
                         and not session_identity_drifted(sdir, email, org_uuid)
                     ):
                         prof_oauth = oauth.extract_oauth_data(profile)
@@ -2174,12 +2193,20 @@ class ClaudeAccountSwitcher:
             # "Nothing consumed" is about the POST, NOT about the store. The
             # resync and the adoption both WRITE before this point, and an
             # earlier version of this comment claimed they raise first; they
-            # do not. A raise arriving here after a completed adoption would
-            # report a failure for a slot that is already freshened, and the
-            # caller would re-POST the generation that adoption superseded.
-            # `_adopt_stashed_successor` closes that by making everything
-            # after its store write non-fatal, so this handler is only ever
-            # reached with the slot genuinely unadvanced.
+            # do not.
+            #
+            # So this handler IS reachable with the slot already advanced:
+            # `_adopt_stashed_successor` makes everything past its own store
+            # write non-fatal, but the adopt is not the last thing in this
+            # `try` — `_get_sequence_data` reads with `strict=True` and comes
+            # AFTER it, so a torn `sequence.json` raises to here over a slot
+            # that adoption already freshened.
+            #
+            # `transient` is still the right answer there, and for the reason
+            # the first line gives rather than an unadvanced slot: no grant of
+            # ours is outstanding, so deferring costs a pass and spends
+            # nothing. The cost of the advanced case is only that the next
+            # pass re-reads a slot that is already fresh.
             self._logger.warning(
                 "Pre-consume window failed for account %s; deferring.",
                 account_num, exc_info=True,
@@ -2634,14 +2661,17 @@ class ClaudeAccountSwitcher:
         projects/history survive. Used when backup credentials change under
         an existing profile (e.g. --import --force).
         """
-        from claude_swap.session import STALE_MARKER, delete_macos_keychain_entry
+        from claude_swap.session import (
+            clear_session_stale,
+            delete_macos_keychain_entry,
+        )
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
-        (session_dir / STALE_MARKER).unlink(missing_ok=True)
+        clear_session_stale(session_dir)
         self._logger.info(
             f"Invalidated session credentials for account {account_num}"
         )
@@ -2651,14 +2681,22 @@ class ClaudeAccountSwitcher:
 
         Keychain first: the hashed service name is derived from the dir path
         and can't be recomputed once the dir is gone.
+
+        The stale marker is a SIBLING of the dir, so ``rmtree`` does not take
+        it: clear it explicitly, or the next profile created for this same
+        slot+email inherits a re-bootstrap flag nothing set for it.
         """
-        from claude_swap.session import delete_macos_keychain_entry
+        from claude_swap.session import (
+            clear_session_stale,
+            delete_macos_keychain_entry,
+        )
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
         delete_macos_keychain_entry(session_dir)
         shutil.rmtree(session_dir, ignore_errors=True)
+        clear_session_stale(session_dir)
         self._logger.info(
             f"Removed session profile for account {account_num} at {session_dir}"
         )
