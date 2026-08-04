@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 # src layout: ensure subprocess can find claude_swap
@@ -1265,7 +1266,8 @@ class TestAliasCommand:
     def test_add_with_alias_flag(self, temp_home, mock_claude_config, capsys):
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
         with patch("os.geteuid", return_value=1000, create=True), \
-             patch.object(ClaudeAccountSwitcher, "_read_credentials", return_value=fake_creds), \
+             patch.object(ClaudeAccountSwitcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
              patch.object(ClaudeAccountSwitcher, "_write_account_credentials"), \
              patch.object(sys, "argv", ["claude-swap", "add", "--alias", "dev"]):
             cli.main()
