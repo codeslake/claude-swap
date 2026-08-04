@@ -14,6 +14,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,8 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
+from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
+from claude_swap import pin
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -74,10 +77,13 @@ class AutoScreen(Screen):
 
     app: "CswapApp"
 
-    def __init__(self) -> None:
+    def __init__(self, *, start_live: bool = False) -> None:
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
+        # Consent already given: `cswap tui --auto` or a persisted
+        # autoStartLive — the engine starts LIVE without the modal.
+        self._start_live = start_live
         # Session-only threshold adjustment (t, then arrows). Never written
         # to settings.json — same memory-only precedent as the dry-run
         # toggle. ``_configured_threshold`` is the mount-time file value the
@@ -86,6 +92,24 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Whether the CURRENT engine's dry_run was True the last time this
+        # screen observed it — seeded by `_start_engine` from the engine's
+        # actual starting state. Lets the self-promotion persist (below) key
+        # on a TRANSITION rather than the steady-state fact `not
+        # engine.dry_run`, which also holds for an engine that started LIVE
+        # from `--auto` with nobody confirming anything (MAJOR-3).
+        self._engine_was_dry_run = True
+        # I1: whether a HUMAN confirmed the modal for the current engine's
+        # live-attempt, on THIS launch. `_engine_was_dry_run` alone is not
+        # enough — a CONTENDED `cswap tui --auto` also starts its engine
+        # dry_run=True (demoted), which makes its later self-promotion look
+        # exactly like the confirmed-then-demoted-then-promoted case
+        # `_engine_was_dry_run` was built to allow, even though `--auto`
+        # never showed the modal at all. Only `_on_live_confirm`'s confirmed
+        # branch sets this True; mount (`--auto` / a resumed
+        # `autoStartLive`) never does, so a contended `--auto` engine's
+        # later self-promotion cannot pass the self-promotion persist below.
+        self._live_confirmed_this_launch = False
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -111,7 +135,12 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        # Prior consent (constructor flag from --auto / app-launch resume,
+        # or the persisted setting when entered from the menu) starts LIVE
+        # without re-asking; otherwise the safe default, dry-run.
+        self._start_engine(
+            dry_run=not (self._start_live or self._settings.auto_start_live)
+        )
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -214,6 +243,16 @@ class AutoScreen(Screen):
             dry_run=dry_run,
         )
         self._engine = engine
+        # A LIVE request the engine could not honor: another LIVE engine holds
+        # the machine's lock. Report what actually started, not what was asked
+        # for — the badge reads engine.dry_run, so it is already right.
+        dry_run = engine.dry_run
+        # Seed the transition tracker from the engine's ACTUAL starting
+        # state (see `_on_engine_event`): an engine that starts LIVE here —
+        # `--auto` or a resumed `autoStartLive` — was never dry-run under
+        # this screen, so it can never look "promoted" and must not fire
+        # the self-promotion persist below.
+        self._engine_was_dry_run = dry_run
         self.run_worker(
             engine.run_loop,
             thread=True,
@@ -244,6 +283,42 @@ class AutoScreen(Screen):
             return
         palette = Palette.from_theme(self.app.current_theme)
         self.query_one("#event-log", RichLog).write(event_text(event, palette=palette))
+        # The engine can PROMOTE itself mid-run: a demotion is a contention
+        # answer, and the holder eventually exits. Nothing else re-reads
+        # `dry_run` after mount, so the badge would keep saying DRY-RUN over a
+        # live engine — worse than the stuck-dry-run it fixes, because now the
+        # display disagrees with what is actually switching accounts.
+        self._update_badge()
+        # AND THE CONSENT WITH THE BADGE. `_persist_auto_start_live` was only
+        # reachable from the two toggle paths, so a self-promotion flipped the
+        # badge to ` LIVE ` and wrote nothing: restart, and the TUI comes back
+        # dry-run contradicting what the user last saw. Mirror of the demotion
+        # bug — the refusal correctly records nothing, and so did the later
+        # grant.
+        #
+        # Keyed on a TRANSITION (this screen watched the engine go from
+        # dry-run to LIVE), not on the steady-state fact `not engine.dry_run`
+        # — that fact is ALSO true for an engine that started LIVE from
+        # `--auto` or a resumed `autoStartLive`, where nobody confirmed
+        # anything on this launch (MAJOR-3: one `cswap tui --auto` was
+        # writing permanent go-live consent on its very first poll event).
+        # Not on the event kind either: a `config-warning` check here would
+        # be a per-kind opt-in the next event is not on. One-directional on
+        # purpose — `autoStartLive` is one shared setting, so writing False
+        # from a dry-run engine would revoke the LIVE holder's consent,
+        # which is exactly the demotion bug.
+        engine = self._engine
+        was_dry_run = self._engine_was_dry_run
+        if engine is not None:
+            self._engine_was_dry_run = engine.dry_run
+        if (
+            engine is not None
+            and was_dry_run
+            and not engine.dry_run
+            and not self._settings.auto_start_live
+            and self._live_confirmed_this_launch
+        ):
+            self._persist_auto_start_live(True)
         if event.kind == "switch":
             self.app.request_refresh()
 
@@ -262,11 +337,42 @@ class AutoScreen(Screen):
                 self._on_live_confirm,
             )
         else:
+            self._persist_auto_start_live(False)
             self._restart_engine(dry_run=True)
 
     def _on_live_confirm(self, confirmed: bool | None) -> None:
         if confirmed:
+            # A HUMAN just confirmed the modal for THIS engine's live
+            # attempt — the one fact `_on_engine_event`'s self-promotion
+            # persist needs and a contended `--auto` launch never has (I1).
+            self._live_confirmed_this_launch = True
+            # Persist AFTER the engine reports what it actually became: a
+            # demotion (another LIVE holder) would otherwise record consent
+            # for a LIVE that never ran, and every later launch would
+            # auto-enter a "LIVE" the user never got.
+            #
+            # A DEMOTION writes nothing: `autoStartLive` is one shared setting,
+            # so `false` here revokes the LIVE holder's consent rather than
+            # declining to record ours. The demotion is about the lock.
             self._restart_engine(dry_run=False)
+            engine = self._engine
+            if engine is not None and getattr(engine, "demoted_from_live", False):
+                return
+            self._persist_auto_start_live(
+                engine is not None and not engine.dry_run
+            )
+
+    def _persist_auto_start_live(self, live: bool) -> None:
+        """Remember the confirmed mode so a restarted TUI resumes it."""
+        from claude_swap.settings import set_setting
+        try:
+            set_setting(
+                self.app.switcher.backup_dir,
+                "autoswitch.autoStartLive", "true" if live else "false",
+            )
+            self._settings = replace(self._settings, auto_start_live=live)
+        except Exception:
+            pass  # a failed persist must never block the toggle itself
 
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
@@ -301,8 +407,32 @@ class AutoScreen(Screen):
         models = parse_model_names(self._settings.model) if self._settings else ()
         ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
         lines: dict[str, Text] = {}
+        # The badge rides on that account's own row rather than the summary
+        # line: naming the pin separately makes you match an email against the
+        # list directly below it instead of just reading the list.
+        pinned_email = pin.pinned_email(self.app.switcher)
         for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
+            if acc.number == active_number:
+                continue
+            # A slot with no stored login is still a place you can GO — that
+            # is now how you fill one. It used to be dropped from this list
+            # entirely, so a machine with the roster but not the credentials
+            # showed two accounts here and five in the engine's own log. A row
+            # that says why it cannot be picked beats a row that isn't there.
+            if not acc.switchable:
+                entry = Text()
+                entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
+                entry.append(acc.email, style=palette.muted)
+                # From SENTINEL_NOTES, not written here: an API-key slot has no
+                # login to restore, and the switch screen reads the same table,
+                # so both surfaces must describe a slot identically.
+                note = data.sentinel_label(
+                    USAGE_API_KEY if acc.kind == "api_key"
+                    else USAGE_NO_CREDENTIALS
+                )
+                entry.append(f"  {note}", style=palette.sev_warn)
+                lines[acc.number] = entry
+                ranked.append((1000.0, acc.number))   # last: never a target
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
@@ -317,14 +447,39 @@ class AutoScreen(Screen):
                 entry.append("  usage unknown", style=palette.muted)
                 ranked.append((999.0, acc.number))
             else:
-                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # Per-window chips, from the same helper the dashboard uses
+                # (data.window_chip_label) so one account cannot read two ways.
+                now = time.time()
+                chips = [
+                    (key, label, data.window_pct(acc.usage.last_good, key))
+                    for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
+                ]
+                chips = [c for c in chips if c[2] is not None]
+                for i, (key, label, wpct) in enumerate(chips):
+                    entry.append("  " if i == 0 else " · ", style=palette.muted)
+                    entry.append(
+                        data.window_chip_label(acc.usage.last_good, key, label, now),
+                        style=palette.muted,
+                    )
+                    entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
+                if not chips:  # no window data at all — keep the old reading
+                    entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 ranked.append((pct, acc.number))
+            # Outside the usage branches on purpose: an account whose usage is
+            # unknown still owns the claude.ai side, so the badge must not hang
+            # off whichever branch happened to run.
+            if pinned_email and acc.email == pinned_email:
+                entry.append("  · ", style=palette.muted)
+                entry.append("○ cloud", style=f"bold {palette.sev_warn}")
             lines[acc.number] = entry
 
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
-            text.append("\n  no other switchable accounts", style=palette.muted)
+            # Reached only when this is the sole account. Slots that cannot be
+            # switched to are listed above with the reason, so "no other
+            # accounts" is now literal rather than a filter's side effect.
+            text.append("\n  no other accounts", style=palette.muted)
             return text
         for _pct, number in sorted(ranked):
             text.append(lines[number])

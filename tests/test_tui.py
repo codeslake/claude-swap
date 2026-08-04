@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap.autoswitch import NoSwitchEvent, SwitchEvent
+from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEvent
 from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -304,7 +304,7 @@ class TestFormatting:
         # active account, not that the user must re-login.
         assert (
             tui_data.sentinel_label(USAGE_TOKEN_EXPIRED)
-            == "token expired — refresh deferred this pass; retries automatically"
+            == "token expired — auto-refreshing on the next pass (≤1m); no action needed"
         )
         from claude_swap.switcher import SENTINEL_NOTES
 
@@ -325,7 +325,7 @@ class TestFormatting:
             age_s=720.0,
         )
         card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
-        assert "token expired — refresh deferred this pass; retries automatically" in card
+        assert "token expired — auto-refreshing on the next pass (≤1m); no action needed" in card
         assert "last seen 53% used" in card
 
         no_history = account_card_text(
@@ -662,6 +662,42 @@ class TestMiniAccountText:
         acc = make_account(1, entry=entry)
         assert "pace" not in mini_account_text(acc, now).plain
 
+    def test_window_reads_the_same_as_the_auto_views_chip(self):
+        """One account must not read two ways on two screens.
+
+        The dashboard rendered `5h 100% (resets 2h 28m)` while the auto view
+        rendered `5h(⟳2h28m):100%` for the same window in the same second.
+        Both now come from data.window_chip_label, so a change to one surface
+        cannot silently diverge from the other.
+        """
+        from claude_swap.tui import data
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        # +1s so the truncating duration format cannot land on 2h27m when the
+        # render happens a hair after _iso_in computed the deadline.
+        last_good = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_in(3600 * 2 + 1680 + 1)}
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        chip = data.window_chip_label(last_good, "five_hour", "5h", now)
+        assert chip == "5h(⟳2h28m):"
+        assert f"{chip}100%" in mini_account_text(acc, now).plain
+
+    def test_countdown_shows_below_100_too(self):
+        """A window's worth IS when it comes back, which is exactly what you
+        compare while picking an account — so it is not hidden until 100%."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 42.0, "resets_at": _iso_in(3600 + 1)}}
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
@@ -784,7 +820,11 @@ class TestDashboard:
 
             panel = app.screen.query_one(AccountsPanel).render().plain
             mini_part = panel.split("user2@example.com", 1)[1]
-            assert "5h 92%" in mini_part
+            # The window reads as one chip now — "5h(⟳1h59m):92%" — built by
+            # the same helper the auto view uses. Assert the parts that carry
+            # the meaning (which window, what pct), not the spacing between
+            # them, so the two surfaces can keep sharing one format.
+            assert "5h(" in mini_part and ":92%" in mini_part
             assert "7d" not in mini_part
 
     async def test_menu_is_default_navigation_and_nests(self, tmp_path):
@@ -804,6 +844,8 @@ class TestDashboard:
                 "auto",
                 "add-menu",
                 "disable-menu",
+                # No "pin-menu": the cloud pin row appears only when the
+                # optional extra is installed, which it is not in CI.
                 "remove-menu",
                 "theme-menu",
                 "quit",
@@ -1324,12 +1366,126 @@ def fake_engine(monkeypatch):
     return _FakeEngine
 
 
+class _ContendedFakeEngine:
+    """Stands in for AutoSwitchEngine, but ALWAYS starts demoted regardless
+    of the requested ``dry_run`` -- simulating a second engine that lost the
+    LIVE lock to a holder already running. ``promote()`` then simulates
+    ``_retry_live_promotion`` succeeding once the holder exits: flips
+    ``dry_run``/``demoted_from_live`` and emits the same event kind
+    (``config-warning``) the real method does, with NO further human action
+    -- exactly what I1 is about.
+    """
+
+    instances: list["_ContendedFakeEngine"] = []
+
+    def __init__(self, switcher, settings, on_event, *, dry_run=False, **kwargs):
+        self.settings = settings
+        self.on_event = on_event
+        self.dry_run = True                 # always demoted on construction
+        self.demoted_from_live = True
+        self.stopped = False
+        self._stop = threading.Event()
+        self._promote_requested = threading.Event()
+        _ContendedFakeEngine.instances.append(self)
+
+    def run_loop(self) -> int:
+        # `on_event` -- like the real engine's -- must run from THIS worker
+        # thread: `_emit_from_thread` reaches it via Textual's
+        # `call_from_thread`, which raises RuntimeError (silently swallowed)
+        # when called from the app's own thread. `promote()` merely flags
+        # the request from the test's thread; the actual emit happens here,
+        # matching where the real `_retry_live_promotion` runs.
+        self.on_event(NoSwitchEvent(reason="cooldown"))
+        while not self._stop.is_set():
+            if self._promote_requested.wait(0.05):
+                self._promote_requested.clear()
+                self.dry_run = False
+                self.demoted_from_live = False
+                self.on_event(
+                    ConfigWarningEvent(
+                        message="the LIVE holder released the lock — this "
+                                "engine is now LIVE"
+                    )
+                )
+        return 0
+
+    def stop(self) -> None:
+        self.stopped = True
+        self._stop.set()
+
+    def apply_threshold(self, threshold: float) -> None:
+        pass
+
+    def wake(self) -> None:
+        pass
+
+    def promote(self) -> None:
+        self._promote_requested.set()
+
+    def wait_promoted(self, timeout: float = 1.0) -> bool:
+        """Block until `run_loop`'s worker thread has flipped `dry_run`."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self.dry_run:
+                return True
+            time.sleep(0.01)
+        return not self.dry_run
+
+
+@pytest.fixture
+def contended_fake_engine(monkeypatch):
+    _ContendedFakeEngine.instances = []
+    monkeypatch.setattr(
+        "claude_swap.tui.autoview.AutoSwitchEngine", _ContendedFakeEngine
+    )
+    return _ContendedFakeEngine
+
+
 @pytest.mark.asyncio
 class TestAutoScreen:
     async def _open(self, pilot):
         await settle(pilot)
         await pilot.press("g")
         await pilot.pause()
+
+    async def test_auto_flag_self_promotion_persists_no_consent(
+        self, tmp_path, fake_engine
+    ):
+        """MAJOR-3: one `cswap tui --auto` must not write permanent go-live
+        consent.
+
+        `--auto` makes the engine LIVE from its very first poll event
+        (`app.py:104` -> `AutoScreen(start_live=True)` -> `on_mount`'s
+        `dry_run=not (self._start_live or ...)` -> `dry_run=False`).
+        Before the fix, `_on_engine_event`'s self-promotion persist keyed on
+        the steady-state fact `not engine.dry_run` — true here on the FIRST
+        event, though nobody confirmed anything: no modal, no toggle.
+        Measured (pre-fix): `autoStartLive` flips to True after one
+        `--auto` run, so every later launch from the menu (no `--auto`, no
+        modal) starts LIVE on every machine sharing settings.json.
+        """
+        from claude_swap.tui.app import CswapApp
+        from claude_swap.settings import load_settings
+
+        assert load_settings(tmp_path).auto_start_live is False, "premise"
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = CswapApp(fake, start="auto")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            assert len(fake_engine.instances) == 1
+            engine = fake_engine.instances[0]
+            assert engine.dry_run is False, "premise: --auto started LIVE"
+
+        assert load_settings(tmp_path).auto_start_live is False, (
+            "auto_start_live flipped to True after a single `cswap tui "
+            "--auto` with no confirmation seen — every later bare `cswap "
+            "tui` (no --auto) now starts LIVE too"
+        )
 
     async def test_opens_in_dry_run_and_store_only(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
@@ -1599,7 +1755,7 @@ class TestBareInvocation:
 
         launched = {}
 
-        def fake_run(switcher):
+        def fake_run(switcher, start="dashboard"):
             launched["switcher"] = switcher
             return 0
 
@@ -1710,3 +1866,458 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
 
+
+
+class TestAutoStartLive:
+    """autoStartLive decides whether the auto view starts LIVE or dry-run
+    once you are ON it. It does NOT decide that you go there — only the
+    explicit `cswap tui --auto` opens the auto view."""
+
+    def test_bare_tui_never_opens_the_auto_view(self, tmp_path):
+        """`cswap tui` must land on the dashboard even with autoStartLive on.
+
+        It used to consult the setting here, so a bare `cswap tui` could open
+        straight into the auto view with the engine LIVE — which made the
+        `--auto` flag meaningless (both did the same thing) and let one
+        go-live confirmation, on a machine whose settings.json is shared,
+        auto-switch accounts everywhere.
+
+        Kept as a source-string check for the ONE thing a behavioural test
+        cannot see directly: that the opening screen's condition is not
+        wired to `auto_start_live` at all (as opposed to being wired to it
+        and happening not to fire on this fixture's False default). The
+        behaviour itself — that a bare launch actually lands on the
+        dashboard, and `--auto` actually opens the auto view — is asserted
+        by `test_bare_tui_stays_on_the_dashboard_with_auto_start_live_set`
+        and `test_auto_flag_actually_opens_the_auto_view` below: a source
+        check alone cannot distinguish "the code is right" from "the string
+        is present" (MINOR-3 — mutation-checked: deleting only the
+        `push_screen(AutoScreen(...))` call left both literals here intact
+        and the suite green).
+        """
+        import inspect
+        from claude_swap.tui import app as app_mod
+
+        src = inspect.getsource(app_mod.CswapApp.on_mount)
+        auto_branch = src.split("elif self._start ==")[-1]
+        assert "auto_start_live" not in auto_branch, (
+            "the opening screen must depend only on --auto"
+        )
+        assert 'elif self._start == "auto"' in src
+
+    def test_auto_flag_still_opens_live(self, tmp_path):
+        import inspect
+        from claude_swap.tui import app as app_mod
+
+        src = inspect.getsource(app_mod.CswapApp.on_mount)
+        assert "AutoScreen(start_live=True)" in src
+
+    @pytest.mark.asyncio
+    async def test_bare_tui_stays_on_the_dashboard_with_auto_start_live_set(
+        self, tmp_path, fake_engine
+    ):
+        """Behavioural pair, half 1: a bare launch must actually SHOW the
+        dashboard — not merely satisfy a source-string check — even when
+        `autoStartLive` is persisted true.
+
+        Mutation-checked: removing the `push_screen(AutoScreen(...))` call
+        in `on_mount` (the MINOR-3 survivor) leaves the source-text test
+        above green, but this test still passes on its own for the wrong
+        reason (there is no auto view to open at all with `start=
+        "dashboard"`) — it is the SIBLING test below,
+        `test_auto_flag_actually_opens_the_auto_view`, that catches that
+        specific mutation, mirroring `test_tui_auto_passes_start_auto` /
+        `test_tui_without_auto_stays_dashboard` at the CLI layer
+        (test_cli.py:1549, :1565).
+        """
+        from claude_swap.settings import set_setting
+        from claude_swap.tui.dashboard import DashboardScreen
+
+        set_setting(tmp_path, "autoswitch.autoStartLive", "true")
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)  # default start="dashboard", no --auto
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert isinstance(app.screen, DashboardScreen)
+            assert fake_engine.instances == [], (
+                "a bare launch must never even CONSTRUCT the auto-switch "
+                "engine"
+            )
+
+    @pytest.mark.asyncio
+    async def test_auto_flag_actually_opens_the_auto_view(
+        self, tmp_path, fake_engine
+    ):
+        """Behavioural pair, half 2: `--auto` must actually SHOW the auto
+        view, not merely construct-and-never-push it.
+
+        This is the test that kills the MINOR-3 mutation: constructing
+        `AutoScreen(start_live=True)` without calling `push_screen` on it
+        leaves `app.screen` at the dashboard, which this test catches and
+        the source-string test above cannot.
+        """
+        from claude_swap.tui.app import CswapApp
+        from claude_swap.tui.autoview import AutoScreen
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = CswapApp(fake, start="auto")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert isinstance(app.screen, AutoScreen)
+
+    def test_setting_roundtrip(self, tmp_path):
+        from claude_swap.settings import load_settings, set_setting
+        set_setting(tmp_path, "autoswitch.autoStartLive", "true")
+        assert load_settings(tmp_path).auto_start_live is True
+        set_setting(tmp_path, "autoswitch.autoStartLive", "false")
+        assert load_settings(tmp_path).auto_start_live is False
+
+    def test_default_off(self, tmp_path):
+        from claude_swap.settings import load_settings
+        assert load_settings(tmp_path).auto_start_live is False
+
+    def test_a_demotion_writes_no_consent_at_all(self, tmp_path):
+        """A demotion says nothing about what the user consented to.
+
+        `autoStartLive` is one shared setting, so writing `false` here is not
+        neutral — it revokes the LIVE holder's own consent. Measured, two
+        TUIs on one machine:
+
+            TUI#1 goes live        auto_start_live=True
+            TUI#2 presses `l`      demoted (the lock is held)
+            TUI#2 persists False   auto_start_live=False
+
+        so opening a second TUI and pressing one key silently makes the NEXT
+        launch start dry-run. Recording what the engine BECAME is right for a
+        granted go-live and wrong for a refused one: the refusal is about the
+        lock, not about consent, so the answer is to write nothing.
+        """
+        from unittest.mock import MagicMock
+        from claude_swap.settings import load_settings, set_setting
+        from claude_swap.tui.autoview import AutoScreen
+
+        set_setting(tmp_path, "autoswitch.autoStartLive", "true")  # the holder's
+
+        view = AutoScreen.__new__(AutoScreen)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        demoted = MagicMock()
+        demoted.dry_run = True                      # the lock was already held
+        demoted.demoted_from_live = True
+
+        def restart(*, dry_run):
+            view._engine = demoted
+
+        view._restart_engine = restart
+        AutoScreen._on_live_confirm(view, True)
+        assert persisted == [], (
+            f"persisted {persisted} — a demoted TUI wrote over the LIVE "
+            "holder's consent, so the next launch starts dry-run"
+        )
+        assert load_settings(tmp_path).auto_start_live is True
+
+    def test_a_granted_go_live_is_persisted(self, tmp_path):
+        from unittest.mock import MagicMock
+        from claude_swap.tui.autoview import AutoScreen
+
+        view = AutoScreen.__new__(AutoScreen)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        live = MagicMock()
+        live.dry_run = False
+        live.demoted_from_live = False   # it actually got LIVE
+
+        def restart(*, dry_run):
+            view._engine = live
+
+        view._restart_engine = restart
+        AutoScreen._on_live_confirm(view, True)
+        assert persisted == [True]
+
+
+    def test_a_self_promotion_persists_the_consent_the_user_sees(self, tmp_path):
+        """The mirror of the demotion bug: the demotion correctly records
+        nothing, and so does the LATER GRANT.
+
+        `_persist_auto_start_live` has exactly two call sites, both inside
+        `action_toggle_live` / `_on_live_confirm`. `_retry_live_promotion`
+        runs on the ENGINE thread and only emits a `ConfigWarningEvent`, and
+        nothing in the TUI reads `config-warning`. So:
+
+            TUI#2 presses `l`      demoted (TUI#1 holds the lock)
+            TUI#2 writes nothing   correct — the refusal is about the lock
+            TUI#1 exits            the lock is free
+            TUI#2 promotes itself  badge flips to ` LIVE `
+            restart TUI#2          DRY-RUN
+
+        contradicting what the user last saw. Asserts on the ENGINE state the
+        badge is rendered from, not on the event kind: keying the persist on
+        `config-warning` would be the same opt-in defect one layer down.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.autoview import AutoScreen
+
+        assert load_settings(tmp_path).auto_start_live is False, "premise"
+
+        view = AutoScreen.__new__(AutoScreen)
+        view._settings = load_settings(tmp_path)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        view._update_badge = lambda: None
+        view.query_one = MagicMock()
+        from claude_swap.tui.theme import CSWAP_DARK
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK     # Palette.from_theme reads real fields
+
+        # This screen watched the engine as dry-run (demoted) before the
+        # promotion — the real shape `_start_engine` seeds, and the
+        # transition the persist below must key on.
+        view._engine_was_dry_run = True
+        # The scenario's own premise ("TUI#2 presses `l`") is a human modal
+        # confirm — the fact I1's flag exists to distinguish from a
+        # contended `--auto` launch, which never shows the modal at all.
+        view._live_confirmed_this_launch = True
+        promoted = MagicMock()
+        promoted.dry_run = False           # it took the lock mid-run
+        promoted.demoted_from_live = False
+        view._engine = promoted
+
+        with patch.object(
+            AutoScreen, "is_attached", property(lambda self: True)
+        ), patch.object(AutoScreen, "app", property(lambda self: app)):
+            AutoScreen._on_engine_event(
+                view,
+                ConfigWarningEvent(
+                    message="the LIVE holder released the lock — this engine "
+                            "is now LIVE"
+                ),
+            )
+
+        assert persisted == [True], (
+            f"persisted {persisted} — the badge reads LIVE but a restart "
+            "comes back dry-run, contradicting what the user last saw"
+        )
+
+    def test_a_dry_run_engine_still_writes_nothing(self, tmp_path):
+        """The persist must stay one-directional.
+
+        `autoStartLive` is one shared setting: writing `false` from a
+        dry-run engine revokes the LIVE holder's consent, which is the
+        demotion bug this PR already fixed. A grant is consent; dry-run is
+        not a revocation.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.autoview import AutoScreen
+
+        view = AutoScreen.__new__(AutoScreen)
+        view._settings = load_settings(tmp_path)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        view._update_badge = lambda: None
+        view.query_one = MagicMock()
+        from claude_swap.tui.theme import CSWAP_DARK
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK     # Palette.from_theme reads real fields
+
+        view._engine_was_dry_run = True
+        demoted = MagicMock()
+        demoted.dry_run = True
+        demoted.demoted_from_live = True
+        view._engine = demoted
+
+        with patch.object(
+            AutoScreen, "is_attached", property(lambda self: True)
+        ), patch.object(AutoScreen, "app", property(lambda self: app)):
+            AutoScreen._on_engine_event(
+                view,
+                ConfigWarningEvent(
+                    message="another LIVE auto-switch engine is already running"
+                ),
+            )
+
+        assert persisted == [], (
+            f"persisted {persisted} — a dry-run engine wrote over the LIVE "
+            "holder's consent"
+        )
+
+    def test_a_contended_auto_flag_self_promotion_persists_no_consent(
+        self, tmp_path
+    ):
+        """I1: a CONTENDED `cswap tui --auto` must not write permanent
+        go-live consent either, once it later self-promotes.
+
+        MAJOR-3 (fixed) only covers the UNCONTENDED case: `--auto` starts
+        LIVE on the very first event, `_engine_was_dry_run` seeded from that
+        actual starting state (False) so the transition check never fires.
+        But a DEMOTED `--auto` engine truthfully starts `dry_run=True` (the
+        real shape `_start_engine` seeds from `engine.dry_run` after
+        construction) -- indistinguishable, by `_engine_was_dry_run` alone,
+        from a screen that showed the modal and watched a real demotion.
+        When that engine later self-promotes (the holder exits,
+        `_retry_live_promotion` flips it LIVE with no further human input),
+        the OLD condition (`was_dry_run and not engine.dry_run and not
+        auto_start_live`) is satisfied purely by the contention shape, and
+        `autoStartLive` flips to True with nobody ever having confirmed
+        anything on this launch -- exactly the MAJOR-3 defect, one level
+        deeper.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from claude_swap.settings import load_settings
+        from claude_swap.tui.autoview import AutoScreen
+
+        assert load_settings(tmp_path).auto_start_live is False, "premise"
+
+        view = AutoScreen.__new__(AutoScreen)
+        view._settings = load_settings(tmp_path)
+        persisted: list[bool] = []
+        view._persist_auto_start_live = persisted.append
+        view._update_badge = lambda: None
+        view.query_one = MagicMock()
+        from claude_swap.tui.theme import CSWAP_DARK
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK
+
+        # The real shape `_start_engine` seeds: a CONTENDED `--auto` engine
+        # starts dry_run=True (demoted), so this screen never saw the modal
+        # -- `_live_confirmed_this_launch` stays at its `__init__` default,
+        # False. No modal means no confirm, so this is set explicitly here
+        # rather than via `_on_live_confirm`, mirroring the real mount path.
+        view._engine_was_dry_run = True
+        view._live_confirmed_this_launch = False
+        promoted = MagicMock()
+        promoted.dry_run = False           # the holder exited; self-promoted
+        promoted.demoted_from_live = False
+        view._engine = promoted
+
+        with patch.object(
+            AutoScreen, "is_attached", property(lambda self: True)
+        ), patch.object(AutoScreen, "app", property(lambda self: app)):
+            AutoScreen._on_engine_event(
+                view,
+                ConfigWarningEvent(
+                    message="the LIVE holder released the lock — this engine "
+                            "is now LIVE"
+                ),
+            )
+
+        assert persisted == [], (
+            f"persisted {persisted} — a contended --auto engine's own "
+            "self-promotion wrote permanent go-live consent with nobody "
+            "having confirmed anything on this launch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_contended_auto_end_to_end_writes_no_consent(
+        self, tmp_path, contended_fake_engine
+    ):
+        """The behavioural twin of the unit test above, through the real
+        Textual app and `AutoScreen.on_mount` / `_on_engine_event` wiring --
+        not just a hand-assembled `AutoScreen.__new__`.
+        """
+        from claude_swap.tui.app import CswapApp
+        from claude_swap.settings import load_settings
+
+        assert load_settings(tmp_path).auto_start_live is False, "premise"
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = CswapApp(fake, start="auto")
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert len(contended_fake_engine.instances) == 1
+            engine = contended_fake_engine.instances[0]
+            assert engine.dry_run is True, "premise: --auto was CONTENDED"
+
+            # The holder exits; this engine self-promotes with no further
+            # human input -- the same shape `_retry_live_promotion` produces.
+            # The emit must run on the engine's OWN worker thread (matching
+            # the real `_retry_live_promotion`): `_emit_from_thread` reaches
+            # `_on_engine_event` via Textual's `call_from_thread`, which
+            # raises (silently swallowed) when called from the app's own
+            # thread -- calling `promote()` synchronously here would emit
+            # nothing and the test would pass for the wrong reason.
+            engine.promote()
+            assert await asyncio.to_thread(engine.wait_promoted), (
+                "premise: the engine worker thread never flipped dry_run"
+            )
+            await pilot.pause()
+            await pilot.pause()
+            assert engine.dry_run is False, "premise: it is now LIVE"
+
+        assert load_settings(tmp_path).auto_start_live is False, (
+            "a contended --auto engine's self-promotion wrote permanent "
+            "go-live consent -- every later bare `cswap tui` now starts LIVE"
+        )
+
+class TestUnswitchableRowsAreListed:
+    """A slot you cannot switch to must still appear, with the reason.
+
+    It used to be filtered out of "Next best" entirely. On a machine that
+    had imported the account roster but not the credentials — which is the
+    normal state right after a sync, since credentials deliberately do not
+    travel — the auto view showed two accounts while the engine's own log
+    line listed five. An absent row reads as "not configured"; a row that
+    says why reads as "here is what to do".
+    """
+
+    def _snap(self, *accounts):
+        from claude_swap.models import AccountsSnapshot
+        return AccountsSnapshot(
+            accounts=list(accounts), active_number=None, taken_at=0.0
+        )
+
+    def _acct(self, number, email, *, switchable, kind="oauth"):
+        from unittest.mock import MagicMock
+        a = MagicMock()
+        a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
+        a.usage.last_good = None
+        a.usage.sentinel = None
+        return a
+
+    def _render(self, snap, active):
+        from unittest.mock import MagicMock, patch
+        from claude_swap.tui.autoview import AutoScreen
+        from claude_swap.settings import AutoSwitchSettings
+
+        v = AutoScreen.__new__(AutoScreen)
+        v._settings = AutoSwitchSettings()
+        from claude_swap.tui.theme import CSWAP_DARK
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
+        with patch.object(AutoScreen, "app", property(lambda s: app)):
+            return str(v._candidates_text(snap, active_number=active))
+
+    def test_a_credential_less_slot_is_shown_with_what_to_do(self):
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("4", "new@x.com", switchable=False),
+        ), active="1")
+        assert "new@x.com" in out, "the slot must not be hidden"
+        # Naming the state is not enough — "no credentials" leaves the user
+        # to guess, and the obvious guess (/login right where you are) writes
+        # the login to whatever slot is active instead of this one.
+        assert "switch here" in out
+        assert "log in" in out
+
+    def test_an_api_key_slot_says_api_key_not_re_login(self):
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("5", "console-api@token.local",
+                       switchable=False, kind="api_key"),
+        ), active="1")
+        assert "console-api@token.local" in out
+        assert "API key" in out
+        # There is no login to restore for an API key slot.
+        assert "cswap add" not in out
+
+    def test_unswitchable_rows_sort_last(self):
+        out = self._render(self._snap(
+            self._acct("4", "empty@x.com", switchable=False),
+            self._acct("1", "a@x.com", switchable=True),
+        ), active="9")
+        assert out.index("a@x.com") < out.index("empty@x.com")
