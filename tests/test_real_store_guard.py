@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -634,3 +635,43 @@ def test_mkdir_exist_ok_true_does_not_swallow_the_refusal(
     # proving the guard is armed (isolates "swallowed" from "never fired").
     with pytest.raises(conftest.RealStoreWriteBlocked):
         (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "the third snapshot's mechanism is `Path.home()` falling back to the "
+        "POSIX pwd database once $HOME is cleared; Windows resolves the home "
+        "from USERPROFILE and has no `pwd` module, so the shape under test "
+        "does not exist there"
+    ),
+)
+def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch, tmp_path):
+    import pwd
+
+    # The autouse `_isolate_real_home` fixture ALSO monkeypatches
+    # `pathlib.Path.home` to the isolated dir, which defeats the pwd
+    # fallback the third snapshot depends on. Restore the real
+    # `Path.home` for this test -- $HOME stays scratch, which is the
+    # condition under test.
+    monkeypatch.undo()
+    scratch = tmp_path / "scratch-home"
+    scratch.mkdir()
+    monkeypatch.setenv("HOME", str(scratch))
+    monkeypatch.setenv("USERPROFILE", str(scratch))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    pwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    specs = conftest._freeze_real_store_specs()
+    roots = [root for root, _recursive in specs]
+
+    assert pwd_home / ".local" / "share" / "claude-swap" in roots, (
+        "with $HOME pointed at a scratch dir -- what the mandated isolation "
+        "recipe does BEFORE the interpreter starts -- the account's true "
+        "store under the OS account home must still be frozen as protected; "
+        "otherwise the guard is armed only for a bare-pytest developer and "
+        "disarmed for exactly the population running mutation batteries"
+    )
+    assert scratch / ".local" / "share" / "claude-swap" in roots, (
+        "the scratch HOME's own root must stay protected too"
+    )
