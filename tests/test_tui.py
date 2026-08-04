@@ -2035,6 +2035,56 @@ class TestAutoStartLive:
         assert persisted == [True]
 
 
+    def test_start_engine_seeds_was_dry_run_from_actual_engine_state(
+        self, tmp_path
+    ):
+        """1007ea2 (MAJOR-3): `_start_engine` must seed `_engine_was_dry_run`
+        from the ENGINE's actual starting `dry_run` (post-construction,
+        possibly demoted by lock contention), never from the `dry_run` the
+        caller merely REQUESTED. A seed that used the request instead of the
+        outcome would make an engine that started LIVE from a lock-free
+        `--auto` look, on the very next self-promotion check, exactly like
+        one that transitioned from dry-run under this screen's own watch --
+        reopening MAJOR-3 one layer up. Unlike the self-promotion tests
+        above (which hand-set the seed and assert the DOWNSTREAM persist
+        decision), this test pins the ASSIGNMENT itself: the property is
+        `self._engine_was_dry_run == engine.dry_run` right after
+        `_start_engine` returns, regardless of what `dry_run=` was passed
+        in.
+        """
+        from unittest.mock import MagicMock, patch
+        from claude_swap.tui.autoview import AutoScreen
+
+        view = AutoScreen.__new__(AutoScreen)
+        view._settings = MagicMock()
+        view.run_worker = MagicMock()
+        view._update_badge = lambda: None
+        view.query_one = MagicMock()
+        app = MagicMock()
+
+        # Requested dry_run=True (the default menu-launch shape), but the
+        # constructed engine reports it actually started LIVE -- a resumed
+        # `autoStartLive` bypassing the caller's own dry_run= argument, the
+        # same "actual, not requested" gap MAJOR-3's fix depends on, just
+        # inverted from the other tests' contended shape so a seed using
+        # the REQUEST instead of the OUTCOME reads wrong in this direction
+        # too.
+        live_engine = MagicMock()
+        live_engine.dry_run = False
+
+        with patch.object(AutoScreen, "app", property(lambda self: app)), \
+             patch(
+                 "claude_swap.tui.autoview.AutoSwitchEngine",
+                 return_value=live_engine,
+             ):
+            AutoScreen._start_engine(view, dry_run=True)
+
+        assert view._engine_was_dry_run is False, (
+            "seeded from the REQUESTED dry_run instead of the engine's "
+            f"actual dry_run, got _engine_was_dry_run={view._engine_was_dry_run!r} "
+            "for an engine that actually started dry_run=False"
+        )
+
     def test_a_self_promotion_persists_the_consent_the_user_sees(self, tmp_path):
         """The mirror of the demotion bug: the demotion correctly records
         nothing, and so does the LATER GRANT.

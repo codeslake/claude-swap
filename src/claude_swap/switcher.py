@@ -4060,7 +4060,9 @@ class ClaudeAccountSwitcher:
                 continue
             entry = entries[num]
             _i = info_by_num[num]
-            dead = self._entry_token_dead(entry, num, _i[1], _i[5], _i[4])
+            dead = self._entry_token_dead(
+                entry, num, _i[1], _i[5], _i[4], self._active_read_degraded
+            )
             if dead:
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif dead is None:
@@ -4087,7 +4089,14 @@ class ClaudeAccountSwitcher:
                 # (credentials.py): once the Keychain answers again, the
                 # next collect pass re-evaluates the fingerprint compare
                 # against real bytes and clears the strike via the `elif`
-                # below, or confirms it still holds.
+                # below, or confirms it still holds. This recovery path is
+                # now also how a DEGRADED active read reaches a verdict
+                # (round 11 C1): `_entry_token_dead` skips the immediate
+                # fingerprint compare against the collector's own
+                # (possibly-stale) `creds` on a degraded read and falls
+                # through to this same backup-fallback machinery, so the
+                # degraded shape gets the identical treatment as an
+                # unreadable backup rather than an immediate confirm.
                 pass
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
@@ -4187,7 +4196,8 @@ class ClaudeAccountSwitcher:
             for num in accepted:
                 _i = info_by_num[num]
                 dead = self._entry_token_dead(
-                    entries[num], num, _i[1], _i[5], _i[4]
+                    entries[num], num, _i[1], _i[5], _i[4],
+                    self._active_read_degraded,
                 )
                 if dead:
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
@@ -4271,6 +4281,7 @@ class ClaudeAccountSwitcher:
         email: str,
         stored: str,
         is_active: bool,
+        active_read_degraded: bool = False,
     ) -> bool | None:
         """Fingerprint-bound dead verdict against EVERY stored source.
 
@@ -4282,6 +4293,16 @@ class ClaudeAccountSwitcher:
         every pass whenever the two lineages differ — the strike/heal/re-POST
         loop that keeps a dead backup out of quarantine forever. The strike
         holds while ANY stored source still matches the struck generation.
+
+        ``active_read_degraded`` says whether ``stored`` came from a DEGRADED
+        active read (Keychain read failed, a plaintext fallback covered it).
+        Those bytes may be a superseded generation — Claude Code rotates
+        keychain-only, so the plaintext file can lag — so they must never
+        CONFIRM a dead verdict: a degraded read serving the OLD, struck
+        generation would otherwise fingerprint-match and condemn a slot a
+        re-login already healed. The first branch below is skipped in that
+        case and falls straight through to the backup check, exactly as it
+        already does for an idle slot.
 
         Returns ``True`` (confirmed dead), ``False`` (confirmed not dead —
         no stored source, seen or fingerprint-matched, still holds the
@@ -4312,12 +4333,15 @@ class ClaudeAccountSwitcher:
         is the Keychain capability cache's own re-probe
         (``KEYCHAIN_RECHECK_COOLDOWN_S``): once the Keychain answers again,
         the next collect pass re-evaluates the fingerprint compare against
-        real bytes.
+        real bytes (both this method's own re-probe below and, for the
+        collector, a fresh ``active_read_degraded`` on the next pass).
 
-        An unstruck row is never affected by an unreadable read (``False``
-        either way) — only a struck one goes ambiguous.
+        An unstruck row is never affected by an unreadable or degraded read
+        (``False`` either way) — only a struck one goes ambiguous.
         """
-        if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
+        if not (is_active and active_read_degraded) and entry.token_dead(
+            stored_fp=oauth.credential_fingerprint(stored)
+        ):
             return True
         if not is_active:
             return False
