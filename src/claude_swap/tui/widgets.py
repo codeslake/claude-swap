@@ -175,6 +175,13 @@ def pin_is_broken(acc: AccountSnapshot) -> bool:
     about the credential, so it is left alone too — a warning that fires on
     "I could not look" teaches people to ignore warnings.
     """
+    # An API-key account can never produce one: `sk-ant-api…` is not OAuth
+    # JSON, so the provider returns None for every request and each one fails
+    # open. `kind` rather than the sentinel — the sentinel is derived and reads
+    # something else entirely for an unreadable backup blob or a locked macOS
+    # keychain, while `kind` is the same fact set_pin refuses on.
+    if getattr(acc, "kind", None) == "api_key":
+        return True
     return acc.usage.sentinel in (
         USAGE_NO_CREDENTIALS,      # nothing stored for the slot
         USAGE_RELOGIN_REQUIRED,    # refresh lineage dead; only a human fixes it

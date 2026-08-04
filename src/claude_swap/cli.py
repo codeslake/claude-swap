@@ -118,31 +118,66 @@ Examples:
   cswap pin 2          pin Remote Control / artifacts to account 2
   cswap pin            show the current pin
   cswap pin --clear    remove the pin
+  cswap pin --heal     restart a pin proxy that died, or unwire it
         """,
     )
     parser.add_argument(
         "account", nargs="?", metavar="NUM|EMAIL", help="Account to pin to"
     )
     parser.add_argument("--clear", action="store_true", help="Remove the pin")
+    parser.add_argument(
+        "--heal",
+        action="store_true",
+        help=(
+            "Restart the pin proxy if it died; if it cannot be restarted, "
+            "remove the wiring so sessions fall back instead of failing"
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
     # `cswap pin 2 --clear` otherwise unpins and prints "Unpinned", giving no
     # sign the 2 was discarded — indistinguishable from having pinned it.
     if args.clear and args.account:
         parser.error("--clear takes no account")
+    if args.heal and (args.account or args.clear):
+        parser.error("--heal takes no account and does not combine with --clear")
 
     from claude_swap.pin import run as pin_run
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
-        sys.exit(pin_run(switcher, args.account, clear=args.clear))
+        sys.exit(
+            pin_run(switcher, args.account, clear=args.clear, heal_only=args.heal)
+        )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+    except Exception as e:  # noqa: BLE001
+        # A BROKEN PACKAGE ROOT is not a ClaudeSwitchError. `_impl` deliberately
+        # re-raises the underlying ImportError so "installed but unusable" is
+        # not conflated with "not installed" — but nothing between there and
+        # the shell rendered it, so a missing `cryptography` reached the user
+        # as a 6-frame traceback. Measured on work-mac, and this command is the
+        # one that has to stay usable when the pin does not.
+        # THROUGH THE SCRUBBER. `_safe` exists because every failure renderer
+        # here interpolates an exception built by an optional package, and the
+        # proxy's own URL carries `user:secret@`. This renderer was the one
+        # that did not use it, so a message naming the proxy printed the
+        # credential verbatim — measured: `http://svc:s3cr3t@127.0.0.1:9901/…`
+        # reached the screen, where `_safe` yields `http://***@127.0.0.1:9901/…`.
+        from claude_swap.pin import _safe
+
+        error(f"Error: the cloud pin is installed but not usable: {_safe(e)}")
+        # NOT an unconditional promise: `cswap pin --clear` works without the
+        # package, but a contended config lock can still make it skip a
+        # config it never got to try (see clear_wiring's budget) — reword
+        # rather than promise an outcome the code cannot guarantee.
+        error("  `cswap pin --clear` still works, and removes the wiring unless the config is locked.")
+        sys.exit(1)
 
 
 def _run_command(argv: list[str]) -> None:
