@@ -2793,6 +2793,32 @@ class TestFreshenRoutesThroughGate:
             "transient bucket and reads as (network?)"
         )
 
+    def test_unreadable_stash_is_not_reported_as_network_trouble(
+        self, temp_home
+    ):
+        """A permanently unreadable stash row is local and needs a human.
+
+        The row is the sole copy of a generation the slot already consumed, so
+        the gate defers on every pass — correctly, since nothing on disk tells
+        a keychain locked for a minute from one locked forever. But an
+        unrecognised kind maps to "transient", and the tick then renders
+        "could not freshen any candidate (network?)" forever, on a condition
+        no network change can affect and only the operator can clear.
+        """
+        from claude_swap import oauth as oauth_mod
+
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        with patch.object(
+            harness.switcher, "consume_backup_grant",
+            return_value=oauth_mod.RefreshOutcome(None, "stash-unreadable"),
+        ):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "stash-unreadable", (
+            f"got {status!r}: an unreadable stash row falls into the "
+            "transient bucket and reads as (network?)"
+        )
+
     def test_store_unmirrored_keeps_its_own_kind(self, temp_home):
         """The precedent this mirrors, pinned so the two stay symmetric."""
         from claude_swap import oauth as oauth_mod

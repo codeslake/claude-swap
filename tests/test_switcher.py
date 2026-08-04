@@ -7889,6 +7889,119 @@ class TestStashStorageHardening:
         assert base64.b64decode(raw, validate=True).decode() == "bytes-1"
 
 
+class TestStashManifestConcurrentMutation:
+    """I-1: both manifest mutators are read-modify-write over ONE file.
+
+    ``_write_unclaimed_credential`` (reached from the ``except LockError``
+    stash path, which runs WITHOUT the slot lock by construction -- it is
+    reached precisely because that lock was unavailable) and
+    ``_remove_unclaimed_credential`` (reached from the retire, which runs
+    UNDER it) both read the whole manifest, mutate their own snapshot, and
+    rewrite the whole file. Run concurrently, each rewrite drops whatever the
+    other wrote after its read.
+
+    Driven with real concurrency, not a mocked interleaving. The CONTROL runs
+    the identical workload with every mutation serialized on a lock the
+    *test* holds: if the control also loses rows, the harness is measuring
+    itself rather than the code.
+    """
+
+    ROWS = 40
+
+    def _store(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        return switcher._store
+
+    def _run(self, store, gate):
+        """2 stashers + 1 stash-then-retire churner, concurrent.
+
+        ``gate()`` wraps each mutation: a real lock for the control, a no-op
+        for the arm under test. Returns the probe tags whose manifest rows
+        did not survive.
+        """
+        import threading
+
+        errors: list[Exception] = []
+
+        def stash(tag):
+            try:
+                for i in range(self.ROWS):
+                    with gate():
+                        store._write_unclaimed_credential(
+                            f"creds-{tag}{i}",
+                            {
+                                "reason": "consume-gate-persist-lock-failed",
+                                "configSlot": "1",
+                                "consumedFp": "fp",
+                                "probe": f"{tag}{i}",
+                            },
+                        )
+            except Exception as e:  # pragma: no cover - asserted below
+                errors.append(e)
+
+        def churn():
+            try:
+                for i in range(self.ROWS):
+                    with gate():
+                        entry_id = store._write_unclaimed_credential(
+                            f"retire-{i}",
+                            {"configSlot": "1", "consumedFp": "other"},
+                        )
+                    with gate():
+                        store._remove_unclaimed_credential(entry_id)
+            except Exception as e:  # pragma: no cover - asserted below
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=stash, args=("a",)),
+            threading.Thread(target=churn),
+            threading.Thread(target=stash, args=("b",)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=120)
+        assert not any(t.is_alive() for t in threads), "worker deadlocked"
+        assert not errors, errors
+        probes = {
+            meta.get("probe") for meta in store._read_stash_manifest().values()
+        }
+        expected = {f"{tag}{i}" for tag in ("a", "b") for i in range(self.ROWS)}
+        return sorted(expected - probes)
+
+    def test_concurrent_stash_and_retire_lose_no_manifest_row(self, temp_home):
+        import contextlib
+
+        store = self._store(temp_home)
+        lost = self._run(store, contextlib.nullcontext)
+        assert not lost, (
+            f"{len(lost)}/{2 * self.ROWS} stash rows lost to a concurrent "
+            "manifest rewrite. The entry BYTES survive (they are written "
+            "first), but the row carrying consumedFp/configSlot does not -- "
+            "and _adopt_stashed_successor iterates manifest rows only, so a "
+            "row-less successor can never be adopted while "
+            "_list_unclaimed_credentials' glob keeps listing it forever"
+        )
+
+    def test_control_serialized_mutation_loses_no_row(self, temp_home):
+        """CONTROL: the same workload, externally serialized, loses nothing.
+
+        Proves the loss above is the unsynchronized read-modify-write and not
+        the harness.
+        """
+        import threading
+
+        store = self._store(temp_home)
+        lock = threading.Lock()
+        lost = self._run(store, lambda: lock)
+        assert not lost, (
+            "control broken: the harness loses rows even when every mutation "
+            "is serialized, so it cannot attribute the loss"
+        )
+
+
 class TestRemoveAccountPrunesMappings:
     """Removing an account drops any directory mappings pointing at it."""
 
@@ -9453,6 +9566,92 @@ class TestConsumeGateLockFailures:
         assert s.list_unclaimed_credentials(), "successor must still be stashed"
 
 
+class TestPermanentlyUnreadableStashRow:
+    """Minor 1: a row that is unreadable on EVERY pass is never retired and
+    the gate defers on it forever -- reported as ``transient``, i.e. the
+    "(network?)" false alarm this branch fixes elsewhere.
+
+    The deferral itself is correct and stays: the bytes are the sole copy of
+    a generation the slot already consumed, and nothing on disk distinguishes
+    "locked for a minute" from "locked forever", so retiring on a strike
+    count would destroy a live refresh token whenever the cause was slow
+    rather than permanent. What must change is the LABEL -- the condition is
+    deterministic, local, and needs a human, so it must not be reported as
+    network trouble.
+    """
+
+    _OLD = json.dumps({
+        "claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-old",
+                          "expiresAt": 1000}})
+    _NEW = json.dumps({
+        "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new",
+                          "expiresAt": 9999999999000}})
+
+    def _switcher(self, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_ten_passes_name_the_condition_instead_of_network(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        entry_id = s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "1",
+             "consumedFp": oauth.credential_fingerprint(self._OLD),
+             "fingerprint": oauth.credential_fingerprint(self._NEW)},
+        )
+        entry_path = s._store._stash_entry_path(entry_id)
+        entry_path.chmod(0o000)
+        try:
+            with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+                errors = {
+                    s.consume_backup_grant(
+                        "1", "test@example.com", self._OLD
+                    ).error
+                    for _ in range(10)
+                }
+        finally:
+            entry_path.chmod(0o600)
+
+        assert not post.called, "the spent generation must never be POSTed"
+        assert errors == {"stash-unreadable"}, (
+            f"10 passes on a permanently unreadable row reported {errors}; "
+            "'transient' routes the tick to 'could not freshen any candidate "
+            "(network?)' and sends the operator to check a connection that "
+            "is fine, on a condition only they can clear"
+        )
+        assert entry_id in s.list_unclaimed_credentials(), (
+            "the row must survive: it is the sole copy of a generation the "
+            "slot already consumed, and nothing distinguishes a lock that "
+            "clears in a minute from one that never does"
+        )
+
+    def test_the_kind_carries_its_remedy_and_skips_the_doomed_fetch(self):
+        """Two seams collapse an unknown kind back onto the generic path.
+
+        ``ERROR_NOTES`` falls back to printing the bare kind, so the remedy
+        the operator needs never renders; ``_DETERMINISTIC_REFRESH_ERRORS``
+        decides whether to spend a guaranteed 401 per pass on a token already
+        known to be expired. (The third seam, the tick's own message, has a
+        behavioural test in ``tests/test_autoswitch.py``.)
+        """
+        from claude_swap.oauth import _DETERMINISTIC_REFRESH_ERRORS
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert "cswap unclaimed" in ERROR_NOTES["stash-unreadable"]
+        assert "stash-unreadable" in _DETERMINISTIC_REFRESH_ERRORS
+
+
 class TestHealedStrikeUnblocksFetching:
     """Review finding 5: a fingerprint-healed strike must also unblock
     fetch eligibility, not just the display — the collector clears the
@@ -10718,7 +10917,7 @@ class TestStashReaderUnreadableVsAbsent:
             "DEFECT: an unreadable stash entry made adoption fall through "
             "and POST the spent generation it was supposed to replace"
         )
-        assert out.error == "transient", (
+        assert out.error == "stash-unreadable", (
             f"unreadable stash entry -> error={out.error!r}; the entry is "
             "the only copy of the live credential, so the gate must defer, "
             "never report the spent-generation POST's invalid_grant"

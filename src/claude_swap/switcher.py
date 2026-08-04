@@ -189,6 +189,10 @@ ERROR_NOTES = {
     "consume-busy": (
         "another cswap surface holds the slot — retries next pass"
     ),
+    "stash-unreadable": (
+        "this slot's stashed successor is unreadable — unlock the keychain "
+        "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -2052,9 +2056,30 @@ class ClaudeAccountSwitcher:
                 # failed: if the store still holds the generation that
                 # successor superseded, writing it back IS the pending
                 # persist — and saves consuming a grant at all.
-                adopted_creds = self._adopt_stashed_successor(
-                    account_num, email, current
-                )
+                try:
+                    adopted_creds = self._adopt_stashed_successor(
+                        account_num, email, current
+                    )
+                except CredentialReadError:
+                    # The slot's only successor is unreadable. Deferring is
+                    # right -- the bytes are the SOLE copy of a generation
+                    # this slot already consumed, and nothing on disk tells
+                    # "locked for a minute" from "locked forever", so
+                    # retiring on a strike count or an age bound would
+                    # destroy a live refresh token every time the cause was
+                    # merely slow. What must not stay is the LABEL: the
+                    # generic handler below degrades this to "transient",
+                    # which the tick renders as "could not freshen any
+                    # candidate (network?)" -- sending the operator to check
+                    # a connection that is fine, forever, on a condition
+                    # only they can clear (unlock the Keychain, fix the
+                    # mode, remount the volume) or drop
+                    # (`cswap unclaimed --purge`).
+                    self._logger.info(
+                        "Account %s's stashed successor is unreadable; "
+                        "deferring the refresh.", account_num, exc_info=True,
+                    )
+                    return oauth.RefreshOutcome(None, "stash-unreadable")
                 if adopted_creds is not None:
                     current = adopted_creds
                 refresh_input = current or snapshot
