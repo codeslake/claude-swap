@@ -117,8 +117,12 @@ RECOVERY_HYSTERESIS_S = 300.0
 
 # Horizon past which a sooner reset stops being worth real headroom. The escape
 # above was measured on minutes-scale resets; days-scale is the opposite trade,
-# since neither account returns within the session. 4h covers a whole 5-hour
-# cycle, so same-day resets keep the recovery ranking.
+# since neither account returns within the session. 4h keeps most of a 5-hour
+# cycle on the recovery ranking: a 5h window can be up to 5h from resetting, so
+# a peer bound by one that is 4h-5h out falls back to headroom ranking instead.
+# Deliberately the conservative side of that boundary -- ranking by headroom
+# where the reset is still an hour away costs at most one extra move, while a
+# wider horizon would rank by a reset the session may never see.
 RECOVERY_HORIZON_S = 4 * 3600.0
 
 # Anti-flap margin on the headroom axis, as a RATIO rather than percentage
@@ -1384,6 +1388,7 @@ class AutoSwitchEngine:
                 kw["active_headroom"],
                 recovered,
                 kw["settings"],
+                kw["current"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1630,6 +1635,7 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         recovered: bool,
         settings: AutoSwitchSettings,
+        current: str | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1644,6 +1650,24 @@ class AutoSwitchEngine:
         SCOPED like every sibling gate — `at-limit` and `failover` skip the
         anti-flap gates by design. Unscoped this stranded a 2-account fleet on
         an exhausted active with the peer at 0%.
+
+        AND SCOPED TO THE ENGINE'S OWN LANDING (`lastSwitchTo == current`).
+        The bar refuses to undo THIS ENGINE'S last move; once the user
+        switches by hand the engine is no longer sitting where it put itself
+        and that move is already undone, so the bar protects nothing and
+        merely withholds the fleet's best account. Reproduced: engine 1 -> 2,
+        user 2 -> 3 by hand, account 1 on 4 pts still barred against an
+        active on 2, every reset far out, no release leg reachable — the
+        `not recovered` return below fires before the ratio leg is read, and
+        `recovered` is False because account 1 was 4 pts at departure too.
+        The engine then holds the worse account until the at-limit escape.
+        Both sides are `str`-normalised: `lastSwitchTo` is a `str` from
+        `_perform` and `lastSwitchFrom` an `int` from `account_ref`. A state
+        record written before `lastSwitchTo` existed has no such key and
+        cannot prove the engine moved away, so it KEEPS the bar — the same
+        conservative reading this module gives every other missing field, and
+        the only one that does not silently drop the anti-flap bound for an
+        upgrade cycle.
 
         RELEASED when the account we left now beats us by the same ratio the
         anti-flap margin uses: that is not the flip this bars, it is a move the
@@ -1691,6 +1715,16 @@ class AutoSwitchEngine:
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
             return None
+        # Only while we are still standing where that switch put us. A manual
+        # switch away already undid the move, so there is nothing left to
+        # refuse to undo. `str` on both sides: `lastSwitchTo` is written from
+        # `_perform`'s `number: str`, `lastSwitchFrom` from `account_ref`'s
+        # `number: int`, and an int/str mismatch here would disarm the bar
+        # everywhere rather than only after a hand switch.
+        landed_on = state.get("lastSwitchTo")
+        if landed_on is not None and current is not None:
+            if str(landed_on) != str(current):
+                return None
         # No membership check on `oauth_candidates`: the loop compares
         # `num == no_return` while iterating that same list, so naming an
         # account that is not in it bars nothing. The check was a no-op and
@@ -1707,10 +1741,10 @@ class AutoSwitchEngine:
                 settings is not None
                 and left_headroom > 100.0 - settings.threshold
             ):
-                # F6 (round-6 review): an unreadable active must not be
-                # silently scored as "the peer does not beat it" -- same
-                # landing-eligible fallback `_left_account_recovered` uses
-                # when it, too, has no active to compare against.
+                # An unreadable active must not be silently scored as "the
+                # peer does not beat it" -- same landing-eligible fallback
+                # `_left_account_recovered` uses when it, too, has no active
+                # to compare against.
                 return None
         return barred
 
@@ -1740,11 +1774,11 @@ class AutoSwitchEngine:
         target that did nothing.
 
         FAILOVER FIRST, before any leg reads the active — checked ahead of
-        dominance because round 5 put dominance first and it starved this
-        branch: `test_a_failover_departure_does_not_disarm_the_bar` broke on
-        its FIRST tick the instant the active fell far enough for `4.0 >
-        active x 2` to go true (measured at active=1.8, one fifth of a point
-        past the boundary this branch's own sibling test already sits on).
+        dominance, because dominance-first starves this branch:
+        `test_a_failover_departure_does_not_disarm_the_bar` broke on its
+        FIRST tick the instant the active fell far enough for `4.0 > active
+        x 2` to go true (measured at active=1.8, one fifth of a point past
+        the boundary this branch's own sibling test already sits on).
         A `(None, None)` snapshot means severity was genuinely unmeasured at
         departure — there is no `leftHeadroom` to diff against and never was
         — so the two signals that do not depend on the active's LIVE state
@@ -1753,30 +1787,30 @@ class AutoSwitchEngine:
         accept this as a landing spot" test `_rank_candidates` already runs
         (`:1617`) on every candidate, reused rather than inventing a fresh
         constant; and (2), when the landing floor cannot answer, whether the
-        peer's own binding reset is meaningfully sooner than the active's
-        (C1, round-6 review). The landing floor is the exact complement of
-        `_every_account_above_threshold`, so it is UNSATISFIABLE whenever the
+        peer's own binding reset is meaningfully sooner than the active's.
+        The landing floor is the exact complement of
+        `_every_account_above_threshold`, so it is UNSATISFIABLE whenever
+        the
         fleet is all-spent — the recovery leg is what keeps the hold from
         becoming unconditional in exactly that regime. Neither leg can tell
         "genuinely recovered" from "was already this good" — there is
-        nothing recorded to tell them apart — so R-A and R-B collapse onto
-        the same answer here. Measured which side the landing floor should
-        land on: MREL-sweeping this same leg for the ordinary path (round 5
-        review, F3) showed an absolute floor is silently reintroducible with
-        a green suite, so this is not free of that risk either — the
+        nothing recorded to tell them apart. Measured which side the landing
+        floor should land on: sweeping mutations of this same leg for the
+        ordinary path showed an absolute floor is silently reintroducible
+        with a green suite, so this is not free of that risk either — the
         difference is this constant is `settings.threshold`, not a
-        hardcoded number, so a user's OWN policy decides how conservative
-        the hold is, and it moves when they change it (pinned directly,
-        below). Deliberately MORE conservative than the ordinary path below:
-        a peer sitting at 4 points held through the whole walk that broke
-        round 5's dominance leg, with no upper bound short of the peer
-        crossing the threshold itself OR its binding reset pulling
-        meaningfully ahead of the active's. Bounded, not permanent —
-        at-limit still escapes untouched (`_no_return_account` scopes this
-        trigger out entirely), and the recovery leg means the bound is no
-        longer just "the active reaches its own hard limit" (round-6
-        review, C1/M4): a peer that resets first releases the hold on its
-        own schedule, without the active ever needing to burn down to it.
+        hardcoded number, so a
+        user's OWN policy decides how conservative the hold is, and it moves
+        when they change it (pinned directly, below). Deliberately MORE
+        conservative than the ordinary path below: a peer sitting at 4 points
+        held through the whole walk that broke a bare dominance leg, with no
+        upper bound short of the peer crossing the threshold itself OR its
+        binding reset pulling meaningfully ahead of the active's. Bounded,
+        not permanent — at-limit still escapes untouched
+        (`_no_return_account` scopes this trigger out entirely), and the
+        recovery leg means the bound is no longer just "the active reaches
+        its own hard limit": a peer that resets first releases the hold on
+        its own schedule, without the active ever needing to burn down to it.
 
         THE ORDINARY PATH HAS A REAL BASELINE (`leftHeadroom` is a number,
         not null), so it gets three legs, checked in this order, each with
@@ -1793,9 +1827,9 @@ class AutoSwitchEngine:
                       was left, and self-improvement against its own
                       departure baseline never fires for an account that had
                       nothing to improve on. The `+SPENT_HEADROOM_PCT` on top
-                      of the bare ratio is what round 5 was missing: measured
-                      on the branch's own flap fleet (peer frozen 4.0 pts,
-                      active burning 98.0% -> 98.4%), the bare ratio flips
+                      of the bare ratio is what the bare ratio misses:
+                      measured on this branch's own flap fleet (peer frozen
+                      4.0 pts, active burning 98.0% -> 98.4%), it flips
                       true at active=1.8 pts purely because the active kept
                       burning; the same walk with the margin added stays
                       false through active=1.6 and only opens once the active
@@ -1823,11 +1857,11 @@ class AutoSwitchEngine:
         """
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
-            # M2 (round-6 review): this return value is unreachable through
-            # `_no_return_account`, the only caller -- it returns `None` at
-            # its own `came_from is None` check before `recovered` is ever
-            # read. Kept `True` (not load-bearing) so a future direct caller
-            # gets "no evidence, release" rather than a silent hold.
+            # Unreachable through `_no_return_account`, the only caller: it
+            # returns `None` at its own `came_from is None` check before
+            # `recovered` is ever read. Kept `True` (not load-bearing) so a
+            # future direct caller gets "no evidence, release" rather than a
+            # silent hold.
             return True
         barred = str(came_from)
         if "leftHeadroom" not in state:
@@ -1835,10 +1869,10 @@ class AutoSwitchEngine:
         h = headroom.get(barred)
         left_headroom = state.get("leftHeadroom")
         left_recovery = state.get("leftRecoveryAt")
-        # I-B (R8 review): a `consume-first` departure can ALSO write
-        # (None, None) -- the same shape a real failover writes -- whenever
-        # the phase-2 refetch's active row is unmeasurable for headroom but
-        # still has a known weekly reset (the split shape `oauth.
+        # A `consume-first` departure can ALSO write (None, None) -- the
+        # same shape a real failover writes -- whenever the phase-2 refetch's
+        # active row is unmeasurable for headroom but still has a known
+        # weekly reset (the split shape `oauth.
         # build_usage_result` emits for `utilization: null` plus a
         # `resets_at`). Inferring "failover" from the two nulls then ran the
         # more permissive failover legs (landing floor + recovery-only) on
@@ -1859,9 +1893,9 @@ class AutoSwitchEngine:
             # not absence of evidence, and there is no baseline to diff
             # against (that is exactly what "unmeasured" means), so this
             # cannot use the active's HEADROOM at all -- see docstring for
-            # why that is what round 5 got wrong and the walk that proved
-            # it. Two legs, both read-only against CURRENT state (no
-            # departure baseline exists to diff against):
+            # why reading the active's headroom here is wrong, and the walk
+            # that proved it. Two legs, both read-only against CURRENT state
+            # (no departure baseline exists to diff against):
             #
             #   landing   `h > 100 - settings.threshold` -- would the
             #             ranking accept this peer as a landing spot right
@@ -1871,16 +1905,16 @@ class AutoSwitchEngine:
             #             `_recovery_is_useful` switches to once headroom
             #             stops being informative. Needed because `landing`
             #             is the exact complement of `_every_account_above_
-            #             threshold` (C1, round-6 review): whenever the
-            #             fleet is all-spent, `landing` is unsatisfiable by
-            #             construction, no matter how soon the peer's own
+            #             threshold`: whenever the fleet is all-spent,
+            #             `landing` is unsatisfiable by construction, no
+            #             matter how soon the peer's own
             #             window resets, and that regime is precisely where
             #             the recovery axis is the one the engine trusts.
             #
             # Burn cannot fake the recovery leg: a reset moves nearer only
             # when a nearer window starts binding, never as a side effect
-            # of the active spending down (round 5's failure mode, guarded
-            # against directly by `MF-round5` in the mutation table).
+            # of the active spending down -- the failure mode a bare
+            # dominance leg has, guarded directly in the mutation table.
             if h is not None and h > 100.0 - settings.threshold:
                 return True
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
@@ -1891,20 +1925,20 @@ class AutoSwitchEngine:
             # `resets_at`, or a stale/past `resets_at`). Reading `inf` as
             # "never" here made `peer < inf - HYST` true for ANY finite
             # peer reset, releasing onto a peer arbitrarily far out on no
-            # evidence (R7 review, C-1). `math.isfinite` requires the
-            # active to have a genuine, known reset before the comparison
-            # even runs -- unknown holds, exactly like unreadable already
-            # does on the headroom axis (F6).
+            # evidence. `math.isfinite` requires the active to have a
+            # genuine, known reset before the comparison even runs --
+            # unknown holds, exactly like unreadable already does on the
+            # headroom axis.
             #
             # But two of the five `inf` states are ordinary shapes for an
             # active that is plainly alive and burning -- a `pct` reported
             # with no `resets_at`, or a `resets_at` already elapsed -- not
-            # unknowns (R8 review, I-A). Reading all five as "unknown, hold"
-            # pins the engine on a near-spent active for up to a full window
-            # even when the peer is back within `RECOVERY_HORIZON_S`, the
+            # unknowns. Reading all five as "unknown, hold" pins the engine
+            # on a near-spent active for up to a full window even when the
+            # peer is back within `RECOVERY_HORIZON_S`, the
             # same constant this PR already uses for "near enough to
             # matter" (`_recovery_is_useful`). Requiring EITHER a known
-            # active reset OR a peer inside that horizon keeps C-1's
+            # active reset OR a peer inside that horizon keeps `isfinite`'s
             # intended release (a known active vs. an arbitrarily-far peer
             # still needs `isfinite`) while letting a near peer through
             # regardless of why the active's own reset reads `inf`.
@@ -1922,9 +1956,9 @@ class AutoSwitchEngine:
         # its own baseline and would stall on self-improvement alone despite
         # dominating throughout.
         #
-        # `active_headroom is None` (F6, round-6 review) means "we could not
-        # read the active this tick" -- reachable through the consume-first
-        # two-phase commit, which reassigns `active_headroom` from a fresh
+        # `active_headroom is None` means "we could not read the active this
+        # tick" -- reachable through the consume-first two-phase commit,
+        # which reassigns `active_headroom` from a fresh
         # refetch without re-classifying the trigger. That is a DIFFERENT
         # state from "readable, but does not dominate" and must not answer
         # the same way: fall back to the landing-eligible test the failover
@@ -1932,8 +1966,8 @@ class AutoSwitchEngine:
         # either, rather than silently treating "unreadable" as "no
         # dominance".
         #
-        # DEFENSIVE, not currently outcome-changing (I-2, R7 review):
-        # measured exhaustively, `active_headroom=None` on this path closes
+        # DEFENSIVE, not currently outcome-changing: measured exhaustively,
+        # `active_headroom=None` on this path closes
         # BOTH of `_rank_candidates`'s gates before this leg is ever asked
         # (`_every_account_above_threshold` is False on a None active, and
         # the consume-first `active_reset_ts` gate is None too), so no
@@ -1941,7 +1975,8 @@ class AutoSwitchEngine:
         # outcome. Kept because the call IS reachable (confirmed via the
         # phase-2 refetch) and a future change to those gates could make it
         # live without anyone revisiting this function -- silently reading
-        # None as "no dominance" would then be exactly F6's original bug.
+        # None as "no dominance" would then be exactly the bug the
+        # unreadable-active fallback was added for.
         if h is not None:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
@@ -2420,10 +2455,10 @@ class AutoSwitchEngine:
             state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
             state["leftHeadroom"], recovery = left
             state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
-            # I-B (R8 review): a `consume-first` phase-2 refetch can write the
-            # SAME (None, None) shape a `failover` departure writes, whenever
-            # the refetched active row has a `pct` but is otherwise
-            # unmeasurable in the same tick its weekly reset is known --
+            # A `consume-first` phase-2 refetch can write the SAME (None,
+            # None) shape a `failover` departure writes, whenever the
+            # refetched active row has a `pct` but is otherwise unmeasurable
+            # in the same tick its weekly reset is known --
             # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
             # needs only `resets_at`. Inferring the trigger from the two
             # nulls then runs the wrong legs. Record it directly so the

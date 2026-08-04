@@ -11,11 +11,18 @@ identity for up to a full hour — pausing does not restore headroom early,
 and earlier "refill rate" estimates were artifacts of measuring while
 saturated.
 
-The identity is the **account/org, not the access token** (corrected
-2026-07-28: a freshly minted token was blocked 135 s after issue, which a
-per-token counter cannot produce). So re-authenticating does not clear a
-block, and two machines holding different tokens for one account share one
-budget — which is what ``POST_429_BACKOFF_MULT`` below exists to converge.
+What that identity is depends on which 429 regime the org is on — the two
+regimes coexist across orgs (see the Retry-After discussion in
+``usage_store``). Under the fixed-deadline regime it is the **account/org**
+(measured 2026-07-28: a freshly minted token was blocked 135 s after issue,
+which a per-token counter cannot produce). Under the saturated-edge
+(``Retry-After: 0``) regime it is the **access token** (measured 2026-07-29,
+probe4: at saturation, a freshly minted token of the same lineage was
+admitted while the old token stayed blocked, requests interleaved). Plan for
+the account-scoped case — it is the conservative one: re-authenticating
+cannot be relied on to clear a block, and two machines holding different
+tokens for one account may share one budget, which is what
+``POST_429_BACKOFF_MULT`` below exists to converge.
 
 Error bars: the horizon is bracketed to ~55-64 minutes from a single
 transition event, the exact edge algorithm (likely a Cloudflare
@@ -115,17 +122,18 @@ EDGE_BACKOFF_S = 300.0
 POST_429_MIN_INTERVAL_S = 360.0
 RECENT_429_WINDOW_S = 3600.0
 
-# AIMD on a contended account. The budget is shared across every machine
-# polling the same account (being account-scoped, a machine with its own token
-# is no less a competitor), none of them can see the others, and the endpoint
+# AIMD on a contended budget. The budget is shared across every machine
+# polling the same account (under the account-scoped regime a machine with its
+# own token is no less a competitor — see the module docstring on scope),
+# none of them can see the others, and the endpoint
 # exposes no remaining-request count — only a Retry-After once already
 # blocked. So while 429s recur, each successful poll multiplicatively grows the
 # interval (×POST_429_BACKOFF_MULT) toward POST_429_MAX_INTERVAL_S — wider than
 # the normal candidate ceiling so several machines can each back off far enough
 # that their combined rate fits under the budget. Movement (a real success run
 # with no recent 429) decays it back down. This is TCP-style congestion control:
-# a token gets fair-shared by reaction alone, with no machine count or shared
-# state to configure.
+# the budget gets fair-shared by reaction alone, with no machine count or
+# shared state to configure.
 POST_429_BACKOFF_MULT = 1.5
 POST_429_MAX_INTERVAL_S = 1800.0
 

@@ -91,8 +91,9 @@ def _live_claim(
 TRUST_MAX_AGE_S = 3600.0
 
 # A usage-endpoint 429 is a polling throttle, not a change in the account's
-# real model quota: the endpoint budgets *usage requests* per account (see
-# poll_policy), independent of the 5h/7d limits it reports. It does NOT move
+# real model quota: the endpoint budgets *usage requests* (scope is
+# regime-dependent; see poll_policy), independent of the 5h/7d limits it
+# reports. It does NOT move
 # the account's real windows, and usage only rises within a window (monotone
 # until the window resets), so last_good is a valid lower bound on the true
 # usage right up to that reset. Trust it until then — data-driven, not a fixed
@@ -805,9 +806,9 @@ def _failure_backoff_s(
     #     unclipped   1.00 requests (worst  1)    1406s
     #
     # Worse on both axes, because the usage endpoint's 429 is a REQUEST-RATE
-    # block, not a quota-window one: `poll_policy` measured ~28-30 requests per
-    # trailing hour per account, where "capacity returns only as old requests
-    # age out". A 5h/7d/scoped reset is a different axis and cannot lift it,
+    # block, not a quota-window one: `poll_policy` measured ~28-30 requests
+    # per trailing hour per budget identity, where "capacity returns only as
+    # old requests age out". A 5h/7d/scoped reset is a different axis and cannot lift it,
     # while every extra retry is itself a request in that trailing hour — so
     # the retries push out the very horizon they are retrying against.
     return max(asked, computed)
