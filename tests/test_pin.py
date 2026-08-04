@@ -1898,13 +1898,11 @@ class TestTheExtraIsGatedByOneFloorOnly:
         assert "not available on Windows" in out, out
 
 
-class TestARound2Regressions:
-    """The seven from review round 2. Each drives the seam, not a stub.
-
-    The shape they share: an action reported as done while the state it claims
-    to have changed is unchanged. A return value cannot carry that — "nothing
-    to do" and "could not do it" collapse into the same False — so each of
-    these re-reads the thing it just claimed.
+class TestAnActionReportedDoneMustReReadWhatItChanged:
+    """An action reported as done while the state it claims to have changed is
+    unchanged. A return value cannot carry that — "nothing to do" and "could
+    not do it" collapse into the same False — so each of these re-reads the
+    thing it just claimed. Each drives the seam, not a stub.
     """
 
     def _cli(self, tmp_path, impl_src, argv_account=None, clear=False, wired=True):
@@ -2195,9 +2193,10 @@ class TestTheVerdictIsSharedNotDuplicated:
         )
 
 
-class TestTheUncoveredRound2Fixes:
-    """Two round-2 fixes survived reversion green. A guard nothing asserts is
-    a guard someone deletes."""
+class TestTheCliRendersABrokenPackageHonestly:
+    """A broken package must reach the user as advice, not a traceback, and
+    the advice must not promise more than the code does. A guard nothing
+    asserts is a guard someone deletes."""
 
     def test_the_cli_renders_a_broken_package_instead_of_a_traceback(self, tmp_path):
         import subprocess
