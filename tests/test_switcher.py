@@ -1792,7 +1792,7 @@ class TestActiveAccountRefresh:
         assert result.sentinel is None
         write_live.assert_called_once_with(self._REFRESHED)
 
-    def test_a_held_consume_lock_defers_the_active_refresh(
+    def test_a_held_credential_lock_defers_the_active_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
         """The active path may POST the slot's BACKUP grant, so it owes the
@@ -1810,8 +1810,28 @@ class TestActiveAccountRefresh:
         switcher = self._switcher(sample_sequence_data)
         holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
         assert holder.acquire(), "could not seed the contended lock"
+        # TWO THINGS WERE WRONG HERE AND THE SECOND HID BEHIND THE FIRST.
+        #
+        # 1. It paid the FileLock default (10s) in full — the slowest test in
+        #    the suite by 5x, 10.01s of a 61s run.
+        # 2. It never reached the gate it names. `consume_lock` lives in
+        #    `consume_backup_grant`; this drives `_fetch_active_usage`, which
+        #    hits an EARLIER gate first. Instrumented: the branch under test
+        #    was reached 0 times, and mutating `if not consume_lock.acquire()`
+        #    to `if False` left the test PASSING — on the original 10s version
+        #    too, so this is not a speedup artefact. It was spending ten
+        #    seconds proving something else.
+        #
+        # What it actually exercised is worth keeping (a held credential lock
+        # defers rather than POSTs), so that is what it now says, asserted
+        # through the log line that names it. The consume gate gets its own
+        # test below, driving `consume_backup_grant` directly.
+        real_init = FileLock.__init__
         try:
-            with patch.object(
+            def fast_init(self, lock_path, timeout=0.05):
+                real_init(self, lock_path, timeout)
+
+            with patch.object(FileLock, "__init__", fast_init), patch.object(
                 switcher, "_read_credentials", return_value=self._EXPIRED
             ), patch.object(
                 switcher, "_read_account_credentials", return_value=self._EXPIRED
@@ -1830,6 +1850,50 @@ class TestActiveAccountRefresh:
             "POSTed a backup grant while another consume held its lock"
         )
         assert result.sentinel == USAGE_TOKEN_EXPIRED
+
+    def test_a_held_consume_lock_defers_the_grant_post(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """THE gate the test above only claimed to cover.
+
+        `consume_backup_grant` owns `.consume-N.lock`, and the whole point is
+        that a second gate must not POST the same one-time-use grant while
+        another holds it: one POST wins, the loser gets invalid_grant, and the
+        strike lands on a live account.
+
+        Driven at `consume_backup_grant` directly. Reaching it through
+        `_fetch_active_usage` is what made the sibling test above miss —
+        an earlier credential-lock gate defers first, so the consume branch
+        was never entered at all (instrumented: 0 hits).
+        """
+        from claude_swap.locking import FileLock
+
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
+        assert holder.acquire(), "could not seed the contended lock"
+
+        real_init = FileLock.__init__
+
+        def fast_init(self, lock_path, timeout=0.05):
+            real_init(self, lock_path, timeout)
+
+        try:
+            with patch.object(FileLock, "__init__", fast_init), patch(
+                "claude_swap.oauth.try_refresh_oauth_credentials"
+            ) as mock_refresh:
+                out = switcher.consume_backup_grant(
+                    "1", "test@example.com", self._EXPIRED
+                )
+        finally:
+            holder.release()
+
+        mock_refresh.assert_not_called(), (
+            "POSTed the shared one-time grant while another consume held its lock"
+        )
+        assert out.error == "consume-busy", (
+            f"a contended consume must report its own kind, got {out.error!r}"
+        )
 
     def test_filelock_contention_defers_instead_of_raising(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
