@@ -76,6 +76,51 @@ fi
 if out=$("$CS" pin 2>&1 | head -3 | tr '\n' ' '); then say pin OK "$out"
 else say pin FAIL "$out"; fi
 
+# 4b. THE PIN IS RECORDED vs THE PIN IS SERVING. Check 4 reads the pin FILE and
+#     nothing else, so its line is byte-identical on a machine whose proxy is
+#     running and on one whose proxy is dead — measured on all three hosts at
+#     once, the same "Cloud account (RC/artifacts): <email>" while one of them
+#     had an EMPTY env block and no daemon. Sessions there go out UNPINNED,
+#     which is the designed degrade and not an outage, but a deploy report that
+#     cannot say it happened is the problem: three identical OK lines described
+#     two different worlds.
+#
+#     Asks the wiring, which is what a session actually reads: `env` in
+#     ~/.claude.json plus the `_cswapPinWiredKeys` receipt cswap writes beside
+#     it. Both must agree. A recorded pin with no wiring is REPORTED, not
+#     failed — an unpinned machine still runs, and a check that fails here
+#     would block every deploy to a host whose daemon is being repaired.
+wire=$("$py" - <<'PYEOF' 2>&1
+import json, os
+try:
+    d = json.load(open(os.path.expanduser("~/.claude.json")))
+except Exception as e:
+    print("UNREADABLE", e); raise SystemExit
+env = d.get("env") or {}
+keys = d.get("_cswapPinWiredKeys")
+proxy = env.get("HTTPS_PROXY", "")
+port = ""
+if "127.0.0.1:" in proxy:
+    port = proxy.rsplit(":", 1)[-1]
+if keys and proxy:
+    print("WIRED", port)
+elif keys or proxy:
+    # One half without the other: a teardown that stopped halfway leaves the
+    # config naming a dead port, which is worse than unpinned because every
+    # request dials it.
+    print("HALF", "keys=%s proxy=%s" % (bool(keys), bool(proxy)))
+else:
+    print("UNWIRED")
+PYEOF
+)
+case "$wire" in
+  WIRED*)      say pin-wired OK "serving on 127.0.0.1:${wire#WIRED }" ;;
+  UNWIRED)     say pin-wired OK "UNPINNED — no wiring, no daemon; sessions go out direct" ;;
+  HALF*)       say pin-wired FAIL "half-wired, requests dial a port nothing serves — ${wire#HALF }" ;;
+  UNREADABLE*) say pin-wired FAIL "~/.claude.json ${wire#UNREADABLE }" ;;
+  *)           say pin-wired FAIL "could not determine wiring (got: ${wire:-no output})" ;;
+esac
+
 # 5. The TUI's pin surface, not just the CLI's. Check 4 probes `cswap pin` and
 #    the daemon; BOTH stayed green through a cutover that deleted every pin
 #    feature from the TUI (measured: tui/ went from 29 cloud-refs and 8 pin
