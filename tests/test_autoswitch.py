@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -46,6 +47,17 @@ class FakeClock:
         self.now += seconds
 
 
+def _iso_at(epoch: float) -> str:
+    """An absolute epoch as the ISO-Z string a window's ``resets_at`` carries."""
+    from datetime import datetime, timezone
+
+    return (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 def _usage(pct: float, resets_at: str | None = None) -> dict:
     window: dict = {"pct": pct}
     if resets_at:
@@ -67,10 +79,29 @@ class EngineHarness:
 
     def __init__(self, temp_home: Path, **settings_kwargs):
         self.temp_home = temp_home
-        self.switcher = ClaudeAccountSwitcher()
-        self.switcher.platform = Platform.LINUX
-        self.switcher._setup_directories()
-        self.switcher._init_sequence_file()
+        # get_backup_root() (switcher.py) resolves via Path.home() on every
+        # platform (both its XDG branch and its legacy
+        # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
+        # but on LINUX/WSL, $XDG_DATA_HOME takes precedence over Path.home()
+        # when set (paths.py:102-106). Patching Path.home() alone is not a
+        # superset of patching $XDG_DATA_HOME alone: a developer/CI with
+        # XDG_DATA_HOME exported would have every EngineHarness's XDG branch
+        # resolve to that ONE ambient value regardless of Path.home(),
+        # aliasing all harnesses in the process onto one store (round-10
+        # review, I-1). Keep BOTH patches — neither mechanism dominates the
+        # other, and each covers the platforms/environments where the other
+        # is silent.
+        with (
+            patch("pathlib.Path.home", return_value=self.temp_home),
+            patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": str(self.temp_home / ".local" / "share")},
+            ),
+        ):
+            self.switcher = ClaudeAccountSwitcher()
+            self.switcher.platform = Platform.LINUX
+            self.switcher._setup_directories()
+            self.switcher._init_sequence_file()
         self.settings = AutoSwitchSettings(**settings_kwargs)
         self.events: list = []
         self.clock = FakeClock()
@@ -161,6 +192,117 @@ def harness(temp_home: Path) -> EngineHarness:
     h.seed(3, "c@example.com")
     h.make_live("a@example.com", 1)
     return h
+
+
+class TestEngineHarnessIsolation:
+    """Pins the guarantee `EngineHarness.__init__`'s per-instance isolation
+    exists for (see its docstring): two harnesses built against the SAME
+    `temp_home` must not resolve to the same store.
+
+    I2 (round-8 review): the prior form of this guard had no test that could
+    kill it — reverting the scoping left the full suite green (round-7's
+    `test_a_non_429_recorded_through_record_does_not_take_the_margin` no
+    longer depends on it; that test's premise now stands on its own
+    `record()` call). Without a test, a future cleanup could delete the
+    isolation silently, and the next multi-harness test would alias two
+    accounts' stores into one without any assertion noticing.
+
+    I2 (round-9 review): round-8's fix scoped isolation on `$XDG_DATA_HOME`,
+    which `get_backup_root()` only consults on LINUX/WSL (paths.py:101) — so
+    the guard's OWN skipif, added because the mechanism is genuinely absent
+    off Linux, also left the guard itself untested there (S2 mutation:
+    skip forced + scoping reverted, full suite SURVIVED). The aliasing it
+    guards against is real off Linux (direct probe: two harnesses on
+    distinct subtrees collapsed to one store under the legacy
+    ~/.claude-swap-backup path, and h1's seeded account silently became
+    h2's). `Path.home()` is honoured by get_backup_root() on EVERY platform
+    (both its XDG branch and its `get_legacy_backup_root()` fallback —
+    paths.py:101-108), so scoping there instead makes the guard, and this
+    test, load-bearing everywhere and lets the skipif be deleted.
+
+    A "distinct subtree" harness (`EngineHarness(temp_home / "h1")`, the
+    pattern this test and `decision_at()` in `TestAdaptiveScheduler` use)
+    supports ONLY `seed()` and other `backup_dir`-scoped switcher calls.
+    `Path.home()` is patched for `EngineHarness.__init__` only, not for the
+    harness's lifetime, so after construction it reverts to whatever the
+    ambient fixture set (the `temp_home` ROOT, not the subtree) — meaning
+    `switcher.home` (cached at construction, `switcher.py:272`) disagrees
+    with what any later `paths.*` call resolves. `make_live()` writes under
+    `self.temp_home` (the subtree) and raises `FileNotFoundError` there
+    (the subtree's `.claude/` is never created), and even if it didn't, the
+    file would land somewhere production's own path resolution would not
+    read. Do NOT call `make_live()` — or anything else that reads
+    `paths.*` after construction — on a subtree harness; build it on
+    `temp_home` directly instead (see `harness` fixture / `TestDecisionTable`).
+    """
+
+    @pytest.mark.parametrize(
+        "platform",
+        [Platform.LINUX, Platform.WSL, Platform.MACOS, Platform.WINDOWS],
+    )
+    def test_two_harnesses_on_one_temp_home_get_distinct_stores(
+        self, temp_home, monkeypatch, platform
+    ):
+        # Two DIFFERENT subtrees of the same temp_home, matching the
+        # existing multi-harness usage pattern (see decision_at() in
+        # TestAdaptiveScheduler) — EngineHarness scopes isolation off the
+        # exact temp_home argument it is given, not off a shared ambient
+        # one, so distinct subtrees are what the guard promises to keep
+        # separate. Parametrized over Platform.detect() (patched here, read
+        # once inside ClaudeAccountSwitcher() before the harness pins
+        # .platform = LINUX for the switcher's own runtime checks) so the
+        # guard is pinned on macOS/Windows CI too, not only whichever OS
+        # happens to run this suite.
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: platform))
+        h1 = EngineHarness(temp_home / "h1")
+        h2 = EngineHarness(temp_home / "h2")
+        assert h1.switcher.backup_dir != h2.switcher.backup_dir, (
+            f"both harnesses ({platform}) resolved to {h1.switcher.backup_dir} "
+            "— EngineHarness.__init__'s isolation is not doing its job, so "
+            "two harnesses alias each other's sequence.json/credentials/cache"
+        )
+
+        h1.seed(1, "a@example.com")
+        h2.seed(1, "z@example.com")
+        assert h1.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "a@example.com"
+        ), "h2's seed() bled into h1's store"
+        assert h2.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "z@example.com"
+        ), "h1's seed() bled into h2's store"
+
+    def test_two_harnesses_with_xdg_data_home_set_get_distinct_stores(
+        self, temp_home, monkeypatch
+    ):
+        """I-1 (round-10 review): round 9's `Path.home()` rescoping is NOT a
+        superset of round 8's `$XDG_DATA_HOME` scoping. `get_backup_root()`
+        gives `$XDG_DATA_HOME` precedence over `Path.home()` on Linux/WSL
+        (paths.py:101-107) -- so a developer/CI with `XDG_DATA_HOME` exported
+        still gets two harnesses colliding on ONE store, even though each
+        harness's `Path.home()` differs. The prior test above cannot see this
+        because the autouse `_isolate_real_home` fixture unconditionally
+        `delenv`s `XDG_DATA_HOME`, so it must be re-set here, after that
+        fixture has already run, to reproduce the defect at all.
+        """
+        monkeypatch.setattr(Platform, "detect", staticmethod(lambda: Platform.LINUX))
+        shared_xdg = temp_home / "shared-xdg"
+        monkeypatch.setenv("XDG_DATA_HOME", str(shared_xdg))
+        h1 = EngineHarness(temp_home / "h1")
+        h2 = EngineHarness(temp_home / "h2")
+        assert h1.switcher.backup_dir != h2.switcher.backup_dir, (
+            f"both harnesses collapsed onto {h1.switcher.backup_dir} with "
+            "XDG_DATA_HOME set -- Path.home() scoping alone does not "
+            "override XDG_DATA_HOME's precedence on Linux/WSL"
+        )
+
+        h1.seed(1, "a@example.com")
+        h2.seed(1, "z@example.com")
+        assert h1.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "a@example.com"
+        ), "h2's seed() bled into h1's store"
+        assert h2.switcher._get_sequence_data()["accounts"]["1"]["email"] == (
+            "z@example.com"
+        ), "h1's seed() bled into h2's store"
 
 
 class TestDecisionTable:
@@ -807,6 +949,494 @@ class TestAdaptiveScheduler:
         assert h.engine._unhealthy_ticks == 0
         assert "1" not in counts  # backoff respected
         assert sum(counts.values()) == 1  # baseline slot only, no escalate-all
+
+    def test_a_non_429_ask_is_bounded_at_its_own_trust_ceiling(
+        self, temp_home, monkeypatch
+    ):
+        """A non-429 ask passes through untouched below its own trust ceiling,
+        and is bounded AT it above — never left to park a row past the point
+        `entries()` already reads it unknown.
+
+        This test used to assert the opposite (`other == ask` at every ask up
+        to 20000, i.e. no bound at all — `test_a_non_429_ask_passes_through_
+        uncapped`). That was wrong: `_classify_usage_error` (oauth.py) parses
+        Retry-After for ANY HTTPError code, not just 429, and the usage
+        endpoint sits behind Cloudflare, which routinely emits Retry-After on
+        503s. A `503 Retry-After: 86400` parked a row 24h with no bound at
+        all — reproduced end-to-end, see the Blocker in review round 5 of PR
+        #197.
+
+        A LATER FIX bounded it at `RETRY_AFTER_FLOOR_CAP_S` (4500) —
+        reasoning "one ceiling for how long any ask can park a row" — but
+        that is the 429 arm's ceiling, not this one's: `entries()` reads a
+        non-429 row unknown once `TRUST_MAX_AGE_S` (3600) elapses past the
+        last success, so a non-429 ask between 3600 and 4500 parked the row
+        past its own trust for up to 900s (a regression against
+        upstream/main introduced by this PR, round 6 Blocker). The bound is
+        now `TRUST_MAX_AGE_S`, the ceiling this arm's trust actually uses.
+
+        Asks below the ceiling are asserted with `==`, not `<=`, so a
+        reintroduced blanket clamp to something shorter still fails this
+        test.
+        """
+        from claude_swap.usage_store import TRUST_MAX_AGE_S, _failure_backoff_s
+
+        for ask in (601.0, 3600.0):
+            other = _failure_backoff_s(1, ask, rate_limited=False)
+            assert other == ask, (
+                f"non-429 ask={ask:.0f} backs off {other:.0f}s — an ask below "
+                "the trust ceiling must pass through untouched"
+            )
+
+        for ask in (3601.0, 4500.0, 7200.0, 10_000.0, 20_000.0, 86_400.0, float("inf")):
+            other = _failure_backoff_s(1, ask, rate_limited=False)
+            assert other == TRUST_MAX_AGE_S, (
+                f"non-429 ask={ask} backs off {other}s, not the "
+                f"{TRUST_MAX_AGE_S:.0f}s trust ceiling — a non-429 Retry-After "
+                "can park a row past its own trust again"
+            )
+
+        # `float("inf")` and an overflow literal parse to the same IEEE inf
+        # via `_classify_usage_error`'s `float(raw.strip())` (oauth.py); both
+        # must land on the ceiling, never inf, or the row is wedged forever
+        # and the wedge survives a restart (json.dumps writes the
+        # non-standard `Infinity` literal).
+        assert _failure_backoff_s(1, float("1e400"), rate_limited=False) == (
+            TRUST_MAX_AGE_S
+        ), "a 1e400 ask (parses to inf) must be bounded, not left infinite"
+
+        # The margin still does its job where it was measured, and the 429
+        # arm's own bound (already at the cap) is unaffected by this change.
+        assert _failure_backoff_s(1, 3600.0, rate_limited=True) == 4500.0, (
+            "the hour-scale 429 margin was lost"
+        )
+        assert _failure_backoff_s(1, float("inf"), rate_limited=True) == 4500.0, (
+            "the 429 arm's own inf handling regressed"
+        )
+
+    def test_shortening_a_429_wait_cannot_move_when_the_row_goes_unknown(
+        self, temp_home
+    ):
+        """Un-pollable and unknown are independent axes, and this is why.
+
+        A previous round clipped the 429 wait to `min(earliest reset, fetchedAt
+        + ceiling) - now`, reading the row's remaining trust as a second
+        deadline the wait had to respect. The reasoning was that a wait running
+        past that instant leaves the row un-pollable AND unknown, which the
+        unhealthy-tick counter converts into a failover.
+
+        The blind window is real. Shortening the wait does not touch it.
+        `entries()` decides trust from `lastGood`/`fetchedAt`, and `record()`
+        writes both in the SUCCESS branch only — a 429 refreshes neither. So
+        the instant the row goes unknown is fixed by the last SUCCESSFUL fetch,
+        and no choice of backoff can move it by one second. A shorter wait only
+        samples that same instant more often, at one request each.
+
+        Asserted by driving two histories that differ ONLY in how long they
+        waited, and reading `decision_value()` at fixed, cadence-independent
+        instants either side of the window's own reset boundary — NOT by
+        polling in a loop and reporting the first sample that observes the
+        flip. A loop's report is only as precise as its own stride, so a
+        stride that happens to divide the reset boundary (1800 % 1800 == 0)
+        agrees with a finer one by coincidence, not because the mechanism was
+        exercised: pick a stride of 2000 instead of 1800 and the same true
+        mechanism reports a different (later, sampling-limited) instant,
+        making the comparison look broken when nothing moved. Checking the
+        same two fixed instants for every cadence removes the coincidence.
+        """
+        from datetime import datetime, timezone
+
+        from claude_swap.usage_store import FetchRecord
+
+        def _at(base, seconds):
+            return (
+                datetime.fromtimestamp(base + seconds, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        def decision_at(home, stride, checkpoint):
+            """`decision_value() is None`, landing the clock EXACTLY on
+            `checkpoint` (never overshooting it), having recorded a 429 every
+            `stride` seconds up to that point — so every cadence is sampled
+            at the identical absolute instant, not at "whenever the loop
+            happens to next check"."""
+            h = EngineHarness(home)
+            h.seed(1, "a@example.com")
+            store = h.switcher._usage_store
+            ids = {"1": ("a@example.com", "")}
+            t0 = h.clock.now
+            store.record({"1": FetchRecord(usage=_usage(50, _at(t0, 1800)))}, ids)
+            elapsed = 0.0
+            while elapsed < checkpoint:
+                store.record(
+                    {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ids
+                )
+                step = min(stride, checkpoint - elapsed)
+                h.clock.advance(step)
+                elapsed += step
+            assert h.clock.now - t0 == checkpoint  # landed exactly, not past it
+            return store.entries(ids)["1"].decision_value() is None
+
+        # A 37s stride and an 1801s one (effectively one big wait) do not
+        # share a divisor with 1800 or with each other, unlike the pre-fix
+        # pairing (1800 vs 1800) — a cadence that moved the lapse instant
+        # could no longer hide behind stride alignment.
+        for checkpoint, expect_unknown in ((1799.0, False), (1801.0, True)):
+            hammered = decision_at(temp_home / f"short{checkpoint}", 37.0, checkpoint)
+            honored = decision_at(temp_home / f"long{checkpoint}", 1801.0, checkpoint)
+            assert hammered == honored == expect_unknown, (
+                f"at +{checkpoint:.0f}s: hammered saw unknown={hammered}, "
+                f"honored saw unknown={honored}, expected {expect_unknown} — "
+                "the backoff cadence moved a deadline that belongs to the "
+                "last successful fetch"
+            )
+
+    def test_a_re_block_chain_spends_one_request_per_block(self, temp_home):
+        """A chain of blocks costs one request each, however long it runs.
+
+        This test used to assert `waited <= max(trust_left, floor)`, pinning a
+        clip that shortened each wait to the row's remaining trust. That bound
+        is satisfied by a wait of ZERO, and once the trust was spent the
+        `max(..., computed)` floor supplied one — turning each further block
+        into a burst of exponential-curve retries. What it called the
+        anti-hammer floor doing its job was the ask being discarded.
+
+        The budget is what a re-block chain actually threatens.
+        `poll_policy` measured ~28-30 requests per trailing hour, per ACCOUNT,
+        shared across every machine holding it. So the invariant is a request
+        count, not an interval: each block costs exactly one poll, and four
+        consecutive hour-long blocks cost four.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        store = h.switcher._usage_store
+        ids = {"1": ("a@example.com", "")}
+        t0 = h.clock.now
+
+        store.record({"1": FetchRecord(usage=_usage(50))}, ids)
+
+        polls = 0
+        for _ in range(4):
+            # One block: poll, get 429, honor the wait it hands back.
+            polls += 1
+            store.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ids
+            )
+            h.clock.now = store.entries(ids)["1"].backoff_until or 0.0
+
+        elapsed = h.clock.now - t0
+        assert polls == 4, f"{polls} requests for 4 blocks"
+        assert elapsed >= 4 * 3600.0, (
+            f"4 blocks of 3600s each elapsed only {elapsed:.0f}s — a wait was "
+            "cut short of the deadline the server actually gave"
+        )
+
+    def test_the_margin_is_not_traded_away_for_a_dead_scoped_window(self, temp_home):
+        """A scoped window that already ended the trust does not shorten the wait.
+
+        An earlier revision trimmed the ask back to the deadline here, on the
+        reasoning that parking past a dead trust bought blindness for nothing.
+        Measured, the trim never salvaged the trust — the row is unknown at
+        release either way (see
+        `test_a_429_wait_is_the_deadline_plus_the_margin`) — while landing on
+        the deadline re-blocks 20 of 35 times for a fresh hour (re-measured
+        2026-08-03, round 8; of 35, not 38 raw gaps — 3 are negative, not a
+        uniform mechanism (per-gap detail in the RETRY_AFTER_MARGIN_S
+        comment), excluded from both numerator and denominator).
+
+        So the wait stays deadline + margin whatever the scoped window says.
+        What the scoped window still decides is whether the row SERVES its
+        last_good, which `entries(models=...)` answers.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 14400)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 400000)},
+            "scoped": [{"name": "Fable", "pct": 60.0,
+                        "resets_at": _iso_at(t0 + 1800)}],
+        })}, ident)
+        st.record({"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident)
+        waited = st.entries(ident, models=("Fable",))["1"].backoff_until - t0
+        assert waited == 4500.0, (
+            f"waited {waited:.0f}s — the wait is the server's deadline plus "
+            "the margin, and a dead scoped window does not buy it back"
+        )
+
+    def test_an_expired_trust_does_not_turn_one_block_into_a_request_storm(
+        self, temp_home
+    ):
+        """Spent trust is not a licence to retry; the server's ask still governs.
+
+        The sibling tests all assert `waited <= trust_left`, which is the
+        direction that produced the defect: they are satisfied by a wait of
+        ZERO. Once the clip drove the wait below `computed`, the
+        `max(..., computed)` floor took over and returned the exponential
+        curve — capped at `BACKOFF_CAP_S = 600` — so a live 3600s
+        `Retry-After` became a 30s wait and the row re-polled through its own
+        block. Measured on the pre-fix form, a genuine 3600s block with the
+        5h window resetting 1800s in:
+
+            req       t  Retry-After  trust_left    wait
+              1       0         3600        1800    1800
+              2    1800         1800           0      60
+              3    1860         1740           0     120
+              4    1980         1620           0     240
+              5    2220         1380           0     480
+              6    2700          900           0     600
+              7    3300          300           0     600
+
+        Seven requests inside one block, against a ~28-30/hour budget SHARED
+        by every machine on the account, and the last retry lands at
+        deadline+300s — inside the +2..887s band `RETRY_AFTER_MARGIN_S` exists
+        to clear (re-measured 2026-08-03). Upstream spends two.
+
+        Every retry from #2 on is also un-pollable AND unknown, the exact state
+        the clip was added to prevent: `record()` writes `lastGood`/`fetchedAt`
+        in the SUCCESS branch only, so a 429 refreshes nothing and the row
+        stays unknown however often it is polled.
+
+        Asserts the request count and the landing offset, not `waited <=
+        trust_left` — a bound satisfied by retrying immediately cannot catch
+        this.
+        """
+        from claude_swap.usage_store import RETRY_AFTER_MARGIN_S, FetchRecord
+
+        block_s = 3600.0
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 1800)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 400000)},
+        })}, ident)
+
+        requests = 0
+        while h.clock.now - t0 < block_s and requests < 40:
+            requests += 1
+            # Retry-After counts down to a FIXED deadline: 40 of 41 measured
+            # blocks opened at exactly 3600 (re-measured 2026-08-03) and every
+            # machine in an episode reported the same one.
+            remaining = block_s - (h.clock.now - t0)
+            st.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=remaining)},
+                ident,
+            )
+            h.clock.now = st.entries(ident, models=("Fable",))["1"].backoff_until
+
+        landed = h.clock.now - t0
+        assert requests <= 2, (
+            f"{requests} requests inside one {block_s:.0f}s block — upstream "
+            "spends 2, and the usage endpoint's ~28-30/hour budget is shared "
+            "across every machine on this account"
+        )
+        assert landed >= block_s + RETRY_AFTER_MARGIN_S, (
+            f"the last retry lands at deadline+{landed - block_s:.0f}s, inside "
+            f"the +2..{RETRY_AFTER_MARGIN_S:.0f}s band where 20 of 35 measured "
+            "lapses re-blocked for a fresh hour"
+        )
+
+        # SECOND KILLING ASSERTION — the PARK BOUND itself.
+        #
+        # This test's own scenario asks exactly `block_s` = 3600s, where the
+        # margin arm's uncapped sum (3600 + 900 = 4500) coincidentally lands
+        # exactly ON `RETRY_AFTER_FLOOR_CAP_S`, so the loop above passes
+        # identically whether the PARK BOUND is applied or not — confirmed by
+        # mutation (removing the PARK BOUND entirely still leaves this test
+        # green; re-measured 2026-08-03: 9 tests in the full suite die
+        # without it, INCLUDING this test's own second assertion below — so
+        # "and this was not that test" no longer holds; the loop above is
+        # still one of the 9 that stays green without the bound, which is
+        # exactly why this second assertion earns its keep). An ask
+        # genuinely past the cap (4000s: 4000 + 900 = 4900, uncapped) is
+        # needed to tell the two apart.
+        from claude_swap.usage_store import (
+            RETRY_AFTER_FLOOR_CAP_S,
+            _failure_backoff_s,
+        )
+
+        past_cap_wait = _failure_backoff_s(1, 4000.0, rate_limited=True)
+        assert past_cap_wait == RETRY_AFTER_FLOOR_CAP_S, (
+            f"a 4000s ask (uncapped sum 4900s) waited {past_cap_wait:.0f}s, "
+            f"not the {RETRY_AFTER_FLOOR_CAP_S:.0f}s PARK BOUND — an ask "
+            "genuinely past the cap can park a row unboundedly again, the "
+            "same request-storm shape this test otherwise guards"
+        )
+
+    def test_the_trim_never_lands_inside_the_re_block_band(self, temp_home):
+        """A 429 wait must clear the WHOLE measured re-block band, not just
+        avoid landing inside a window sized by the very margin under test.
+
+        RETRY_AFTER_MARGIN_S is 900 because 20 of 35 measured lapses
+        re-blocked at +2s..+887s past their own deadline (re-measured
+        2026-08-03, round 8; "of 35" not "of 38": 3 of the 38 raw gaps are
+        negative — not a uniform mechanism (per-gap detail in the
+        RETRY_AFTER_MARGIN_S comment) — excluded from both numerator and
+        denominator), each earning a fresh hour. So `(deadline, deadline +
+        900)` — the MEASURED band, a literal, independent of whatever
+        `RETRY_AFTER_MARGIN_S` happens to be configured to — is the interval
+        a 429 wait must clear.
+
+        ROUND-7 FINDING: the previous form of this assertion compared
+        `waited` (which the code under test computed AS `3600 +
+        RETRY_AFTER_MARGIN_S`) against an upper bound of `3600.0 +
+        RETRY_AFTER_MARGIN_S` — the SAME margin constant on both sides. So
+        the upper edge of the band always equalled the wait itself, and
+        `x < x` is false for any margin, including 0 and 450 — the assertion
+        could not fail regardless of what the margin was set to. Mutation-
+        confirmed: `RETRY_AFTER_MARGIN_S = 0.0` and `= 450.0` both still
+        passed, and neutralising `oauth.relevant_windows` to always return
+        `[]` (removing the scoped-window mechanism entirely) also still
+        passed. Fixed here by comparing against `MEASURED_BAND_S`, a literal
+        that does not consume `RETRY_AFTER_MARGIN_S`.
+
+        The `for scoped in (3700, 4000, 4400)` loop that used to wrap this
+        assertion is deleted: `_failure_backoff_s` takes no window argument,
+        and the ONLY mechanism that ever made a scoped reset change the
+        computed wait — a trust-based clip against a soon-resetting window
+        — was removed in an earlier round (see `usage_store.py`'s "NO TRUST
+        TRIM AGAINST THE SERVER'S DEADLINE"). All three scoped values
+        therefore drove byte-identical `waited`; the loop exercised nothing
+        that differed between iterations. A single scoped window is kept
+        below (not swept) to confirm the record()->entries() round trip
+        still produces the deadline+margin wait with a live scoped binding
+        present, not to distinguish scoped values from each other.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        MEASURED_BAND_S = 900.0  # the measured re-block band; NOT RETRY_AFTER_MARGIN_S
+
+        h = EngineHarness(temp_home, model="Fable")
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 7200)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_at(t0 + 30 * 86400)},
+            "scoped": [{"name": "Fable", "pct": 60.0,
+                        "resets_at": _iso_at(t0 + 4000)}],
+        })}, ident)
+        st.record(
+            {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
+        )
+        waited = st.entries(ident, models=("Fable",))["1"].backoff_until - t0
+        assert waited >= 3600.0 + MEASURED_BAND_S, (
+            f"waited {waited:.0f}s, {waited - 3600:.0f}s past the deadline — "
+            f"short of the measured {MEASURED_BAND_S:.0f}s re-block band"
+        )
+
+    def test_a_re_block_chain_does_not_shorten_its_own_waits(self, temp_home):
+        """Every block waits deadline + margin, however deep into the chain.
+
+        A previous round rewrote this to `max(min(4500, trust_left), floor)`,
+        on the reasoning that the row's own trust shrinks as the chain runs and
+        a wait past it buys no data. The shrinking is real; acting on it is
+        what was wrong. The stored trust is not a second deadline the wait must
+        respect — see
+        `test_shortening_a_429_wait_cannot_move_when_the_row_goes_unknown` —
+        and clipping to it only drops later waits onto (or short of) the
+        server's deadline, which is the 21-of-36 re-block band this PR exists
+        to clear (re-measured 2026-08-03).
+
+        So the invariant is a constant again. The five-hour window here resets
+        at +16000 and the ceiling would bind at +7200, both well inside the
+        chain: a wait that honors neither is the point.
+        """
+        from claude_swap.usage_store import FetchRecord
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        t0 = h.clock.now
+        ident = {"1": ("a@example.com", "")}
+        st.record({"1": FetchRecord(usage={
+            "five_hour": {"pct": 50.0, "resets_at": _iso_at(t0 + 16000)},
+            "seven_day": {"pct": 0.0},
+        })}, ident)
+
+        for block in range(4):
+            st.record(
+                {"1": FetchRecord(error="http-429", retry_after_s=3600.0)}, ident
+            )
+            waited = st.entries(ident)["1"].backoff_until - h.clock.now
+            assert waited == 4500.0, (
+                f"block {block}: waited {waited:.0f}s, not the server's "
+                "3600s deadline plus the 900s margin — a later block traded "
+                "the margin away for trust it cannot salvage"
+            )
+            h.clock.advance(waited)
+
+    def test_a_non_429_recorded_through_record_does_not_take_the_margin(
+        self, temp_home
+    ):
+        """The call-site wiring, not just the helper.
+
+        Every other test of the `rate_limited` guard calls
+        `_failure_backoff_s` directly with an explicit keyword. Mutation-checked:
+        deleting `rate_limited=` from `record()` — so every 503/504 falls back
+        to the `True` default and takes the 429-only margin again — left the
+        whole suite green. `record()` is the only path production reaches, so
+        the guard was untested where it runs.
+
+        Drives a REAL success through `record()` first, so `last_good` and
+        `fetched_at` actually exist and are decision-trusted before the 503.
+        The round-3/round-4 defect this test previously carried recorded
+        neither (`last_good=None, fetched_at=None`) and asserted a trust
+        relationship that was never exercised — masked by `EngineHarness`
+        instances sharing one store (see its docstring), which supplied a
+        `lastGood` left behind by an earlier test in the same file even with
+        the success record deleted. Fixed at the harness level; this test's
+        premise assertion now genuinely depends on the record() call above
+        it, not on cross-test contamination.
+
+        The ask is chosen strictly between `TRUST_MAX_AGE_S` (3600) and
+        `RETRY_AFTER_FLOOR_CAP_S` (4500). Above `TRUST_MAX_AGE_S`, the
+        correct non-429 wiring clips the wait to `TRUST_MAX_AGE_S` (its own
+        trust ceiling, so a non-429 park never outlasts it — see the round-6
+        Blocker). The buggy wiring (defaulting to `rate_limited=True`) takes
+        the 429-only margin instead: `min(ask + 900, RETRY_AFTER_FLOOR_CAP_S)`
+        = 4500 for any ask at or above 3600. The two provably disagree (3600
+        vs 4500) for any ask in this range. `_classify_usage_error` parses
+        Retry-After for ANY HTTPError code, so a 503 carrying this Retry-After
+        is the reachable shape.
+        """
+        from claude_swap.usage_store import (
+            RETRY_AFTER_FLOOR_CAP_S,
+            TRUST_MAX_AGE_S,
+            FetchRecord,
+        )
+
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        st = h.switcher._usage_store
+        ident = {"1": ("a@example.com", "")}
+
+        st.record({"1": FetchRecord(usage=_usage(50))}, ident)
+        h.clock.advance(120.0)  # ages last_good, still well inside STALE_OK_S
+        premise = st.entries(ident)["1"]
+        assert premise.decision_value() is not None, "premise: last_good trusted"
+        t1 = h.clock.now
+
+        ask = (TRUST_MAX_AGE_S + RETRY_AFTER_FLOOR_CAP_S) / 2  # strictly between
+        st.record({"1": FetchRecord(error="http-503", retry_after_s=ask)}, ident)
+        entry = st.entries(ident)["1"]
+        waited = entry.backoff_until - t1
+        assert waited == TRUST_MAX_AGE_S, (
+            f"a non-429 backed off {waited:.0f}s, not its own trust ceiling "
+            f"{TRUST_MAX_AGE_S:.0f}s — it took the 429-only margin at the "
+            "record() call site"
+        )
 
     def test_all_exhausted_escalation_preserves_wider_plan(
         self, temp_home, monkeypatch
