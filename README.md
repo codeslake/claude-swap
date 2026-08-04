@@ -159,6 +159,8 @@ Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
+`cswap tui --auto` opens the auto-switch view **live**, for a TUI meant to keep running unattended — after a reboot, a deploy, or a tmux respawn it resumes switching instead of waiting in dry-run for a keypress. Only the flag does this: a bare `cswap tui` lands on the dashboard, and reaching the auto view from the menu watches without switching, so opening a view never starts moving accounts on its own. One live engine runs per machine — a second TUI still shows its dashboard but stays in dry-run and says so, since two engines decide independently and undo each other's switches.
+
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
 ### Refresh expired tokens
@@ -193,6 +195,7 @@ cswap unclaimed                 # List stashed credential entries (slot + why th
 cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
+cswap tui --auto                # Dashboard, opened on the auto-switch view, LIVE
 cswap upgrade                   # Upgrade claude-swap to the latest version
 cswap purge                     # Remove all claude-swap data
 ```
