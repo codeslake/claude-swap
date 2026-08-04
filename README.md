@@ -266,9 +266,12 @@ The pin keeps those on one account of your choosing while `cswap switch` / [`csw
 cswap pin 2          # Remote Control / artifacts → account 2
 cswap pin            # show the current pin
 cswap pin --clear    # remove it
+cswap pin --heal     # restart a pin proxy that died, or unwire it
 ```
 
 The pinned account is re-read per request, so re-pinning takes effect without restarting anything. The one thing a re-pin cannot move is a Remote Control session that is **already open** — the server fixed its owner when the session was created, so reconnecting inside it (`/rc` → Disconnect → `/rc`) is what moves it.
+
+If the pin's daemon dies, `.claude.json` keeps naming its dead port and every new session inherits it at boot — reach for `--heal` to restart the daemon, or, if it can't come back, remove the wiring so sessions fall back to what they had before the pin.
 
 Implemented in [cswap-pin](https://github.com/codeslake/cswap-pin), which the extra pulls in.
 
