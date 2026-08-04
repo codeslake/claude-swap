@@ -136,10 +136,18 @@ class TestListSessions:
     def test_missing_sessions_dir(self, tmp_path):
         assert list_sessions(tmp_path) == []
 
-    def test_corrupt_json(self, tmp_path):
+    @pytest.mark.parametrize(
+        "write_bad_file",
+        [
+            lambda p: p.write_text("not json{{{", encoding="utf-8"),
+            lambda p: p.write_bytes(b"\xff\xfe{\"pid\": 1}"),
+        ],
+        ids=["invalid_json", "invalid_utf8"],
+    )
+    def test_corrupt_session_file_is_skipped(self, tmp_path, write_bad_file):
         sessions_dir = tmp_path / "sessions"
         sessions_dir.mkdir()
-        (sessions_dir / "9999.json").write_text("not json{{{", encoding="utf-8")
+        write_bad_file(sessions_dir / "9999.json")
 
         result = list_sessions(tmp_path)
         assert result == []

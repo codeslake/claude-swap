@@ -108,7 +108,7 @@ def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
                 entrypoint=data.get("entrypoint", ""),
                 status=data.get("status"),
             ))
-        except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
             logger.debug("Skipping session file %s: %s", path, exc)
     return sessions
 

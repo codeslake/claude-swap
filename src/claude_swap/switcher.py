@@ -793,7 +793,13 @@ class ClaudeAccountSwitcher:
         if self._live_session_pids(account_num, email):
             from claude_swap.session import mark_session_stale
 
-            mark_session_stale(self._session_dir(account_num, email))
+            if not mark_session_stale(self._session_dir(account_num, email)):
+                self._logger.error(
+                    "Account %s's backup credentials changed but its live "
+                    "session profile could not be marked stale; it may keep "
+                    "serving the superseded generation once it exits.",
+                    account_num,
+                )
         else:
             self._invalidate_session_credentials(account_num, email)
 

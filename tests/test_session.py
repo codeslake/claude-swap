@@ -1397,22 +1397,95 @@ class TestGuards:
             "this slot inherits a stale flag nothing set for it"
         )
 
-    def test_backup_credential_write_leaves_live_profile_alone_but_marks_stale(
-        self, seeded_switcher
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    @pytest.mark.parametrize(
+        "denied, legacy_marker",
+        [
+            (True, True),
+            (True, False),
+            (False, True),
+        ],
+        ids=["denied_with_legacy_marker", "denied_no_marker", "writable_with_marker"],
+    )
+    def test_delete_session_profile_survives_a_denied_dir_with_legacy_marker(
+        self, seeded_switcher, denied, legacy_marker
     ):
+        """`clear_session_stale`'s legacy-location unlink is a CHILD of
+        the profile dir. The `rmtree(ignore_errors=True)` above it already
+        tolerates EACCES on that same dir -- `unlink` does not, so only the
+        COMBINATION (denied dir + a legacy marker inside it) raises, right
+        after `remove_account` has already deleted the credentials but
+        before it writes the roster."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / "x.txt").write_text("keep", encoding="utf-8")
+        if legacy_marker:
+            (session_dir / session_mod.STALE_MARKER).touch()
+        if denied:
+            session_dir.chmod(0o500)
+        try:
+            seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
+        finally:
+            if denied:
+                try:
+                    session_dir.chmod(0o700)
+                except OSError:
+                    pass
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    @pytest.mark.parametrize("marker_lands", [True, False])
+    def test_backup_credential_write_leaves_live_profile_alone_but_marks_stale(
+        self, seeded_switcher, caplog, marker_lands
+    ):
+        """The LIVE arm used to discard `mark_session_stale`'s return value, so
+        a marker that failed to land was reported to nobody -- the same
+        silent-fallback shape the non-live arm's own ERROR log exists to
+        avoid."""
+        import logging
+
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         make_live(session_dir)
         (session_dir / ".credentials.json").write_text("live session creds")
 
-        seeded_switcher._write_account_credentials(
-            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
-        )
+        if not marker_lands:
+            session_dir.parent.chmod(0o500)
+        try:
+            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+                seeded_switcher._write_account_credentials(
+                    ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+                )
+        finally:
+            if not marker_lands:
+                session_dir.parent.chmod(0o700)
 
-        # Live copy untouched, but flagged for re-bootstrap after exit.
+        # Live copy untouched either way.
         assert (session_dir / ".credentials.json").read_text() == "live session creds"
-        assert session_mod.is_session_stale(session_dir)
+
+        if marker_lands:
+            assert session_mod.is_session_stale(session_dir)
+            assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+        else:
+            assert not session_mod.is_session_stale(session_dir), (
+                "premise: the marker's own write target was denied"
+            )
+            assert any(
+                r.levelno >= logging.ERROR and ACCOUNT_NUM in r.getMessage()
+                for r in caplog.records
+            ), (
+                "the LIVE arm's failed marker was reported to nobody -- a "
+                "function that reports failure to nobody has not stopped "
+                "reporting success"
+            )
 
     def test_list_skips_refresh_for_live_session_accounts(
         self, seeded_switcher, monkeypatch
