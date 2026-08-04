@@ -2303,6 +2303,13 @@ class ClaudeAccountSwitcher:
         cur_fp = oauth.credential_fingerprint(current)
         if not cur_fp:
             return None
+        # A row that is merely unreadable THIS instant (locked keychain,
+        # transient EIO) must not abort the scan before a later, readable
+        # sibling on the same generation is tried (repeated persist-failures
+        # can stash more than one row against the same consumedFp). Remember
+        # it and keep scanning; only defer via CredentialReadError once no
+        # row adopted.
+        deferred_entry_id: str | None = None
         for entry_id, meta in self._store._read_stash_manifest().items():
             if meta.get("configSlot") != account_num:
                 continue
@@ -2335,15 +2342,26 @@ class ClaudeAccountSwitcher:
                 # through here would make the caller POST the slot's
                 # spent generation -- an unrecoverable invalid_grant on an
                 # account whose live credential is sitting right here,
-                # merely unreadable this instant. Raise into the caller's
-                # existing pre-consume exception handling, which already
-                # degrades to "transient" and defers to the next pass.
-                raise CredentialReadError(
-                    f"stash entry {entry_id} for account {account_num} is "
-                    "unreadable; deferring adoption rather than discarding "
-                    "its generation"
-                )
+                # merely unreadable this instant. Remember it and keep
+                # looking for a readable sibling on the same generation
+                # before giving up.
+                if deferred_entry_id is None:
+                    deferred_entry_id = entry_id
+                continue
             if not creds:
+                # ABSENT (unlinked bytes, matching manifest row) or CORRUPT
+                # (undecodable) -- either way the bytes are permanently gone,
+                # not merely inaccessible right now, so nothing can ever
+                # adopt this row. Retire it now: left alone it is rescanned
+                # on every gate pass and leaks in --json's
+                # unclaimedCredentials forever, the same accumulation the
+                # CAS-conflict branch above already retires on sight.
+                self._store._remove_unclaimed_credential(entry_id)
+                self._logger.info(
+                    "Retired account %s's unreadable-bytes stash entry: its "
+                    "generation is gone, so no pass could ever adopt it.",
+                    account_num,
+                )
                 continue
             self._write_account_credentials(account_num, email, creds)
             self._store._remove_unclaimed_credential(entry_id)
@@ -2353,6 +2371,17 @@ class ClaudeAccountSwitcher:
                 "stashed it.", account_num, meta.get("reason", "unknown"),
             )
             return creds
+        if deferred_entry_id is not None:
+            # No row on this generation adopted; the deferred one is the
+            # only copy of a generation this slot already consumed. Raise
+            # into the caller's existing pre-consume exception handling,
+            # which already degrades to "transient" and defers to the next
+            # pass rather than discarding that generation.
+            raise CredentialReadError(
+                f"stash entry {deferred_entry_id} for account {account_num} "
+                "is unreadable; deferring adoption rather than discarding "
+                "its generation"
+            )
         return None
 
     def _record_active_verdict(self, active) -> None:

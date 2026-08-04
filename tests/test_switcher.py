@@ -10787,6 +10787,102 @@ class TestStashReaderUnreadableVsAbsent:
             "temporarily inaccessible"
         )
         assert out.error == "invalid_grant"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD, (
+            "an unreadable/undecodable stash entry must never be written into "
+            "the slot: an empty adopt destroys the slot's credential, and "
+            "`refresh_input = current or snapshot` hides it from every "
+            "POST-side assertion"
+        )
+
+    def test_row_d_absent_entry_bytes_terminate_instead_of_deferring(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """ROW D: the manifest row survives (a crash between the unlink and
+        the manifest rewrite in ``_remove_unclaimed_credential``), but the
+        bytes are GONE. Unlike row A's momentarily-unreadable entry, no
+        retry can ever adopt them -- the gate must reach a terminal verdict
+        (POST the spent snapshot and report invalid_grant), not defer
+        forever the way an UNREADABLE entry correctly does."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._store._stash_entry_path(self._stash_successor(s)).unlink()
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._post_rejects_spent) as post:
+            out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert post.called, (
+            "an absent entry must not defer -- nothing can ever adopt bytes "
+            "that are already gone"
+        )
+        assert out.error == "invalid_grant"
+
+    def test_absent_entry_is_retired_not_rescanned_forever(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Minor 5: an ABSENT-bytes row has the same never-adoptable
+        property as a CAS-conflict entry, which is already retired at the
+        point of discovery (see the ``consume-gate-cas-conflict`` branch
+        above). Left un-retired, it is re-scanned on every gate pass and
+        leaks in ``--json``'s ``unclaimedCredentials`` forever,
+        indistinguishable from an entry still pending adoption."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._store._stash_entry_path(self._stash_successor(s)).unlink()
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._post_rejects_spent):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert not s.list_unclaimed_credentials(), (
+            "an absent-bytes stash entry must be retired once the gate "
+            "confirms it can never be adopted, the same way a CAS-conflict "
+            "entry already is"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_unreadable_row_does_not_starve_a_readable_sibling(
+        self, temp_home: Path, sample_sequence_data: dict,
+    ):
+        """Minor 2: two stash rows can share a ``consumedFp`` (repeated
+        persist-failures on the same generation stash more than once). An
+        unreadable row must not abort the whole manifest scan before a
+        later, readable, adoptable sibling on the same generation is
+        tried."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        unreadable_id = self._stash_successor(s)
+        entry_path = s._store._stash_entry_path(unreadable_id)
+        entry_path.chmod(0o000)
+        try:
+            # A second row on the SAME generation, readable, must still be
+            # reached and adopted despite the first row being unreadable.
+            second_id = s._store._write_unclaimed_credential(
+                self._NEW,
+                {"reason": "consume-gate-persist-lock-failed",
+                 "configSlot": "1",
+                 "consumedFp": oauth.credential_fingerprint(self._OLD),
+                 "fingerprint": oauth.credential_fingerprint(self._NEW)},
+            )
+            with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+                out = s.consume_backup_grant("1", "test@example.com", self._OLD)
+        finally:
+            entry_path.chmod(0o600)
+
+        assert not post.called, (
+            "a readable sibling on the same generation must be adopted "
+            "instead of POSTing the spent snapshot"
+        )
+        assert out.credentials == self._NEW, (
+            f"expected the readable sibling's credentials to be adopted, "
+            f"got {out.credentials!r} (error={out.error!r}) -- the "
+            "unreadable row starved the scan before the readable one was "
+            "reached"
+        )
+        assert second_id not in s.list_unclaimed_credentials()
 
 
 class TestSessionShellGuardCoversEveryMutator:
