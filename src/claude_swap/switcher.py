@@ -5627,13 +5627,12 @@ class ClaudeAccountSwitcher:
         # there is still something to unwire with.
         #
         # RE-READ, DO NOT TRUST THE BOOL. `clear_wiring` returns False both
-        # for "there was nothing to remove" and for "the lock was contended
-        # so this path was skipped", and swallows every per-path failure — so
-        # only `_wiring_present` can tell ABSENT from FAILED. Same shape as
-        # pin.clear_pin and pin.heal. A survivor is warned about and the purge
-        # continues, as it does for every other partial failure below: after
-        # this the user is the only one who can remove it, so the message has
-        # to name the file and the keys.
+        # for "there was nothing to remove" and for "the lock was contended so
+        # this path was skipped", and swallows every per-path failure, so only
+        # `_wiring_present` tells ABSENT from FAILED — as pin.clear_pin and
+        # pin.heal already do. A survivor warns and the purge continues, like
+        # every other partial failure below; after this the user is the only
+        # one who can remove it, so the message names the file and the keys.
         from claude_swap import pin as _pin
 
         if _pin.clear_wiring(self):
