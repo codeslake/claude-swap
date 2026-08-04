@@ -3005,7 +3005,7 @@ class ClaudeAccountSwitcher:
 
     def _reject_foreign_credential_capture(
         self, creds: str, email: str, org_uuid: str
-    ) -> None:
+    ) -> str:
         """Guard for ``add_account``: the stored token must be THIS account's.
 
         ``add_account`` reads the IDENTITY from ``.claude.json``'s
@@ -3044,7 +3044,7 @@ class ClaudeAccountSwitcher:
         """
         token = oauth.extract_access_token(creds)
         if not token:
-            return
+            return creds
         oauth_data = oauth.extract_oauth_data(creds)
         if oauth_data and oauth.is_oauth_token_expired(oauth_data.get("expiresAt")):
             # refresh_oauth_credentials already no-ops (no network) when there
@@ -3052,16 +3052,20 @@ class ClaudeAccountSwitcher:
             # dead" and "refresh attempt failed".
             refreshed = oauth.refresh_oauth_credentials(creds)
             if not refreshed:
-                return                  # unresolvable, not wrong
+                return creds                  # unresolvable, not wrong
             token = oauth.extract_access_token(refreshed)
             if not token:
-                return
+                return creds
+            # Accepting a rotated refresh token retires its predecessor
+            # server-side, so the bytes that were VERIFIED are the bytes to
+            # store -- the same reason session.py persists its refresh result.
+            creds = refreshed
         profile = oauth.fetch_oauth_profile(token)
         if not profile:
-            return                      # unresolvable, not wrong
+            return creds                      # unresolvable, not wrong
         seen = (profile.get("email") or "").strip()
         if not seen:
-            return                      # uuid-only resolution says nothing here
+            return creds                      # uuid-only resolution says nothing here
         same_email = seen.lower() == email.lower()
         if not same_email:
             raise ConfigError(
@@ -3074,10 +3078,10 @@ class ClaudeAccountSwitcher:
             )
         resolved_org = profile.get("organizationUuid")
         if resolved_org is None:
-            return                      # structurally absent -- unverifiable
+            return creds                      # structurally absent -- unverifiable
         seen_org = resolved_org.strip()
         if seen_org == (org_uuid or ""):
-            return
+            return creds
         # Same address, different org: naming the address twice says
         # nothing (it's the address that agrees) -- name the two
         # organizations that disagree instead.
@@ -3329,7 +3333,7 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
-            self._reject_foreign_credential_capture(
+            current_creds = self._reject_foreign_credential_capture(
                 current_creds, current_email, current_org_uuid
             )
 
@@ -3441,7 +3445,7 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
-        self._reject_foreign_credential_capture(
+        current_creds = self._reject_foreign_credential_capture(
             current_creds, current_email, current_org_uuid
         )
 
