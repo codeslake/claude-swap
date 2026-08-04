@@ -10,6 +10,7 @@ The probe is INSTRUMENTED: it prints the strike state it actually built, so a
 `sentinel=None` from never reaching the path cannot be mistaken for a fix.
 """
 import json
+import textwrap
 from pathlib import Path
 from unittest.mock import patch
 
@@ -20,7 +21,7 @@ from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.models import Platform
-from claude_swap.usage_store import FetchRecord as FR
+from claude_swap.usage_store import FetchRecord as FR, UsageEntry
 
 OLD = json.dumps({"claudeAiOauth": {"accessToken": "sk-old",
                                     "refreshToken": "rt-old", "expiresAt": 1000}})
@@ -76,3 +77,108 @@ def test_degraded_active_read_must_not_condemn_a_healed_slot(
     assert e.sentinel != USAGE_RELOGIN_REQUIRED, (
         "an already-healed active slot was condemned on a degraded read"
     )
+
+
+@pytest.mark.parametrize("degraded", [False, True],
+                         ids=["CONTROL-healthy", "PROBE-degraded"])
+def test_post_fetch_call_site_is_guarded_too(degraded):
+    """`_collect_usage_entries` calls `_entry_token_dead` TWICE: the pre-fetch
+    quarantine scan, and again after a fetch returns invalid_grant. The test
+    above runs with ``fetch=set()`` and so only ever reaches the first one.
+
+    Measured: dropping ``self._active_read_degraded`` from the SECOND call
+    site leaves the whole suite green (447 passed), while the same inputs
+    flip the verdict True<->False here. That mutant is not equivalent, it was
+    merely untested — a guard no test kills is one the next refactor removes.
+
+    Driven at the method, not through the collector: reaching the post-fetch
+    branch needs a granted claim plus a fetch that re-strikes, and a fleet
+    built by hand for it silently failed to claim the slot (strikes stayed 0),
+    which reads as a pass while never entering the branch.
+
+    NOTE, measured: this pins the GUARD, not the WIRING. Because it calls the
+    method directly it does not pass through either call site, so dropping
+    `self._active_read_degraded` from the post-fetch call still leaves it
+    green. `test_post_fetch_call_site_passes_the_flag` below is what kills
+    that mutant.
+    """
+    struck = oauth.credential_fingerprint(OLD)
+    s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+    # HEALED: the struck generation matches nothing stored any more.
+    s._read_account_credentials_ex = lambda num, email: (NEW, False)
+    entry = UsageEntry(auth_dead_strikes=1, struck_fingerprint=struck)
+
+    # OLD is what a DEGRADED read serves: the superseded generation, because
+    # Claude Code rotates keychain-only and the plaintext fallback lags.
+    verdict = ClaudeAccountSwitcher._entry_token_dead(
+        s, entry, "2", "b@example.com", OLD, True, degraded,
+    )
+    if degraded:
+        assert verdict is False, (
+            "a degraded read serving the struck generation condemned an "
+            "already-healed slot at the post-fetch call site"
+        )
+    else:
+        assert verdict is True, (
+            "CONTROL BROKEN: a healthy read of the struck generation must "
+            "still confirm dead, or this test cannot detect the guard"
+        )
+
+
+@pytest.mark.parametrize("degraded", [False, True],
+                         ids=["healthy", "degraded"])
+def test_unstruck_row_is_unaffected_by_the_degraded_flag(degraded):
+    """The guard must only narrow the STRUCK path. An unstruck row answers
+    False either way — the same invariant the docstring commits to."""
+    s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+    s._read_account_credentials_ex = lambda num, email: (NEW, False)
+    entry = UsageEntry(auth_dead_strikes=0,
+                       struck_fingerprint=oauth.credential_fingerprint(OLD))
+    assert ClaudeAccountSwitcher._entry_token_dead(
+        s, entry, "2", "b@example.com", OLD, True, degraded) is False
+
+
+def test_post_fetch_call_site_passes_the_flag():
+    """The post-fetch call site must actually HAND `_active_read_degraded` in.
+
+    The guard test above pins the method's behaviour but calls it directly,
+    so it cannot see a call site that forgot the argument — measured: with
+    only that test present, dropping the argument here left 451 passing.
+    A guard nothing kills is one the next refactor deletes.
+
+    Read from the source rather than driven through a fleet: reaching the
+    post-fetch branch for real needs a granted claim plus a re-striking
+    fetch, and every hand-built fleet for it so far failed to claim the slot
+    and reported a pass without ever entering the branch. What must hold is
+    structural — the argument is present at BOTH call sites — so that is
+    what is asserted, with the count as its own control.
+    """
+    import ast
+    import inspect
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    src = inspect.getsource(ClaudeAccountSwitcher._collect_usage_entries)
+    tree = ast.parse(textwrap.dedent(src))
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "_entry_token_dead"
+    ]
+    assert len(calls) == 2, (
+        f"_collect_usage_entries has {len(calls)} _entry_token_dead call "
+        "sites, not 2 — this test's premise moved; re-derive it rather than "
+        "loosening the count"
+    )
+    for i, call in enumerate(calls):
+        passed = [
+            a for a in call.args
+            if isinstance(a, ast.Attribute) and a.attr == "_active_read_degraded"
+        ] + [
+            k for k in call.keywords if k.arg == "active_read_degraded"
+        ]
+        assert passed, (
+            f"call site {i + 1} of _entry_token_dead does not pass "
+            "_active_read_degraded: a degraded active read will confirm a "
+            "dead verdict against possibly-stale bytes there"
+        )
