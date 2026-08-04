@@ -145,7 +145,7 @@ class TestMoveAccount:
         assert data["accounts"]["5"]["email"] == "account2@example.com"
 
     def test_move_failed_required_clear_aborts_commit(
-        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data: dict
     ):
         """A required clear of the target key is strict: if the stale material
         cannot actually be removed, the move must abort before committing
@@ -164,10 +164,15 @@ class TestMoveAccount:
                 raise OSError("permission denied (injected)")
             return real_unlink(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "unlink", failing_unlink)
-        with pytest.raises(CredentialError, match="aborting before commit"):
-            switcher.move_account("2", "5")
-        monkeypatch.undo()
+        # Scoped context, not the fixture's shared `monkeypatch`: that
+        # instance also carries the autouse colour/keychain/home scrubs, and
+        # `.undo()` on it would unwind those too (H-1) — restoring whatever
+        # FORCE_COLOR/NO_COLOR the developer's shell actually has exported
+        # for the rest of this test.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(Path, "unlink", failing_unlink)
+            with pytest.raises(CredentialError, match="aborting before commit"):
+                switcher.move_account("2", "5")
 
         # Metadata was never committed: the account is intact under its
         # original number and the stale key stays unreferenced.
@@ -212,7 +217,6 @@ class TestMoveAccount:
         temp_home: Path,
         sample_sequence_data: dict,
         block_real_keychain,
-        monkeypatch,
     ):
         """macOS with a locked Keychain: deletion raises and the normal
         verification read reports "" (unreadable == absent in the best-effort
@@ -230,12 +234,14 @@ class TestMoveAccount:
         def locked(*args, **kwargs):
             raise macos_keychain.KeychainError("keychain locked (injected)")
 
-        monkeypatch.setattr(macos_keychain, "get_password", locked)
-        monkeypatch.setattr(macos_keychain, "delete_password", locked)
-
-        with pytest.raises(CredentialError, match="aborting before commit"):
-            switcher.move_account("2", "5")
-        monkeypatch.undo()
+        # Scoped context: see the comment on the sibling test above (H-1) —
+        # `monkeypatch.undo()` on the fixture's shared instance would also
+        # unwind the autouse colour scrub.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(macos_keychain, "get_password", locked)
+            mp.setattr(macos_keychain, "delete_password", locked)
+            with pytest.raises(CredentialError, match="aborting before commit"):
+                switcher.move_account("2", "5")
 
         # Nothing committed; the stale item survived but stays unreferenced.
         data = switcher._get_sequence_data()
@@ -244,7 +250,7 @@ class TestMoveAccount:
         assert block_real_keychain.data[stale_key] == "stale-keychain"
 
     def test_move_metadata_failure_leaves_account_intact(
-        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data: dict
     ):
         """The sequence.json write is the commit point: if it fails, the
         account must remain fully usable under its original number — the old
@@ -261,10 +267,11 @@ class TestMoveAccount:
                 raise OSError("disk full (injected)")
             return real_write_json(self, path, data)
 
-        monkeypatch.setattr(ClaudeAccountSwitcher, "_write_json", failing_write_json)
-        with pytest.raises(OSError):
-            switcher.move_account("2", "5")
-        monkeypatch.undo()
+        # Scoped context: see H-1 comment above.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(ClaudeAccountSwitcher, "_write_json", failing_write_json)
+            with pytest.raises(OSError):
+                switcher.move_account("2", "5")
 
         assert (
             switcher._read_account_credentials("2", "account2@example.com")
