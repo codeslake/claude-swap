@@ -3012,9 +3012,48 @@ class TestHealNeverTearsDownAServingPin:
 
         assert not changed  # nothing was removed, and it must not claim so
         assert msg != "Nothing to heal", "reported health over a live outage"
-        assert "could not be removed" in msg, msg
+        # THE FULL SENTENCE, not the fragment. This is the only thing telling
+        # a user what to do when the pin's proxy died AND the config lock is
+        # held; nothing in the suite asserted it verbatim before this
+        # (`grep -c` for the sentence across both test files was 0), so a
+        # mutation to the string body survived unnoticed.
+        assert msg == (
+            "A cloud pin wiring points at a proxy that is gone, and it "
+            "could not be removed (the config is locked) — re-run "
+            "`cswap pin --heal`"
+        ), msg
         # The wiring really did survive — the message is describing reality.
         assert "_cswapPinWiredKeys" in json.loads(cfg.read_text())
+
+    def test_an_exception_inside_the_heal_arm_names_its_own_cause(
+        self, tmp_path, monkeypatch
+    ):
+        """`pin.py:1319`'s catch-all: anything raising inside the block that
+        checks staleness and clears the wiring lands here, with `_safe(exc)`
+        naming the cause. Nothing in the suite asserted this message before
+        (`grep -c "Could not heal the cloud pin" across both test files was
+        0`); `tests/test_pin.py:2579,2586` mention "Could not heal" only in
+        prose explaining a DIFFERENT fixture where this arm is NOT reached.
+
+        `_wiring_is_stale` is made to raise directly — the narrowest way to
+        land in `heal`'s bottom `except`. The port passed to the fixture is
+        never dialled: the mock raises before it would ever be read.
+        """
+        from claude_swap import pin
+
+        sw, cfg = self._wired_to(tmp_path, 0)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)
+        monkeypatch.setattr(
+            pin,
+            "_wiring_is_stale",
+            lambda switcher: (_ for _ in ()).throw(RuntimeError("disk gone")),
+        )
+
+        changed, msg = pin.heal(sw)
+
+        assert not changed
+        assert msg == "Could not heal the cloud pin (disk gone)", msg
 
     def test_a_serving_but_OBSOLETE_daemon_still_reaches_the_recycle(
         self, tmp_path, monkeypatch
