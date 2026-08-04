@@ -28,7 +28,7 @@ from claude_swap.json_output import (
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
-from claude_swap.usage_store import UsageEntry
+from claude_swap.usage_store import STALE_OK_S, UsageEntry
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +690,14 @@ class TestMiniAccountText:
         assert chip == "5h(⟳2h28m):"
         assert f"{chip}100%" in mini_account_text(acc, now).plain
 
-    def test_a_spend_only_account_shows_spend_not_usage_unknown(self):
+    @pytest.mark.parametrize(
+        "age_s, expect_dim",
+        [(5.0, False), (STALE_OK_S + 100, True)],
+        ids=["fresh", "stale"],
+    )
+    def test_a_spend_only_account_shows_spend_not_usage_unknown(
+        self, age_s, expect_dim
+    ):
         """PROBE: the same defect `TestUnswitchableRowsAreListed` fixed on the
         auto view, on the dashboard's mini line.
 
@@ -700,6 +707,12 @@ class TestMiniAccountText:
         $10.29 / $50.00` for the same `last_good` in the same second. One
         account must not read two ways on two screens.
 
+        Also covers staleness: every other pct in this file dims once the
+        measurement is older than `STALE_OK_S` (`account_card_text` dims the
+        very same `$$` row on the card for this same account), so the mini
+        line's spend pct must too — an undimmed reading asserts a freshness
+        the code never checked.
+
         Display only: spend is a budget, not rate-limit headroom, and nothing
         here feeds a ranking.
         """
@@ -707,15 +720,20 @@ class TestMiniAccountText:
 
         now = time.time()
         entry = make_entry(
-            pct5=None, pct7=None,
+            pct5=None, pct7=None, age_s=age_s,
             spend={"used": 10.29, "limit": 20.0, "pct": 51.45, "currency": "USD"},
         )
-        out = mini_account_text(make_account(1, entry=entry), now).plain
+        text = mini_account_text(make_account(1, entry=entry), now)
+        out = text.plain
         assert "usage unknown" not in out, (
             f"a spend-only account still reads as unknown: {out!r}"
         )
         assert "51%" in out, out
         assert "$10.29" in out and "$20.00" in out, out
+        pct_span = next(s for s in text.spans if out[s.start : s.end] == "51%")
+        assert ("dim" in str(pct_span.style)) == expect_dim, (
+            f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
+        )
 
     def test_CONTROL_no_windows_and_no_spend_still_says_unknown(self):
         """CONTROL for the probe: "usage unknown" is still the right answer
@@ -728,6 +746,45 @@ class TestMiniAccountText:
         out = mini_account_text(make_account(1, entry=entry), now).plain
         assert "usage unknown" in out, (
             f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
+        )
+
+    def test_scoped_only_account_below_the_cap_is_shown_not_usage_unknown(self):
+        """PROBE: the mini line's maxed-scoped loop only fires at/over 100%,
+        so an account whose only window is a per-model (e.g. Fable) limit
+        below its cap fell all the way through to "usage unknown" — while
+        `account_card_text` renders the same `Fable 99%` row from the same
+        `usage_rows` one screen over. Same rendering gap `c209903` closed for
+        spend, left open for scoped.
+        """
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(pct5=None, pct7=None, scoped=[("Fable", 99.0)])
+        out = mini_account_text(make_account(1, entry=entry), now).plain
+        assert "usage unknown" not in out, (
+            f"a scoped-only account below its cap still reads as unknown: {out!r}"
+        )
+        assert "Fable" in out and "99%" in out, out
+
+    def test_spend_shows_alongside_a_healthy_window_not_hidden_behind_it(self):
+        """PROBE: the spend row only rendered inside `if not parts:`, so a
+        95%-spent budget vanished behind ANY healthy 5h/7d window — the mini
+        line said "5h:10%" and nothing else, while the card shows both rows
+        for the same account. Spend is a separate axis from a rate-limit
+        window (never enters the ranking), so hiding it behind one is not a
+        real precedence, just an accident of the fallback's shape.
+        """
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(
+            pct5=10.0, pct7=None,
+            spend={"used": 19.0, "limit": 20.0, "pct": 95.0, "currency": "USD"},
+        )
+        out = mini_account_text(make_account(1, entry=entry), now).plain
+        assert "10%" in out, out
+        assert "95%" in out, (
+            f"a 95%-spent budget vanished behind a healthy window: {out!r}"
         )
 
     def test_countdown_shows_below_100_too(self):
