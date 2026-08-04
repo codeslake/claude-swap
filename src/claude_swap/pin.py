@@ -620,25 +620,42 @@ def _wiring_present(_switcher) -> bool:
     interchangeably — dropping it here alone would make this one predicate
     look different from its siblings for no reason a caller could see.
     """
-    # Imported here, as clear_wiring does: paths.py reads CLAUDE_CONFIG_DIR at
-    # CALL time, and a module-scope import would freeze the resolution for a
-    # process whose env changes (the `cswap run` case both functions exist for).
+    # ONE TRAVERSAL, in `wired_config_paths`. This used to walk the configs
+    # itself, and `purge` needed the same walk to name the survivor — two
+    # copies of "which configs are wired" is two things to keep in step, and
+    # the one that drifted was the one a user reads after their only other
+    # recourse has been deleted.
+    #
+    # The getter-raises guard, the de-dup and the unreadable-is-not-wired rule
+    # all live there now; see that function for why `heal` cannot afford a
+    # raise to escape.
+    return bool(wired_config_paths(_switcher))
+
+
+def wired_config_paths(_switcher=None) -> list:
+    """Every config that still carries OUR marker, in read order.
+
+    :func:`_wiring_present` answers "is any of them wired" and throws away
+    WHICH — fine for a gate, wrong for a message. `purge` printed
+    ``get_global_config_path()`` after asking that gate, so when the survivor
+    was the OTHER config the user was sent to a file that was already clean
+    while the wiring that strands them sat in one they were never told about.
+    After a purge the record, cert dir and daemon state are gone, so hand
+    editing is the only cure left and naming the wrong file is the whole
+    failure.
+
+    Same traversal, same guards, same de-dup as ``_wiring_present`` — it is
+    now written once here and that predicate reads this.
+    """
     from claude_swap.paths import (
         get_default_global_config_path,
         get_global_config_path,
     )
 
-    seen = set()
+    wired, seen = [], set()
     for get in (get_global_config_path, get_default_global_config_path):
-        # THE GETTER ITSELF CAN RAISE (see the same guard on `_wired_ports`,
-        # Task 1 of the prior round): `get_default_global_config_path` calls
-        # `Path.home()`, which raises `RuntimeError` with no HOME and no
-        # `/etc/passwd` entry. `heal` survives that today only because this
-        # function's own raise happens to land inside `heal`'s bottom `try`
-        # — a refactor moving the call above it would reintroduce the
-        # traceback `heal` documents as never happening. With no HOME,
-        # `_wired_ports()` returns `[]` because it guards; an unguarded
-        # `_wiring_present` raises instead.
+        # The getter itself can raise; see `_wiring_present` above for why
+        # `heal` cannot afford that to escape.
         try:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
@@ -652,8 +669,8 @@ def _wiring_present(_switcher) -> bool:
         except Exception:  # noqa: BLE001 — unreadable/absent is not "wired"
             continue
         if _wire_mark_of(raw) is not None:
-            return True
-    return False
+            wired.append(path)
+    return wired
 
 
 def _clear_wiring_locked(switcher, path) -> bool:

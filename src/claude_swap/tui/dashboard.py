@@ -306,7 +306,20 @@ class DashboardScreen(Screen):
         # and gets locked out of the wiring, and gating on the record alone
         # then hid the row while the root menu still showed the Cloud line and
         # the message said "re-run once it frees up".
-        if current or pin._wiring_present(self.app.switcher):
+        #
+        # AND THE RECORD IS READ THE WAY `clear_pin` READS IT. `current` comes
+        # from `pinned_email`, which asks the PACKAGE and answers None
+        # whenever it is absent or broken; `clear_pin` decides from
+        # `_pinned_email_now`, which reads cswap's OWN settings.json and can
+        # still clear it. Gating on the package's answer hid the row for a
+        # record this repo can see and remove — one that re-pins the account
+        # the moment anything reinstalls the package. A gate must ask what the
+        # ACTION asks, or it hides work that exists.
+        if (
+            current
+            or pin._pinned_email_now(self.app.switcher) is not None
+            or pin._wiring_present(self.app.switcher)
+        ):
             entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
         return entries

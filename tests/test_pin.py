@@ -1409,11 +1409,16 @@ class TestPurgeDoesNotStrandTheWiring:
     a dead port with nothing remaining that knows how to remove it: the exact
     stranding clear_wiring lives in this repo to prevent."""
 
-    def _purge_with(self, tmp_path, monkeypatch, cfg):
+    def _purge_with(self, tmp_path, monkeypatch, cfg, default_cfg=None):
         """Drive a real purge against ``cfg``. Returns stdout.
 
         NO STUB: `clear_wiring` is the real one, so the only way a test can
         make the unwire fail is the way the machine does it.
+
+        ``default_cfg`` points the OTHER getter somewhere else. Both getters
+        resolving to one file is the common shape and the one every test here
+        used, which is exactly why a message that names only one of them read
+        as correct.
         """
         import io
         from contextlib import redirect_stdout
@@ -1424,7 +1429,9 @@ class TestPurgeDoesNotStrandTheWiring:
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        monkeypatch.setattr(
+            paths, "get_default_global_config_path", lambda: default_cfg or cfg
+        )
         # switcher.py imports the name at module scope, so patching the
         # module it came FROM does not reach it.
         monkeypatch.setattr(_sw_mod, "get_global_config_path", lambda: cfg)
@@ -1479,6 +1486,53 @@ class TestPurgeDoesNotStrandTheWiring:
         # a session-scoped isolated_home fixture also sets HOME.
         assert str(cfg) in out, "the message does not name the file to edit"
         assert "_cswapPinWiredKeys" in out, "it does not name what to delete"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root): chmod is a no-op "
+        "on win32 and root writes into a 0o500 dir regardless",
+    )
+    def test_the_warning_names_the_config_that_actually_survived(
+        self, tmp_path, monkeypatch
+    ):
+        """It named ONE file; the check that produced it reads TWO.
+
+        `_wiring_present` answers about EITHER config, so the survivor can be
+        the default global config while the message points at the session one
+        — sending the user to a file that is already clean, and leaving the
+        wiring that strands them in a file they were never told about. After
+        a purge the record, cert dir and daemon state are gone, so hand-editing
+        is the ONLY cure and naming the wrong file is the whole failure.
+
+        Every existing test here points both getters at one path, which is the
+        common deployment shape — and is why a message naming one of them read
+        as correct for as long as it did.
+        """
+        session_cfg = _cfg(tmp_path, "sessiondir", marker=False)  # clean
+        default_cfg = _cfg(tmp_path, "defaultdir", _dead_port())  # the survivor
+        assert "_cswapPinWiredKeys" in json.loads(default_cfg.read_text())
+        assert "_cswapPinWiredKeys" not in json.loads(session_cfg.read_text()), (
+            "fixture invalid: BOTH are wired, so naming either would pass"
+        )
+
+        # Lock the unwire out of the survivor the way the machine does.
+        default_cfg.parent.chmod(0o500)
+        try:
+            out = self._purge_with(
+                tmp_path, monkeypatch, session_cfg, default_cfg=default_cfg
+            )
+        finally:
+            default_cfg.parent.chmod(0o700)
+
+        assert "_cswapPinWiredKeys" in json.loads(default_cfg.read_text()), (
+            "fixture did not reach the stranded shape: the unwire succeeded"
+        )
+        assert "Could not remove the cloud pin wiring" in out, out
+        assert str(default_cfg) in out, (
+            f"the warning does not name the file that ACTUALLY still carries "
+            f"the wiring ({default_cfg}) — the user edits the wrong file and "
+            f"the stranding survives: {out!r}"
+        )
 
     def test_an_unwired_config_says_nothing(self, tmp_path, monkeypatch):
         """...and the silent case must stay silent: nothing wired, nothing to
