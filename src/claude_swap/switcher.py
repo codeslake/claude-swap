@@ -5637,11 +5637,20 @@ class ClaudeAccountSwitcher:
 
         if _pin.clear_wiring(self):
             removed_items.append("Cloud pin wiring in .claude.json")
-        if _pin._wiring_present(self):
+        # NAME THE FILE THAT ACTUALLY SURVIVED. This printed
+        # `get_global_config_path()` after asking a check that reads BOTH
+        # configs, so when the survivor was the other one the user was sent to
+        # a file that was already clean — while the wiring that strands them
+        # sat in a file they were never told about. By this point the record,
+        # cert dir and daemon state are gone, so hand editing is the only cure
+        # and naming the wrong file is the whole failure.
+        survivors = _pin.wired_config_paths(self)
+        if survivors:
             warning(
                 "Could not remove the cloud pin wiring — edit "
-                f"{get_global_config_path()} by hand and delete the "
-                f'"_cswapPinWiredKeys" entry and the proxy vars it names.'
+                + " and ".join(str(p) for p in survivors)
+                + ' by hand and delete the "_cswapPinWiredKeys" entry and the '
+                "proxy vars it names."
             )
 
         # Remove credentials. On macOS backups may be in the Keychain and/or .enc

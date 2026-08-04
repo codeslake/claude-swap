@@ -439,6 +439,47 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
         finally:
             pin._impl, pin._wiring_present, pin.pinned_email = real
 
+    async def test_the_submenu_offers_the_clear_for_a_record_only_the_repo_can_see(
+        self, tmp_path
+    ):
+        """The other half of the same mismatch, and the opposite direction.
+
+        The row is gated on `pinned_email`, which asks the PACKAGE
+        (`_live_impl().load_pin`) and returns None whenever the package is
+        absent or broken. `clear_pin` decides from `_pinned_email_now`, which
+        reads cswap's OWN settings.json. So with a live record and a package
+        that cannot answer, the two disagree: `clear_pin` has real work to do
+        (it clears the record itself, precisely for this case) and the TUI
+        offers no row to run it from.
+
+        Not the broken-package branch: `_impl` resolves here, so the submenu
+        takes its normal path — the branch whose gate is under test. The
+        wiring is absent, so `_wiring_present` cannot carry the row either and
+        the record is the only thing that can.
+        """
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        real = (pin._impl, pin._wiring_present, pin.pinned_email,
+                pin._pinned_email_now)
+        pin._impl = lambda: object()
+        pin._wiring_present = lambda _sw: False        # no wiring left
+        pin.pinned_email = lambda _sw: None            # the PACKAGE cannot say
+        pin._pinned_email_now = lambda _sw: ("a@b.c", "")  # cswap's file CAN
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                ids = [aid for _label, aid in app.screen._pin_entries()]
+                assert "pin:clear" in ids, (
+                    f"a pin record cswap can see and remove — and which keeps "
+                    f"the pin live the moment the package returns — had no "
+                    f"row to remove it from: {ids}"
+                )
+        finally:
+            (pin._impl, pin._wiring_present, pin.pinned_email,
+             pin._pinned_email_now) = real
+
     async def test_clear_reaches_pin_py_without_the_package(self, tmp_path):
         """The dispatcher resolved _impl() for EVERY pin: action, so the one
         operation still available was the one it refused."""
