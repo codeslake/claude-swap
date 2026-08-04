@@ -61,6 +61,30 @@ LIVE_LOCK_FILENAME = ".auto-live.lock"
 
 _logger = logging.getLogger("claude-swap")
 
+# Systemic freshen refusals, MOST ACTIONABLE FIRST. Deterministic conditions
+# that every candidate hits identically, so the tick reports one of them —
+# and the order decides which, because reporting the wrong one is how a cause
+# needing a human hides behind one that clears itself. store-unmirrored and
+# invalid_client stay until somebody unsets an env var or fixes a client
+# registration, and stash-unreadable until they unlock a keychain, fix a mode,
+# or purge the row; consume-busy is gone by the next pass. stash-unreadable is
+# the one that is per-SLOT rather than global, which costs nothing here: this
+# message is only ever emitted when NO candidate freshened, so naming the real
+# cause of the only slot that had one beats "(network?)".
+_SYSTEMIC_MESSAGES = {
+    "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
+                        "run cswap from a normal shell",
+    "invalid_client": "cswap's OAuth client was rejected — systemic, not this "
+                      "account",
+    "stash-unreadable": "a stashed successor is unreadable — unlock the "
+                        "keychain or fix the file, then retry; "
+                        "`cswap unclaimed` inspects it",
+    "consume-busy": "another cswap surface holds the slot — retries next pass",
+}
+# Insertion order IS the precedence order, so the remedy and its rank cannot
+# drift apart.
+_SYSTEMIC_STATUSES = tuple(_SYSTEMIC_MESSAGES)
+
 # Freshen targets whose access token expires within this window: twice Claude
 # Code's own 5-minute refresh buffer, so its post-lock "abort refresh if not
 # expired" re-read holds with margin after our swap.
@@ -759,9 +783,7 @@ class AutoSwitchEngine:
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return "invalid_grant"
-        if outcome.error in (
-            "store-unmirrored", "invalid_client", "consume-busy"
-        ):
+        if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
             # refuses identically and keeps refusing until something outside
             # this process changes — the shell for store-unmirrored (an
@@ -1359,10 +1381,19 @@ class AutoSwitchEngine:
             if status == "transient":
                 transient_failure = True
                 continue
-            if status in (
-                "store-unmirrored", "invalid_client", "consume-busy"
-            ):
-                systemic = status
+            if status in _SYSTEMIC_STATUSES:
+                # ONE cause is reported, so it must be the one worth acting
+                # on. Assigning unconditionally made it the LAST candidate's,
+                # and `consume-busy` clears itself on the next pass while the
+                # other two need a human — unset an env var, chase a rejected
+                # client_id. So a busy slot sorting after an unmirrored one
+                # named the harmless cause and hid the real one: exactly the
+                # "reads as intermittent, nothing names it" trap these kinds
+                # were split out of "transient" to escape.
+                if not systemic or _SYSTEMIC_STATUSES.index(
+                    status
+                ) < _SYSTEMIC_STATUSES.index(systemic):
+                    systemic = status
                 continue
             if status == "skip-live-session":
                 continue
@@ -1371,18 +1402,9 @@ class AutoSwitchEngine:
         if systemic or transient_failure:
             self._emit(
                 ErrorEvent(
-                    message=(
-                        "could not freshen: CLAUDE_SECURESTORAGE_CONFIG_DIR "
-                        "is set — unset it or run cswap from a normal shell"
-                        if systemic == "store-unmirrored"
-                        else "could not freshen: cswap's OAuth client was "
-                        "rejected — systemic, not this account"
-                        if systemic == "invalid_client"
-                        else "could not freshen: another cswap surface holds "
-                        "the slot — retries next pass"
-                        if systemic == "consume-busy"
-                        else "could not freshen any candidate (network?)"
-                    ),
+                    message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
+                    if systemic
+                    else "could not freshen any candidate (network?)",
                     transient=True,
                 )
             )

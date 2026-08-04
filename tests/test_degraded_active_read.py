@@ -193,18 +193,25 @@ def test_post_fetch_call_site_passes_the_flag():
 
 
 class TestTheDegradedFlagIsPerPassNotPerObject:
-    """R13 I-1: `_build_accounts_info` BLANKS `_active_read_degraded` and
-    only restores it after `_read_active_credentials()` — a Keychain read.
+    """The degraded verdict belongs to the READ that produced it, not to the
+    switcher object.
 
-    The comment at the blank claims "main thread writes it here before the
-    fetch pool starts → no data race". True of the fetch POOL, not of a
-    second PASS: the TUI's two refresh lanes and the auto engine's worker
-    share one switcher, and a collector landing inside that window reads
-    `False` — the value NO read produced — and re-enters the very condemn
-    branch round 11 exists to skip.
+    `_build_accounts_info` clears the verdict before reading and publishes the
+    real one after. While the switcher held that on an INSTANCE attribute, a
+    second pass landing inside the read window saw `False` — a value no read
+    produced — and re-entered the condemn branch on possibly-stale bytes. The
+    TUI's two refresh lanes and the auto engine's worker share one switcher,
+    so "the main thread writes it before the fetch pool starts" was true of
+    the fetch POOL and never of a second PASS.
 
-    Real threads, not a mocked interleaving: the window is the duration of
-    a real call, so a test that fakes the ordering proves nothing about it.
+    The verdict is thread-local now (`_active_verdict_tls`), so a pass can
+    only ever clear its OWN. A pool worker never reads, so it inherits the
+    verdict explicitly through `_with_active_verdict` — that wrapper is the
+    only way the value crosses a thread, and the first test drives exactly
+    that path.
+
+    Real threads, not a mocked interleaving: the window is the duration of a
+    real call, so a test that fakes the ordering proves nothing about it.
     """
 
     def test_a_concurrent_reader_never_sees_a_blank_during_the_active_read(
@@ -221,7 +228,7 @@ class TestTheDegradedFlagIsPerPassNotPerObject:
 
         # A PRIOR pass already established DEGRADED. Nothing has read the
         # Keychain successfully since, so no read has produced `False`.
-        s._active_read_degraded = True
+        s._record_active_verdict(ActiveCredentials(OLD, False, True))
 
         entered = threading.Event()
         release = threading.Event()
@@ -242,7 +249,12 @@ class TestTheDegradedFlagIsPerPassNotPerObject:
             seen.append(s._active_read_degraded)
             release.set()
 
-        reader = threading.Thread(target=concurrent_collector)
+        # WRAPPED, because that is the production shape: `_run_usage_fetches`
+        # hands every pool worker to `_with_active_verdict`, which is what
+        # carries the verdict across the thread boundary. An unwrapped thread
+        # never read and correctly answers with a clean verdict — testing that
+        # one would pin the fallback, not the invariant.
+        reader = threading.Thread(target=s._with_active_verdict(concurrent_collector))
         reader.start()
         with patch("claude_swap.switcher.ClaudeAccountSwitcher.current_account_number",
                    return_value="2"):
@@ -270,7 +282,7 @@ class TestTheDegradedFlagIsPerPassNotPerObject:
         s = ClaudeAccountSwitcher()
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
-        s._active_read_degraded = True  # a prior pass degraded
+        s._record_active_verdict(ActiveCredentials(OLD, False, True))  # prior pass
 
         monkeypatch.setattr(
             s, "_read_active_credentials",

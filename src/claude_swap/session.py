@@ -572,9 +572,21 @@ class SessionManager:
                 # invalid_grant on first use: a spent grant, silently.
                 # Validity is an identity check, not a generation check, so it
                 # cannot see this. Re-seed instead of returning early.
+                #
+                # NEVER under a live claude. _bootstrap deletes the profile's
+                # Keychain entry and overwrites .credentials.json, and the peer
+                # that bootstrapped ahead of us has already exec'd into that
+                # profile — rewriting it beneath a running instance is the
+                # failure every other invalidation site in this file guards
+                # against (the STALE_MARKER branch above, and
+                # _post_backup_write's). This branch fires precisely when the
+                # profile is VALID, which is the live case, so it needed the
+                # guard most and had it least. Deferring costs the peer a
+                # generation it can still refresh from; rewriting costs it the
+                # session.
                 if not self._profile_matches_backup(
                     session_dir, account_num, email
-                ):
+                ) and not live_sessions_for(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
@@ -624,8 +636,18 @@ class SessionManager:
         # entry from an earlier profile at this path would shadow the seed.
         delete_macos_keychain_entry(session_dir)
 
-        creds = self.switcher.read_account_credentials(account_num, email)
+        creds, unreadable = self.switcher._read_account_credentials_ex(
+            account_num, email
+        )
         if not creds:
+            if unreadable:
+                # Third copy of the switch path's message; same reason not to
+                # send the user to a re-add over a locked Keychain.
+                raise SessionError(
+                    f"Account-{account_num}'s backup is in the macOS Keychain "
+                    f"but it is unreadable right now (locked or no GUI "
+                    f"session). Retry from a GUI terminal; do not re-add."
+                )
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
                 f"Re-add with: cswap --add-account --slot {account_num}"

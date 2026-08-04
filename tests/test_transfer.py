@@ -1087,6 +1087,41 @@ class TestCleanHomeActivation:
                 merged = json.loads(config_path.read_text())
                 assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
 
+    def test_a_valid_empty_config_is_spliced_not_called_unparseable(
+        self, temp_home: Path
+    ):
+        """M-2: `is not None`, not truthiness.
+
+        A valid but EMPTY `{}` config is readable and loses nothing by being
+        spliced. Under a truthiness test it falls to the salvage branch, which
+        copies the file aside and tells the user it "could not be parsed" —
+        the same ""-vs-None conflation this whole PR exists to separate, one
+        level up. The sibling malformed-config test cannot see it: `{not
+        valid json` is genuinely unreadable, so both forms agree there.
+        """
+        src_home = temp_home.parent / "src"
+        src_home.mkdir()
+        export_path = self._seed_and_export(src_home)
+
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                config_path = dst._get_claude_config_path()
+                config_path.write_text("{}")
+
+                import_accounts(dst, str(export_path))
+                with patch.object(dst, "list_accounts"):
+                    dst.switch_to("1")
+
+                merged = json.loads(config_path.read_text())
+                assert merged["oauthAccount"]["emailAddress"] == "alice@example.com"
+                assert not list(config_path.parent.glob("*.unreadable-*")), (
+                    "a valid empty config was salvaged and reported as "
+                    "unparseable"
+                )
+
     def test_active_seeded_when_envelope_active_was_skipped(
         self, temp_home: Path
     ):
@@ -1570,6 +1605,63 @@ class TestImportClearsDeadTokenQuarantine:
         assert entry.auth_dead_strikes == 0
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_HEALED"
+
+    def test_a_healed_strike_does_not_license_a_plain_import_to_replace(
+        self, temp_home: Path, capsys
+    ):
+        """`import_accounts` must consult the helper, not `token_dead()` raw.
+
+        The two new tests in this class both pass against the pre-PR inline
+        expression: one asserts `_slot_token_dead` DIRECTLY without going
+        through `import_accounts`, and in the other the old expression happens
+        to return True as well. So reverting transfer.py's routing to
+        `entries(...)[slot].token_dead()` leaves the suite green and nothing
+        pins that the import asks the collectors' question at all.
+
+        The verdicts differ exactly where the fingerprint binding does its
+        work: a strike bound to a generation the slot no longer stores is
+        HEALED. `entry.token_dead()` with no `stored_fp` still says dead — and
+        a plain import then replaces a healthy slot's credential, which is the
+        whole reason `--force` exists.
+        """
+        from claude_swap import oauth
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        # Struck on a generation that is NOT what the slot stores now.
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant",
+                              struck_fp="sha256:someothergeneration")},
+            ident,
+        )
+        # The raw row is dead; the fingerprint-bound question says healed.
+        assert s._usage_store.entries(ident)["2"].token_dead(), (
+            "premise: the unbound verdict, which the pre-PR import used"
+        )
+        stored = s._read_account_credentials("2", "bob@example.com")
+        assert not s._usage_store.entries(ident)["2"].token_dead(
+            stored_fp=oauth.credential_fingerprint(stored)
+        ), "premise: bound to the stored generation, the strike is healed"
+        assert not s._slot_token_dead("2", "bob@example.com")
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_OVERWRITTEN"
+        out.write_text(json.dumps(env))
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "already exists, use --force" in err, (
+            "the import used the unbound verdict, so a slot whose strike the "
+            "fingerprint already healed was replaced without --force"
+        )
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds).get("_marker") != "BOB_OVERWRITTEN", (
+            "a healthy slot's credential was overwritten by a plain import"
+        )
 
     def test_the_heal_finds_the_row_of_an_org_scoped_account(
         self, temp_home: Path, capsys
