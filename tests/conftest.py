@@ -654,3 +654,31 @@ def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    """Pin every real-Keychain test to ONE xdist worker.
+
+    ``no_keychain_fake`` means "this test drives the actual ``security`` CLI
+    against a real keychain" -- a process-wide shared resource. Under
+    ``-n auto`` two workers seed and delete the same ``Claude Code-credentials``
+    item and the reader sees "" where it just wrote a token. Measured on CI
+    (macos-latest, commit 0aa9c1f), green on the previous head serially:
+
+        FAILED test_read_credentials_finds_claude_code_seeded_entry
+        AssertionError: assert '' == 'fake-token-read'
+
+    ``xdist_group`` sends the group to one worker, so these serialize against
+    each other while the other ~1900 tests stay parallel. A no-op without
+    xdist: the marker is simply never consumed.
+
+    ``tryfirst`` is load-bearing. xdist reads the group when it builds the
+    schedule, so a marker applied later is the same as no marker. Measured
+    both ways: with tryfirst the group lands on gw0 alone; without it the
+    marker IS present on the node and the tests still scatter across gw0..gw7,
+    indistinguishable from no grouping at all.
+    """
+    for item in items:
+        if item.get_closest_marker("no_keychain_fake"):
+            item.add_marker(pytest.mark.xdist_group("real-keychain"))

@@ -64,7 +64,7 @@ pythonpath = ["src"]
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
 # store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
 # cores) and this box both get the cores they have.
-addopts = "-n auto"
+addopts = "-n auto --dist loadgroup"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
