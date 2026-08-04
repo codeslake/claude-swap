@@ -4571,7 +4571,17 @@ class ClaudeAccountSwitcher:
         # with --force.
         if is_active:
             active = self._store._read_active_credentials()
-            if active.keychain_unavailable or active.degraded:
+            # UNION of 196's and 199's guards, because they catch DIFFERENT
+            # states and the integration merge first took only 199's:
+            #   value is None            a plaintext-file read ERROR (196) —
+            #                            neither flag is set for it
+            #   keychain_unavailable     the macOS OAuth read failed (199)
+            #   degraded                 a fallback covered a failed Keychain
+            #                            read, so the bytes may be stale (199)
+            # Each PR is green alone; only the integration build sees all
+            # three, and dropping the first re-opened 196's own test.
+            if (active.value is None
+                    or active.keychain_unavailable or active.degraded):
                 return False
             stored = active.value or ""
         else:

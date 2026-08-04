@@ -255,7 +255,12 @@ class TestMoveAccount:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(macos_keychain, "get_password", locked)
             mp.setattr(macos_keychain, "delete_password", locked)
-            with pytest.raises(CredentialError, match="aborting before commit"):
+            # ConfigError, not CredentialError: #196 added the source-side
+            # pre-move guard this docstring describes, and #209 rewrote the
+            # monkeypatch mechanics on the line above. Different lines of one
+            # region, so git merged both cleanly and left the assertion
+            # contradicting the docstring.
+            with pytest.raises(ConfigError, match="could not be read"):
                 switcher.move_account("2", "5")
 
         # Nothing committed; the stale item survived but stays unreferenced.
