@@ -330,7 +330,7 @@ class TestLaunchIsNeverBlocked:
         env = {"A": "1"}
         assert pin.wire_launch_env(object(), env) == env
 
-    def test_wire_launch_env_actually_wires_the_pinned_proxy(self, monkeypatch):
+    def test_wire_launch_env_actually_wires_the_pinned_proxy(self, tmp_path, monkeypatch):
         """`grep -rn 'wire_env' tests/` was zero hits: every existing test
         drives a FAILURE shape (no package, ensure_proxy raising, ensure_proxy
         returning None) and none drives an active pin actually getting wired.
@@ -342,12 +342,16 @@ class TestLaunchIsNeverBlocked:
         wire_env's return value is thrown away.
         """
         import types
-        from pathlib import Path
 
         from claude_swap import pin
 
+        # `tmp_path`, not a literal "/tmp/..." — a POSIX path literal renders as
+        # `\tmp\pin-ca.pem` on Windows and the equality fails there while
+        # passing here. Measured: this test was the whole of PR #210's first
+        # red CI, on test-windows only.
+        ca = tmp_path / "pin-ca.pem"
         impl = types.SimpleNamespace(
-            ensure_proxy=lambda sw: (9955, Path("/tmp/pin-ca.pem")),
+            ensure_proxy=lambda sw: (9955, ca),
             wire_env=lambda env, port, ca_path: {
                 **env,
                 "HTTPS_PROXY": f"http://127.0.0.1:{port}",
@@ -359,10 +363,10 @@ class TestLaunchIsNeverBlocked:
         assert result == {
             "A": "1",
             "HTTPS_PROXY": "http://127.0.0.1:9955",
-            "NODE_EXTRA_CA_CERTS": "/tmp/pin-ca.pem",
+            "NODE_EXTRA_CA_CERTS": str(ca),
         }, f"the pin was resolved and returned a proxy but the env is {result!r}"
 
-    def test_wire_env_raising_leaves_the_launch_unpinned(self, monkeypatch):
+    def test_wire_env_raising_leaves_the_launch_unpinned(self, tmp_path, monkeypatch):
         """The fail-open invariant on the SAME path as the test above: an
         `ensure_proxy` that succeeds followed by a `wire_env` that RAISES must
         still return an env that names no proxy — never partial wiring, never
@@ -370,7 +374,6 @@ class TestLaunchIsNeverBlocked:
         exception escaped `wire_launch_env`.
         """
         import types
-        from pathlib import Path
 
         from claude_swap import pin
 
@@ -378,7 +381,7 @@ class TestLaunchIsNeverBlocked:
             raise RuntimeError("wire_env boom")
 
         impl = types.SimpleNamespace(
-            ensure_proxy=lambda sw: (9955, Path("/tmp/pin-ca.pem")),
+            ensure_proxy=lambda sw: (9955, tmp_path / "pin-ca.pem"),
             wire_env=_boom,
             unwire_if_dead=lambda p: None,
         )
@@ -386,7 +389,7 @@ class TestLaunchIsNeverBlocked:
         # Isolate this test from the real config lock/unwire tail below the
         # guarded call — that tail is Task 2's surface, not this one's.
         monkeypatch.setattr(pin, "_config_lock_is_free", lambda budget: False)
-        sw = types.SimpleNamespace(backup_dir=Path("/tmp"))
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
         result = pin.wire_launch_env(sw, {"A": "1"})
         assert result == {"A": "1"}, (
             f"wire_env raised but the returned env still names a proxy: {result!r}"
