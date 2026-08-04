@@ -360,22 +360,37 @@ def mini_account_text(
             text.append(" · ", style=palette.track)
         text.append(f"{name} (!)", style=palette.sev_crit)
         parts += 1
+    # Spend is a separate axis from a rate-limit window (never enters the
+    # ranking — see oauth.relevant_windows) so it must show whether or not a
+    # 5h/7d window already rendered above, not only as a last-resort fallback
+    # when nothing else was shown; a budget can be 95% spent behind a window
+    # that still reads perfectly healthy. From `usage_rows`, not a third
+    # spelling of the same amounts.
+    rows = usage_rows(last_good, now, fetched_at)
+    spend_row = next((r for r in rows if r[0] == "$$"), None)
+    if spend_row is not None:
+        if parts:
+            text.append(" · ", style=palette.track)
+        _label, pct, suffix, _full = spend_row
+        color = palette.severity(pct)
+        text.append("$$ ", style=palette.muted)
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        text.append(f" · {suffix}", style=palette.muted)
+        parts += 1
     if not parts:
-        # An extra-usage (pay-as-you-go) account has neither window — only a
-        # SPEND budget — so this said "usage unknown" about an account
-        # `usage_rows` renders in full one screen over. From that same helper,
-        # not a third spelling. Display only: nothing here feeds a ranking.
-        spend_row = next(
-            (r for r in usage_rows(last_good, now, fetched_at) if r[0] == "$$"),
-            None,
-        )
-        if spend_row is None:
+        # Nothing above rendered — an account whose only window is a
+        # per-model (scoped) limit below its cap (the maxed loop only counts
+        # ones at/over 100) still has something to show via the same helper,
+        # rather than reading as no data at all. `rows` has no "$$" row here
+        # (spend_row was None, or `parts` would already be nonzero).
+        if not rows:
             text.append("usage unknown", style=palette.muted)
-        else:
-            _label, pct, suffix, _full = spend_row
-            text.append("$$ ", style=palette.muted)
-            text.append(f"{pct:.0f}%", style=palette.severity(pct))
-            text.append(f" · {suffix}", style=palette.muted)
+        for i, (label, pct, _suffix, _full) in enumerate(rows):
+            if i:
+                text.append(" · ", style=palette.track)
+            color = palette.severity(pct)
+            text.append(f"{label} ", style=palette.muted)
+            text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
     return text
 
 

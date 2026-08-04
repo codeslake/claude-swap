@@ -15,7 +15,6 @@ import pytest
 from claude_swap import oauth, poll_policy
 from claude_swap.autoswitch import (
     IDLE_HOLD_MAX_S,
-    LIVE_LOCK_FILENAME,
     NO_RESET_FALLBACK_S,
     RECOVERY_HORIZON_S,
     SPENT_HEADROOM_PCT,

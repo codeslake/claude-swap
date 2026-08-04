@@ -38,7 +38,7 @@ from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel
+from claude_swap.tui.widgets import AccountsPanel, usage_rows
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -372,15 +372,17 @@ class AutoScreen(Screen):
                 # `relevant_windows` excludes spend on purpose (a separate
                 # axis from a rate-limit window), so this row was the only
                 # place the same account read two different ways.
-                spend = (acc.usage.last_good or {}).get("spend")
-                if spend:
+                spend_row = next(
+                    (r for r in usage_rows(acc.usage.last_good, time.time())
+                     if r[0] == "$$"),
+                    None,
+                )
+                if spend_row is not None:
+                    _label, spend_pct, spend_suffix, _full = spend_row
                     entry.append("  $$ ", style=palette.muted)
-                    entry.append(f"{float(spend['pct']):.0f}%",
-                                 style=palette.severity(float(spend["pct"])))
-                    entry.append(
-                        f" · ${float(spend['used']):,.2f}/${float(spend['limit']):,.2f}",
-                        style=palette.muted,
-                    )
+                    entry.append(f"{spend_pct:.0f}%",
+                                 style=palette.severity(spend_pct))
+                    entry.append(f" · {spend_suffix}", style=palette.muted)
                 else:
                     entry.append("  usage unknown", style=palette.muted)
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
