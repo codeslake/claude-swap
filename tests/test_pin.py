@@ -3790,8 +3790,17 @@ class TestTheMarkerGuardIsNotJustTheStalenessVerdict:
         assert pin._wiring_present(None) is False, (
             "fixture invalid: a marker exists somewhere"
         )
-        assert pin._wired_ports() != [], (
-            "fixture invalid: the dead port is not visible to _wired_ports"
+        # THE PORT IS FILTERED AT THE SOURCE NOW, not one scope up.
+        # `_port_of_config` asks `_wire_mark_of` before it reads
+        # CSWAP_PIN_PORT, so an unmarked config has no port to offer any
+        # consumer — which is what stopped a FOREIGN dead port from making
+        # the verdict True while cswap's own marked wiring was serving.
+        # Before, this read `!= []` and the whole guard lived in
+        # `_wiring_is_stale`.
+        assert pin._wired_ports() == [], (
+            "an unmarked config still offers its port to every consumer — "
+            "the marker guard has to hold at the read, not only in the one "
+            "caller that remembered to ask"
         )
         assert pin._wiring_is_stale(None) is False, (
             "a config with no _cswapPinWiredKeys marker was condemned as "
