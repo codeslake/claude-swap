@@ -4076,11 +4076,18 @@ class ClaudeAccountSwitcher:
                 # than guessing True). Set NO sentinel and fall through: the
                 # active credential itself is fine (it already cleared the
                 # first fingerprint check above), so a live measurement
-                # still serves from the entry's own last_good if fresh, or
-                # this account stays a normal fetch candidate — a real,
-                # successful fetch resets authDeadStrikes on its own
-                # (UsageStore.record's success path), the legitimate way
-                # this strike heals.
+                # still serves from the entry's own last_good if fresh.
+                # This does NOT become a normal fetch candidate — measured:
+                # _row_eligible refuses any row with authDeadStrikes at
+                # threshold regardless of sentinel (usage_store.py), and
+                # due_candidate refuses on entry.token_dead() the same way,
+                # so a struck row is never reserved for a fetch on this
+                # path. The strike's real recovery is the Keychain
+                # capability cache's own re-probe on KEYCHAIN_RECHECK_COOLDOWN_S
+                # (credentials.py): once the Keychain answers again, the
+                # next collect pass re-evaluates the fingerprint compare
+                # against real bytes and clears the strike via the `elif`
+                # below, or confirms it still holds.
                 pass
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
@@ -4231,12 +4238,28 @@ class ClaudeAccountSwitcher:
             return False
         is_active = num == self.current_account_number()
         # The stored source, as _build_accounts_info reports it: the LIVE
-        # credential for the active slot, the backup otherwise.
-        stored = (
-            (self._store._read_active_credentials().value or "")
-            if is_active
-            else (self._read_account_credentials(num, email) or "")
-        )
+        # credential for the active slot, the backup otherwise. A read that
+        # FAILED must not collapse to "" and reach _entry_token_dead's first
+        # fingerprint compare as though empty bytes were evidence --
+        # credential_fingerprint("") is None, and token_dead(stored_fp=None)
+        # skips the compare entirely, answering on the raw strike count
+        # alone before _entry_token_dead's own None-machinery ever runs.
+        # Mirrors round 9's guard on the backup read: an unreadable OR
+        # degraded (possibly-stale) read coerces to "not dead" here, the
+        # same conservative direction the docstring above already commits
+        # to for _entry_token_dead's own None answer -- an ambiguous read
+        # must not silently authorize an overwrite the user never confirmed
+        # with --force.
+        if is_active:
+            active = self._store._read_active_credentials()
+            if active.keychain_unavailable or active.degraded:
+                return False
+            stored = active.value or ""
+        else:
+            backup, unreadable = self._read_account_credentials_ex(num, email)
+            if unreadable:
+                return False
+            stored = backup
         return bool(
             self._entry_token_dead(entry, num, email, stored, is_active)
         )
@@ -4283,8 +4306,13 @@ class ClaudeAccountSwitcher:
         the auto engine's unhealthy-ticks counter toward the same failover
         this fix exists to stop (measured) — no better than guessing
         ``True``. Leaving the row unsentineled lets it keep serving its
-        last-good measurement (or become a normal fetch candidate, whose
-        success legitimately heals the strike via ``UsageStore.record``).
+        last-good measurement. It does NOT become a normal fetch candidate
+        while struck -- ``_row_eligible``/``due_candidate`` refuse any row
+        at the strike threshold regardless of sentinel -- the real recovery
+        is the Keychain capability cache's own re-probe
+        (``KEYCHAIN_RECHECK_COOLDOWN_S``): once the Keychain answers again,
+        the next collect pass re-evaluates the fingerprint compare against
+        real bytes.
 
         An unstruck row is never affected by an unreadable read (``False``
         either way) — only a struck one goes ambiguous.
