@@ -3896,6 +3896,128 @@ class TestDeadTokenQuarantine:
         run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
+    def test_the_collector_hands_the_trust_bound_its_configured_models(
+        self, temp_home
+    ):
+        """`models=models` at the record call site, not the default `()`.
+
+        `entries()` honours the configured per-model windows when it bounds
+        429 trust, so a scoped window that ENDS the trust must be visible
+        wherever that trust is computed. Defaulted to `()` the window is
+        invisible and the row keeps serving data its own reset already killed.
+
+        Store-level tests pass `models=` themselves, so they hold with the
+        wiring cut. Measured: mutating this call site to `models=()` left the
+        whole suite green. This drives `_collect_usage_entries`, the only path
+        production reaches.
+
+        Unscoped windows sit far out; the Fable window resets in 30 minutes.
+        Asserted on what the row SERVES, not on the wait: the wait is the
+        server's deadline plus the margin either way. An earlier revision
+        trimmed it back to the deadline when the trust expired first, which was
+        measured wrong — see `test_the_trust_bound_never_shortens_a_429_wait`.
+        """
+        from datetime import datetime, timezone
+
+        from claude_swap.usage_store import SERVE_TTL_S, FetchRecord
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._poll_inputs_override = (90.0, ("Fable",))
+        store = switcher._usage_store
+        now = time.time()
+
+        def iso(ahead):
+            return (
+                datetime.fromtimestamp(now + ahead, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt",
+            "expiresAt": (now + 86400) * 1000,
+        }})
+        info = [(2, "test@example.com", "Org", "", False, live, "")]
+        ident = {"2": ("test@example.com", "")}
+        store.record({"2": FetchRecord(usage={
+            "five_hour": {"pct": 25.0, "resets_at": iso(100 * 3600.0)},
+            "seven_day": {"pct": 10.0, "resets_at": iso(100 * 3600.0)},
+            "scoped": [{"name": "Fable", "pct": 90.0, "resets_at": iso(1800.0)}],
+        })}, ident)
+        # Age the row past the serve TTL so it is fetch-eligible, without
+        # advancing the clock (which would move the scoped reset with it).
+        with store.path.open() as fh:
+            table = json.load(fh)
+        table["accounts"]["2"]["fetchedAt"] -= SERVE_TTL_S * 4
+        store.path.write_text(json.dumps(table))
+
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(error="http-429", retry_after_s=3600.0)},
+        ) as run:
+            switcher._collect_usage_entries(info, fetch={"2"})
+        run.assert_called_once()   # premise: the 429 actually went through record()
+
+        assert store.entries(ident, ("Fable",))["2"].backoff_until is not None, (
+            "premise: a backoff was recorded"
+        )
+        # Move the scoped window's reset into the PAST — the state a real
+        # clock reaches 30 minutes later — while the unscoped windows stay far
+        # ahead. Only a bound that sees the configured models ends the trust.
+        with store.path.open() as fh:
+            table = json.load(fh)
+        row = table["accounts"]["2"]
+        row["lastGood"]["scoped"][0]["resets_at"] = iso(-60.0 / 3600.0)
+        row["fetchedAt"] -= 1860.0
+        store.path.write_text(json.dumps(table))
+
+        # BOTH RETURN PATHS, and the FETCHING one first. `_collect_usage_entries`
+        # has two `store.entries(identities, models)` sites: :3520 on the
+        # no-fetch path and :3581 on the post-fetch re-read. On a tick that
+        # actually fetched — every 429 tick, which is this one — :3520's value
+        # is discarded and :3581 is what comes back. Asserting only on a
+        # follow-up `fetch=set()` call covered the line that does NOT run:
+        # measured, mutating :3581 alone left the whole suite green.
+        #
+        # `record()` is what makes this hard to reach. `models` only changes an
+        # answer while `lastError == "http-429"`, and any second fetch rewrites
+        # that row — a usage payload clears it, a fresh 429 resets `fetchedAt`
+        # so the window is no longer past. Four earlier revisions of this
+        # assertion each passed with the wiring cut, each for a different one
+        # of those reasons.
+        #
+        # BACKOFF MUST BE PAST, or `reserve` refuses and `if claims:` never
+        # opens — measured, `claims={}` on the second call and :3581 was
+        # unreachable through six earlier shapes of this assertion. The row's
+        # own backoff is cleared here rather than by advancing a clock the
+        # store does not share with the test.
+        with store.path.open() as fh:
+            table = json.load(fh)
+        table["accounts"]["2"]["backoffUntil"] = None
+        store.path.write_text(json.dumps(table))
+
+        # And the fetch answers with NOTHING: the slot is claimed so the block
+        # opens and :3581 runs, but `record()` gets an empty `records`, touches
+        # no row, and the re-read sees exactly the state staged above.
+        with patch.object(
+            switcher, "_run_usage_fetches", return_value={},
+        ):
+            fetched = switcher._collect_usage_entries(info, fetch={"2"})["2"]
+        assert fetched.decision_value() is None, (
+            f"the FETCHING path returned a row still serving last_good "
+            f"(trust_extended={fetched.trust_extended}) although its scoped "
+            "window has reset — :3581 never got the configured models"
+        )
+
+        returned = switcher._collect_usage_entries(info, fetch=set())["2"]
+        assert returned.decision_value() is None, (
+            f"the collector RETURNED a row still serving last_good "
+            f"(trust_extended={returned.trust_extended}) although its scoped "
+            "window has reset — it never handed its configured models to the "
+            "bound"
+        )
+
     def test_readd_clears_quarantine(self, temp_home):
         # Re-adding an account (fresh credential) must lift the quarantine, so
         # the disabled fetches don't leave it stuck at "re-login needed" forever.

@@ -396,7 +396,7 @@ class TestSnapshotSource:
         # Pacing lives in the usage store (poll plans + freshness + atomic
         # reservation), so every take is the same on-demand pass `cswap list`
         # runs — including the user's explicit refresh, which cannot bypass
-        # the store's per-token cadence.
+        # the store's per-account cadence.
         fake, source = self._source(tmp_path)
         source.take()
         source.take()
