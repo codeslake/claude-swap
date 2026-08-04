@@ -914,7 +914,24 @@ def _port_of_config(path) -> int | None:
     import json as _json
 
     try:
-        env = _json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+        # ONLY A PORT THIS TOOL WIRED. The marker is the receipt; a
+        # ``CSWAP_PIN_PORT`` without one was put there by something else, and
+        # its liveness says nothing about ours. Reading it anyway let a foreign
+        # dead port make the staleness verdict True while OUR wiring was marked
+        # and serving — and ``heal`` then tore down the healthy one. The
+        # marker check lived only in ``_wiring_present``, one scope up, so
+        # every port-level consumer inherited the gap.
+        #
+        # THROUGH ``_wire_mark_of``, not a fresh isinstance. That helper exists
+        # because two readers of this same marker disagreed once and `--clear`
+        # never converged; a third reader written here would be a fourth
+        # opinion on one fact. It is the stricter test — a marker must be a
+        # NON-EMPTY list — and asking it here is what makes "names a port" and
+        # "is wired" the same question everywhere.
+        if _wire_mark_of(raw) is None:
+            return None
+        env = raw.get("env") or {}
         port = int(env.get("CSWAP_PIN_PORT") or 0)
     except Exception:  # noqa: BLE001 — unreadable/unwired: no opinion
         return None
