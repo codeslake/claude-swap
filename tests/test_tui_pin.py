@@ -405,6 +405,38 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
         finally:
             pin.is_available, pin._wiring_present = real
 
+    async def test_the_submenu_offers_the_clear_a_partial_clear_left_behind(
+        self, tmp_path
+    ):
+        """The two gates must ask the same question.
+
+        The root gate is `is_available() or _wiring_present(...)`; the submenu
+        gated the clear row on the RECORD alone. A partial `clear_pin` drops
+        the record and gets locked out of the wiring ("Could not remove the
+        wiring — re-run once it frees up"), so the root menu showed the Cloud
+        row, the submenu showed the accounts and `← back`, and the user
+        following the TUI's own advice found nothing to press.
+        """
+        from claude_swap import pin
+
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        real = (pin.is_available, pin._impl, pin._wiring_present, pin.pinned_email)
+        pin.is_available = lambda: True
+        pin._impl = lambda: object()
+        pin._wiring_present = lambda _sw: True   # the wiring survived
+        pin.pinned_email = lambda _sw: None      # the record did not
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                ids = [aid for _label, aid in app.screen._pin_entries()]
+                assert "pin:clear" in ids, (
+                    "the TUI told the user to re-run the clear and then "
+                    f"offered no row to run it from: {ids}"
+                )
+        finally:
+            pin.is_available, pin._impl, pin._wiring_present, pin.pinned_email = real
+
     async def test_clear_reaches_pin_py_without_the_package(self, tmp_path):
         """The dispatcher resolved _impl() for EVERY pin: action, so the one
         operation still available was the one it refused."""
