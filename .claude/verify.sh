@@ -12,6 +12,17 @@ CS="$HOME/.local/bin/cswap"
 fail=0
 say() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; [ "$2" = FAIL ] && fail=1; return 0; }
 
+# The two python probes below PARSE what they capture, so their stderr must not
+# land in the value. Measured on via-personal-mac: a dependency emitted a
+# SyntaxWarning on import (3.14 flags `return` inside `finally`), `2>&1` put it
+# in front of the count, and tui-pin reported "could not count" on a machine
+# whose TUI was entirely healthy -- a FAIL that describes the interpreter's
+# chattiness, not the code. Warnings are also version-dependent, so the same
+# tree passes on one host and fails on another. stderr is kept, and reported
+# only when the verdict itself is unusable.
+ERRF=$(mktemp); trap 'rm -f "$ERRF"' EXIT
+errtail() { tr '\n' ' ' < "$ERRF" | cut -c1-160; }
+
 # 1. The console script runs at all. This is the check that catches a deploy
 #    that landed a tree the entry point cannot even import.
 if out=$("$CS" --version 2>&1); then say version OK "$out"
@@ -90,7 +101,7 @@ else say pin FAIL "$out"; fi
 #     it. Both must agree. A recorded pin with no wiring is REPORTED, not
 #     failed — an unpinned machine still runs, and a check that fails here
 #     would block every deploy to a host whose daemon is being repaired.
-wire=$("$py" - <<'PYEOF' 2>&1
+wire=$("$py" - <<'PYEOF' 2>"$ERRF"
 import json, os
 try:
     d = json.load(open(os.path.expanduser("~/.claude.json")))
@@ -118,6 +129,7 @@ case "$wire" in
   UNWIRED)     say pin-wired OK "UNPINNED — no wiring, no daemon; sessions go out direct" ;;
   HALF*)       say pin-wired FAIL "half-wired, requests dial a port nothing serves — ${wire#HALF }" ;;
   UNREADABLE*) say pin-wired FAIL "~/.claude.json ${wire#UNREADABLE }" ;;
+  '')          say pin-wired FAIL "the probe produced no verdict; stderr: $(errtail)" ;;
   *)           say pin-wired FAIL "could not determine wiring (got: ${wire:-no output})" ;;
 esac
 
@@ -135,7 +147,7 @@ esac
 #    `del impl` left _pin_entries raising UnboundLocalError on every successful
 #    call, while every guard asserting the surface EXISTS stayed green. So it
 #    now CALLS the pin surface and reads what comes back.
-tui=$("$py" - <<'PYEOF' 2>&1
+tui=$("$py" - <<'PYEOF' 2>"$ERRF"
 import importlib, inspect
 n = 0
 for m in ("dashboard", "widgets", "autoview"):
@@ -181,7 +193,7 @@ case "$tui" in
   IMPORTFAIL*)   say tui-pin FAIL "$tui" ;;
   RAISES*)       say tui-pin FAIL "the pin surface EXISTS but RAISES when called — $tui" ;;
   NOCALLABLE*)   say tui-pin FAIL "$tui" ;;
-  ''|*[!0-9]*)   say tui-pin FAIL "could not count (got: ${tui:-no output})" ;;
+  ''|*[!0-9]*)   say tui-pin FAIL "could not count (got: ${tui:-no output}; stderr: $(errtail))" ;;
   0)             say tui-pin FAIL "the TUI has NO pin surface — CLI works, dashboard/badge gone" ;;
   *)             say tui-pin OK "$tui cloud refs across dashboard/widgets/autoview" ;;
 esac
