@@ -330,6 +330,68 @@ class TestLaunchIsNeverBlocked:
         env = {"A": "1"}
         assert pin.wire_launch_env(object(), env) == env
 
+    def test_wire_launch_env_actually_wires_the_pinned_proxy(self, monkeypatch):
+        """`grep -rn 'wire_env' tests/` was zero hits: every existing test
+        drives a FAILURE shape (no package, ensure_proxy raising, ensure_proxy
+        returning None) and none drives an active pin actually getting wired.
+
+        Mutating the success path to `return env` (the pin wires nothing at
+        all) left the suite at 150 passed — this is the test that closes that
+        gap. Asserts on the RESULT `wire_env` produced, not that it was
+        called: a "wire_env was called" mock assertion passes even when
+        wire_env's return value is thrown away.
+        """
+        import types
+        from pathlib import Path
+
+        from claude_swap import pin
+
+        impl = types.SimpleNamespace(
+            ensure_proxy=lambda sw: (9955, Path("/tmp/pin-ca.pem")),
+            wire_env=lambda env, port, ca_path: {
+                **env,
+                "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                "NODE_EXTRA_CA_CERTS": str(ca_path),
+            },
+        )
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+        result = pin.wire_launch_env(object(), {"A": "1"})
+        assert result == {
+            "A": "1",
+            "HTTPS_PROXY": "http://127.0.0.1:9955",
+            "NODE_EXTRA_CA_CERTS": "/tmp/pin-ca.pem",
+        }, f"the pin was resolved and returned a proxy but the env is {result!r}"
+
+    def test_wire_env_raising_leaves_the_launch_unpinned(self, monkeypatch):
+        """The fail-open invariant on the SAME path as the test above: an
+        `ensure_proxy` that succeeds followed by a `wire_env` that RAISES must
+        still return an env that names no proxy — never partial wiring, never
+        a propagated exception. Checked on the env content, not just that no
+        exception escaped `wire_launch_env`.
+        """
+        import types
+        from pathlib import Path
+
+        from claude_swap import pin
+
+        def _boom(env, port, ca_path):
+            raise RuntimeError("wire_env boom")
+
+        impl = types.SimpleNamespace(
+            ensure_proxy=lambda sw: (9955, Path("/tmp/pin-ca.pem")),
+            wire_env=_boom,
+            unwire_if_dead=lambda p: None,
+        )
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+        # Isolate this test from the real config lock/unwire tail below the
+        # guarded call — that tail is Task 2's surface, not this one's.
+        monkeypatch.setattr(pin, "_config_lock_is_free", lambda budget: False)
+        sw = types.SimpleNamespace(backup_dir=Path("/tmp"))
+        result = pin.wire_launch_env(sw, {"A": "1"})
+        assert result == {"A": "1"}, (
+            f"wire_env raised but the returned env still names a proxy: {result!r}"
+        )
+
 
 class TestTheWiringCanAlwaysBeRemoved:
     """`.claude.json` names the pin's port, and Claude Code applies that env
@@ -2220,6 +2282,60 @@ class TestTheUncoveredRound2Fixes:
         assert "still works and removes the wiring." not in combined, (
             "the advice still promises an unconditional outcome: "
             f"{combined[-500:]}"
+        )
+
+
+class TestTheLockProbeActuallyProbes:
+    """`_config_lock_is_free`'s only two references in the suite
+    (`test_the_launch_unwire_is_bounded_by_the_budget` above) both
+    monkeypatch the function itself — its real body, the `proper_lockfile`
+    call, never runs under test. Inverting both returns (True<->False) left
+    the suite at 150 passed.
+
+    Drives the REAL function against a real lock directory in `tmp_path`, no
+    monkeypatch of `_config_lock_is_free` itself. `get_global_config_path` is
+    pointed at a tmp path the same way `TestHealNeverTearsDownAServingPin`
+    and others already do in this file.
+
+    THE CONTROL: asserting "returned in under N seconds" for the held case
+    passes trivially if the lock was never actually taken by anything — a
+    broken fixture and a working one both return fast. So the held case's
+    False is paired with a free probe on the SAME path returning True; only
+    together do they prove the probe reached the real lock.
+    """
+
+    def test_a_held_lock_answers_false_within_the_budget(self, tmp_path, monkeypatch):
+        import time as _time
+
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.claude_locks import proper_lockfile
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text("{}")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+
+        lock_dir = cfg.parent / (cfg.name + ".lock")
+        with proper_lockfile(lock_dir, timeout=5):
+            start = _time.monotonic()
+            held_result = pin._config_lock_is_free(0.3)
+            elapsed = _time.monotonic() - start
+
+        assert held_result is False, "answered True while the lock was held"
+        # roughly `budget`, not instant and not the process default (9s) —
+        # confirms the probe actually waited on the held lock rather than
+        # short-circuiting some other way.
+        assert 0.2 <= elapsed <= 2.0, (
+            f"took {elapsed:.2f}s against a 0.3s budget — not bounded by it"
+        )
+
+        # THE CONTROL: same path, lock released, must now answer True. If a
+        # broken fixture made the held probe return False for some reason
+        # unrelated to the real lock, this would also fail — it is what rules
+        # that out.
+        assert pin._config_lock_is_free(1.0) is True, (
+            "a free probe on the same path after release did not answer True "
+            "— the held-case False above is not trustworthy without this"
         )
 
 
