@@ -6112,10 +6112,17 @@ class ClaudeAccountSwitcher:
                 f"but it is unreadable right now (locked or no GUI "
                 f"session). Retry from a GUI terminal; do not re-add."
             )
-        raise SwitchError(
-            f"Account-{account_num} has no stored credentials. "
-            f"Re-add with: cswap --add-account --slot {account_num}"
-        )
+        # ABSENT returns "" rather than raising. #199 lands on an empty
+        # slot deliberately -- a roster import syncs the account LIST and
+        # not the credentials, so an empty slot is a destination, and the
+        # only way to fill one is to be ON it and log in. Raising here made
+        # the one slot you needed to reach the one slot you could not,
+        # because the caller's `if not target_creds:` branch is then dead.
+        #
+        # UNREADABLE still raises above: that is a slot whose backup exists
+        # behind a locked Keychain, and landing on it as "empty" would clear
+        # a live login for a slot that has one.
+        return ""
     def _switch_to_empty_slot(
         self,
         target_account: str,

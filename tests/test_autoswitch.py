@@ -8096,9 +8096,14 @@ class TestStoppedEngineDoesNotAct:
 
         real_perform = engine._perform
 
-        def perform_after_stop(number, email, trigger):
+        # *args: 199 wrote this stub against its own 3-arg `_perform`; 204
+        # widened the real signature with `left`. A fixed arity here is a
+        # TypeError the moment both land, and only in the integration build —
+        # each PR is green alone. Star-args keeps the stub honest against
+        # either signature.
+        def perform_after_stop(*args):
             engine.stop()  # lands in the gap before _perform's own gate
-            return real_perform(number, email, trigger)
+            return real_perform(*args)
 
         engine._perform = perform_after_stop
         harness.events.clear()
