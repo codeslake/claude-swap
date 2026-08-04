@@ -10513,6 +10513,67 @@ class TestGateUltraReviewFixes:
                 "return credentials the slot does not hold"
             )
 
+    def test_a_failed_session_invalidation_never_unwinds_a_stored_credential(
+        self, tmp_path
+    ):
+        """`_write_account_credentials` is two steps: the store write ADVANCES
+        the slot, then session invalidation runs and can raise (EACCES on the
+        session dir, a read-only mount). A raise escaping the wrapper is read
+        by every caller as "the persist failed" for a slot that HOLDS the new
+        credential — so the post-POST arm stashes a row byte-identical to the
+        slot's live credential and demotes a successful refresh to `transient`,
+        and `cswap run` prints "Could not refresh the token" for a refresh that
+        worked.
+
+        The invalidation is housekeeping: its job is to stop a session profile
+        serving a superseded token, and `mark_session_stale` already exists for
+        the case where the profile cannot be touched now. Losing it costs a
+        re-bootstrap; losing the write's RETURN costs a live credential.
+
+        Parametrized against the succeeding control so the row that matters
+        cannot pass alone.
+        """
+        from claude_swap.session import STALE_MARKER
+
+        for invalidation_raises in (False, True):
+            sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+            wrote = {}
+            sw._store = type("S", (), {
+                "_write_account_credentials":
+                    lambda self, n, e, c: wrote.__setitem__("creds", c),
+            })()
+            sess = tmp_path / f"sess-{invalidation_raises}"
+            sess.mkdir()
+            sw._session_dir = lambda n, e: sess
+            sw._live_session_pids = lambda n, e: []
+
+            def _invalidate(n, e, _raise=invalidation_raises):
+                if _raise:
+                    raise PermissionError(13, "Permission denied")
+                wrote["invalidated"] = True
+
+            sw._invalidate_session_credentials = _invalidate
+            sw._logger = type("L", (), {"info": lambda *a, **k: None,
+                                        "warning": lambda *a, **k: None})()
+
+            sw._write_account_credentials("2", "a@b.c", "NEW-GENERATION")
+
+            assert wrote.get("creds") == "NEW-GENERATION", (
+                f"the store write did not happen "
+                f"(invalidation_raises={invalidation_raises})"
+            )
+            if invalidation_raises:
+                # The profile could not be invalidated now, so it must be
+                # MARKED — otherwise a profile whose access token is still
+                # unexpired keeps serving a spent refresh token and nothing
+                # forces the re-bootstrap.
+                assert (sess / STALE_MARKER).exists(), (
+                    "a swallowed invalidation left no stale marker: the "
+                    "profile will keep serving the superseded generation"
+                )
+            else:
+                assert wrote.get("invalidated"), "CONTROL: invalidation skipped"
+
     @pytest.mark.parametrize("row_a_readable", [True, False])
     def test_an_unreadable_non_matching_row_does_not_abort_the_scan(
         self, temp_home: Path, sample_sequence_data: dict, row_a_readable: bool

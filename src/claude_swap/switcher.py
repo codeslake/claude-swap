@@ -808,9 +808,36 @@ class ClaudeAccountSwitcher:
         The store performs the pure write and raises on failure *before* returning,
         so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
         once and only after a successful write.
+
+        PAST THE STORE WRITE, NOTHING MAY RAISE. The write ADVANCES the slot,
+        and every caller reads an exception from this method as "the persist
+        failed" — so a raise here reports a failure for a slot that holds the
+        new credential. At the post-POST call site that is worse than losing
+        the invalidation: the grant is already spent, the handler stashes a
+        "successor" byte-identical to what the store now holds, and a
+        successful refresh is demoted to ``transient`` (measured: the tick then
+        emits "could not freshen any candidate (network?)" forever over a
+        healthy slot, and ``cswap run`` prints "Could not refresh the token").
+
+        So the invalidation is contained, and its failure LEAVES THE MARKER
+        instead. That is not a downgrade: a profile whose access token is still
+        unexpired passes the local reuse check, so simply skipping the
+        invalidation would let it keep serving a superseded generation until it
+        expires. ``STALE_MARKER`` is what forces the re-bootstrap regardless,
+        and it is the same mechanism the live-session branch already relies on.
         """
         self._store._write_account_credentials(account_num, email, credentials)
-        self._post_backup_write(account_num, email)
+        try:
+            self._post_backup_write(account_num, email)
+        except Exception:  # noqa: BLE001 — see the docstring: never past the write
+            from claude_swap.session import mark_session_stale
+
+            mark_session_stale(self._session_dir(account_num, email))
+            self._logger.warning(
+                "Stored account %s's credential but could not invalidate its "
+                "session profile; marked it stale so the next run "
+                "re-bootstraps.", account_num, exc_info=True,
+            )
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
@@ -2448,24 +2475,17 @@ class ClaudeAccountSwitcher:
                     account_num,
                 )
                 continue
-            # Store write first and UNGUARDED: if the slot does not take
-            # the credential there is no adoption to report, and returning
-            # one would hand the caller bytes the store does not hold.
-            self._store._write_account_credentials(account_num, email, creds)
-            # Past this line the slot IS advanced, so nothing may raise: the
-            # caller reads an exception as "the refresh failed" and re-POSTs
-            # a generation this pass already consumed. Session invalidation
-            # and the retire are both housekeeping — a stale session profile
-            # re-bootstraps on its next `cswap run`, a stale row is retried
-            # next pass or dropped with `cswap unclaimed --purge`.
-            try:
-                self._post_backup_write(account_num, email)
-            except Exception:
-                self._logger.warning(
-                    "Adopted account %s's successor but could not invalidate "
-                    "its session profile; it re-bootstraps on the next run.",
-                    account_num, exc_info=True,
-                )
+            # The WRAPPER, not the store method plus a private repeat of its
+            # tail: `_write_account_credentials` already contains the
+            # invalidation and leaves STALE_MARKER when it cannot run, so it
+            # cannot raise past its own store write. Open-coding the split
+            # here made this one call site safe and left the other two — the
+            # resync and the post-POST persist — carrying the defect.
+            self._write_account_credentials(account_num, email, creds)
+            # Housekeeping, and non-fatal for the same reason: the slot is
+            # advanced, so a raise would report a failed refresh for a
+            # credential the store holds. A stale row is retried next pass or
+            # dropped with `cswap unclaimed --purge`.
             self._retire_stash_entry(entry_id, account_num)
             self._logger.info(
                 "Adopted account %s's stashed successor (%s): the stored "
