@@ -360,7 +360,26 @@ class AutoScreen(Screen):
                 )
                 ranked.append((998.0, acc.number))
             elif pct is None:
-                entry.append("  usage unknown", style=palette.muted)
+                # An extra-usage (pay-as-you-go) account has no 5h/7d window,
+                # so binding_pct answers None — but it is not unknown, it has
+                # a SPEND budget, and the watch screen already renders it.
+                # `relevant_windows` excludes spend on purpose (a separate
+                # axis from a rate-limit window), so this row was the only
+                # place the same account read two different ways.
+                spend = (acc.usage.last_good or {}).get("spend")
+                if spend:
+                    entry.append("  $$ ", style=palette.muted)
+                    entry.append(f"{float(spend['pct']):.0f}%",
+                                 style=palette.severity(float(spend["pct"])))
+                    entry.append(
+                        f" · ${float(spend['used']):,.2f}/${float(spend['limit']):,.2f}",
+                        style=palette.muted,
+                    )
+                else:
+                    entry.append("  usage unknown", style=palette.muted)
+                # RANKED LAST EITHER WAY. Spend is not headroom: folding it
+                # into the sort key would change which account the engine
+                # picks, and the ranking axis is not this row's to move.
                 ranked.append((999.0, acc.number))
             else:
                 # Per-window chips, from the same helper the dashboard uses

@@ -1897,11 +1897,11 @@ class TestUnswitchableRowsAreListed:
             accounts=list(accounts), active_number=None, taken_at=0.0
         )
 
-    def _acct(self, number, email, *, switchable, kind="oauth"):
+    def _acct(self, number, email, *, switchable, kind="oauth", last_good=None):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
-        a.usage.last_good = None
+        a.usage.last_good = last_good
         a.usage.sentinel = None
         return a
 
@@ -1940,6 +1940,63 @@ class TestUnswitchableRowsAreListed:
         assert "API key" in out
         # There is no login to restore for an API key slot.
         assert "cswap add" not in out
+
+    def test_a_spend_only_account_shows_its_spend_not_usage_unknown(self):
+        """An extra-usage (pay-as-you-go) account has no 5h/7d window, so the
+        binding-window helper answers None and the row read "usage unknown"
+        while the watch screen showed `$$ 51%  $10.29 / $20.00` for the same
+        account from the same `last_good`. One account cannot read two ways.
+
+        `relevant_windows` excludes `spend` deliberately — it is a separate
+        axis from a rate-limit window and must not enter the ranking — so this
+        is a RENDERING gap, not a missing window. The row stays sorted last.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "paid@x.com", switchable=True, last_good={
+                "spend": {"pct": 51.45, "used": 10.29, "limit": 20.0},
+            }),
+        ), active="1")
+        assert "usage unknown" not in out, (
+            f"a spend-only account still reads as unknown: {out!r}"
+        )
+        assert "$10.29" in out and "$20.00" in out, out
+        assert "51%" in out, out
+
+    def test_spend_does_not_enter_the_ranking(self):
+        """Showing spend must not make it a sort key. Spend is a budget, not
+        rate-limit headroom, and `relevant_windows` excludes it from every
+        decision — a spend-only account ranks last whatever its percentage,
+        or the display would quietly change which account the engine picks.
+
+        Measured by the row ORDER: a 1%-spent account still sorts behind a
+        95%-used oauth account, which it would overtake on any spend-aware key.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "busy@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 95.0},
+            }),
+            self._acct("6", "cheap@x.com", switchable=True, last_good={
+                "spend": {"pct": 1.0, "used": 0.2, "limit": 20.0},
+            }),
+        ), active="1")
+        assert out.index("busy@x.com") < out.index("cheap@x.com"), (
+            f"spend entered the ranking — a barely-spent account outranked a "
+            f"95%-used one: {out!r}"
+        )
+
+    def test_CONTROL_an_account_with_no_usage_at_all_still_says_unknown(self):
+        """The control: "usage unknown" is still the right answer when there
+        is genuinely nothing to show. A fix that removes the phrase outright
+        would pass the row above and lose the real signal."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("7", "silent@x.com", switchable=True),
+        ), active="1")
+        assert "usage unknown" in out, (
+            f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
+        )
 
     def test_unswitchable_rows_sort_last(self):
         out = self._render(self._snap(
