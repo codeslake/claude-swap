@@ -1494,11 +1494,19 @@ class CredentialStore:
         manifest rows only, so a row-less entry can never be adopted, while
         ``_list_unclaimed_credentials``' glob keeps listing its bytes forever.
 
-        A lock timeout raises ``LockError``, which both callers already
-        handle: a failed stash must be loud (callers treat a successful one as
-        the license to overwrite the live store), and a failed retire unwinds
-        into the gate's own ``except LockError`` -- pre-POST, so nothing is
-        consumed and the pass defers.
+        This raises on failure -- ``LockError`` on a lock timeout, ``OSError``
+        from ``_write_stash_manifest``'s ``atomic_write_json`` (full disk,
+        read-only mount) -- and the two callers want opposite things from
+        that, so neither may assume the other's handling.
+
+        A failed STASH must be loud: callers treat a successful one as the
+        license to overwrite the live store.
+
+        A failed RETIRE must not be. It is housekeeping, and its call sites in
+        ``_adopt_stashed_successor`` run after a store write that already
+        advanced the slot, so a raise there would report a failed refresh for
+        a slot that is in fact freshened and make the caller re-POST a spent
+        generation. ``_retire_stash_entry`` therefore swallows and logs.
         """
         from claude_swap.locking import FileLock
 
