@@ -9568,6 +9568,46 @@ class TestDegradedReadProvenance:
             "refresh token is POSTed and a live account can be quarantined"
         )
 
+    def test_status_path_does_not_condemn_a_healed_slot_on_degraded_read(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch,
+    ):
+        """Round 11 C1, `:4768` variant: `_active_account_usage` (the
+        `--status` single-slot path) sets `self._active_read_degraded` and
+        then calls the shared `_collect_usage_entries`, so it must inherit
+        the same fix as the `--list`/collector path above. Same scenario as
+        `test_collector_own_active_read_does_not_condemn_a_healed_slot_on_degraded_read`
+        (TestActiveSlotStrikeParity), driven through `_active_account_usage`
+        instead of `_build_accounts_info`."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        old_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-old",
+                              "refreshToken": "rt-old", "expiresAt": 1000}})
+        new_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new",
+                              "expiresAt": 99999999999000}})
+        idents = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            idents,
+        )
+        s._write_account_credentials("2", "b@example.com", new_gen)  # healed
+        monkeypatch.setattr(
+            s, "_read_active_credentials",
+            lambda: ActiveCredentials(old_gen, False, True),  # degraded, stale
+        )
+        entry = s._active_account_usage("2", "b@example.com", "")
+        assert entry.sentinel != USAGE_RELOGIN_REQUIRED, (
+            "C1 (round 11) regression on the --status path: an already-"
+            f"healed slot was condemned on a degraded read, sentinel={entry.sentinel!r}"
+        )
+
 class TestBackupReadTriState:
     """M1: a backup read that failed at the Keychain (not rc-44 absent) must
     be distinguishable from a genuinely absent backup — 'unreadable' shows
@@ -11171,6 +11211,67 @@ class TestActiveSlotStrikeParity:
         assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED, (
             "C1 regression: collector condemned an already-healed active "
             f"slot on a locked Keychain, sentinel={entries['2'].sentinel!r}"
+        )
+
+    def test_collector_own_active_read_does_not_condemn_a_healed_slot_on_degraded_read(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """Round 11 C1: the test above hand-builds the info tuple and feeds
+        it the ALREADY-HEALED bytes (`new_gen`) as `creds` -- it never
+        exercises `_build_accounts_info`'s own active read, the third
+        collapse site rounds 9/10 did not touch. `_build_accounts_info`
+        does `creds = active.value or ""` and records `_active_read_degraded`
+        one line later, but the collector's quarantine scan never consulted
+        it -- a degraded read serving the STALE (still-struck) generation
+        fingerprint-matched and condemned an already-healed slot.
+
+        This test drives the REAL `_build_accounts_info` +
+        `_collect_usage_entries` (not a hand-built info row), with the
+        degraded read serving the OLD, struck generation while the backup
+        already holds the healed NEW one -- exactly what "degraded" means:
+        the Keychain read failed and a lagging plaintext fallback covered
+        it.
+        """
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        old_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-old",
+                              "refreshToken": "rt-old", "expiresAt": 1000}})
+        new_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new",
+                              "expiresAt": 99999999999000}})
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            identities,
+        )
+        # HEALED: backup now holds the new generation; the struck fp
+        # matches nothing there.
+        s._write_account_credentials("2", "b@example.com", new_gen)
+        # The active read itself is DEGRADED and serves the STALE (struck)
+        # generation -- a lagging plaintext fallback covering a failed
+        # Keychain read, which is what "degraded" means.
+        monkeypatch.setattr(
+            s, "_read_active_credentials",
+            lambda: ActiveCredentials(old_gen, False, True),
+        )
+        # _build_accounts_info derives active_num from the live IDENTITY
+        # (_get_current_account), not current_account_number.
+        monkeypatch.setattr(s, "_get_current_account",
+                             lambda: ("b@example.com", ""))
+        with patch.object(s, "current_account_number", return_value="2"):
+            info = s._build_accounts_info()
+            entries = s._collect_usage_entries(info, fetch=set())
+        assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED, (
+            "C1 (round 11) regression: the collector's OWN active read "
+            "condemned an already-healed slot on a degraded read, "
+            f"sentinel={entries['2'].sentinel!r}"
         )
 
     def test_collector_does_not_silently_heal_an_unresolved_strike_on_locked_keychain(
