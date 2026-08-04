@@ -1477,6 +1477,37 @@ class CredentialStore:
                     )
         atomic_write_json(path, {"schemaVersion": 1, "entries": entries})
 
+    def _mutate_stash_manifest(self, mutate) -> None:
+        """Apply ``mutate(entries)`` to the manifest as one atomic step.
+
+        The manifest is a single whole-file rewrite, so read-modify-write is
+        only safe under mutual exclusion. Its own lock, deliberately NOT the
+        slot lock: the stash writer at ``switcher.py``'s ``except LockError``
+        runs precisely BECAUSE the slot lock was unavailable, so it can never
+        take it, while the retire it races runs under it. Unsynchronized, the
+        two rewrite the whole file from snapshots taken before the other's
+        write and each drops the other's row -- measured 50 of 80 rows lost
+        with three real concurrent workers, 0 lost with the same workload
+        serialized.
+
+        Losing a row is not cosmetic: ``_adopt_stashed_successor`` iterates
+        manifest rows only, so a row-less entry can never be adopted, while
+        ``_list_unclaimed_credentials``' glob keeps listing its bytes forever.
+
+        A lock timeout raises ``LockError``, which both callers already
+        handle: a failed stash must be loud (callers treat a successful one as
+        the license to overwrite the live store), and a failed retire unwinds
+        into the gate's own ``except LockError`` -- pre-POST, so nothing is
+        consumed and the pass defers.
+        """
+        from claude_swap.locking import FileLock
+
+        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
+        with FileLock(self._stash_manifest_path().with_suffix(".lock")):
+            entries = self._read_stash_manifest()
+            mutate(entries)
+            self._write_stash_manifest(entries)
+
     def _write_unclaimed_credential(self, credentials: str, context: dict) -> str:
         """Stash a credential of unknown provenance. Returns the entry id.
 
@@ -1496,12 +1527,11 @@ class CredentialStore:
         # existing id.
         entry_id = f"{ts}-{digest}-{secrets.token_hex(3)}"
         self._atomic_b64_write(self._stash_entry_path(entry_id), credentials)
-        entries = self._read_stash_manifest()
-        entries[entry_id] = {
+        row = {
             "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             **context,
         }
-        self._write_stash_manifest(entries)
+        self._mutate_stash_manifest(lambda entries: entries.update({entry_id: row}))
         return entry_id
 
     def _list_unclaimed_credentials(self) -> dict[str, dict]:
@@ -1558,7 +1588,4 @@ class CredentialStore:
             self._host._logger.warning(
                 f"Failed to remove unclaimed credential {entry_id}: {e}"
             )
-        entries = self._read_stash_manifest()
-        if entry_id in entries:
-            del entries[entry_id]
-            self._write_stash_manifest(entries)
+        self._mutate_stash_manifest(lambda entries: entries.pop(entry_id, None))

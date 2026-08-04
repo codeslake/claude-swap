@@ -64,12 +64,19 @@ _logger = logging.getLogger("claude-swap")
 # and the order decides which, because reporting the wrong one is how a cause
 # needing a human hides behind one that clears itself. store-unmirrored and
 # invalid_client stay until somebody unsets an env var or fixes a client
-# registration; consume-busy is gone by the next pass.
+# registration, and stash-unreadable until they unlock a keychain, fix a mode,
+# or purge the row; consume-busy is gone by the next pass. stash-unreadable is
+# the one that is per-SLOT rather than global, which costs nothing here: this
+# message is only ever emitted when NO candidate freshened, so naming the real
+# cause of the only slot that had one beats "(network?)".
 _SYSTEMIC_MESSAGES = {
     "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
                         "run cswap from a normal shell",
     "invalid_client": "cswap's OAuth client was rejected — systemic, not this "
                       "account",
+    "stash-unreadable": "a stashed successor is unreadable — unlock the "
+                        "keychain or fix the file, then retry; "
+                        "`cswap unclaimed` inspects it",
     "consume-busy": "another cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
