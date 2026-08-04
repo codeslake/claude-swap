@@ -95,12 +95,11 @@ class CswapApp(App):
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
         elif self._start == "auto":
-            # ONLY the explicit `cswap tui --auto` opens on the auto view.
-            # autoStartLive used to be consulted here too, which made the flag
-            # a lie and let one go-live confirmation auto-enter LIVE on every
-            # machine sharing settings.json. It still decides LIVE-vs-dry-run
-            # once you are ON the view (AutoScreen.on_mount) — not that you go
-            # there.
+            # ONLY the explicit `cswap tui --auto` opens on the auto view,
+            # and only it starts the engine LIVE. A bare `cswap tui` lands on
+            # the dashboard, and reaching the auto view from the menu watches
+            # without switching — opening a view must never begin switching
+            # accounts.
             self.push_screen(AutoScreen(start_live=True))
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
