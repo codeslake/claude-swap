@@ -10289,6 +10289,296 @@ class TestGateUltraReviewFixes:
         assert out.error is None
         assert out.credentials == self._NEW
 
+    # -- a failed retire must not unwind a completed adoption -------------
+
+    @pytest.mark.parametrize("retire_fails", [False, True])
+    def test_a_failed_retire_does_not_unwind_a_completed_adoption(
+        self, temp_home: Path, sample_sequence_data: dict, retire_fails: bool
+    ):
+        """The retire is housekeeping; the adoption is the credential.
+
+        ``_adopt_stashed_successor`` writes the backup and only THEN retires
+        the stash row. The row's bytes are already unlinked at that point, so
+        a raise out of the retire escapes a slot that has ALREADY been
+        advanced: the caller is told the adoption failed while the store says
+        it succeeded, and re-POSTs a generation this pass just consumed.
+
+        Any ``OSError`` from the manifest's ``atomic_write_json`` triggers it
+        (full disk, read-only mount) — no lock contention required.
+
+        Parametrized so the succeeding-retire CONTROL runs beside the probe:
+        if the control also lost the adoption, the probe would prove nothing.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "1",
+             "consumedFp": oauth.credential_fingerprint(self._OLD),
+             "fingerprint": oauth.credential_fingerprint(self._NEW)},
+        )
+
+        real_retire = s._store._remove_unclaimed_credential
+
+        def retire(entry_id):
+            if retire_fails:
+                raise OSError(28, "No space left on device")
+            real_retire(entry_id)
+
+        with patch.object(s._store, "_remove_unclaimed_credential", retire):
+            adopted = s._adopt_stashed_successor(
+                "1", "test@example.com", self._OLD
+            )
+
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW, (
+            "premise: the adoption write lands in both arms"
+        )
+        assert adopted == self._NEW, (
+            "the adoption completed but its credentials were not returned: "
+            "the caller re-POSTs a generation this pass already consumed"
+        )
+
+    @pytest.mark.parametrize("dead_row_is_byteless", [False, True])
+    def test_a_failed_housekeeping_retire_does_not_abort_the_scan(
+        self, temp_home: Path, sample_sequence_data: dict,
+        dead_row_is_byteless: bool
+    ):
+        """Housekeeping retires run mid-scan; a raise skips later rows.
+
+        The scan retires two kinds of dead row as it iterates — CAS-conflict
+        rows and rows whose bytes are gone. Both run BEFORE the adoptable row
+        may be reached, so a raise there aborts the loop and the successor
+        sitting right behind it is never adopted.
+
+        Both dead-row shapes are covered; each case is its own control, since
+        the same manifest with a working retire must adopt row B.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        # Row A: dead, retired as housekeeping, written FIRST so the scan
+        # reaches it before the adoptable row.
+        if dead_row_is_byteless:
+            # matching generation, bytes unlinked -> the `not creds` retire
+            dead_meta = {"reason": "consume-gate-persist-failed",
+                         "consumedFp": oauth.credential_fingerprint(self._OLD)}
+        else:
+            # non-matching generation -> the CAS-conflict retire
+            dead_meta = {"reason": "consume-gate-cas-conflict",
+                         "consumedFp": "sha256:gone"}
+        dead_id = s._store._write_unclaimed_credential(
+            self._NEW, {"configSlot": "1", **dead_meta})
+        if dead_row_is_byteless:
+            s._store._stash_entry_path(dead_id).unlink()
+
+        # Row B: the adoptable successor, behind A in the manifest.
+        live_id = s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "1",
+             "consumedFp": oauth.credential_fingerprint(self._OLD),
+             "fingerprint": oauth.credential_fingerprint(self._NEW)},
+        )
+        assert list(s._store._read_stash_manifest()) == [dead_id, live_id], (
+            "premise: the dead row is scanned before the adoptable one"
+        )
+
+        real_retire = s._store._remove_unclaimed_credential
+
+        def retire(entry_id):
+            if entry_id == dead_id:
+                raise OSError(28, "No space left on device")
+            real_retire(entry_id)
+
+        with patch.object(s._store, "_remove_unclaimed_credential", retire):
+            adopted = s._adopt_stashed_successor(
+                "1", "test@example.com", self._OLD
+            )
+
+        assert adopted == self._NEW, (
+            "a failed housekeeping retire aborted the scan before the "
+            "adoptable row behind it was reached"
+        )
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW
+
+
+    @pytest.mark.parametrize("bytes_survive", [True, False])
+    def test_a_byteless_non_matching_row_is_retired(
+        self, temp_home: Path, sample_sequence_data: dict, bytes_survive: bool
+    ):
+        """A row whose bytes are gone can never be adopted by anyone.
+
+        This is the state a failed retire leaves behind:
+        ``_remove_unclaimed_credential`` unlinks the bytes BEFORE rewriting
+        the manifest, so an ``OSError`` from that rewrite orphans a row whose
+        credential no longer exists. The adoption also moved the slot off the
+        generation the row keys against, so it never matches ``consumedFp``
+        again and the only non-match retire (CAS-conflict) does not apply —
+        it is immortal junk in ``--json``'s unclaimedCredentials.
+
+        The control is the whole point of drawing the line at the BYTES: a
+        non-matching row that still HAS its bytes holds a real, superseded
+        refresh token, and retiring that would destroy a credential an
+        operator may still want. Only the byte-less ones are free to drop.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._NEW)
+        entry_id = s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "1",
+             # keys against a generation the slot has already moved past
+             "consumedFp": oauth.credential_fingerprint(self._OLD),
+             "fingerprint": oauth.credential_fingerprint(self._NEW)},
+        )
+        if not bytes_survive:
+            s._store._stash_entry_path(entry_id).unlink()
+
+        adopted = s._adopt_stashed_successor("1", "test@example.com", self._NEW)
+
+        assert adopted is None, "premise: a non-matching row is never adopted"
+        listed = entry_id in s._store._read_stash_manifest()
+        if bytes_survive:
+            assert listed, (
+                "a superseded row that still holds its bytes is a real "
+                "credential; dropping it is the operator's call (--purge)"
+            )
+        else:
+            assert not listed, (
+                "a row whose bytes are gone can never be adopted by any "
+                "pass, yet nothing retires it: permanent junk in --json"
+            )
+
+    @pytest.mark.parametrize("store_write_lands", [True, False])
+    def test_a_failed_session_invalidation_does_not_discard_the_adoption(
+        self, temp_home: Path, sample_sequence_data: dict,
+        store_write_lands: bool
+    ):
+        """``_write_account_credentials`` is two steps, and the second can raise.
+
+        It writes the store (which ADVANCES the slot) and only then runs
+        ``_post_backup_write`` to invalidate the slot's session profile. The
+        live-session arm of that already swallows ``OSError``; the other arm
+        unlinks profile files and does not, so an EACCES/EIO on the session
+        dir raises out of an adoption whose credential is already stored —
+        the same shape as a failed retire, and the caller likewise re-POSTs a
+        spent generation.
+
+        The control is what keeps this from swallowing real failures: when the
+        STORE write is what failed, nothing was advanced and the exception
+        must still propagate, because returning credentials the store does not
+        hold would be a lie.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "1",
+             "consumedFp": oauth.credential_fingerprint(self._OLD),
+             "fingerprint": oauth.credential_fingerprint(self._NEW)},
+        )
+
+        def boom(*a, **kw):
+            raise OSError(13, "Permission denied")
+
+        if store_write_lands:
+            # only the post-write session invalidation fails
+            ctx = patch.object(type(s), "_post_backup_write", boom)
+        else:
+            # the store write itself fails: the slot never advances
+            ctx = patch.object(type(s._store), "_write_account_credentials", boom)
+
+        raised = None
+        with ctx:
+            try:
+                adopted = s._adopt_stashed_successor(
+                    "1", "test@example.com", self._OLD
+                )
+            except Exception as e:
+                adopted, raised = None, e
+
+        stored = s._read_account_credentials("1", "test@example.com")
+        if store_write_lands:
+            assert stored == self._NEW, "premise: the store took the write"
+            assert raised is None and adopted == self._NEW, (
+                "a completed adoption was discarded because the session "
+                "profile could not be invalidated"
+            )
+        else:
+            assert stored == self._OLD, "premise: the store rejected the write"
+            assert isinstance(raised, OSError), (
+                "the store never advanced; claiming an adoption would "
+                "return credentials the slot does not hold"
+            )
+
+    @pytest.mark.parametrize("row_a_readable", [True, False])
+    def test_an_unreadable_non_matching_row_does_not_abort_the_scan(
+        self, temp_home: Path, sample_sequence_data: dict, row_a_readable: bool
+    ):
+        """Classifying a dead row must not raise on a row it cannot read.
+
+        The byte-less retire has to decide whether a non-matching row still
+        holds a credential. ``Path.exists()`` is the obvious way and the wrong
+        one: it only swallows ENOENT-shaped errors, so an EACCES/EIO on the
+        entry file RAISES out of the scan — aborting it before an adoptable
+        sibling behind it is reached, which is exactly the failure this round
+        exists to remove.
+
+        ``_read_unclaimed_credential`` is the reader that already draws this
+        distinction (absent/corrupt vs merely unreadable) and never raises for
+        either. An unreadable row must also SURVIVE: its bytes are still there
+        and may hold a real superseded token.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        # Row A: non-matching (hits the dead-row classifier), bytes present.
+        row_a = s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-failed", "configSlot": "1",
+             "consumedFp": "sha256:some-other-generation"},
+        )
+        # Row B: the adoptable successor, behind A.
+        row_b = s._store._write_unclaimed_credential(
+            self._NEW,
+            {"reason": "consume-gate-persist-lock-failed",
+             "configSlot": "1",
+             "consumedFp": oauth.credential_fingerprint(self._OLD),
+             "fingerprint": oauth.credential_fingerprint(self._NEW)},
+        )
+        assert list(s._store._read_stash_manifest()) == [row_a, row_b], (
+            "premise: the dead row is classified before the adoptable one"
+        )
+
+        path_a = s._store._stash_entry_path(row_a)
+        real_stat, real_read = Path.stat, Path.read_text
+
+        def deny(self, *a, **kw):
+            if not row_a_readable and self.name == path_a.name:
+                raise PermissionError(13, "Permission denied")
+            return real_stat(self, *a, **kw)
+
+        def deny_read(self, *a, **kw):
+            if not row_a_readable and self.name == path_a.name:
+                raise PermissionError(13, "Permission denied")
+            return real_read(self, *a, **kw)
+
+        with patch.object(Path, "stat", deny), \
+             patch.object(Path, "read_text", deny_read):
+            adopted = s._adopt_stashed_successor(
+                "1", "test@example.com", self._OLD
+            )
+
+        assert adopted == self._NEW, (
+            "an unreadable dead row aborted the scan before the adoptable "
+            "row behind it was reached"
+        )
+        assert row_a in s._store._read_stash_manifest(), (
+            "a row whose bytes are merely unreadable still holds a real "
+            "credential; only a byte-less one is free to retire"
+        )
 
 class TestActiveSlotStrikeParity:
     """Ultra-review: the active slot has TWO stored sources (live + backup).

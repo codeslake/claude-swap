@@ -2132,15 +2132,27 @@ class ClaudeAccountSwitcher:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
             # the slot; defer cleanly rather than raise through callers
             # that promise never to (the collect pass thread-pools us).
+            # "Nothing consumed" is about the POST, not the store -- see
+            # the generic handler below.
             self._logger.info(
                 "Slot lock held elsewhere; deferring account %s's backup "
                 "refresh to the next pass.", account_num,
             )
             return oauth.RefreshOutcome(None, "transient")
         except Exception:
-            # Nothing consumed yet either (the resync/adopt writes raise
-            # before any POST) — degrade to transient instead of raising
-            # through the never-raises collect pass.
+            # No POST has been issued yet, so no grant of ours is
+            # outstanding — degrade to transient instead of raising through
+            # the never-raises collect pass.
+            #
+            # "Nothing consumed" is about the POST, NOT about the store. The
+            # resync and the adoption both WRITE before this point, and an
+            # earlier version of this comment claimed they raise first; they
+            # do not. A raise arriving here after a completed adoption would
+            # report a failure for a slot that is already freshened, and the
+            # caller would re-POST the generation that adoption superseded.
+            # `_adopt_stashed_successor` closes that by making everything
+            # after its store write non-fatal, so this handler is only ever
+            # reached with the slot genuinely unadvanced.
             self._logger.warning(
                 "Pre-consume window failed for account %s; deferring.",
                 account_num, exc_info=True,
@@ -2313,6 +2325,32 @@ class ClaudeAccountSwitcher:
             outcome_creds, None, result.token_account, consumed_fp
         )
 
+    def _retire_stash_entry(self, entry_id: str, account_num: str) -> None:
+        """Drop one stash entry as housekeeping. Never fatal.
+
+        Every call site is inside the adopt scan, and the one that matters
+        runs AFTER ``_write_account_credentials`` has already advanced the
+        slot. ``_remove_unclaimed_credential`` can raise there -- its manifest
+        rewrite ends in ``atomic_write_json`` (``OSError`` on a full disk or a
+        read-only mount) under a lock that can time out (``LockError``) -- and
+        a raise escaping a COMPLETED adoption is read by
+        ``_consume_backup_grant_locked`` as a failed refresh, so the caller
+        re-POSTs a generation this pass already consumed.
+
+        The two costs differ by an order of magnitude. Losing a retire leaves
+        one stale row, which the next pass retries and `cswap unclaimed
+        --purge` drops by hand. Losing the adoption discards a live credential
+        already written to the store. So: log and continue.
+        """
+        try:
+            self._store._remove_unclaimed_credential(entry_id)
+        except Exception:
+            self._logger.warning(
+                "Could not retire account %s's stash entry %s; leaving it for "
+                "the next pass (`cswap unclaimed --purge` drops it by hand).",
+                account_num, entry_id, exc_info=True,
+            )
+
     def _adopt_stashed_successor(
         self, account_num: str, email: str, current: str
     ) -> str | None:
@@ -2353,11 +2391,33 @@ class ClaudeAccountSwitcher:
                     # lineage in the same breath, so this successor branches
                     # off a generation that lineage already superseded. It is
                     # not the pending persist it looks like.
-                    self._store._remove_unclaimed_credential(entry_id)
+                    self._retire_stash_entry(entry_id, account_num)
                     self._logger.info(
                         "Retired account %s's CAS-conflict stash entry: its "
                         "generation was superseded by the writer that won the "
                         "race, so no pass can ever adopt it.", account_num,
+                    )
+                elif not any(self._store._read_unclaimed_credential(entry_id)):
+                    # No bytes and no matching generation: nothing can ever
+                    # adopt this row, and no other reason retires it. This is
+                    # the state a FAILED retire leaves -- the bytes are
+                    # unlinked before the manifest rewrite, so an OSError
+                    # there orphans the row while the adoption that preceded
+                    # it moved the slot off the generation it keys against.
+                    #
+                    # The READER, not `exists()`: `Path.exists()` swallows
+                    # only ENOENT-shaped errors, so an EACCES/EIO would raise
+                    # straight out of the scan and strand an adoptable sibling
+                    # behind this row. `any(...)` is false only for
+                    # ("", False) -- absent or corrupt. A merely UNREADABLE
+                    # row is ("", True) and survives: its bytes may hold a
+                    # real superseded token, so dropping it stays the
+                    # operator's call (`cswap unclaimed --purge`).
+                    self._retire_stash_entry(entry_id, account_num)
+                    self._logger.info(
+                        "Retired account %s's byte-less stash entry: its "
+                        "credential is gone and its generation has passed, "
+                        "so no pass could ever adopt it.", account_num,
                     )
                 continue
             creds, unreadable = self._store._read_unclaimed_credential(entry_id)
@@ -2381,15 +2441,32 @@ class ClaudeAccountSwitcher:
                 # on every gate pass and leaks in --json's
                 # unclaimedCredentials forever, the same accumulation the
                 # CAS-conflict branch above already retires on sight.
-                self._store._remove_unclaimed_credential(entry_id)
+                self._retire_stash_entry(entry_id, account_num)
                 self._logger.info(
                     "Retired account %s's unreadable-bytes stash entry: its "
                     "generation is gone, so no pass could ever adopt it.",
                     account_num,
                 )
                 continue
-            self._write_account_credentials(account_num, email, creds)
-            self._store._remove_unclaimed_credential(entry_id)
+            # Store write first and UNGUARDED: if the slot does not take
+            # the credential there is no adoption to report, and returning
+            # one would hand the caller bytes the store does not hold.
+            self._store._write_account_credentials(account_num, email, creds)
+            # Past this line the slot IS advanced, so nothing may raise: the
+            # caller reads an exception as "the refresh failed" and re-POSTs
+            # a generation this pass already consumed. Session invalidation
+            # and the retire are both housekeeping — a stale session profile
+            # re-bootstraps on its next `cswap run`, a stale row is retried
+            # next pass or dropped with `cswap unclaimed --purge`.
+            try:
+                self._post_backup_write(account_num, email)
+            except Exception:
+                self._logger.warning(
+                    "Adopted account %s's successor but could not invalidate "
+                    "its session profile; it re-bootstraps on the next run.",
+                    account_num, exc_info=True,
+                )
+            self._retire_stash_entry(entry_id, account_num)
             self._logger.info(
                 "Adopted account %s's stashed successor (%s): the stored "
                 "generation was already consumed by the gate pass that "
