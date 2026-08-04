@@ -342,9 +342,15 @@ class AutoScreen(Screen):
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
+                # The slot's OWN sentinel first: unswitchable is not always
+                # "nothing stored". A backup that exists but could not be READ
+                # reads USAGE_KEYCHAIN_UNAVAILABLE, and sending that slot to
+                # `cswap add` overwrites a working stored grant. `kind` still
+                # wins for api_key — the sentinel diverges from it behind a
+                # locked keychain (see dashboard.py's pin menu).
                 note = data.sentinel_label(
                     USAGE_API_KEY if acc.kind == "api_key"
-                    else USAGE_NO_CREDENTIALS
+                    else acc.usage.sentinel or USAGE_NO_CREDENTIALS
                 )
                 entry.append(f"  {note}", style=palette.sev_warn)
                 lines[acc.number] = entry

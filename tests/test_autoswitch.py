@@ -6549,24 +6549,23 @@ class TestEscapeBeforeTheLimitLands:
             "and spent-band rankings that proactive owns"
         )
 
-    def test_at_99_with_only_spent_peers_it_holds(self, harness):
-        """The 18:50 shape: nowhere better, so staying is right. The spent-band
-        rule decides where to sit, not an early escape."""
+    @pytest.mark.parametrize("case,pcts", [
+        # The 18:50 shape: nowhere better, so staying is right. The spent-band
+        # rule decides where to sit, not an early escape.
+        ("at the brink with only spent peers", (99, 100, 100)),
+        # A comfortable account is untouched: the hysteresis margin applies.
+        ("below the brink, ordinary rules", (50, 45, 40)),
+    ])
+    def test_it_holds(self, harness, case, pcts):
+        """Both halves of "no early escape": the two ends of the range hold for
+        different reasons and neither needs a trigger of its own."""
+        active, peer2, peer3 = pcts
         outcome = harness.tick_with_usage({
-            "1": _usage(99, self._at(harness, 109 * 3600)),
-            "2": _usage(100, self._at(harness, 80 * 3600)),
-            "3": _usage(100, self._at(harness, 50 * 3600)),
+            "1": _usage(active, self._at(harness, 109 * 3600)),
+            "2": _usage(peer2, self._at(harness, 80 * 3600)),
+            "3": _usage(peer3, self._at(harness, 50 * 3600)),
         })
-        assert outcome is not TickOutcome.SWITCHED
-
-    def test_below_the_brink_the_ordinary_rules_still_decide(self, harness):
-        """A comfortable account is untouched: the hysteresis margin applies."""
-        outcome = harness.tick_with_usage({
-            "1": _usage(50, self._at(harness, 109 * 3600)),
-            "2": _usage(45, self._at(harness, 80 * 3600)),
-            "3": _usage(40, self._at(harness, 50 * 3600)),
-        })
-        assert outcome is not TickOutcome.SWITCHED
+        assert outcome is not TickOutcome.SWITCHED, case
 
 
 class TestReviewFindings202:
