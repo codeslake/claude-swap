@@ -4140,35 +4140,39 @@ class TestEveryCallSiteRecordsAnUnresolvableGetter:
     # `clear_wiring`'s lock WARNING — a bare `_logger.warning`, not a
     # `_log_unresolvable` site at all. So the three are two getter sites plus
     # the lock WARNING, and the lock WARNING is what separates the two
-    # records that share `funcName == "clear_wiring"`. `_wiring_present`, the
-    # site this shape misses, fires only on the REMOVABLE shape — which this
-    # comment is explicitly not describing (measured on both).
+    # records that share `funcName == "clear_wiring"`. Why this shape misses
+    # `_wiring_present` is the last paragraph below, and it is not the reason
+    # this comment gave for two rounds.
     #
     # `funcName` is chosen because a lineno key is BRITTLE, not because it
-    # cannot discriminate. This paragraph was written by `f361237` and
-    # revised by `f22197a` and `eb6dc53`; only `f361237` moved a site in
-    # `pin.py` — neither revision did (`6e03af7` also moved sites, but via
-    # the comment block above this paragraph, which it left unchanged).
-    # Measured across `f361237` and `6e03af7`: THREE sites moved twice, not
-    # one — the lock WARNING (588 -> 633 -> 648) and both members of
-    # `_PER_TICK_SITES`, `_wiring_present` (755 -> 800 -> 815) and
-    # `_wired_ports` (1067 -> 1112 -> 1127). Not every site and not every
-    # round: the getter site below has sat at 468 since `d343bfb`, which
-    # moved it there (447 -> 468) by editing a docstring, not code — the
-    # last commit to change `pin.py`'s executable code is `3e97cdd`,
-    # `d343bfb`'s parent, and every round since (`d343bfb` included) has
-    # changed zero (measured, comments and docstrings both excluded). Both
-    # keyed-on sites moving twice under comment-only edits is the
-    # brittleness — a lineno key pins the guard to the file's current
-    # layout instead of to the fact it is about. `stacklevel=2` is what
-    # makes `funcName` the CALLER, which is that fact.
+    # cannot discriminate. NO REVISION OF THIS PARAGRAPH has ever moved a
+    # site in `pin.py` — the brittleness is that OTHER comment-only edits
+    # keep moving the sites it names anyway. Across the whole branch all
+    # four are moving targets: the getter below (447 -> 468 at `d343bfb`,
+    # +17 COMMENT lines and +4 docstring lines above it — "not code" is
+    # right, "a docstring" undersells it), the lock WARNING
+    # (588 -> 633 -> 648), and both `_PER_TICK_SITES` getters,
+    # `_wiring_present` (755 -> 800 -> 815) and `_wired_ports`
+    # (1067 -> 1112 -> 1127 -> 1128, the last at `e6df933`). "Exactly N
+    # moved" is a claim about a WINDOW, not a fixed count: those numbers
+    # show three sites moving twice across `d343bfb` -> `f361237` ->
+    # `6e03af7` while this getter sat still — `funcName` is immune to all
+    # of it, for the `stacklevel=2` reason already given above. The
+    # `two of them` in the two copies that point back here is that SAME
+    # window narrowed to one set: the three linenos the UNREMOVABLE shape
+    # reaches, of which the getter is the one that held.
     #
-    # THREE HERE AND `two of them` IN THE OTHER TWO COPIES IS NOT A
-    # CONTRADICTION — they count different sets. Those two count the
-    # linenos the UNREMOVABLE shape produces, of which exactly two moved;
-    # this counts every site in the file, of which three did.
-    # `_wiring_present` is the difference: it is in this set and not in
-    # theirs, because it fires solely on the REMOVABLE shape.
+    # `_wiring_present`'s ABSENCE from the UNREMOVABLE funcName set is not
+    # because it "fires solely on the REMOVABLE shape" — measured false, it
+    # also fires on NOTHING-WIRED. It runs twice on a wired tick: once
+    # inside `_wiring_is_stale` to gate the tick, once inside `heal` to
+    # confirm `clear_wiring` worked. On UNREMOVABLE the marker survives the
+    # failed removal, so the second call's `_wire_mark_of(raw) is not None:
+    # return True` answers from the FIRST config before the raising getter
+    # ever runs — an early return, not a shape restriction. REMOVABLE and
+    # NOTHING-WIRED both reach it (marker gone / never present), and
+    # `wired=False` in `test_the_per_tick_getters_stay_below_INFO` already
+    # depends on that reach.
     _PER_TICK_SITES = ("_wiring_present", "_wired_ports")
 
     def _heal(self, tmp_path, monkeypatch, caplog, *, wired, removable=True):
