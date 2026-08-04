@@ -81,8 +81,8 @@ class AutoScreen(Screen):
         super().__init__()
         self._engine: AutoSwitchEngine | None = None
         self._settings = None
-        # Consent already given: `cswap tui --auto` or a persisted
-        # autoStartLive — the engine starts LIVE without the modal.
+        # `cswap tui --auto` only. The engine starts LIVE without the modal
+        # because the flag IS the consent, for that launch alone.
         self._start_live = start_live
         # Session-only threshold adjustment (t, then arrows). Never written
         # to settings.json — same memory-only precedent as the dry-run
@@ -92,24 +92,6 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
-        # Whether the CURRENT engine's dry_run was True the last time this
-        # screen observed it — seeded by `_start_engine` from the engine's
-        # actual starting state. Lets the self-promotion persist (below) key
-        # on a TRANSITION rather than the steady-state fact `not
-        # engine.dry_run`, which also holds for an engine that started LIVE
-        # from `--auto` with nobody confirming anything (MAJOR-3).
-        self._engine_was_dry_run = True
-        # I1: whether a HUMAN confirmed the modal for the current engine's
-        # live-attempt, on THIS launch. `_engine_was_dry_run` alone is not
-        # enough — a CONTENDED `cswap tui --auto` also starts its engine
-        # dry_run=True (demoted), which makes its later self-promotion look
-        # exactly like the confirmed-then-demoted-then-promoted case
-        # `_engine_was_dry_run` was built to allow, even though `--auto`
-        # never showed the modal at all. Only `_on_live_confirm`'s confirmed
-        # branch sets this True; mount (`--auto` / a resumed
-        # `autoStartLive`) never does, so a contended `--auto` engine's
-        # later self-promotion cannot pass the self-promotion persist below.
-        self._live_confirmed_this_launch = False
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -135,12 +117,13 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        # Prior consent (constructor flag from --auto / app-launch resume,
-        # or the persisted setting when entered from the menu) starts LIVE
-        # without re-asking; otherwise the safe default, dry-run.
-        self._start_engine(
-            dry_run=not (self._start_live or self._settings.auto_start_live)
-        )
+        # ONLY `cswap tui --auto` starts LIVE. Entering the view from the
+        # menu always starts dry-run, because opening a view must never
+        # begin switching accounts — and a persisted "yes" is not consent
+        # for a launch nobody asked to be live. A setting used to be read
+        # here too, so one confirmed "Go live" made every later menu visit
+        # switch accounts unasked, on every machine sharing settings.json.
+        self._start_engine(dry_run=not self._start_live)
 
     def on_unmount(self) -> None:
         if self._engine is not None:
@@ -247,12 +230,6 @@ class AutoScreen(Screen):
         # the machine's lock. Report what actually started, not what was asked
         # for — the badge reads engine.dry_run, so it is already right.
         dry_run = engine.dry_run
-        # Seed the transition tracker from the engine's ACTUAL starting
-        # state (see `_on_engine_event`): an engine that starts LIVE here —
-        # `--auto` or a resumed `autoStartLive` — was never dry-run under
-        # this screen, so it can never look "promoted" and must not fire
-        # the self-promotion persist below.
-        self._engine_was_dry_run = dry_run
         self.run_worker(
             engine.run_loop,
             thread=True,
@@ -289,36 +266,6 @@ class AutoScreen(Screen):
         # live engine — worse than the stuck-dry-run it fixes, because now the
         # display disagrees with what is actually switching accounts.
         self._update_badge()
-        # AND THE CONSENT WITH THE BADGE. `_persist_auto_start_live` was only
-        # reachable from the two toggle paths, so a self-promotion flipped the
-        # badge to ` LIVE ` and wrote nothing: restart, and the TUI comes back
-        # dry-run contradicting what the user last saw. Mirror of the demotion
-        # bug — the refusal correctly records nothing, and so did the later
-        # grant.
-        #
-        # Keyed on a TRANSITION (this screen watched the engine go from
-        # dry-run to LIVE), not on the steady-state fact `not engine.dry_run`
-        # — that fact is ALSO true for an engine that started LIVE from
-        # `--auto` or a resumed `autoStartLive`, where nobody confirmed
-        # anything on this launch (MAJOR-3: one `cswap tui --auto` was
-        # writing permanent go-live consent on its very first poll event).
-        # Not on the event kind either: a `config-warning` check here would
-        # be a per-kind opt-in the next event is not on. One-directional on
-        # purpose — `autoStartLive` is one shared setting, so writing False
-        # from a dry-run engine would revoke the LIVE holder's consent,
-        # which is exactly the demotion bug.
-        engine = self._engine
-        was_dry_run = self._engine_was_dry_run
-        if engine is not None:
-            self._engine_was_dry_run = engine.dry_run
-        if (
-            engine is not None
-            and was_dry_run
-            and not engine.dry_run
-            and not self._settings.auto_start_live
-            and self._live_confirmed_this_launch
-        ):
-            self._persist_auto_start_live(True)
         if event.kind == "switch":
             self.app.request_refresh()
 
@@ -337,42 +284,11 @@ class AutoScreen(Screen):
                 self._on_live_confirm,
             )
         else:
-            self._persist_auto_start_live(False)
             self._restart_engine(dry_run=True)
 
     def _on_live_confirm(self, confirmed: bool | None) -> None:
         if confirmed:
-            # A HUMAN just confirmed the modal for THIS engine's live
-            # attempt — the one fact `_on_engine_event`'s self-promotion
-            # persist needs and a contended `--auto` launch never has (I1).
-            self._live_confirmed_this_launch = True
-            # Persist AFTER the engine reports what it actually became: a
-            # demotion (another LIVE holder) would otherwise record consent
-            # for a LIVE that never ran, and every later launch would
-            # auto-enter a "LIVE" the user never got.
-            #
-            # A DEMOTION writes nothing: `autoStartLive` is one shared setting,
-            # so `false` here revokes the LIVE holder's consent rather than
-            # declining to record ours. The demotion is about the lock.
             self._restart_engine(dry_run=False)
-            engine = self._engine
-            if engine is not None and getattr(engine, "demoted_from_live", False):
-                return
-            self._persist_auto_start_live(
-                engine is not None and not engine.dry_run
-            )
-
-    def _persist_auto_start_live(self, live: bool) -> None:
-        """Remember the confirmed mode so a restarted TUI resumes it."""
-        from claude_swap.settings import set_setting
-        try:
-            set_setting(
-                self.app.switcher.backup_dir,
-                "autoswitch.autoStartLive", "true" if live else "false",
-            )
-            self._settings = replace(self._settings, auto_start_live=live)
-        except Exception:
-            pass  # a failed persist must never block the toggle itself
 
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
