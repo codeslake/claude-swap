@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import threading
 from dataclasses import replace
@@ -4219,9 +4220,18 @@ class TestStoppedEngineDoesNotAct:
 
         real_perform = engine._perform
 
-        def perform_after_stop(number, email, trigger):
+        # Forwards whatever `_perform` actually takes. NOT because the arity
+        # is unknown here — it is — but because this fake stands in for a
+        # method other branches extend (a departure snapshot, a trigger
+        # reason), and a fake pinned to today's arity fails with a TypeError
+        # the tick's own error handler swallows into an ErrorEvent. That
+        # reads as "the stop gate regressed" while the gate is fine, which
+        # is the wrong bug to go looking for. `functools.wraps` keeps the
+        # signature introspectable for anything that asks.
+        @functools.wraps(real_perform)
+        def perform_after_stop(*args, **kwargs):
             engine.stop()  # lands in the gap before _perform's own gate
-            return real_perform(number, email, trigger)
+            return real_perform(*args, **kwargs)
 
         engine._perform = perform_after_stop
         harness.events.clear()
