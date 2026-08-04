@@ -743,3 +743,112 @@ class TestClearRunsWithTheExtraGone:
         raw = json.loads(cfg.read_text())
         assert "_cswapPinWiredKeys" not in raw
         assert raw["env"] == {"K": "v"}, "the wiring outlived the uninstall"
+
+
+class TestTheTuiClearReachesTheSameGuaranteeAsTheCli:
+    """R13 I-3: the TUI's "Clear cloud pin" called only `impl.apply_pin(sw,
+    None, None)` and notified "Cloud pin cleared". It never cleared the
+    WIRING, so ~/.claude.json kept naming a dead port and every hand-launched
+    `claude` dialled it and retried forever.
+
+    That is the failure `pin.run(clear=True)`'s comment already records
+    happening once — a second call site drifted from the contract, which is
+    why these drive BOTH callers against the same real `clear_wiring` and the
+    same file. The CLI row is the control: if it stops clearing, the harness
+    proves nothing.
+    """
+
+    def _wired(self, tmp_path, monkeypatch):
+        import claude_swap.paths as paths
+        from claude_swap.pin import _WIRE_MARK
+
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "HTTPS_PROXY": "http://cswap:tok@127.0.0.1:44444",
+                        "CSWAP_PIN_PORT": "44444",
+                    },
+                    _WIRE_MARK: ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+                }
+            )
+        )
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        return cfg
+
+    def _fake_impl(self, monkeypatch):
+        """A pin package whose apply_pin(None, None) succeeds and, like the
+        real one, does not touch THIS config path."""
+        import types
+
+        from claude_swap import pin
+
+        impl = types.SimpleNamespace(
+            apply_pin=lambda sw, email, org: False,
+            load_pin=lambda d: ("a@b.c", None),
+            live_remote_control_sessions=lambda: [],
+        )
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+        return impl
+
+    def test_CONTROL_the_cli_clear_unwires_the_config(self, tmp_path, monkeypatch):
+        from claude_swap import pin
+        from claude_swap.pin import _WIRE_MARK
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        cfg = self._wired(tmp_path, monkeypatch)
+        self._fake_impl(monkeypatch)
+        pin.run(ClaudeAccountSwitcher(), None, clear=True)
+        raw = json.loads(cfg.read_text())
+        assert _WIRE_MARK not in raw and "env" not in raw, (
+            f"CONTROL BROKEN: the CLI clear left {raw}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_tui_clear_unwires_the_config_too(self, tmp_path, monkeypatch):
+        import types
+
+        from claude_swap.pin import _WIRE_MARK
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from claude_swap.tui import dashboard
+
+        cfg = self._wired(tmp_path, monkeypatch)
+        self._fake_impl(monkeypatch)
+
+        notes: list[str] = []
+        monkeypatch.setattr(
+            dashboard.DashboardScreen,
+            "app",
+            property(lambda self: types.SimpleNamespace(
+                switcher=ClaudeAccountSwitcher(),
+                snapshot=None,
+                notify=notes.append,
+                # _dispatch builds its whole action map up front, so every
+                # entry has to resolve even for the one row under test.
+                action_open_watch=lambda: None,
+                action_open_auto=lambda: None,
+                action_add_current=lambda: None,
+                action_add_token=lambda: None,
+                exit=lambda: None,
+            )),
+            raising=False,
+        )
+        screen = object.__new__(dashboard.DashboardScreen)
+        screen._menu_stack = [("menu", []), ("cloud account", [])]
+        monkeypatch.setattr(screen, "_render_menu", _noop_async, raising=False)
+
+        await screen._dispatch("pin:clear")
+
+        raw = json.loads(cfg.read_text())
+        assert _WIRE_MARK not in raw and "env" not in raw, (
+            f"the TUI cleared the pin and left the config wired to a dead "
+            f"port: {raw} — every hand-launched claude dials it and retries "
+            f"forever (notified: {notes})"
+        )
+        assert notes, "the TUI cleared silently"
+
+
+async def _noop_async(*a, **k):
+    return None

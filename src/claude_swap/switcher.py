@@ -3170,11 +3170,20 @@ class ClaudeAccountSwitcher:
                 active_num = str(roster_active)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
-        # Reset each build; set below only when the active slot's OAuth Keychain
-        # read failed with no fallback. Read by _static_usage_sentinel (main
-        # thread writes it here before the fetch pool starts → no data race).
-        self._active_keychain_unavailable = False
-        self._active_read_degraded = False
+        # Accumulated locally, published ONCE after the loop. Blanking the
+        # instance attributes here and restoring them after
+        # `_read_active_credentials()` opened a window the width of a Keychain
+        # read in which a concurrent pass read `False` — a value no read
+        # produced — and re-entered the condemn branch round 11 exists to skip.
+        # The TUI's two refresh lanes and the auto engine's worker share one
+        # switcher, so "the main thread writes it before the fetch pool starts"
+        # was true of the fetch POOL and not of a second PASS. Published once,
+        # every value a reader can see is some real read's verdict: this pass's
+        # or the previous one's. Both are honest, and a stale `True` only
+        # refuses to CONFIRM a dead verdict (fail-safe). The blank was the one
+        # value that was neither.
+        keychain_unavailable = False
+        read_degraded = False
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -3186,12 +3195,14 @@ class ClaudeAccountSwitcher:
             if is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
-                self._active_keychain_unavailable = active.keychain_unavailable
-                self._active_read_degraded = active.degraded
+                keychain_unavailable = active.keychain_unavailable
+                read_degraded = active.degraded
             else:
                 creds = self._read_account_credentials(str(num), email)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
+        self._active_keychain_unavailable = keychain_unavailable
+        self._active_read_degraded = read_degraded
         return accounts_info
 
     def _fetch_active_usage(
@@ -4297,22 +4308,25 @@ class ClaudeAccountSwitcher:
         ``active_read_degraded`` says whether ``stored`` came from a DEGRADED
         active read (Keychain read failed, a plaintext fallback covered it).
         Those bytes may be a superseded generation — Claude Code rotates
-        keychain-only, so the plaintext file can lag — so they must never
-        CONFIRM a dead verdict: a degraded read serving the OLD, struck
-        generation would otherwise fingerprint-match and condemn a slot a
-        re-login already healed. The first branch below is skipped in that
-        case and falls straight through to the backup check, exactly as it
-        already does for an idle slot.
+        keychain-only, so the plaintext file can lag — so they are not
+        examined at all: the first branch below is skipped, and they can
+        neither CONFIRM a dead verdict (condemning a slot a re-login already
+        healed) nor witness a heal (erasing a strike bound to the live
+        generation). A degraded read therefore leaves the BACKUP as the only
+        source that can answer: matching the struck generation still confirms
+        dead, and anything else is ``None`` — not ``False``, because "the
+        backup moved on" says nothing about the credential nobody read.
 
         Returns ``True`` (confirmed dead), ``False`` (confirmed not dead —
         no stored source, seen or fingerprint-matched, still holds the
         struck generation), or ``None`` — cannot determine.
 
-        ``None`` is not a corner case, it is a real third answer. When the
-        backup is UNREADABLE (macOS Keychain locked/denied/timeout) and the
-        row is otherwise struck, "genuinely still struck, unhealed" and
-        "genuinely healed by a re-login, just unseen right now" are
-        OBSERVATIONALLY IDENTICAL to this method — both produce the same
+        ``None`` is not a corner case, it is a real third answer. When no
+        stored source could be examined — the backup UNREADABLE (macOS
+        Keychain locked/denied/timeout), or the live bytes withheld by a
+        degraded read — and the row is otherwise struck, "genuinely still
+        struck, unhealed" and "genuinely healed by a re-login, just unseen
+        right now" are OBSERVATIONALLY IDENTICAL to this method — both produce the same
         ``(backup="", unreadable=True)`` regardless of what the real bytes
         say. No local read distinguishes them, so guessing either boolean is
         wrong for the other case: guessing ``True`` condemns an already-
@@ -4346,11 +4360,25 @@ class ClaudeAccountSwitcher:
         if not is_active:
             return False
         backup, unreadable = self._read_account_credentials_ex(num, email)
-        if unreadable:
-            return None if entry.token_dead() else False
-        return bool(backup) and entry.token_dead(
+        if not unreadable and bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
-        )
+        ):
+            return True
+        # Nothing CONFIRMED the strike. Whether that is a heal or merely an
+        # unobservable one turns on whether every stored source was actually
+        # examined — an unreadable backup was not, and neither were the LIVE
+        # bytes when the read was degraded (the branch above skips that
+        # compare on purpose). Both are the same ambiguity: a divergent (or
+        # absent) backup is no evidence about a generation nobody looked at.
+        # ``False`` here routes into the caller's strike-CLEAR branch and
+        # erases a strike bound to the LIVE generation (``refresh_input =
+        # live`` on the active path) — the slot becomes reservable once
+        # backoff lapses, the dead token is re-POSTed, and the re-login
+        # prompt never appears. Round 8's regression in the one shape the
+        # round-11 guard cannot observe.
+        if unreadable or active_read_degraded:
+            return None if entry.token_dead() else False
+        return False
 
     def _plans_after_fetch(
         self,

@@ -286,6 +286,44 @@ def _clear_wiring_locked(switcher, path) -> bool:
     return True
 
 
+def clear_pin(switcher) -> bool:
+    """Unpin the cloud account AND remove the launch wiring. True when there
+    was something to clear.
+
+    The one place either surface unpins. The CLI and the TUI each spelled the
+    sequence out, and the TUI's copy was missing the :func:`clear_wiring`
+    half — it cleared the pin and left ``~/.claude.json`` naming a dead port,
+    so every hand-launched ``claude`` dialled it and retried forever, while
+    the TUI said "Cloud pin cleared". A second call site that can drift IS
+    the defect, so there is no longer a second one.
+
+    Works WITHOUT the package on purpose: unpinning is what a user reaches
+    for precisely when they have uninstalled the pin, and the wiring is
+    cswap's own record (see :func:`clear_wiring`). Any failure falls back,
+    not just a missing package — "installed but unusable" (a broken
+    cryptography) is the other way a user ends up here, and a traceback is
+    the worst possible outcome for the one action whose job is to work when
+    the pin does not.
+    """
+    had_pin = False
+    try:
+        impl = _impl()
+        had_pin = impl.load_pin(switcher.backup_dir) is not None
+        impl.apply_pin(switcher, None, None)
+    except Exception:  # noqa: BLE001
+        pass
+    # ALWAYS, not only when apply_pin failed. The package unwires through its
+    # own single-path resolver, so with the extra installed a clear from
+    # inside a session terminal cleared that session's config and left
+    # ~/.claude.json naming a dead port — while reporting success. The
+    # both-paths guarantee has to hold for the users who HAVE the pin, which
+    # is all of them at the moment they unpin.
+    #
+    # apply_pin cannot answer "was there anything to clear": it returns
+    # whether a proxy is now serving, which on this path is always False.
+    return clear_wiring(switcher) or had_pin
+
+
 # -- command -----------------------------------------------------------------
 
 
@@ -295,31 +333,7 @@ def run(switcher, account: str | None, clear: bool = False) -> int:
     from claude_swap.printer import accent, dimmed
 
     if clear:
-        # Works WITHOUT the package on purpose: ``--clear`` is what a user
-        # reaches for precisely when they have uninstalled the pin, and the
-        # wiring is cswap's own record (see clear_wiring).
-        #
-        # Any failure falls back, not just a missing package: "installed but
-        # unusable" (a broken cryptography) is the other way a user ends up
-        # here, and a traceback is the worst possible outcome for the one
-        # command whose job is to work when the pin does not.
-        had_pin = False
-        try:
-            impl = _impl()
-            had_pin = impl.load_pin(switcher.backup_dir) is not None
-            impl.apply_pin(switcher, None, None)
-        except Exception:  # noqa: BLE001
-            pass
-        # ALWAYS, not only when apply_pin failed. The package unwires through
-        # its own single-path resolver, so with the extra installed a --clear
-        # run from inside a session terminal cleared that session's config and
-        # left ~/.claude.json naming a dead port — while printing "Unpinned".
-        # The both-paths guarantee has to hold for the users who HAVE the pin,
-        # which is all of them at the moment they unpin.
-        #
-        # apply_pin cannot answer "was there anything to clear": it returns
-        # whether a proxy is now serving, which on this path is always False.
-        if not clear_wiring(switcher) and not had_pin:
+        if not clear_pin(switcher):
             print(dimmed("No cloud account pinned"))
             return 0
         print(f"{accent('Unpinned')} the cloud account")
