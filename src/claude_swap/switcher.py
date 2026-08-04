@@ -5626,27 +5626,21 @@ class ClaudeAccountSwitcher:
         # clear_wiring lives in this repo to prevent. Before the rmtree, while
         # there is still something to unwire with.
         #
-        # ABSENT and FAILED are not the same, and a bare `except Exception`
-        # cannot tell them apart. Measured with clear_wiring raising OSError
-        # 30 (a read-only home; a contended lock and an unreadable config
-        # reach the same handler): "Purge complete." printed over a config
-        # that still carried the wiring — and with LESS recourse than before,
-        # since the record, cert dir and daemon state a later
-        # `cswap pin --clear` could have keyed off are now gone. Hand-editing
-        # .claude.json was the only cure and nothing on screen said so.
-        try:
-            from claude_swap import pin as _pin
+        # RE-READ, DO NOT TRUST THE BOOL. `clear_wiring` returns False both
+        # for "there was nothing to remove" and for "the lock was contended
+        # so this path was skipped", and swallows every per-path failure — so
+        # only `_wiring_present` can tell ABSENT from FAILED. Same shape as
+        # pin.clear_pin and pin.heal. A survivor is warned about and the purge
+        # continues, as it does for every other partial failure below: after
+        # this the user is the only one who can remove it, so the message has
+        # to name the file and the keys.
+        from claude_swap import pin as _pin
 
-            if _pin.clear_wiring(self):
-                removed_items.append("Cloud pin wiring in .claude.json")
-        except ImportError:
-            pass  # no extra installed: nothing was ever wired
-        except Exception as exc:  # noqa: BLE001 — never block the purge itself
-            # The wiring may have survived, and after this the user is the
-            # only one who can remove it. `clear_wiring` returning False is
-            # the silent case (nothing there); raising is not.
+        if _pin.clear_wiring(self):
+            removed_items.append("Cloud pin wiring in .claude.json")
+        if _pin._wiring_present(self):
             warning(
-                f"Could not remove the cloud pin wiring: {exc} — edit "
+                "Could not remove the cloud pin wiring — edit "
                 f"{get_global_config_path()} by hand and delete the "
                 f'"_cswapPinWiredKeys" entry and the proxy vars it names.'
             )
