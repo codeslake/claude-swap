@@ -1215,6 +1215,35 @@ class TestStruckFingerprintHygiene:
         # unconditional binding: differs-from-old-fp must NOT heal it
         assert entry.token_dead(stored_fp="sha256:new")
 
+    def test_a_legacy_restrike_overwrites_a_live_stale_fingerprint(self, store):
+        """The same promise, with nothing else nulling the field first.
+
+        `test_legacy_strike_overwrites_stale_fingerprint` calls
+        `clear_dead_token` between the two strikes, which already sets
+        `struckFingerprint` to None — so a conditional write and an
+        unconditional one agree, and the guard mutates green.
+
+        Here the row keeps its old fingerprint right up to the legacy strike.
+        A conditional write leaves "sha256:old" in place, and the strike then
+        binds to a generation the legacy writer never POSTed: a credential
+        matching "sha256:old" would be condemned on someone else's evidence,
+        and the one actually struck would read as healed.
+        """
+        ident = {"1": ("a@b.c", "")}
+        store.record(
+            {"1": FetchRecord(error="invalid_grant", struck_fp="sha256:old")},
+            ident,
+        )
+        assert store.entries(ident)["1"].struck_fingerprint == "sha256:old"
+        # A legacy writer strikes with no fingerprint, on a LIVE row.
+        store.record({"1": FetchRecord(error="invalid_grant")}, ident)
+        entry = store.entries(ident)["1"]
+        assert entry.struck_fingerprint is None, (
+            "a legacy strike must bind unconditionally, not inherit the "
+            "fingerprint of an earlier, differently-bound strike"
+        )
+        assert entry.token_dead(stored_fp="sha256:new")
+
     def test_clear_dead_token_drops_fingerprint(self, store):
         ident = {"1": ("a@b.c", "")}
         store.record(

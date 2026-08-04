@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +50,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
+from claude_swap.fsutil import read_text_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -163,6 +165,19 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
 # the user must re-login).
 # Friendly text for error KINDS that deserve an explanation beyond their
 # identifier (rendered in the "usage unavailable (…)" detail line).
+# Stash reasons that mean the slot was NOT freshened, so `error is None`
+# would lie to the caller. The other two are excluded deliberately: a REMOVED
+# slot has nothing left to activate, and a CAS CONFLICT left the slot holding
+# a racing writer's newer valid lineage — freshened, which is the opposite of
+# what this demotion denies. An UNREADABLE store is neither: the CAS could not
+# be evaluated at all, so the slot may still hold the spent generation.
+_DEMOTING_STASH_REASONS = (
+    "consume-gate-persist-failed",
+    "consume-gate-persist-lock-failed",
+    "consume-gate-unpersisted",
+    "consume-gate-store-unreadable",
+)
+
 ERROR_NOTES = {
     "store-unmirrored": (
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
@@ -173,6 +188,10 @@ ERROR_NOTES = {
     ),
     "consume-busy": (
         "another cswap surface holds the slot — retries next pass"
+    ),
+    "stash-unreadable": (
+        "this slot's stashed successor is unreadable — unlock the keychain "
+        "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
 }
 
@@ -326,14 +345,16 @@ class ClaudeAccountSwitcher:
         # One store per switcher: the capability cache is per-process.
         self._store = CredentialStore(self)
 
-        # Set by _build_accounts_info: True when the active account's OAuth
-        # credential could not be read because the macOS Keychain was unavailable
-        # (locked / denied / timeout) with no fallback — so the usage row shows
-        # "keychain unavailable" instead of a misleading "no credentials".
-        self._active_keychain_unavailable = False
-        # Same lifecycle for the degraded-read flag (keychain failed but a
-        # fallback covered it): consumption is banned while it is True.
-        self._active_read_degraded = False
+        # The active read's verdict, PER THREAD. Set by _build_accounts_info
+        # from the active slot's own read; consumed later by the usage
+        # sentinel, the rotation resync and the consume gate.
+        #
+        # Thread-local: a fact about one READ, and the TUI runs two lanes on
+        # one switcher (`tui/app.py` starts a store refresh while a normal one
+        # is in flight). A build's unconditional reset erased the other lane's
+        # verdict — measured against a 4ms window, 60 of 60 lost, after which
+        # the consume gate POSTs a possibly-spent grant.
+        self._active_verdict_tls = threading.local()
 
         # Accounts already warned about a provenance problem with the active
         # credential — each condition persists across collect passes and
@@ -424,15 +445,120 @@ class ClaudeAccountSwitcher:
             if sys.platform != "win32":
                 os.chmod(directory, 0o700)
 
-    def _read_json(self, path: Path) -> dict | None:
-        """Read and parse JSON file."""
+    def _read_json(self, path: Path, *, strict: bool = False) -> dict | None:
+        """Read and parse a JSON file. None when the file is ABSENT.
+
+        With ``strict=True``, raises ``ConfigError`` when the file is THERE
+        but unreadable — the distinction ``_read_global_config``'s callers
+        keep having to make, and the one ~25 ``or {}`` call sites here were
+        silently collapsing. Default False so the reader stays a reader:
+        upstream's import path DELIBERATELY replaces a malformed config it is
+        about to seed (`test_clean_switch_fallback_when_local_config_malformed`),
+        and a blanket refusal would flip that intent.
+
+        Measured on the plain switch path: a torn ``~/.claude.json`` read as
+        None, fell to the `else` branch at :5954, and the 1-key backup config
+        was written over the user's whole file — `projects`, `mcpServers`,
+        `userID` gone, `switched: True` returned. Absent is a genuine empty
+        start; unreadable is a file we must not overwrite unread.
+
+        Also rejects a non-dict payload. ``json.loads`` happily returns a str
+        or an int for a file holding `"hello"` or `123`, and every caller then
+        fails on `.get` with a raw AttributeError that escapes
+        ``ClaudeSwitchError``. ``_read_global_config`` already ends with the
+        same isinstance check; the two readers of the same file disagreed.
+        """
         if not path.exists():
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            data = json.loads(read_text_with_retry(path))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             self._logger.warning(f"Invalid JSON in {path}")
+            if strict:
+                raise ConfigError(
+                    f"{path} exists but could not be parsed ({e}). Repair or "
+                    "move it, then retry — refusing to overwrite it unread."
+                ) from e
             return None
+        except OSError as e:
+            self._logger.warning(f"Could not read {path}: {e}")
+            if strict:
+                raise ConfigError(
+                    f"{path} exists but could not be read ({e}). Fix what is "
+                    "blocking the read, then retry."
+                ) from e
+            return None
+        if not isinstance(data, dict):
+            self._logger.warning(
+                f"{path} holds {type(data).__name__}, not a JSON object"
+            )
+            if strict:
+                raise ConfigError(
+                    f"{path} holds {type(data).__name__}, not a JSON object. "
+                    "Repair or move it, then retry."
+                )
+            return None
+        return data
+
+    def _salvage_unreadable(
+        self, path: Path, emit_output: bool, warnings_out: list[str]
+    ) -> Path:
+        """Copy an unreadable file aside before it is replaced. Returns the copy.
+
+        Three things the first cut got wrong, all of them the same promise —
+        THE BYTES SURVIVE AND THE USER KNOWS:
+
+        MODE. `shutil.copy2` preserves the source mode. Measured on a 0644
+        `~/.claude.json` holding `primaryApiKey`: the replacement got 0600 from
+        `_write_json` and the salvage stayed 0644, so the secret ended up
+        world-readable in a file cswap created. Copied without metadata and
+        chmod'ed 0600 explicitly.
+
+        COLLISION. The stamp is second-resolution and `copy2` onto an existing
+        name overwrites. Two failed switches inside one second left ONE file —
+        measured, the first user's data unrecoverable. The retry is exactly
+        what a user does next, so the guard lost the bytes precisely when it
+        was needed. A counter suffix makes each copy its own file.
+
+        NAME. The first cut stamped with `get_timestamp()`, whose ISO form
+        carries `:` — forbidden in a Windows filename. Measured on CI (run
+        30774451162): five tests died with `[Errno 22] Invalid argument`, the
+        copy raised, and the switch ABORTED, which is worse than the data loss
+        this guard exists to prevent. `int(time.time())` is what
+        `credentials.py`'s sibling `.corrupt-` aside already uses; reusing it
+        keeps one convention rather than inventing a third.
+
+        VISIBILITY. `warnings_out` is only rendered by the JSON envelope. In
+        human mode the user saw "Activated Account-1" and nothing else while
+        their `projects`/`mcpServers` were gone from the live config — every
+        other `warnings_out.append` in `_perform_switch` is paired with an
+        `if emit_output: warning(msg)`; this one was not.
+        """
+        stem = f"{path.name}.unreadable-{int(time.time())}"
+        salvage = path.with_name(stem)
+        n = 1
+        while salvage.exists():
+            salvage = path.with_name(f"{stem}.{n}")
+            n += 1
+        try:
+            shutil.copy(path, salvage)          # NOT copy2: mode is set below
+            if sys.platform != "win32":
+                os.chmod(salvage, 0o600)
+        except OSError as e:
+            raise SwitchError(
+                f"{path} could not be parsed and the salvage copy failed "
+                f"({e}); aborting rather than destroying it"
+            )
+        msg = (
+            f"{path.name} could not be parsed — a copy was kept at "
+            f"{salvage.name}"
+        )
+        self._logger.warning(f"{path} could not be parsed; a copy was kept at "
+                             f"{salvage} before it was replaced")
+        warnings_out.append(msg)
+        if emit_output:
+            warning(msg)
+        return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
         """Write JSON file with validation."""
@@ -503,6 +629,39 @@ class ClaudeAccountSwitcher:
     def _read_active_credentials(self) -> ActiveCredentials:
         return self._store._read_active_credentials()
 
+    def _refuse_degraded_capture(self) -> str | None:
+        """Refuse to CAPTURE bytes a degraded read produced.
+
+        Both env-var branches of :meth:`_read_capture_credentials` pass
+        ``strict_keychain=True`` — an unreadable (not absent) Keychain raises
+        rather than silently capturing the plaintext seed, which on macOS may
+        be the consumed predecessor because Claude Code rotates keychain-only.
+
+        The DEFAULT path is the most-used one and had no such guard: it reads
+        through ``_read_credentials``, which is ``_read_active_credentials()``
+        with ``degraded`` discarded. So a locked-keychain ``cswap add``
+        captured the possibly-spent fallback into the slot backup, and
+        ``add_account`` then cleared the dead-token strike — re-creating on the
+        common path exactly the stale-consume this PR exists to prevent.
+
+        I-1 (round 9): returns the value THIS read produced so the caller
+        captures those exact bytes instead of reading again. The check-read
+        and a separate use-read are two independent Keychain reads — a
+        Keychain that answers the first and fails the second passes the
+        guard and then captures the possibly-stale plaintext fallback
+        anyway, which is precisely the outcome this guard exists to prevent.
+        """
+        active = self._read_active_credentials()
+        if active.degraded:
+            raise CredentialReadError(
+                "The macOS Keychain is unreadable right now (locked or no GUI "
+                "session), so the only readable credential is a plaintext "
+                "fallback that may be a superseded generation — capturing it "
+                "would file a spent refresh token against this slot. Retry "
+                "from a GUI terminal."
+            )
+        return active.value
+
     def _read_capture_credentials(self) -> str | None:
         """Read the credential of the profile the environment points at.
 
@@ -558,8 +717,16 @@ class ClaudeAccountSwitcher:
             )
             if creds:
                 return creds
+            # The tail below is not a continuation of this branch: it reads
+            # ``primaryApiKey`` through ``get_global_config_path()``, which
+            # follows ``CLAUDE_CONFIG_DIR``. With the two vars diverged that
+            # is the cross-profile capture this branch just refused — and it
+            # cannot be reached by the secure profile's OWN key either, since
+            # ``read_config_dir_credentials`` is OAuth-only and never looks at
+            # ``primaryApiKey``. A miss here is what claude sees: logged out.
+            return ""
         elif not config_dir:
-            return self._read_credentials()
+            return self._refuse_degraded_capture()
         else:
             creds = read_config_dir_credentials(config_dir, strict_keychain=True)
             if creds:
@@ -567,7 +734,7 @@ class ClaudeAccountSwitcher:
             if _same_directory(Path(config_dir), get_default_claude_config_home()):
                 # Safe only on this legacy path: the active store's env-following
                 # file backend and the default profile coincide here.
-                return self._read_credentials()
+                return self._refuse_degraded_capture()
         # Only this profile's own ``primaryApiKey`` — never the unsuffixed
         # "Claude Code" Keychain item, which belongs to the default profile
         # and would answer for a login that is not the one being added.
@@ -649,9 +816,36 @@ class ClaudeAccountSwitcher:
         The store performs the pure write and raises on failure *before* returning,
         so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
         once and only after a successful write.
+
+        PAST THE STORE WRITE, NOTHING MAY RAISE. The write ADVANCES the slot,
+        and every caller reads an exception from this method as "the persist
+        failed" — so a raise here reports a failure for a slot that holds the
+        new credential. At the post-POST call site that is worse than losing
+        the invalidation: the grant is already spent, the handler stashes a
+        "successor" byte-identical to what the store now holds, and a
+        successful refresh is demoted to ``transient`` (measured: the tick then
+        emits "could not freshen any candidate (network?)" forever over a
+        healthy slot, and ``cswap run`` prints "Could not refresh the token").
+
+        So the invalidation is contained, and its failure LEAVES THE MARKER
+        instead. That is not a downgrade: a profile whose access token is still
+        unexpired passes the local reuse check, so simply skipping the
+        invalidation would let it keep serving a superseded generation until it
+        expires. ``STALE_MARKER`` is what forces the re-bootstrap regardless,
+        and it is the same mechanism the live-session branch already relies on.
         """
         self._store._write_account_credentials(account_num, email, credentials)
-        self._post_backup_write(account_num, email)
+        try:
+            self._post_backup_write(account_num, email)
+        except Exception:  # noqa: BLE001 — see the docstring: never past the write
+            from claude_swap.session import mark_session_stale
+
+            mark_session_stale(self._session_dir(account_num, email))
+            self._logger.warning(
+                "Stored account %s's credential but could not invalidate its "
+                "session profile; marked it stale so the next run "
+                "re-bootstraps.", account_num, exc_info=True,
+            )
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
@@ -768,6 +962,7 @@ class ClaudeAccountSwitcher:
             ValidationError: alias format is invalid.
             ConfigError: the normalized alias is already used by another account.
         """
+        self._refuse_session_shell()
         try:
             normalized = normalize_alias(alias)
         except ValueError as e:
@@ -803,6 +998,7 @@ class ClaudeAccountSwitcher:
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
         """
+        self._refuse_session_shell()
         self._get_sequence_data_migrated()
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
@@ -863,8 +1059,26 @@ class ClaudeAccountSwitcher:
         # resolve-validate-mutate sequence — a concurrent switch or usage-
         # refresh persist (which take the same lock) can never interleave
         # with the relocation.
+        self._refuse_session_shell()
         with FileLock(self.lock_file):
             return self._swap_accounts_locked(first, second)
+
+    def _read_backup_or_abort(self, account_num: str, email: str) -> str:
+        """Backup read for swap/move's pre-mutation snapshot; raises on an
+        unreadable (not absent) backup.
+
+        Nothing has moved yet at the call sites, so an unreadable verdict
+        aborts here rather than committing a swap/move that silently drops
+        the slot's live refresh token in favor of an empty destination.
+        """
+        creds, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable:
+            raise ConfigError(
+                f"Account-{account_num}'s stored credential could not be "
+                "read (keychain unavailable?); nothing was changed. Retry "
+                "once it is readable again."
+            )
+        return creds
 
     def _swap_accounts_locked(self, first: str, second: str) -> tuple[str, str]:
         """Body of :meth:`swap_accounts`; the caller holds ``self.lock_file``.
@@ -904,9 +1118,12 @@ class ClaudeAccountSwitcher:
 
         # Read both slots' backup material up front so a read failure aborts
         # before anything has been moved. Missing material reads as "" (an
-        # api-key or never-backed-up slot) and stays missing after the swap.
-        creds_a = self._read_account_credentials(num_a, email_a)
-        creds_b = self._read_account_credentials(num_b, email_b)
+        # api-key or never-backed-up slot) and stays missing after the swap
+        # — but the plain reader answers that same "" for a backup that
+        # EXISTS and simply could not be read right now (locked Keychain,
+        # a permission glitch). See _read_backup_or_abort.
+        creds_a = self._read_backup_or_abort(num_a, email_a)
+        creds_b = self._read_backup_or_abort(num_b, email_b)
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
 
@@ -1237,6 +1454,7 @@ class ClaudeAccountSwitcher:
         Returns ``(source_num, target_num, swapped)`` where ``swapped`` is True
         when an occupant was displaced.
         """
+        self._refuse_session_shell()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -1318,8 +1536,11 @@ class ClaudeAccountSwitcher:
         self._ensure_no_live_session(num_src, email, "--move-account")
 
         # Read backup material up front so a read failure aborts before any
-        # move. Missing material reads as "" (api-key or never-backed-up slot).
-        creds = self._read_account_credentials(num_src, email)
+        # move. Missing material reads as "" (api-key or never-backed-up
+        # slot) — but the plain reader answers that same "" for a backup
+        # that EXISTS and simply could not be read right now. See
+        # _read_backup_or_abort.
+        creds = self._read_backup_or_abort(num_src, email)
         config = self._read_account_config(num_src, email)
 
         src_dir = self._session_dir(num_src, email)
@@ -1870,9 +2091,30 @@ class ClaudeAccountSwitcher:
                 # failed: if the store still holds the generation that
                 # successor superseded, writing it back IS the pending
                 # persist — and saves consuming a grant at all.
-                adopted_creds = self._adopt_stashed_successor(
-                    account_num, email, current
-                )
+                try:
+                    adopted_creds = self._adopt_stashed_successor(
+                        account_num, email, current
+                    )
+                except CredentialReadError:
+                    # The slot's only successor is unreadable. Deferring is
+                    # right -- the bytes are the SOLE copy of a generation
+                    # this slot already consumed, and nothing on disk tells
+                    # "locked for a minute" from "locked forever", so
+                    # retiring on a strike count or an age bound would
+                    # destroy a live refresh token every time the cause was
+                    # merely slow. What must not stay is the LABEL: the
+                    # generic handler below degrades this to "transient",
+                    # which the tick renders as "could not freshen any
+                    # candidate (network?)" -- sending the operator to check
+                    # a connection that is fine, forever, on a condition
+                    # only they can clear (unlock the Keychain, fix the
+                    # mode, remount the volume) or drop
+                    # (`cswap unclaimed --purge`).
+                    self._logger.info(
+                        "Account %s's stashed successor is unreadable; "
+                        "deferring the refresh.", account_num, exc_info=True,
+                    )
+                    return oauth.RefreshOutcome(None, "stash-unreadable")
                 if adopted_creds is not None:
                     current = adopted_creds
                 refresh_input = current or snapshot
@@ -1925,15 +2167,27 @@ class ClaudeAccountSwitcher:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
             # the slot; defer cleanly rather than raise through callers
             # that promise never to (the collect pass thread-pools us).
+            # "Nothing consumed" is about the POST, not the store -- see
+            # the generic handler below.
             self._logger.info(
                 "Slot lock held elsewhere; deferring account %s's backup "
                 "refresh to the next pass.", account_num,
             )
             return oauth.RefreshOutcome(None, "transient")
         except Exception:
-            # Nothing consumed yet either (the resync/adopt writes raise
-            # before any POST) — degrade to transient instead of raising
-            # through the never-raises collect pass.
+            # No POST has been issued yet, so no grant of ours is
+            # outstanding — degrade to transient instead of raising through
+            # the never-raises collect pass.
+            #
+            # "Nothing consumed" is about the POST, NOT about the store. The
+            # resync and the adoption both WRITE before this point, and an
+            # earlier version of this comment claimed they raise first; they
+            # do not. A raise arriving here after a completed adoption would
+            # report a failure for a slot that is already freshened, and the
+            # caller would re-POST the generation that adoption superseded.
+            # `_adopt_stashed_successor` closes that by making everything
+            # after its store write non-fatal, so this handler is only ever
+            # reached with the slot genuinely unadvanced.
             self._logger.warning(
                 "Pre-consume window failed for account %s; deferring.",
                 account_num, exc_info=True,
@@ -1992,10 +2246,25 @@ class ClaudeAccountSwitcher:
         try:
             try:
                 with FileLock(self.lock_file):
-                    store_now = self._read_account_credentials(
-                        account_num, email
+                    store_now, store_unreadable = (
+                        self._read_account_credentials_ex(account_num, email)
                     )
-                    if not store_now:
+                    if store_unreadable:
+                        # The Keychain locked during the POST (macOS screen
+                        # lock is ~1s away at any moment). The CAS cannot be
+                        # evaluated: writing back could clobber a racing
+                        # writer, and the plain reader's `""` would otherwise
+                        # be read as "the slot was emptied", whose reason is
+                        # deliberately NOT demoting. The grant IS spent and
+                        # the slot may still hold the generation that spent
+                        # it, so this must stash AND demote.
+                        stash_successor(
+                            "consume-gate-store-unreadable",
+                            "Account %s's stored credential was unreadable "
+                            "(keychain) after a refresh POST; successor "
+                            "stashed, nothing rewritten.",
+                        )
+                    elif not store_now:
                         # The slot was emptied mid-POST (remove-account):
                         # writing the successor back would resurrect
                         # credentials the user just deleted. Park it
@@ -2060,7 +2329,7 @@ class ClaudeAccountSwitcher:
                     "storage failure, then re-login and `cswap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
-        if stashed_reason and stashed_reason != "consume-gate-slot-removed":
+        if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
             # generation whose grant we just spent. Callers read `error is
             # None` as "the slot is freshened and safe to activate" — after a
@@ -2071,15 +2340,51 @@ class ClaudeAccountSwitcher:
             # still ride along, so a caller that only needs a live token for
             # THIS request keeps working.
             #
-            # A REMOVED slot is excluded: there is nothing left to activate or
-            # retry, so deferring would only turn a completed user action into
-            # a recurring error.
+            # Two stash reasons are excluded, for opposite reasons.
+            #
+            # A REMOVED slot: there is nothing left to activate or retry, so
+            # deferring would only turn a completed user action into a
+            # recurring error.
+            #
+            # A CAS CONFLICT: the slot is FRESHENED, which is the condition
+            # this demotion exists to deny. A racing writer won and wrote a
+            # newer valid lineage; we adopted it and it is what the caller
+            # asked for. Reporting it as an error made `_freshen_target` skip
+            # a healthy candidate and the tick emit "could not freshen any
+            # candidate (network?)" on every multi-surface race — the exact
+            # contention this gate was built for, turned into a false alarm.
             return oauth.RefreshOutcome(
                 outcome_creds, "transient", result.token_account, consumed_fp
             )
         return oauth.RefreshOutcome(
             outcome_creds, None, result.token_account, consumed_fp
         )
+
+    def _retire_stash_entry(self, entry_id: str, account_num: str) -> None:
+        """Drop one stash entry as housekeeping. Never fatal.
+
+        Every call site is inside the adopt scan, and the one that matters
+        runs AFTER ``_write_account_credentials`` has already advanced the
+        slot. ``_remove_unclaimed_credential`` can raise there -- its manifest
+        rewrite ends in ``atomic_write_json`` (``OSError`` on a full disk or a
+        read-only mount) under a lock that can time out (``LockError``) -- and
+        a raise escaping a COMPLETED adoption is read by
+        ``_consume_backup_grant_locked`` as a failed refresh, so the caller
+        re-POSTs a generation this pass already consumed.
+
+        The two costs differ by an order of magnitude. Losing a retire leaves
+        one stale row, which the next pass retries and `cswap unclaimed
+        --purge` drops by hand. Losing the adoption discards a live credential
+        already written to the store. So: log and continue.
+        """
+        try:
+            self._store._remove_unclaimed_credential(entry_id)
+        except Exception:
+            self._logger.warning(
+                "Could not retire account %s's stash entry %s; leaving it for "
+                "the next pass (`cswap unclaimed --purge` drops it by hand).",
+                account_num, entry_id, exc_info=True,
+            )
 
     def _adopt_stashed_successor(
         self, account_num: str, email: str, current: str
@@ -2096,6 +2401,13 @@ class ClaudeAccountSwitcher:
         cur_fp = oauth.credential_fingerprint(current)
         if not cur_fp:
             return None
+        # A row that is merely unreadable THIS instant (locked keychain,
+        # transient EIO) must not abort the scan before a later, readable
+        # sibling on the same generation is tried (repeated persist-failures
+        # can stash more than one row against the same consumedFp). Remember
+        # it and keep scanning; only defer via CredentialReadError once no
+        # row adopted.
+        deferred_entry_id: str | None = None
         for entry_id, meta in self._store._read_stash_manifest().items():
             if meta.get("configSlot") != account_num:
                 continue
@@ -2114,25 +2426,144 @@ class ClaudeAccountSwitcher:
                     # lineage in the same breath, so this successor branches
                     # off a generation that lineage already superseded. It is
                     # not the pending persist it looks like.
-                    self._store._remove_unclaimed_credential(entry_id)
+                    self._retire_stash_entry(entry_id, account_num)
                     self._logger.info(
                         "Retired account %s's CAS-conflict stash entry: its "
                         "generation was superseded by the writer that won the "
                         "race, so no pass can ever adopt it.", account_num,
                     )
+                elif not any(self._store._read_unclaimed_credential(entry_id)):
+                    # No bytes and no matching generation: nothing can ever
+                    # adopt this row, and no other reason retires it. This is
+                    # the state a FAILED retire leaves -- the bytes are
+                    # unlinked before the manifest rewrite, so an OSError
+                    # there orphans the row while the adoption that preceded
+                    # it moved the slot off the generation it keys against.
+                    #
+                    # The READER, not `exists()`: `Path.exists()` swallows
+                    # only ENOENT-shaped errors, so an EACCES/EIO would raise
+                    # straight out of the scan and strand an adoptable sibling
+                    # behind this row. `any(...)` is false only for
+                    # ("", False) -- absent or corrupt. A merely UNREADABLE
+                    # row is ("", True) and survives: its bytes may hold a
+                    # real superseded token, so dropping it stays the
+                    # operator's call (`cswap unclaimed --purge`).
+                    self._retire_stash_entry(entry_id, account_num)
+                    self._logger.info(
+                        "Retired account %s's byte-less stash entry: its "
+                        "credential is gone and its generation has passed, "
+                        "so no pass could ever adopt it.", account_num,
+                    )
                 continue
-            creds = self._store._read_unclaimed_credential(entry_id)
+            creds, unreadable = self._store._read_unclaimed_credential(entry_id)
+            if unreadable:
+                # This entry is the SOLE copy of a generation a prior gate
+                # pass already consumed and could not persist. Falling
+                # through here would make the caller POST the slot's
+                # spent generation -- an unrecoverable invalid_grant on an
+                # account whose live credential is sitting right here,
+                # merely unreadable this instant. Remember it and keep
+                # looking for a readable sibling on the same generation
+                # before giving up.
+                if deferred_entry_id is None:
+                    deferred_entry_id = entry_id
+                continue
             if not creds:
+                # ABSENT (unlinked bytes, matching manifest row) or CORRUPT
+                # (undecodable) -- either way the bytes are permanently gone,
+                # not merely inaccessible right now, so nothing can ever
+                # adopt this row. Retire it now: left alone it is rescanned
+                # on every gate pass and leaks in --json's
+                # unclaimedCredentials forever, the same accumulation the
+                # CAS-conflict branch above already retires on sight.
+                self._retire_stash_entry(entry_id, account_num)
+                self._logger.info(
+                    "Retired account %s's unreadable-bytes stash entry: its "
+                    "generation is gone, so no pass could ever adopt it.",
+                    account_num,
+                )
                 continue
+            # The WRAPPER, not the store method plus a private repeat of its
+            # tail: `_write_account_credentials` already contains the
+            # invalidation and leaves STALE_MARKER when it cannot run, so it
+            # cannot raise past its own store write. Open-coding the split
+            # here made this one call site safe and left the other two — the
+            # resync and the post-POST persist — carrying the defect.
             self._write_account_credentials(account_num, email, creds)
-            self._store._remove_unclaimed_credential(entry_id)
+            # Housekeeping, and non-fatal for the same reason: the slot is
+            # advanced, so a raise would report a failed refresh for a
+            # credential the store holds. A stale row is retried next pass or
+            # dropped with `cswap unclaimed --purge`.
+            self._retire_stash_entry(entry_id, account_num)
             self._logger.info(
                 "Adopted account %s's stashed successor (%s): the stored "
                 "generation was already consumed by the gate pass that "
                 "stashed it.", account_num, meta.get("reason", "unknown"),
             )
             return creds
+        if deferred_entry_id is not None:
+            # No row on this generation adopted; the deferred one is the
+            # only copy of a generation this slot already consumed. Raise
+            # into the caller's existing pre-consume exception handling,
+            # which already degrades to "transient" and defers to the next
+            # pass rather than discarding that generation.
+            raise CredentialReadError(
+                f"stash entry {deferred_entry_id} for account {account_num} "
+                "is unreadable; deferring adoption rather than discarding "
+                "its generation"
+            )
         return None
+
+    def _record_active_verdict(self, active) -> None:
+        """Record THIS thread's active-read verdict (see `_active_verdict_tls`)."""
+        self._active_verdict_tls.value = active
+
+    def _with_active_verdict(self, fn):
+        """Wrap `fn` so a worker thread inherits THIS thread's verdict.
+
+        Thread-local keeps two TUI lanes from erasing each other's, but
+        `_fetch_active_usage` always runs on a pool worker that never read —
+        measured 30/30 verdicts lost, and the consume gate never fired.
+        """
+        verdict = self._active_verdict()
+
+        def _inherit(*args, **kwargs):
+            self._record_active_verdict(verdict)
+            return fn(*args, **kwargs)
+
+        return _inherit
+
+    def _active_verdict(self):
+        """This thread's active-read verdict; a clean one if it never read."""
+        from claude_swap.credentials import ActiveCredentials
+
+        return getattr(self._active_verdict_tls, "value", None) or ActiveCredentials(
+            "", False, False
+        )
+
+    @property
+    def _active_keychain_unavailable(self) -> bool:
+        return self._active_verdict().keychain_unavailable
+
+    @property
+    def _active_read_unreadable(self) -> bool:
+        """Whether THIS thread's active-credential read outright FAILED
+        (plaintext-file OSError), as opposed to a genuinely absent slot.
+
+        ``keychain_unavailable`` alone misses this off macOS:
+        ``_read_active_credentials``'s file-read-error arm returns
+        ``ActiveCredentials(None, keychain_failed, keychain_failed)``, and
+        ``keychain_failed`` stays False on Linux/WSL/Windows (there is no
+        Keychain to fail there) — ``value is None`` is the only surviving
+        signal of the three states (readable / genuinely absent / could not
+        be read). Mirrors the ``is None`` guard ``_slot_token_dead`` already
+        uses for the same tri-state on the backup side.
+        """
+        return self._active_verdict().value is None
+
+    @property
+    def _active_read_degraded(self) -> bool:
+        return self._active_verdict().degraded
 
     def _read_account_credentials_ex(
         self, account_num: str, email: str
@@ -2252,8 +2683,25 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, init_data)
 
     def _get_sequence_data(self) -> dict | None:
-        """Get sequence data."""
-        return self._read_json(self.sequence_file)
+        """Get sequence data. None ONLY when the roster does not exist yet.
+
+        `strict=True` because ~59 call sites read this and 27 of them write
+        the result back through `or {}` — so a torn or unreadable
+        `sequence.json` read as "no accounts" and the next write rebuilt the
+        roster from nothing. Measured on a torn file with a resident slot 1:
+        `add_account` collapsed `_get_next_account_number` to 1, overwrote the
+        live credential backup at :2934, and THEN died at :2941 with a raw
+        TypeError that `cli.py`'s `except ClaudeSwitchError` does not catch —
+        so `--json` emitted no envelope at all.
+
+            before  sha256:296e3
+            raised  TypeError    is_ClaudeSwitchError=False
+            after   sha256:6aabc    DESTROYED
+            with strict: ConfigError, backup unchanged
+
+        Guarding each caller was the alternative and it is 27 edits that the
+        28th forgets. This is the reader; the distinction belongs here."""
+        return self._read_json(self.sequence_file, strict=True)
 
     def _get_next_account_number(self) -> int:
         """Get next account number."""
@@ -3041,6 +3489,7 @@ class ClaudeAccountSwitcher:
         When ``assume_yes`` is True the confirmation prompt is skipped (used by
         the TUI, which collects confirmation before calling).
         """
+        self._refuse_session_shell()
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -3170,20 +3619,13 @@ class ClaudeAccountSwitcher:
                 active_num = str(roster_active)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
-        # Accumulated locally, published ONCE after the loop. Blanking the
-        # instance attributes here and restoring them after
-        # `_read_active_credentials()` opened a window the width of a Keychain
-        # read in which a concurrent pass could read `False` — a value no
-        # read had actually produced — and re-enter the condemn branch on it.
-        # The TUI's two refresh lanes and the auto engine's worker share one
-        # switcher, so "the main thread writes it before the fetch pool starts"
-        # was true of the fetch POOL and not of a second PASS. Published once,
-        # every value a reader can see is some real read's verdict: this pass's
-        # or the previous one's. Both are honest, and a stale `True` only
-        # refuses to CONFIRM a dead verdict (fail-safe). The blank was the one
-        # value that was neither.
-        keychain_unavailable = False
-        read_degraded = False
+        # PER THREAD, not per switcher. The TUI's two refresh lanes and the
+        # auto engine's worker share one switcher, so instance attributes let
+        # one pass read a value no read of its own had produced. The verdict
+        # is thread-local (`_active_verdict_tls`); this clears only THIS
+        # thread's, and a worker inherits it explicitly via
+        # `_with_active_verdict`.
+        self._record_active_verdict(None)
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -3195,14 +3637,11 @@ class ClaudeAccountSwitcher:
             if is_active:
                 active = self._read_active_credentials()
                 creds = active.value or ""
-                keychain_unavailable = active.keychain_unavailable
-                read_degraded = active.degraded
+                self._record_active_verdict(active)
             else:
                 creds = self._read_account_credentials(str(num), email)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
-        self._active_keychain_unavailable = keychain_unavailable
-        self._active_read_degraded = read_degraded
         return accounts_info
 
     def _fetch_active_usage(
@@ -3913,12 +4352,22 @@ class ClaudeAccountSwitcher:
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
-            if is_active and self._active_keychain_unavailable:
+            if is_active and (
+                self._active_keychain_unavailable or self._active_read_unreadable
+            ):
                 return USAGE_KEYCHAIN_UNAVAILABLE
-            if not is_active and self._store._keychain_unreadable:
-                # The empty read happened with the Keychain pinned unusable:
-                # the backup may exist unseen. "keychain unavailable" — not
-                # "no credentials", which nudges an unnecessary re-add.
+            if not is_active and self._read_account_credentials_ex(
+                str(num), email
+            )[1]:
+                # THIS slot's own read, not the process flag — which one
+                # slot's clean read erased for every other slot. Measured with
+                # every read denied and a real backup on slot 2:
+                #
+                #     before   slot2='no credentials'   slot9='no credentials'
+                #     after    slot2='keychain unavailable'
+                #
+                # "no credentials" sends the user to re-add a slot that has one
+                # — the dead end 41313b9 removed from three other sites.
                 return USAGE_KEYCHAIN_UNAVAILABLE
             return USAGE_NO_CREDENTIALS
         # An expired active token is no longer a static state: the fetch path
@@ -4022,7 +4471,9 @@ class ClaudeAccountSwitcher:
             return str(info[0]), self._fetch_account_usage(info)
 
         with ThreadPoolExecutor() as executor:
-            return dict(executor.map(fetch_one, enumerate(infos)))
+            return dict(
+                executor.map(self._with_active_verdict(fetch_one), enumerate(infos))
+            )
 
     def _collect_usage_entries(
         self,
@@ -4257,6 +4708,17 @@ class ClaudeAccountSwitcher:
         if entry is None:
             return False
         is_active = num == self.current_account_number()
+        # The backup is a stored source on BOTH paths — directly when idle,
+        # and as _entry_token_dead's second source when active — and each
+        # turns an unreadable one into "dead" by a different route: an empty
+        # fingerprint skips token_dead's binding check, and the active path
+        # deliberately HOLDS a strike it cannot disprove (right for the
+        # collectors, wrong here). Both end in `import_accounts` replacing a
+        # healthy slot without --force. We cannot see it, so we cannot
+        # condemn it.
+        backup, unreadable = self._read_account_credentials_ex(num, email)
+        if unreadable:
+            return False
         # The stored source, as _build_accounts_info reports it: the LIVE
         # credential for the active slot, the backup otherwise. A read that
         # FAILED must not collapse to "" and reach _entry_token_dead's first
@@ -4264,21 +4726,28 @@ class ClaudeAccountSwitcher:
         # credential_fingerprint("") is None, and token_dead(stored_fp=None)
         # skips the compare entirely, answering on the raw strike count
         # alone before _entry_token_dead's own None-machinery ever runs.
-        # Mirrors the guard on the backup read elsewhere in this class: an
-        # unreadable OR degraded (possibly-stale) read coerces to "not dead"
-        # here, the same conservative direction the docstring above already
-        # commits to for _entry_token_dead's own None answer -- an ambiguous
-        # read must not silently authorize an overwrite the user never
-        # confirmed with --force.
+        # Mirrors the guard on the backup read above: an unreadable OR
+        # degraded (possibly-stale) read coerces to "not dead" here, the same
+        # conservative direction the docstring already commits to for
+        # _entry_token_dead's own None answer -- an ambiguous read must not
+        # silently authorize an overwrite the user never confirmed with
+        # --force.
+        #
+        # `.value is None` is the third axis and it is NOT covered by the two
+        # flags: off macOS the file-read-error arm returns
+        # `ActiveCredentials(None, False, False)` because there is no Keychain
+        # to fail, so on Linux/WSL/Windows `None` is the ONLY surviving signal
+        # that the read errored rather than the slot being genuinely empty.
         if is_active:
             active = self._store._read_active_credentials()
-            if active.keychain_unavailable or active.degraded:
+            if (
+                active.keychain_unavailable
+                or active.degraded
+                or active.value is None
+            ):
                 return False
-            stored = active.value or ""
+            stored = active.value
         else:
-            backup, unreadable = self._read_account_credentials_ex(num, email)
-            if unreadable:
-                return False
             stored = backup
         return bool(
             self._entry_token_dead(entry, num, email, stored, is_active)
@@ -4817,8 +5286,7 @@ class ClaudeAccountSwitcher:
         """
         active = self._read_active_credentials()
         creds = active.value or ""
-        self._active_keychain_unavailable = active.keychain_unavailable
-        self._active_read_degraded = active.degraded
+        self._record_active_verdict(active)
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
@@ -6052,8 +6520,13 @@ class ClaudeAccountSwitcher:
         shell IS a session — its "live store" is the profile, not the
         default login; a switch/add here would splice the default sequence
         against the wrong live store (mirrors SessionManager's own guard).
-        Guarded at the shared chokepoint so every entry point — switch_to,
-        plain rotation, strategy switches, add — is covered once.
+        Called by every entry point that mutates the live store or the
+        roster. There is no single chokepoint to hang this on: the one it
+        used to claim was `_perform_switch`, which covers the switch family
+        only, so `remove_account`, `swap_accounts`, `move_account`, `purge`
+        and the alias setters all ran happily inside a session shell —
+        `remove_account` deleting the session profile of the very shell it
+        was running in. Nine call sites is the honest cost of that.
         """
         cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
         if not cfg_dir:
@@ -6276,13 +6749,40 @@ class ClaudeAccountSwitcher:
                     # settings/projects when ~/.claude.json already exists, only
                     # swapping in oauthAccount. Fall back to the full imported
                     # config when no usable local config exists.
+                    # `_read_json` answers None for ABSENT and for TORN alike,
+                    # so a torn ~/.claude.json fell to the else branch and the
+                    # 1-key backup config was written over the user's whole
+                    # file — measured through the public `switch_to`:
+                    # `switched: True` returned with `projects`, `mcpServers`
+                    # and `userID` gone.
+                    #
+                    # Back it up before replacing it, rather than refusing.
+                    # Upstream REPLACES a malformed config here on purpose
+                    # (`test_clean_switch_fallback_when_local_config_malformed`
+                    # — a machine being seeded by import, where the leftover
+                    # file is noise), and nothing in scope separates that from
+                    # a working install whose config just tore: measured, both
+                    # reach this line with `current_account` set and
+                    # `_get_current_account()` None. So keep upstream's
+                    # behaviour and stop it being LOSSY: the bytes survive next
+                    # to the config, named, and the switch still lands.
                     existing_config = (
                         self._read_json(config_path) if config_path.exists() else None
                     )
-                    if existing_config:
+                    if existing_config is not None:
+                        # `is not None`, not truthiness. A VALID but empty `{}`
+                        # is readable and loses nothing by being spliced; the
+                        # falsy form sent it down the salvage branch and told
+                        # the user it "could not be parsed", which is the same
+                        # ""-vs-None conflation this branch exists to separate.
                         existing_config["oauthAccount"] = target_oauth
                         self._write_json(config_path, existing_config)
                     else:
+                        if config_path.exists():
+                            salvage = self._salvage_unreadable(
+                                config_path, emit_output, warnings_out
+                            )
+                            del salvage
                         self._write_json(config_path, target_config_data)
                     config_written = True
 
@@ -6540,10 +7040,24 @@ class ClaudeAccountSwitcher:
                 if not oauth_section:
                     raise SwitchError("Invalid oauthAccount in backup")
 
+                # `is not None`, not truthiness — same conflation the direct-
+                # activation branch above (:6148-6165) already guards
+                # against. A torn ~/.claude.json reads as None here too;
+                # `current_config_data["oauthAccount"] = ...` on that None
+                # raised `'NoneType' object does not support item
+                # assignment` with no salvage copy, losing the user's torn
+                # config for good. Absent/unreadable both fall to the same
+                # salvage-then-replace the direct-activation branch uses.
                 current_config_data = self._read_json(config_path)
-                current_config_data["oauthAccount"] = oauth_section
-
-                self._write_json(config_path, current_config_data)
+                if current_config_data is not None:
+                    current_config_data["oauthAccount"] = oauth_section
+                    self._write_json(config_path, current_config_data)
+                else:
+                    if config_path.exists():
+                        self._salvage_unreadable(
+                            config_path, emit_output, warnings_out
+                        )
+                    self._write_json(config_path, target_config_data)
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 
@@ -6630,6 +7144,7 @@ class ClaudeAccountSwitcher:
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
         """
+        self._refuse_session_shell()
         legacy = get_legacy_backup_root()
         legacy_distinct = legacy != self.backup_dir
 

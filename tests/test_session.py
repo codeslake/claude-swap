@@ -2193,6 +2193,59 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             "the profile kept a generation the consume already spent"
         )
 
+    def test_a_live_peer_is_not_re_seeded_beneath_itself(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """The re-seed above must never fire under a RUNNING claude.
+
+        Same shape as the test above — a peer bootstraps a pre-rotation
+        profile while we wait for the lock — except the peer has already
+        exec'd into it. `_bootstrap` deletes the profile's Keychain entry and
+        overwrites `.credentials.json`, so re-seeding there costs the peer its
+        session, while deferring costs it only a generation it can still
+        refresh from.
+
+        Mutation-checked: dropping `and not live_sessions_for(session_dir)`
+        left all 1783 green. The branch fires precisely when the profile is
+        VALID, which IS the live case, so it needed the guard most and had
+        nothing pinning it.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        def fake_gate(self, num, email, snapshot):
+            self._write_account_credentials(num, email, ROTATED_CREDS)
+            return oauth.RefreshOutcome(ROTATED_CREDS, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant", fake_gate
+        )
+
+        calls = {"n": 0}
+
+        def peer_bootstraps_while_we_wait(self, sdir, email, org_uuid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return False
+            sdir.mkdir(parents=True, exist_ok=True)
+            (sdir / ".credentials.json").write_text(CREDS)  # PRE-rotation
+            return True
+
+        monkeypatch.setattr(
+            SessionManager, "_is_session_valid", peer_bootstraps_while_we_wait
+        )
+        # ...and that peer is RUNNING against the profile.
+        live = SimpleNamespace(pid=4242)
+        monkeypatch.setattr(session_mod, "live_sessions_for", lambda _sdir: [live])
+
+        got, _, _ = manager.setup_session("2", share=False)
+
+        assert (got / ".credentials.json").read_text() == CREDS, (
+            "re-seeded a profile a live claude is running against; "
+            "_bootstrap would delete its Keychain entry mid-session"
+        )
+
     def test_a_failed_persist_warns_rather_than_seeding_a_spent_grant(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
     ):

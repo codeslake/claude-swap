@@ -586,7 +586,9 @@ def fetch_usage(access_token: str) -> dict | None:
 # hindsight: the retry re-enters the same gate, finds it still held, and the
 # distinct kind arrives as generic "refresh-failed" — hiding it, and spending a
 # guaranteed 401 per pass to learn nothing.
-_DETERMINISTIC_REFRESH_ERRORS = ("store-unmirrored", "invalid_client", "consume-busy")
+_DETERMINISTIC_REFRESH_ERRORS = (
+    "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+)
 
 
 def try_fetch_usage_for_account(
