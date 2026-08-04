@@ -301,8 +301,12 @@ class DashboardScreen(Screen):
                 continue
             entries.append((f"{acc.number}  {name}{state}", f"pin:{acc.number}"))
         # Only offer the clear when there is something to clear — an inert row
-        # reads as "a pin exists" to anyone scanning the menu.
-        if current:
+        # reads as "a pin exists" to anyone scanning the menu. The SAME
+        # question the root gate asks: a partial clear_pin drops the record
+        # and gets locked out of the wiring, and gating on the record alone
+        # then hid the row while the root menu still showed the Cloud line and
+        # the message said "re-run once it frees up".
+        if current or pin._wiring_present(self.app.switcher):
             entries.append(("Clear cloud pin", "pin:clear"))
         entries.append(_BACK)
         return entries
