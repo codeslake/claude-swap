@@ -257,6 +257,15 @@ class DashboardScreen(Screen):
             await self._pop_menu()
         elif action_id == "pin-menu":
             await self._push_menu("cloud account", self._pin_entries())
+        elif action_id == "pin:clear":
+            # The same function `cswap pin --clear` runs, not a second
+            # spelling of it: this used to call only apply_pin and left
+            # ~/.claude.json naming a dead port while notifying "Cloud pin
+            # cleared". Ahead of _impl() because clear_pin is deliberately
+            # the one action that still works when the package does not.
+            pin.clear_pin(app.switcher)
+            app.notify("Cloud pin cleared")
+            await self._pop_menu()
         elif action_id.startswith("pin:"):
             try:
                 impl = pin._impl()
@@ -269,27 +278,23 @@ class DashboardScreen(Screen):
                 return
             target = action_id.split(":", 1)[1]
             snap = app.snapshot
-            if target == "clear":
-                impl.apply_pin(app.switcher, None, None)
-                app.notify("Cloud pin cleared")
-            else:
-                acc = next(
-                    (a for a in (snap.accounts if snap else ()) if a.number == target),
-                    None,
+            acc = next(
+                (a for a in (snap.accounts if snap else ()) if a.number == target),
+                None,
+            )
+            if acc is not None:
+                impl.apply_pin(app.switcher, acc.email, acc.org_uuid)
+                # An RC session that is already open keeps its old owner
+                # (the server fixed it at creation); reconnecting inside it
+                # is what moves it. Say so only when there is one.
+                open_rc = impl.live_remote_control_sessions()
+                note = (
+                    "  Reconnect open Remote Control sessions to move them "
+                    "(/rc → Disconnect → /rc)."
+                    if open_rc
+                    else ""
                 )
-                if acc is not None:
-                    impl.apply_pin(app.switcher, acc.email, acc.org_uuid)
-                    # An RC session that is already open keeps its old owner
-                    # (the server fixed it at creation); reconnecting inside it
-                    # is what moves it. Say so only when there is one.
-                    open_rc = impl.live_remote_control_sessions()
-                    note = (
-                        "  Reconnect open Remote Control sessions to move them "
-                        "(/rc → Disconnect → /rc)."
-                        if open_rc
-                        else ""
-                    )
-                    app.notify(f"Cloud pin → {acc.email}.{note}")
+                app.notify(f"Cloud pin → {acc.email}.{note}")
             await self._pop_menu()
         else:
             actions[action_id]()
