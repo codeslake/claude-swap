@@ -1409,58 +1409,70 @@ class TestPurgeDoesNotStrandTheWiring:
     a dead port with nothing remaining that knows how to remove it: the exact
     stranding clear_wiring lives in this repo to prevent."""
 
-    def _purge_with(self, tmp_path, monkeypatch, clear_wiring):
-        """Drive a real purge with ``clear_wiring`` replaced. Returns stdout."""
+    def _purge_with(self, tmp_path, monkeypatch, cfg):
+        """Drive a real purge against ``cfg``. Returns stdout.
+
+        NO STUB: `clear_wiring` is the real one, so the only way a test can
+        make the unwire fail is the way the machine does it.
+        """
         import io
-        import json as _json
         from contextlib import redirect_stdout
         from unittest.mock import patch
 
         import claude_swap.paths as paths
-        from claude_swap import pin
+        import claude_swap.switcher as _sw_mod
         from claude_swap.switcher import ClaudeAccountSwitcher
 
-        cfg = tmp_path / ".claude.json"
-        cfg.write_text(_json.dumps({
-            "env": {"HTTPS_PROXY": f"http://127.0.0.1:{_dead_port()}"},
-            "_cswapPinWiredKeys": ["HTTPS_PROXY"],
-            "_cswapPinWiredKeysSaved": {},
-        }))
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
         # switcher.py imports the name at module scope, so patching the
         # module it came FROM does not reach it.
-        import claude_swap.switcher as _sw_mod
-
         monkeypatch.setattr(_sw_mod, "get_global_config_path", lambda: cfg)
         monkeypatch.setenv("HOME", str(tmp_path))
-        monkeypatch.setattr(pin, "clear_wiring", clear_wiring)
 
         sw = ClaudeAccountSwitcher()
         sw.backup_dir.mkdir(parents=True, exist_ok=True)
         buf = io.StringIO()
         with patch("builtins.input", return_value="y"), redirect_stdout(buf):
             sw.purge()
-        return buf.getvalue(), cfg
+        return buf.getvalue()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root): chmod is a no-op "
+        "on win32 and root writes into a 0o500 dir regardless, so the lock "
+        "never fails",
+    )
     def test_a_FAILED_unwire_tells_the_user_instead_of_saying_complete(
         self, tmp_path, monkeypatch
     ):
         """"Absent" and "failed" are different, and only one is silent.
 
-        A bare `except Exception` could not tell them apart, so a read-only
-        home (or a contended lock, or an unreadable config) printed "Purge
-        complete." over a config that still carried the wiring — and with
-        LESS recourse than before, since the record, cert dir and daemon
-        state a later `cswap pin --clear` could have keyed off are now gone.
-        Hand-editing was the only cure and nothing said so.
+        `clear_wiring`'s bool is False for both, so a purge that trusts it
+        prints "Purge complete." over a config that still carries the wiring —
+        and with LESS recourse than before, since the record, cert dir and
+        daemon state a later `cswap pin --clear` could have keyed off are gone
+        by then. Hand-editing is the only cure and nothing says so.
+
+        The failure is REAL, not injected: `proper_lockfile` mkdirs its lock
+        beside the config, so a read-only config dir locks the unwire out on
+        the same path a contended lock does.
         """
-        def _raise(sw, timeout=None):
-            raise OSError(30, "Read-only file system")
+        cfg = _cfg(tmp_path, "cfgdir", _dead_port())
+        assert "_cswapPinWiredKeys" in json.loads(cfg.read_text()), (
+            "fixture is not wired — a before/after check whose BEFORE is empty "
+            "reports success for the absence of what it measures"
+        )
+        cfg.parent.chmod(0o500)
+        try:
+            out = self._purge_with(tmp_path, monkeypatch, cfg)
+        finally:
+            cfg.parent.chmod(0o700)  # or tmp_path cleanup cannot remove it
 
-        out, cfg = self._purge_with(tmp_path, monkeypatch, _raise)
-
-        assert "Read-only file system" in out, (
+        assert "_cswapPinWiredKeys" in json.loads(cfg.read_text()), (
+            "fixture did not reach the stranded shape: the unwire succeeded"
+        )
+        assert "Could not remove the cloud pin wiring" in out, (
             "the purge reported success over a wiring it failed to remove"
         )
         # The path the code resolves, not where this test happened to write:
@@ -1468,39 +1480,18 @@ class TestPurgeDoesNotStrandTheWiring:
         assert str(cfg) in out, "the message does not name the file to edit"
         assert "_cswapPinWiredKeys" in out, "it does not name what to delete"
 
-    def test_an_ABSENT_extra_says_nothing(self, tmp_path, monkeypatch):
-        """...and the silent case must stay silent: no extra, nothing wired,
-        nothing to report."""
-        def _absent(sw, timeout=None):
-            raise ImportError("no cswap_pin", name="cswap_pin")
-
-        out, _cfg = self._purge_with(tmp_path, monkeypatch, _absent)
+    def test_an_unwired_config_says_nothing(self, tmp_path, monkeypatch):
+        """...and the silent case must stay silent: nothing wired, nothing to
+        report. A warning here cries wolf on every ordinary purge."""
+        cfg = _cfg(tmp_path, "cfgdir", marker=False)
+        out = self._purge_with(tmp_path, monkeypatch, cfg)
         assert "cloud pin wiring" not in out.lower(), out
 
     def test_purge_unwires_before_it_deletes(self, tmp_path, monkeypatch):
-        import json as _json
-        from unittest.mock import patch
+        cfg = _cfg(tmp_path, "cfgdir", _dead_port())
+        self._purge_with(tmp_path, monkeypatch, cfg)
 
-        import claude_swap.paths as paths
-        from claude_swap.switcher import ClaudeAccountSwitcher
-
-        cfg = tmp_path / ".claude.json"
-        port = _dead_port()
-        cfg.write_text(_json.dumps({
-            "env": {"HTTPS_PROXY": f"http://127.0.0.1:{port}", "CSWAP_PIN_PORT": str(port)},
-            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
-            "_cswapPinWiredKeysSaved": {},
-        }))
-        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
-        monkeypatch.setenv("HOME", str(tmp_path))
-
-        sw = ClaudeAccountSwitcher()
-        sw.backup_dir.mkdir(parents=True, exist_ok=True)
-        with patch("builtins.input", return_value="y"):
-            sw.purge()
-
-        raw = _json.loads(cfg.read_text())
+        raw = json.loads(cfg.read_text())
         assert "_cswapPinWiredKeys" not in raw, (
             "purge left the pin wiring behind: every hand-launched claude "
             "now dials a port nothing serves"
