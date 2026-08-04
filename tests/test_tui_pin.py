@@ -421,8 +421,10 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
 
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
-        real = (pin.is_available, pin._impl, pin._wiring_present, pin.pinned_email)
-        pin.is_available = lambda: True
+        real = (pin._impl, pin._wiring_present, pin.pinned_email)
+        # _impl must resolve: without it `_pin_entries` takes its broken-package
+        # branch, which offers the clear on `_wiring_present` already — so the
+        # test would pass against the record-only gate it exists to catch.
         pin._impl = lambda: object()
         pin._wiring_present = lambda _sw: True   # the wiring survived
         pin.pinned_email = lambda _sw: None      # the record did not
@@ -435,7 +437,7 @@ class TestTheStrandedWiringIsRemovableFromTheTui:
                     f"offered no row to run it from: {ids}"
                 )
         finally:
-            pin.is_available, pin._impl, pin._wiring_present, pin.pinned_email = real
+            pin._impl, pin._wiring_present, pin.pinned_email = real
 
     async def test_clear_reaches_pin_py_without_the_package(self, tmp_path):
         """The dispatcher resolved _impl() for EVERY pin: action, so the one
