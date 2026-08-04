@@ -361,7 +361,21 @@ def mini_account_text(
         text.append(f"{name} (!)", style=palette.sev_crit)
         parts += 1
     if not parts:
-        text.append("usage unknown", style=palette.muted)
+        # An extra-usage (pay-as-you-go) account has neither window — only a
+        # SPEND budget — so this said "usage unknown" about an account
+        # `usage_rows` renders in full one screen over. From that same helper,
+        # not a third spelling. Display only: nothing here feeds a ranking.
+        spend_row = next(
+            (r for r in usage_rows(last_good, now, fetched_at) if r[0] == "$$"),
+            None,
+        )
+        if spend_row is None:
+            text.append("usage unknown", style=palette.muted)
+        else:
+            _label, pct, suffix, _full = spend_row
+            text.append("$$ ", style=palette.muted)
+            text.append(f"{pct:.0f}%", style=palette.severity(pct))
+            text.append(f" · {suffix}", style=palette.muted)
     return text
 
 

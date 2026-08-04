@@ -20,7 +20,11 @@ from pathlib import Path
 import pytest
 
 from claude_swap.autoswitch import ConfigWarningEvent, NoSwitchEvent, SwitchEvent
-from claude_swap.json_output import USAGE_API_KEY, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_API_KEY,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
@@ -685,6 +689,46 @@ class TestMiniAccountText:
         chip = data.window_chip_label(last_good, "five_hour", "5h", now)
         assert chip == "5h(⟳2h28m):"
         assert f"{chip}100%" in mini_account_text(acc, now).plain
+
+    def test_a_spend_only_account_shows_spend_not_usage_unknown(self):
+        """PROBE: the same defect `TestUnswitchableRowsAreListed` fixed on the
+        auto view, on the dashboard's mini line.
+
+        An extra-usage (pay-as-you-go) account has neither a 5h nor a 7d
+        window — only `spend` — so this loop found nothing and fell through to
+        "usage unknown", while `usage_rows` IN THIS FILE rendered `$$ 51%
+        $10.29 / $50.00` for the same `last_good` in the same second. One
+        account must not read two ways on two screens.
+
+        Display only: spend is a budget, not rate-limit headroom, and nothing
+        here feeds a ranking.
+        """
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(
+            pct5=None, pct7=None,
+            spend={"used": 10.29, "limit": 20.0, "pct": 51.45, "currency": "USD"},
+        )
+        out = mini_account_text(make_account(1, entry=entry), now).plain
+        assert "usage unknown" not in out, (
+            f"a spend-only account still reads as unknown: {out!r}"
+        )
+        assert "51%" in out, out
+        assert "$10.29" in out and "$20.00" in out, out
+
+    def test_CONTROL_no_windows_and_no_spend_still_says_unknown(self):
+        """CONTROL for the probe: "usage unknown" is still the right answer
+        with genuinely nothing to show. Deleting the phrase would pass the row
+        above and lose the real signal."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = make_entry(pct5=None, pct7=None)
+        out = mini_account_text(make_account(1, entry=entry), now).plain
+        assert "usage unknown" in out, (
+            f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
+        )
 
     def test_countdown_shows_below_100_too(self):
         """A window's worth IS when it comes back, which is exactly what you
@@ -1897,12 +1941,13 @@ class TestUnswitchableRowsAreListed:
             accounts=list(accounts), active_number=None, taken_at=0.0
         )
 
-    def _acct(self, number, email, *, switchable, kind="oauth", last_good=None):
+    def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
+              sentinel=None):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.usage.last_good = last_good
-        a.usage.sentinel = None
+        a.usage.sentinel = sentinel
         return a
 
     def _render(self, snap, active):
@@ -1940,6 +1985,51 @@ class TestUnswitchableRowsAreListed:
         assert "API key" in out
         # There is no login to restore for an API key slot.
         assert "cswap add" not in out
+
+    def test_an_api_key_slot_says_api_key_even_behind_a_locked_keychain(self):
+        """CONTROL for the probe below: consulting the sentinel must not let it
+        overrule `kind`.
+
+        `dashboard.py`'s pin-menu comment records the measured divergence — an
+        API-key slot behind a locked macOS keychain derives
+        USAGE_KEYCHAIN_UNAVAILABLE — and `kind` is the fact the CLI and set_pin
+        refuse on. "try again" is wrong advice for a slot that has no login to
+        come back to, however many times you retry.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("5", "console-api@token.local", switchable=False,
+                       kind="api_key", sentinel=USAGE_KEYCHAIN_UNAVAILABLE),
+        ), active="1")
+        assert "API key" in out, (
+            f"the sentinel overruled `kind` — the divergence dashboard.py's "
+            f"pin menu documents: {out!r}"
+        )
+        assert "keychain" not in out, out
+
+    def test_an_unreadable_slot_says_keychain_not_no_stored_login(self):
+        """PROBE for the two rows above: a slot whose backup EXISTS but could
+        not be read right now (locked keychain, no GUI session) is unswitchable
+        for a different reason, and its own sentinel already says which.
+
+        This arm never consulted it, so the row printed the `no stored login —
+        switch here, then log in (`cswap add` …)` advice, and taking it burns a
+        working stored grant by overwriting it with whatever is live. The same
+        dead end `switcher.py`'s `_static_usage_sentinel` comment says was
+        removed from three other sites; this arm was a fourth.
+        """
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("4", "locked@x.com", switchable=False,
+                       sentinel=USAGE_KEYCHAIN_UNAVAILABLE),
+        ), active="1")
+        assert "locked@x.com" in out
+        assert "keychain unavailable" in out, (
+            f"the real sentinel was shadowed by the hardcoded pair: {out!r}"
+        )
+        assert "cswap add" not in out, (
+            f"advice that overwrites a good stored credential: {out!r}"
+        )
 
     def test_a_spend_only_account_shows_its_spend_not_usage_unknown(self):
         """An extra-usage (pay-as-you-go) account has no 5h/7d window, so the
