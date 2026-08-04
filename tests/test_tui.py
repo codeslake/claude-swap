@@ -748,23 +748,41 @@ class TestMiniAccountText:
             f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
         )
 
-    def test_scoped_only_account_below_the_cap_is_shown_not_usage_unknown(self):
+    @pytest.mark.parametrize(
+        "age_s,expect_dim",
+        [(5.0, False), (STALE_OK_S + 100, True)],
+        ids=["fresh", "stale"],
+    )
+    def test_scoped_only_account_below_the_cap_is_shown_not_usage_unknown(
+        self, age_s, expect_dim
+    ):
         """PROBE: the mini line's maxed-scoped loop only fires at/over 100%,
         so an account whose only window is a per-model (e.g. Fable) limit
         below its cap fell all the way through to "usage unknown" — while
         `account_card_text` renders the same `Fable 99%` row from the same
         `usage_rows` one screen over. Same rendering gap `c209903` closed for
         spend, left open for scoped.
+
+        Staleness rides the same axis as the spend row above: this branch is
+        the OTHER place a pct is emitted, and an undimmed reading asserts a
+        freshness the code never checked.
         """
         from claude_swap.tui.widgets import mini_account_text
 
         now = time.time()
-        entry = make_entry(pct5=None, pct7=None, scoped=[("Fable", 99.0)])
-        out = mini_account_text(make_account(1, entry=entry), now).plain
+        entry = make_entry(
+            pct5=None, pct7=None, age_s=age_s, scoped=[("Fable", 99.0)]
+        )
+        text = mini_account_text(make_account(1, entry=entry), now)
+        out = text.plain
         assert "usage unknown" not in out, (
             f"a scoped-only account below its cap still reads as unknown: {out!r}"
         )
         assert "Fable" in out and "99%" in out, out
+        pct_span = next(s for s in text.spans if out[s.start : s.end] == "99%")
+        assert ("dim" in str(pct_span.style)) == expect_dim, (
+            f"age_s={age_s}: expected dim={expect_dim}, style={pct_span.style!r}"
+        )
 
     def test_spend_shows_alongside_a_healthy_window_not_hidden_behind_it(self):
         """PROBE: the spend row only rendered inside `if not parts:`, so a
@@ -785,6 +803,9 @@ class TestMiniAccountText:
         assert "10%" in out, out
         assert "95%" in out, (
             f"a 95%-spent budget vanished behind a healthy window: {out!r}"
+        )
+        assert "10% \u00b7 $$" in out, (
+            f"the window and the spend row ran together: {out!r}"
         )
 
     def test_countdown_shows_below_100_too(self):
