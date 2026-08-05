@@ -120,6 +120,7 @@ Examples:
   cswap pin --clear    remove the pin
   cswap pin --heal     restart a pin proxy that died, or unwire it
   cswap pin --port     print the serving port (for scripts), or exit 1
+  cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
         """,
     )
     parser.add_argument(
@@ -148,6 +149,18 @@ Examples:
             "(exit 1 if none). For scripts: PORT=$(cswap pin --port)"
         ),
     )
+    # THE LAUNCH HOOK. `--heal` prints its verdict and is called by a human or
+    # a status line; this is called by an rc hook before every hand-launched
+    # `claude`, where nothing of ours runs. Silent, always exit 0, and free
+    # when nothing is wired.
+    parser.add_argument(
+        "--ensure",
+        action="store_true",
+        help=(
+            "Repair a stale pin wiring before a launch. Silent, never fails, "
+            "and does nothing when no pin is set. For rc hooks."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
     # `cswap pin 2 --clear` otherwise unpins and prints "Unpinned", giving no
@@ -158,8 +171,10 @@ Examples:
         parser.error("--heal takes no account and does not combine with --clear")
     # Same rule as --clear/--heal: a query that silently discarded an action
     # would be indistinguishable from having performed it.
-    if args.port and (args.account or args.clear or args.heal):
+    if args.port and (args.account or args.clear or args.heal or args.ensure):
         parser.error("--port takes no account and does not combine with other flags")
+    if args.ensure and (args.account or args.clear or args.heal):
+        parser.error("--ensure takes no account and does not combine with other flags")
 
     from claude_swap.pin import run as pin_run
 
@@ -173,6 +188,7 @@ Examples:
                 clear=args.clear,
                 heal_only=args.heal,
                 port=args.port,
+                ensure=args.ensure,
             )
         )
     except ClaudeSwitchError as e:
