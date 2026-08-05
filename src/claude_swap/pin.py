@@ -1258,6 +1258,21 @@ def run(
             if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
                 return 0
             heal(switcher)
+            # RE-READ, DO NOT TRUST THE RETURN. This is disaster path D from
+            # the lmd42 outage, one level in: an old cswap REJECTED `--heal`
+            # with exit 2, the call was made, the rejection went unread, and
+            # the machine stayed stranded for days. `pin-ensure` answers that
+            # by re-reading the config rather than believing the command, and
+            # the same exposure exists here — `heal` calls into `cswap_pin`,
+            # a PEER on its own release schedule, so a version that reports
+            # success while binding nothing gives a launch hook that did its
+            # job and a session that dials a dead port anyway.
+            #
+            # The wiring is CSWAP'S OWN record, so removing it needs no
+            # package at all: unpinned is a working session, wired-to-a-dead-
+            # port is not.
+            if _wiring_is_stale(switcher):
+                clear_wiring(switcher)
         except Exception:  # noqa: BLE001 — a launch must never fail on the pin
             pass
         return 0
