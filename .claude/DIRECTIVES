@@ -1,0 +1,15 @@
+# Standing orders for this repo's watch. Given at invocation, NOT baked into
+# the skill — the skill is the shape, these are this repo's instructions.
+#
+# watch.sh appends the matching lines to EVERY event it emits, so a session
+# that inherits the watch is told the order at the moment it matters, instead
+# of being expected to remember one from hours earlier.
+#
+# Format:  <selector>|<order>
+#   pr:<n>   fires on events for that PR
+#   tui      fires when the event's PR touches src/claude_swap/tui/
+#   any      fires on every event
+
+pr:210|#210 is the pin session's (cswap_pin_artifacts, ai-inter-session channel `cswap`). Watch it, but on an event CHECK WITH THAT SESSION whether it is already handling it. Never push to its branch.
+
+tui|TUI CHANGE: after merging, redeploy AND RESTART the TUI on every machine — `cswap tui --auto`, in the tmux window named `cswap-tui` (create the window in the `dotfiles` session if it is missing). `--auto` is required, not optional: without it the TUI opens on the dashboard and NO auto-switch engine runs at all. Then CONFIRM AUTO IS LIVE, do not assume it: the engine must hold `.auto-live.lock` (measured paths differ per machine — ~/.claude-swap-backup/ on the macs, ~/.local/share/claude-swap/ on linux; find it, do not hardcode it). A TUI that is running but not holding that lock is in DRY-RUN and switches nothing — measured on via-work-mac, where the lock file existed and no process held it. An editable install means the pull is the deploy for the FILES only; a running TUI keeps the code it exec-ed, so the deploy is NOT done until each TUI pid postdates the deployed commit AND holds the live lock.
