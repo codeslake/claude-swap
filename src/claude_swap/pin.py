@@ -1170,10 +1170,80 @@ def heal(switcher) -> tuple[bool, str]:
     return False, "Nothing to heal"
 
 
-def run(switcher, account: str | None, clear: bool = False, heal_only: bool = False) -> int:
+def serving_port(switcher) -> int | None:
+    """The port a live pin daemon is serving, or None. CSWAP'S OWN RECORD.
+
+    Exists because nothing could ASK. Measured in the owner's dotfiles:
+    `cc-update` opens ``pin-proxy/proxy.json`` at TWO hardcoded paths and
+    parses our JSON schema, because a pinned session's ``HTTPS_PROXY`` names
+    the pin's own dynamic port rather than the cache proxy's — and without
+    that number every pinned session is reported as "the cache proxy was
+    bypassed" while it is in fact chained correctly. A consumer that cannot
+    ask reaches into our data dir, and then our LAYOUT and our SCHEMA become
+    a compatibility surface we cannot change without breaking scripts we do
+    not own.
+
+    Read from the record rather than through the package, like
+    :func:`_pinned_email_now`: the caller most likely to need this is one
+    diagnosing a failure, which is exactly when the package may be the thing
+    that is broken.
+
+    THE DAEMON'S RECORD, NOT THE CONFIG'S. These are different questions and
+    the caller is asking the first one: "which port is the proxy on", so that
+    a session seen using it can be recognised as chained rather than reported
+    as bypassing the cache proxy. The config's answer is "which port were
+    sessions TOLD to use", which is the same number in the healthy case and
+    deliberately not during a handover — `proxy.json` is what the daemon
+    itself publishes.
+
+    LIVENESS IS NOT ASSUMED. A recorded port whose daemon has died is the
+    stranding case this module keeps meeting, and answering with it would
+    send a caller to an address nothing serves. So the port is asked, not
+    inferred: a loopback connect, which also works with the package absent.
+    """
+    import json as _json
+    import socket
+    from pathlib import Path
+
+    record = Path(switcher.backup_dir) / "pin-proxy" / "proxy.json"
+    try:
+        port = int(_json.loads(record.read_text(encoding="utf-8"))["port"])
+    except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
+        return None
+    if not 0 < port <= 65535:
+        return None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0):
+            return port
+    except OSError:
+        return None
+
+
+def run(
+    switcher,
+    account: str | None,
+    clear: bool = False,
+    heal_only: bool = False,
+    port: bool = False,
+) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
     from claude_swap.printer import accent, dimmed, warning
+
+    if port:
+        # A NUMBER ON STDOUT AND NOTHING ELSE. This is read by `$(cswap pin
+        # --port)`, so a prefix, a colour code or a "no pin set" sentence
+        # would land INSIDE the caller's variable — turning every consumer
+        # back into a parser, which is the thing this flag removes. Silence
+        # plus a nonzero exit lets a caller branch without string-matching.
+        #
+        # BEFORE _impl(), for the same reason as --heal and --clear: the
+        # question is most urgent when the package is broken.
+        p = serving_port(switcher)
+        if p is None:
+            return 1
+        print(p)
+        return 0
 
     if heal_only:
         # Deliberately BEFORE _impl(): healing must work when the package is
