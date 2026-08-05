@@ -433,6 +433,50 @@ class TestLaunchIsNeverBlocked:
         assert pin.run(sw, None, ensure=True) == 0
         assert healed == [1], "a wired config was not healed"
 
+    def test_ensure_re_reads_rather_than_trusting_heal(self, tmp_path, monkeypatch):
+        """CASE D, one level in: the CALLER must not trust the return value.
+
+        The host-a outage's fourth disaster path was an old cswap that
+        REJECTED `--heal` — exit 2, the call made, the rejection unread, and
+        the machine stranded for days. `pin-ensure` answers it by RE-READING
+        the config afterwards instead of believing the command.
+
+        The same shape exists inside the package, because `heal` is allowed
+        to be wrong: it calls into `cswap_pin`, a PEER on its own release
+        schedule, and this module's standing rule is that a verdict comes
+        from the state and not from a call. A heal that returns
+        (True, "Restored") while the wiring still names a dead port must not
+        end the launch hook's work.
+        """
+        import socket
+        import types
+
+        from claude_swap import pin
+
+        cfg = _cfg(tmp_path, "cfgdir", _dead_port())
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        # `_write_json` is not decoration: `clear_wiring` writes through the
+        # switcher, so a stub without it makes the unwire fail and the test
+        # would "reproduce" a defect that is only the fixture's.
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        # A LYING heal: reports success, changes nothing. Exactly what an old
+        # cswap's rejected --heal looks like from the caller's side.
+        monkeypatch.setattr(pin, "heal", lambda s: (True, "Restored the cloud pin"))
+
+        assert pin.run(sw, None, ensure=True) == 0
+        assert not pin._wiring_is_stale(sw), (
+            "ensure believed a heal that changed nothing — the config still "
+            "names a dead port and every session started after this launch "
+            "inherits it, which is disaster path D"
+        )
+
     def test_ensure_prints_nothing_and_survives_a_raising_heal(
         self, tmp_path, monkeypatch, capsys
     ):
