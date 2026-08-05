@@ -1402,6 +1402,180 @@ class TestTheTwoWiringPredicatesAgree:
         assert pin._wiring_present(sw) is False, "the clear did not converge"
 
 
+class TestThePortIsQueryable:
+    """Nothing could ASK which port the pin serves, so callers read the file.
+
+    Measured in the owner's dotfiles: `cc-update` opens
+    `pin-proxy/proxy.json` at TWO hardcoded paths (the legacy
+    `~/.claude-swap-backup` one and the XDG one) and parses our JSON schema,
+    because a pinned session's HTTPS_PROXY names the pin's own dynamic port
+    rather than the cache proxy's, and without that number every pinned
+    session gets reported as "the cache proxy was bypassed" while it is in
+    fact chained correctly. The statusline badge does the same.
+
+    That is not the caller being sloppy: `cswap pin` had `--clear`, `--heal`
+    and `--debug` and no way to answer "what port". A consumer that cannot
+    ask has to reach into our data dir, and then our layout and our schema
+    become their compatibility surface — we cannot move either without
+    breaking a script we do not own.
+
+    So the port becomes a QUERY. Both files stay where they are; the caller
+    stops needing to know that they exist.
+    """
+
+    def _sw(self, tmp_path):
+        import types
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        return types.SimpleNamespace(backup_dir=backup)
+
+    def _serving(self, sw):
+        """A record whose port ACTUALLY answers, and the listener holding it.
+
+        A record alone would let an implementation that never checks liveness
+        pass — and answering with a dead port is the stranding this module
+        keeps meeting, so it is the one thing the query must not do.
+        """
+        import socket
+
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(4)
+        port = lsn.getsockname()[1]
+        (sw.backup_dir / "pin-proxy" / "proxy.json").write_text(
+            json.dumps({"port": port, "pid": 999, "fingerprint": "f"})
+        )
+        return lsn, port
+
+    def test_port_prints_just_the_number(self, tmp_path, capsys):
+        """One line, one integer, no decoration — it is read by `$(...)`.
+
+        A human-facing prefix, a colour code or a trailing word turns every
+        caller into a parser again, which is the thing being removed.
+        """
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        lsn, port = self._serving(sw)
+        try:
+            rc = pin.run(sw, None, port=True)
+            out = capsys.readouterr().out
+        finally:
+            lsn.close()
+        assert rc == 0, out
+        assert out.strip() == str(port), (
+            f"a caller doing PORT=$(cswap pin --port) got {out!r}"
+        )
+
+    def test_a_recorded_port_nothing_serves_is_not_reported(
+        self, tmp_path, capsys
+    ):
+        """A DEAD record must answer nothing, not a number.
+
+        `proxy.json` outlives the daemon that wrote it — an unclean exit, a
+        handover that failed — and a caller told that port would route a
+        session at an address nothing answers, or here report a session as
+        correctly chained when it is not. The record is a claim; the port is
+        the evidence.
+        """
+        from claude_swap import pin
+        import socket
+
+        sw = self._sw(tmp_path)
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()  # recorded, and now nothing is behind it
+        (sw.backup_dir / "pin-proxy" / "proxy.json").write_text(
+            json.dumps({"port": dead_port, "pid": 999})
+        )
+
+        rc = pin.run(sw, None, port=True)
+        out = capsys.readouterr().out
+        assert rc != 0, f"a dead port was reported as serving: {out!r}"
+        assert out.strip() == "", out
+
+    def test_port_is_silent_and_nonzero_when_nothing_is_serving(
+        self, tmp_path, capsys
+    ):
+        """No pin, no port. Nothing on stdout, so `$(...)` yields empty, and
+        a nonzero exit so a caller can branch without string-matching.
+
+        Printing a message here would put prose INSIDE the variable the
+        caller just assigned — the failure mode of every command that mixes
+        its report with its answer.
+        """
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)  # no proxy.json at all
+        rc = pin.run(sw, None, port=True)
+        out = capsys.readouterr().out
+        assert rc != 0, "a missing pin reported success"
+        assert out.strip() == "", (
+            f"stdout was not empty when there is no port: {out!r}"
+        )
+
+    def test_the_cli_actually_passes_port_through(self):
+        """The flag must be WIRED, not merely declared.
+
+        `cswap pin --port` that parses and then calls `run()` without it would
+        print the pin STATUS and exit 0 — a caller's `$(...)` captures prose
+        and the script behaves as though a pin were serving. A correct
+        mechanism with no caller is the defect this repo keeps finding, so
+        assert on the parse tree rather than on a comment.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from claude_swap import cli
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(cli._pin_command)))
+        declared = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "attr", None) == "add_argument"
+            and any(
+                isinstance(a, ast.Constant) and a.value == "--port" for a in n.args
+            )
+        ]
+        assert declared, "cswap pin does not declare --port"
+        forwarded = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and any(kw.arg == "port" for kw in n.keywords)
+        ]
+        assert forwarded, (
+            "--port is parsed but never forwarded to pin.run — the flag would "
+            "print the pin STATUS into the caller's variable and exit 0"
+        )
+
+    def test_port_does_not_need_the_package(self, tmp_path, capsys):
+        """The record is CSWAP's own file, so the query works with the
+        optional package absent or broken — the same rule `--clear` follows,
+        and for the same reason: a caller asking "what port" during a failure
+        is exactly when it must answer."""
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        lsn, port = self._serving(sw)
+
+        def _boom():
+            raise ClaudeSwitchError("The cloud pin requires 'cswap-pin'")
+
+        real = pin._impl
+        pin._impl = _boom
+        try:
+            rc = pin.run(sw, None, port=True)
+            out = capsys.readouterr().out
+        finally:
+            pin._impl = real
+            lsn.close()
+        assert rc == 0, out
+        assert out.strip() == str(port), out
+
+
 class TestPurgeDoesNotStrandTheWiring:
     """purge deletes backup_dir — the pin record, the cert dir, the daemon
     state — but .claude.json's env block is not in there, and Claude Code
@@ -2778,8 +2952,10 @@ class TestHealADeadPin:
 
         seen = {}
 
-        def _run(switcher, account, clear=False, heal_only=False):
-            seen.update(account=account, clear=clear, heal_only=heal_only)
+        def _run(switcher, account, clear=False, heal_only=False, port=False):
+            seen.update(
+                account=account, clear=clear, heal_only=heal_only, port=port
+            )
             return 0
 
         monkeypatch.setattr("claude_swap.pin.run", _run)
@@ -2788,7 +2964,9 @@ class TestHealADeadPin:
         with pytest.raises(SystemExit) as e:
             cli._pin_command(["--heal"])
         assert e.value.code == 0
-        assert seen == {"account": None, "clear": False, "heal_only": True}
+        assert seen == {
+            "account": None, "clear": False, "heal_only": True, "port": False
+        }
 
     def test_heal_runs_before_the_package_is_required(self, tmp_path, monkeypatch):
         """`run(--heal)` must not go through _impl(): the missing-package error

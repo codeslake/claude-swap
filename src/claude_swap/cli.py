@@ -119,6 +119,7 @@ Examples:
   cswap pin            show the current pin
   cswap pin --clear    remove the pin
   cswap pin --heal     restart a pin proxy that died, or unwire it
+  cswap pin --port     print the serving port (for scripts), or exit 1
         """,
     )
     parser.add_argument(
@@ -133,6 +134,20 @@ Examples:
             "remove the wiring so sessions fall back instead of failing"
         ),
     )
+    # A QUERY, so consumers stop reading our files. Measured in the owner's
+    # dotfiles: `cc-update` opens pin-proxy/proxy.json at two hardcoded paths
+    # and parses our schema, because a pinned session's HTTPS_PROXY names the
+    # pin's own dynamic port and without that number every pinned session is
+    # reported as bypassing the cache proxy. Nothing could ask, so the layout
+    # and the schema became a compatibility surface we do not control.
+    parser.add_argument(
+        "--port",
+        action="store_true",
+        help=(
+            "Print the port a live pin proxy is serving, and nothing else "
+            "(exit 1 if none). For scripts: PORT=$(cswap pin --port)"
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
     # `cswap pin 2 --clear` otherwise unpins and prints "Unpinned", giving no
@@ -141,6 +156,10 @@ Examples:
         parser.error("--clear takes no account")
     if args.heal and (args.account or args.clear):
         parser.error("--heal takes no account and does not combine with --clear")
+    # Same rule as --clear/--heal: a query that silently discarded an action
+    # would be indistinguishable from having performed it.
+    if args.port and (args.account or args.clear or args.heal):
+        parser.error("--port takes no account and does not combine with other flags")
 
     from claude_swap.pin import run as pin_run
 
@@ -148,7 +167,13 @@ Examples:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         sys.exit(
-            pin_run(switcher, args.account, clear=args.clear, heal_only=args.heal)
+            pin_run(
+                switcher,
+                args.account,
+                clear=args.clear,
+                heal_only=args.heal,
+                port=args.port,
+            )
         )
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
