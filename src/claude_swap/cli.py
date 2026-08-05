@@ -97,6 +97,85 @@ def _translate_subcommand(argv: list[str]) -> list[str]:
     return argv
 
 
+def _pin_command(argv: list[str]) -> None:
+    """Handle `cswap pin [NUM|EMAIL] [--clear]`.
+
+    Pre-dispatched like `run`/`auto`: a positional subcommand cannot coexist
+    with main()'s mutually-exclusive flag group, and `--clear` needs a parser
+    of its own. The work lives in claude_swap.pin, which is import-safe
+    without the extra — a missing 'cswap-pin' surfaces from run() as a
+    ClaudeSwitchError with the install hint, the same way menubar does.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} pin",
+        description=(
+            "Keep Remote Control and Artifacts on one account while inference "
+            "follows the account swap. Needs the 'pin' extra."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap pin 2          pin Remote Control / artifacts to account 2
+  cswap pin            show the current pin
+  cswap pin --clear    remove the pin
+  cswap pin --heal     restart a pin proxy that died, or unwire it
+        """,
+    )
+    parser.add_argument(
+        "account", nargs="?", metavar="NUM|EMAIL", help="Account to pin to"
+    )
+    parser.add_argument("--clear", action="store_true", help="Remove the pin")
+    parser.add_argument(
+        "--heal",
+        action="store_true",
+        help=(
+            "Restart the pin proxy if it died; if it cannot be restarted, "
+            "remove the wiring so sessions fall back instead of failing"
+        ),
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+    # `cswap pin 2 --clear` otherwise unpins and prints "Unpinned", giving no
+    # sign the 2 was discarded — indistinguishable from having pinned it.
+    if args.clear and args.account:
+        parser.error("--clear takes no account")
+    if args.heal and (args.account or args.clear):
+        parser.error("--heal takes no account and does not combine with --clear")
+
+    from claude_swap.pin import run as pin_run
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        sys.exit(
+            pin_run(switcher, args.account, clear=args.clear, heal_only=args.heal)
+        )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+    except Exception as e:  # noqa: BLE001
+        # A broken package root is not a ClaudeSwitchError: `_impl` re-raises
+        # the underlying ImportError so "installed but unusable" stays distinct
+        # from "not installed". Unrendered it reaches the user as a traceback,
+        # and this command has to stay usable when the pin does not.
+        #
+        # THROUGH `_safe`: the exception is built by an optional package and
+        # the proxy's own URL carries `user:secret@`, which would otherwise
+        # print verbatim (`_safe` yields `http://***@127.0.0.1:9901/…`).
+        from claude_swap.pin import _safe
+
+        error(f"Error: the cloud pin is installed but not usable: {_safe(e)}")
+        # NOT an unconditional promise: `cswap pin --clear` works without the
+        # package, but a contended config lock can still make it skip a
+        # config it never got to try (see clear_wiring's budget) — reword
+        # rather than promise an outcome the code cannot guarantee.
+        error("  `cswap pin --clear` still works, and removes the wiring unless the config is locked.")
+        sys.exit(1)
+
+
 def _run_command(argv: list[str]) -> None:
     """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
 
@@ -708,8 +787,16 @@ Defaults live in settings.json in the backup root; flags override them.
         if args.once:
             sys.exit(engine.tick().value)
 
-        # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
+        # Loop mode: SIGTERM (systemd stop) and SIGINT (the Ctrl-C the banner
+        # below promises) both exit the loop cleanly. Without the SIGINT
+        # handler, KeyboardInterrupt is a BaseException — neither `except
+        # ClaudeSwitchError` nor `except Exception` in `tick()` catches it — so
+        # it propagated out of `_perform` between `switch_to` and the state
+        # write: the account switched, `lastSwitchAt` was never recorded, and
+        # the LIVE lock stayed held. The next engine then saw no cooldown and
+        # could switch again immediately.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        signal.signal(signal.SIGINT, lambda *_: engine.stop())
         if not args.json:
             print(
                 dimmed(
@@ -920,6 +1007,9 @@ def main() -> None:
         pass  # theme is cosmetic; never block the CLI on it
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
+    if argv and argv[0] == "pin":
+        _pin_command(argv[1:])
+        return
     if argv and argv[0] == "run":
         _run_command(argv[1:])
         return  # only reachable in tests where exec/exit is mocked
@@ -993,6 +1083,8 @@ Commands:
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
+  %(prog)s pin [num|email]            pin Remote Control/artifacts to one account
+  %(prog)s pin --clear                unpin
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1171,6 +1263,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    # `cswap tui --auto`: open on the auto-switch view with the engine LIVE.
+    # The explicit flag is the consent the interactive path collects via the
+    # go-live modal. Not in the mutually-exclusive group — it modifies --tui.
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        dest="tui_auto",
+        help=argparse.SUPPRESS,
+    )
     group.add_argument(
         "--menubar",
         action="store_true",
@@ -1342,7 +1443,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
-            sys.exit(tui_run(switcher))
+            sys.exit(tui_run(
+                switcher, start="auto" if args.tui_auto else "dashboard"
+            ))
         elif args.watch:
             from claude_swap.tui import run as tui_run
 
