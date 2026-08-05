@@ -1225,10 +1225,42 @@ def run(
     clear: bool = False,
     heal_only: bool = False,
     port: bool = False,
+    ensure: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
     from claude_swap.printer import accent, dimmed, warning
+
+    if ensure:
+        # THE LAUNCH CONTRACT, which `--heal` deliberately does not make.
+        # An rc hook calls this before EVERY `claude`, so three properties
+        # matter more than the repair itself:
+        #
+        #   never fails    a launch is not optional and a pin is, so every
+        #                  path exits 0 — including a raise, which an rc hook
+        #                  would otherwise propagate into the launch
+        #   silent         a launch that prints has changed what the user sees
+        #                  for an optional feature
+        #   cheap when idle  this runs on every launch, so a machine that
+        #                  never pinned must not pay for the repair path
+        #
+        # This exists so 200 lines of shell in a user's dotfiles can be one
+        # line. That script was written when `--heal` did not exist in the
+        # installed cswap; the repair belongs here, and the only irreducible
+        # part is the TRIGGER — a hand-launched `claude` execs from the user's
+        # shell and nothing of ours runs inside it.
+        try:
+            # NOTHING WIRED AND NOTHING RECORDED IS THE COMMON CASE. Healing
+            # unconditionally would spend a config read, two path resolutions
+            # and a socket probe per launch for a user who has never pinned —
+            # and the status line already calls `heal` on a timer, so on a
+            # machine with both this would be the second caller per tick.
+            if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
+                return 0
+            heal(switcher)
+        except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+            pass
+        return 0
 
     if port:
         # A NUMBER ON STDOUT AND NOTHING ELSE. This is read by `$(cswap pin
