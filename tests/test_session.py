@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 import unicodedata
 from pathlib import Path
@@ -1396,19 +1397,35 @@ class TestGuards:
         assert (session_dir / ".claude.json").exists()  # history preserved
         assert block_real_keychain.get_password(service, account) is None
 
+    @pytest.mark.parametrize(
+        "dir_still_there", [True, False],
+        ids=["profile_dir_present", "profile_dir_already_gone"],
+    )
     def test_deleting_a_profile_takes_its_stale_marker_with_it(
-        self, seeded_switcher
+        self, seeded_switcher, dir_still_there
     ):
         """The marker is a SIBLING of the profile dir, so `rmtree` no longer
         removes it. A leftover marker outlives the profile it described, and
         the next profile created for that same slot+email inherits a
-        re-bootstrap flag that nothing set for it."""
+        re-bootstrap flag that nothing set for it.
+
+        The already-gone case is what ``purge`` leaves behind: it removes
+        profile DIRS (``iterdir()`` filtered by ``is_dir()``) and the marker is
+        a dot-FILE beside them, so it survives by design. This function then
+        early-outs on the missing directory and never reaches the marker —
+        two artifacts, one of them consulted.
+        """
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         session_dir.mkdir(parents=True, exist_ok=True)
         session_mod.mark_session_stale(session_dir)
         assert session_mod.is_session_stale(session_dir), "premise: marked"
+        if not dir_still_there:
+            shutil.rmtree(session_dir)  # what purge does
+            assert session_mod.is_session_stale(session_dir), (
+                "premise: the marker outlives the dir purge removed"
+            )
 
         seeded_switcher._delete_session_profile(ACCOUNT_NUM, ACCOUNT_EMAIL)
 
@@ -2415,6 +2432,61 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             "re-seeded a profile a live claude is running against; "
             "_bootstrap would delete its Keychain entry mid-session"
         )
+
+    def test_an_unverifiable_probe_does_not_destroy_the_profile(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        """`claude` unresolvable on PATH is not a verdict about the profile.
+
+        `_is_session_valid` catches OSError/TimeoutExpired and returns False,
+        and the post-bootstrap caller reads False as "invalid" and runs
+        `_cleanup_failed_session` — which deletes the Keychain entry AND
+        rmtree's the profile, then tells the user to re-add the account. So a
+        missing binary, or `claude auth status` exceeding its 10s timeout on a
+        loaded machine, destroys a profile that was just built.
+
+        The file's own comment above that probe records this already happening
+        on Windows via FileNotFoundError; that fixed the PATHEXT cause and left
+        the collapse.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        def unresolvable(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "claude")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", unresolvable)
+
+        with pytest.raises(SessionError, match="could not be verified"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert session_dir.exists(), (
+            "deleted a profile it was never able to verify — the probe failing "
+            "is not evidence the profile is invalid"
+        )
+
+    def test_a_genuinely_invalid_profile_is_still_cleaned_up(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        """The control. A probe that RUNS and reports not-logged-in is a real
+        verdict, and must still clean up — otherwise the test above passes on
+        a version that simply never cleans up anything."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        def not_logged_in(*args, **kwargs):
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"loggedIn": False}), stderr=""
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", not_logged_in)
+
+        with pytest.raises(SessionError, match="failed validation"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert not session_dir.exists()
 
     def test_a_failed_persist_warns_rather_than_seeding_a_spent_grant(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys

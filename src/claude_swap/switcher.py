@@ -2722,10 +2722,14 @@ class ClaudeAccountSwitcher:
         )
 
         session_dir = self._session_dir(account_num, email)
-        if not session_dir.exists():
-            return
-        delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
+        if session_dir.exists():
+            delete_macos_keychain_entry(session_dir)
+            shutil.rmtree(session_dir, ignore_errors=True)
+        # NOT under that `if`. The marker lives OUTSIDE the dir, so it
+        # outlives it: `purge` removes profile dirs (`iterdir()` + `is_dir()`)
+        # and leaves the dot-file beside them by design. Early-returning on
+        # the missing dir left that marker for the next profile in this slot,
+        # which then re-bootstraps on a flag nothing set for it.
         cleared = clear_session_stale(session_dir)
         if session_dir.exists() or not cleared:
             # Both removals tolerate a denied dir, which is right -- the

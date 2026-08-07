@@ -662,7 +662,20 @@ class SessionManager:
             self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share, share_history)
 
-            if not self._is_session_valid(session_dir, email, org_uuid):
+            verdict = self._session_validity(session_dir, email, org_uuid)
+            if verdict == "unknown":
+                # The PROBE failed, not the profile. `_cleanup_failed_session`
+                # below deletes the Keychain entry and the whole directory, so
+                # running it here would destroy a profile we never managed to
+                # look at — on nothing worse than `claude` missing from PATH or
+                # a 10s timeout on a loaded machine.
+                raise SessionError(
+                    f"Session profile for Account-{account_num} ({email}) could "
+                    f"not be verified: `claude auth status` did not run or did "
+                    f"not answer. The profile is left in place — check that "
+                    f"`claude` is on PATH, then retry."
+                )
+            if verdict != "valid":
                 self._cleanup_failed_session(session_dir)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
@@ -786,18 +799,27 @@ class SessionManager:
 
     # -- validation ------------------------------------------------------
 
-    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
-        """Whether claude sees the profile as logged in with the right identity.
+    def _session_validity(
+        self, session_dir: Path, email: str, org_uuid: str
+    ) -> str:
+        """``"valid"`` / ``"invalid"`` / ``"unknown"`` for a session profile.
 
         Local check only (`claude auth status` makes no API call): a revoked
         but unexpired token still passes and fails on first real use.
+
+        ``"unknown"`` is the answer whenever the PROBE failed rather than the
+        profile: `claude` not resolvable, the run timing out, output that will
+        not parse. That is a separate answer from ``"invalid"`` because the
+        caller that acts on ``"invalid"`` deletes the profile's Keychain entry
+        and rmtree's the directory. A probe we could not run is not evidence
+        about the profile, and the two must not share a return value.
         """
         if not session_dir.is_dir():
-            return False
+            return "invalid"
         # On Windows `claude` is a `.cmd` shim, and a bare "claude" passed to
         # subprocess won't resolve it (PATHEXT isn't applied) — it raises
-        # FileNotFoundError, which the handler below turns into a false
-        # "failed validation". shutil.which finds the shim.
+        # FileNotFoundError. `shutil.which` finds the shim; when it finds
+        # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
         try:
             result = subprocess.run(
@@ -808,27 +830,40 @@ class SessionManager:
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
         except (OSError, subprocess.TimeoutExpired):
-            return False
+            return "unknown"
         if result.returncode != 0:
-            return False
+            return "invalid"
         try:
             status = json.loads(result.stdout)
         except json.JSONDecodeError:
-            return False
+            return "unknown"
+        if not isinstance(status, dict):
+            return "unknown"
         if status.get("loggedIn") is not True:
-            return False
+            return "invalid"
         # Verified against claude 2.1.175; an env API key reports a different
         # method, and the probe env already drops those vars anyway.
         if status.get("authMethod") != "claude.ai":
-            return False
+            return "invalid"
         if status.get("email") != email:
-            return False
+            return "invalid"
         # Lenient org check: only when both sides have a value, so schema
         # drift degrades to email-only validation instead of false negatives.
         status_org = status.get("orgId")
         if status_org and org_uuid and status_org != org_uuid:
-            return False
-        return True
+            return "invalid"
+        return "valid"
+
+    def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
+        """Whether the profile is DEFINITELY usable.
+
+        Reuse-shaped view of :meth:`_session_validity`: "unknown" answers
+        False, so an unverifiable profile is simply not reused. Callers that
+        DESTROY on a negative must use the tri-state instead — for them the
+        difference between "invalid" and "could not tell" is the difference
+        between a correct cleanup and deleting a working profile.
+        """
+        return self._session_validity(session_dir, email, org_uuid) == "valid"
 
     # -- sharing ---------------------------------------------------------
 
