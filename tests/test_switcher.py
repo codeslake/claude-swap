@@ -19,6 +19,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    SessionError,
     SwitchError,
     ValidationError,
 )
@@ -914,6 +915,43 @@ class TestFetchAccountUsageSessionProfile:
         args, kwargs = mock_fetch.call_args
         assert args[2] == session
         assert kwargs.get("is_active") is True
+
+
+class TestLiveSessionGuardOnAnUnreadableRecord:
+    """A session record we could not READ must not answer "nobody there".
+
+    ``list_sessions`` skips an unparseable record, which is right for a SCAN:
+    one bad file must not kill a listing. ``_ensure_no_live_session`` is a
+    GUARD on the same data, and it gates destruction — ``_bootstrap`` deletes
+    the profile's Keychain entry and overwrites ``.credentials.json``, and
+    ``remove_account`` deletes the slot. A shorter list reads there as "no
+    live claude", so one unreadable record opens that gate underneath a
+    running instance.
+
+    Every other test of this guard patches ``_live_session_pids``, so none of
+    them exercises the read that produces the collapse.
+    """
+
+    def _sessions_dir(self, switcher) -> Path:
+        d = switcher._session_dir("2", "test@example.com") / "sessions"
+        d.mkdir(parents=True)
+        return d
+
+    def test_unreadable_record_refuses_like_a_live_one(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        d = self._sessions_dir(switcher)
+        (d / "9999.json").write_text("not json{{{", encoding="utf-8")
+
+        with pytest.raises(SessionError, match="could not be read"):
+            switcher._ensure_no_live_session("2", "test@example.com", "the operation")
+
+    def test_readable_and_empty_still_permits(self, temp_home: Path):
+        """The control. Without it the test above passes on a guard that
+        refuses unconditionally, which is not the contract."""
+        switcher = ClaudeAccountSwitcher()
+        self._sessions_dir(switcher)
+
+        switcher._ensure_no_live_session("2", "test@example.com", "the operation")
 
 
 class TestListAccountsUsage:

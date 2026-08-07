@@ -31,8 +31,9 @@ from claude_swap.session import (
     SessionManager,
     _probe_env,
     keychain_service_name,
-    live_sessions_for,
+    profile_is_quiescent,
     read_session_identity,
+    scan_live_sessions,
     session_dir_for,
     session_identity_drifted,
     slugify_email,
@@ -232,16 +233,35 @@ class TestHelpers:
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
         assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path)
 
-    def test_live_sessions_for_missing_dir(self, tmp_path):
-        assert live_sessions_for(tmp_path / "nope") == []
+    def test_scan_live_sessions_missing_dir(self, tmp_path):
+        assert scan_live_sessions(tmp_path / "nope") == ([], 0)
 
-    def test_live_sessions_for_dead_pid_ignored(self, tmp_path):
+    def test_scan_live_sessions_dead_pid_ignored(self, tmp_path):
         make_live(tmp_path, pid=2**22 + 12345)  # vanishingly unlikely to exist
-        assert live_sessions_for(tmp_path) == []
+        assert scan_live_sessions(tmp_path) == ([], 0)
 
-    def test_live_sessions_for_own_pid(self, tmp_path):
+    def test_scan_live_sessions_own_pid(self, tmp_path):
         make_live(tmp_path)
-        assert [s.pid for s in live_sessions_for(tmp_path)] == [os.getpid()]
+        sessions, unreadable = scan_live_sessions(tmp_path)
+        assert [s.pid for s in sessions] == [os.getpid()]
+        assert unreadable == 0
+
+    def test_unreadable_record_is_not_quiescent(self, tmp_path):
+        """A dead PID and an unreadable record both yield zero live sessions.
+        Only the first is evidence that nothing is running."""
+        (tmp_path / "sessions").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "sessions" / "9999.json").write_text(
+            "not json{{{", encoding="utf-8"
+        )
+
+        assert scan_live_sessions(tmp_path) == ([], 1)
+        assert not profile_is_quiescent(tmp_path)
+
+    def test_dead_pid_is_quiescent(self, tmp_path):
+        """The control: zero live from a READABLE record IS safe to act on,
+        so the predicate is not just refusing everything."""
+        make_live(tmp_path, pid=2**22 + 12345)
+        assert profile_is_quiescent(tmp_path)
 
 
 class TestSessionIdentity:
@@ -1656,7 +1676,7 @@ class TestShareHistoryPosix:
         (session_dir / "projects").mkdir()
         (session_dir / "projects" / "x.jsonl").write_text("live\n")
         monkeypatch.setattr(
-            session_mod, "live_sessions_for", lambda _dir: [object()]
+            session_mod, "scan_live_sessions", lambda _dir: ([object()], 0)
         )
 
         mgr._sync_sharing(session_dir, share=True, share_history=True)
@@ -2353,7 +2373,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         session, while deferring costs it only a generation it can still
         refresh from.
 
-        Mutation-checked: dropping `and not live_sessions_for(session_dir)`
+        Mutation-checked: dropping `and profile_is_quiescent(session_dir)`
         left all 1783 green. The branch fires precisely when the profile is
         VALID, which IS the live case, so it needed the guard most and had
         nothing pinning it.
@@ -2385,7 +2405,9 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
         # ...and that peer is RUNNING against the profile.
         live = SimpleNamespace(pid=4242)
-        monkeypatch.setattr(session_mod, "live_sessions_for", lambda _sdir: [live])
+        monkeypatch.setattr(
+            session_mod, "scan_live_sessions", lambda _sdir: ([live], 0)
+        )
 
         got, _, _ = manager.setup_session("2", share=False)
 

@@ -60,7 +60,7 @@ from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
-from claude_swap.process_detection import ClaudeSession, list_sessions
+from claude_swap.process_detection import ClaudeSession, scan_sessions
 from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
@@ -398,11 +398,30 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     return bool(profile_org and org_uuid and profile_org != org_uuid)
 
 
-def live_sessions_for(session_dir: Path) -> list[ClaudeSession]:
-    """Live Claude instances running against a session profile."""
+def scan_live_sessions(session_dir: Path) -> tuple[list[ClaudeSession], int]:
+    """Live Claude instances for a profile, and records that could not be read.
+
+    Every caller of this gates a destructive step, so the unreadable count
+    travels with the list: a record we could not read is not evidence that
+    nothing is running. Renamed from ``live_sessions_for`` deliberately -- the
+    old name returned a bare list, and a call site left on it would read a
+    tuple as unconditionally truthy.
+    """
     if not session_dir.exists():
-        return []
-    return list_sessions(claude_dir=session_dir)
+        return [], 0
+    return scan_sessions(claude_dir=session_dir)
+
+
+def profile_is_quiescent(session_dir: Path) -> bool:
+    """Nothing is running against this profile, AND we could read every record.
+
+    The predicate every "is it safe to rewrite/remove this profile" site
+    wants. False when a record is unreadable: not knowing is not the same as
+    knowing nothing is there, and the step behind these callers cannot be
+    undone.
+    """
+    sessions, unreadable = scan_live_sessions(session_dir)
+    return not sessions and unreadable == 0
 
 
 def _mkdir_private(path: Path) -> None:
@@ -571,9 +590,7 @@ class SessionManager:
         # pass the local reuse check. Honored only when no session is live —
         # a second `cswap run` joining a live session must not invalidate
         # under the running claude (the marker survives for later).
-        stale = is_session_stale(session_dir) and not live_sessions_for(
-            session_dir
-        )
+        stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
@@ -611,9 +628,7 @@ class SessionManager:
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
-            if is_session_stale(session_dir) and not live_sessions_for(
-                session_dir
-            ):
+            if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
                 self.switcher._invalidate_session_credentials(account_num, email)
                 clear_session_stale(session_dir)
             if self._is_session_valid(session_dir, email, org_uuid):
@@ -639,7 +654,7 @@ class SessionManager:
                 # session.
                 if not self._profile_matches_backup(
                     session_dir, account_num, email
-                ) and not live_sessions_for(session_dir):
+                ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
@@ -1143,7 +1158,7 @@ class SessionManager:
             # Real per-account history accumulated before the flag existed.
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
-            if live_sessions_for(session_dir):
+            if not profile_is_quiescent(session_dir):
                 print(
                     dimmed(
                         f"Not sharing {dest.name} yet: another session is "

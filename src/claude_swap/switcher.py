@@ -2644,19 +2644,43 @@ class ClaudeAccountSwitcher:
         return lines
 
     def _live_session_pids(self, account_num: str, email: str) -> list[int]:
-        """PIDs of Claude instances running against an account's session profile."""
-        from claude_swap.session import live_sessions_for
+        """PIDs of Claude instances running against an account's session profile.
 
-        return [s.pid for s in live_sessions_for(self._session_dir(account_num, email))]
+        Scan-shaped: an unreadable record contributes no PID. Fine for the
+        usage heuristics that read this; a destructive guard must use
+        ``_ensure_no_live_session``, which asks the readability question too.
+        """
+        from claude_swap.session import scan_live_sessions
+
+        sessions, _ = scan_live_sessions(self._session_dir(account_num, email))
+        return [s.pid for s in sessions]
 
     def _ensure_no_live_session(self, account_num: str, email: str, action: str) -> None:
-        """Refuse a destructive operation while a session-mode claude is live."""
+        """Refuse a destructive operation while a session-mode claude is live.
+
+        "We could not read the records" refuses too, and says so in its own
+        words. This gates ``_bootstrap`` (Keychain entry deleted,
+        ``.credentials.json`` overwritten) and slot removal, so treating an
+        unreadable record as an absent one runs them under a live instance.
+        """
+        from claude_swap.session import scan_live_sessions
+
         pids = self._live_session_pids(account_num, email)
         if pids:
             raise SessionError(
                 f"Account-{account_num} ({email}) has a live session-mode Claude "
                 f"instance (PID {', '.join(map(str, pids))}). "
                 f"Exit it first, then retry {action}."
+            )
+        session_dir = self._session_dir(account_num, email)
+        _, unreadable = scan_live_sessions(session_dir)
+        if unreadable:
+            raise SessionError(
+                f"Account-{account_num} ({email}) has {unreadable} session "
+                f"record(s) that could not be read, so whether a Claude "
+                f"instance is live cannot be determined. Inspect "
+                f"{session_dir / 'sessions'} and remove or repair them, then "
+                f"retry {action}."
             )
 
     def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
@@ -6800,13 +6824,16 @@ class ClaudeAccountSwitcher:
             if sessions_root.is_dir()
             else []
         )
-        from claude_swap.session import live_sessions_for
+        from claude_swap.session import scan_live_sessions
 
         live = {}
+        unreadable = {}
         for d in session_dirs:
-            pids = [s.pid for s in live_sessions_for(d)]
-            if pids:
-                live[d.name] = pids
+            sessions, bad = scan_live_sessions(d)
+            if sessions:
+                live[d.name] = [s.pid for s in sessions]
+            elif bad:
+                unreadable[d.name] = bad
         if live:
             details = "; ".join(
                 f"{name} (PID {', '.join(map(str, pids))})"
@@ -6815,6 +6842,16 @@ class ClaudeAccountSwitcher:
             raise SessionError(
                 f"Live session-mode Claude instance(s) found: {details}. "
                 "Exit them first, then retry --purge."
+            )
+        if unreadable:
+            details = "; ".join(
+                f"{name} ({n} record(s))" for name, n in unreadable.items()
+            )
+            raise SessionError(
+                f"Session records that could not be read: {details}. Whether a "
+                "Claude instance is live cannot be determined, and purging "
+                "would pull a live profile out from under it. Repair or remove "
+                "them, then retry --purge."
             )
 
         warning("This will remove ALL claude-swap data from your system:")
