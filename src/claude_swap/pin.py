@@ -620,25 +620,42 @@ def _wiring_present(_switcher) -> bool:
     interchangeably — dropping it here alone would make this one predicate
     look different from its siblings for no reason a caller could see.
     """
-    # Imported here, as clear_wiring does: paths.py reads CLAUDE_CONFIG_DIR at
-    # CALL time, and a module-scope import would freeze the resolution for a
-    # process whose env changes (the `cswap run` case both functions exist for).
+    # ONE TRAVERSAL, in `wired_config_paths`. This used to walk the configs
+    # itself, and `purge` needed the same walk to name the survivor — two
+    # copies of "which configs are wired" is two things to keep in step, and
+    # the one that drifted was the one a user reads after their only other
+    # recourse has been deleted.
+    #
+    # The getter-raises guard, the de-dup and the unreadable-is-not-wired rule
+    # all live there now; see that function for why `heal` cannot afford a
+    # raise to escape.
+    return bool(wired_config_paths(_switcher))
+
+
+def wired_config_paths(_switcher=None) -> list:
+    """Every config that still carries OUR marker, in read order.
+
+    :func:`_wiring_present` answers "is any of them wired" and throws away
+    WHICH — fine for a gate, wrong for a message. `purge` printed
+    ``get_global_config_path()`` after asking that gate, so when the survivor
+    was the OTHER config the user was sent to a file that was already clean
+    while the wiring that strands them sat in one they were never told about.
+    After a purge the record, cert dir and daemon state are gone, so hand
+    editing is the only cure left and naming the wrong file is the whole
+    failure.
+
+    Same traversal, same guards, same de-dup as ``_wiring_present`` — it is
+    now written once here and that predicate reads this.
+    """
     from claude_swap.paths import (
         get_default_global_config_path,
         get_global_config_path,
     )
 
-    seen = set()
+    wired, seen = [], set()
     for get in (get_global_config_path, get_default_global_config_path):
-        # THE GETTER ITSELF CAN RAISE (see the same guard on `_wired_ports`,
-        # Task 1 of the prior round): `get_default_global_config_path` calls
-        # `Path.home()`, which raises `RuntimeError` with no HOME and no
-        # `/etc/passwd` entry. `heal` survives that today only because this
-        # function's own raise happens to land inside `heal`'s bottom `try`
-        # — a refactor moving the call above it would reintroduce the
-        # traceback `heal` documents as never happening. With no HOME,
-        # `_wired_ports()` returns `[]` because it guards; an unguarded
-        # `_wiring_present` raises instead.
+        # The getter itself can raise; see `_wiring_present` above for why
+        # `heal` cannot afford that to escape.
         try:
             path = get()
         except Exception as exc:  # noqa: BLE001 — unresolvable: no opinion
@@ -652,8 +669,8 @@ def _wiring_present(_switcher) -> bool:
         except Exception:  # noqa: BLE001 — unreadable/absent is not "wired"
             continue
         if _wire_mark_of(raw) is not None:
-            return True
-    return False
+            wired.append(path)
+    return wired
 
 
 def _clear_wiring_locked(switcher, path) -> bool:
@@ -914,7 +931,24 @@ def _port_of_config(path) -> int | None:
     import json as _json
 
     try:
-        env = _json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+        raw = _json.loads(path.read_text(encoding="utf-8"))
+        # ONLY A PORT THIS TOOL WIRED. The marker is the receipt; a
+        # ``CSWAP_PIN_PORT`` without one was put there by something else, and
+        # its liveness says nothing about ours. Reading it anyway let a foreign
+        # dead port make the staleness verdict True while OUR wiring was marked
+        # and serving — and ``heal`` then tore down the healthy one. The
+        # marker check lived only in ``_wiring_present``, one scope up, so
+        # every port-level consumer inherited the gap.
+        #
+        # THROUGH ``_wire_mark_of``, not a fresh isinstance. That helper exists
+        # because two readers of this same marker disagreed once and `--clear`
+        # never converged; a third reader written here would be a fourth
+        # opinion on one fact. It is the stricter test — a marker must be a
+        # NON-EMPTY list — and asking it here is what makes "names a port" and
+        # "is wired" the same question everywhere.
+        if _wire_mark_of(raw) is None:
+            return None
+        env = raw.get("env") or {}
         port = int(env.get("CSWAP_PIN_PORT") or 0)
     except Exception:  # noqa: BLE001 — unreadable/unwired: no opinion
         return None
@@ -1136,10 +1170,127 @@ def heal(switcher) -> tuple[bool, str]:
     return False, "Nothing to heal"
 
 
-def run(switcher, account: str | None, clear: bool = False, heal_only: bool = False) -> int:
+def serving_port(switcher) -> int | None:
+    """The port a live pin daemon is serving, or None. CSWAP'S OWN RECORD.
+
+    Exists because nothing could ASK. Measured in the owner's dotfiles:
+    `cc-update` opens ``pin-proxy/proxy.json`` at TWO hardcoded paths and
+    parses our JSON schema, because a pinned session's ``HTTPS_PROXY`` names
+    the pin's own dynamic port rather than the cache proxy's — and without
+    that number every pinned session is reported as "the cache proxy was
+    bypassed" while it is in fact chained correctly. A consumer that cannot
+    ask reaches into our data dir, and then our LAYOUT and our SCHEMA become
+    a compatibility surface we cannot change without breaking scripts we do
+    not own.
+
+    Read from the record rather than through the package, like
+    :func:`_pinned_email_now`: the caller most likely to need this is one
+    diagnosing a failure, which is exactly when the package may be the thing
+    that is broken.
+
+    THE DAEMON'S RECORD, NOT THE CONFIG'S. These are different questions and
+    the caller is asking the first one: "which port is the proxy on", so that
+    a session seen using it can be recognised as chained rather than reported
+    as bypassing the cache proxy. The config's answer is "which port were
+    sessions TOLD to use", which is the same number in the healthy case and
+    deliberately not during a handover — `proxy.json` is what the daemon
+    itself publishes.
+
+    LIVENESS IS NOT ASSUMED. A recorded port whose daemon has died is the
+    stranding case this module keeps meeting, and answering with it would
+    send a caller to an address nothing serves. So the port is asked, not
+    inferred: a loopback connect, which also works with the package absent.
+    """
+    import json as _json
+    import socket
+    from pathlib import Path
+
+    record = Path(switcher.backup_dir) / "pin-proxy" / "proxy.json"
+    try:
+        port = int(_json.loads(record.read_text(encoding="utf-8"))["port"])
+    except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
+        return None
+    if not 0 < port <= 65535:
+        return None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0):
+            return port
+    except OSError:
+        return None
+
+
+def run(
+    switcher,
+    account: str | None,
+    clear: bool = False,
+    heal_only: bool = False,
+    port: bool = False,
+    ensure: bool = False,
+) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
     from claude_swap.printer import accent, dimmed, warning
+
+    if ensure:
+        # THE LAUNCH CONTRACT, which `--heal` deliberately does not make.
+        # An rc hook calls this before EVERY `claude`, so three properties
+        # matter more than the repair itself:
+        #
+        #   never fails    a launch is not optional and a pin is, so every
+        #                  path exits 0 — including a raise, which an rc hook
+        #                  would otherwise propagate into the launch
+        #   silent         a launch that prints has changed what the user sees
+        #                  for an optional feature
+        #   cheap when idle  this runs on every launch, so a machine that
+        #                  never pinned must not pay for the repair path
+        #
+        # This exists so 200 lines of shell in a user's dotfiles can be one
+        # line. That script was written when `--heal` did not exist in the
+        # installed cswap; the repair belongs here, and the only irreducible
+        # part is the TRIGGER — a hand-launched `claude` execs from the user's
+        # shell and nothing of ours runs inside it.
+        try:
+            # NOTHING WIRED AND NOTHING RECORDED IS THE COMMON CASE. Healing
+            # unconditionally would spend a config read, two path resolutions
+            # and a socket probe per launch for a user who has never pinned —
+            # and the status line already calls `heal` on a timer, so on a
+            # machine with both this would be the second caller per tick.
+            if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
+                return 0
+            heal(switcher)
+            # RE-READ, DO NOT TRUST THE RETURN. This is disaster path D from
+            # the lmd42 outage, one level in: an old cswap REJECTED `--heal`
+            # with exit 2, the call was made, the rejection went unread, and
+            # the machine stayed stranded for days. `pin-ensure` answers that
+            # by re-reading the config rather than believing the command, and
+            # the same exposure exists here — `heal` calls into `cswap_pin`,
+            # a PEER on its own release schedule, so a version that reports
+            # success while binding nothing gives a launch hook that did its
+            # job and a session that dials a dead port anyway.
+            #
+            # The wiring is CSWAP'S OWN record, so removing it needs no
+            # package at all: unpinned is a working session, wired-to-a-dead-
+            # port is not.
+            if _wiring_is_stale(switcher):
+                clear_wiring(switcher)
+        except Exception:  # noqa: BLE001 — a launch must never fail on the pin
+            pass
+        return 0
+
+    if port:
+        # A NUMBER ON STDOUT AND NOTHING ELSE. This is read by `$(cswap pin
+        # --port)`, so a prefix, a colour code or a "no pin set" sentence
+        # would land INSIDE the caller's variable — turning every consumer
+        # back into a parser, which is the thing this flag removes. Silence
+        # plus a nonzero exit lets a caller branch without string-matching.
+        #
+        # BEFORE _impl(), for the same reason as --heal and --clear: the
+        # question is most urgent when the package is broken.
+        p = serving_port(switcher)
+        if p is None:
+            return 1
+        print(p)
+        return 0
 
     if heal_only:
         # Deliberately BEFORE _impl(): healing must work when the package is

@@ -395,6 +395,112 @@ class TestLaunchIsNeverBlocked:
             f"wire_env raised but the returned env still names a proxy: {result!r}"
         )
 
+    def test_ensure_heals_only_when_there_is_something_to_heal(
+        self, tmp_path, monkeypatch
+    ):
+        """`--ensure` is the SAME invariant one level out: an rc hook calls it
+        before every hand-launched `claude`, where `wire_launch_env` cannot
+        reach (that session execs from the user's shell, not through us).
+
+        Three properties, all of which `--heal` deliberately does NOT promise
+        — it prints its verdict and is called by a human or a status line:
+        exit 0 on every path including a raise, silence on the repair path,
+        and no work at all when nothing is wired.
+
+        Driven through the REPAIR path for the silence check: an ensure that
+        returns early is silent for free, so the idle machine would pass
+        against a version that prints every repair.
+        """
+        import types
+
+        from claude_swap import pin
+
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+
+        # Idle: nothing wired, nothing recorded -> no heal at all. This runs on
+        # EVERY launch, and the status line already calls heal on a timer.
+        healed = []
+        monkeypatch.setattr(pin, "heal", lambda s: healed.append(1) or (False, ""))
+        monkeypatch.setattr(pin, "_wiring_present", lambda s: False)
+        monkeypatch.setattr(pin, "_pinned_email_now", lambda s: None)
+        assert pin.run(sw, None, ensure=True) == 0
+        assert healed == [], "ensure healed a machine that was never pinned"
+
+        # Wired: it must actually repair, or the assertion above is satisfied
+        # by an ensure that never heals anything.
+        monkeypatch.setattr(pin, "_wiring_present", lambda s: True)
+        monkeypatch.setattr(pin, "heal", lambda s: healed.append(1) or (True, "Restored"))
+        assert pin.run(sw, None, ensure=True) == 0
+        assert healed == [1], "a wired config was not healed"
+
+    def test_ensure_re_reads_rather_than_trusting_heal(self, tmp_path, monkeypatch):
+        """CASE D, one level in: the CALLER must not trust the return value.
+
+        The lmd42 outage's fourth disaster path was an old cswap that
+        REJECTED `--heal` — exit 2, the call made, the rejection unread, and
+        the machine stranded for days. `pin-ensure` answers it by RE-READING
+        the config afterwards instead of believing the command.
+
+        The same shape exists inside the package, because `heal` is allowed
+        to be wrong: it calls into `cswap_pin`, a PEER on its own release
+        schedule, and this module's standing rule is that a verdict comes
+        from the state and not from a call. A heal that returns
+        (True, "Restored") while the wiring still names a dead port must not
+        end the launch hook's work.
+        """
+        import socket
+        import types
+
+        from claude_swap import pin
+
+        cfg = _cfg(tmp_path, "cfgdir", _dead_port())
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        # `_write_json` is not decoration: `clear_wiring` writes through the
+        # switcher, so a stub without it makes the unwire fail and the test
+        # would "reproduce" a defect that is only the fixture's.
+        sw = types.SimpleNamespace(
+            backup_dir=tmp_path,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        # A LYING heal: reports success, changes nothing. Exactly what an old
+        # cswap's rejected --heal looks like from the caller's side.
+        monkeypatch.setattr(pin, "heal", lambda s: (True, "Restored the cloud pin"))
+
+        assert pin.run(sw, None, ensure=True) == 0
+        assert not pin._wiring_is_stale(sw), (
+            "ensure believed a heal that changed nothing — the config still "
+            "names a dead port and every session started after this launch "
+            "inherits it, which is disaster path D"
+        )
+
+    def test_ensure_prints_nothing_and_survives_a_raising_heal(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The two halves of the launch contract that need capsys/raises."""
+        import types
+
+        from claude_swap import pin
+
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+        monkeypatch.setattr(pin, "_wiring_present", lambda s: True)
+
+        monkeypatch.setattr(pin, "heal", lambda s: (True, "Restored the cloud pin"))
+        pin.run(sw, None, ensure=True)
+        assert capsys.readouterr().out == "", "a launch hook printed"
+
+        def _boom(_s):
+            raise RuntimeError("heal exploded")
+
+        monkeypatch.setattr(pin, "heal", _boom)
+        assert pin.run(sw, None, ensure=True) == 0, (
+            "a raising heal made --ensure exit nonzero; an rc hook "
+            "propagating that fails the launch it was protecting"
+        )
+
 
 class TestTheWiringCanAlwaysBeRemoved:
     """`.claude.json` names the pin's port, and Claude Code applies that env
@@ -1409,11 +1515,16 @@ class TestPurgeDoesNotStrandTheWiring:
     a dead port with nothing remaining that knows how to remove it: the exact
     stranding clear_wiring lives in this repo to prevent."""
 
-    def _purge_with(self, tmp_path, monkeypatch, cfg):
+    def _purge_with(self, tmp_path, monkeypatch, cfg, default_cfg=None):
         """Drive a real purge against ``cfg``. Returns stdout.
 
         NO STUB: `clear_wiring` is the real one, so the only way a test can
         make the unwire fail is the way the machine does it.
+
+        ``default_cfg`` points the OTHER getter somewhere else. Both getters
+        resolving to one file is the common shape and the one every test here
+        used, which is exactly why a message that names only one of them read
+        as correct.
         """
         import io
         from contextlib import redirect_stdout
@@ -1424,7 +1535,9 @@ class TestPurgeDoesNotStrandTheWiring:
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        monkeypatch.setattr(
+            paths, "get_default_global_config_path", lambda: default_cfg or cfg
+        )
         # switcher.py imports the name at module scope, so patching the
         # module it came FROM does not reach it.
         monkeypatch.setattr(_sw_mod, "get_global_config_path", lambda: cfg)
@@ -1479,6 +1592,53 @@ class TestPurgeDoesNotStrandTheWiring:
         # a session-scoped isolated_home fixture also sets HOME.
         assert str(cfg) in out, "the message does not name the file to edit"
         assert "_cswapPinWiredKeys" in out, "it does not name what to delete"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root): chmod is a no-op "
+        "on win32 and root writes into a 0o500 dir regardless",
+    )
+    def test_the_warning_names_the_config_that_actually_survived(
+        self, tmp_path, monkeypatch
+    ):
+        """It named ONE file; the check that produced it reads TWO.
+
+        `_wiring_present` answers about EITHER config, so the survivor can be
+        the default global config while the message points at the session one
+        — sending the user to a file that is already clean, and leaving the
+        wiring that strands them in a file they were never told about. After
+        a purge the record, cert dir and daemon state are gone, so hand-editing
+        is the ONLY cure and naming the wrong file is the whole failure.
+
+        Every existing test here points both getters at one path, which is the
+        common deployment shape — and is why a message naming one of them read
+        as correct for as long as it did.
+        """
+        session_cfg = _cfg(tmp_path, "sessiondir", marker=False)  # clean
+        default_cfg = _cfg(tmp_path, "defaultdir", _dead_port())  # the survivor
+        assert "_cswapPinWiredKeys" in json.loads(default_cfg.read_text())
+        assert "_cswapPinWiredKeys" not in json.loads(session_cfg.read_text()), (
+            "fixture invalid: BOTH are wired, so naming either would pass"
+        )
+
+        # Lock the unwire out of the survivor the way the machine does.
+        default_cfg.parent.chmod(0o500)
+        try:
+            out = self._purge_with(
+                tmp_path, monkeypatch, session_cfg, default_cfg=default_cfg
+            )
+        finally:
+            default_cfg.parent.chmod(0o700)
+
+        assert "_cswapPinWiredKeys" in json.loads(default_cfg.read_text()), (
+            "fixture did not reach the stranded shape: the unwire succeeded"
+        )
+        assert "Could not remove the cloud pin wiring" in out, out
+        assert str(default_cfg) in out, (
+            f"the warning does not name the file that ACTUALLY still carries "
+            f"the wiring ({default_cfg}) — the user edits the wrong file and "
+            f"the stranding survives: {out!r}"
+        )
 
     def test_an_unwired_config_says_nothing(self, tmp_path, monkeypatch):
         """...and the silent case must stay silent: nothing wired, nothing to
@@ -2724,8 +2884,12 @@ class TestHealADeadPin:
 
         seen = {}
 
-        def _run(switcher, account, clear=False, heal_only=False):
-            seen.update(account=account, clear=clear, heal_only=heal_only)
+        def _run(switcher, account, clear=False, heal_only=False, port=False,
+                 ensure=False):
+            seen.update(
+                account=account, clear=clear, heal_only=heal_only, port=port,
+                ensure=ensure,
+            )
             return 0
 
         monkeypatch.setattr("claude_swap.pin.run", _run)
@@ -2734,7 +2898,94 @@ class TestHealADeadPin:
         with pytest.raises(SystemExit) as e:
             cli._pin_command(["--heal"])
         assert e.value.code == 0
-        assert seen == {"account": None, "clear": False, "heal_only": True}
+        assert seen == {
+            "account": None, "clear": False, "heal_only": True, "port": False,
+            "ensure": False,
+        }
+
+    def test_the_port_query_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
+        """`--port` exists so consumers stop reading our files.
+
+        Measured in the owner's dotfiles: `cc-update` opens
+        `pin-proxy/proxy.json` at TWO hardcoded paths and parses our schema,
+        because a pinned session's HTTPS_PROXY names the pin's own dynamic
+        port and without that number every pinned session is reported as
+        bypassing the cache proxy. Nothing could ASK, so our layout and schema
+        became a compatibility surface we cannot change.
+
+        Two properties, and the second is the one that makes it safe:
+        stdout is bare digits (it is read by `$(...)`, so a prefix or a "no
+        pin" sentence lands inside the caller's variable), and the port is
+        PROBED — `proxy.json` outlives a dead daemon, and answering with that
+        number reports a session as chained when it is not.
+        """
+        import socket
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        sw = types.SimpleNamespace(backup_dir=backup)
+        record = backup / "pin-proxy" / "proxy.json"
+
+        # A dead record — the shape an unclean exit or a failed handover leaves.
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+        record.write_text(json.dumps({"port": dead_port, "pid": 999}))
+        assert pin.run(sw, None, port=True) != 0, (
+            "a dead recorded port was reported as serving"
+        )
+
+        # ...and a live one, with the package unavailable: the caller most
+        # likely to ask is diagnosing a failure.
+        lsn = socket.socket()
+        lsn.bind(("127.0.0.1", 0))
+        lsn.listen(4)
+        port = lsn.getsockname()[1]
+        record.write_text(json.dumps({"port": port, "pid": 999}))
+        monkeypatch.setattr(pin, "_impl", lambda: (_ for _ in ()).throw(
+            ClaudeSwitchError("The cloud pin requires 'cswap-pin'")))
+        try:
+            assert pin.run(sw, None, port=True) == 0
+        finally:
+            lsn.close()
+
+    def test_the_cli_forwards_port_and_ensure(self):
+        """Both flags must be WIRED, not merely declared.
+
+        A flag that parses and is then dropped prints the pin STATUS and exits
+        0 — a caller's `$(...)` captures prose and the script behaves as
+        though a pin were serving. A correct mechanism with no caller is the
+        defect this repo keeps finding, so assert on the parse tree.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from claude_swap import cli
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(cli._pin_command)))
+        for flag in ("--port", "--ensure"):
+            assert [
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and getattr(n.func, "attr", None) == "add_argument"
+                and any(
+                    isinstance(a, ast.Constant) and a.value == flag for a in n.args
+                )
+            ], f"cswap pin does not declare {flag}"
+        forwarded = {
+            kw.arg
+            for n in ast.walk(tree) if isinstance(n, ast.Call)
+            for kw in n.keywords
+        }
+        assert {"port", "ensure"} <= forwarded, (
+            f"parsed but never forwarded to pin.run: "
+            f"{ {'port', 'ensure'} - forwarded }"
+        )
 
     def test_heal_runs_before_the_package_is_required(self, tmp_path, monkeypatch):
         """`run(--heal)` must not go through _impl(): the missing-package error
@@ -3790,8 +4041,17 @@ class TestTheMarkerGuardIsNotJustTheStalenessVerdict:
         assert pin._wiring_present(None) is False, (
             "fixture invalid: a marker exists somewhere"
         )
-        assert pin._wired_ports() != [], (
-            "fixture invalid: the dead port is not visible to _wired_ports"
+        # THE PORT IS FILTERED AT THE SOURCE NOW, not one scope up.
+        # `_port_of_config` asks `_wire_mark_of` before it reads
+        # CSWAP_PIN_PORT, so an unmarked config has no port to offer any
+        # consumer — which is what stopped a FOREIGN dead port from making
+        # the verdict True while cswap's own marked wiring was serving.
+        # Before, this read `!= []` and the whole guard lived in
+        # `_wiring_is_stale`.
+        assert pin._wired_ports() == [], (
+            "an unmarked config still offers its port to every consumer — "
+            "the marker guard has to hold at the read, not only in the one "
+            "caller that remembered to ask"
         )
         assert pin._wiring_is_stale(None) is False, (
             "a config with no _cswapPinWiredKeys marker was condemned as "
