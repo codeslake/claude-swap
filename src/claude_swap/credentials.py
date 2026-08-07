@@ -1041,10 +1041,17 @@ class CredentialStore:
         """
         enc_file = self._backup_enc_path(account_num, email)
         try:
-            # Python 3.12's Path.exists() raises on an unsearchable directory
-            # where 3.13+ returns False — normalize to "missing" so every
-            # version takes the same best-effort path.
-            enc_present = enc_file.exists()
+            # `stat`, NOT `exists`. `Path.exists()` SWALLOWS OSError from 3.13
+            # on and answers False, so an unsearchable credentials/ dir became
+            # byte-identical to a genuinely absent backup — on 3.12 the raise
+            # reached the handler below and marked the read failed, on 3.13+
+            # nothing did. The platform decided whether a read failure was
+            # reported, and the fleet runs both (3.12 on two machines, 3.14 on
+            # one). `stat` raises on every version, so the distinction the
+            # handler below exists to draw survives on all of them.
+            enc_file.stat()
+        except FileNotFoundError:
+            enc_present = False
         except OSError as e:
             # The directory itself could not be searched (permissions, a
             # mid-unmount, ...) — a real read failure, same as the arm below
@@ -1056,6 +1063,8 @@ class CredentialStore:
                 failed.append(True)
             self._host._logger.warning(f"Failed to read credentials file: {e}")
             enc_present = False
+        else:
+            enc_present = True
         if enc_present:
             try:
                 encoded = enc_file.read_text(encoding="utf-8").strip()
