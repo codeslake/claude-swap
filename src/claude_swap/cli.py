@@ -245,7 +245,9 @@ def _pin_env_command(argv: list[str]) -> None:
     # HTTPS_PROXY is replaced (the pin proxy chains onward to it).
     # open_refcount=False: the SHELL opens the refcount fd (below), not this
     # short-lived process.
-    env = pin_proxy.wire_env(dict(os.environ), port, ca_path, open_refcount=False)
+    env = pin_proxy.wire_env(
+        dict(os.environ), port, ca_path, ca_path.parent, open_refcount=False
+    )
     # CSWAP_PIN_PORT rides along as the self-loop marker: without it, the next
     # cswap invocation in this shell reads our own proxy as its ambient one and
     # records the daemon as its own upstream, making it CONNECT to itself.

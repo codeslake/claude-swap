@@ -21,7 +21,6 @@ import json
 import os
 import re
 import selectors
-import select
 import socket
 import ssl
 import threading
@@ -56,15 +55,6 @@ def parse_upstream_proxy(value: str | None) -> tuple[str, int] | None:
     return host, split.port or 80
 
 
-def _read_upstream(certdir: Path, key: str) -> str | None:
-    """One field out of the upstream record, or None when it is absent."""
-    try:
-        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
-    except (OSError, ValueError):
-        return None
-    return (raw.get(key) or None) if isinstance(raw, dict) else None
-
-
 def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     """The egress proxy the LAST launch was using, as recorded on disk.
 
@@ -78,7 +68,12 @@ def read_upstream_hint(certdir: Path) -> tuple[str, int] | None:
     Returns ``None`` when the file is absent or records "no proxy" — the same
     thing a direct dial means.
     """
-    return parse_upstream_proxy(_read_upstream(certdir, "proxy"))
+    try:
+        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    value = raw.get("proxy") if isinstance(raw, dict) else None
+    return parse_upstream_proxy(value) if value else None
 
 
 def write_upstream_hint(
@@ -115,7 +110,12 @@ def write_upstream_hint(
 
 def read_upstream_ca(certdir: Path) -> str | None:
     """The CA of the egress proxy, as last recorded. See above."""
-    return _read_upstream(certdir, "ca")
+    try:
+        raw = json.loads((Path(certdir) / _UPSTREAM_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    value = raw.get("ca") if isinstance(raw, dict) else None
+    return value or None
 
 
 _WIRE_KEYS = ("HTTPS_PROXY", "https_proxy", "NODE_EXTRA_CA_CERTS")
@@ -165,112 +165,6 @@ def _merged_ca(ca_path: Path, existing: str | None) -> Path:
     except OSError:
         return ca_path
     return bundle
-
-
-CA_TRUST_DIR = "ca-trust.d"
-CA_TRUST_FILE = "ca-trust.pem"
-
-
-def _trust_file(ca_path: Path, existing: str | None) -> Path:
-    """The single file to name in ``NODE_EXTRA_CA_CERTS``.
-
-    Prefers the shared merged bundle when a launcher has built one: it already
-    contains every component's CA plus the ambient roots, so a proxy added
-    later is trusted without cswap knowing it exists. Falls back to merging
-    ours with whatever the caller already trusted, and to ours alone when there
-    is nothing else — which is the no-launcher, no-other-MITM case and behaves
-    exactly as before.
-    """
-    try:
-        from claude_swap.paths import get_claude_config_home
-
-        shared = get_claude_config_home() / CA_TRUST_FILE
-        if shared.is_file() and shared.stat().st_size > 0:
-            ours = Path(ca_path).read_bytes().strip()
-            body = shared.read_bytes()
-            # Carrying our CA is necessary but not sufficient. An unbalanced
-            # BEGIN/END anywhere in the file makes Node reject the WHOLE extras
-            # bundle — every component CA and every corporate root at once —
-            # and it says so only in a stderr warning, so the session dies on
-            # "unable to verify the first certificate" with no visible cause.
-            # Checking that we are in there cannot see that; count the markers.
-            if (
-                ours
-                and ours in body
-                and body.count(b"-----BEGIN CERTIFICATE-----")
-                == body.count(b"-----END CERTIFICATE-----")
-            ):
-                return shared
-    except Exception:
-        pass
-    # No shared bundle: merge with what THIS env trusts. Deliberately not
-    # _merged_ca, which also consults the ambient process environment and a
-    # recorded upstream CA — wire_env is handed the environment it must
-    # describe, and reaching past it would wire a session to trust something
-    # its caller never mentioned.
-    if not existing or Path(existing) == Path(ca_path):
-        return Path(ca_path)
-    bundle = Path(ca_path).parent / "ca-bundle.pem"
-    try:
-        bundle.write_bytes(Path(ca_path).read_bytes() + Path(existing).read_bytes())
-        return bundle
-    except OSError:
-        return Path(ca_path)
-
-
-def publish_ca(ca_path: Path, name: str = "cswap-pin") -> Path | None:
-    """Publish our CA where any component's launcher can pick it up.
-
-    ``NODE_EXTRA_CA_CERTS`` names ONE file, so every MITM in the chain that
-    writes it as an overwrite silently drops the others. Two already do it for
-    the same host, and each new one repeats the fight — which is how a pinned
-    session ended up verifying everything it SENDS while every Remote Control
-    SSE reconnect failed with ``unable to verify the first certificate``
-    (measured on work-mac: 13 attempts, 0 connects, while worker/heartbeat and
-    client/presence answered 200 in the same process).
-
-    So publish instead of overwrite: one file per component under
-    ``<claude-config>/ca-trust.d/``, named after the component, and nobody
-    touches anybody else's. A launcher concatenates the directory; a component
-    that only needs to be trusted just drops its file. Adding a proxy stops
-    being a negotiation.
-
-    Deliberately knows nothing about which proxies exist: with no launcher and
-    no other MITM the directory is simply unread, and behaviour is unchanged.
-    Best-effort — trust plumbing must never block a launch.
-
-    Written ATOMICALLY, which the contract needs rather than merely prefers: a
-    builder reads this directory while N producers write it on their own
-    schedules, and a reader that catches a half-written PEM does not get a
-    partial bundle — Node refuses the WHOLE extras file
-    (``PEM routines::bad end line``, on stderr, not an error) and then trusts
-    no component CA and no corporate root at all. The session dies on
-    ``unable to verify the first certificate`` with the cause in a warning
-    nobody reads. A truncate-then-write is exactly what produces that state.
-    """
-    try:
-        from claude_swap.paths import get_claude_config_home
-
-        ours = Path(ca_path).read_bytes().strip()
-        if not ours:
-            return None
-        out = get_claude_config_home() / CA_TRUST_DIR / f"{name}.pem"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        # Idempotent: rewriting on every launch would churn the mtime the
-        # launcher's own rebuild check keys on.
-        if out.exists() and out.read_bytes().strip() == ours:
-            return out
-        # Same directory, so the rename cannot cross a filesystem and stays
-        # atomic; the pid keeps two concurrent launches off each other's temp.
-        tmp = out.with_name(f"{out.name}.{os.getpid()}.tmp")
-        try:
-            tmp.write_bytes(ours + b"\n")
-            os.replace(tmp, out)
-        finally:
-            tmp.unlink(missing_ok=True)
-        return out
-    except Exception:
-        return None
 
 
 def wire_global_config(port: int | None, ca_path: Path | None) -> bool:
@@ -400,42 +294,14 @@ def _ambient_proxy(env: dict[str, str] | None = None) -> str | None:
         # the session's, and our env block displaces it. `cswap pin` runs in a
         # plain shell where that value does not exist yet, so ask the config
         # what the last session was actually told to use.
-        return _wired_over_proxy()
+        return _wired_over_proxy(src)
     host, port = parsed
     if host in _LOOPBACK and port == _self_port(src):
-        return _wired_over_proxy()
-    # This shell has A proxy — but not necessarily the one Claude Code runs
-    # behind. A launcher (cc-wrapper) starts a per-session cache proxy and
-    # points HTTPS_PROXY at THAT; an ordinary shell, and every ssh shell, only
-    # has the machine-wide egress proxy the launcher itself chains to. Taking
-    # the shell's value then silently drops the launcher's proxy out of the
-    # chain: measured on work-mac, where `cswap pin` run over ssh recorded
-    # privoxy:8118 while CCF on :9901 (whose own upstream IS 8118) was left
-    # bypassed for every pinned session. Prefer the recorded one when it is
-    # still serving — it is the inner link, and it reaches this one anyway.
-    prev = _wired_over_proxy()
-    prev_parsed = parse_upstream_proxy(prev)
-    if (
-        prev_parsed is not None
-        and prev_parsed != parsed
-        and prev_parsed[0] in _LOOPBACK
-        and prev_parsed[1] != _self_port(src)
-        and _port_is_serving(*prev_parsed)
-    ):
-        return prev
+        return _wired_over_proxy(src)
     return value
 
 
-def _port_is_serving(host: str, port: int) -> bool:
-    """Whether something still accepts connections there. Cheap and local."""
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except OSError:
-        return False
-
-
-def _wired_over_proxy() -> str | None:
+def _wired_over_proxy(env: dict[str, str]) -> str | None:
     """The proxy our env block is currently displacing, if any.
 
     Recorded by :func:`wire_global_config` when it wrote over a value that was
@@ -875,20 +741,6 @@ def ensure_proxy(switcher) -> tuple[int, Path] | None:
     fp = daemon_fingerprint(account_num, email)
 
     ca = certdir / "ca.pem"
-    # Generate the CA here rather than leaving it to the daemon: publishing has
-    # to happen before the client is exec'd, and on the very first launch the
-    # daemon has not run yet, so there would be nothing to publish. ensure_ca is
-    # idempotent, so this only ever does work once.
-    try:
-        ensure_ca(certdir, UPSTREAM_HOST)
-    except Exception:
-        pass
-    # Publish on EVERY launch, not only when another CA happens to be in play.
-    # A launcher builds its merged bundle from this directory as it starts us,
-    # so a CA published later would miss that build, and a component whose cert
-    # dir was wiped must reappear on the next launch rather than stay silently
-    # absent.
-    publish_ca(ca)
 
     # Fast path (no lock): a fresh, current daemon is reused as-is.
     port = _read_alive_port(certdir, fingerprint=fp)
@@ -1259,6 +1111,7 @@ def wire_env(
     env: dict[str, str],
     port: int,
     ca_path: Path,
+    certdir: Path,
     open_refcount: bool = True,
 ) -> dict[str, str]:
     """Return a copy of ``env`` routed through the pin proxy.
@@ -1267,7 +1120,7 @@ def wire_env(
     MITM CA. Node's ``NODE_EXTRA_CA_CERTS`` takes exactly one file, so when the
     session already trusts another CA (a corporate MITM, another local proxy)
     the two PEMs are merged into
-    ``<ca dir>/ca-bundle.pem`` — never replaced.
+    ``certdir/ca-bundle.pem`` — never replaced.
 
     ``open_refcount`` controls the refcount holder. In-process callers
     (session.py, which execs claude and hands off its own fds) pass True: we
@@ -1283,15 +1136,24 @@ def wire_env(
     # Marks this env as already pinned, so a nested launch records the proxy
     # we chain THROUGH as upstream rather than us (see _ambient_proxy).
     out["CSWAP_PIN_PORT"] = str(port)
-    out["NODE_EXTRA_CA_CERTS"] = str(
-        _trust_file(ca_path, env.get("NODE_EXTRA_CA_CERTS"))
-    )
+    existing = env.get("NODE_EXTRA_CA_CERTS")
+    if existing and Path(existing) != ca_path:
+        bundle = Path(certdir) / "ca-bundle.pem"
+        try:
+            bundle.write_bytes(
+                Path(ca_path).read_bytes() + Path(existing).read_bytes()
+            )
+            out["NODE_EXTRA_CA_CERTS"] = str(bundle)
+        except OSError:
+            out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
+    else:
+        out["NODE_EXTRA_CA_CERTS"] = str(ca_path)
 
     # Attach this launch as a refcount holder: open a write fd on the FIFO and
     # mark it inheritable so the exec'd claude keeps it open for its lifetime.
     # The daemon's reader sees EOF only when every such fd closes → idle
     # teardown. O_RDWR so the open never blocks even if the daemon died.
-    fifo = refcount_fifo_path(Path(ca_path).parent)
+    fifo = refcount_fifo_path(certdir)
     out["CSWAP_PIN_FIFO"] = str(fifo)
     if open_refcount and fifo.exists():
         try:
@@ -1404,13 +1266,6 @@ class PinProxy:
             ).start()
 
     def _handle_client(self, conn: socket.socket) -> None:
-        # A per-CONNECTION id, not a thread id: threads are pooled and reused,
-        # so tagging with get_ident() made two sequential connections share a
-        # tag and the log could no longer pair a request with its response —
-        # which read as "this request never answered" and sent a live
-        # investigation down the wrong path twice. Assigned here rather than in
-        # _mitm so a blind tunnel gets one too, on the same counter.
-        self._local.cid = next(self._conn_seq)
         try:
             line = _read_line(conn)
             if not line:
@@ -1521,6 +1376,12 @@ class PinProxy:
                 pass
 
     def _mitm(self, conn: socket.socket) -> None:
+        # A per-CONNECTION id, not a thread id: threads are pooled and reused,
+        # so tagging with get_ident() made two sequential connections share a
+        # tag and the log could no longer pair a request with its response —
+        # which read as "this request never answered" and sent a live
+        # investigation down the wrong path twice.
+        self._local.cid = next(self._conn_seq)
         conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         tls = self._server_ctx.wrap_socket(conn, server_side=True)
         try:
@@ -1538,8 +1399,7 @@ class PinProxy:
         request_line = _read_line(tls)
         if not request_line:
             return False
-        _parts = request_line.split(" ")
-        method, path = _parts[0], _parts[1] if len(_parts) > 1 else "/"
+        method, path = _split_request_line(request_line)
         headers: list[tuple[str, str]] = []
         while True:
             h = _read_line(tls)
@@ -1774,54 +1634,12 @@ class PinProxy:
         sock.settimeout(None)
         return sock
 
-    @staticmethod
-    def _tunnel_is_open(up: socket.socket) -> bool:
-        """Whether a just-established tunnel is actually carrying, not EOF.
-
-        A CONNECT 200 means the proxy ACCEPTED the request, not that it reached
-        the host: privoxy answers optimistically and dials afterwards, closing
-        the socket when that dial fails. Peek for a closed read end — no client
-        byte has been sent yet, so a readable socket here can only mean EOF.
-        Never blocks: a healthy idle tunnel has nothing to read and reports not
-        ready, which is exactly the "open" answer.
-        """
-        try:
-            ready, _, _ = select.select([up], [], [], 0.35)
-            if not ready:
-                return True  # nothing to read == still open, the normal case
-            return bool(up.recv(1, socket.MSG_PEEK))
-        except OSError:
-            return False
-
     def _blind_tunnel(self, target: str, conn: socket.socket) -> None:
         host, _, port_s = target.rpartition(":")
         port = int(port_s) if port_s else 443
         chain = self._current_chain()
-        # Trace the tunnel too. Remote Control receives over a WebSocket to the
-        # ingress host the /bridge response names — NOT api.anthropic.com — so
-        # it lands here, not in the MITM. Logging only the MITM made an absent
-        # inbound channel look identical to a healthy one: the routes CC sends
-        # (worker/events, heartbeat) were all 200 in the trace while the
-        # channel CC *receives* on left no line at all.
-        if _TRACE is not None:
-            _TRACE.write(
-                f"[c{getattr(self._local, 'cid', 0)}] CONNECT {target} "
-                f"tunnelled (no pin: bearer never seen)\n"
-            )
-            _TRACE.flush()
-        up = None
-        if chain:
-            # Try the chain first, but never let it be the only answer. Remote
-            # Control RECEIVES over a WebSocket to the ingress host named in the
-            # /bridge response — a host the egress proxy has no rule for, and
-            # which a filtering proxy (privoxy with per-domain forwards, a
-            # corporate MITM) may refuse outright. Closing here made that
-            # refusal invisible: the session kept heartbeating and posting
-            # events through the MITM path at 200, the pin still read as
-            # applied, and nothing sent from claude.ai ever arrived. Measured
-            # on work-mac, where the same session on a machine whose chain let
-            # the host through received normally.
-            try:
+        try:
+            if chain:
                 up = socket.create_connection(chain, timeout=15)
                 up.sendall(
                     f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode("latin1")
@@ -1832,41 +1650,14 @@ class PinProxy:
                     if h in ("", None):
                         break
                 if not status or " 200" not in status:
-                    # Refused BY the chain (not a transport failure) — the one
-                    # case where a direct dial is both correct and necessary.
-                    if _TRACE is not None:
-                        _TRACE.write(
-                            f"[c{getattr(self._local, 'cid', 0)}] chain refused "
-                            f"{target} ({(status or '').strip()}) — dialling direct\n"
-                        )
-                        _TRACE.flush()
                     up.close()
-                    up = None
-            except OSError:
-                up = None
-        if up is not None and not self._tunnel_is_open(up):
-            # A 200 is not proof the chain reached the host. privoxy answers
-            # CONNECT optimistically and only then dials; when that dial fails
-            # it closes, so the tunnel is EOF the instant we look. Measured on
-            # work-mac against the RC ingress: "200 Connection established"
-            # followed by UNEXPECTED_EOF_WHILE_READING on the first TLS byte.
-            # Trusting the status alone made Remote Control silently deaf —
-            # everything Claude Code SENDS still went through the MITM path at
-            # 200 while the receive channel was a dead socket.
-            if _TRACE is not None:
-                _TRACE.write(
-                    f"[c{getattr(self._local, 'cid', 0)}] chain answered 200 but "
-                    f"the tunnel to {target} was already EOF — dialling direct\n"
-                )
-                _TRACE.flush()
-            up.close()
-            up = None
-        if up is None:
-            try:
+                    conn.close()
+                    return
+            else:
                 up = socket.create_connection((host, port), timeout=15)
-            except OSError:
-                conn.close()
-                return
+        except OSError:
+            conn.close()
+            return
         # Connect budget only — a tunnel is long-lived by definition, and a
         # read timeout left on it would tear down an idle-but-healthy stream.
         up.settimeout(None)
@@ -1900,6 +1691,11 @@ def _read_line(sock) -> str | None:
                 buf.pop()
             return buf.decode("latin1")
         buf += b
+
+
+def _split_request_line(line: str) -> tuple[str, str]:
+    parts = line.split(" ")
+    return parts[0], parts[1] if len(parts) > 1 else "/"
 
 
 def _read_body(sock, headers) -> bytes:

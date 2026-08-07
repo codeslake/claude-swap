@@ -50,7 +50,6 @@ from typing import TYPE_CHECKING, NoReturn
 from claude_swap import macos_keychain, pin_proxy
 from claude_swap.claude_locks import proper_lockfile
 from claude_swap.exceptions import ClaudeCodeLockTimeout, SessionError
-from claude_swap.fsutil import replace_with_retry
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
@@ -423,7 +422,7 @@ class SessionManager:
             pinned = pin_proxy.ensure_proxy(self.switcher)
             if pinned:
                 port, ca_path = pinned
-                env = pin_proxy.wire_env(env, port, ca_path)
+                env = pin_proxy.wire_env(env, port, ca_path, ca_path.parent)
         except Exception as e:  # noqa: BLE001 — never block the launch
             warning(f"remote-control pin disabled for this launch: {e}")
         argv = [claude_bin, *claude_args]
@@ -1067,7 +1066,7 @@ class SessionManager:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
-            replace_with_retry(tmp, manifest_path)
+            os.replace(tmp, manifest_path)
         except OSError:
             try:
                 os.unlink(tmp)
