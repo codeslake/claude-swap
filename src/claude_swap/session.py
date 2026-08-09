@@ -663,7 +663,7 @@ class SessionManager:
             self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
-            if verdict == "unknown":
+            if verdict in ("unknown", "unreachable"):
                 # The PROBE failed, not the profile. `_cleanup_failed_session`
                 # below deletes the Keychain entry and the whole directory, so
                 # running it here would destroy a profile we never managed to
@@ -802,17 +802,27 @@ class SessionManager:
     def _session_validity(
         self, session_dir: Path, email: str, org_uuid: str
     ) -> str:
-        """``"valid"`` / ``"invalid"`` / ``"unknown"`` for a session profile.
+        """``"valid"`` / ``"invalid"`` / ``"unknown"`` / ``"unreachable"``.
 
         Local check only (`claude auth status` makes no API call): a revoked
         but unexpired token still passes and fails on first real use.
 
-        ``"unknown"`` is the answer whenever the PROBE failed rather than the
-        profile: `claude` not resolvable, the run timing out, output that will
-        not parse. That is a separate answer from ``"invalid"`` because the
-        caller that acts on ``"invalid"`` deletes the profile's Keychain entry
-        and rmtree's the directory. A probe we could not run is not evidence
-        about the profile, and the two must not share a return value.
+        The last two are both "the PROBE failed, not the profile", and neither
+        may share a return value with ``"invalid"`` — the caller that acts on
+        ``"invalid"`` deletes the profile's Keychain entry and rmtree's the
+        directory, and a probe we could not run is not evidence about the
+        profile. They are split because REUSE wants opposite answers:
+
+        ``"unknown"`` — the probe ran and did not answer (timeout, output that
+        will not parse). Nothing suggests the profile is bad, so reuse leans
+        valid; on a loaded machine `claude`'s cold start exceeds the 10s
+        timeout and forcing a re-bootstrap there fails a launch that would
+        have worked (upstream #224/#225).
+
+        ``"unreachable"`` — `claude` could not be spawned at all. Reuse leans
+        invalid: a binary we cannot run cannot serve the session either way,
+        so the honest outcome is the bootstrap path and its "check that
+        `claude` is on PATH" error, not a silent reuse.
         """
         if not session_dir.is_dir():
             return "invalid"
@@ -829,8 +839,10 @@ class SessionManager:
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
             return "unknown"
+        except OSError:
+            return "unreachable"
         if result.returncode != 0:
             return "invalid"
         try:
@@ -855,15 +867,22 @@ class SessionManager:
         return "valid"
 
     def _is_session_valid(self, session_dir: Path, email: str, org_uuid: str) -> bool:
-        """Whether the profile is DEFINITELY usable.
+        """Whether the profile is usable as far as we can tell.
 
-        Reuse-shaped view of :meth:`_session_validity`: "unknown" answers
-        False, so an unverifiable profile is simply not reused. Callers that
-        DESTROY on a negative must use the tri-state instead — for them the
-        difference between "invalid" and "could not tell" is the difference
-        between a correct cleanup and deleting a working profile.
+        Reuse-shaped view of :meth:`_session_validity`, and best-effort by
+        design: "unknown" answers True, because a probe that did not answer is
+        not a reason to throw away a profile that has shown nothing wrong.
+        "unreachable" answers False — see that method for why the two split.
+
+        Callers that DESTROY on a negative must use the full verdict instead.
+        For them the difference between "invalid" and "could not tell" is the
+        difference between a correct cleanup and deleting a working profile,
+        and this boolean cannot express it.
         """
-        return self._session_validity(session_dir, email, org_uuid) == "valid"
+        return self._session_validity(session_dir, email, org_uuid) in (
+            "valid",
+            "unknown",
+        )
 
     # -- sharing ---------------------------------------------------------
 
