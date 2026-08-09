@@ -285,6 +285,51 @@ def read_session_credentials(session_dir: Path) -> str | None:
     return read_config_dir_credentials(str(session_dir))
 
 
+def _may_have_credential_material(session_dir: Path) -> bool:
+    """Whether a profile's credential material is anything but definitely absent.
+
+    Existence test for the validation-timeout fallback, not a read: ``False``
+    only when every store is *positively* empty — no readable plaintext seed
+    and (on macOS) a keychain miss claude itself signals with rc 44. An
+    unreadable keychain — locked, denied, ``security`` timing out under the
+    same load that timed out the probe — is indeterminate, and leans present:
+    the profile may hold the freshest generation of the account's token
+    family, and re-bootstrapping over it would start by deleting that entry.
+    ``read_session_credentials`` is unsuitable here by design — its
+    error-to-plaintext fallback erases exactly this distinction.
+    """
+    try:
+        if (session_dir / ".credentials.json").read_text(encoding="utf-8"):
+            return True
+    except (OSError, ValueError):
+        pass  # no readable seed — the keychain may still hold the material
+    if Platform.detect() != Platform.MACOS:
+        return False
+    try:
+        material = macos_keychain.get_password(
+            keychain_service_name(session_dir), _keychain_account_name()
+        )
+    except macos_keychain.KEYCHAIN_ERRORS:
+        return True  # unreadable is not absent: preserve the profile
+    return material is not None
+
+
+def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
+    """What local artifacts can say about a profile without running the probe.
+
+    Upstream's probe-timeout fallback (#224 follow-up), lifted to a function
+    because two callers ask it and a copy in each is how they drift apart: the
+    REUSE check (`_is_session_valid`) and the post-bootstrap check, which must
+    not fail a launch over a probe that merely did not answer.
+
+    Deliberately NOT consulted for "unreachable". There the question is
+    whether `claude` can be run at all, and no file on disk answers it.
+    """
+    return _may_have_credential_material(session_dir) and (
+        not session_identity_drifted(session_dir, email, org_uuid)
+    )
+
+
 # Bounded retry for the strict capture read, mirroring the active store's
 # (credentials._ACTIVE_READ_ATTEMPTS / _ACTIVE_READ_RETRY_DELAY).
 _STRICT_KEYCHAIN_ATTEMPTS = 2
@@ -663,12 +708,23 @@ class SessionManager:
             self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
+            # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
+            # below: it deletes the Keychain entry and the whole directory, and
+            # running it here would destroy a profile we never managed to look
+            # at — on nothing worse than a 10s timeout on a loaded machine.
+            #
+            # But "do not delete" is not "do not proceed". We have just
+            # bootstrapped from the backup credentials, so the same local
+            # artifacts that answer the reuse path answer this one, and a
+            # timeout here must not fail a launch that is fine (#224
+            # follow-up). Only "unreachable" still stops: no local file can
+            # tell us whether `claude` runs, and a session we cannot exec into
+            # is not a session.
+            if verdict == "unknown" and _artifacts_say_usable(
+                session_dir, email, org_uuid
+            ):
+                verdict = "valid"
             if verdict in ("unknown", "unreachable"):
-                # The PROBE failed, not the profile. `_cleanup_failed_session`
-                # below deletes the Keychain entry and the whole directory, so
-                # running it here would destroy a profile we never managed to
-                # look at — on nothing worse than `claude` missing from PATH or
-                # a 10s timeout on a loaded machine.
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) could "
                     f"not be verified: `claude auth status` did not run or did "
@@ -840,6 +896,13 @@ class SessionManager:
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
+            # The verdict layer answers what the PROBE established, and a
+            # timeout established nothing. Upstream's artifact fallback is a
+            # REUSE judgement, not a verdict, so it lives in
+            # `_is_session_valid` where its answer is what gets consumed —
+            # putting it here would make "the probe timed out" and "the
+            # profile is bad" the same value again, which is the conflation
+            # this whole tri-state exists to undo.
             return "unknown"
         except OSError:
             return "unreachable"
@@ -870,19 +933,28 @@ class SessionManager:
         """Whether the profile is usable as far as we can tell.
 
         Reuse-shaped view of :meth:`_session_validity`, and best-effort by
-        design: "unknown" answers True, because a probe that did not answer is
-        not a reason to throw away a profile that has shown nothing wrong.
-        "unreachable" answers False — see that method for why the two split.
+        design. ``"unknown"`` — the probe ran and did not answer — is decided
+        from local artifacts instead of blanket-True, because "the probe timed
+        out" is not by itself a reason to reuse: credential material must not
+        be definitely absent (keychain-aware — claude migrates a macOS
+        profile's credential into the keychain and deletes the plaintext seed,
+        while stale invalidation deletes both) and the recorded identity must
+        not have drifted (in-session /login to another account). Anything
+        subtler still fails on first real use.
+
+        ``"unreachable"`` answers False without consulting artifacts: the
+        question there is not whether the profile holds a credential but
+        whether `claude` can be run at all, and no local file answers that.
 
         Callers that DESTROY on a negative must use the full verdict instead.
         For them the difference between "invalid" and "could not tell" is the
         difference between a correct cleanup and deleting a working profile,
         and this boolean cannot express it.
         """
-        return self._session_validity(session_dir, email, org_uuid) in (
-            "valid",
-            "unknown",
-        )
+        verdict = self._session_validity(session_dir, email, org_uuid)
+        if verdict == "unknown":
+            return _artifacts_say_usable(session_dir, email, org_uuid)
+        return verdict == "valid"
 
     # -- sharing ---------------------------------------------------------
 
