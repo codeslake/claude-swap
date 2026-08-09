@@ -459,6 +459,31 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
         assert not (session_dir / session_mod.STALE_MARKER).exists()
 
+    def test_stale_marker_plus_probe_timeout_still_rebootstraps(
+        self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch,
+    ):
+        """A probe timeout on the stale path must not skip the re-seed.
+
+        The stale path deletes .credentials.json before re-validating; a
+        timeout there leaning valid would launch a cred-less profile. The
+        local-artifact fallback reports invalid instead, bootstrap re-seeds,
+        and the post-bootstrap timeout leans valid without deleting the
+        profile (#224 follow-up).
+        """
+        session_dir, _, _ = manager.setup_session("2", share=False)
+        (session_dir / session_mod.STALE_MARKER).touch()
+
+        def raise_timeout(*a, **k):
+            raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+
+        manager.setup_session("2", share=False)
+
+        assert (session_dir / ".credentials.json").read_text() == ROTATED_CREDS
+        assert not (session_dir / session_mod.STALE_MARKER).exists()
+
     def test_stale_marker_preserved_while_session_still_live(
         self, manager, seeded_switcher, auth_status_tracks_seed, refresh_rotates
     ):
@@ -544,6 +569,21 @@ class TestIsSessionValid:
             tmp_path / "missing", ACCOUNT_EMAIL, ORG_UUID
         )
 
+    def _seed_profile(self, session_dir, email=ACCOUNT_EMAIL, org=ORG_UUID):
+        """Local artifacts of a bootstrapped profile: creds + identity."""
+        (session_dir / ".credentials.json").write_text("{}")
+        (session_dir / ".claude.json").write_text(
+            json.dumps(
+                {"oauthAccount": {"emailAddress": email, "organizationUuid": org}}
+            )
+        )
+
+    def _probe_times_out(self, monkeypatch):
+        def raise_timeout(*a, **k):
+            raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+
     def test_probe_timeout_leans_valid(self, manager, tmp_path, monkeypatch):
         """A probe timeout is a busy machine, not a bad login.
 
@@ -552,11 +592,110 @@ class TestIsSessionValid:
         probe must not report invalid (#224).
         """
         tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
+        self._probe_times_out(monkeypatch)
+        assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
-        def raise_timeout(*a, **k):
-            raise session_mod.subprocess.TimeoutExpired(cmd="claude", timeout=10)
+    def test_probe_timeout_needs_credential_material(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """Timeout must not vouch for a profile with no credentials.
 
-        monkeypatch.setattr(session_mod.subprocess, "run", raise_timeout)
+        The stale-marker path deletes .credentials.json right before
+        re-validating; leaning valid there would skip bootstrap and launch
+        claude logged out (#224 follow-up).
+        """
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
+        (tmp_path / ".credentials.json").unlink()
+        self._probe_times_out(monkeypatch)
+        assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
+    def test_probe_timeout_accepts_keychain_only_credentials(
+        self, manager, tmp_path, monkeypatch, block_real_keychain
+    ):
+        """A keychain-migrated macOS profile is not cred-less.
+
+        Claude's first credential write moves the material into the hashed
+        keychain entry and deletes the plaintext seed — the steady state for
+        any used macOS profile. Only stale invalidation removes both, so
+        the timeout fallback must consult the keychain before declaring the
+        profile cred-less and forcing a re-bootstrap that would discard the
+        profile's freshest token family (#224 follow-up).
+        """
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
+        (tmp_path / ".credentials.json").unlink()
+        block_real_keychain.set_password(
+            session_mod.keychain_service_name(tmp_path),
+            session_mod._keychain_account_name(),
+            "migrated material",
+        )
+        self._probe_times_out(monkeypatch)
+        assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
+    def test_probe_timeout_with_unreadable_keychain_leans_valid(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """A locked/busy keychain is indeterminate, not a credential miss.
+
+        Only rc 44 means "definitely absent"; under the same load that times
+        out the probe, `security` can time out too, and treating that as
+        cred-less would re-bootstrap over the keychain entry holding the
+        profile's freshest token family (#224 follow-up).
+        """
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
+        (tmp_path / ".credentials.json").unlink()
+
+        def raise_keychain_error(*a, **k):
+            raise session_mod.macos_keychain.KeychainError("keychain locked")
+
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "get_password", raise_keychain_error
+        )
+        self._probe_times_out(monkeypatch)
+        assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
+    def test_probe_timeout_rejects_empty_credential_file(
+        self, manager, tmp_path, monkeypatch
+    ):
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
+        (tmp_path / ".credentials.json").write_text("")
+        self._probe_times_out(monkeypatch)
+        assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
+    def test_probe_timeout_still_rejects_drifted_identity(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """Timeout must not vouch for a profile re-pointed by /login.
+
+        The profile's own .claude.json records the account it is logged in
+        as; on timeout that local record still gates validity (#224
+        follow-up).
+        """
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path, email="other@example.com")
+        self._probe_times_out(monkeypatch)
+        assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+
+    def test_probe_timeout_lenient_on_unreadable_identity(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """A broken .claude.json degrades to trusting the profile.
+
+        Mirrors session_identity_drifted's stance: unreadable metadata is
+        not drift. Failing closed here would re-open the destructive
+        cleanup path #224 removed: a backup whose oauthAccount lacks an
+        emailAddress keeps the identity unreadable even after re-bootstrap,
+        so the post-bootstrap check would delete the profile on every
+        loaded launch.
+        """
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
+        (tmp_path / ".claude.json").write_text("not json")
+        self._probe_times_out(monkeypatch)
         assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
     def test_probe_oserror_stays_invalid(self, manager, tmp_path, monkeypatch):

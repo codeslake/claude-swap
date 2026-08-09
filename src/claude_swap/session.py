@@ -222,6 +222,35 @@ def read_session_credentials(session_dir: Path) -> str | None:
     return read_config_dir_credentials(str(session_dir))
 
 
+def _may_have_credential_material(session_dir: Path) -> bool:
+    """Whether a profile's credential material is anything but definitely absent.
+
+    Existence test for the validation-timeout fallback, not a read: ``False``
+    only when every store is *positively* empty — no readable plaintext seed
+    and (on macOS) a keychain miss claude itself signals with rc 44. An
+    unreadable keychain — locked, denied, ``security`` timing out under the
+    same load that timed out the probe — is indeterminate, and leans present:
+    the profile may hold the freshest generation of the account's token
+    family, and re-bootstrapping over it would start by deleting that entry.
+    ``read_session_credentials`` is unsuitable here by design — its
+    error-to-plaintext fallback erases exactly this distinction.
+    """
+    try:
+        if (session_dir / ".credentials.json").read_text(encoding="utf-8"):
+            return True
+    except (OSError, ValueError):
+        pass  # no readable seed — the keychain may still hold the material
+    if Platform.detect() != Platform.MACOS:
+        return False
+    try:
+        material = macos_keychain.get_password(
+            keychain_service_name(session_dir), _keychain_account_name()
+        )
+    except macos_keychain.KEYCHAIN_ERRORS:
+        return True  # unreadable is not absent: preserve the profile
+    return material is not None
+
+
 # Bounded retry for the strict capture read, mirroring the active store's
 # (credentials._ACTIVE_READ_ATTEMPTS / _ACTIVE_READ_RETRY_DELAY).
 _STRICT_KEYCHAIN_ATTEMPTS = 2
@@ -657,9 +686,17 @@ class SessionManager:
         except subprocess.TimeoutExpired:
             # A timeout is the machine under load, not a bad profile: this
             # check is best-effort (see docstring), and setup_session
-            # escalates a False all the way to deleting the profile. Real
-            # invalidity still fails on first use.
-            return True
+            # escalates a False all the way to deleting the profile. Fall
+            # back to what local artifacts can answer without the probe:
+            # credential material must not be definitely absent (keychain-
+            # aware — claude migrates a macOS profile's credential into the
+            # keychain and deletes the plaintext seed, while stale
+            # invalidation deletes both) and the profile's recorded identity
+            # must not have drifted (in-session /login to another account).
+            # Anything subtler still fails on first real use.
+            return _may_have_credential_material(session_dir) and (
+                not session_identity_drifted(session_dir, email, org_uuid)
+            )
         except OSError:
             return False
         if result.returncode != 0:
