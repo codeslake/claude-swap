@@ -3012,7 +3012,7 @@ class ClaudeAccountSwitcher:
         ``oauthAccount`` and the CREDENTIAL from the keychain/file store.
         Those are two different sources and nothing made them agree.
 
-        Measured in the field: a session registered ``account-a@example.com``
+        Measured in the field: a session registered one account's address
         and the slot received a different account's token — an ssh session had
         ``.claude.json`` renamed to the new profile while the live keychain
         item still held the original account's credential. The slot ends up

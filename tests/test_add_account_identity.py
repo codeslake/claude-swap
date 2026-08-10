@@ -1,13 +1,13 @@
 """`cswap add` must not store a credential that belongs to another account.
 
 MEASURED IN THE FIELD (2026-08-03, work-mac): a session registered
-account-a@example.com and the slot received account-b@example.com's credential.
-The shape: an ssh session had `.claude.json` renamed to the ax profile while
+one address and the slot received a DIFFERENT account's credential.
+The shape: an ssh session had `.claude.json` renamed to the new profile while
 the live keychain item still held the ORIGINAL account's token. `add_account`
 reads the identity from `.claude.json`'s `oauthAccount` and the credential
 from the keychain/file store, and nothing asks whether the two agree.
 
-The damage is silent and durable: the slot is LABELLED ax and CONTAINS the
+The damage is silent and durable: the slot is LABELLED one account and CONTAINS the
 other account, so every later switch to that slot logs the wrong user in,
 and `cswap --status` shows a name that is not whose token is stored.
 
