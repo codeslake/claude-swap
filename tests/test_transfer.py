@@ -14,6 +14,7 @@ import pytest
 
 from claude_swap.exceptions import TransferError
 from claude_swap.models import Platform
+from claude_swap.oauth import credential_fingerprint
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.transfer import export_accounts, import_accounts
 from claude_swap.usage_store import FetchRecord
@@ -1533,6 +1534,41 @@ class TestImportClearsDeadTokenQuarantine:
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_NEW"
 
+    def test_force_import_of_the_byte_identical_struck_generation_lifts_the_quarantine(
+        self, temp_home: Path
+    ):
+        """Pins issue #218's reporter experiment: the strike is bound to the
+        stored generation's fingerprint (#196 shape) and the forced import
+        carries that exact generation back in, so fingerprint healing can
+        never fire — only transfer.py's explicit clear_dead_token call lifts
+        the verdict. Deleting that call (say, trusting usage_store.py's
+        "heals … without a bespoke clear call" comment) leaves the fp-bound
+        verdict True and fails this test. Pairs with
+        test_import_force_lifts_quarantine, which pins the legacy
+        struckFingerprint-less row shape."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+        entry = s._usage_store.entries(ident)["2"]
+        assert entry.struck_fingerprint == fp, "premise: strike is fp-bound"
+        assert entry.token_dead(stored_fp=fp), "premise: verdict holds"
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        # No envelope mutation: re-import exactly the condemned generation.
+        import_accounts(s, str(out), force=True)
+
+        entry = s._usage_store.entries(ident)["2"]
+        assert entry.auth_dead_strikes == 0
+        assert entry.struck_fingerprint is None
+        assert not entry.token_dead(stored_fp=fp)
+
     def test_reimport_after_removal_lifts_orphan_quarantine(
         self, temp_home: Path, capsys
     ):
@@ -1871,3 +1907,118 @@ class TestImportClearsDeadTokenQuarantine:
                 )[slot]
                 assert not entry.token_dead()
                 assert entry.auth_dead_strikes == 0
+
+
+class TestForceOverwriteNarratesTheStrikeClear:
+    """A forced overwrite of a slot whose row holds a dead-token strike must
+    say the strike was cleared — and, when the imported bytes carry the very
+    refresh-token generation the strike condemned, say the re-test can
+    honestly re-condemn it. Issue #218: the silent lift → poll → re-strike
+    cycle read exactly like "the clear never happened"."""
+
+    def test_force_overwrite_names_the_same_condemned_generation(
+        self, temp_home: Path, capsys
+    ):
+        """Byte-identical re-import of the struck generation prints both the
+        clear line and the same-generation candor note. Killed mutations:
+        dropping the narration, and fingerprinting the wrong side of the
+        comparison (the omits-test pins the other direction)."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "Overwrote bob@example.com (slot 2)" in err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" in err
+
+    def test_force_overwrite_with_a_newer_generation_omits_the_generation_note(
+        self, temp_home: Path, capsys
+    ):
+        """A rotated refresh token in the envelope is a different generation:
+        the clear line still prints, the candor note must not."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["refreshToken"] = "rtok-2-rotated"
+        out.write_text(json.dumps(env))
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" not in err
+
+    def test_force_overwrite_narrates_only_the_struck_account(
+        self, temp_home: Path, capsys
+    ):
+        """Two accounts forced in one run, only the first struck: exactly one
+        clear line. Kills both an unconditional print and per-iteration state
+        leaking from the struck account into the healthy one."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 2, "bob@example.com")
+        _seed_account(s, 3, "carol@example.com")
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant")},
+            {"2": ("bob@example.com", "")},
+        )
+
+        out = temp_home / "both.cswap"
+        export_accounts(s, str(out))
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "Overwrote bob@example.com (slot 2)" in err
+        assert "Overwrote carol@example.com (slot 3)" in err
+        assert err.count("cleared this slot's stored dead-token strike") == 1
+
+    def test_force_overwrite_narrates_a_condemned_generation_without_a_refresh_token(
+        self, temp_home: Path, capsys
+    ):
+        """no_refresh_token strikes are fingerprint-bound too — by content
+        hash, since the condemned blob has no refresh token — so the candor
+        note must not claim a "refresh-token generation" or predict
+        invalid_grant specifically. Pins the generic wording for the
+        non-invalid_grant strike class."""
+        s = _linux_switcher(temp_home)
+        creds = {"accessToken": "tok-1", "expiresAt": 9999}
+        _seed_account(s, 2, "bob@example.com", creds=creds)
+        ident = {"2": ("bob@example.com", "")}
+        fp = credential_fingerprint(
+            s._read_account_credentials("2", "bob@example.com")
+        )
+        assert fp is not None and fp.startswith("sha256-full:"), (
+            "premise: a refresh-token-less blob fingerprints by content"
+        )
+        s._usage_store.record(
+            {"2": FetchRecord(error="no_refresh_token", struck_fp=fp)}, ident
+        )
+
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        import_accounts(s, str(out), force=True)
+
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" in err
+        assert "invalid_grant" not in err
+        assert "refresh-token generation" not in err
