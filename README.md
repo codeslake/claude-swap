@@ -52,6 +52,8 @@ Log in with another account, then:
 cswap add
 ```
 
+Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
+
 ### Switch accounts
 
 Rotate to the next account:
