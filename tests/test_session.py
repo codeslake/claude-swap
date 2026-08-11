@@ -2678,9 +2678,12 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         def gate_consumes_then_fails_to_persist(self, num, email, snapshot):
             # Grant spent; successor NOT written to the backup, which still
-            # holds CREDS. Exactly the shape switcher.py returns when the
-            # persist fails and the successor is stashed.
-            return oauth.RefreshOutcome(ROTATED_CREDS, "transient")
+            # holds CREDS, but it DID reach the stash. Exactly the shape
+            # switcher.py returns when the persist fails and the successor is
+            # parked for the next pass.
+            return oauth.RefreshOutcome(
+                ROTATED_CREDS, "transient", stashed=True
+            )
 
         monkeypatch.setattr(
             ClaudeAccountSwitcher,
@@ -2688,7 +2691,7 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             gate_consumes_then_fails_to_persist,
         )
 
-        with pytest.raises(SessionError, match="retry"):
+        with pytest.raises(SessionError, match="stashed — please retry"):
             manager.setup_session("2", share=False)
 
         assert seeded_switcher.read_account_credentials(
@@ -2701,4 +2704,39 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert not seeded.exists() or seeded.read_text() != CREDS, (
             "seeded the profile with the generation whose grant the gate had "
             "just spent — claude's first refresh gets invalid_grant"
+        )
+
+    def test_an_unpersisted_successor_is_not_reported_as_stashed(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
+    ):
+        """The `consume-gate-unpersisted` corner needs the OPPOSITE advice.
+
+        There the persist AND the stash both failed, so the successor survived
+        only in the return value the raise discards, and retrying POSTs the
+        spent predecessor — earning a strike. `error` and `credentials` are
+        identical to the stashed shape, so without the gate carrying
+        `stashed` this message promises a stash that never happened and sends
+        the user to retry into a guaranteed invalid_grant.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher,
+            "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(
+                ROTATED_CREDS, "transient", stashed=False
+            ),
+        )
+
+        with pytest.raises(SessionError) as exc:
+            manager.setup_session("2", share=False)
+
+        msg = str(exc.value)
+        assert "neither be stored nor stashed" in msg
+        assert "Fix the storage failure" in msg
+        assert "the successor is stashed" not in msg, (
+            "promised a stash that never happened"
         )

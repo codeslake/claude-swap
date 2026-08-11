@@ -28,7 +28,11 @@ from pathlib import Path
 from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
-from claude_swap.exceptions import CredentialError, CredentialWriteError
+from claude_swap.exceptions import (
+    CredentialError,
+    CredentialReadError,
+    CredentialWriteError,
+)
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform
 from claude_swap.paths import (
@@ -1446,31 +1450,37 @@ class CredentialStore:
     def _stash_entry_path(self, entry_id: str) -> Path:
         return self._host.credentials_dir / f".unclaimed-{entry_id}.enc"
 
-    def _read_stash_manifest_ex(self) -> tuple[dict, bool]:
-        """Manifest read with an unreadable-vs-absent verdict.
+    def _read_stash_manifest_ex(self) -> tuple[dict, str]:
+        """Manifest read with a three-way verdict: ok / unreadable / corrupt.
 
-        Returns ``(entries, unreadable)`` — the same shape as
-        ``_read_account_credentials_ex`` and ``_read_unclaimed_credential``,
-        and for the same reason: "no rows" and "could not see the rows" have
-        opposite consequences here. A stash row is the SOLE record of a
-        generation a prior gate pass already consumed, so a caller that reads
-        an I/O failure as "nothing stashed" POSTs the spent generation — the
-        one POST the consume gate exists to prevent. The failure is also
-        CORRELATED rather than independent: the stash exists *because*
-        storage I/O already failed once.
+        Returns ``(entries, verdict)``. The verdict exists because "no rows"
+        and "could not establish the rows" have opposite consequences here: a
+        stash row is the SOLE record of a generation a prior gate pass already
+        consumed, so a caller that reads a failure as "nothing stashed" POSTs
+        the spent generation — the one POST the consume gate exists to
+        prevent. The failure is also CORRELATED rather than independent: the
+        stash exists *because* storage I/O already failed once.
+
+        A bool cannot carry it, because the two failure modes need different
+        answers and one of them is caller-dependent:
+
+        - ``"unreadable"`` — the bytes exist and could not be read (locked
+          keychain, EIO, a mode). Transient by nature and self-clearing, so
+          every caller defers: it costs a pass and spends nothing.
+        - ``"corrupt"`` — the bytes were read and are not a manifest. This is
+          PERMANENT, so a blanket fail-closed would deadlock the slot: the
+          repair is ``_write_stash_manifest`` renaming the bad file aside, and
+          that runs only on a manifest WRITE, which deferring prevents. The
+          adopt scan therefore decides by whether any entry bytes are actually
+          at risk (see ``_stash_entry_files_exist``), and the mutator proceeds
+          so the set-aside can happen at all.
+        - ``"ok"`` — includes a genuinely absent manifest; no rows and nothing
+          to protect read the same to every caller.
 
         The read, not ``exists()``, decides. ``Path.exists()`` answers False
         for an unsearchable directory on 3.13+ and RAISES on 3.12, so gating
         on it makes this verdict depend on the interpreter — the same trap
         this branch removes from the backup reader.
-
-        CORRUPT is deliberately NOT unreadable. It is permanent, and failing
-        closed on it would deadlock: the repair (``_write_stash_manifest``
-        renaming the bad file aside) only runs on a manifest WRITE, and
-        deferring is what prevents that write from ever happening. Reading it
-        as empty lets the next stash set it aside and self-heal, at the cost
-        of one POST. Unreadable is transient by nature and self-clears, so
-        deferring there costs a pass and spends nothing.
         """
         path = self._stash_manifest_path()
         # BYTES, so the two failure classes cannot cross. `read_text` decodes
@@ -1482,16 +1492,34 @@ class CredentialStore:
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
-            return {}, False
+            return {}, "ok"
         except OSError as e:
             self._host._logger.warning(f"Unclaimed manifest unreadable: {e}")
-            return {}, True
+            return {}, "unreadable"
         try:
             entries = json.loads(raw.decode("utf-8")).get("entries")
         except Exception as e:
             self._host._logger.warning(f"Failed to read unclaimed manifest: {e}")
-            return {}, False
-        return (entries if isinstance(entries, dict) else {}), False
+            return {}, "corrupt"
+        return (entries if isinstance(entries, dict) else {}), "ok"
+
+    def _stash_entry_files_exist(self) -> bool:
+        """Is there any stashed credential's BYTES on disk?
+
+        Asked only when the manifest is corrupt, to tell "the mapping is gone
+        and there is nothing it could have mapped" from "the mapping is gone
+        and a consumed generation's only copy is sitting right here". The
+        entry files are named independently of the manifest, so they answer
+        even when it cannot.
+
+        Unknowable answers TRUE: a directory we cannot list is not evidence
+        that nothing is at risk, and the caller uses this to decide whether to
+        spend a grant.
+        """
+        try:
+            return any(self._host.credentials_dir.glob(".unclaimed-*.enc"))
+        except OSError:
+            return True
 
     def _read_stash_manifest(self) -> dict:
         return self._read_stash_manifest_ex()[0]
@@ -1559,7 +1587,28 @@ class CredentialStore:
 
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         with FileLock(self._stash_manifest_path().with_suffix(".lock")):
-            entries = self._read_stash_manifest()
+            entries, verdict = self._read_stash_manifest_ex()
+            if verdict == "unreadable":
+                # Reading an unreadable-but-VALID manifest as `{}` does not
+                # merely miss rows. ``_write_stash_manifest`` below finds the
+                # same file unparseable, renames the healthy manifest aside,
+                # and writes a fresh one holding only this mutation's row —
+                # orphaning every previously mapped successor in one step,
+                # in exactly the correlated setting where a stash is being
+                # written because storage already misbehaved.
+                #
+                # Raising suits both callers: a failed STASH must be loud (a
+                # successful one is the licence to overwrite the live store),
+                # and a failed RETIRE is already swallowed by
+                # ``_retire_stash_entry``.
+                #
+                # CORRUPT deliberately falls through: the set-aside below is
+                # the only repair, and it can only happen on a write.
+                raise CredentialReadError(
+                    "the unclaimed manifest is unreadable; refusing to rewrite "
+                    "it from an empty read, which would orphan every stashed "
+                    "successor it maps"
+                )
             mutate(entries)
             self._write_stash_manifest(entries)
 

@@ -9397,22 +9397,160 @@ class TestConsumeGate:
         )
         assert result.error == "stash-unreadable"
 
-    def test_a_corrupt_manifest_still_posts_rather_than_deadlocking(
+    def test_a_stash_write_refuses_an_unreadable_manifest(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The mutator read the plain wrapper, which discards the verdict.
+
+        A stash writer that reads an unreadable-but-VALID manifest as `{}`
+        does not merely miss rows: `_write_stash_manifest` then finds the file
+        unparseable too, renames the good manifest aside, and writes a fresh
+        one holding only the new row. Every previously mapped successor is
+        orphaned in one step — and this runs in exactly the correlated setting
+        where a stash is being written because storage already misbehaved.
+
+        `_write_unclaimed_credential`'s own contract is that a failed stash
+        must be LOUD, because callers treat a successful one as the licence to
+        overwrite the live store.
+        """
+        s = self._switcher(sample_sequence_data)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        path = s._store._stash_manifest_path()
+        before = path.read_bytes()
+
+        deny = [True]
+
+        def _deny(real):
+            def denied(self_path, *a, **kw):
+                if deny[0] and self_path.name == ".unclaimed-manifest.json":
+                    raise PermissionError(13, "Permission denied")
+                return real(self_path, *a, **kw)
+            return denied
+
+        monkeypatch.setattr(Path, "read_bytes", _deny(Path.read_bytes))
+        monkeypatch.setattr(Path, "read_text", _deny(Path.read_text))
+
+        with pytest.raises(CredentialReadError):
+            s._store._write_unclaimed_credential(self._OLD, {
+                "reason": "consume-gate-persist-failed", "configSlot": "1",
+            })
+
+        deny[0] = False
+        assert path.read_bytes() == before, (
+            "renamed a healthy manifest aside and replaced it with one row — "
+            "every other slot's stashed successor is now unmappable"
+        )
+        assert not list(
+            s.credentials_dir.glob(".unclaimed-manifest.json.corrupt-*")
+        ), "set a READABLE manifest aside as corrupt"
+
+    def test_the_purge_exit_the_fail_closed_message_names_actually_works(
         self, temp_home: Path, sample_sequence_data: dict
     ):
-        """CORRUPT is deliberately not UNREADABLE, and this pins the line.
+        """A remedy named in an error message has to be a remedy.
 
-        Failing closed here would deadlock the slot: the repair is
-        ``_write_stash_manifest`` renaming the bad file aside, and that runs
-        only on a manifest WRITE — which deferring is precisely what prevents.
-        The slot would never refresh again without a hand `cswap unclaimed
-        --purge`. Reading it as empty lets the next stash set it aside and
-        self-heal, at the cost of one POST; the entry bytes survive as orphan
-        files either way. Unreadable self-clears and gets the opposite answer.
+        Failing closed on corrupt+orphans is only defensible because the
+        operator has a way out, and the message names one: `cswap unclaimed`
+        to see them, `--purge` to drop one. Both run against a CORRUPT
+        manifest, so the mutator must NOT refuse there — which is why its
+        refusal is scoped to `unreadable`. Walk the whole exit rather than
+        asserting the sentence.
         """
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         self._stash_successor_of(s, self._NEW, self._OLD)
+        s._store._stash_manifest_path().write_text("{not json at all")
+
+        # 1. the operator can SEE the orphan, by glob, with no readable rows
+        listed = s.list_unclaimed_credentials()
+        assert listed, "corrupt manifest hid the orphan from `cswap unclaimed`"
+
+        # 2. and can DROP it — the mutator does not refuse on corrupt
+        for entry_id in list(listed):
+            s._store._remove_unclaimed_credential(entry_id)
+
+        # 3. after which nothing is at risk and the slot moves again
+        assert s._store._stash_entry_files_exist() is False
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [self._OLD], "the documented exit did not unblock it"
+        assert result.error is None
+
+    def test_an_unlistable_dir_counts_as_entries_at_risk(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The corrupt policy asks "is anything at risk"; not knowing is YES.
+
+        `_stash_entry_files_exist` is what lets a corrupt manifest proceed, so
+        a glob that FAILS must not read as "nothing on disk" — that is the
+        empty-means-safe conflation this whole PR removes, one level down. The
+        caller spends a grant on this answer.
+        """
+        s = self._switcher(sample_sequence_data)
+
+        def unlistable(self_path, *a, **kw):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "glob", unlistable)
+
+        assert s._store._stash_entry_files_exist() is True
+
+    def test_a_corrupt_manifest_with_orphan_entries_fails_closed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Corrupt + orphan bytes on disk: a successor may be pending.
+
+        The `{}` reading costs a POST of the slot's spent generation, which
+        does not "self-heal at the cost of one POST" — it returns
+        invalid_grant, and the gate returns before any manifest write, so
+        nothing is ever set aside. The exit is the operator's
+        (`cswap unclaimed --purge`, which still lists orphans by glob), not a
+        POST that strikes a live account.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        s._store._stash_manifest_path().write_text("{not json at all")
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(None, "invalid_grant")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], "POSTed a spent grant with a successor on disk"
+        assert result.error == "stash-unreadable"
+
+    def test_a_corrupt_manifest_still_posts_rather_than_deadlocking(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CORRUPT with NOTHING to protect: set aside and proceed.
+
+        No orphan entry files exist, so `{}` is not a guess about whether a
+        successor is pending — there are provably no bytes on disk to lose.
+        Failing closed here would deadlock for nothing: the repair is
+        ``_write_stash_manifest`` renaming the bad file aside, and that runs
+        only on a manifest WRITE, which deferring is precisely what prevents.
+
+        The sibling test covers corrupt WITH orphan entries, where a pending
+        successor may exist and the answer flips to fail-closed. The earlier
+        version of THIS test stashed a successor and mocked the POST of the
+        spent generation to succeed — a world that cannot happen, which is
+        what made "self-heal at the cost of one POST" look true.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
         s._store._stash_manifest_path().write_text("{not json at all")
         posted = []
 
@@ -9443,9 +9581,9 @@ class TestConsumeGate:
         self._stash_successor_of(s, self._NEW, self._OLD)
         s._store._stash_manifest_path().write_bytes(b"\xff\xfe\x00not utf8")
 
-        entries, unreadable = s._store._read_stash_manifest_ex()
+        entries, verdict = s._store._read_stash_manifest_ex()
 
-        assert (entries, unreadable) == ({}, False)
+        assert (entries, verdict) == ({}, "corrupt")
 
     def test_a_readable_empty_manifest_still_posts(
         self, temp_home: Path, sample_sequence_data: dict
@@ -9499,6 +9637,52 @@ class TestConsumeGate:
         assert result.error == "transient"
         assert not s.list_unclaimed_credentials(), (
             "stashed a successor for an account the user deleted"
+        )
+
+
+    def test_an_absent_slot_defers_even_when_a_newer_profile_exists(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The defer must not quietly regress into a heal.
+
+        With `or snapshot` gone, the session-profile precedence block below is
+        no longer reachable for an ABSENT slot — it used to resync that
+        profile into the empty slot and POST it. That is the resurrect class
+        this PR forbids everywhere else, and the same verdict the CAS branch
+        reaches for a slot emptied mid-POST: a half-finished delete must not
+        be undone by a background poll. The wiped-keychain case keeps its
+        documented remedy (re-add).
+
+        Pinned because it is defined behaviour on a path no test covered
+        before, which is exactly the kind that gets "fixed" back.
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        # No stored credential for slot 1 — but a profile that outlived it.
+        profile_newer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-prof", "refreshToken": "rt-prof",
+                "expiresAt": 9999999999000,
+            }
+        })
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(profile_newer)
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], "healed a removed slot from its surviving profile"
+        assert result.error == "transient"
+        assert not s._read_account_credentials("1", "test@example.com"), (
+            "resurrected the slot's stored credential from the profile"
         )
 
 

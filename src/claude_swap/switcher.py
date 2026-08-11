@@ -2410,7 +2410,11 @@ class ClaudeAccountSwitcher:
             # candidate (network?)" on every multi-surface race — the exact
             # contention this gate was built for, turned into a false alarm.
             return oauth.RefreshOutcome(
-                outcome_creds, "transient", result.token_account, consumed_fp
+                outcome_creds, "transient", result.token_account, consumed_fp,
+                # `consume-gate-unpersisted` is set precisely WHEN the stash
+                # write raised, so it is the one demoting reason that did not
+                # park anything. Every other one wrote the entry first.
+                stashed=stashed_reason != "consume-gate-unpersisted",
             )
         return oauth.RefreshOutcome(
             outcome_creds, None, result.token_account, consumed_fp
@@ -2464,17 +2468,36 @@ class ClaudeAccountSwitcher:
         # it and keep scanning; only defer via CredentialReadError once no
         # row adopted.
         deferred_entry_id: str | None = None
-        manifest, manifest_unreadable = self._store._read_stash_manifest_ex()
-        if manifest_unreadable:
-            # Not "nothing stashed": the rows exist and cannot be seen. Every
-            # row below is the sole record of a generation some pass already
-            # consumed, so treating this as an empty scan makes the caller
-            # POST the slot's spent generation. Defer through the same
-            # CredentialReadError the byte-level version raises below.
+        manifest, manifest_verdict = self._store._read_stash_manifest_ex()
+        if manifest_verdict == "unreadable" or (
+            manifest_verdict == "corrupt"
+            and self._store._stash_entry_files_exist()
+        ):
+            # Not "nothing stashed": the rows cannot be established, and entry
+            # bytes are at risk. Every row this scan would have read is the
+            # sole record of a generation some pass already consumed, so an
+            # empty scan makes the caller POST the slot's spent generation.
+            #
+            # That POST does not cost "one retry". The generation is spent by
+            # construction, so it returns invalid_grant, and the gate returns
+            # before any manifest write — nothing is set aside, nothing
+            # self-heals, and at AUTH_DEAD_STRIKES=1 a live account is
+            # quarantined while its successor sits orphaned on disk.
+            #
+            # CORRUPT with no entry files falls through instead: `{}` is then
+            # not a guess about a pending successor, there provably is none,
+            # and proceeding lets ``_write_stash_manifest`` set the bad file
+            # aside — the only repair, and it only runs on a write.
+            #
+            # Fail-closed still has an exit: ``_list_unclaimed_credentials``
+            # globs the entry files, so `cswap unclaimed` lists the orphans by
+            # id and `--purge` drops them even with the manifest unreadable.
             raise CredentialReadError(
-                f"the unclaimed manifest is unreadable; deferring account "
-                f"{account_num}'s adoption rather than POSTing a generation "
-                "a stashed successor may already have superseded"
+                f"the unclaimed manifest is {manifest_verdict} and stashed "
+                f"entry files exist; deferring account {account_num}'s "
+                "adoption rather than POSTing a generation a stashed "
+                "successor may already have superseded (`cswap unclaimed` "
+                "lists them, `--purge` drops one)"
             )
         for entry_id, meta in manifest.items():
             if meta.get("configSlot") != account_num:

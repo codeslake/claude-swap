@@ -668,20 +668,41 @@ class SessionManager:
                 # generation and claude's first refresh gets invalid_grant —
                 # the warning scrolls past and the session is broken anyway.
                 #
-                # Refuse, and say it is worth retrying. The gate stashed the
-                # successor; the next run adopts it without consuming
-                # anything and bootstraps normally, so the recovery machinery
-                # already built here does the rest.
+                # Refuse — but the two demoted shapes need OPPOSITE advice,
+                # and `error`/`credentials` cannot tell them apart, which is
+                # why the gate carries `stashed`.
+                #
+                # Stashed: retrying is right. The next run's gate adopts the
+                # successor without consuming anything and bootstraps
+                # normally, so the recovery machinery already built here does
+                # the rest.
+                #
+                # NOT stashed (`consume-gate-unpersisted`, where the persist
+                # AND the stash both failed): retrying POSTs the spent
+                # predecessor and earns a strike. The successor survived only
+                # in this return value, which the raise discards — saying
+                # "nothing was lost" there would be false on both counts. The
+                # remedy is the storage failure, which is what the gate's own
+                # ERROR log at that site already says.
                 #
                 # This shape is distinguishable at the call site: a genuine
                 # network-transient carries `credentials=None` and falls to
                 # the warning below, where continuing on the stored
                 # credentials is correct because nothing was spent.
+                if outcome.stashed:
+                    raise SessionError(
+                        f"Account-{account_num}'s refreshed credential could "
+                        f"not be stored, so the backup still holds a spent "
+                        f"grant. The successor is stashed — please retry, and "
+                        f"the next run adopts it automatically."
+                    )
                 raise SessionError(
-                    f"Account-{account_num}'s refreshed credential could not "
-                    f"be stored, so the backup still holds a spent grant. "
-                    f"Nothing was lost — the successor is stashed. Please "
-                    f"retry: the next run adopts it automatically."
+                    f"Account-{account_num}'s refreshed credential could "
+                    f"neither be stored nor stashed, so the backup holds a "
+                    f"spent grant and the successor is gone. Fix the storage "
+                    f"failure first; retrying before that spends nothing but "
+                    f"earns a strike. If the slot strikes, log in again and "
+                    f"re-add it: cswap --add-account --slot {account_num}"
                 )
             if outcome.error is not None:
                 warning(

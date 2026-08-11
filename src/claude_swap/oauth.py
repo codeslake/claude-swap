@@ -99,6 +99,14 @@ class RefreshOutcome:
     # profile for the caller's snapshot — strike binding must follow the
     # POSTed bytes, not the snapshot.
     consumed_fp: str | None = None
+    # Did the consumed successor actually reach the stash? Only meaningful on
+    # a demoted (`transient` WITH credentials) outcome from the consume gate.
+    # False there means the `consume-gate-unpersisted` corner: BOTH the
+    # persist and the stash write failed, so the successor survives only in
+    # `credentials` and retrying POSTs the spent predecessor. Callers that
+    # tell the user what to do next must not promise a stash that never
+    # happened.
+    stashed: bool = False
 
 
 def try_refresh_oauth_credentials(
