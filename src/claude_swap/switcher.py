@@ -2007,14 +2007,22 @@ class ClaudeAccountSwitcher:
     def consume_backup_grant(
         self, account_num: str, email: str, snapshot: str
     ) -> "oauth.RefreshOutcome":
-        """The single gate through which a backup refresh token is consumed.
+        """The gate through which a backup refresh token is consumed.
+
+        Not the only site that POSTs one: ``_fetch_active_usage``'s recovery
+        branch can POST the slot's backup grant too, when the live bytes moved
+        or were cleared. It is not an escape — it takes this same per-slot
+        *consume lock*, in this same order, and its own comment at that site
+        records why. What is single here is the SERIALIZATION, not the call
+        site, and saying "the single place" instead sends the next reader
+        looking for a violation rather than for the second lock holder.
 
         A refresh token is one-time-use, so the POST must consume the
         provably-freshest copy of the slot's grant — never a caller's
         snapshot, which may be a superseded generation. The whole sequence
-        runs under a per-slot *consume lock* (re-read → POST → CAS) so two
-        gates can never POST the same grant; the slot ``FileLock`` itself
-        never covers the network call.
+        runs under that consume lock (re-read → POST → CAS) so two consumers
+        can never POST the same grant; the slot ``FileLock`` itself never
+        covers the network call.
 
         The body below is the sequence: adopt a stashed successor and re-read
         under the slot lock, POST outside it, then CAS on the refresh-token
@@ -2032,15 +2040,19 @@ class ClaudeAccountSwitcher:
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
         """
         # Store-resolution parity: CC ≥2.1.220 honors
-        # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store; cswap
-        # does not mirror that resolution yet. Consuming a grant read from
-        # the DEFAULT store while CC reads/writes the redirected one is the
-        # stale-copy failure class by construction — refuse (transient, so
-        # nothing strikes) rather than operate on a store CC left behind.
+        # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
+        # mirrors that resolution on the CAPTURE path (#205 —
+        # `_read_capture_credentials` reads the store CC would read), but
+        # the consume and switch paths still resolve the DEFAULT store.
+        # Consuming a grant read from the default store while CC
+        # reads/writes the redirected one is the stale-copy failure class by
+        # construction — refuse (transient, so nothing strikes) rather than
+        # operate on a store CC left behind.
         if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
             self._logger.warning(
-                "CLAUDE_SECURESTORAGE_CONFIG_DIR is set but not mirrored by "
-                "cswap; refusing to consume account %s's refresh token "
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
+                "when capturing a credential but not when consuming one, "
+                "so refusing to consume account %s's refresh token "
                 "(unset the variable or run from a normal shell).",
                 account_num,
             )
@@ -2134,7 +2146,26 @@ class ClaudeAccountSwitcher:
                     return oauth.RefreshOutcome(None, "stash-unreadable")
                 if adopted_creds is not None:
                     current = adopted_creds
-                refresh_input = current or snapshot
+                if not current:
+                    # ABSENT, not unreadable (that branch returned above): the
+                    # slot was removed between the caller's read and this
+                    # locked re-read. Falling back to the caller's snapshot
+                    # spends a grant for an account the user just deleted and
+                    # stashes a successor keyed to a generation no slot holds
+                    # — `_adopt_stashed_successor` returns early on an empty
+                    # store fingerprint, so nothing can ever adopt it. The CAS
+                    # branch below already refuses to WRITE that successor
+                    # (`consume-gate-slot-removed`); this is the same rule one
+                    # step earlier, before the grant is spent rather than
+                    # after. Every production caller reads its snapshot from
+                    # the backup store, so absent here really does mean gone.
+                    self._logger.info(
+                        "Account %s's stored credential is gone; deferring "
+                        "the refresh rather than consuming a grant for a "
+                        "slot that no longer exists.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "transient")
+                refresh_input = current
                 input_oauth = oauth.extract_oauth_data(refresh_input)
                 # Session-profile precedence: only when no live session owns
                 # the profile (a live claude rotates its own tokens — #97's
@@ -2433,7 +2464,19 @@ class ClaudeAccountSwitcher:
         # it and keep scanning; only defer via CredentialReadError once no
         # row adopted.
         deferred_entry_id: str | None = None
-        for entry_id, meta in self._store._read_stash_manifest().items():
+        manifest, manifest_unreadable = self._store._read_stash_manifest_ex()
+        if manifest_unreadable:
+            # Not "nothing stashed": the rows exist and cannot be seen. Every
+            # row below is the sole record of a generation some pass already
+            # consumed, so treating this as an empty scan makes the caller
+            # POST the slot's spent generation. Defer through the same
+            # CredentialReadError the byte-level version raises below.
+            raise CredentialReadError(
+                f"the unclaimed manifest is unreadable; deferring account "
+                f"{account_num}'s adoption rather than POSTing a generation "
+                "a stashed successor may already have superseded"
+            )
+        for entry_id, meta in manifest.items():
             if meta.get("configSlot") != account_num:
                 continue
             if meta.get("consumedFp") != cur_fp:
@@ -3830,16 +3873,18 @@ class ClaudeAccountSwitcher:
 
         # Store-resolution parity (M4), same refusal as the consume gate:
         # with CLAUDE_SECURESTORAGE_CONFIG_DIR set, CC reads/writes a
-        # redirected store while cswap resolves the default one — the copy
-        # about to be consumed is the stale predecessor by construction.
+        # redirected store while this path resolves the default one (capture
+        # mirrors it since #205; this one does not) — the copy about to be
+        # consumed is the stale predecessor by construction.
         # Serving usage on a still-valid token (above) is fine; consuming
         # or persisting against the left-behind store is not. The distinct
         # kind surfaces the remedy (ERROR_NOTES) instead of striking a
         # healthy account.
         if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
             self._logger.warning(
-                "CLAUDE_SECURESTORAGE_CONFIG_DIR is set but not mirrored by "
-                "cswap; refusing to refresh account %s's active credential "
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
+                "when capturing a credential but not when refreshing one, "
+                "so refusing to refresh account %s's active credential "
                 "(unset the variable or run from a normal shell).",
                 account_num,
             )

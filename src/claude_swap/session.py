@@ -656,15 +656,34 @@ class SessionManager:
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
-            if outcome.error is not None:
+            if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
                 # and safe to activate" signal, and it is NOT implied by
                 # credentials being present: a failed persist returns the
                 # successor AND `transient`, with the backup still holding
-                # the generation whose grant was just spent. Branching on the
-                # credentials alone stayed silent exactly there, and
-                # _bootstrap then seeded the profile from that spent
-                # generation — claude's first refresh gets invalid_grant.
+                # the generation whose grant was just spent.
+                #
+                # WARNING ABOUT IT IS NOT ENOUGH. `_bootstrap` re-reads the
+                # backup, so continuing seeds the profile from that spent
+                # generation and claude's first refresh gets invalid_grant —
+                # the warning scrolls past and the session is broken anyway.
+                #
+                # Refuse, and say it is worth retrying. The gate stashed the
+                # successor; the next run adopts it without consuming
+                # anything and bootstraps normally, so the recovery machinery
+                # already built here does the rest.
+                #
+                # This shape is distinguishable at the call site: a genuine
+                # network-transient carries `credentials=None` and falls to
+                # the warning below, where continuing on the stored
+                # credentials is correct because nothing was spent.
+                raise SessionError(
+                    f"Account-{account_num}'s refreshed credential could not "
+                    f"be stored, so the backup still holds a spent grant. "
+                    f"Nothing was lost — the successor is stashed. Please "
+                    f"retry: the next run adopts it automatically."
+                )
+            if outcome.error is not None:
                 warning(
                     f"Could not refresh the token for Account-{account_num}; "
                     "continuing with the stored credentials."

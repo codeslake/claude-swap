@@ -2651,19 +2651,25 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         assert not session_dir.exists()
 
-    def test_a_failed_persist_warns_rather_than_seeding_a_spent_grant(
-        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
+    def test_a_failed_persist_does_not_seed_the_profile_from_a_spent_grant(
+        self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
     ):
         """A failed persist returns credentials AND an error — both matter.
 
         The gate consumes the grant, fails to write the successor, and reports
         ``transient`` while the BACKUP still holds the spent generation. Its
         own comment says callers read ``error is None`` as "safe to activate",
-        and after a failed persist it is the opposite. Branching on
-        ``not outcome.credentials`` misses it: the successor rides along in
-        the return value, so the warning never fires and ``_bootstrap`` seeds
-        the profile from the backup — the spent generation. Claude's first
-        refresh then gets invalid_grant.
+        and after a failed persist it is the opposite.
+
+        Warning about it is not enough: the code continued into ``_bootstrap``,
+        which re-reads the backup, and in exactly this state the backup is the
+        generation whose grant was just spent. The profile is seeded with a
+        dead refresh token and claude's first refresh gets invalid_grant — the
+        warning scrolls past and the session is broken anyway.
+
+        Refuse instead. The next run's gate pass adopts the stashed successor
+        without consuming anything and bootstraps normally, so the recovery
+        machinery this PR already builds does the rest.
         """
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
@@ -2682,9 +2688,17 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             gate_consumes_then_fails_to_persist,
         )
 
-        manager.setup_session("2", share=False)
+        with pytest.raises(SessionError, match="retry"):
+            manager.setup_session("2", share=False)
 
         assert seeded_switcher.read_account_credentials(
             ACCOUNT_NUM, ACCOUNT_EMAIL
         ) == CREDS, "test premise: the backup still holds the spent generation"
-        assert "Could not refresh the token" in capsys.readouterr().out
+        # The half the old assertions never covered: what landed in the
+        # PROFILE. A warning that fires while the spent generation is seeded
+        # anyway pins the symptom and misses the defect.
+        seeded = session_dir / ".credentials.json"
+        assert not seeded.exists() or seeded.read_text() != CREDS, (
+            "seeded the profile with the generation whose grant the gate had "
+            "just spent — claude's first refresh gets invalid_grant"
+        )

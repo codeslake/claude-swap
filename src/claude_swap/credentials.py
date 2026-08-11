@@ -1446,17 +1446,55 @@ class CredentialStore:
     def _stash_entry_path(self, entry_id: str) -> Path:
         return self._host.credentials_dir / f".unclaimed-{entry_id}.enc"
 
-    def _read_stash_manifest(self) -> dict:
+    def _read_stash_manifest_ex(self) -> tuple[dict, bool]:
+        """Manifest read with an unreadable-vs-absent verdict.
+
+        Returns ``(entries, unreadable)`` — the same shape as
+        ``_read_account_credentials_ex`` and ``_read_unclaimed_credential``,
+        and for the same reason: "no rows" and "could not see the rows" have
+        opposite consequences here. A stash row is the SOLE record of a
+        generation a prior gate pass already consumed, so a caller that reads
+        an I/O failure as "nothing stashed" POSTs the spent generation — the
+        one POST the consume gate exists to prevent. The failure is also
+        CORRELATED rather than independent: the stash exists *because*
+        storage I/O already failed once.
+
+        The read, not ``exists()``, decides. ``Path.exists()`` answers False
+        for an unsearchable directory on 3.13+ and RAISES on 3.12, so gating
+        on it makes this verdict depend on the interpreter — the same trap
+        this branch removes from the backup reader.
+
+        CORRUPT is deliberately NOT unreadable. It is permanent, and failing
+        closed on it would deadlock: the repair (``_write_stash_manifest``
+        renaming the bad file aside) only runs on a manifest WRITE, and
+        deferring is what prevents that write from ever happening. Reading it
+        as empty lets the next stash set it aside and self-heal, at the cost
+        of one POST. Unreadable is transient by nature and self-clears, so
+        deferring there costs a pass and spends nothing.
+        """
         path = self._stash_manifest_path()
-        if not path.exists():
-            return {}
+        # BYTES, so the two failure classes cannot cross. `read_text` decodes
+        # inside the read, and ``UnicodeDecodeError`` is a ``ValueError``, not
+        # an ``OSError`` — undecodable bytes would escape an OSError-only
+        # split entirely, where the single ``except Exception`` this replaces
+        # swallowed them. Decoding below puts them where they belong: the
+        # bytes were readable, their content is garbage. That is corrupt.
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            entries = data.get("entries")
-            return entries if isinstance(entries, dict) else {}
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return {}, False
+        except OSError as e:
+            self._host._logger.warning(f"Unclaimed manifest unreadable: {e}")
+            return {}, True
+        try:
+            entries = json.loads(raw.decode("utf-8")).get("entries")
         except Exception as e:
             self._host._logger.warning(f"Failed to read unclaimed manifest: {e}")
-            return {}
+            return {}, False
+        return (entries if isinstance(entries, dict) else {}), False
+
+    def _read_stash_manifest(self) -> dict:
+        return self._read_stash_manifest_ex()[0]
 
     def _write_stash_manifest(self, entries: dict) -> None:
         from claude_swap.settings import atomic_write_json

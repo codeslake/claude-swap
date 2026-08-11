@@ -9209,9 +9209,10 @@ class TestSwitchUnreadableBackup:
 
 
 class TestConsumeGate:
-    """M2: every backup-refresh-token POST goes through consume_backup_grant —
-    locked re-read → unlocked POST → reacquire-and-CAS persist. The gate is
-    the single place a backup rt may be consumed."""
+    """M2: every backup-refresh-token POST is serialized by the consume lock —
+    locked re-read → unlocked POST → reacquire-and-CAS persist. Two call sites
+    take that lock (this gate and `_fetch_active_usage`'s recovery branch), so
+    what is single is the serialization, not the call site."""
 
     _OLD = json.dumps({
         "claudeAiOauth": {
@@ -9339,6 +9340,166 @@ class TestConsumeGate:
         assert result.error == "invalid_grant"
         # the dead bytes stay put — no destructive write
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def _stash_successor_of(self, s, credentials: str, consumed: str) -> None:
+        """A prior gate consumed `consumed`'s grant and could not persist
+        `credentials`; the store still holds `consumed`."""
+        s._store._write_unclaimed_credential(credentials, {
+            "reason": "consume-gate-persist-failed",
+            "configSlot": "1",
+            "consumedFp": oauth.credential_fingerprint(consumed),
+            "fingerprint": oauth.credential_fingerprint(credentials),
+        })
+
+    def test_an_unreadable_stash_manifest_defers_instead_of_posting(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A manifest that cannot be READ is not a manifest with no rows.
+
+        `_read_stash_manifest` collapses every failure to `{}`, and
+        `_adopt_stashed_successor` iterates manifest rows only — so with a
+        stash pending (store = the spent generation) and the manifest
+        momentarily unreadable, the gate is blind to the successor and POSTs
+        the generation whose grant is already spent. That POST is the one
+        this whole gate exists to prevent, and the failure is CORRELATED: the
+        stash exists because storage I/O already failed once.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+
+        # Both readers, so the simulation does not depend on WHICH one the
+        # manifest reader happens to use — a patch that misses the real call
+        # stops simulating anything, and the gate then reads a healthy
+        # manifest while the test still claims to be testing an unreadable one.
+        def _deny(real):
+            def denied(self_path, *a, **kw):
+                if self_path.name == ".unclaimed-manifest.json":
+                    raise PermissionError(13, "Permission denied")
+                return real(self_path, *a, **kw)
+            return denied
+
+        monkeypatch.setattr(Path, "read_bytes", _deny(Path.read_bytes))
+        monkeypatch.setattr(Path, "read_text", _deny(Path.read_text))
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], (
+            "POSTed the spent generation while its successor sat in a stash "
+            "the gate could not see"
+        )
+        assert result.error == "stash-unreadable"
+
+    def test_a_corrupt_manifest_still_posts_rather_than_deadlocking(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CORRUPT is deliberately not UNREADABLE, and this pins the line.
+
+        Failing closed here would deadlock the slot: the repair is
+        ``_write_stash_manifest`` renaming the bad file aside, and that runs
+        only on a manifest WRITE — which deferring is precisely what prevents.
+        The slot would never refresh again without a hand `cswap unclaimed
+        --purge`. Reading it as empty lets the next stash set it aside and
+        self-heal, at the cost of one POST; the entry bytes survive as orphan
+        files either way. Unreadable self-clears and gets the opposite answer.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        s._store._stash_manifest_path().write_text("{not json at all")
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [self._OLD], "a corrupt manifest froze the slot"
+        assert result.error is None
+
+    def test_a_manifest_of_invalid_utf8_is_corrupt_not_unreadable(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Undecodable BYTES are corrupt, not inaccessible.
+
+        `read_text` raises UnicodeDecodeError — a ValueError, not an OSError —
+        so a verdict that splits on OSError alone lets it escape the reader
+        entirely. The old single `except Exception` swallowed it to `{}`;
+        losing that is a regression the unreadable/corrupt split can introduce
+        silently, because the two named failure modes both still pass.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        s._store._stash_manifest_path().write_bytes(b"\xff\xfe\x00not utf8")
+
+        entries, unreadable = s._store._read_stash_manifest_ex()
+
+        assert (entries, unreadable) == ({}, False)
+
+    def test_a_readable_empty_manifest_still_posts(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The control. Nothing stashed really does mean nothing to adopt —
+        without this, the test above passes on a gate that never POSTs."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [self._OLD]
+        assert result.error is None
+
+    def test_a_removed_slot_defers_instead_of_posting_the_snapshot(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`refresh_input = current or snapshot` resurrects a deleted account.
+
+        A slot removed between the caller's read and this gate's locked
+        re-read comes back ABSENT (not unreadable), and the `or` falls back to
+        the caller's snapshot: the gate spends a grant and stashes the
+        successor of an account the user just deleted. The CAS branch twenty
+        lines later already refuses to write that successor back
+        (`consume-gate-slot-removed`) — this is the same rule, one step
+        earlier, before the grant is spent rather than after.
+
+        All three production callers source their snapshot from the backup
+        store, so an absent re-read really does mean removed.
+        """
+        s = self._switcher(sample_sequence_data)
+        # No stored credential for slot 1: `cswap remove` landed first.
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], "spent a grant for a slot that no longer exists"
+        assert result.error == "transient"
+        assert not s.list_unclaimed_credentials(), (
+            "stashed a successor for an account the user deleted"
+        )
 
 
 class TestInactiveRefreshRoutesThroughGate:
