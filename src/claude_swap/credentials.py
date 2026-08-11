@@ -1501,7 +1501,18 @@ class CredentialStore:
         except Exception as e:
             self._host._logger.warning(f"Failed to read unclaimed manifest: {e}")
             return {}, "corrupt"
-        return (entries if isinstance(entries, dict) else {}), "ok"
+        if not isinstance(entries, dict):
+            # Parseable, but structurally not a manifest: ``entries`` missing
+            # or the wrong type. Reading that as ok-with-no-rows re-opens the
+            # gap the corrupt verdict closes — orphan entry files would bypass
+            # the fail-closed condition because the verdict said nothing was
+            # wrong. The rows are as unestablishable as under unparseable
+            # bytes, so it gets the same verdict.
+            self._host._logger.warning(
+                "Unclaimed manifest parses but has no valid 'entries' member"
+            )
+            return {}, "corrupt"
+        return entries, "ok"
 
     def _stash_entry_files_exist(self) -> bool:
         """Is there any stashed credential's BYTES on disk?
@@ -1515,11 +1526,29 @@ class CredentialStore:
         Unknowable answers TRUE: a directory we cannot list is not evidence
         that nothing is at risk, and the caller uses this to decide whether to
         spend a grant.
+
+        ``iterdir``, NOT ``glob``. ``Path.glob`` SUPPRESSES directory-scan
+        ``OSError``s, so the guard's except arm never ran: measured on 3.14.6,
+        a searchable-but-unlistable credentials dir (mode 0o311) returned
+        ``[]`` with a real orphan sitting right there — the manifest and the
+        entry bytes stay readable through the searchable dir, so corrupt+
+        orphans read as corrupt+empty and the gate POSTed the spent grant.
+        ``iterdir`` raises on the same state. The same interpreter-suppression
+        trap as ``Path.exists()``, third appearance in this file.
+
+        A MISSING directory is the one ``OSError`` that answers False: no
+        credentials dir means provably nothing was ever stashed.
         """
         try:
-            return any(self._host.credentials_dir.glob(".unclaimed-*.enc"))
+            for entry in self._host.credentials_dir.iterdir():
+                name = entry.name
+                if name.startswith(".unclaimed-") and name.endswith(".enc"):
+                    return True
+        except FileNotFoundError:
+            return False
         except OSError:
             return True
+        return False
 
     def _read_stash_manifest(self) -> dict:
         return self._read_stash_manifest_ex()[0]

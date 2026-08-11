@@ -9484,24 +9484,72 @@ class TestConsumeGate:
         assert posted == [self._OLD], "the documented exit did not unblock it"
         assert result.error is None
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
     def test_an_unlistable_dir_counts_as_entries_at_risk(
-        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+        self, temp_home: Path, sample_sequence_data: dict
     ):
         """The corrupt policy asks "is anything at risk"; not knowing is YES.
 
         `_stash_entry_files_exist` is what lets a corrupt manifest proceed, so
-        a glob that FAILS must not read as "nothing on disk" — that is the
+        a scan that FAILS must not read as "nothing on disk" — that is the
         empty-means-safe conflation this whole PR removes, one level down. The
         caller spends a grant on this answer.
+
+        The REAL state, not a monkeypatched scan. The first version of this
+        test patched `Path.glob` to raise — and passed against a detector
+        whose except arm was dead code, because `glob` SUPPRESSES scan
+        OSErrors (3.14: a searchable-but-unlistable dir answers `[]`, no
+        raise, with the orphan sitting right there). A test that fakes the
+        raise cannot see that the raise never happens; only the state itself
+        can.
         """
         s = self._switcher(sample_sequence_data)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        assert s._store._stash_entry_files_exist() is True, "test premise"
 
-        def unlistable(self_path, *a, **kw):
-            raise PermissionError(13, "Permission denied")
+        cred_dir = s._store._host.credentials_dir
+        os.chmod(cred_dir, 0o311)  # searchable (files reachable), unlistable
+        try:
+            assert s._store._stash_entry_files_exist() is True
+        finally:
+            os.chmod(cred_dir, 0o700)
 
-        monkeypatch.setattr(Path, "glob", unlistable)
+    def test_a_missing_credentials_dir_is_provably_nothing_stashed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The one scan failure that answers False: no dir, nothing ever
+        stashed. Folding it into the at-risk arm would fail a corrupt-manifest
+        slot closed on a machine that never stashed anything — permanently,
+        since with no entries there is no purge exit to walk."""
+        s = self._switcher(sample_sequence_data)
+        cred_dir = s._store._host.credentials_dir
+        if cred_dir.is_dir():
+            import shutil as _shutil
 
-        assert s._store._stash_entry_files_exist() is True
+            _shutil.rmtree(cred_dir)
+
+        assert s._store._stash_entry_files_exist() is False
+
+    def test_a_manifest_without_a_dict_entries_member_is_corrupt(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Parseable-but-structurally-wrong is corrupt, not ok-with-no-rows.
+
+        `{"entries": "bogus"}` decodes and parses, so it reaches neither the
+        unreadable nor the unparseable arm — and reading it as `"ok"` with no
+        rows bypasses the corrupt+orphans fail-closed condition exactly the
+        way unparseable bytes used to. The rows are equally unestablishable in
+        both shapes, so both get the corrupt verdict.
+        """
+        s = self._switcher(sample_sequence_data)
+        for payload in ('{"schemaVersion": 1, "entries": "bogus"}',
+                        '{"schemaVersion": 1}'):
+            s._store._stash_manifest_path().write_text(payload)
+            entries, verdict = s._store._read_stash_manifest_ex()
+            assert (entries, verdict) == ({}, "corrupt"), payload
 
     def test_a_corrupt_manifest_with_orphan_entries_fails_closed(
         self, temp_home: Path, sample_sequence_data: dict
