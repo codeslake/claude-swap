@@ -35,6 +35,11 @@ from claude_swap.switcher import (
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
 )
+from claude_swap import macos_keychain as _kc
+from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.paths import get_global_config_path
+from claude_swap.usage_store import SERVE_TTL_S, _row_eligible
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 
 
 def _raise_locked(*args, **kwargs):

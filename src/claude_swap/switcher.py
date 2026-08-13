@@ -6691,10 +6691,14 @@ class ClaudeAccountSwitcher:
                 f"but it is unreadable right now (locked or no GUI "
                 f"session). Retry from a GUI terminal; do not re-add."
             )
-        raise SwitchError(
-            f"Account-{account_num} has no stored credentials. "
-            f"Re-add with: cswap --add-account --slot {account_num}"
-        )
+        # GENUINELY ABSENT is not an error here: an empty slot is a
+        # destination, not a failure — it is what a roster import leaves
+        # behind, and the only way to fill one is to BE on it and log in.
+        # Returning "" lets `_perform_switch` route to
+        # `_switch_to_empty_slot`; raising sent the one slot you needed to
+        # reach to "re-add the account", which is the case #199 exists to fix.
+        # The UNREADABLE raise above stays: that one must not become a re-add.
+        return ""
 
     def _refuse_session_shell(self) -> None:
         """Refuse live-store mutation from inside a ``cswap run`` shell.
@@ -6832,6 +6836,10 @@ class ClaudeAccountSwitcher:
                 target_creds = self._read_target_credentials(
                     target_account, target_email
                 )
+                if not target_creds:
+                    return self._switch_to_empty_slot(
+                        target_account, target_email, from_ref, to_ref, data
+                    )
                 target_config = self._read_account_config(target_account, target_email)
                 if (not target_creds or not target_config) and self._keychain_blind():
                     raise SwitchError(
@@ -7189,6 +7197,10 @@ class ClaudeAccountSwitcher:
                 target_creds = self._read_target_credentials(
                     target_account, target_email
                 )
+                if not target_creds:
+                    return self._switch_to_empty_slot(
+                        target_account, target_email, from_ref, to_ref, data
+                    )
                 target_config = self._read_account_config(target_account, target_email)
 
                 if (not target_creds or not target_config) and self._keychain_blind():
