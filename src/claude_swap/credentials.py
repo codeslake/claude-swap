@@ -548,9 +548,6 @@ class CredentialStore:
         # key reading as a genuinely empty slot.
         unreachable = keychain_failed or self._managed_read_failed
         return ActiveCredentials("", unreachable, unreachable)
-        # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
-        # UI distinguishes it from a real empty slot.
-        return ActiveCredentials("", keychain_failed, keychain_failed)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.

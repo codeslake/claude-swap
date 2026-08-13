@@ -12875,6 +12875,7 @@ class TestGateUltraReviewFixes:
         cannot pass alone.
         """
         from claude_swap.session import STALE_MARKER
+        from claude_swap.session import stale_marker_for
 
         for invalidation_raises in (False, True):
             sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
@@ -12908,7 +12909,7 @@ class TestGateUltraReviewFixes:
                 # MARKED — otherwise a profile whose access token is still
                 # unexpired keeps serving a spent refresh token and nothing
                 # forces the re-bootstrap.
-                assert (sess / STALE_MARKER).exists(), (
+                assert stale_marker_for(sess).exists(), (
                     "a swallowed invalidation left no stale marker: the "
                     "profile will keep serving the superseded generation"
                 )
