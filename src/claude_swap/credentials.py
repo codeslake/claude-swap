@@ -843,12 +843,6 @@ class CredentialStore:
                 f"{get_global_config_path()} is unreadable"
             )
             return False
-            self._host._logger.warning(
-                "Could not clear primaryApiKey: the global config exists "
-                "but could not be read (unreadable, not absent) — leaving "
-                "it in place rather than overwriting it unread"
-            )
-            return
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
                 c.pop("primaryApiKey", None)

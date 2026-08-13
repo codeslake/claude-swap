@@ -2126,22 +2126,13 @@ class TestForceOverwriteNarratesTheStrikeClear:
         out = temp_home / "bob.cswap"
         export_accounts(s, str(out), account="2")
         env = json.loads(out.read_text())
-        env["accounts"][0]["credentials"]["_marker"] = "SHOULD_NOT_LAND"
+        env["accounts"][0]["credentials"]["refreshToken"] = "rtok-2-rotated"
         out.write_text(json.dumps(env))
+        import_accounts(s, str(out), force=True)
 
-        with patch.object(macos_keychain, "get_password", side_effect=_raise_locked):
-            active = s._store._read_active_credentials()
-            assert active.degraded is True and active.keychain_unavailable is False, (
-                "setup error: this shape needs degraded=True, "
-                f"keychain_unavailable=False, got {active!r}"
-            )
-            import_accounts(s, str(out), force=False)
-            err = capsys.readouterr().err
-            assert "Skipped bob@example.com (already exists, use --force)" in err, (
-                "C-1 Shape B regression: a degraded (stale-fallback-covered) "
-                f"active read let import overwrite without --force, got: {err!r}"
-            )
-            assert "Replaced" not in err
+        err = capsys.readouterr().err
+        assert "cleared this slot's stored dead-token strike" in err
+        assert "same credential generation" not in err
 
     def test_plain_import_does_not_overwrite_healed_idle_slot_on_locked_keychain(
         self, temp_home: Path, capsys, block_real_keychain,
