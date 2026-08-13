@@ -62,14 +62,27 @@ menubar = ["rumps>=0.4.0"]
 #     lineage rather than for the port, which is what made every earlier
 #     reading of it wrong.
 #
+# WHAT 0.1.70 ADDS, and why the floor moves off 0.1.68:
+#   - save_pin writes settings.json byte-stably. Before it, `--clear` popped
+#     `remoteControl` and a re-pin appended it LAST, so atomic_write_json —
+#     insertion-ordered, no sort_keys — rewrote identical content in a
+#     different byte order. settings.json is symlinked into dotfiles, so a
+#     clear+re-pin cycle dirtied a TRACKED file on all three machines with a
+#     diff nobody could attribute. 0.1.68 and 0.1.69 both predate the fix.
+#
 # The seam itself does not need any of this: `heal`, `load_pin` and
-# `apply_pin` have byte-identical signatures from v0.1.0 through 0.1.68. The
+# `apply_pin` have byte-identical signatures from v0.1.0 through 0.1.70. The
 # floor is about the BEHAVIOUR around them, not the API.
+#
+# Not a live break today — `uv tool install` resolves newest-satisfying, so it
+# takes 0.1.70 regardless; 0.1.68/0.1.69 only get in when resolution has to
+# backtrack. Tightened because the floor is a statement about which build this
+# extra was tested against, and the untested ones write to a tracked file.
 #
 # RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
 # accepted deliberately, and the pre-push hook in cswap-pin already warns when
 # src changes without a version bump — this is the other half of that.
-pin = ["cswap-pin>=0.1.68"]
+pin = ["cswap-pin>=0.1.70"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
