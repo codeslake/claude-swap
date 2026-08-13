@@ -28,7 +28,11 @@ from pathlib import Path
 from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
-from claude_swap.exceptions import CredentialError, CredentialWriteError
+from claude_swap.exceptions import (
+    CredentialError,
+    CredentialReadError,
+    CredentialWriteError,
+)
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform
 from claude_swap.paths import (
@@ -544,6 +548,9 @@ class CredentialStore:
         # key reading as a genuinely empty slot.
         unreachable = keychain_failed or self._managed_read_failed
         return ActiveCredentials("", unreachable, unreachable)
+        # Nothing anywhere. Flag a failed-and-uncovered OAuth Keychain read so the
+        # UI distinguishes it from a real empty slot.
+        return ActiveCredentials("", keychain_failed, keychain_failed)
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -673,6 +680,7 @@ class CredentialStore:
         to discard. Callers that must VERIFY a clear need this: a read cannot
         answer for them once file mode is pinned, because then nothing asks the
         Keychain at all. Off macOS there is no Keychain item, hence ``True``.
+        to discard. Off macOS there is no Keychain item, hence ``True``.
         """
         if self._host.platform != Platform.MACOS:
             return True
@@ -805,6 +813,16 @@ class CredentialStore:
         same: a stale ``primaryApiKey`` surviving alongside a freshly
         activated OAuth credential is a live cross-account key that bills per
         token while it lies.
+        I-2 (round 9): ``_read_global_config`` collapses ABSENT and UNREADABLE
+        into the same ``None`` — without the distinction below, an unreadable
+        config (permissions, mid-unmount) reads exactly like a genuinely
+        keyless profile, so the clear is silently skipped. Best-effort stays
+        best-effort here (never raises — the write path this feeds must not
+        block on a transient read glitch), but a distinguishing warning
+        matters: a stale ``primaryApiKey`` surviving alongside a freshly
+        activated OAuth credential is a live cross-account key that bills
+        per token while it lies, and a caller/log reader must be able to
+        tell "nothing to clear" from "could not check".
         """
         cleared = True
         if self._host.platform == Platform.MACOS:
@@ -828,6 +846,12 @@ class CredentialStore:
                 f"{get_global_config_path()} is unreadable"
             )
             return False
+            self._host._logger.warning(
+                "Could not clear primaryApiKey: the global config exists "
+                "but could not be read (unreadable, not absent) — leaving "
+                "it in place rather than overwriting it unread"
+            )
+            return
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
                 c.pop("primaryApiKey", None)
@@ -1077,10 +1101,17 @@ class CredentialStore:
         """
         enc_file = self._backup_enc_path(account_num, email)
         try:
-            # Python 3.12's Path.exists() raises on an unsearchable directory
-            # where 3.13+ returns False — normalize to "missing" so every
-            # version takes the same best-effort path.
-            enc_present = enc_file.exists()
+            # `stat`, NOT `exists`. `Path.exists()` SWALLOWS OSError from 3.13
+            # on and answers False, so an unsearchable credentials/ dir became
+            # byte-identical to a genuinely absent backup — on 3.12 the raise
+            # reached the handler below and marked the read failed, on 3.13+
+            # nothing did. The platform decided whether a read failure was
+            # reported, and the fleet runs both (3.12 on two machines, 3.14 on
+            # one). `stat` raises on every version, so the distinction the
+            # handler below exists to draw survives on all of them.
+            enc_file.stat()
+        except FileNotFoundError:
+            enc_present = False
         except OSError as e:
             # The directory itself could not be searched (permissions, a
             # mid-unmount, ...) — a real read failure, same as the arm below
@@ -1092,6 +1123,8 @@ class CredentialStore:
                 failed.append(True)
             self._host._logger.warning(f"Failed to read credentials file: {e}")
             enc_present = False
+        else:
+            enc_present = True
         if enc_present:
             try:
                 encoded = enc_file.read_text(encoding="utf-8").strip()
@@ -1473,17 +1506,108 @@ class CredentialStore:
     def _stash_entry_path(self, entry_id: str) -> Path:
         return self._host.credentials_dir / f".unclaimed-{entry_id}.enc"
 
-    def _read_stash_manifest(self) -> dict:
+    def _read_stash_manifest_ex(self) -> tuple[dict, str]:
+        """Manifest read with a three-way verdict: ok / unreadable / corrupt.
+
+        Returns ``(entries, verdict)``. The verdict exists because "no rows"
+        and "could not establish the rows" have opposite consequences here: a
+        stash row is the SOLE record of a generation a prior gate pass already
+        consumed, so a caller that reads a failure as "nothing stashed" POSTs
+        the spent generation — the one POST the consume gate exists to
+        prevent. The failure is also CORRELATED rather than independent: the
+        stash exists *because* storage I/O already failed once.
+
+        A bool cannot carry it, because the two failure modes need different
+        answers and one of them is caller-dependent:
+
+        - ``"unreadable"`` — the bytes exist and could not be read (locked
+          keychain, EIO, a mode). Transient by nature and self-clearing, so
+          every caller defers: it costs a pass and spends nothing.
+        - ``"corrupt"`` — the bytes were read and are not a manifest. This is
+          PERMANENT, so a blanket fail-closed would deadlock the slot: the
+          repair is ``_write_stash_manifest`` renaming the bad file aside, and
+          that runs only on a manifest WRITE, which deferring prevents. The
+          adopt scan therefore decides by whether any entry bytes are actually
+          at risk (see ``_stash_entry_files_exist``), and the mutator proceeds
+          so the set-aside can happen at all.
+        - ``"ok"`` — includes a genuinely absent manifest; no rows and nothing
+          to protect read the same to every caller.
+
+        The read, not ``exists()``, decides. ``Path.exists()`` answers False
+        for an unsearchable directory on 3.13+ and RAISES on 3.12, so gating
+        on it makes this verdict depend on the interpreter — the same trap
+        this branch removes from the backup reader.
+        """
         path = self._stash_manifest_path()
-        if not path.exists():
-            return {}
+        # BYTES, so the two failure classes cannot cross. `read_text` decodes
+        # inside the read, and ``UnicodeDecodeError`` is a ``ValueError``, not
+        # an ``OSError`` — undecodable bytes would escape an OSError-only
+        # split entirely, where the single ``except Exception`` this replaces
+        # swallowed them. Decoding below puts them where they belong: the
+        # bytes were readable, their content is garbage. That is corrupt.
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            entries = data.get("entries")
-            return entries if isinstance(entries, dict) else {}
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return {}, "ok"
+        except OSError as e:
+            self._host._logger.warning(f"Unclaimed manifest unreadable: {e}")
+            return {}, "unreadable"
+        try:
+            entries = json.loads(raw.decode("utf-8")).get("entries")
         except Exception as e:
             self._host._logger.warning(f"Failed to read unclaimed manifest: {e}")
-            return {}
+            return {}, "corrupt"
+        if not isinstance(entries, dict):
+            # Parseable, but structurally not a manifest: ``entries`` missing
+            # or the wrong type. Reading that as ok-with-no-rows re-opens the
+            # gap the corrupt verdict closes — orphan entry files would bypass
+            # the fail-closed condition because the verdict said nothing was
+            # wrong. The rows are as unestablishable as under unparseable
+            # bytes, so it gets the same verdict.
+            self._host._logger.warning(
+                "Unclaimed manifest parses but has no valid 'entries' member"
+            )
+            return {}, "corrupt"
+        return entries, "ok"
+
+    def _stash_entry_files_exist(self) -> bool:
+        """Is there any stashed credential's BYTES on disk?
+
+        Asked only when the manifest is corrupt, to tell "the mapping is gone
+        and there is nothing it could have mapped" from "the mapping is gone
+        and a consumed generation's only copy is sitting right here". The
+        entry files are named independently of the manifest, so they answer
+        even when it cannot.
+
+        Unknowable answers TRUE: a directory we cannot list is not evidence
+        that nothing is at risk, and the caller uses this to decide whether to
+        spend a grant.
+
+        ``iterdir``, NOT ``glob``. ``Path.glob`` SUPPRESSES directory-scan
+        ``OSError``s, so the guard's except arm never ran: measured on 3.14.6,
+        a searchable-but-unlistable credentials dir (mode 0o311) returned
+        ``[]`` with a real orphan sitting right there — the manifest and the
+        entry bytes stay readable through the searchable dir, so corrupt+
+        orphans read as corrupt+empty and the gate POSTed the spent grant.
+        ``iterdir`` raises on the same state. The same interpreter-suppression
+        trap as ``Path.exists()``, third appearance in this file.
+
+        A MISSING directory is the one ``OSError`` that answers False: no
+        credentials dir means provably nothing was ever stashed.
+        """
+        try:
+            for entry in self._host.credentials_dir.iterdir():
+                name = entry.name
+                if name.startswith(".unclaimed-") and name.endswith(".enc"):
+                    return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return False
+
+    def _read_stash_manifest(self) -> dict:
+        return self._read_stash_manifest_ex()[0]
 
     def _write_stash_manifest(self, entries: dict) -> None:
         from claude_swap.settings import atomic_write_json
@@ -1548,7 +1672,28 @@ class CredentialStore:
 
         self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
         with FileLock(self._stash_manifest_path().with_suffix(".lock")):
-            entries = self._read_stash_manifest()
+            entries, verdict = self._read_stash_manifest_ex()
+            if verdict == "unreadable":
+                # Reading an unreadable-but-VALID manifest as `{}` does not
+                # merely miss rows. ``_write_stash_manifest`` below finds the
+                # same file unparseable, renames the healthy manifest aside,
+                # and writes a fresh one holding only this mutation's row —
+                # orphaning every previously mapped successor in one step,
+                # in exactly the correlated setting where a stash is being
+                # written because storage already misbehaved.
+                #
+                # Raising suits both callers: a failed STASH must be loud (a
+                # successful one is the licence to overwrite the live store),
+                # and a failed RETIRE is already swallowed by
+                # ``_retire_stash_entry``.
+                #
+                # CORRUPT deliberately falls through: the set-aside below is
+                # the only repair, and it can only happen on a write.
+                raise CredentialReadError(
+                    "the unclaimed manifest is unreadable; refusing to rewrite "
+                    "it from an empty read, which would orphan every stashed "
+                    "successor it maps"
+                )
             mutate(entries)
             self._write_stash_manifest(entries)
 

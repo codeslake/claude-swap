@@ -892,7 +892,9 @@ class AutoSwitchEngine:
         )
         if not near_expiry:
             return "ok"
-        # The consume gate is the single place a backup rt may be POSTed:
+        # The consume gate serializes every backup-rt POST (the recovery
+        # branch in `_fetch_active_usage` is a second call site, under the
+        # same per-slot consume lock):
         # it re-reads under the slot lock (our snapshot may be superseded),
         # consults the session profile for a newer generation, and persists
         # via fingerprint CAS — so a freshen racing the collector (or a

@@ -1705,6 +1705,8 @@ class TestStruckFingerprintHygiene:
         )
         # legacy writer strikes without a fingerprint -- no clear in between,
         # so only THIS write can change struckFingerprint.
+        store.clear_dead_token(["1"], ident)
+        # legacy writer strikes without a fingerprint
         store.record({"1": FetchRecord(error="invalid_grant")}, ident)
         entry = store.entries(ident)["1"]
         assert entry.struck_fingerprint is None

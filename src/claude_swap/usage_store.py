@@ -1220,6 +1220,9 @@ class UsageStore:
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
+            row["consecutiveFailures"] = 0
+            row["lastError"] = None
+            row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
 

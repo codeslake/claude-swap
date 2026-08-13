@@ -27,6 +27,7 @@ from unittest.mock import call, patch
 import pytest
 
 from claude_swap import macos_keychain
+from claude_swap.exceptions import SwitchError
 from claude_swap.models import Platform
 from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
@@ -1165,16 +1166,14 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
         )
         assert verdict == USAGE_NO_CREDENTIALS, verdict
 
-    def test_switch_to_an_empty_slot_lands_after_our_file_mode_write(
+    def test_switch_to_an_empty_slot_says_re_add_after_our_file_mode_write(
         self, macos_switcher, temp_home: Path
     ):
-        """The third sibling: the guard in front of ``_perform_switch``.
+        """The third sibling: ``_perform_switch``'s ``backup_unreadable``.
 
-        Reading the raw flag there refuses the switch with "retry from a GUI
-        terminal; do not re-add" — advice that cannot work for a slot with no
-        backup at all, and which blocks the one thing that fills it: being ON
-        the slot to log in. An empty slot is a destination, so the switch must
-        LAND rather than raise.
+        Reading the raw flag there sends the user to the one remedy that
+        cannot work — "retry from a GUI terminal; do not re-add" for a slot
+        that has no backup at all — and hides the one that can.
         """
         s = macos_switcher
         s._setup_directories()
@@ -1202,3 +1201,6 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
 
         assert out["switched"] is True, out
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+        with pytest.raises(SwitchError) as exc:
+            s._perform_switch("2", emit_output=False, force_activate=True)
+        assert "has no stored credentials" in str(exc.value), exc.value

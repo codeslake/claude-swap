@@ -14,27 +14,20 @@ import pytest
 
 from claude_swap import macos_keychain
 from claude_swap import oauth
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_RELOGIN_REQUIRED, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
     AccountNotFoundError,
-    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
+    SessionError,
     SwitchError,
     ValidationError,
 )
-from claude_swap.usage_store import (
-    FetchRecord,
-    UsageEntry,
-    UsageStore,
-    SERVE_TTL_S,
-    _row_eligible,
-)
+from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.credentials import ActiveCredentials
-from claude_swap.paths import get_global_config_path
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
@@ -924,6 +917,43 @@ class TestFetchAccountUsageSessionProfile:
         assert kwargs.get("is_active") is True
 
 
+class TestLiveSessionGuardOnAnUnreadableRecord:
+    """A session record we could not READ must not answer "nobody there".
+
+    ``list_sessions`` skips an unparseable record, which is right for a SCAN:
+    one bad file must not kill a listing. ``_ensure_no_live_session`` is a
+    GUARD on the same data, and it gates destruction — ``_bootstrap`` deletes
+    the profile's Keychain entry and overwrites ``.credentials.json``, and
+    ``remove_account`` deletes the slot. A shorter list reads there as "no
+    live claude", so one unreadable record opens that gate underneath a
+    running instance.
+
+    Every other test of this guard patches ``_live_session_pids``, so none of
+    them exercises the read that produces the collapse.
+    """
+
+    def _sessions_dir(self, switcher) -> Path:
+        d = switcher._session_dir("2", "test@example.com") / "sessions"
+        d.mkdir(parents=True)
+        return d
+
+    def test_unreadable_record_refuses_like_a_live_one(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        d = self._sessions_dir(switcher)
+        (d / "9999.json").write_text("not json{{{", encoding="utf-8")
+
+        with pytest.raises(SessionError, match="could not be read"):
+            switcher._ensure_no_live_session("2", "test@example.com", "the operation")
+
+    def test_readable_and_empty_still_permits(self, temp_home: Path):
+        """The control. Without it the test above passes on a guard that
+        refuses unconditionally, which is not the contract."""
+        switcher = ClaudeAccountSwitcher()
+        self._sessions_dir(switcher)
+
+        switcher._ensure_no_live_session("2", "test@example.com", "the operation")
+
+
 class TestListAccountsUsage:
     """Test list_accounts shows usage info."""
 
@@ -1031,12 +1061,7 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        # The state, and what to do about it. It used to print the bare
-        # words "no credentials", which name the problem and stop there —
-        # and the fix people reach for (/login on whatever account is
-        # active) writes the login to the wrong slot.
-        assert "no stored login" in output
-        assert "switch here" in output
+        assert "no credentials" in output
 
     def test_list_never_writes_live_while_claude_code_running(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -1792,7 +1817,7 @@ class TestActiveAccountRefresh:
         assert result.sentinel is None
         write_live.assert_called_once_with(self._REFRESHED)
 
-    def test_a_held_credential_lock_defers_the_active_refresh(
+    def test_a_held_consume_lock_defers_the_active_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
         """The active path may POST the slot's BACKUP grant, so it owes the
@@ -1810,28 +1835,8 @@ class TestActiveAccountRefresh:
         switcher = self._switcher(sample_sequence_data)
         holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
         assert holder.acquire(), "could not seed the contended lock"
-        # TWO THINGS WERE WRONG HERE AND THE SECOND HID BEHIND THE FIRST.
-        #
-        # 1. It paid the FileLock default (10s) in full — the slowest test in
-        #    the suite by 5x, 10.01s of a 61s run.
-        # 2. It never reached the gate it names. `consume_lock` lives in
-        #    `consume_backup_grant`; this drives `_fetch_active_usage`, which
-        #    hits an EARLIER gate first. Instrumented: the branch under test
-        #    was reached 0 times, and mutating `if not consume_lock.acquire()`
-        #    to `if False` left the test PASSING — on the original 10s version
-        #    too, so this is not a speedup artefact. It was spending ten
-        #    seconds proving something else.
-        #
-        # What it actually exercised is worth keeping (a held credential lock
-        # defers rather than POSTs), so that is what it now says, asserted
-        # through the log line that names it. The consume gate gets its own
-        # test below, driving `consume_backup_grant` directly.
-        real_init = FileLock.__init__
         try:
-            def fast_init(self, lock_path, timeout=0.05):
-                real_init(self, lock_path, timeout)
-
-            with patch.object(FileLock, "__init__", fast_init), patch.object(
+            with patch.object(
                 switcher, "_read_credentials", return_value=self._EXPIRED
             ), patch.object(
                 switcher, "_read_account_credentials", return_value=self._EXPIRED
@@ -1850,50 +1855,6 @@ class TestActiveAccountRefresh:
             "POSTed a backup grant while another consume held its lock"
         )
         assert result.sentinel == USAGE_TOKEN_EXPIRED
-
-    def test_a_held_consume_lock_defers_the_grant_post(
-        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
-    ):
-        """THE gate the test above only claimed to cover.
-
-        `consume_backup_grant` owns `.consume-N.lock`, and the whole point is
-        that a second gate must not POST the same one-time-use grant while
-        another holds it: one POST wins, the loser gets invalid_grant, and the
-        strike lands on a live account.
-
-        Driven at `consume_backup_grant` directly. Reaching it through
-        `_fetch_active_usage` is what made the sibling test above miss —
-        an earlier credential-lock gate defers first, so the consume branch
-        was never entered at all (instrumented: 0 hits).
-        """
-        from claude_swap.locking import FileLock
-
-        switcher = self._switcher(sample_sequence_data)
-        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
-        holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
-        assert holder.acquire(), "could not seed the contended lock"
-
-        real_init = FileLock.__init__
-
-        def fast_init(self, lock_path, timeout=0.05):
-            real_init(self, lock_path, timeout)
-
-        try:
-            with patch.object(FileLock, "__init__", fast_init), patch(
-                "claude_swap.oauth.try_refresh_oauth_credentials"
-            ) as mock_refresh:
-                out = switcher.consume_backup_grant(
-                    "1", "test@example.com", self._EXPIRED
-                )
-        finally:
-            holder.release()
-
-        mock_refresh.assert_not_called(), (
-            "POSTed the shared one-time grant while another consume held its lock"
-        )
-        assert out.error == "consume-busy", (
-            f"a contended consume must report its own kind, got {out.error!r}"
-        )
 
     def test_filelock_contention_defers_instead_of_raising(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -3053,6 +3014,109 @@ class TestActiveAccountRefresh:
         write_backup.assert_not_called()
         mock_fetch.assert_not_called()
 
+    def test_a_held_credential_lock_defers_the_active_refresh(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """The active path may POST the slot's BACKUP grant, so it owes the
+        consume lock.
+
+        refresh_input becomes `backup` when the live bytes moved or were
+        cleared, which makes this a second backup-token POST outside
+        consume_backup_grant. Measured before the fix: with .consume-N.lock
+        held by another process, this path still POSTed the shared grant —
+        one of the two POSTs wins, the loser gets invalid_grant, and the
+        strike lands on a live account.
+        """
+        from claude_swap.locking import FileLock
+
+        switcher = self._switcher(sample_sequence_data)
+        holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
+        assert holder.acquire(), "could not seed the contended lock"
+        # TWO THINGS WERE WRONG HERE AND THE SECOND HID BEHIND THE FIRST.
+        #
+        # 1. It paid the FileLock default (10s) in full — the slowest test in
+        #    the suite by 5x, 10.01s of a 61s run.
+        # 2. It never reached the gate it names. `consume_lock` lives in
+        #    `consume_backup_grant`; this drives `_fetch_active_usage`, which
+        #    hits an EARLIER gate first. Instrumented: the branch under test
+        #    was reached 0 times, and mutating `if not consume_lock.acquire()`
+        #    to `if False` left the test PASSING — on the original 10s version
+        #    too, so this is not a speedup artefact. It was spending ten
+        #    seconds proving something else.
+        #
+        # What it actually exercised is worth keeping (a held credential lock
+        # defers rather than POSTs), so that is what it now says, asserted
+        # through the log line that names it. The consume gate gets its own
+        # test below, driving `consume_backup_grant` directly.
+        real_init = FileLock.__init__
+        try:
+            def fast_init(self, lock_path, timeout=0.05):
+                real_init(self, lock_path, timeout)
+
+            with patch.object(FileLock, "__init__", fast_init), patch.object(
+                switcher, "_read_credentials", return_value=self._EXPIRED
+            ), patch.object(
+                switcher, "_read_account_credentials", return_value=self._EXPIRED
+            ), patch(
+                "claude_swap.oauth.try_refresh_oauth_credentials"
+            ) as mock_refresh, patch(
+                "claude_swap.oauth.try_fetch_usage_for_account"
+            ):
+                result = switcher._fetch_active_usage(
+                    "1", "test@example.com", self._EXPIRED
+                )
+        finally:
+            holder.release()
+
+        mock_refresh.assert_not_called(), (
+            "POSTed a backup grant while another consume held its lock"
+        )
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+
+    def test_a_held_consume_lock_defers_the_grant_post(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """THE gate the test above only claimed to cover.
+
+        `consume_backup_grant` owns `.consume-N.lock`, and the whole point is
+        that a second gate must not POST the same one-time-use grant while
+        another holds it: one POST wins, the loser gets invalid_grant, and the
+        strike lands on a live account.
+
+        Driven at `consume_backup_grant` directly. Reaching it through
+        `_fetch_active_usage` is what made the sibling test above miss —
+        an earlier credential-lock gate defers first, so the consume branch
+        was never entered at all (instrumented: 0 hits).
+        """
+        from claude_swap.locking import FileLock
+
+        switcher = self._switcher(sample_sequence_data)
+        switcher._write_account_credentials("1", "test@example.com", self._EXPIRED)
+        holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
+        assert holder.acquire(), "could not seed the contended lock"
+
+        real_init = FileLock.__init__
+
+        def fast_init(self, lock_path, timeout=0.05):
+            real_init(self, lock_path, timeout)
+
+        try:
+            with patch.object(FileLock, "__init__", fast_init), patch(
+                "claude_swap.oauth.try_refresh_oauth_credentials"
+            ) as mock_refresh:
+                out = switcher.consume_backup_grant(
+                    "1", "test@example.com", self._EXPIRED
+                )
+        finally:
+            holder.release()
+
+        mock_refresh.assert_not_called(), (
+            "POSTed the shared one-time grant while another consume held its lock"
+        )
+        assert out.error == "consume-busy", (
+            f"a contended consume must report its own kind, got {out.error!r}"
+        )
+
 
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
@@ -3973,43 +4037,6 @@ class TestDeadTokenQuarantine:
         run.assert_called_once()  # it was fetch-eligible, not pre-quarantined
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
-    def test_post_fetch_invalid_grant_on_active_slot_does_not_condemn_when_unreadable(
-        self, temp_home, monkeypatch
-    ):
-        """C1 (round 9) at the SECOND `_entry_token_dead` call site: a fetch
-        that just returned invalid_grant, on an ACTIVE slot, with the
-        Keychain locked, and the strike bound to a DIFFERENT generation than
-        the live credential (i.e. this exact fetch's failure doesn't confirm
-        the live bytes are the condemned ones -- the active-slot backup
-        might already hold a fresher, healthy generation we simply can't
-        see). Must not get USAGE_RELOGIN_REQUIRED -- same ambiguity as the
-        pre-fetch scan, just reached from the post-fetch branch."""
-        from claude_swap.usage_store import FetchRecord
-        switcher = ClaudeAccountSwitcher()
-        switcher.platform = Platform.MACOS
-        switcher._setup_directories()
-        live = self._dead_creds()  # the live credential the fetch POSTed
-        other_gen = json.dumps({"claudeAiOauth": {
-            "accessToken": "at-other", "refreshToken": "rt-other",
-            "expiresAt": 1}})
-        info = [(2, "test@example.com", "Org", "", True, live, "")]
-
-        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
-        with patch.object(
-            switcher, "_run_usage_fetches",
-            return_value={"2": FetchRecord(
-                error="invalid_grant",
-                struck_fp=oauth.credential_fingerprint(other_gen),
-            )},
-        ):
-            entries = switcher._collect_usage_entries(info)
-
-        assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED, (
-            "C1 regression at the post-fetch call site: an ambiguous "
-            "unreadable read on an active slot was condemned, "
-            f"sentinel={entries['2'].sentinel!r}"
-        )
-
     def test_the_collector_hands_the_trust_bound_its_configured_models(
         self, temp_home
     ):
@@ -4152,6 +4179,43 @@ class TestDeadTokenQuarantine:
             switcher.add_account()
 
         assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+    def test_post_fetch_invalid_grant_on_active_slot_does_not_condemn_when_unreadable(
+        self, temp_home, monkeypatch
+    ):
+        """C1 (round 9) at the SECOND `_entry_token_dead` call site: a fetch
+        that just returned invalid_grant, on an ACTIVE slot, with the
+        Keychain locked, and the strike bound to a DIFFERENT generation than
+        the live credential (i.e. this exact fetch's failure doesn't confirm
+        the live bytes are the condemned ones -- the active-slot backup
+        might already hold a fresher, healthy generation we simply can't
+        see). Must not get USAGE_RELOGIN_REQUIRED -- same ambiguity as the
+        pre-fetch scan, just reached from the post-fetch branch."""
+        from claude_swap.usage_store import FetchRecord
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.MACOS
+        switcher._setup_directories()
+        live = self._dead_creds()  # the live credential the fetch POSTed
+        other_gen = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-other", "refreshToken": "rt-other",
+            "expiresAt": 1}})
+        info = [(2, "test@example.com", "Org", "", True, live, "")]
+
+        monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
+        with patch.object(
+            switcher, "_run_usage_fetches",
+            return_value={"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(other_gen),
+            )},
+        ):
+            entries = switcher._collect_usage_entries(info)
+
+        assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED, (
+            "C1 regression at the post-fetch call site: an ambiguous "
+            "unreadable read on an active slot was condemned, "
+            f"sentinel={entries['2'].sentinel!r}"
+        )
 
 
 class TestAddAccountOrgFields:
@@ -5279,6 +5343,112 @@ class TestSwitchSkipsBrokenSlots:
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 1
 
+    def test_switch_to_missing_credentials_actionable_error(self, temp_home: Path):
+        """switch_to a broken target raises with the new credentials message."""
+        from claude_swap.exceptions import SwitchError
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+
+        live_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(live_creds)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+            },
+        }))
+
+        with pytest.raises(SwitchError, match="has no stored credentials"):
+            s.switch_to("2")
+
+    def test_switch_to_missing_config_actionable_error(self, temp_home: Path):
+        """switch_to a target with creds but no config raises a distinct error."""
+        from claude_swap.exceptions import SwitchError
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", config=False)
+
+        live_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(live_creds)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+            },
+        }))
+
+        with pytest.raises(SwitchError, match="has no stored config backup"):
+            s.switch_to("2")
+
+    def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
+        """No live session — picks first switchable slot if the recorded
+        activeAccountNumber is broken (e.g., right after import)."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com", creds=False)
+        self._seed(s, 2, "b@example.com")
+        # Mark account 1 as the recorded active (broken) — simulates a stale
+        # state after import + later corruption.
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        # No live config — fresh-machine branch.
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-1" in out
+
+        data = s._get_sequence_data()
+        assert data["activeAccountNumber"] == 2
+
+    def test_fresh_machine_skips_disabled_preferred_target(
+        self, temp_home: Path, capsys
+    ):
+        """No live session — a disabled recorded active slot stays out of rotation."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("1", True)
+        capsys.readouterr()
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        assert "Skipping Account-1 (disabled)" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_fresh_machine_all_broken_raises(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com", creds=False)
+        self._seed(s, 2, "b@example.com", config=False)
+
+        with pytest.raises(ConfigError, match="No managed accounts have valid"):
+            s.switch()
+
+    def test_fresh_machine_all_disabled_raises(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        s.set_account_disabled("1", True)
+        s.set_account_disabled("2", True)
+
+        with pytest.raises(ConfigError, match="No accounts remain in rotation"):
+            s.switch()
+
     def test_switch_to_credential_less_slot_lands_logged_out(self, temp_home: Path):
         """An empty slot is a destination, not an error.
 
@@ -6364,62 +6534,6 @@ class TestSwitchSkipsBrokenSlots:
         out = s.switch_to("3", json_output=True)
         assert out["switched"] is True
         assert s._get_sequence_data()["activeAccountNumber"] == 3
-
-    def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
-        """No live session — picks first switchable slot if the recorded
-        activeAccountNumber is broken (e.g., right after import)."""
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com", creds=False)
-        self._seed(s, 2, "b@example.com")
-        # Mark account 1 as the recorded active (broken) — simulates a stale
-        # state after import + later corruption.
-        data = s._get_sequence_data()
-        data["activeAccountNumber"] = 1
-        s._write_json(s.sequence_file, data)
-
-        # No live config — fresh-machine branch.
-        with patch.object(s, "list_accounts"):
-            s.switch()
-
-        out = capsys.readouterr().out
-        assert "Skipping Account-1" in out
-
-        data = s._get_sequence_data()
-        assert data["activeAccountNumber"] == 2
-
-    def test_fresh_machine_skips_disabled_preferred_target(
-        self, temp_home: Path, capsys
-    ):
-        """No live session — a disabled recorded active slot stays out of rotation."""
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        s.set_account_disabled("1", True)
-        capsys.readouterr()
-
-        with patch.object(s, "list_accounts"):
-            s.switch()
-
-        assert "Skipping Account-1 (disabled)" in capsys.readouterr().out
-        assert s._get_sequence_data()["activeAccountNumber"] == 2
-
-    def test_fresh_machine_all_broken_raises(self, temp_home: Path):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com", creds=False)
-        self._seed(s, 2, "b@example.com", config=False)
-
-        with pytest.raises(ConfigError, match="No managed accounts have valid"):
-            s.switch()
-
-    def test_fresh_machine_all_disabled_raises(self, temp_home: Path):
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com")
-        s.set_account_disabled("1", True)
-        s.set_account_disabled("2", True)
-
-        with pytest.raises(ConfigError, match="No accounts remain in rotation"):
-            s.switch()
 
 
 class TestUsageAwareSwitch:
@@ -10361,9 +10475,10 @@ class TestSwitchUnreadableBackup:
 
 
 class TestConsumeGate:
-    """M2: every backup-refresh-token POST goes through consume_backup_grant —
-    locked re-read → unlocked POST → reacquire-and-CAS persist. The gate is
-    the single place a backup rt may be consumed."""
+    """M2: every backup-refresh-token POST is serialized by the consume lock —
+    locked re-read → unlocked POST → reacquire-and-CAS persist. Two call sites
+    take that lock (this gate and `_fetch_active_usage`'s recovery branch), so
+    what is single is the serialization, not the call site."""
 
     _OLD = json.dumps({
         "claudeAiOauth": {
@@ -10491,6 +10606,398 @@ class TestConsumeGate:
         assert result.error == "invalid_grant"
         # the dead bytes stay put — no destructive write
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def _stash_successor_of(self, s, credentials: str, consumed: str) -> None:
+        """A prior gate consumed `consumed`'s grant and could not persist
+        `credentials`; the store still holds `consumed`."""
+        s._store._write_unclaimed_credential(credentials, {
+            "reason": "consume-gate-persist-failed",
+            "configSlot": "1",
+            "consumedFp": oauth.credential_fingerprint(consumed),
+            "fingerprint": oauth.credential_fingerprint(credentials),
+        })
+
+    def test_an_unreadable_stash_manifest_defers_instead_of_posting(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A manifest that cannot be READ is not a manifest with no rows.
+
+        `_read_stash_manifest` collapses every failure to `{}`, and
+        `_adopt_stashed_successor` iterates manifest rows only — so with a
+        stash pending (store = the spent generation) and the manifest
+        momentarily unreadable, the gate is blind to the successor and POSTs
+        the generation whose grant is already spent. That POST is the one
+        this whole gate exists to prevent, and the failure is CORRELATED: the
+        stash exists because storage I/O already failed once.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+
+        # Both readers, so the simulation does not depend on WHICH one the
+        # manifest reader happens to use — a patch that misses the real call
+        # stops simulating anything, and the gate then reads a healthy
+        # manifest while the test still claims to be testing an unreadable one.
+        def _deny(real):
+            def denied(self_path, *a, **kw):
+                if self_path.name == ".unclaimed-manifest.json":
+                    raise PermissionError(13, "Permission denied")
+                return real(self_path, *a, **kw)
+            return denied
+
+        monkeypatch.setattr(Path, "read_bytes", _deny(Path.read_bytes))
+        monkeypatch.setattr(Path, "read_text", _deny(Path.read_text))
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], (
+            "POSTed the spent generation while its successor sat in a stash "
+            "the gate could not see"
+        )
+        assert result.error == "stash-unreadable"
+
+    def test_a_stash_write_refuses_an_unreadable_manifest(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """The mutator read the plain wrapper, which discards the verdict.
+
+        A stash writer that reads an unreadable-but-VALID manifest as `{}`
+        does not merely miss rows: `_write_stash_manifest` then finds the file
+        unparseable too, renames the good manifest aside, and writes a fresh
+        one holding only the new row. Every previously mapped successor is
+        orphaned in one step — and this runs in exactly the correlated setting
+        where a stash is being written because storage already misbehaved.
+
+        `_write_unclaimed_credential`'s own contract is that a failed stash
+        must be LOUD, because callers treat a successful one as the licence to
+        overwrite the live store.
+        """
+        s = self._switcher(sample_sequence_data)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        path = s._store._stash_manifest_path()
+        before = path.read_bytes()
+
+        deny = [True]
+
+        def _deny(real):
+            def denied(self_path, *a, **kw):
+                if deny[0] and self_path.name == ".unclaimed-manifest.json":
+                    raise PermissionError(13, "Permission denied")
+                return real(self_path, *a, **kw)
+            return denied
+
+        monkeypatch.setattr(Path, "read_bytes", _deny(Path.read_bytes))
+        monkeypatch.setattr(Path, "read_text", _deny(Path.read_text))
+
+        with pytest.raises(CredentialReadError):
+            s._store._write_unclaimed_credential(self._OLD, {
+                "reason": "consume-gate-persist-failed", "configSlot": "1",
+            })
+
+        deny[0] = False
+        assert path.read_bytes() == before, (
+            "renamed a healthy manifest aside and replaced it with one row — "
+            "every other slot's stashed successor is now unmappable"
+        )
+        assert not list(
+            s.credentials_dir.glob(".unclaimed-manifest.json.corrupt-*")
+        ), "set a READABLE manifest aside as corrupt"
+
+    def test_the_purge_exit_the_fail_closed_message_names_actually_works(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A remedy named in an error message has to be a remedy.
+
+        Failing closed on corrupt+orphans is only defensible because the
+        operator has a way out, and the message names one: `cswap unclaimed`
+        to see them, `--purge` to drop one. Both run against a CORRUPT
+        manifest, so the mutator must NOT refuse there — which is why its
+        refusal is scoped to `unreadable`. Walk the whole exit rather than
+        asserting the sentence.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        s._store._stash_manifest_path().write_text("{not json at all")
+
+        # 1. the operator can SEE the orphan, by glob, with no readable rows
+        listed = s.list_unclaimed_credentials()
+        assert listed, "corrupt manifest hid the orphan from `cswap unclaimed`"
+
+        # 2. and can DROP it — the mutator does not refuse on corrupt
+        for entry_id in list(listed):
+            s._store._remove_unclaimed_credential(entry_id)
+
+        # 3. after which nothing is at risk and the slot moves again
+        assert s._store._stash_entry_files_exist() is False
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [self._OLD], "the documented exit did not unblock it"
+        assert result.error is None
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_an_unlistable_dir_counts_as_entries_at_risk(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The corrupt policy asks "is anything at risk"; not knowing is YES.
+
+        `_stash_entry_files_exist` is what lets a corrupt manifest proceed, so
+        a scan that FAILS must not read as "nothing on disk" — that is the
+        empty-means-safe conflation this whole PR removes, one level down. The
+        caller spends a grant on this answer.
+
+        The REAL state, not a monkeypatched scan. The first version of this
+        test patched `Path.glob` to raise — and passed against a detector
+        whose except arm was dead code, because `glob` SUPPRESSES scan
+        OSErrors (3.14: a searchable-but-unlistable dir answers `[]`, no
+        raise, with the orphan sitting right there). A test that fakes the
+        raise cannot see that the raise never happens; only the state itself
+        can.
+        """
+        s = self._switcher(sample_sequence_data)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        assert s._store._stash_entry_files_exist() is True, "test premise"
+
+        cred_dir = s._store._host.credentials_dir
+        os.chmod(cred_dir, 0o311)  # searchable (files reachable), unlistable
+        try:
+            assert s._store._stash_entry_files_exist() is True
+        finally:
+            os.chmod(cred_dir, 0o700)
+
+    def test_a_missing_credentials_dir_is_provably_nothing_stashed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The one scan failure that answers False: no dir, nothing ever
+        stashed. Folding it into the at-risk arm would fail a corrupt-manifest
+        slot closed on a machine that never stashed anything — permanently,
+        since with no entries there is no purge exit to walk."""
+        s = self._switcher(sample_sequence_data)
+        cred_dir = s._store._host.credentials_dir
+        if cred_dir.is_dir():
+            import shutil as _shutil
+
+            _shutil.rmtree(cred_dir)
+
+        assert s._store._stash_entry_files_exist() is False
+
+    def test_a_manifest_without_a_dict_entries_member_is_corrupt(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Parseable-but-structurally-wrong is corrupt, not ok-with-no-rows.
+
+        `{"entries": "bogus"}` decodes and parses, so it reaches neither the
+        unreadable nor the unparseable arm — and reading it as `"ok"` with no
+        rows bypasses the corrupt+orphans fail-closed condition exactly the
+        way unparseable bytes used to. The rows are equally unestablishable in
+        both shapes, so both get the corrupt verdict.
+        """
+        s = self._switcher(sample_sequence_data)
+        for payload in ('{"schemaVersion": 1, "entries": "bogus"}',
+                        '{"schemaVersion": 1}'):
+            s._store._stash_manifest_path().write_text(payload)
+            entries, verdict = s._store._read_stash_manifest_ex()
+            assert (entries, verdict) == ({}, "corrupt"), payload
+
+    def test_a_corrupt_manifest_with_orphan_entries_fails_closed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Corrupt + orphan bytes on disk: a successor may be pending.
+
+        The `{}` reading costs a POST of the slot's spent generation, which
+        does not "self-heal at the cost of one POST" — it returns
+        invalid_grant, and the gate returns before any manifest write, so
+        nothing is ever set aside. The exit is the operator's
+        (`cswap unclaimed --purge`, which still lists orphans by glob), not a
+        POST that strikes a live account.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        s._store._stash_manifest_path().write_text("{not json at all")
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(None, "invalid_grant")
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], "POSTed a spent grant with a successor on disk"
+        assert result.error == "stash-unreadable"
+
+    def test_a_corrupt_manifest_still_posts_rather_than_deadlocking(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CORRUPT with NOTHING to protect: set aside and proceed.
+
+        No orphan entry files exist, so `{}` is not a guess about whether a
+        successor is pending — there are provably no bytes on disk to lose.
+        Failing closed here would deadlock for nothing: the repair is
+        ``_write_stash_manifest`` renaming the bad file aside, and that runs
+        only on a manifest WRITE, which deferring is precisely what prevents.
+
+        The sibling test covers corrupt WITH orphan entries, where a pending
+        successor may exist and the answer flips to fail-closed. The earlier
+        version of THIS test stashed a successor and mocked the POST of the
+        spent generation to succeed — a world that cannot happen, which is
+        what made "self-heal at the cost of one POST" look true.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._store._stash_manifest_path().write_text("{not json at all")
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [self._OLD], "a corrupt manifest froze the slot"
+        assert result.error is None
+
+    def test_a_manifest_of_invalid_utf8_is_corrupt_not_unreadable(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Undecodable BYTES are corrupt, not inaccessible.
+
+        `read_text` raises UnicodeDecodeError — a ValueError, not an OSError —
+        so a verdict that splits on OSError alone lets it escape the reader
+        entirely. The old single `except Exception` swallowed it to `{}`;
+        losing that is a regression the unreadable/corrupt split can introduce
+        silently, because the two named failure modes both still pass.
+        """
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        self._stash_successor_of(s, self._NEW, self._OLD)
+        s._store._stash_manifest_path().write_bytes(b"\xff\xfe\x00not utf8")
+
+        entries, verdict = s._store._read_stash_manifest_ex()
+
+        assert (entries, verdict) == ({}, "corrupt")
+
+    def test_a_readable_empty_manifest_still_posts(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The control. Nothing stashed really does mean nothing to adopt —
+        without this, the test above passes on a gate that never POSTs."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [self._OLD]
+        assert result.error is None
+
+    def test_a_removed_slot_defers_instead_of_posting_the_snapshot(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`refresh_input = current or snapshot` resurrects a deleted account.
+
+        A slot removed between the caller's read and this gate's locked
+        re-read comes back ABSENT (not unreadable), and the `or` falls back to
+        the caller's snapshot: the gate spends a grant and stashes the
+        successor of an account the user just deleted. The CAS branch twenty
+        lines later already refuses to write that successor back
+        (`consume-gate-slot-removed`) — this is the same rule, one step
+        earlier, before the grant is spent rather than after.
+
+        All three production callers source their snapshot from the backup
+        store, so an absent re-read really does mean removed.
+        """
+        s = self._switcher(sample_sequence_data)
+        # No stored credential for slot 1: `cswap remove` landed first.
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], "spent a grant for a slot that no longer exists"
+        assert result.error == "transient"
+        assert not s.list_unclaimed_credentials(), (
+            "stashed a successor for an account the user deleted"
+        )
+
+
+    def test_an_absent_slot_defers_even_when_a_newer_profile_exists(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The defer must not quietly regress into a heal.
+
+        With `or snapshot` gone, the session-profile precedence block below is
+        no longer reachable for an ABSENT slot — it used to resync that
+        profile into the empty slot and POST it. That is the resurrect class
+        this PR forbids everywhere else, and the same verdict the CAS branch
+        reaches for a slot emptied mid-POST: a half-finished delete must not
+        be undone by a background poll. The wiped-keychain case keeps its
+        documented remedy (re-add).
+
+        Pinned because it is defined behaviour on a path no test covered
+        before, which is exactly the kind that gets "fixed" back.
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        # No stored credential for slot 1 — but a profile that outlived it.
+        profile_newer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-prof", "refreshToken": "rt-prof",
+                "expiresAt": 9999999999000,
+            }
+        })
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(profile_newer)
+        posted = []
+
+        def mock_refresh(credentials, **kw):
+            posted.append(credentials)
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted == [], "healed a removed slot from its surviving profile"
+        assert result.error == "transient"
+        assert not s._read_account_credentials("1", "test@example.com"), (
+            "resurrected the slot's stored credential from the profile"
+        )
 
 
 class TestInactiveRefreshRoutesThroughGate:
@@ -12188,66 +12695,135 @@ class TestGateUltraReviewFixes:
                 "return credentials the slot does not hold"
             )
 
-    def test_a_failed_session_invalidation_never_unwinds_a_stored_credential(
-        self, tmp_path
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    @pytest.mark.parametrize(
+        "denied", [None, "session_dir", "session_dir_and_parent"]
+    )
+    def test_a_denied_session_dir_still_leaves_the_stale_marker(
+        self, temp_home: Path, sample_sequence_data: dict, denied: str | None,
+        caplog,
     ):
-        """`_write_account_credentials` is two steps: the store write ADVANCES
-        the slot, then session invalidation runs and can raise (EACCES on the
-        session dir, a read-only mount). A raise escaping the wrapper is read
-        by every caller as "the persist failed" for a slot that HOLDS the new
-        credential — so the post-POST arm stashes a row byte-identical to the
-        slot's live credential and demotes a successful refresh to `transient`,
-        and `cswap run` prints "Could not refresh the token" for a refresh that
-        worked.
+        """C-1: the fallback must not write into the directory whose EACCES
+        caused the raise.
 
-        The invalidation is housekeeping: its job is to stop a session profile
-        serving a superseded token, and `mark_session_stale` already exists for
-        the case where the profile cannot be touched now. Losing it costs a
-        re-bootstrap; losing the write's RETURN costs a live credential.
+        `_write_account_credentials` is two steps: the store write ADVANCES
+        the slot, then `_post_backup_write` invalidates the slot's session
+        profile and can fail on exactly the faults the wrapper's docstring
+        names — EACCES on the session dir, a read-only mount. A raise escaping
+        the wrapper is read by every caller as "the persist failed" for a slot
+        that HOLDS the new credential, so the write is contained and the
+        STALE_MARKER is what forces the re-bootstrap instead.
 
-        Parametrized against the succeeding control so the row that matters
-        cannot pass alone.
+        But the marker was a CHILD of the session dir, so the very fault that
+        denied the unlink also denied the marker's create, and
+        `mark_session_stale` swallows the OSError. `_is_session_valid` is a
+        LOCAL check (its own docstring), so a revoked-but-unexpired token
+        still passes it: without the marker `setup_session` returns early and
+        launches claude on the spent generation, with nothing recording it.
+
+        A REAL kernel fault (`chmod 0500`), not an injected raise — the
+        coupling between the failing unlink and the fallback's write target
+        IS the defect, and an injected raise cannot see it.
+
+        `denied=None` is the CONTROL: on a healthy dir the invalidation really
+        happens (old `.credentials.json` gone) and no marker is needed.
+
+        `session_dir_and_parent` is the CEILING of any marker location: the
+        whole `<backup>/sessions/` root is read-only, so the sibling cannot
+        land either (that is the docstring's "read-only mount"). No path fixes
+        the launch there, so what is required is that it is not SILENT — an
+        ERROR naming the account, never a warning implying the fallback worked.
         """
-        from claude_swap.session import STALE_MARKER
+        import logging
 
-        for invalidation_raises in (False, True):
-            sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
-            wrote = {}
-            sw._store = type("S", (), {
-                "_write_account_credentials":
-                    lambda self, n, e, c: wrote.__setitem__("creds", c),
-            })()
-            sess = tmp_path / f"sess-{invalidation_raises}"
-            sess.mkdir()
-            sw._session_dir = lambda n, e: sess
-            sw._live_session_pids = lambda n, e: []
+        from claude_swap.session import is_session_stale
 
-            def _invalidate(n, e, _raise=invalidation_raises):
-                if _raise:
-                    raise PermissionError(13, "Permission denied")
-                wrote["invalidated"] = True
+        s = self._switcher(sample_sequence_data)
+        sess = s._session_dir("1", "test@example.com")
+        sess.mkdir(parents=True, exist_ok=True)
+        (sess / ".credentials.json").write_text(self._OLD)
 
-            sw._invalidate_session_credentials = _invalidate
-            sw._logger = type("L", (), {"info": lambda *a, **k: None,
-                                        "warning": lambda *a, **k: None})()
+        chmodded = []
+        if denied in ("session_dir", "session_dir_and_parent"):
+            chmodded.append(sess)
+        if denied == "session_dir_and_parent":
+            chmodded.append(sess.parent)
+        caplog.clear()
+        try:
+            for d in chmodded:
+                d.chmod(0o500)
+            with caplog.at_level(logging.WARNING, logger="claude-swap"):
+                s._write_account_credentials("1", "test@example.com", self._NEW)
+        finally:
+            for d in reversed(chmodded):
+                d.chmod(0o700)
 
-            sw._write_account_credentials("2", "a@b.c", "NEW-GENERATION")
-
-            assert wrote.get("creds") == "NEW-GENERATION", (
-                f"the store write did not happen "
-                f"(invalidation_raises={invalidation_raises})"
+        assert s._read_account_credentials("1", "test@example.com") == self._NEW, (
+            "premise: the store write ADVANCED the slot"
+        )
+        if denied is None:
+            assert not (sess / ".credentials.json").exists(), (
+                "CONTROL: the invalidation really ran on a healthy dir"
             )
-            if invalidation_raises:
-                # The profile could not be invalidated now, so it must be
-                # MARKED — otherwise a profile whose access token is still
-                # unexpired keeps serving a spent refresh token and nothing
-                # forces the re-bootstrap.
-                assert (sess / STALE_MARKER).exists(), (
-                    "a swallowed invalidation left no stale marker: the "
-                    "profile will keep serving the superseded generation"
-                )
-            else:
-                assert wrote.get("invalidated"), "CONTROL: invalidation skipped"
+            assert not is_session_stale(sess), (
+                "CONTROL: nothing failed, so nothing to mark"
+            )
+            return
+
+        assert (sess / ".credentials.json").exists(), (
+            f"premise ({denied}): the unlink was denied, so the profile "
+            "still holds the superseded credential"
+        )
+        if denied == "session_dir":
+            assert is_session_stale(sess), (
+                "DEFECT: the invalidation was denied and NO stale marker "
+                "landed — the marker's own write target was the directory "
+                "that denied it. The profile's token is unexpired, so the "
+                "local reuse check passes and `cswap run` launches claude on "
+                "the spent generation, silently"
+            )
+        else:
+            # Ceiling: nothing under a read-only `sessions/` can be written.
+            assert not is_session_stale(sess), (
+                "premise: the whole sessions root is denied, so no marker "
+                "location under it can land"
+            )
+            assert any(
+                r.levelno >= logging.ERROR and "1" in r.getMessage()
+                for r in caplog.records
+            ), (
+                "DEFECT: the profile keeps serving the superseded generation "
+                "and nothing says so above WARNING — the fallback did not "
+                "work, so a warning claiming it did is worse than silence"
+            )
+
+    def test_the_suites_real_store_guard_is_not_absorbed_by_the_wrapper(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """I-1: the containment must be `except OSError`, not `except Exception`.
+
+        `tests/conftest.py`'s `RealStoreWriteBlocked` is deliberately NOT an
+        `OSError` subclass (its own docstring) precisely so that no
+        `except OSError` in this codebase can hide a real-store refusal. An
+        `except Exception` on the credential-persist path catches it and
+        disarms the guard for every write that routes through here.
+
+        The wrapper's whole documented fault list is EACCES on the session dir
+        and a read-only mount — both `OSError`. Nothing else belongs in it.
+        """
+        from tests import conftest
+
+        s = self._switcher(sample_sequence_data)
+
+        def blocked(*a, **kw):
+            raise conftest.RealStoreWriteBlocked("refused: the REAL store")
+
+        with patch.object(type(s), "_post_backup_write", blocked):
+            with pytest.raises(conftest.RealStoreWriteBlocked):
+                s._write_account_credentials("1", "test@example.com", self._NEW)
 
     @pytest.mark.parametrize("row_a_readable", [True, False])
     def test_an_unreadable_non_matching_row_does_not_abort_the_scan(
@@ -12316,6 +12892,67 @@ class TestGateUltraReviewFixes:
             "credential; only a byte-less one is free to retire"
         )
 
+    def test_a_failed_session_invalidation_never_unwinds_a_stored_credential(
+        self, tmp_path
+    ):
+        """`_write_account_credentials` is two steps: the store write ADVANCES
+        the slot, then session invalidation runs and can raise (EACCES on the
+        session dir, a read-only mount). A raise escaping the wrapper is read
+        by every caller as "the persist failed" for a slot that HOLDS the new
+        credential — so the post-POST arm stashes a row byte-identical to the
+        slot's live credential and demotes a successful refresh to `transient`,
+        and `cswap run` prints "Could not refresh the token" for a refresh that
+        worked.
+
+        The invalidation is housekeeping: its job is to stop a session profile
+        serving a superseded token, and `mark_session_stale` already exists for
+        the case where the profile cannot be touched now. Losing it costs a
+        re-bootstrap; losing the write's RETURN costs a live credential.
+
+        Parametrized against the succeeding control so the row that matters
+        cannot pass alone.
+        """
+        from claude_swap.session import STALE_MARKER
+
+        for invalidation_raises in (False, True):
+            sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+            wrote = {}
+            sw._store = type("S", (), {
+                "_write_account_credentials":
+                    lambda self, n, e, c: wrote.__setitem__("creds", c),
+            })()
+            sess = tmp_path / f"sess-{invalidation_raises}"
+            sess.mkdir()
+            sw._session_dir = lambda n, e: sess
+            sw._live_session_pids = lambda n, e: []
+
+            def _invalidate(n, e, _raise=invalidation_raises):
+                if _raise:
+                    raise PermissionError(13, "Permission denied")
+                wrote["invalidated"] = True
+
+            sw._invalidate_session_credentials = _invalidate
+            sw._logger = type("L", (), {"info": lambda *a, **k: None,
+                                        "warning": lambda *a, **k: None})()
+
+            sw._write_account_credentials("2", "a@b.c", "NEW-GENERATION")
+
+            assert wrote.get("creds") == "NEW-GENERATION", (
+                f"the store write did not happen "
+                f"(invalidation_raises={invalidation_raises})"
+            )
+            if invalidation_raises:
+                # The profile could not be invalidated now, so it must be
+                # MARKED — otherwise a profile whose access token is still
+                # unexpired keeps serving a spent refresh token and nothing
+                # forces the re-bootstrap.
+                assert (sess / STALE_MARKER).exists(), (
+                    "a swallowed invalidation left no stale marker: the "
+                    "profile will keep serving the superseded generation"
+                )
+            else:
+                assert wrote.get("invalidated"), "CONTROL: invalidation skipped"
+
 class TestActiveSlotStrikeParity:
     """Ultra-review: the active slot has TWO stored sources (live + backup).
     Strike heal/quarantine verdicts must consider both, and the active
@@ -12352,44 +12989,6 @@ class TestActiveSlotStrikeParity:
         assert s._entry_token_dead(entry, "2", "b@example.com", live, True), (
             "backup-bound strike must hold while the backup still stores "
             "the condemned generation"
-        )
-
-    def test_active_strike_healed_by_absent_backup_not_unreadable(
-        self, temp_home: Path, mock_claude_config: Path,
-        sample_sequence_data: dict
-    ):
-        """Mutation guard (review IMPORTANT-1 / brief I-list item 1): the
-        ABSENT direction of `bool(backup) and ...` must heal, not fail
-        closed. A GENUINELY ABSENT backup (never written -- rc-44 'not
-        found', `unreadable=False`) is not the same fact as an UNREADABLE
-        one; only the latter must survive the strike. Dropping
-        `bool(backup) and` collapses ABSENT into the same fail-closed path
-        as UNREADABLE -- this pins the opposite, correct behavior."""
-        from claude_swap.usage_store import FetchRecord as FR
-        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        s._write_json(s.sequence_file, sample_sequence_data)
-        old_gen = json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-old",
-                              "refreshToken": "rt-old", "expiresAt": 1000}})
-        live = json.dumps({
-            "claudeAiOauth": {"accessToken": "sk-live",
-                              "refreshToken": "rt-live", "expiresAt": 2000}})
-        # No backup ever written for slot 2 -- genuinely absent, not merely
-        # unreadable (Linux platform: _read_account_credentials_ex's
-        # `unreadable` axis is always False off macOS).
-        identities = {"2": ("b@example.com", "")}
-        s._usage_store.record(
-            {"2": FR(error="invalid_grant",
-                     struck_fp=oauth.credential_fingerprint(old_gen))},
-            identities,
-        )
-        entry = s._usage_store.entries(identities, [])["2"]
-        result = s._entry_token_dead(entry, "2", "b@example.com", live, True)
-        assert result is False, (
-            "a genuinely ABSENT backup must heal the strike (fp(stored) "
-            f"already differs from struck_fingerprint), got {result}"
         )
 
     def test_idle_slot_keeps_live_fp_heal_semantics(
@@ -12461,6 +13060,44 @@ class TestActiveSlotStrikeParity:
         ):
             s._fetch_active_usage("2", "b@example.com", fresh)
         resync.assert_not_called()
+
+    def test_active_strike_healed_by_absent_backup_not_unreadable(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        """Mutation guard (review IMPORTANT-1 / brief I-list item 1): the
+        ABSENT direction of `bool(backup) and ...` must heal, not fail
+        closed. A GENUINELY ABSENT backup (never written -- rc-44 'not
+        found', `unreadable=False`) is not the same fact as an UNREADABLE
+        one; only the latter must survive the strike. Dropping
+        `bool(backup) and` collapses ABSENT into the same fail-closed path
+        as UNREADABLE -- this pins the opposite, correct behavior."""
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        old_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-old",
+                              "refreshToken": "rt-old", "expiresAt": 1000}})
+        live = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live",
+                              "refreshToken": "rt-live", "expiresAt": 2000}})
+        # No backup ever written for slot 2 -- genuinely absent, not merely
+        # unreadable (Linux platform: _read_account_credentials_ex's
+        # `unreadable` axis is always False off macOS).
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(old_gen))},
+            identities,
+        )
+        entry = s._usage_store.entries(identities, [])["2"]
+        result = s._entry_token_dead(entry, "2", "b@example.com", live, True)
+        assert result is False, (
+            "a genuinely ABSENT backup must heal the strike (fp(stored) "
+            f"already differs from struck_fingerprint), got {result}"
+        )
 
     def test_active_strike_survives_unreadable_backup_not_absent(
         self, temp_home: Path, mock_claude_config: Path,
@@ -12723,7 +13360,6 @@ class TestActiveSlotStrikeParity:
             "C1 regression: an already-healed slot was condemned by an "
             f"unreadable Keychain read, got {result}"
         )
-
 
     def test_slot_token_dead_coerces_ambiguous_to_not_dead(
         self, temp_home: Path, mock_claude_config: Path,
