@@ -2691,7 +2691,6 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
             gate_consumes_then_fails_to_persist,
         )
 
-        manager.setup_session("2", share=False)
         with pytest.raises(SessionError, match="stashed — please retry"):
             manager.setup_session("2", share=False)
 

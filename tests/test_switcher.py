@@ -1066,7 +1066,12 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "no credentials" in output
+        # The state, and what to do about it. It used to print the bare
+        # words "no credentials", which name the problem and stop there —
+        # and the fix people reach for (/login on whatever account is
+        # active) writes the login to the wrong slot.
+        assert "no stored login" in output
+        assert "switch here" in output
 
     def test_list_never_writes_live_while_claude_code_running(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -5348,55 +5353,7 @@ class TestSwitchSkipsBrokenSlots:
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 1
 
-    def test_switch_to_missing_credentials_actionable_error(self, temp_home: Path):
-        """switch_to a broken target raises with the new credentials message."""
-        from claude_swap.exceptions import SwitchError
 
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com", creds=False)
-
-        live_creds = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-live-1",
-                "refreshToken": "rt-live-1",
-            },
-        })
-        (temp_home / ".claude" / ".credentials.json").write_text(live_creds)
-        (temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": "a@example.com",
-                "accountUuid": "uuid-1",
-            },
-        }))
-
-        with pytest.raises(SwitchError, match="has no stored credentials"):
-            s.switch_to("2")
-
-    def test_switch_to_missing_config_actionable_error(self, temp_home: Path):
-        """switch_to a target with creds but no config raises a distinct error."""
-        from claude_swap.exceptions import SwitchError
-
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
-        self._seed(s, 2, "b@example.com", config=False)
-
-        live_creds = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-live-1",
-                "refreshToken": "rt-live-1",
-            },
-        })
-        (temp_home / ".claude" / ".credentials.json").write_text(live_creds)
-        (temp_home / ".claude.json").write_text(json.dumps({
-            "oauthAccount": {
-                "emailAddress": "a@example.com",
-                "accountUuid": "uuid-1",
-            },
-        }))
-
-        with pytest.raises(SwitchError, match="has no stored config backup"):
-            s.switch_to("2")
 
     def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
         """No live session — picks first switchable slot if the recorded

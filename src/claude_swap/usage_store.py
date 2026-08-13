@@ -1217,12 +1217,15 @@ class UsageStore:
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
             if not strike_only:
+                # A strike heal is evidence the FINGERPRINT no longer matches,
+                # not evidence the server's own 429 throttle lifted:
+                # `backoffUntil`/`lastError` are the server's word, and erasing
+                # them re-opens a token still inside its own block. The
+                # unconditional copy of these three lines that the merge left
+                # below this guard defeated it entirely.
                 row["consecutiveFailures"] = 0
                 row["lastError"] = None
                 row["backoffUntil"] = None
-            row["consecutiveFailures"] = 0
-            row["lastError"] = None
-            row["backoffUntil"] = None
 
         self._mutate(identities, nums, apply)
 
