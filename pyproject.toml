@@ -79,10 +79,33 @@ menubar = ["rumps>=0.4.0"]
 # backtrack. Tightened because the floor is a statement about which build this
 # extra was tested against, and the untested ones write to a tracked file.
 #
+# WHY 0.1.76, and why this one is not a preference:
+#   - 0.1.72 tried to close the deploy gap from inside the daemon and made it
+#     WORSE (2 s -> ~9 s). Reverted in 0.1.73, but the range still admits it.
+#   - 0.1.74 is the one that matters. Its daemon asks its holder to replace it
+#     by SIGUSR1, and assumed the holder could hear it. On an upgrade the holder
+#     is ALWAYS the previous release, which has no handler, and USR1 unhandled
+#     TERMINATES. Measured on host-a: the ask killed the holder, port
+#     36301 went REFUSED for 30 s, and only a standby noticing the free port
+#     brought it back. On a machine with no standby left there is nothing to
+#     notice.
+#   - 0.1.75 makes the capability the holder's to advertise and refuses to
+#     signal one that has not; 0.1.76 retires a holder the deploy left on the
+#     previous release, which is the half that made every later deploy fall
+#     back to the slow path forever.
+#
+# So the floor is not "the newest we happened to test". Everything from 0.1.72
+# to 0.1.74 can take the port down on the next upgrade, and this extra is
+# exactly what installs the thing that does it.
+#
+# Verified on all three machines at 0.1.76: two overlapping daemons on one
+# socket during the handover, then the stale holder retired — 200/200, 200/200
+# and 45/45 completed requests, zero failures.
+#
 # RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
 # accepted deliberately, and the pre-push hook in cswap-pin already warns when
 # src changes without a version bump — this is the other half of that.
-pin = ["cswap-pin>=0.1.70"]
+pin = ["cswap-pin>=0.1.76"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
