@@ -79,7 +79,16 @@ menubar = ["rumps>=0.4.0"]
 # backtrack. Tightened because the floor is a statement about which build this
 # extra was tested against, and the untested ones write to a tracked file.
 #
-# WHY 0.1.76, and why this one is not a preference:
+# WHY 0.1.77, and why this one is not a preference:
+#   - 0.1.75 and 0.1.76 cannot be IMPORTED on Windows. They resolve
+#     `signal.SIGUSR1` at module scope and Windows has no such attribute, so
+#     `import cswap_pin.proxy` raises AttributeError before any of their code
+#     runs. This extra is what puts them on a Windows machine, and CI caught it
+#     the moment the floor moved onto them:
+#         AttributeError: module 'signal' has no attribute 'SIGUSR1'
+#         .venv\Lib\site-packages\cswap_pin\proxy.py:4503
+#     0.1.77 resolves both POSIX-only signals with getattr and declines the
+#     paths that need them.
 #   - 0.1.72 tried to close the deploy gap from inside the daemon and made it
 #     WORSE (2 s -> ~9 s). Reverted in 0.1.73, but the range still admits it.
 #   - 0.1.74 is the one that matters. Its daemon asks its holder to replace it
@@ -105,7 +114,7 @@ menubar = ["rumps>=0.4.0"]
 # RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
 # accepted deliberately, and the pre-push hook in cswap-pin already warns when
 # src changes without a version bump — this is the other half of that.
-pin = ["cswap-pin>=0.1.76"]
+pin = ["cswap-pin>=0.1.77"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
