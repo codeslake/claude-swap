@@ -74,6 +74,35 @@ class DashboardScreen(Screen):
         # mid-session, and the label names the pinned account, which changes
         # from the CLI too.
         self.watch(self.app, "snapshot", lambda _s: self.refresh_root_menu())
+        # A USER WHO OPENED THIS HAS ALREADY ASKED FOR THE PIN TO WORK. When the
+        # daemon has published that it cannot mint, the badge said so and then
+        # asked them to go run the repair by hand — with `--heal`, the obvious
+        # candidate, declining this exact state by design. The product knew the
+        # pin was broken, knew the fix, and waited to be asked.
+        #
+        # ONLY `is False`. `None` is "cannot tell" and a healthy pin must never
+        # be recycled on open: that restarts the daemon under live sessions for
+        # nothing, which is how a repair becomes the outage it was meant to
+        # prevent.
+        #
+        # Off the event loop, like every other pin action here: `apply_pin`
+        # spawns a daemon and can take the config lock, and doing that inline
+        # froze the dashboard for 9.31s the last time something skipped
+        # `_start_action`.
+        self._repair_pin_if_stranded()
+
+    def _repair_pin_if_stranded(self) -> None:
+        try:
+            if not pin.is_available() or not pin.pinned_email(self.app.switcher):
+                return
+            if pin.pin_is_applying(self.app.switcher) is not False:
+                return
+        except Exception:  # noqa: BLE001 — a badge-level question, never fatal
+            return
+        self.app._start_action(
+            "Repairing the cloud pin",
+            partial(pin.repin_current, self.app.switcher),
+        )
 
     # -- menu plumbing --------------------------------------------------------
 

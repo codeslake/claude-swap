@@ -291,6 +291,37 @@ def pin_is_applying(switcher) -> bool | None:
     return not state.get("unpinnable")
 
 
+def repin_current(switcher) -> bool:
+    """Re-apply the pin already recorded, to replace a daemon that cannot mint.
+
+    THE REPAIR THE PRODUCT ALREADY KNEW HOW TO DO. When a daemon publishes
+    `unpinnable` the pin is set, the account is fine, and the daemon is serving
+    — it simply cannot read the credential, so every request goes out on the
+    active account. `heal` declines this by design ("something IS serving"), so
+    the state persisted until a human ran `cswap pin <n>` by hand.
+
+    That hand-run command lands here: `apply_pin` ends in
+    ``return ensure_proxy(switcher) is not None``, and `ensure_proxy` reads the
+    daemon record WITH a fingerprint — the read an `unpinnable` daemon answers
+    "nothing is serving" to. So it spawns a successor, and a successor born
+    somewhere that CAN read the credential mints again.
+
+    Returns False on anything unexpected. A repair that raises is worse than a
+    pin that stays broken: it takes down whatever asked for it.
+    """
+    impl = _live_impl()
+    if impl is None:
+        return False
+    try:
+        pin = impl.load_pin(switcher.backup_dir)
+        if not pin:
+            return False
+        email, org = pin[0], (pin[1] if len(pin) > 1 else None)
+        return bool(impl.apply_pin(switcher, email, org))
+    except Exception:  # noqa: BLE001 — a repair must not take its caller down
+        return False
+
+
 # -- launch integration ------------------------------------------------------
 
 
