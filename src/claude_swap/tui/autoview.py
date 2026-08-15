@@ -306,6 +306,11 @@ class AutoScreen(Screen):
         # line: naming the pin separately makes you match an email against the
         # list directly below it instead of just reading the list.
         pinned_email = pin.pinned_email(self.app.switcher)
+        # ONCE PER RENDER, not once per row: this reads the daemon's record off
+        # disk, and the badge below is drawn inside the account loop. The same
+        # mistake was fixed for `pinned_email` itself — see the test that pins
+        # its call count.
+        pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_email else None
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -329,7 +334,18 @@ class AutoScreen(Screen):
             # off whichever branch happened to run.
             if pinned_email and acc.email == pinned_email:
                 entry.append("  · ", style=palette.muted)
-                entry.append("○ cloud", style=f"bold {palette.sev_warn}")
+                # SET IS NOT APPLYING. This badge used to be lit by
+                # `pinned_email` alone, so it stayed green while the daemon
+                # could not mint the pinned token and every request went out
+                # unpinned — measured on the owner's laptop, with the
+                # statusline and pin-coherence agreeing with it. `False` is the
+                # only value worth shouting about; `None` means "could not
+                # tell" and must read as healthy here, same rule as
+                # `pin_is_broken`.
+                if pin_applying is False:
+                    entry.append("⚠ cloud UNPINNED", style=f"bold {palette.sev_crit}")
+                else:
+                    entry.append("○ cloud", style=f"bold {palette.sev_warn}")
             lines[acc.number] = entry
 
         text = Text()

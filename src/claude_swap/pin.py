@@ -258,6 +258,39 @@ def pinned_email(switcher) -> str | None:
     return pin[0] if pin else None
 
 
+def pin_is_applying(switcher) -> bool | None:
+    """Whether the daemon serving right now can actually mint the pinned token.
+
+    THE SECOND QUESTION, and the one nothing asked. `pinned_email` answers
+    "which account is it SET to", and every indicator the owner sees was lit on
+    that alone: the TUI badge, the statusline, and `pin-coherence` — settings,
+    proxy.json, pid and port all agreeing. Measured on the owner's laptop, all
+    three read healthy while every request went out UNPINNED, because the daemon
+    could not reach the macOS keychain and had marked its own record
+    `unpinnable`. Nothing in this package had ever read that flag.
+
+    The proxy's own comment says where that ends: reusing such a daemon "makes
+    `cswap pin` report success forever while Remote Control sessions keep
+    landing on the wrong account."
+
+    ``False`` means SET BUT NOT APPLYING — the state worth shouting about.
+    ``None`` is "cannot tell" (no extra, no daemon record, an unreadable one)
+    and must read the same as healthy at the call sites: a badge that fires on
+    "I could not look" is one people stop reading, which is the rule
+    :func:`pin_is_broken` already follows.
+    """
+    impl = _live_impl()
+    if impl is None:
+        return None
+    try:
+        state = impl.read_daemon_state(switcher.backup_dir / "pin-proxy")
+    except Exception:  # noqa: BLE001 — a badge must not take the view down
+        return None
+    if not state:
+        return None
+    return not state.get("unpinnable")
+
+
 # -- launch integration ------------------------------------------------------
 
 

@@ -368,6 +368,66 @@ class TestThePinBadgeDoesNotOverstate:
         )
         assert pin_is_broken(acc), "an API-key account read as pinnable"
 
+    def test_a_daemon_that_cannot_mint_is_not_a_healthy_pin(self, tmp_path):
+        """SET is not APPLYING, and the badge was lit on SET alone.
+
+        Measured on the owner's laptop: `○ cloud` in the TUI, `pinned#1` in the
+        statusline, `pin-coherence: OK` — settings, proxy.json, the daemon pid
+        and the port all agreeing — while the daemon could not read the pinned
+        account's credential and every request went out UNPINNED. The daemon
+        itself had written the reason to its log and marked its own record
+        `unpinnable`; nothing in this package ever read that flag, so every
+        indicator the owner looks at said healthy.
+
+        The proxy's own comment says where that ends: it "makes `cswap pin`
+        report success forever while Remote Control sessions keep landing on
+        the wrong account."
+
+        This is the runtime half of `pin_is_broken`. That one asks whether the
+        ACCOUNT could ever produce a bearer; this asks whether the daemon
+        serving right now actually is. An account can be perfectly healthy and
+        the answer still be no — a daemon started outside the macOS GUI session
+        cannot reach the keychain, and it keeps serving regardless.
+        """
+        import json
+        import types
+
+        from claude_swap import pin
+
+        certdir = tmp_path / "pin-proxy"
+        certdir.mkdir(parents=True)
+        sw = types.SimpleNamespace(backup_dir=tmp_path)
+
+        # A record that says: serving, current, and CANNOT mint.
+        (certdir / "proxy.json").write_text(
+            json.dumps({"port": 53749, "pid": 41798, "unpinnable": True})
+        )
+        assert pin.pin_is_applying(sw) is False, (
+            "a daemon that marked itself unable to mint the pinned token read "
+            "as a healthy pin — this is the state the badge lit green on"
+        )
+
+        # Control: the same record without the flag must NOT be flagged, or the
+        # badge cries wolf on every healthy machine.
+        (certdir / "proxy.json").write_text(
+            json.dumps({"port": 53749, "pid": 41798})
+        )
+        assert pin.pin_is_applying(sw) is not False, (
+            "a healthy daemon read as broken — a warning that fires on the "
+            "normal case is one people stop reading"
+        )
+
+        # AND NO RECORD AT ALL must not read as broken either. This is the
+        # common case, not an edge: every machine between a pin being set and
+        # the daemon first writing its record, and every machine without the
+        # extra. Mutating the `not state` branch to False survived the two
+        # assertions above — they both supply a record, so neither reached it.
+        (certdir / "proxy.json").unlink()
+        assert pin.pin_is_applying(sw) is not False, (
+            "no daemon record read as BROKEN — that lights the alarm on every "
+            "machine that has not started one yet"
+        )
+
     def test_a_healthy_oauth_account_is_not_flagged(self):
         import types
 
