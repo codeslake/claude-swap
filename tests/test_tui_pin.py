@@ -375,7 +375,7 @@ class TestThePinBadgeDoesNotOverstate:
         statusline, `pin-coherence: OK` — settings, proxy.json, the daemon pid
         and the port all agreeing — while the daemon could not read the pinned
         account's credential and every request went out UNPINNED. The daemon
-        itself had written the reason to its log and marked its own record
+        had written the reason to its own log and marked its record
         `unpinnable`; nothing in this package ever read that flag, so every
         indicator the owner looks at said healthy.
 
@@ -398,35 +398,73 @@ class TestThePinBadgeDoesNotOverstate:
         certdir.mkdir(parents=True)
         sw = types.SimpleNamespace(backup_dir=tmp_path)
 
-        # A record that says: serving, current, and CANNOT mint.
-        (certdir / "proxy.json").write_text(
-            json.dumps({"port": 53749, "pid": 41798, "unpinnable": True})
-        )
-        assert pin.pin_is_applying(sw) is False, (
-            "a daemon that marked itself unable to mint the pinned token read "
-            "as a healthy pin — this is the state the badge lit green on"
+        # THE DECISION IS WHAT THIS CASE OWNS, not package resolution. Written
+        # against the installed extra it returned None wherever cswap-pin is
+        # absent, and `is False` failed there — green on linux and the pin-cli
+        # shard, red on the windows `rest` shard, which is exactly the split
+        # between "extra installed" and "not". Stub the resolver so the
+        # three-state answer is tested on every shard.
+        def _fake_read(cd):
+            try:
+                return json.loads((cd / "proxy.json").read_text())
+            except OSError:
+                return None
+
+        real_live = pin._live_impl
+        pin._live_impl = lambda: types.SimpleNamespace(read_daemon_state=_fake_read)
+        try:
+            # A record that says: serving, current, and CANNOT mint.
+            (certdir / "proxy.json").write_text(
+                json.dumps({"port": 53749, "pid": 41798, "unpinnable": True})
+            )
+            assert pin.pin_is_applying(sw) is False, (
+                "a daemon that marked itself unable to mint the pinned token "
+                "read as a healthy pin — this is the state the badge lit green on"
+            )
+
+            # Control: the same record without the flag must NOT be flagged, or
+            # the badge cries wolf on every healthy machine.
+            (certdir / "proxy.json").write_text(
+                json.dumps({"port": 53749, "pid": 41798})
+            )
+            assert pin.pin_is_applying(sw) is not False, (
+                "a healthy daemon read as broken — a warning that fires on the "
+                "normal case is one people stop reading"
+            )
+
+            # AND NO RECORD AT ALL must not read as broken either. This is the
+            # common case, not an edge: every machine between a pin being set
+            # and the daemon first writing its record, and every machine
+            # without the extra. Mutating the `not state` branch to False
+            # survived the two assertions above — they both supply a record, so
+            # neither reached it.
+            (certdir / "proxy.json").unlink()
+            assert pin.pin_is_applying(sw) is not False, (
+                "no daemon record read as BROKEN — that lights the alarm on "
+                "every machine that has not started one yet"
+            )
+        finally:
+            pin._live_impl = real_live
+
+    def test_the_stubbed_reader_matches_the_real_package(self):
+        """The stub above is only honest while the real seam still exists.
+
+        A fake that has drifted from the thing it stands in for passes forever
+        and proves nothing — the failure mode this repo has already paid for.
+        So where the extra IS installed, assert the function this feature calls
+        is really there. Where it is not, there is nothing to drift from and
+        the check is correctly silent — not skipped for convenience.
+        """
+        from claude_swap import pin
+
+        impl = pin._live_impl()
+        if impl is None:
+            return
+        assert callable(getattr(impl, "read_daemon_state", None)), (
+            "cswap_pin no longer exposes read_daemon_state — pin_is_applying "
+            "calls it, and the badge would silently fall back to 'healthy'"
         )
 
-        # Control: the same record without the flag must NOT be flagged, or the
-        # badge cries wolf on every healthy machine.
-        (certdir / "proxy.json").write_text(
-            json.dumps({"port": 53749, "pid": 41798})
-        )
-        assert pin.pin_is_applying(sw) is not False, (
-            "a healthy daemon read as broken — a warning that fires on the "
-            "normal case is one people stop reading"
-        )
-
-        # AND NO RECORD AT ALL must not read as broken either. This is the
-        # common case, not an edge: every machine between a pin being set and
-        # the daemon first writing its record, and every machine without the
-        # extra. Mutating the `not state` branch to False survived the two
-        # assertions above — they both supply a record, so neither reached it.
-        (certdir / "proxy.json").unlink()
-        assert pin.pin_is_applying(sw) is not False, (
-            "no daemon record read as BROKEN — that lights the alarm on every "
-            "machine that has not started one yet"
-        )
 
     def test_a_healthy_oauth_account_is_not_flagged(self):
         import types
