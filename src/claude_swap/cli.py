@@ -150,6 +150,20 @@ Examples:
             "(exit 1 if none). For scripts: PORT=$(cswap pin --get_port)"
         ),
     )
+    # THE SAME ARGUMENT, for the path. A session diagnosing the pin on a Mac
+    # did not know the state directory is not at the Linux location, could not
+    # ask, and ran an unbounded `find` over ~/Library on the owner's personal
+    # laptop to get a string this process already holds. What cannot be asked
+    # for gets searched for.
+    parser.add_argument(
+        "--get_certdir",
+        action="store_true",
+        help=(
+            "Print this host's pin state directory, and nothing else. For "
+            "scripts: D=$(cswap pin --get_certdir). Answers whether or not a "
+            "daemon is running — diagnosing a dead pin is when it is asked."
+        ),
+    )
     # The WRITE side. Persisted in the pin's own settings file, not in
     # ~/.claude.json — that file is for what Claude Code reads.
     parser.add_argument(
@@ -185,8 +199,14 @@ Examples:
     # would be indistinguishable from having performed it.
     if args.get_port and (args.account or args.clear or args.heal or args.ensure):
         parser.error("--get_port takes no account and does not combine with other flags")
+    if args.get_certdir and (args.account or args.clear or args.heal
+                             or args.ensure or args.get_port):
+        parser.error(
+            "--get_certdir takes no account and does not combine with other flags"
+        )
     if args.set_port is not None and (args.account or args.clear or args.heal
-                                      or args.ensure or args.get_port):
+                                      or args.ensure or args.get_port
+                                      or args.get_certdir):
         parser.error("--set_port takes no account and does not combine with other flags")
     if args.ensure and (args.account or args.clear or args.heal):
         parser.error("--ensure takes no account and does not combine with other flags")
@@ -241,6 +261,7 @@ Examples:
                 clear=args.clear,
                 heal_only=args.heal,
                 get_port=args.get_port,
+                get_certdir=args.get_certdir,
                 set_port=args.set_port,
                 ensure=args.ensure,
             )

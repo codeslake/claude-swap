@@ -4005,11 +4005,20 @@ class TestHealADeadPin:
 
         seen = {}
 
-        def _run(switcher, account, clear=False, heal_only=False, get_port=False,
-                 set_port=None, ensure=False):
+        # NO DEFAULTS FOR THE FLAGS. A stub that defaults every keyword accepts
+        # a CLI which has stopped passing one, and this case's whole subject is
+        # that the flag reaches `run`. Requiring them means the day a flag stops
+        # being forwarded, this fails on the signature rather than passing on a
+        # default that happens to match. (Measured the other way: adding
+        # `get_certdir` to the CLI made the old stub raise TypeError, the CLI
+        # caught it, and the case failed as `exit 1` — a real signal, but for
+        # the wrong reason and in the wrong place.)
+        def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
+                 set_port, ensure):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
-                get_port=get_port, set_port=set_port, ensure=ensure,
+                get_port=get_port, get_certdir=get_certdir,
+                set_port=set_port, ensure=ensure,
             )
             return 0
 
@@ -4130,7 +4139,8 @@ class TestHealADeadPin:
         )
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
-            "get_port": False, "set_port": None, "ensure": False,
+            "get_port": False, "get_certdir": False, "set_port": None,
+            "ensure": False,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -4182,6 +4192,43 @@ class TestHealADeadPin:
             assert pin.run(sw, None, get_port=True) == 0
         finally:
             lsn.close()
+
+    def test_get_certdir_answers_without_a_filesystem_search(self, tmp_path):
+        """The same contract as `--get_port`, for the OTHER thing consumers
+        cannot ask for — and the one that cost a user's laptop real time.
+
+        A session diagnosing the pin on a Mac did not know where the state
+        directory lives (it is not the Linux path), and nothing could tell it.
+        So it ran, over ssh, on the owner's personal laptop:
+
+            find ~/Library ~/.local/share -maxdepth 4 -name proxy.json ...
+
+        Unbounded, hours long, on a machine that later froze under unrelated
+        load. The answer was already in the process table the whole time, and
+        the package knew it exactly. A layout that cannot be ASKED for is a
+        layout every consumer has to SEARCH for, and a search on someone's
+        laptop is the cost of that.
+
+        Bare path on stdout, nothing else, exit 1 when there is no pin — the
+        `--get_port` rules, for the same reason: it is read by `$(...)`.
+        """
+        import io
+        import types
+
+        from claude_swap import pin
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        sw = types.SimpleNamespace(backup_dir=backup)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = pin.run(sw, None, get_certdir=True)
+        assert rc == 0, "a pinned host could not report its own state directory"
+        assert out.getvalue().strip() == str(backup / "pin-proxy"), (
+            f"stdout must be the bare path and nothing else, or it lands "
+            f"inside the caller's variable: {out.getvalue()!r}"
+        )
 
     def test_set_port_persists_where_the_package_looks_for_it(
         self, tmp_path, monkeypatch

@@ -1710,6 +1710,7 @@ def run(
     clear: bool = False,
     heal_only: bool = False,
     get_port: bool = False,
+    get_certdir: bool = False,
     set_port: int | None = None,
     ensure: bool = False,
 ) -> int:
@@ -1858,6 +1859,28 @@ def run(
         if p is None:
             return 1
         print(p)
+        return 0
+
+    if get_certdir:
+        # THE OTHER THING NOBODY COULD ASK FOR, and the one that cost a user's
+        # laptop real time. The state directory is not the same path on Darwin
+        # as on Linux, and a session diagnosing the pin on a Mac had no way to
+        # ask — so it ran, over ssh, on the owner's personal machine:
+        #
+        #     find ~/Library ~/.local/share -maxdepth 4 -name proxy.json ...
+        #
+        # Unbounded and hours long, for a string this process already holds.
+        # A layout that cannot be ASKED for is a layout every consumer has to
+        # SEARCH for, and on someone's laptop that search is the cost.
+        #
+        # BEFORE _impl() and printing a bare path, for the same two reasons as
+        # --get_port: the caller most likely to ask is diagnosing a failure, and
+        # the value is read by `$(...)` so a prefix lands in their variable.
+        #
+        # Unlike --get_port this does NOT probe. The question is "where does
+        # this host keep it", which is true whether or not a daemon is up —
+        # and a diagnosis of a DEAD pin is exactly when it is asked.
+        print(switcher.backup_dir / "pin-proxy")
         return 0
 
     if heal_only:
