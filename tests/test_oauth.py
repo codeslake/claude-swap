@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -952,15 +953,39 @@ class TestClassifyUsageError:
         )
         assert oauth._classify_usage_error(e)[0] == "tls-cert"
 
-    def test_plain_transport_failure_still_reads_as_network(self):
-        """Control for the case above: narrowing must not swallow the ordinary
-        transport error, which is what ``network`` exists for."""
+    def test_a_non_cert_ssl_failure_is_not_a_cert_failure(self):
+        """Pins the PREDICATE, not just the outcome.
+
+        ``ssl.SSLCertVerificationError`` is the narrow choice on purpose, and
+        the obvious loosening -- ``ssl.SSLError`` -- passes every other test in
+        this file. A non-cert TLS failure is a different condition with a
+        different repair: speaking https to a plaintext port raises
+        ``SSLError("record layer failure")``, and calling that ``tls-cert``
+        sends the operator to fix a CA bundle for a wrong-port problem.
+        """
         assert oauth._classify_usage_error(
-            urllib.error.URLError(ConnectionRefusedError())
+            urllib.error.URLError(ssl.SSLEOFError("handshake failed"))
         )[0] == "network"
         assert oauth._classify_usage_error(
-            urllib.error.URLError(OSError("unreachable"))
+            urllib.error.URLError(ssl.SSLError("record layer failure"))
         )[0] == "network"
+
+    def test_tls_cert_carries_a_remedy_note(self):
+        """A kind with no ERROR_NOTES entry renders as the bare identifier.
+
+        The whole point of splitting this out of ``network`` is that the two
+        need different repairs, and that only reaches the operator through the
+        note. Without one the display trades one uninformative word for
+        another. ``test_every_deterministic_kind_has_a_note`` states the same
+        principle but iterates ``_DETERMINISTIC_REFRESH_ERRORS``, which is a
+        refresh-error list -- a usage-fetch kind is outside its loop, so it
+        cannot cover this.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert "tls-cert" in ERROR_NOTES
+        note = ERROR_NOTES["tls-cert"]
+        assert "SSL_CERT_FILE" in note
 
     def test_bad_response(self):
         try:

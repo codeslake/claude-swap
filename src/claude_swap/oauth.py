@@ -380,8 +380,9 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
 
     ``kind`` is a short stable token for logs and backoff decisions
     (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
-    ``"bad-response"``, or the exception type name as a fallback). ``retry_after_s`` is the parsed
-    ``Retry-After`` header when the server sent one (seconds form only — the
+    ``"bad-response"``, or the exception type name as a fallback).
+    ``retry_after_s`` is the parsed ``Retry-After`` header when the server sent
+    one (seconds form only — the
     HTTP-date form is rare enough to ignore).
     """
     if isinstance(e, urllib.error.HTTPError):
@@ -406,9 +407,14 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
         # as "network". An account sat unpolled for ten days with that one word
         # as the whole record. `network` says "the host is unreachable" and
         # sends you to look at DNS and connectivity; the actual repair is a CA
-        # bundle. urllib reads SSL_CERT_FILE and neither REQUESTS_CA_BUNDLE nor
-        # NODE_EXTRA_CA_CERTS, which is exactly how a host can look configured
-        # and still fail here.
+        # bundle -- and WHICH bundle depends on the platform, because
+        # `cli.py` injects `truststore`, whose backends do not agree:
+        # truststore's OpenSSL backend calls set_default_verify_paths(), so on
+        # Linux SSL_CERT_FILE is read; its macOS and Windows backends verify
+        # through Security.framework and SChannel and read it not at all, so
+        # there the CA has to be trusted in the OS store. Nothing in this path
+        # reads REQUESTS_CA_BUNDLE or NODE_EXTRA_CA_CERTS on any platform,
+        # which is how a host can look configured and still fail here.
         if isinstance(e.reason, ssl.SSLCertVerificationError):
             return "tls-cert", None
         return "network", None
