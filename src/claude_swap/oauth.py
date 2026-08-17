@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import ssl
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -378,8 +379,8 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     """Map a usage-fetch exception to ``(kind, retry_after_s)``.
 
     ``kind`` is a short stable token for logs and backoff decisions
-    (``"http-429"``, ``"timeout"``, ``"network"``, ``"bad-response"``, or the
-    exception type name as a fallback). ``retry_after_s`` is the parsed
+    (``"http-429"``, ``"timeout"``, ``"tls-cert"``, ``"network"``,
+    ``"bad-response"``, or the exception type name as a fallback). ``retry_after_s`` is the parsed
     ``Retry-After`` header when the server sent one (seconds form only — the
     HTTP-date form is rare enough to ignore).
     """
@@ -397,6 +398,19 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
     if isinstance(e, urllib.error.URLError):
         if isinstance(e.reason, TimeoutError):
             return "timeout", None
+        # A TLS handshake that the SERVER answered and we refused is not a
+        # transport failure, and calling it one hides the only fix that works.
+        # Measured 2026-08-17: a TLS-terminating proxy (corporate MITM, or a
+        # local one) presents a CA that urllib does not trust, every poll
+        # raises URLError(SSLCertVerificationError), and all of it was recorded
+        # as "network". An account sat unpolled for ten days with that one word
+        # as the whole record. `network` says "the host is unreachable" and
+        # sends you to look at DNS and connectivity; the actual repair is a CA
+        # bundle. urllib reads SSL_CERT_FILE and neither REQUESTS_CA_BUNDLE nor
+        # NODE_EXTRA_CA_CERTS, which is exactly how a host can look configured
+        # and still fail here.
+        if isinstance(e.reason, ssl.SSLCertVerificationError):
+            return "tls-cert", None
         return "network", None
     if isinstance(e, json.JSONDecodeError):
         return "bad-response", None

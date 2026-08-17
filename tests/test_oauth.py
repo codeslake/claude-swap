@@ -927,6 +927,41 @@ class TestClassifyUsageError:
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
 
+    def test_tls_cert_failure_is_not_flattened_to_network(self):
+        """A MITM proxy with an untrusted CA must not read as a transport error.
+
+        Measured 2026-08-17 on lambda-docker: every usage poll went through a
+        TLS-terminating proxy whose CA urllib does not trust, so each one raised
+
+            URLError(SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED]
+            certificate verify failed: unable to get local issuer certificate"))
+
+        and was recorded as ``network``. One account sat dead for ten days and
+        "network" is the only word anyone could see; the real cause reaches
+        DEBUG alone, which nothing enables. "Cannot reach the host" and "reached
+        the host and refused its certificate" need opposite fixes, so they may
+        not share a token.
+        """
+        import ssl
+        e = urllib.error.URLError(
+            ssl.SSLCertVerificationError(
+                1,
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "unable to get local issuer certificate (_ssl.c:1000)",
+            )
+        )
+        assert oauth._classify_usage_error(e)[0] == "tls-cert"
+
+    def test_plain_transport_failure_still_reads_as_network(self):
+        """Control for the case above: narrowing must not swallow the ordinary
+        transport error, which is what ``network`` exists for."""
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ConnectionRefusedError())
+        )[0] == "network"
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(OSError("unreachable"))
+        )[0] == "network"
+
     def test_bad_response(self):
         try:
             json.loads("not json")
