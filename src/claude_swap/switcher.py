@@ -180,9 +180,11 @@ _DEMOTING_STASH_REASONS = (
 
 ERROR_NOTES = {
     "tls-cert": (
-        "the server's certificate was refused — a TLS-terminating proxy "
-        "(corporate or local) whose CA is not trusted here; trust that CA in "
-        "the OS store on macOS/Windows, or set SSL_CERT_FILE on Linux"
+        "the certificate chain was not trusted — most often a TLS-terminating "
+        "proxy whose CA is missing here, sometimes an expired duplicate root "
+        "shadowing a valid one; fix it in the OS store on macOS/Windows, or "
+        "via SSL_CERT_FILE on Linux (REQUESTS_CA_BUNDLE and "
+        "NODE_EXTRA_CA_CERTS are not read on this path)"
     ),
     "store-unmirrored": (
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
