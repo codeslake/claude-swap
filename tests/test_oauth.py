@@ -943,7 +943,6 @@ class TestClassifyUsageError:
         the host and refused its certificate" need opposite fixes, so they may
         not share a token.
         """
-        import ssl
         e = urllib.error.URLError(
             ssl.SSLCertVerificationError(
                 1,
