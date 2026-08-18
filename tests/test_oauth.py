@@ -1541,6 +1541,47 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
         monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
         monkeypatch.setitem(sys.modules, "cswap_pin.proxy", mod)
 
+    def test_the_bridge_calls_trust_our_own_proxy_without_an_env_var(self):
+        """A python client of the pin must ADD our CA, never REPLACE the store.
+
+        These two calls are plain urllib through whatever proxy the session
+        was wired to. When that proxy is the pin, it MITMs api.anthropic.com,
+        so the default context cannot verify it and every call dies
+        CERTIFICATE_VERIFY_FAILED — swallowed to debug, returning None, which
+        is how the cloud session names stayed wrong for hours with nothing in
+        any log.
+
+        SSL_CERT_FILE WAS THE WRONG TOOL AND THE MEASUREMENTS SAY SO. It
+        REPLACES OpenSSL's file, so it is only safe where the bundle subsumes
+        the store it displaces — measured per machine:
+
+            host-a     ambient 124  bundle 126  safe
+            host-b      ambient 128  bundle 167  NOT (27 missing)
+            host-c  ambient 128  bundle   2  NOT (128 missing)
+
+        so the gate that writes it correctly refuses on both Macs, and the
+        restore stays broken there. Adding the CA to a default context keeps
+        the system roots and needs no variable at all. Measured on
+        host-c, same process, same proxy:
+
+            default ctx                 CERTIFICATE_VERIFY_FAILED
+            default ctx + our CA added  HTTP 200
+
+        This pins that the context builder ADDS: a context that verifies our
+        CA must still carry the ambient roots.
+        """
+        import ssl
+
+        from claude_swap import oauth
+
+        ctx = oauth._pin_aware_ssl_context()
+        assert isinstance(ctx, ssl.SSLContext)
+        # The ambient roots survive. `get_ca_certs()` reads what was loaded, so
+        # a builder that replaced the store shows a near-empty list here.
+        assert len(ctx.get_ca_certs()) > 20, (
+            "the context dropped the system roots — SSL_CERT_FILE's bug, "
+            "rebuilt in code")
+
     def test_every_title_the_policy_names_is_put_back(self, monkeypatch):
         from claude_swap import oauth
 

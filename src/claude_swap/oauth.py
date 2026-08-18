@@ -784,6 +784,57 @@ def _persist(
 _BRIDGE_SESSIONS_URL = "https://api.anthropic.com/v1/code/sessions"
 
 
+def _pin_aware_ssl_context():
+    """A verifying context that ALSO trusts the pin's CA, if there is one.
+
+    NAMED FOR THE PROPERTY, NOT THE CALLER. It started as
+    `_bridge_ssl_context` because the bridge calls were the first to need it,
+    and the cswap session has three more sites in this same module — token
+    refresh, profile, usage — with the identical problem. A helper named after
+    its first caller is one the next caller writes a second copy of.
+
+    These calls are plain urllib through whatever proxy the session was wired
+    to. When that is the pin, it MITMs api.anthropic.com — so the default
+    context cannot verify it, every call dies CERTIFICATE_VERIFY_FAILED, and
+    `_list_bridge_sessions` swallows that to debug and returns None. That is
+    how the cloud session names stayed wrong for hours with nothing in any log.
+
+    ADD, NEVER REPLACE, and the difference is not cosmetic. `SSL_CERT_FILE`
+    REPLACES OpenSSL's file, so it is safe only where the bundle subsumes the
+    store it displaces. Measured per machine, by certificate SET:
+
+        host-a     ambient 124  bundle 126  safe
+        host-b      ambient 128  bundle 167  NOT — 27 missing
+        host-c  ambient 128  bundle   2  NOT — 128 missing
+
+    So the writer that sets it correctly refuses on both Macs, and the repair
+    stays dead there. Loading our CA into a default context keeps every
+    ambient root and needs no environment variable at all. Measured on
+    host-c, same process and proxy:
+
+        default ctx                 CERTIFICATE_VERIFY_FAILED
+        default ctx + our CA added  HTTP 200
+
+    NEVER RAISES and never returns None: with no pin installed, or an
+    unreadable CA, the caller still gets an ordinary verifying context. An
+    optional extra must not be able to break a call that worked without it.
+    """
+    import ssl
+
+    ctx = ssl.create_default_context()
+    try:
+        from cswap_pin.proxy import ca_path_for_trust
+    except Exception:  # noqa: BLE001 — the pin is an optional extra
+        return ctx
+    try:
+        ca = ca_path_for_trust()
+        if ca:
+            ctx.load_verify_locations(cafile=str(ca))
+    except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
+        _logger.debug("bridge ssl context: pin CA not added: %r", e)
+    return ctx
+
+
 def _bridge_headers(access_token: str) -> dict:
     return {
         "Authorization": f"Bearer {access_token}",
@@ -804,7 +855,8 @@ def _list_bridge_sessions(access_token: str) -> list[dict] | None:
         f"{_BRIDGE_SESSIONS_URL}?limit=100", headers=_bridge_headers(access_token)
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(
+                req, timeout=10, context=_pin_aware_ssl_context()) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — cosmetic repair, never fatal
         _logger.debug("bridge listing failed: %r", e)
@@ -822,7 +874,8 @@ def _put_bridge_title(access_token: str, session_id: str, title: str) -> bool:
         method="PUT",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10):
+        with urllib.request.urlopen(
+                req, timeout=10, context=_pin_aware_ssl_context()):
             return True
     except Exception as e:  # noqa: BLE001
         _logger.debug("bridge rename failed for %s: %r", session_id, e)
