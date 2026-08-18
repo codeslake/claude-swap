@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -958,6 +959,15 @@ def _put_bridge_title(access_token: str, session_id: str, title: str) -> bool:
         return False
 
 
+#: How long the bridge-title repair may spend on PUTs in ONE pass. It runs
+#: inside `AutoSwitchEngine.tick()`, the loop body that decides when to switch
+#: before a rate-limit lockout, and each PUT carries its own 10s timeout with
+#: no cap on how many there are. Smaller than one tick's usual cost on purpose:
+#: a repair that delays the switch is worse than a repair that finishes next
+#: pass, and the cadence is 300s so there always is a next pass.
+_BRIDGE_TITLE_BUDGET_S = 20.0
+
+
 def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
     """Put each live session's own name back on its cloud bridge.
 
@@ -1002,14 +1012,33 @@ def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
             return 0, "list-failed"
         if not sessions:
             return 0, "no-bridges"
-        done = 0
         wanted = list(titles_to_restore(sessions, names))
+        # THE ZERO-OUTCOME IS DECIDED BEFORE THE LOOP IT PRECEDES. This sat
+        # BELOW the loop, so the empty case walked a body that cannot execute
+        # before being detected and a reader had to prove the loop was a no-op
+        # to see the branch was reachable.
+        if not wanted:
+            return 0, "nothing-to-rename"
+        done = 0
+        # A DEADLINE, BECAUSE THIS RUNS INSIDE `tick()`. Each PUT carries a 10s
+        # timeout and `wanted` is unbounded, so 100 stale titles against a
+        # black-holing endpoint block the switch engine for ~1000s — on the
+        # very tick that was about to prevent a rate-limit lockout, which is
+        # the outcome moving this call into `finally` was meant to avoid. The
+        # cadence gate does not help: `_bridge_titles_next_at` is advanced
+        # before the work.
+        #
+        # LEFTOVERS ARE NOT LOST. This is a repair on a 300s cadence, so a pass
+        # that runs out of budget renames what it reached and the next one
+        # picks up the rest; the outcome says so rather than reporting a clean
+        # `renamed`.
+        deadline = time.monotonic() + _BRIDGE_TITLE_BUDGET_S
         for sid, want in wanted:
+            if time.monotonic() >= deadline:
+                return done, f"partial-{done}-of-{len(wanted)}"
             if _put_bridge_title(access_token, sid, want):
                 done += 1
                 _logger.info("restored the cloud title for %s to %r", sid, want)
-        if not wanted:
-            return 0, "nothing-to-rename"
         if not done:
             # Listed fine, had work, renamed none: every PUT was refused. A
             # different fault from every other zero here.

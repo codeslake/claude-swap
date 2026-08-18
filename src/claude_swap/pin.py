@@ -293,7 +293,7 @@ def pin_is_applying(switcher) -> bool | None:
     if impl is None:
         return None
     try:
-        state = impl.read_daemon_state(switcher.backup_dir / "pin-proxy")
+        state = impl.read_daemon_state(_certdir(switcher))
     except Exception:  # noqa: BLE001 — a badge must not take the view down
         return None
     if not state:
@@ -1801,10 +1801,17 @@ def _certdir(switcher):
     """Where the pin keeps its own files. One definition, so a layout change
     is one edit rather than a grep.
 
-    IT HAD ONE CALLER while two other sites spelled `backup_dir /
-    "pin-proxy"` themselves, so the grep it exists to prevent was still
-    three files wide and the docstring above was aspirational. All three go
-    through it now; the literal appears exactly once, below."""
+    THIS DOCSTRING HAS BEEN FALSE TWICE. It first said "all three go through
+    it now" while two sites still spelled `backup_dir / "pin-proxy"`
+    themselves; those were routed here, and the SAME diff then grew two more —
+    `pin_is_applying` and `--get_certdir`, the command whose entire purpose is
+    being the single authority on this path. A prose claim about a grep is a
+    claim nothing checks, so it drifts every time somebody needs the path in a
+    hurry.
+
+    `test_the_certdir_literal_appears_exactly_once` is what makes it true now.
+    Adding a third spelling fails the suite instead of aging into another
+    aspirational sentence."""
     from pathlib import Path
 
     return Path(switcher.backup_dir) / "pin-proxy"
@@ -1986,7 +1993,7 @@ def run(
         # Unlike --get_port this does NOT probe. The question is "where does
         # this host keep it", which is true whether or not a daemon is up —
         # and a diagnosis of a DEAD pin is exactly when it is asked.
-        print(switcher.backup_dir / "pin-proxy")
+        print(_certdir(switcher))
         return 0
 
     if heal_only:

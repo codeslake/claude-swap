@@ -7317,3 +7317,46 @@ class TestTheLockFailureThatStrandsTheWiringIsNamed:
             f"Records: "
             f"{[(r.funcName, r.levelname, r.getMessage()) for r in caplog.records]}"
         )
+
+
+class TestTheCertdirPathHasOneSpelling:
+    """`_certdir`'s docstring has been false twice; this is what makes it true.
+
+    It claimed "all three go through it now" while two sites spelled
+    `backup_dir / "pin-proxy"` themselves, and after those were routed through
+    it the same diff grew two more — including `--get_certdir`, the command
+    whose whole job is being the single authority on that path. A prose claim
+    about a grep is a claim nothing checks.
+    """
+
+    def test_the_certdir_literal_appears_exactly_once(self):
+        import ast
+        from pathlib import Path
+
+        src = (Path(__file__).parent.parent
+               / "src" / "claude_swap" / "pin.py").read_text()
+        tree = ast.parse(src)
+        # STRING CONSTANTS IN THE AST, not lines matching a phrase. The first
+        # version grepped for the literal and caught `_certdir`'s own docstring
+        # quoting it while explaining why it must not be spelled twice — a
+        # check its own subject's documentation trips is a check that gets
+        # deleted. Docstrings are excluded by identity here, not by wording.
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+                d = ast.get_docstring(node, clean=False)
+                if d is not None:
+                    docstrings.add(id(node.body[0].value))
+        spellings = [
+            n.lineno for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and n.value == "pin-proxy"
+            and id(n) not in docstrings
+        ]
+        assert len(spellings) == 1, (
+            "the certdir path is spelled in more than one place, so a layout "
+            f"change moves some callers and strands the rest: lines "
+            f"{spellings}")
+        assert "def _certdir(" in src, (
+            "the helper the single spelling belongs to is gone, so this test "
+            "now passes by asserting nothing")

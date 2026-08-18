@@ -6942,6 +6942,123 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         with pytest.raises(RuntimeError):
             harness.engine.tick()
 
+    def test_the_restore_cannot_block_the_switch_engine(self, monkeypatch):
+        """UNBOUNDED WORK INSIDE `tick()`, THE LOOP THAT PREVENTS A LOCKOUT.
+
+        `restore_bridge_titles` PUT once per stale title with a 10s timeout
+        each and no cap on how many, so 100 of them against a black-holing
+        endpoint blocked the engine ~1000s — on the very tick that was about to
+        switch before a rate-limit lockout, which is the outcome moving the
+        call into `finally` was meant to avoid. The 300s cadence does not help:
+        `_bridge_titles_next_at` is advanced BEFORE the work.
+
+        Driven with a clock that jumps per PUT rather than by sleeping, so the
+        case measures the budget rather than the machine it runs on.
+        """
+        import sys
+        import types
+
+        from claude_swap import oauth as _oauth
+
+        # `titles_to_restore` is imported INSIDE the function from
+        # cswap_pin.proxy — the policy deliberately lives in the pin — so the
+        # stub goes in sys.modules, not on the oauth module.
+        fake = types.ModuleType("cswap_pin.proxy")
+        fake.titles_to_restore = (
+            lambda sessions, names: [(x["id"], "mine") for x in sessions])
+        pkg = types.ModuleType("cswap_pin")
+        pkg.proxy = fake
+        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
+        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
+
+        now = [1000.0]
+        monkeypatch.setattr(_oauth.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            _oauth, "_list_bridge_sessions",
+            lambda _tok: [{"id": f"cse_{i}", "title": "server-name"}
+                          for i in range(100)])
+
+        puts = []
+
+        def slow_put(tok, sid, title):
+            puts.append(sid)
+            now[0] += 10.0          # one PUT, one timeout
+            return True
+
+        monkeypatch.setattr(_oauth, "_put_bridge_title", slow_put)
+        done, outcome = _oauth.restore_bridge_titles("tok", {"x": "mine"})
+
+        spent = now[0] - 1000.0
+        assert spent <= _oauth._BRIDGE_TITLE_BUDGET_S + 10.0, (
+            f"the repair spent {spent}s inside one tick against a budget of "
+            f"{_oauth._BRIDGE_TITLE_BUDGET_S}s; a tick that is about to "
+            "prevent a lockout cannot wait that long")
+        assert len(puts) < 100, "every PUT ran, so nothing bounded the pass"
+        # AND IT SAYS SO. A pass that renamed some of them and stopped must not
+        # report the same `renamed` as one that finished — the leftovers are
+        # picked up next cadence, and the outcome is the only place that says
+        # there ARE leftovers.
+        assert outcome.startswith("partial-"), (
+            f"a truncated pass reported {outcome!r}, indistinguishable from a "
+            "complete one")
+        assert done == len(puts)
+
+    def test_a_dry_run_engine_does_not_rename_the_users_sessions(
+        self, harness, monkeypatch, caplog
+    ):
+        """DRY RUN MUST NOT WRITE, and this one PUTs to the cloud.
+
+        `_tick_inner` gates every mutation on `self.dry_run` — "Dry-run must
+        not write anything", "no token refresh, no quarantine writes". The
+        restore hook runs from `tick()`'s `finally`, OUTSIDE `_tick_inner`, and
+        had no such gate: `cswap auto --dry-run` and the TUI's demoted engine
+        both issue `PUT /v1/code/sessions/<id>` and rename the user's real
+        sessions.
+
+        AND IT BREAKS THE METHOD'S OWN PREMISE. The design note says "LIVE is
+        single-instance, so two of them cannot both PUT". True of LIVE engines;
+        a second TUI is DEMOTED to dry-run rather than stopped, so without this
+        gate the demoted one PUTs against the same bridges as the live one.
+        """
+        import logging
+        import sys
+        import types
+
+        fake = types.ModuleType("cswap_pin.proxy")
+        fake.live_bridge_names = lambda: {"cse_x": "my-session"}
+        fake.titles_to_restore = lambda sessions, names: [("cse_x", "my-session")]
+        pkg = types.ModuleType("cswap_pin")
+        pkg.proxy = fake
+        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
+        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
+
+        put = []
+        monkeypatch.setattr(
+            oauth, "_list_bridge_sessions",
+            lambda _tok: [{"id": "cse_x", "title": "renamed-by-server"}])
+        monkeypatch.setattr(
+            oauth, "_put_bridge_title",
+            lambda tok, sid, title: put.append(sid) or True)
+
+        harness.engine.dry_run = True
+        harness.engine._bridge_titles_next_at = 0.0
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._restore_bridge_titles_if_due()
+        assert put == [], (
+            "a dry-run engine renamed the user's cloud sessions: PUT "
+            f"{put}")
+
+        # AND THE CONTROL, or the assertion above passes for any reason at all
+        # — a wrong module stub, a cadence that never came due, a listing that
+        # returned nothing. A LIVE engine on the same wiring must PUT.
+        harness.engine.dry_run = False
+        harness.engine._bridge_titles_next_at = 0.0
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._restore_bridge_titles_if_due()
+        assert put == ["cse_x"], (
+            "the live engine did not rename either, so the dry-run assertion "
+            f"above proved nothing: {put}")
+
     def test_a_restore_that_can_do_nothing_says_so_ONCE(self, harness,
                                                         monkeypatch, caplog):
         """FIVE STATES, ONE RETURN VALUE, AND A CALLER THAT ONLY SPOKE ON WIN.

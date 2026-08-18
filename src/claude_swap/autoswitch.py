@@ -937,11 +937,33 @@ class AutoSwitchEngine:
         # This one called the module's `time.time()`, so a test that advances
         # the injected clock could not make the repair due, and a run with a
         # shifted clock had one timer on a different time base.
-        now = self.clock()
-        if now < getattr(self, "_bridge_titles_next_at", 0.0):
+        # DRY RUN MUST NOT WRITE, and this is a WRITE — `PUT /v1/code/
+        # sessions/<id>` renames the user's real cloud sessions. Every mutation
+        # in `_tick_inner` is gated on this flag; the restore runs from
+        # `tick()`'s `finally`, outside `_tick_inner`, and was not.
+        #
+        # IT ALSO RESTORES THE SINGLE-WRITER PREMISE this repair is designed
+        # around. A second TUI is DEMOTED to dry-run rather than stopped, so
+        # without the gate the demoted engine PUTs against the same bridges as
+        # the live one — the exact concurrent-writer case "LIVE is
+        # single-instance" was supposed to rule out.
+        if self.dry_run:
             return
-        self._bridge_titles_next_at = now + self.BRIDGE_TITLE_INTERVAL_S
+        # THE WHOLE BODY IS GUARDED, because this runs from `tick()`'s
+        # `finally`. A raise here does not merely fail the repair — it REPLACES
+        # whatever tick() was about to return or propagate, so a clock that
+        # raises turns a real switch decision into a traceback and hides the
+        # original error. `run_loop` has its own net; `cswap auto --once` does
+        # `sys.exit(engine.tick().value)` under a handler that only catches
+        # ClaudeSwitchError, and exits with a traceback instead.
+        #
+        # The cadence read, the clock and the reporter inside the old `except`
+        # were all outside any guard.
         try:
+            now = self.clock()
+            if now < getattr(self, "_bridge_titles_next_at", 0.0):
+                return
+            self._bridge_titles_next_at = now + self.BRIDGE_TITLE_INTERVAL_S
             # EVERY WAY OUT REPORTS. Three bare `return`s used to sit here,
             # one frame above the reporter whose own docstring says five
             # reasons for renaming nothing were all the same silence. The
@@ -965,8 +987,14 @@ class AutoSwitchEngine:
             done, outcome = oauth.restore_bridge_titles(token, names)
             self._report_bridge_titles(outcome, done)
         except Exception as e:  # noqa: BLE001 — see the docstring
-            _logger.debug("bridge title restore skipped: %r", e)
-            self._report_bridge_titles(f"raised:{type(e).__name__}", 0)
+            # THE REPORTER CAN RAISE TOO, and it sits in the handler rather
+            # than in the guarded body, so it was the one statement whose
+            # failure still escaped into `tick()`'s `finally`.
+            try:
+                _logger.debug("bridge title restore skipped: %r", e)
+                self._report_bridge_titles(f"raised:{type(e).__name__}", 0)
+            except Exception:  # noqa: BLE001 — nothing left to report with
+                pass
 
     def _bridge_owner_number(self) -> str | None:
         """Which account's bearer can SEE these bridges — the pinned one.
