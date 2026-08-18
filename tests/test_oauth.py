@@ -443,7 +443,7 @@ class TestRefreshOAuthCredentials:
         mock_response.__enter__ = lambda s: s
         mock_response.__exit__ = MagicMock(return_value=False)
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             seen_body.update(json.loads(req.data.decode()))
             return mock_response
 
@@ -626,7 +626,7 @@ class TestFetchUsageForAccount:
         usage_resp = self._make_usage_response()
         persist_mock = MagicMock()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 return token_resp
             if "oauth/usage" in req.full_url:
@@ -663,7 +663,7 @@ class TestFetchUsageForAccount:
         usage_calls = 0
         persist_mock = MagicMock()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             nonlocal usage_calls
             if "oauth/token" in req.full_url:
                 return token_resp
@@ -698,7 +698,7 @@ class TestFetchUsageForAccount:
 
         usage_resp = self._make_usage_response(h5_pct=10.0, d7_pct=20.0)
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/usage" in req.full_url:
                 assert req.get_header("Authorization") == "Bearer old-access"
                 return usage_resp
@@ -720,7 +720,7 @@ class TestFetchUsageForAccount:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         credentials = self._make_credentials(expires_at=now_ms - 1_000)
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 raise urllib.error.HTTPError(
                     req.full_url, 400, "Bad Request", hdrs=None, fp=None,
@@ -758,7 +758,7 @@ class TestFetchUsageForAccount:
         usage_resp = self._make_usage_response()
         persist_mock = MagicMock()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 body = json.loads(req.data.decode())
                 assert "scope" not in body
@@ -790,7 +790,7 @@ class TestFetchUsageForAccount:
         persist_mock = MagicMock()
         refresh_calls = 0
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             nonlocal refresh_calls
             if "oauth/token" in req.full_url:
                 refresh_calls += 1
@@ -819,7 +819,7 @@ class TestFetchUsageForAccount:
         """Active account that 401s returns None without attempting a refresh."""
         credentials = self._make_credentials()
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             if "oauth/token" in req.full_url:
                 raise AssertionError(
                     "Active account must not trigger a refresh POST on 401"
@@ -918,13 +918,49 @@ class TestNativeTlsFallbackIsAudible:
 
     def test_a_successful_injection_stays_quiet(self, caplog):
         """The control: the normal path must not warn, or the warning is noise
-        every run and stops being read."""
+        every run and stops being read.
+
+        AND IT PUTS SSL BACK. `inject_into_ssl` is process-global and has no
+        automatic undo, so without the `finally` below every
+        `ssl.create_default_context()` for the rest of the worker returns a
+        `truststore._api.SSLContext` — a different class with a different API.
+
+        That is not hypothetical: it turned CI red. `truststore`'s context
+        raises `NotImplementedError` from `get_ca_certs()`, so a later test in
+        this file that asked a context what roots it carried died on a call
+        this test had made. It passed locally and failed in CI purely on
+        xdist's scheduling — same worker, poisoned; different workers, both
+        green. A suite whose result depends on which worker drew which test is
+        not reporting on the code.
+
+        The undo belongs HERE rather than in the victim, because the blast
+        radius is every test that touches ssl after this one, not the one that
+        happened to be caught.
+        """
         import logging
         from claude_swap import cli
 
-        with caplog.at_level(logging.WARNING):
-            cli._use_native_tls()
-        assert not [r for r in caplog.records if "truststore" in r.getMessage().lower()]
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+            assert not [r for r in caplog.records
+                        if "truststore" in r.getMessage().lower()]
+        finally:
+            try:
+                import truststore
+
+                truststore.extract_from_ssl()
+            except Exception:  # noqa: BLE001 — nothing to undo is a fine outcome
+                pass
+
+        # THE GUARD, not decoration. A cleanup nothing asserts is one the next
+        # edit deletes, and its absence is invisible until some unrelated test
+        # in some unrelated file starts failing on a scheduling coin-flip.
+        import ssl
+
+        assert type(ssl.create_default_context()).__module__ == "ssl", (
+            "this test left truststore injected into ssl — every later test in "
+            "this worker now gets a different SSLContext class")
 
 
 class TestClassifyUsageError:
@@ -1359,7 +1395,7 @@ class TestFetchOauthProfile:
     def test_resolves_identity(self):
         seen = {}
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             seen["url"] = req.full_url
             seen["auth"] = req.headers.get("Authorization")
             return self._profile_response({
@@ -1380,7 +1416,7 @@ class TestFetchOauthProfile:
         never hang a switch."""
         seen = {}
 
-        def mock_urlopen(req, timeout=0):
+        def mock_urlopen(req, timeout=0, **_kw):
             seen["timeout"] = timeout
             return self._profile_response({
                 "account": {"uuid": "acc-uuid", "email": "a@b.c"},
@@ -1567,20 +1603,86 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
             default ctx                 CERTIFICATE_VERIFY_FAILED
             default ctx + our CA added  HTTP 200
 
-        This pins that the context builder ADDS: a context that verifies our
-        CA must still carry the ambient roots.
+        This pins that the context builder ADDS: it hands back the DEFAULT
+        context, with our CA loaded into it.
+
+        A CERT COUNT CANNOT ASK THIS QUESTION, and the first version of this
+        test tried. `assert len(ctx.get_ca_certs()) > 20` was wrong twice over:
+
+          - `get_ca_certs()` reports only certs loaded from a *cafile*. Roots
+            that arrive from a *capath* directory load lazily and never appear,
+            so a perfectly healthy store reads 0 on such a machine. Measured on
+            host-a: `get_default_verify_paths().cafile` is None and the
+            count is 0 while verification works fine.
+          - it is a COUNT, and containment is not size. Measured on
+            host-b: a 167-cert bundle was still missing 27 certs of the
+            128-cert store it would have displaced. A bigger number looked like
+            an answer and was not.
+
+        So assert the structure instead: `create_default_context()` is the
+        base — whatever roots this machine and this interpreter give it — and
+        the pin CA goes in through `load_verify_locations`, which ADDS. Both
+        claims are checked without asking any context to enumerate anything,
+        which is also why this survives `truststore.inject_into_ssl()` — its
+        context class raises NotImplementedError from `get_ca_certs()`.
         """
         import ssl
 
         from claude_swap import oauth
 
-        ctx = oauth._pin_aware_ssl_context()
-        assert isinstance(ctx, ssl.SSLContext)
-        # The ambient roots survive. `get_ca_certs()` reads what was loaded, so
-        # a builder that replaced the store shows a near-empty list here.
-        assert len(ctx.get_ca_certs()) > 20, (
-            "the context dropped the system roots — SSL_CERT_FILE's bug, "
-            "rebuilt in code")
+        class Recorder:
+            """Stands in for the default context and records what was ADDED."""
+
+            def __init__(self):
+                self.loaded = []
+
+            def load_verify_locations(self, cafile=None, capath=None, cadata=None):
+                self.loaded.append(cafile)
+
+        def build(ca):
+            """Run the builder with `cswap_pin.proxy.ca_path_for_trust -> ca`."""
+            import sys
+            import types
+
+            spy = Recorder()
+            mod = types.ModuleType("cswap_pin.proxy")
+            mod.ca_path_for_trust = lambda: ca
+            pkg = types.ModuleType("cswap_pin")
+            pkg.proxy = mod
+            real_ctx = ssl.create_default_context
+            saved = {k: sys.modules.get(k) for k in ("cswap_pin", "cswap_pin.proxy")}
+            sys.modules["cswap_pin"] = pkg
+            sys.modules["cswap_pin.proxy"] = mod
+            ssl.create_default_context = lambda *a, **k: spy
+            try:
+                return spy, oauth._pin_aware_ssl_context()
+            finally:
+                ssl.create_default_context = real_ctx
+                for k, v in saved.items():
+                    if v is None:
+                        sys.modules.pop(k, None)
+                    else:
+                        sys.modules[k] = v
+
+        # A PIN IS INSTALLED AND HAS A CA.
+        spy, ctx = build("/somewhere/pin-proxy/ca.pem")
+        # THE SAME OBJECT BACK. A builder that returned a fresh, narrower
+        # context — which is what SSL_CERT_FILE effectively does — fails here,
+        # because the ambient roots live in the object it was handed.
+        assert ctx is spy, (
+            "the builder did not return the default context — the ambient "
+            "roots were replaced, which is SSL_CERT_FILE's bug rebuilt in code")
+        assert spy.loaded == ["/somewhere/pin-proxy/ca.pem"], spy.loaded
+
+        # THE CONTROL, and it is the case that runs on every machine WITHOUT a
+        # pin — including CI, where `cswap_pin` is not importable at all. The
+        # first version of this test had no control and asserted the CA was
+        # always added, so it failed in CI for the correct behaviour: with no
+        # pin there is nothing to add, and adding nothing is right.
+        spy, ctx = build(None)
+        assert ctx is spy, "no pin must still yield the untouched default context"
+        assert spy.loaded == [], (
+            f"nothing to trust, so nothing may be loaded; got {spy.loaded}")
 
     def test_every_title_the_policy_names_is_put_back(self, monkeypatch):
         from claude_swap import oauth
@@ -1806,3 +1908,82 @@ class TestConsumeBusyIsDeterministic:
             k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
         ]
         assert not missing, missing
+
+
+class TestEveryPinRoutedCallCarriesThePinAwareContext:
+    """The helper existing is not the helper being USED.
+
+    `_pin_aware_ssl_context` is covered by a test that proves it ADDS rather
+    than replaces. Nothing proved any call site passes it. That is the shape
+    where a fix ships and changes nothing: the builder is correct, the callers
+    still hand urllib the default context, and every request through the pin
+    keeps dying CERTIFICATE_VERIFY_FAILED exactly as before.
+
+    Measured through the pin on all three machines, each with its own
+    interpreter and its port read from `cswap pin --get_port`:
+
+        host-b      default FAIL -> +pin CA HTTP 429
+        host-c  default FAIL -> +pin CA HTTP 429
+        host-a-docker      default FAIL -> +pin CA HTTP 429
+
+    So every one of these calls needs the context, not just the bridge pair
+    that happened to be noticed first.
+
+    THE SENTINEL IS THE POINT. Asserting `context is not None` would pass on a
+    site that built its own bare `ssl.create_default_context()` — which is the
+    unfixed behaviour wearing the right shape. Identity against the sentinel
+    is the only assertion that separates them.
+    """
+
+    SENTINEL = object()
+
+    def _capture(self, monkeypatch):
+        """Record the kwargs of every urlopen this module makes."""
+        seen = []
+
+        class _Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+            def read(self_inner):
+                return b"{}"
+
+        def _fake_urlopen(req, **kwargs):
+            seen.append(kwargs)
+            return _Resp()
+
+        monkeypatch.setattr(oauth, "_pin_aware_ssl_context",
+                            lambda: self.SENTINEL)
+        monkeypatch.setattr(oauth.urllib.request, "urlopen", _fake_urlopen)
+        return seen
+
+    def test_the_usage_request_carries_it(self, monkeypatch):
+        """acct7's call. This is the one the failure was measured on."""
+        seen = self._capture(monkeypatch)
+        oauth.request_usage_data("tok")
+        assert seen, "request_usage_data made no request"
+        assert seen[0].get("context") is self.SENTINEL, (
+            "request_usage_data did not pass the pin-aware context — through "
+            "the pin this call cannot verify api.anthropic.com")
+
+    def test_the_profile_request_carries_it(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        oauth.fetch_oauth_profile("tok")
+        assert seen, "fetch_oauth_profile made no request"
+        assert seen[0].get("context") is self.SENTINEL, (
+            "fetch_oauth_profile did not pass the pin-aware context")
+
+    def test_the_bridge_listing_carries_it(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        oauth._list_bridge_sessions("tok")
+        assert seen, "_list_bridge_sessions made no request"
+        assert seen[0].get("context") is self.SENTINEL
+
+    def test_the_bridge_rename_carries_it(self, monkeypatch):
+        seen = self._capture(monkeypatch)
+        oauth._put_bridge_title("tok", "cse_a", "name")
+        assert seen, "_put_bridge_title made no request"
+        assert seen[0].get("context") is self.SENTINEL

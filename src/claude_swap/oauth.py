@@ -255,7 +255,9 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
     }
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(
+            req, timeout=5, context=_pin_aware_ssl_context()
+        ) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -371,7 +373,9 @@ def request_usage_data(access_token: str) -> dict:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with urllib.request.urlopen(
+        req, timeout=5, context=_pin_aware_ssl_context()
+    ) as resp:
         return json.loads(resp.read().decode())
 
 
