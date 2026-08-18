@@ -7017,7 +7017,23 @@ class ClaudeAccountSwitcher:
         # "Removed: Cloud pin wiring" with NO warning while HTTPS_PROXY and
         # CSWAP_PIN_PORT still named a dead port. Measured, not reasoned.
         before = _pin.wired_env_keys(self)
-        _pin.clear_pin(self)
+        # GUARDED LIKE EVERY OTHER STEP IN THIS FUNCTION. `clear_pin` is not
+        # documented never-raising and several of its steps are not guarded —
+        # `_pinned_email_now`, `clear_wiring` (whose `_write_json` catches only
+        # OSError and ConfigError), and `_ledger_path`, which calls
+        # `get_backup_root()`. This is the FIRST destructive step and it runs
+        # after the user has already confirmed, so a raise here leaves the
+        # credentials, the session profiles and `backup_dir` in place and exits
+        # with a traceback — the one partial failure in `purge` that does not
+        # `warning()` and continue.
+        try:
+            _pin.clear_pin(self)
+        except Exception as exc:  # noqa: BLE001 — purge continues, always
+            warning(
+                f"Could not clear the cloud pin ({type(exc).__name__}: {exc}). "
+                "Continuing the purge; the wiring check below still reports "
+                "what survived."
+            )
         # NAME THE FILE THAT ACTUALLY SURVIVED. This printed
         # `get_global_config_path()` after asking a check that reads BOTH
         # configs, so when the survivor was the other one the user was sent to

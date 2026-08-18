@@ -7360,3 +7360,100 @@ class TestTheCertdirPathHasOneSpelling:
         assert "def _certdir(" in src, (
             "the helper the single spelling belongs to is gone, so this test "
             "now passes by asserting nothing")
+
+
+class TestAnUnreadableSidecarIsNotAnAbsentOne:
+    """ABSENT and UNREADABLE answer the readers identically, and must not
+    answer the OPERATOR identically.
+
+    `_read_ledger` returns `{}` for both, and its docstring defends that: the
+    two readers ask questions an empty dict answers the same way. True, and it
+    is only half the story. Current cswap-pin writes the receipt ONLY to the
+    sidecar, so an unreadable one (root-owned parent, read-only mount, a
+    truncated file — all states `_clear_ledger`'s own docstring treats as
+    reachable) makes a live wiring invisible to every recovery path at once:
+    `_wiring_present` False, `heal` "Nothing to heal", `--ensure` a no-op, and
+    `purge` printing "Removed: Cloud pin wiring" — while `.claude.json` still
+    names a dead HTTPS_PROXY that every hand-launched `claude` dials.
+
+    The control flow stays as verified across all 56 sidecar/config pairs. What
+    changes is that the operator is TOLD, at the single read point every caller
+    already goes through, instead of being handed a success line.
+    """
+
+    def test_an_unreadable_receipt_warns_while_an_absent_one_is_silent(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        from claude_swap import pin
+
+        cfg = tmp_path / "claude.json"
+        cfg.write_text("{}")
+        led = tmp_path / "pin-wiring" / "deadbeef.json"
+        led.parent.mkdir(parents=True)
+        monkeypatch.setattr(pin, "_ledger_path", lambda _c: led)
+
+        # ABSENT: the ordinary state on a machine that was never pinned. It
+        # must stay silent, or the warning is noise on every launch and the
+        # next person deletes it.
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert pin._read_ledger(cfg) == {}
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING], (
+            "an absent receipt warned; that is every unpinned machine, and a "
+            "warning nobody can act on is one everybody learns to skip")
+
+        # UNREADABLE: the file is THERE and cannot be parsed. Same `{}` to the
+        # readers, different fact about the world.
+        caplog.clear()
+        led.write_text("{not json")
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert pin._read_ledger(cfg) == {}, (
+                "the return changed; the 56 verified sidecar/config pairs "
+                "depend on it staying an empty dict")
+        warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warns, (
+            "a receipt that exists but cannot be read was reported as no "
+            "receipt at all, so heal/purge/--ensure all answer 'nothing to "
+            "do' over a wiring that is still live")
+        msg = warns[0].getMessage()
+        assert str(led) in msg, f"the warning does not name the file: {msg}"
+
+
+class TestClearPinCapturesEvidenceBeforeAnythingUnwires:
+    """The survivor check must see the config as the user left it.
+
+    `clear_pin` snapshotted `wired_env_keys` for `env_keys_survive`, but did it
+    AFTER `impl.apply_pin(switcher, None, None)` — the package call that
+    unwires. So a peer that removed the receipt and left the env keys produced
+    an empty snapshot, no survivors, and `(True, 'Unpinned the cloud account')`
+    over a config still naming a dead proxy port. `purge` captures before it
+    calls `clear_pin`; the comment claimed parity with that and was only true
+    relative to `clear_wiring`, one step later.
+    """
+
+    def test_the_snapshot_precedes_the_package_call(self, monkeypatch):
+        from claude_swap import pin
+
+        order = []
+
+        class _Impl:
+            @staticmethod
+            def apply_pin(switcher, *_a):
+                order.append("apply_pin")
+
+        monkeypatch.setattr(pin, "_impl", lambda: _Impl)
+        monkeypatch.setattr(
+            pin, "wired_env_keys",
+            lambda _s: order.append("snapshot") or {})
+        monkeypatch.setattr(pin, "_pinned_email_now", lambda _s: None)
+        monkeypatch.setattr(pin, "clear_wiring", lambda _s: False)
+        monkeypatch.setattr(pin, "env_keys_survive", lambda _b: {})
+        monkeypatch.setattr(pin, "_clear_pin_record", lambda _s: None)
+
+        pin.clear_pin(object())
+
+        assert order[:2] == ["snapshot", "apply_pin"], (
+            "the survivor evidence was captured after the call that unwires, "
+            f"so a half-removed wiring is invisible to it: {order}")

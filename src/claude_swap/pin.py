@@ -820,9 +820,47 @@ def _read_ledger(config_path) -> dict:
     receipt, it answers FOR THE SIDECAR, and it carries what that clear
     displaced. Absence carries nothing.
     """
+    # RESOLVING THE PATH IS ITSELF A RAISING CALL — `_ledger_path` goes through
+    # `get_backup_root()`, which raises with no HOME. It used to sit inside the
+    # try below, where the bare `except` swallowed it; hoisting it to name the
+    # file in the warning took it OUT of every guard, and three tests that run
+    # without HOME turned into RuntimeErrors. A receipt whose PATH cannot be
+    # resolved is a machine with no backup root, i.e. no pin — genuinely
+    # absent, so it answers like absent, at debug rather than in silence.
     try:
-        raw = json.loads(_ledger_path(config_path).read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — absent/unreadable is not "wired"
+        path = _ledger_path(config_path)
+    except Exception as exc:  # noqa: BLE001 — no backup root means no pin
+        _logger.debug("no pin receipt path for %s: %r", config_path, exc)
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        # THE ORDINARY STATE. Every machine that was never pinned lands here,
+        # so it must stay silent or the warning below is noise on every launch
+        # and the next reader deletes it.
+        return {}
+    except Exception as exc:  # noqa: BLE001 — see below
+        # PRESENT AND UNREADABLE IS NOT ABSENT, even though both answer the two
+        # readers with `{}` — which is true, verified across all 56
+        # sidecar/config pairs, and only half the story.
+        #
+        # Current cswap-pin writes the receipt ONLY here; the config carries no
+        # marker. So a root-owned parent, a read-only mount or a truncated file
+        # makes a LIVE wiring invisible to every recovery path at once:
+        # `_wiring_present` False, `heal` -> "Nothing to heal", `--ensure` a
+        # no-op, and `purge` printing "Removed: Cloud pin wiring" — while
+        # `.claude.json` still names a dead HTTPS_PROXY that every hand-launched
+        # `claude` dials.
+        #
+        # The RETURN stays `{}` so that equivalence is untouched. What changes
+        # is that the operator hears about it, and it is said HERE because this
+        # is the single read point every caller already goes through — the
+        # property `_wire_mark_of`'s docstring claims for the read-both rule.
+        _logger.warning(
+            "%s exists but could not be read (%s) — treating it as no pin "
+            "receipt. If a pin IS wired, heal/purge/--ensure will all report "
+            "nothing to do while the env block still names its proxy.",
+            path, exc)
         return {}
     return raw if isinstance(raw, dict) else {}
 
@@ -1146,6 +1184,17 @@ def clear_pin(switcher) -> tuple[bool, str]:
     skipped" — only the second is a failure, and the skip is deliberate.
     """
     had_pin = _pinned_email_now(switcher) is not None
+    # CAPTURED BEFORE THE FIRST THING THAT UNWIRES, which is `apply_pin`, not
+    # `clear_wiring`. This snapshot sat below both, so the survivor check ran
+    # against a config the package had ALREADY rewritten: a peer that removed
+    # the receipt but left the env keys (a partial rewrite, or the
+    # ledger-first/config-second split failing on the second half) produced an
+    # empty `before`, an empty `survivors`, and `(True, 'Unpinned the cloud
+    # account')` over a config still naming a dead proxy port.
+    #
+    # `purge` gets this right by capturing before it calls US; the old comment
+    # claimed parity with it, and was only true relative to `clear_wiring`.
+    before = wired_env_keys(switcher)
     try:
         impl = _impl()
         impl.apply_pin(switcher, None, None)
@@ -1174,10 +1223,6 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # The failure is what the peer DID, not whether it raised, so ask.
     if _pinned_email_now(switcher) is not None:
         _clear_pin_record(switcher)
-    # CAPTURED BEFORE, for the same reason `purge` does it: `_wiring_present`
-    # reads the MARKER, and a clear that got the config but not the sidecar
-    # leaves the marker behind over a config that is already clean.
-    before = wired_env_keys(switcher)
     cleared = clear_wiring(switcher)
     still_pinned = _pinned_email_now(switcher) is not None
     # THE ENV BLOCK, NOT THE MARKER. `_clear_wiring_locked` returns
