@@ -114,7 +114,7 @@ menubar = ["rumps>=0.4.0"]
 # RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
 # accepted deliberately, and the pre-push hook in cswap-pin already warns when
 # src changes without a version bump — this is the other half of that.
-pin = ["cswap-pin>=0.1.103"]
+pin = ["cswap-pin>=0.1.105"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
