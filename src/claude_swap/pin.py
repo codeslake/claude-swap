@@ -2022,6 +2022,7 @@ def run(
             current = None
         if current:
             print(f"Cloud account (RC/artifacts): {current[0]}")
+            _warn_if_bridges_disagree(pin, current)
         else:
             print(dimmed("No cloud account pinned"))
         return 0
@@ -2081,3 +2082,55 @@ def run(
     else:
         print(dimmed("New sessions pick this up."))
     return 0
+
+
+def _warn_if_bridges_disagree(pin, current) -> None:
+    """Say so when the live bridges do not belong to the account we pinned.
+
+    THE STATUS LINE REPORTS THE PIN, WHICH IS WHAT WE WROTE — never what the
+    machine has. Measured 2026-08-17, three accounts at once:
+
+        the line said       acct1@example.com    pinned, acct 1
+        the live bridge was org da3631be…          acct 2
+        the login was       org b7e54904…          acct 3
+
+    Thirteen live bridges, none on the pinned org, and this command reported
+    "pinned" throughout. What ended the silence was the server answering
+    `API Error: 500` on a reattach, which cost the user the session.
+
+    NEVER FATAL, and that is the point of the guard rather than tidiness. This
+    is the second unguarded call into the optional package on this path; the
+    first turned a SUCCEEDED pin into `Error: … not usable` with advice to run
+    `--clear`, which would have destroyed it (see
+    TestANoteMustNotFailTheAction). `observed_bridge_owners` landed in
+    cswap-pin 0.1.85 and the two ship on separate schedules, so a host on an
+    older one must lose this extra line and keep the command.
+
+    Only a bridge whose recorded owner DISAGREES is named. An unrecorded owner
+    (`None`) is not evidence of anything and stays quiet here — the reader keeps
+    that key so a caller can tell unknown from absent, which is a different
+    question than this one.
+    """
+    # Imported here, like `run` does: `printer` is pulled in at call time
+    # throughout this module, and a module-level import would be the one
+    # difference between this helper and every other renderer in the file.
+    from claude_swap.printer import warning
+
+    try:
+        owners = pin.observed_bridge_owners()
+    except Exception:  # noqa: BLE001 — see the docstring: a raise unpins nothing
+        return
+    if not isinstance(owners, dict):
+        return
+    pinned_org = (current[1] if len(current) > 1 else "") or ""
+    if not pinned_org:
+        return
+    other = sorted({o for o in owners.values() if o and o != pinned_org})
+    if not other:
+        return
+    warning(
+        "the live Remote Control bridges do not belong to it: "
+        f"{len(other)} other organization(s) — {', '.join(other)}. "
+        "A reattach against a bridge this login does not own is refused by "
+        "the server; the pin is in name only until those sessions restart."
+    )

@@ -5301,6 +5301,92 @@ class TestANoteMustNotFailTheAction:
         assert rc == 0, "a malformed pin file made a read-only command fail"
         assert "No cloud account pinned" in out, out
 
+    def test_the_status_line_names_a_bridge_the_pin_does_not_own(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """REPORTING THE PIN IS NOT REPORTING THE STATE.
+
+        `Cloud account (RC/artifacts): …` prints `load_pin()` — the value this
+        code wrote itself. Measured 2026-08-17, three accounts at once:
+
+            cswap pin says      acct1@example.com     pinned, acct 1
+            the live bridge is  org da3631be…           acct 2
+            the login is        org b7e54904…           acct 3
+
+        Thirteen live bridges, zero on the pinned org, and the line said
+        "pinned" throughout — until the server answered `API Error: 500` on a
+        reattach and the user had to switch Remote Control off to recover.
+
+        The discriminator is local and free: cswap-pin >=0.1.85 exposes
+        `observed_bridge_owners()`, read from the job record beside the pointer.
+        """
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        (sw.backup_dir / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "pinned@example.com",
+                               "pinnedOrganizationUuid": "org-1"}}))
+        impl = self._impl(sw.backup_dir)
+        impl.observed_bridge_owners = lambda: {"cse_a": "org-2"}
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+
+        rc = pin.run(sw, None)
+        out = capsys.readouterr().out
+        assert rc == 0, "a status read must not fail the command"
+        assert "pinned@example.com" in out, out
+        assert "org-2" in out or "does not" in out.lower(), (
+            "the line reported the pin and said nothing about the bridge that "
+            f"is actually there: {out}")
+
+    def test_the_status_line_stays_quiet_when_the_bridges_agree(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """THE CONTROL. Without it, "warns on a mismatch" also passes on a
+        version that warns unconditionally — and a warning on every healthy
+        machine is how the real one gets skimmed past."""
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        (sw.backup_dir / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "pinned@example.com",
+                               "pinnedOrganizationUuid": "org-1"}}))
+        impl = self._impl(sw.backup_dir)
+        impl.observed_bridge_owners = lambda: {"cse_a": "org-1"}
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+
+        rc = pin.run(sw, None)
+        out = capsys.readouterr().out
+        assert rc == 0 and "pinned@example.com" in out, out
+        # ASSERT ON THE WARNING'S OWN WORDS, not on the org ids it happens to
+        # interpolate. The first version checked for "org-" outside "org-1",
+        # and a mutant that removed the early return still passed it: with
+        # nothing to disagree with, the warning renders "0 other
+        # organization(s) — " and carries no org id at all. Measured — the
+        # mutation SURVIVED. The stable half of that line is the sentence.
+        assert "do not belong to it" not in out, (
+            f"a machine whose bridges agree was warned at anyway: {out}")
+
+    def test_an_older_pin_package_without_the_reader_still_reports(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """cswap-pin is on its own release schedule and this is the exact shape
+        that turned a working pin into `Error: … not usable` once already (see
+        this class's docstring). A host on <0.1.85 has no
+        `observed_bridge_owners`; it must lose the extra line, not the
+        command."""
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        (sw.backup_dir / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "pinned@example.com",
+                               "pinnedOrganizationUuid": "org-1"}}))
+        monkeypatch.setattr(pin, "_impl", lambda: self._impl(sw.backup_dir))
+
+        rc = pin.run(sw, None)
+        out = capsys.readouterr().out
+        assert rc == 0, f"a missing optional reader failed the command: {out}"
+        assert "pinned@example.com" in out, out
+
     def test_the_cli_catch_all_scrubs_credentials(self, monkeypatch, capsys):
         """`_safe` exists for exactly this renderer, and it was the one
         renderer not using it.
