@@ -6906,10 +6906,34 @@ class TestTheEngineActuallyRunsTheTitleRestore:
     """
 
     def _engine(self, monkeypatch):
+        """A half-constructed engine, with everything `tick` does BUT the
+        restore patched out.
+
+        `object.__new__` skips `__init__`, so no instance state exists. That
+        was invisible while `tick` read none — and then #199 added
+        `self._announce_demotion()` as its FIRST line, which reads
+        `self._demotion_announced` that only `__init__` assigns. Both branches
+        were green alone and the MERGE was red:
+
+            #210 alone   3 passed
+            #199 alone   no tests ran (this class does not exist there)
+            merged       2 failed, AttributeError: _demotion_announced
+
+        Setting the missing attribute would fix today and break on the next
+        line `tick` grows. Patching the calls keeps this class asserting the one
+        thing it is for — that tick runs the restore — and nothing else.
+
+        `raising=False` because these methods exist on the merge target but not
+        on this branch, and a test that only runs on one side of a merge is how
+        this happened in the first place.
+        """
         from claude_swap import autoswitch
 
-        eng = object.__new__(autoswitch.AutoSwitchEngine)
-        return eng
+        for name in ("_announce_demotion", "_retry_live_promotion"):
+            monkeypatch.setattr(
+                autoswitch.AutoSwitchEngine, name, lambda self: None,
+                raising=False)
+        return object.__new__(autoswitch.AutoSwitchEngine)
 
     def test_tick_calls_the_restore(self, monkeypatch):
         from claude_swap import autoswitch
