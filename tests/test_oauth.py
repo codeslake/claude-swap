@@ -871,6 +871,62 @@ class TestFetchUsageForAccount:
         assert "cswap --add-account" in output
 
 
+class TestNativeTlsFallbackIsAudible:
+    """A silent fallback to stdlib ssl is a silent NARROWING OF TRUST.
+
+    ``_use_native_tls`` swallows every exception so the CLI is never blocked
+    over a trust nicety. That part is right. What is wrong is that it leaves no
+    trace, and the two paths do not trust the same roots.
+
+    Measured on macOS 2026-08-17, comparing the OS keychains against what
+    stdlib actually loads:
+
+        OS-store unique roots           173   (system 154, admin 4, login 15)
+        stdlib-loaded roots             128
+        trusted by OS, NOT by stdlib     67   <-- lost, with no message
+
+    Four of those live in /Library/Keychains/System.keychain, which is where an
+    administrator puts a corporate MITM CA. So the fallback can take away the
+    exact root the machine was configured with, and the user is then told to
+    "trust the CA in the OS store" by a remedy note pointing at a store that is
+    no longer being read.
+    """
+
+    def test_a_failed_injection_says_so(self, caplog):
+        import logging
+        import builtins
+        from claude_swap import cli
+
+        real_import = builtins.__import__
+
+        def refuse(name, *a, **k):
+            if name == "truststore":
+                raise ImportError("simulated: truststore unavailable")
+            return real_import(name, *a, **k)
+
+        builtins.__import__ = refuse
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+        finally:
+            builtins.__import__ = real_import
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "truststore" in joined.lower() or "native" in joined.lower(), (
+            f"the fallback left no trace; records={[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_a_successful_injection_stays_quiet(self, caplog):
+        """The control: the normal path must not warn, or the warning is noise
+        every run and stops being read."""
+        import logging
+        from claude_swap import cli
+
+        with caplog.at_level(logging.WARNING):
+            cli._use_native_tls()
+        assert not [r for r in caplog.records if "truststore" in r.getMessage().lower()]
+
+
 class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 
