@@ -8,6 +8,8 @@ import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from claude_swap import oauth
 
 
@@ -1910,6 +1912,17 @@ class TestConsumeBusyIsDeterministic:
         assert not missing, missing
 
 
+# OPTS OUT OF #216's AUTOUSE `block_real_oauth_profile_fetch`, which replaces
+# `fetch_oauth_profile` with a stub so dozens of unrelated tests do not open
+# real 5s HTTPS connections through add_account's identity guard. This class
+# mocks `urlopen` BENEATH that function and asserts the call reaches it, so a
+# stub above makes the assertion unreachable — "fetch_oauth_profile made no
+# request", green on either branch alone and red only on the merged tree.
+#
+# The marker is the escape hatch that fixture's own docstring already names for
+# exactly this shape. Narrowing the fixture instead would trade a hermetic
+# suite for a merge convenience.
+@pytest.mark.no_oauth_profile_fake
 class TestEveryPinRoutedCallCarriesThePinAwareContext:
     """The helper existing is not the helper being USED.
 
