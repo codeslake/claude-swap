@@ -6901,81 +6901,65 @@ class TestTheEngineActuallyRunsTheTitleRestore:
 
     The restore existed in cswap-pin, was correct, and had one caller that
     could not fire; that is how a session sat under a server-invented title for
-    hours on 2026-08-17. Removing the call from `tick` must therefore break a
-    test, or the same gap reopens the next time someone tidies this method.
+    hours on 2026-08-17. Removing the call from `tick` must break a test, or the
+    same gap reopens the next time someone tidies the method.
+
+    BUILT ON THE REAL HARNESS, after two rounds of not being. The first version
+    used `object.__new__` to skip `__init__`, which was invisible while `tick`
+    read no instance state — and then a merge brought a `tick` that does:
+
+        self._announce_demotion()      a method: patchable, and I patched it
+        self._tick_in_flight.clear()   an attribute: no patch can reach it
+
+    Two merge-only failures in a row, each one line further down. Any
+    construction that skips `__init__` is coupled to the internals of the method
+    it is only trying to observe, so this one does not skip it.
     """
 
-    def _engine(self, monkeypatch):
-        """A half-constructed engine, with everything `tick` does BUT the
-        restore patched out.
-
-        `object.__new__` skips `__init__`, so no instance state exists. That
-        was invisible while `tick` read none — and then #199 added
-        `self._announce_demotion()` as its FIRST line, which reads
-        `self._demotion_announced` that only `__init__` assigns. Both branches
-        were green alone and the MERGE was red:
-
-            #210 alone   3 passed
-            #199 alone   no tests ran (this class does not exist there)
-            merged       2 failed, AttributeError: _demotion_announced
-
-        Setting the missing attribute would fix today and break on the next
-        line `tick` grows. Patching the calls keeps this class asserting the one
-        thing it is for — that tick runs the restore — and nothing else.
-
-        `raising=False` because these methods exist on the merge target but not
-        on this branch, and a test that only runs on one side of a merge is how
-        this happened in the first place.
-        """
-        from claude_swap import autoswitch
-
-        for name in ("_announce_demotion", "_retry_live_promotion"):
-            monkeypatch.setattr(
-                autoswitch.AutoSwitchEngine, name, lambda self: None,
-                raising=False)
-        return object.__new__(autoswitch.AutoSwitchEngine)
-
-    def test_tick_calls_the_restore(self, monkeypatch):
-        from claude_swap import autoswitch
+    def test_tick_calls_the_restore(self, harness, monkeypatch):
+        from claude_swap.autoswitch import AutoSwitchEngine
 
         called = []
         monkeypatch.setattr(
-            autoswitch.AutoSwitchEngine, "_restore_bridge_titles_if_due",
+            AutoSwitchEngine, "_restore_bridge_titles_if_due",
             lambda self: called.append(True))
-        monkeypatch.setattr(
-            autoswitch.AutoSwitchEngine, "_tick_inner",
-            lambda self: autoswitch.TickOutcome.NO_ACTION)
-        eng = self._engine(monkeypatch)
-        assert eng.tick() is autoswitch.TickOutcome.NO_ACTION
+        harness.engine.tick()
         assert called == [True], "tick no longer runs the title restore"
 
-    def test_a_restore_that_explodes_does_not_fail_the_tick(self, monkeypatch):
-        """It is called BEFORE the try in `tick`, so this is not theoretical:
-        an unguarded raise there would end a tick that was about to prevent a
-        rate-limit lockout. The method owns its own guard; this pins that."""
-        from claude_swap import autoswitch
+    def test_a_restore_that_explodes_does_not_fail_the_tick(
+        self, harness, monkeypatch
+    ):
+        """It runs BEFORE the try in `tick`, so an unguarded raise there would
+        end a tick that was about to prevent a rate-limit lockout. The method
+        owns its own guard; this pins that it keeps owning it."""
+        from claude_swap.autoswitch import AutoSwitchEngine
+
+        def boom(self):
+            raise RuntimeError("restore on fire")
 
         monkeypatch.setattr(
-            autoswitch.AutoSwitchEngine, "_tick_inner",
-            lambda self: autoswitch.TickOutcome.NO_ACTION)
-        eng = self._engine(monkeypatch)
-        # The real method, with the pin import failing and the clock at zero:
-        # it must return quietly rather than propagate.
-        eng._bridge_titles_next_at = 0.0
-        eng.tick()  # no raise
+            AutoSwitchEngine, "_restore_bridge_titles_if_due", boom)
+        with pytest.raises(RuntimeError):
+            harness.engine.tick()
 
-    def test_the_cadence_is_honoured(self, monkeypatch):
+    def test_the_real_restore_is_guarded_and_returns_quietly(self, harness):
+        """The real method, on a machine whose optional extra may be absent and
+        whose clock is at zero: it must return rather than propagate. This is
+        the case that would have caught the guard being removed."""
+        harness.engine._bridge_titles_next_at = 0.0
+        harness.engine._restore_bridge_titles_if_due()  # no raise
+
+    def test_the_cadence_is_honoured(self, harness, monkeypatch):
         """Ticks are frequent; a listing per tick would put this next to usage
-        polling on the wire for a repair that is needed once in a blue moon."""
+        polling on the wire for a repair needed once in a blue moon."""
         import time
 
         from claude_swap import autoswitch
 
-        eng = self._engine(monkeypatch)
-        eng._bridge_titles_next_at = time.time() + 10_000
         seen = []
+        harness.engine._bridge_titles_next_at = time.time() + 10_000
         monkeypatch.setattr(autoswitch, "oauth", type(
             "O", (), {"restore_bridge_titles": staticmethod(
                 lambda *a: seen.append(a))})())
-        eng._restore_bridge_titles_if_due()
+        harness.engine._restore_bridge_titles_if_due()
         assert seen == [], "the restore ran while it was not due"
