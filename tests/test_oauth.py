@@ -1647,6 +1647,9 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
             import types
 
             spy = Recorder()
+            # THE CACHE IS PROCESS-WIDE, so a build under a different CA state
+            # would otherwise hand this one a context built for that state.
+            oauth._PIN_CTX_CACHE.clear()
             mod = types.ModuleType("cswap_pin.proxy")
             mod.ca_path_for_trust = lambda: ca
             pkg = types.ModuleType("cswap_pin")
@@ -1685,6 +1688,38 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
         assert ctx is spy, "no pin must still yield the untouched default context"
         assert spy.loaded == [], (
             f"nothing to trust, so nothing may be loaded; got {spy.loaded}")
+
+        # AND IT IS BUILT ONCE PER CA STATE, not once per API call. This runs
+        # on the polling path — once per account per usage poll, plus every
+        # profile fetch, listing and rename — and each build loads the whole
+        # system trust store before parsing ours on top.
+        again = oauth._pin_aware_ssl_context()
+        assert again is ctx, (
+            "the second call rebuilt the context, so every polled request "
+            "reloads ~130 system certificates for an answer that cannot have "
+            "changed")
+
+        # AND A REGENERATED CA INVALIDATES IT, which is the only way a cache
+        # here can be wrong: `cswap pin` can mint a new CA at the SAME path,
+        # and a context still trusting the old one fails every call with
+        # exactly the error this helper exists to prevent.
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            ca = os.path.join(d, "ca.pem")
+            with open(ca, "w") as fh:
+                fh.write("first")
+            first_spy, first = build(ca)
+            assert first is first_spy, "precondition: the first build is fresh"
+            with open(ca, "w") as fh:
+                fh.write("regenerated")
+            os.utime(ca, (0, 0))
+            second = oauth._pin_aware_ssl_context()
+            assert second is not first, (
+                "a regenerated CA at the same path kept the context built for "
+                "the old one — every call afterwards dies "
+                "CERTIFICATE_VERIFY_FAILED and the cache is the cause")
 
     def test_every_title_the_policy_names_is_put_back(self, monkeypatch):
         from claude_swap import oauth
@@ -2000,3 +2035,71 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         oauth._put_bridge_title("tok", "cse_a", "name")
         assert seen, "_put_bridge_title made no request"
         assert seen[0].get("context") is self.SENTINEL
+
+    def test_a_body_that_is_not_an_object_is_a_listing_failure(
+        self, monkeypatch
+    ):
+        """`data.get(...)` sat OUTSIDE the try, in a function documented to
+        return None on failure.
+
+        A JSON array or string body — an error envelope, a captive portal page
+        that happens to parse — makes it raise AttributeError out of
+        `_list_bridge_sessions` entirely. The caller's outer handler then
+        records `raised:AttributeError` instead of `list-failed`, collapsing
+        the distinction the (renamed, outcome) return value exists to preserve
+        and routing an ordinary transport fault into the branch reserved for
+        programming errors.
+        """
+        import contextlib
+        import io
+
+        class _Resp:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+        for body in (b'["not", "an", "object"]', b'"a string"', b'42'):
+            @contextlib.contextmanager
+            def _open(req, timeout=None, context=None, _b=body):
+                yield _Resp(_b)
+
+            monkeypatch.setattr(oauth.urllib.request, "urlopen", _open)
+            with contextlib.redirect_stderr(io.StringIO()):
+                got = oauth._list_bridge_sessions("tok")
+            assert got is None, (
+                f"a {body!r} body returned {got!r} instead of the None that "
+                "means 'could not list' — or raised out of a function that "
+                "documents itself as never raising")
+
+    def test_the_token_refresh_needs_no_pin_ca(self):
+        """THE ONE SITE THAT DOES NOT NEED IT, and the docstring used to name
+        it as though it did.
+
+        The helper is only necessary where the pin MITMs the host. It MITMs
+        `UPSTREAM_HOST` and blind-tunnels everything else, so a call to a
+        different host is verified against the REAL certificate by an ordinary
+        default context. Adding ours there would buy nothing and reload the
+        system CA store on every refresh.
+
+        Pinned as a test rather than a comment because it is a relationship
+        between two packages: the day the pin starts MITMing more than one
+        host, this fails and the refresh call needs the context.
+        """
+        from urllib.parse import urlparse
+
+        mitm = None
+        try:
+            from cswap_pin.proxy import UPSTREAM_HOST as mitm
+        except Exception:  # noqa: BLE001 — optional extra, nothing to check
+            pytest.skip("cswap-pin is not installed")
+
+        assert urlparse(oauth.OAUTH_TOKEN_URL).hostname != mitm, (
+            f"the token endpoint is on {mitm}, which the pin re-signs — that "
+            "call now needs `_pin_aware_ssl_context()` like the other three, "
+            "and without it every refresh dies CERTIFICATE_VERIFY_FAILED and "
+            "is reported as a transient network blip")
+        assert urlparse(oauth._BRIDGE_SESSIONS_URL).hostname == mitm, (
+            "the scan is broken: if the bridge endpoint is not on the MITM'd "
+            "host either, this case proves nothing about the split")

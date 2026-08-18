@@ -7036,3 +7036,116 @@ class TestTheEngineActuallyRunsTheTitleRestore:
                 lambda *a: seen.append(a))})())
         harness.engine._restore_bridge_titles_if_due()
         assert seen == [], "the restore ran while it was not due"
+
+    def _fake_pin_module(self, monkeypatch, names=None):
+        """The optional extra, present. Without it every case below returns at
+        the import guard having executed none of the code it names — the way
+        the first version of the sibling case passed."""
+        import sys
+        import types
+
+        fake = types.ModuleType("cswap_pin.proxy")
+        fake.live_bridge_names = lambda: (names or {"cse_x": "my-session"})
+        fake.titles_to_restore = lambda sessions, names_: []
+        pkg = types.ModuleType("cswap_pin")
+        pkg.proxy = fake
+        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
+        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
+        return fake
+
+    def test_the_token_belongs_to_the_account_that_owns_the_bridges(
+        self, harness, monkeypatch
+    ):
+        """A PIN EXISTS PRECISELY SO BRIDGES LIVE ON AN ACCOUNT THE SWITCHER IS
+        NOT ACTIVE ON, and this repair was authenticating as the active one.
+
+        The import guard means it only runs at all when a pin is installed, so
+        the mismatched case is not an edge — it is the only case. Listing with
+        the active account's bearer returns that account's sessions, the
+        pinned account's bridges are never in the response, and every PUT
+        against one is refused. Permanent `no-bridges`, titles never restored.
+
+        It appears to work only when cswap's own process happens to sit behind
+        the pin proxy, which rewrites the bearer for us — a property of the
+        machine's environment, not of this code.
+        """
+        from claude_swap import autoswitch, oauth, pin
+
+        self._fake_pin_module(monkeypatch)
+        monkeypatch.setattr(pin, "pinned_email", lambda sw: "c@example.com")
+
+        used = []
+        real_read = harness.switcher.read_account_credentials
+
+        def _spy(num, email):
+            used.append((num, email))
+            return real_read(num, email)
+
+        monkeypatch.setattr(harness.switcher, "read_account_credentials", _spy)
+        monkeypatch.setattr(autoswitch, "_access_token_of", lambda c: "tok")
+        monkeypatch.setattr(oauth, "restore_bridge_titles",
+                            lambda tok, names: (0, "no-bridges"))
+
+        harness.engine._bridge_titles_next_at = 0.0
+        harness.engine._restore_bridge_titles_if_due()
+
+        assert used, (
+            "no credential was read at all — the case never reached the code "
+            "it names and would certify anything")
+        assert used[0][1] == "c@example.com", (
+            "the repair authenticated as the ACTIVE account while the bridges "
+            f"it repairs belong to the PINNED one. read={used[0]}")
+
+    def test_every_way_out_says_why(self, harness, monkeypatch, caplog):
+        """FIVE REASONS FOR RENAMING NOTHING WERE ALL THE SAME SILENCE — that
+        is `_report_bridge_titles`' own docstring, and three bare `return`s
+        one frame above it went straight past the reporter.
+
+        `not token` is the persistent one: an API-key slot, an unreadable
+        credential blob, or a locked keychain makes it None on every 300 s pass
+        forever, and the log says nothing. The same 107-minute silent failure
+        the taxonomy was built for, through a higher door.
+        """
+        import logging
+
+        from claude_swap import autoswitch, pin
+
+        self._fake_pin_module(monkeypatch)
+        monkeypatch.setattr(pin, "pinned_email", lambda sw: None)
+        monkeypatch.setattr(autoswitch, "_access_token_of", lambda c: None)
+
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+
+        warns = [r.getMessage() for r in caplog.records
+                 if r.levelno >= logging.WARNING]
+        assert warns, (
+            "a slot whose credential yields no bearer renamed nothing and "
+            "said nothing — indistinguishable from a healthy pass, forever")
+        assert "token" in warns[0], warns[0]
+
+    def test_the_timer_reads_the_injected_clock(self, harness, monkeypatch):
+        """THIRTEEN OTHER TIME READS IN THIS CLASS GO THROUGH `self.clock`.
+
+        This one called the module's `time.time()`, so a test that advances the
+        injected clock cannot make the repair due and a run with a shifted
+        clock has one timer on a different time base. It is wall-clock rather
+        than monotonic too: an NTP step backwards suspends the repair for the
+        length of the step.
+        """
+        from claude_swap import autoswitch
+
+        self._fake_pin_module(monkeypatch)
+        reached = []
+        monkeypatch.setattr(autoswitch, "_access_token_of",
+                            lambda c: reached.append(True))
+        # NOT DUE ON THE ENGINE'S CLOCK, long past due on the wall's.
+        harness.engine._bridge_titles_next_at = harness.clock.now + 1_000
+        monkeypatch.setattr(autoswitch.time, "time", lambda: 1e12)
+
+        harness.engine._restore_bridge_titles_if_due()
+
+        assert not reached, (
+            "the repair ran because the WALL clock said it was due, while the "
+            "clock this engine was constructed with said it was not")

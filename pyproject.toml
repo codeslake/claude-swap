@@ -114,7 +114,22 @@ menubar = ["rumps>=0.4.0"]
 # RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
 # accepted deliberately, and the pre-push hook in cswap-pin already warns when
 # src changes without a version bump — this is the other half of that.
-pin = ["cswap-pin>=0.1.105"]
+#
+# NO `; sys_platform != 'win32'` MARKER, and it has been proposed twice.
+# `pin._impl()` does refuse Windows outright, so the extra is unusable there
+# and the marker looks free. It is not: the dev group depends on
+# `claude-swap[pin]` precisely so `test_the_marker_still_matches_the_package_
+# that_writes_it` RUNS, and that test's own comment records what happened when
+# it did not — it "had never run once", on any platform, so the one check
+# standing between a rename in cswap-pin and `--clear` silently finding
+# nothing was decorative. A platform marker puts that skip back on Windows.
+#
+# The cost cited for the marker is that 0.1.75/0.1.76 could not be imported on
+# Windows (`signal.SIGUSR1` at module scope) and took this repo's Windows CI
+# red. That is the check WORKING: a package that cannot be imported is broken
+# for everyone who installs it, and the platform that noticed is not the
+# platform at fault.
+pin = ["cswap-pin>=0.1.106"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

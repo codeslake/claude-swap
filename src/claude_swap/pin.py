@@ -224,6 +224,16 @@ def _live_impl() -> ModuleType | None:
     INSIDE the TTL window was invisible until the window expired, and the
     test that "proved" otherwise advanced a fake clock past the TTL, so it
     asserted the cache's own contract rather than the user's.
+
+    THE CONFIG READS AROUND IT WERE RE-RAISED AS A STALL AND RE-MEASURED
+    2026-08-18. `_root_entries` runs on the 3s watcher and reaches
+    `_wiring_present` and `_pinned_email_now`, each of which parses the global
+    config. On this fleet's real file: 175 KB, 1.1 ms per read+parse, so the
+    whole render tick spends ~5 ms of 3000 — 0.2%. The "megabytes on a real
+    machine" that motivates `_dead_wired_configs`' own frugality is a
+    different machine's file, and none on this fleet is one. Cache it when a
+    measurement shows a tick that matters, not because the shape looks
+    expensive; the last cache here cost more than it saved.
     """
     import importlib
 
@@ -631,16 +641,31 @@ def _config_lock_is_free(budget: float) -> bool:
     deliberate: losing it costs one skipped unwire (the next launch heals it),
     while the alternative is the launch itself waiting on the package's own
     5-second lock timeout, which it has no way to shorten.
+
+    BOTH CONFIGS, because the operation this gates acts on both. It probed
+    `get_global_config_path()` alone, and `clear_wiring` says why that is not
+    the same question: with `CLAUDE_CONFIG_DIR` set the two paths diverge, so
+    a free session config and a HELD `~/.claude.json` — a Claude Code
+    credential refresh, say — passed the probe. `unwire_if_dead` then blocked
+    on the package's own `claude_config_lock(timeout=5)`: a 5.3 s launch
+    stall, ten times the `_LAUNCH_LOCK_BUDGET_S` this guard exists to enforce,
+    reached THROUGH the guard.
+
+    The budget is per config rather than shared. Two configs is the maximum,
+    they are the same path whenever `CLAUDE_CONFIG_DIR` is unset (so the
+    common case pays once), and splitting a sub-second budget in half makes
+    each probe more likely to lose a race it would otherwise have won.
     """
     from claude_swap.claude_locks import proper_lockfile
-    from claude_swap.paths import get_global_config_path
 
-    path = get_global_config_path()
-    try:
-        with proper_lockfile(path.parent / (path.name + ".lock"), timeout=budget):
-            return True
-    except Exception:  # noqa: BLE001
-        return False
+    for path in _each_config():
+        try:
+            with proper_lockfile(
+                    path.parent / (path.name + ".lock"), timeout=budget):
+                continue
+        except Exception:  # noqa: BLE001
+            return False
+    return True
 
 
 def _pinned_email_now(switcher) -> tuple[str, str] | None:
@@ -1478,8 +1503,13 @@ def _nothing_to_heal(switcher) -> tuple[bool, str]:
     # inherits the same receipt — which is what Claude Code recreating that
     # file normally does. The `--clear` half of the advice does resolve it,
     # which is what keeps the cost to one message.
-    stale = [p for p in unreadable if not (set(wired_env_keys(switcher).get(p, ()))
-                                           & set(_env_of_config(p)))]
+    # HOISTED, because it is loop-invariant and expensive. Called inside the
+    # comprehension it re-walked both configs and both sidecars once per
+    # unreadable path, on a file this module's own comment calls "megabytes on
+    # a real machine".
+    receipts = wired_env_keys(switcher)
+    stale = [p for p in unreadable
+             if not (set(receipts.get(p, ())) & set(_env_of_config(p)))]
     if stale:
         return False, (
             "A leftover cloud pin receipt names "

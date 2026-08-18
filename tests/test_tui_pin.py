@@ -151,6 +151,26 @@ class TestThePinTuiSurface:
             await pilot.pause()
             assert app.is_running, "an actionless row killed the dashboard"
 
+    async def test_an_id_that_should_resolve_and_does_not_still_raises(
+        self, tmp_path
+    ):
+        """AND ONLY THE ACTIONLESS ROW IS INERT — the fix for the case above
+        was `elif action_id in actions`, which silences every unknown id.
+
+        Rename a key in `_root_entries`, or typo a new one, and the menu row
+        goes permanently dead with no exception, no notify and nothing in any
+        log. That is a special case repaired by widening shared
+        infrastructure, and the KeyError it removed is the only thing that
+        surfaces the typo. An id that is SUPPOSED to resolve must still be
+        loud when it does not.
+        """
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            with pytest.raises(KeyError):
+                await app.screen._dispatch("no-such-action-id")
+
     async def test_the_tui_clear_also_removes_the_wiring(self, tmp_path):
         """The TUI never got the CLI's both-configs clear.
 
@@ -363,6 +383,58 @@ class TestThePinTuiSurface:
         finally:
             (pin.is_available, pin._impl, pin.pinned_email,
              pin.pin_is_applying, pin.repin_current) = real
+
+    async def test_a_repair_that_fails_is_not_silent(self, tmp_path):
+        """`repin_current` RETURNS False and never raises, so handing it
+        straight to `_start_action` lost the failure entirely.
+
+        `run_action` builds `ActionResult(True, ...)` for any fn that does not
+        raise and this one prints nothing, so `_action_done` found an empty
+        first line and notified nothing. Against a daemon publishing
+        `unpinnable` the repair ran on mount, failed, held `app.busy` for its
+        duration — the user's next keystroke answering "Another action is
+        still running" — and the cloud UNPINNED badge stayed lit with no
+        explanation anywhere.
+        """
+        from claude_swap import pin
+
+        acc = make_account(1, active=True)
+        fake = FakeSwitcher([acc], tmp_path)
+        app = make_app(fake)
+
+        # ASSERTED ON THE SEAM, like `_run_pin_op`'s sibling above: driving the
+        # worker asserts on Textual's scheduling rather than on the contract.
+        import contextlib
+        import io
+
+        from claude_swap.exceptions import ClaudeSwitchError
+
+        real = pin.repin_current
+        pin.repin_current = lambda _sw: False           # the failure, silent
+        try:
+            async with app.run_test(size=(100, 32)) as pilot:
+                await settle(pilot)
+                screen = app.screen
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), pytest.raises(
+                    ClaudeSwitchError, match="cloud pin"
+                ):
+                    screen._repin_or_say_so(fake)
+                assert buf.getvalue() == "", (
+                    "the message was printed as well as raised, so the modal "
+                    f"carries it twice: {buf.getvalue()!r}")
+
+                # And the success path stays a plain toast, no raise — or a
+                # working repair starts opening a modal at every launch.
+                pin.repin_current = lambda _sw: True
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    screen._repin_or_say_so(fake)
+                assert buf.getvalue().strip(), (
+                    "a successful repair said nothing, which is the silence "
+                    "this case exists to remove, in the other direction")
+        finally:
+            pin.repin_current = real
 
     async def test_opening_the_tui_does_not_recycle_a_healthy_pin(self, tmp_path):
         """The control, and the one that keeps this from being a menace.

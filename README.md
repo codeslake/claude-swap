@@ -270,6 +270,7 @@ cswap pin            # show the current pin
 cswap pin --clear    # remove it
 cswap pin --heal     # restart a pin proxy that died, or unwire it
 cswap pin --get_port # the serving port, bare digits (exit 1 if none)
+cswap pin --get_certdir # the cert directory, a bare path
 cswap pin --set_port N   # serve on N from the next start (0 = dynamic)
 cswap pin --ensure   # repair a stale wiring before a launch, for rc hooks
 ```

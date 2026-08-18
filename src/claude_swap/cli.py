@@ -121,6 +121,7 @@ Examples:
   cswap pin --clear    remove the pin
   cswap pin --heal     restart a pin proxy that died, or unwire it
   cswap pin --get_port print the serving port (for scripts), or exit 1
+  cswap pin --get_certdir  print the cert directory (for scripts)
   cswap pin --set_port N   serve on port N from the next start (0 = dynamic)
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
         """,
@@ -1089,7 +1090,7 @@ Examples:
 _logger = logging.getLogger("claude-swap")
 
 
-def _use_native_tls() -> None:
+def _use_native_tls(quiet: bool = False) -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
     Claude's token endpoint (``platform.claude.com``) serves a Let's Encrypt
@@ -1119,6 +1120,13 @@ def _use_native_tls() -> None:
 
         truststore.inject_into_ssl()
     except Exception as e:
+        if quiet:
+            # See `main`: an rc-hook invocation whose contract is silence. The
+            # fallback still happened and is still worth knowing about, so it
+            # goes to debug rather than nowhere.
+            _logger.debug("native TLS trust unavailable (%s: %s)",
+                          type(e).__name__, e)
+            return
         _logger.warning(
             "native TLS trust unavailable (%s: %s) — falling back to stdlib "
             "ssl, which does not read the OS certificate store; a CA trusted "
@@ -1131,8 +1139,27 @@ def _use_native_tls() -> None:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
-    _use_native_tls()
     argv = sys.argv[1:]
+    # QUIET FOR THE INVOCATIONS THAT PROMISE SILENCE. This runs before the
+    # `pin` dispatch below, and its failure branch logs a multi-line WARNING
+    # with no handler configured — so `logging.lastResort` puts it on stderr.
+    # `pin --ensure` runs from an rc hook before EVERY hand-launched `claude`
+    # and its documented contract is "silent, never fails"; `--get_port` and
+    # `--get_certdir` print a bare value into `$(...)`. On a host where
+    # `truststore.inject_into_ssl()` cannot work — an unsupported platform, a
+    # stripped ssl module, a sandbox — that paragraph would print on every
+    # single shell launch.
+    #
+    # SUPPRESSED, NOT MOVED. Running it after the dispatch would leave the pin
+    # commands themselves on stdlib trust, and the warning exists because that
+    # difference is real.
+    try:
+        from claude_swap.appearance import pin_invocation_is_script_consumed
+
+        _quiet_tls = pin_invocation_is_script_consumed(argv)
+    except Exception:  # noqa: BLE001 — appearance is cosmetic, never fatal
+        _quiet_tls = False
+    _use_native_tls(quiet=_quiet_tls)
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`

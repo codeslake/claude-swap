@@ -101,8 +101,36 @@ class DashboardScreen(Screen):
             return
         self.app._start_action(
             "Repairing the cloud pin",
-            partial(pin.repin_current, self.app.switcher),
+            partial(self._repin_or_say_so, self.app.switcher),
         )
+
+    @staticmethod
+    def _repin_or_say_so(switcher) -> None:
+        """`repin_current` returns False and never raises — so say it out loud.
+
+        Handed straight to `_start_action`, that False vanished: `run_action`
+        builds `ActionResult(True, ...)` for any fn that does not raise, its
+        docstring says "Returns False on anything unexpected", and it prints
+        nothing. So `_action_done` found an empty first line and notified
+        nothing at all. On mount, against a daemon publishing `unpinnable`,
+        the repair ran, failed, held `app.busy` for its duration — making the
+        user's next keystroke answer "Another action is still running" — and
+        the ⚠ cloud UNPINNED badge simply stayed lit with no explanation.
+
+        Every sibling pin action in this file goes through `_run_pin_op`, which
+        raises `ClaudeSwitchError` precisely so the modal opens. This one
+        bypassed it, so it gets the same treatment here rather than a fifth
+        way of reporting.
+        """
+        from claude_swap import pin as _pin
+
+        if not _pin.repin_current(switcher):
+            raise ClaudeSwitchError(
+                "Could not repair the cloud pin. The daemon serving now "
+                "cannot mint the pinned token — `cswap pin --heal`, or "
+                "`cswap pin <account>` to re-apply it."
+            )
+        print("Cloud pin repaired")
 
     # -- menu plumbing --------------------------------------------------------
 
@@ -493,14 +521,24 @@ class DashboardScreen(Screen):
                         "nothing was pinned"
                     )
             await self._pop_menu()
-        elif action_id in actions:
+        elif not action_id:
+            # AN INFORMATIONAL ROW, and it says so by carrying no id at all
+            # (see `_pin_entries`, which shows the reason the pin is
+            # unusable). `actions[action_id]()` raised KeyError out of
+            # on_list_view_selected and killed the dashboard — the same class
+            # of failure as a raising apply_pin, one menu level up. Selecting
+            # a row that says nothing should do nothing.
+            #
+            # THE FIRST FIX WAS `elif action_id in actions`, which silences
+            # every unknown id rather than the one that is meant to be inert:
+            # rename a key in `_root_entries` and the row goes permanently
+            # dead with no exception, no notify and nothing in any log. That
+            # is a special case repaired by widening shared infrastructure,
+            # and the KeyError it removed is the only thing that would have
+            # surfaced the typo.
+            pass
+        else:
             actions[action_id]()
-        # An id that matches nothing is an INFORMATIONAL row (see
-        # _pin_entries, which shows the reason the pin is unusable). It has no
-        # action by design, and `actions[action_id]()` raised KeyError out of
-        # on_list_view_selected and killed the dashboard — the same class of
-        # failure as a raising apply_pin, one menu level up. Selecting a row
-        # that says nothing should do nothing.
 
     # -- actions ----------------------------------------------------------------
 

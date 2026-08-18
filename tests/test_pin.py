@@ -3587,7 +3587,11 @@ class TestTheLockProbeActuallyProbes:
 
         cfg = tmp_path / ".claude.json"
         cfg.write_text("{}")
+        # BOTH GETTERS. The probe walks `_each_config`, and leaving the
+        # default one unpatched points it at the REAL `~/.claude.json` and
+        # takes a lock there.
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
 
         lock_dir = cfg.parent / (cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
@@ -3611,6 +3615,48 @@ class TestTheLockProbeActuallyProbes:
             "a free probe on the same path after release did not answer True "
             "— the held-case False above is not trustworthy without this"
         )
+
+    def test_a_held_default_config_is_not_invisible(self, tmp_path, monkeypatch):
+        """THE PROBE ASKED ABOUT ONE CONFIG AND GATED AN OPERATION ON TWO.
+
+        `clear_wiring` establishes that the two diverge as soon as
+        `CLAUDE_CONFIG_DIR` is set — "BOTH configs, because the writing side
+        resolves the same way this does". With the session config free and
+        `~/.claude.json` held by a Claude Code credential refresh, the probe
+        said free, `unwire_if_dead` ran, and it blocked on the package's own
+        `claude_config_lock(timeout=5)`: a 5.3 s launch stall, ten times the
+        `_LAUNCH_LOCK_BUDGET_S` this guard exists to enforce, reached THROUGH
+        the guard.
+
+        The session config is left FREE here on purpose. A version that probes
+        only the first path answers True and fails this; one that probes only
+        the second passes it and fails its sibling above.
+        """
+        import claude_swap.paths as paths
+        from claude_swap import pin
+        from claude_swap.claude_locks import proper_lockfile
+
+        session_cfg = tmp_path / "session" / ".claude.json"
+        session_cfg.parent.mkdir()
+        session_cfg.write_text("{}")
+        default_cfg = tmp_path / "home" / ".claude.json"
+        default_cfg.parent.mkdir()
+        default_cfg.write_text("{}")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: session_cfg)
+        monkeypatch.setattr(
+            paths, "get_default_global_config_path", lambda: default_cfg)
+
+        assert pin._config_lock_is_free(0.3) is True, (
+            "precondition: with neither lock held the probe must say free")
+
+        lock_dir = default_cfg.parent / (default_cfg.name + ".lock")
+        with proper_lockfile(lock_dir, timeout=5):
+            held = pin._config_lock_is_free(0.3)
+
+        assert held is False, (
+            "the DEFAULT config's lock was held and the probe said free — the "
+            "unwire it gates then waits out the package's own 5s timeout on "
+            "the interactive launch path")
 
 
 class TestTheVerdictHasExactlyOneImplementation:

@@ -788,14 +788,61 @@ def _persist(
 _BRIDGE_SESSIONS_URL = "https://api.anthropic.com/v1/code/sessions"
 
 
+# One entry per distinct CA state. Bounded by construction: a machine has one
+# pin CA, so this holds one context, two across a regeneration.
+_PIN_CTX_CACHE: dict = {}
+
+
+def _pin_ca_fingerprint():
+    """What the cached context was built FOR — path and mtime, or None.
+
+    A REGENERATED CA MUST NOT KEEP THE OLD CONTEXT, which is the only way a
+    cache here can be wrong: `cswap pin` can mint a new CA at the same path,
+    and a context still trusting the old one fails every call afterwards with
+    exactly the error this helper exists to prevent. mtime answers that
+    without reading the file.
+
+    None when there is no pin at all — a real key, not an error: it caches the
+    plain default context for machines without the extra.
+    """
+    try:
+        from cswap_pin.proxy import ca_path_for_trust
+
+        ca = ca_path_for_trust()
+    except Exception:  # noqa: BLE001 — the extra is not installed
+        return None
+    if not ca:
+        return None
+    try:
+        import os
+
+        return (str(ca), os.stat(ca).st_mtime_ns)
+    except OSError:
+        # A CA THAT NAMES A PATH WE CANNOT STAT IS NOT THE SAME STATE AS NO
+        # PIN AT ALL, and collapsing the two hands the no-pin caller a context
+        # built for a pin. Distinct key, so each caches its own.
+        return (str(ca), None)
+
+
 def _pin_aware_ssl_context():
     """A verifying context that ALSO trusts the pin's CA, if there is one.
 
     NAMED FOR THE PROPERTY, NOT THE CALLER. It started as
     `_bridge_ssl_context` because the bridge calls were the first to need it,
-    and the cswap session has three more sites in this same module — token
-    refresh, profile, usage — with the identical problem. A helper named after
-    its first caller is one the next caller writes a second copy of.
+    and this module has two more sites with the identical problem — profile
+    and usage. A helper named after its first caller is one the next caller
+    writes a second copy of.
+
+    TOKEN REFRESH IS NOT ONE OF THEM, and an earlier draft of this docstring
+    said it was, which is enough to make a reviewer file the missing `context=`
+    as a bug. The helper is only needed where the pin RE-SIGNS the host: it
+    MITMs `UPSTREAM_HOST` and blind-tunnels everything else, and
+    `OAUTH_TOKEN_URL` is on a different host, so that call is verified against
+    the real certificate by an ordinary default context. Adding ours there
+    would buy nothing and reload the system CA store on every refresh. The
+    relationship is pinned by a test rather than left here as prose, because
+    it holds between two packages and the day the pin re-signs a second host
+    it stops being true.
 
     These calls are plain urllib through whatever proxy the session was wired
     to. When that is the pin, it MITMs api.anthropic.com — so the default
@@ -825,10 +872,23 @@ def _pin_aware_ssl_context():
     """
     import ssl
 
+    # BUILT ONCE PER CA, NOT PER CALL. `create_default_context()` loads the
+    # whole system trust store (~130 certificates) and `load_verify_locations`
+    # parses ours on top — and this is on the polling path: once per account
+    # per usage poll, plus every profile fetch, every bridge listing and every
+    # rename. Nothing in the result changes unless the pin's CA file does, so
+    # the cache is keyed on that file's path and mtime and a regenerated CA
+    # invalidates it by itself.
+    key = _pin_ca_fingerprint()
+    cached = _PIN_CTX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     ctx = ssl.create_default_context()
     try:
         from cswap_pin.proxy import ca_path_for_trust
     except Exception:  # noqa: BLE001 — the pin is an optional extra
+        _PIN_CTX_CACHE[key] = ctx
         return ctx
     try:
         ca = ca_path_for_trust()
@@ -836,6 +896,7 @@ def _pin_aware_ssl_context():
             ctx.load_verify_locations(cafile=str(ca))
     except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
         _logger.debug("bridge ssl context: pin CA not added: %r", e)
+    _PIN_CTX_CACHE[key] = ctx
     return ctx
 
 
@@ -864,6 +925,17 @@ def _list_bridge_sessions(access_token: str) -> list[dict] | None:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — cosmetic repair, never fatal
         _logger.debug("bridge listing failed: %r", e)
+        return None
+    # SHAPED, NOT JUST PARSED, and this used to sit outside the try. A JSON
+    # array or string body — an error envelope, a captive-portal page that
+    # happens to parse — made `.get` raise AttributeError out of a function
+    # documented to return None on failure. The caller then recorded
+    # `raised:AttributeError` instead of `list-failed`, which collapses the
+    # exact distinction the (renamed, outcome) pair exists to preserve and
+    # files an ordinary transport fault under programming error.
+    if not isinstance(data, dict):
+        _logger.debug(
+            "bridge listing returned %s, not an object", type(data).__name__)
         return None
     items = data.get("data") or data.get("sessions") or []
     return items if isinstance(items, list) else None
