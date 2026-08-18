@@ -792,7 +792,18 @@ _BRIDGE_SESSIONS_URL = "https://api.anthropic.com/v1/code/sessions"
 
 # One entry per distinct CA state. Bounded by construction: a machine has one
 # pin CA, so this holds one context, two across a regeneration.
-_PIN_CTX_CACHE: dict = {}
+# ONE SLOT, NOT A DICT. Keyed on the CA's path and mtime, so a regenerated CA
+# inserts a new entry — and the old `SSLContext`, holding a full parsed copy of
+# the system trust store (~130 roots), stayed referenced forever. In `cswap
+# tui`, the menu-bar app or a long-running `cswap auto`, repeated re-pins grew
+# it monotonically. The docstring's "bounded by construction: a machine has one
+# pin CA" is true only until the CA is regenerated, which is exactly what a
+# re-pin does.
+#
+# A single slot gives the same hit rate for the same reason the dict did — the
+# key changes only when the CA does, and when it changes the old context is
+# dead — with a ceiling of one.
+_PIN_CTX_SLOT: "tuple | None" = None
 
 
 def _pin_ca_fingerprint():
@@ -871,8 +882,6 @@ def _pin_aware_ssl_context():
     unreadable CA, the caller still gets an ordinary verifying context. An
     optional extra must not be able to break a call that worked without it.
     """
-    import ssl
-
     # BUILT ONCE PER CA, NOT PER CALL. `create_default_context()` loads the
     # whole system trust store (~130 certificates) and `load_verify_locations`
     # parses ours on top — and this is on the polling path: once per account
@@ -880,16 +889,17 @@ def _pin_aware_ssl_context():
     # rename. Nothing in the result changes unless the pin's CA file does, so
     # the cache is keyed on that file's path and mtime and a regenerated CA
     # invalidates it by itself.
+    global _PIN_CTX_SLOT
+
     key = _pin_ca_fingerprint()
-    cached = _PIN_CTX_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if _PIN_CTX_SLOT is not None and _PIN_CTX_SLOT[0] == key:
+        return _PIN_CTX_SLOT[1]
 
     ctx = ssl.create_default_context()
     try:
         from cswap_pin.proxy import ca_path_for_trust
     except Exception:  # noqa: BLE001 — the pin is an optional extra
-        _PIN_CTX_CACHE[key] = ctx
+        _PIN_CTX_SLOT = (key, ctx)
         return ctx
     try:
         ca = ca_path_for_trust()
@@ -897,7 +907,7 @@ def _pin_aware_ssl_context():
             ctx.load_verify_locations(cafile=str(ca))
     except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
         _logger.debug("bridge ssl context: pin CA not added: %r", e)
-    _PIN_CTX_CACHE[key] = ctx
+    _PIN_CTX_SLOT = (key, ctx)
     return ctx
 
 

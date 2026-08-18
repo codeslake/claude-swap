@@ -5100,7 +5100,7 @@ class TestHealNeverTearsDownAServingPin:
         # mutation to the string body survived unnoticed.
         assert msg == (
             "A cloud pin wiring points at a proxy that is gone, and it "
-            "could not be removed — re-run `cswap pin --heal`, or "
+            "could not be removed; re-run `cswap pin --heal`, or "
             "`cswap pin --heal --debug` for the reason (a held config "
             "lock and a config directory you cannot write both land here)"
         ), msg

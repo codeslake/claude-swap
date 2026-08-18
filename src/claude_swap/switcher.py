@@ -180,7 +180,7 @@ _DEMOTING_STASH_REASONS = (
 
 ERROR_NOTES = {
     "tls-cert": (
-        "the certificate chain was not trusted — most often a TLS-terminating "
+        "the certificate chain was not trusted, most often a TLS-terminating "
         "proxy whose CA is missing here, sometimes an expired duplicate root "
         "shadowing a valid one; fix it in the OS store on macOS/Windows, or "
         "via SSL_CERT_FILE on Linux (REQUESTS_CA_BUNDLE and "
@@ -7050,7 +7050,7 @@ class ClaudeAccountSwitcher:
             # — and the sidecar that lists the real keys is about to be
             # rmtree'd, so after this nothing can reconstruct them.
             warning(
-                f"Could not remove the cloud pin wiring — edit {path} by hand "
+                f"Could not remove the cloud pin wiring; edit {path} by hand "
                 f"and delete these entries from its \"env\" block: "
                 + ", ".join(names)
             )

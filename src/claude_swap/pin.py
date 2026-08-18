@@ -857,7 +857,7 @@ def _read_ledger(config_path) -> dict:
         # is the single read point every caller already goes through — the
         # property `_wire_mark_of`'s docstring claims for the read-both rule.
         _logger.warning(
-            "%s exists but could not be read (%s) — treating it as no pin "
+            "%s exists but could not be read (%s), so it is treated as no pin "
             "receipt. If a pin IS wired, heal/purge/--ensure will all report "
             "nothing to do while the env block still names its proxy.",
             path, exc)
@@ -1228,7 +1228,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # THE ENV BLOCK, NOT THE MARKER. `_clear_wiring_locked` returns
     # `_clear_ledger(path)` AFTER the config write, so an unwritable
     # `pin-wiring/` (root-owned parent, read-only mount, full disk) reported
-    # "could not remove the wiring — re-run once it frees up" FOREVER over a
+    # "could not remove the wiring; re-run once it frees up" FOREVER over a
     # user whose launches were already fine. Its docstring argues the return
     # prevents a phantom success; it substituted a permanent phantom failure,
     # which is the same defect with the sign flipped.
@@ -1238,7 +1238,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
             w for w, on in (("the pin", still_pinned), ("the wiring", bool(survivors)))
             if on
         )
-        return False, f"Could not remove {what} — re-run once it frees up"
+        return False, f"Could not remove {what}; re-run once it frees up"
     stale = wired_config_paths(switcher)
     if stale:
         # A DIFFERENT STATE AND A DIFFERENT SENTENCE. Nothing dials a dead
@@ -1246,7 +1246,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
         # cannot rewrite a directory it may not write. Name the file.
         return True, (
             "Removed the cloud pin wiring. A stale receipt could not be "
-            "deleted — remove "
+            "deleted; remove "
             + " and ".join(str(_ledger_path(p)) for p in stale)
             + " by hand, or cswap will keep reporting a wiring that is gone"
         )
@@ -1310,7 +1310,7 @@ def set_pin(
     except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
         rolled = _restore_pin(switcher, before)
         return False, (
-            f"Could not pin the cloud account: {_safe(exc)} — "
+            f"Could not pin the cloud account: {_safe(exc)}. "
             + _rollback_tail(rolled, before, email)
         )
     if not started:
@@ -1323,7 +1323,7 @@ def set_pin(
         rolled = _restore_pin(switcher, before)
         return False, (
             f"Could not pin the cloud account to {email}: no proxy is running, "
-            "so nothing is pinned yet — " + _rollback_tail(rolled, before, email)
+            "so nothing is pinned yet. " + _rollback_tail(rolled, before, email)
         )
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
@@ -1344,10 +1344,9 @@ def _port_of_config(path) -> int | None:
     documents "never raises". Treating it as "no opinion" here, at the
     source, means every downstream consumer inherits the fix for free.
     """
-    import json as _json
 
     try:
-        raw = _json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
         # ONLY A PORT THIS TOOL WIRED. The marker is the receipt; a
         # ``CSWAP_PIN_PORT`` without one was put there by something else, and
         # its liveness says nothing about ours. Reading it anyway let a foreign
@@ -1384,6 +1383,32 @@ def _wired_ports() -> list[int]:
 
 def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     """Is the port the CONFIG names actually answering?
+
+    REVIEWED AND KEPT AS IS, so the next reader does not re-raise it. A review
+    counted "up to five probes per `--ensure`, 10 x 0.2s = 2.0s on every
+    hand-launched claude" and proposed computing one result and threading it
+    through. The arithmetic is close and the disposition is wrong:
+
+      - At most FOUR rounds can run in one pass, not five: two
+        `_wired_port_is_serving` inside `heal` and one `_dead_wired_configs`
+        each in `heal` and `run`. The third `_wired_port_is_serving` is on the
+        `elif` branch and is mutually exclusive with the other two.
+      - Every repeat sits AFTER something that can change the answer. 1654 runs
+        after `impl.heal()`; 1663 exists because "the restart may have
+        succeeded while returning False — re-READ rather than infer"; `run`'s
+        scan exists because a contended lock can leave `heal`'s verdict stale.
+        Each of those comments carries its own measurement of the damage that
+        followed inferring instead of re-reading. Memoising is precisely the
+        inference they forbid.
+      - The cost needs a port that DROPS. A loopback port with nothing on it
+        REFUSES instantly, so the ordinary dead-pin case costs microseconds;
+        0.2s per config requires a deliberate firewall rule on 127.0.0.1.
+
+    So the price is paid only in a state that barely occurs, and it buys the
+    one property that has already stopped this code from unwiring a live pin
+    twice. If it ever needs to go, the thing to remove is a re-read, and that
+    needs a measurement showing the state cannot change across it — not a
+    cache.
 
     Asks the thing that is about to be removed, rather than any state file.
     ``proxy.json`` is unlinked at the START of a respawn, so its absence is not
@@ -1571,13 +1596,13 @@ def _nothing_to_heal(switcher) -> tuple[bool, str]:
         return False, (
             "A leftover cloud pin receipt names "
             + " and ".join(str(path) for path in stale)
-            + ", whose env block no longer carries the wiring — nothing is "
+            + ", whose env block no longer carries the wiring, so nothing is "
             "misrouted. Run `cswap pin --clear` to drop the receipt"
         )
     return False, (
         "A cloud pin wiring names no readable CSWAP_PIN_PORT in "
         + " and ".join(str(path) for path in unreadable)
-        + " — it is left alone (it may still be serving) and cannot be "
+        + ": it is left alone (it may still be serving) and cannot be "
         "checked. Fix that value, or run `cswap pin --clear` to remove the "
         "wiring"
     )
@@ -1744,7 +1769,7 @@ def heal(
             clear_wiring(switcher, timeout=lock_timeout, only=dead)
             if not env_keys_survive(before):
                 return True, (
-                    "Removed a cloud pin wiring whose proxy was gone — "
+                    "Removed a cloud pin wiring whose proxy was gone. "
                     "sessions fall back to the proxy they had before the pin"
                 )
             # NAME THE CONDITION, NOT A CAUSE THIS CANNOT KNOW. `clear_wiring`
@@ -1763,7 +1788,7 @@ def heal(
             # way as naming none.
             return False, (
                 "A cloud pin wiring points at a proxy that is gone, and it "
-                "could not be removed — re-run `cswap pin --heal`, or "
+                "could not be removed; re-run `cswap pin --heal`, or "
                 "`cswap pin --heal --debug` for the reason (a held config "
                 "lock and a config directory you cannot write both land here)"
             )
@@ -1816,12 +1841,11 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     send a caller to an address nothing serves. So the port is asked, not
     inferred: a loopback connect, which also works with the package absent.
     """
-    import json as _json
     import socket
 
     record = _certdir(switcher) / "proxy.json"
     try:
-        port = int(_json.loads(record.read_text(encoding="utf-8"))["port"])
+        port = int(json.loads(record.read_text(encoding="utf-8"))["port"])
     except Exception:  # noqa: BLE001 — absent/unreadable/malformed: no opinion
         return None
     if not 0 < port <= 65535:

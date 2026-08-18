@@ -122,7 +122,7 @@ class DashboardScreen(Screen):
             return True, "Cloud pin repaired"
         return False, (
             "Could not repair the cloud pin. The daemon serving now cannot "
-            "mint the pinned token — `cswap pin --heal`, or "
+            "mint the pinned token; `cswap pin --heal`, or "
             "`cswap pin <account>` to re-apply it."
         )
 
@@ -206,7 +206,7 @@ class DashboardScreen(Screen):
                 # is wider than Remote Control alone (artifacts, triggers and
                 # marketplace sync all follow the pin).
                 [(
-                    "Cloud account (RC/artifacts)… — "
+                    "Cloud account (RC/artifacts)… "
                     f"{pin.pinned_email(self.app.switcher) or 'none'}",
                     "pin-menu",
                 )]
@@ -511,7 +511,7 @@ class DashboardScreen(Screen):
                     # leaves a row that resolves to nothing. Silently popping
                     # reads as "pinned" — say what happened instead.
                     app.notify(
-                        f"Account {target} is no longer in the list — "
+                        f"Account {target} is no longer in the list, so "
                         "nothing was pinned"
                     )
             await self._pop_menu()

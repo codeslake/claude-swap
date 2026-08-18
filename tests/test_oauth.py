@@ -1649,7 +1649,9 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
             spy = Recorder()
             # THE CACHE IS PROCESS-WIDE, so a build under a different CA state
             # would otherwise hand this one a context built for that state.
-            oauth._PIN_CTX_CACHE.clear()
+            # ONE SLOT now rather than a dict — see `_PIN_CTX_SLOT`, which
+            # replaced an entry-per-CA map that never evicted.
+            oauth._PIN_CTX_SLOT = None
             mod = types.ModuleType("cswap_pin.proxy")
             mod.ca_path_for_trust = lambda: ca
             pkg = types.ModuleType("cswap_pin")
@@ -2103,3 +2105,43 @@ class TestEveryPinRoutedCallCarriesThePinAwareContext:
         assert urlparse(oauth._BRIDGE_SESSIONS_URL).hostname == mitm, (
             "the scan is broken: if the bridge endpoint is not on the MITM'd "
             "host either, this case proves nothing about the split")
+
+
+class TestTheSslContextCacheHasACeiling:
+    """It kept one full trust store per CA REGENERATION, forever.
+
+    Keyed on the CA file's path and mtime, so a re-pin — which regenerates the
+    CA — inserted a new entry while the old `SSLContext`, holding a parsed copy
+    of the system roots (~130 of them), stayed referenced. In `cswap tui`, the
+    menu-bar app or a long-running `cswap auto`, repeated re-pins grew it
+    monotonically. "Bounded by construction: a machine has one pin CA" held
+    only until the CA changed, which is precisely what a re-pin does.
+    """
+
+    def test_a_hundred_regenerations_leave_one_context(self, monkeypatch):
+        from claude_swap import oauth
+
+        oauth._PIN_CTX_SLOT = None
+        made = []
+        monkeypatch.setattr(
+            oauth.ssl, "create_default_context",
+            lambda *a, **k: made.append(1) or object())
+        # Each "regeneration" is a new mtime on the same path, which is what
+        # the key is built from.
+        for i in range(100):
+            monkeypatch.setattr(
+                oauth, "_pin_ca_fingerprint", lambda i=i: ("/p/ca.pem", i))
+            oauth._pin_aware_ssl_context()
+
+        held = 0 if oauth._PIN_CTX_SLOT is None else 1
+        assert held == 1, (
+            f"the cache holds {held} contexts after 100 CA regenerations; each "
+            "carries a parsed copy of the system trust store")
+        # CONTROL: it must still be CACHING. A slot that holds one because it
+        # rebuilds every call passes the assertion above and defeats the point.
+        before = len(made)
+        oauth._pin_aware_ssl_context()
+        assert len(made) == before, (
+            "a repeat call with an unchanged CA built a new context, so the "
+            "single slot is not caching at all")
+        oauth._PIN_CTX_SLOT = None

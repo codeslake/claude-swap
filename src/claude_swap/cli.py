@@ -163,7 +163,7 @@ Examples:
         help=(
             "Print this host's pin state directory, and nothing else. For "
             "scripts: D=$(cswap pin --get_certdir). Answers whether or not a "
-            "daemon is running — diagnosing a dead pin is when it is asked."
+            "daemon is running; diagnosing a dead pin is when it is asked."
         ),
     )
     # The WRITE side. Persisted in the pin's own settings file, not in
@@ -1128,7 +1128,7 @@ def _use_native_tls(quiet: bool = False) -> None:
                           type(e).__name__, e)
             return
         _logger.warning(
-            "native TLS trust unavailable (%s: %s) — falling back to stdlib "
+            "native TLS trust unavailable (%s: %s); falling back to stdlib "
             "ssl, which does not read the OS certificate store; a CA trusted "
             "only there will not verify",
             type(e).__name__,
