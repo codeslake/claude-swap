@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -521,9 +522,12 @@ class TestTryRefreshOAuthCredentials:
         outcome = oauth.try_refresh_oauth_credentials(creds)
         assert outcome.error == "no_refresh_token"
 
-    def test_invalid_json_is_permanent(self):
+    def test_invalid_json_is_transient(self):
+        # Changed contract (stale-credential robustness): an unparseable blob
+        # is more likely a torn read than a credential shape — it must not
+        # produce a permanent strike-advancing verdict.
         outcome = oauth.try_refresh_oauth_credentials("not json")
-        assert outcome.error == "no_refresh_token"
+        assert outcome.error == "transient"
 
     def test_wrapper_returns_none_on_failure(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
@@ -867,6 +871,62 @@ class TestFetchUsageForAccount:
         assert "cswap --add-account" in output
 
 
+class TestNativeTlsFallbackIsAudible:
+    """A silent fallback to stdlib ssl is a silent NARROWING OF TRUST.
+
+    ``_use_native_tls`` swallows every exception so the CLI is never blocked
+    over a trust nicety. That part is right. What is wrong is that it leaves no
+    trace, and the two paths do not trust the same roots.
+
+    Measured on macOS 2026-08-17, comparing the OS keychains against what
+    stdlib actually loads:
+
+        OS-store unique roots           173   (system 154, admin 4, login 15)
+        stdlib-loaded roots             128
+        trusted by OS, NOT by stdlib     67   <-- lost, with no message
+
+    Four of those live in /Library/Keychains/System.keychain, which is where an
+    administrator puts a corporate MITM CA. So the fallback can take away the
+    exact root the machine was configured with, and the user is then told to
+    "trust the CA in the OS store" by a remedy note pointing at a store that is
+    no longer being read.
+    """
+
+    def test_a_failed_injection_says_so(self, caplog):
+        import logging
+        import builtins
+        from claude_swap import cli
+
+        real_import = builtins.__import__
+
+        def refuse(name, *a, **k):
+            if name == "truststore":
+                raise ImportError("simulated: truststore unavailable")
+            return real_import(name, *a, **k)
+
+        builtins.__import__ = refuse
+        try:
+            with caplog.at_level(logging.WARNING):
+                cli._use_native_tls()
+        finally:
+            builtins.__import__ = real_import
+
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "truststore" in joined.lower() or "native" in joined.lower(), (
+            f"the fallback left no trace; records={[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_a_successful_injection_stays_quiet(self, caplog):
+        """The control: the normal path must not warn, or the warning is noise
+        every run and stops being read."""
+        import logging
+        from claude_swap import cli
+
+        with caplog.at_level(logging.WARNING):
+            cli._use_native_tls()
+        assert not [r for r in caplog.records if "truststore" in r.getMessage().lower()]
+
+
 class TestClassifyUsageError:
     """Test _classify_usage_error kinds and Retry-After parsing."""
 
@@ -923,6 +983,64 @@ class TestClassifyUsageError:
         assert oauth._classify_usage_error(
             urllib.error.URLError(ConnectionRefusedError())
         )[0] == "network"
+
+    def test_tls_cert_failure_is_not_flattened_to_network(self):
+        """A MITM proxy with an untrusted CA must not read as a transport error.
+
+        Measured 2026-08-17 on host-a: every usage poll went through a
+        TLS-terminating proxy whose CA urllib does not trust, so each one raised
+
+            URLError(SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED]
+            certificate verify failed: unable to get local issuer certificate"))
+
+        and was recorded as ``network``. One account sat dead for ten days and
+        "network" is the only word anyone could see; the real cause reaches
+        DEBUG alone, which nothing enables. "Cannot reach the host" and "reached
+        the host and refused its certificate" need opposite fixes, so they may
+        not share a token.
+        """
+        e = urllib.error.URLError(
+            ssl.SSLCertVerificationError(
+                1,
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "unable to get local issuer certificate (_ssl.c:1000)",
+            )
+        )
+        assert oauth._classify_usage_error(e)[0] == "tls-cert"
+
+    def test_a_non_cert_ssl_failure_is_not_a_cert_failure(self):
+        """Pins the PREDICATE, not just the outcome.
+
+        ``ssl.SSLCertVerificationError`` is the narrow choice on purpose, and
+        the obvious loosening -- ``ssl.SSLError`` -- passes every other test in
+        this file. A non-cert TLS failure is a different condition with a
+        different repair: speaking https to a plaintext port raises
+        ``SSLError("record layer failure")``, and calling that ``tls-cert``
+        sends the operator to fix a CA bundle for a wrong-port problem.
+        """
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ssl.SSLEOFError("handshake failed"))
+        )[0] == "network"
+        assert oauth._classify_usage_error(
+            urllib.error.URLError(ssl.SSLError("record layer failure"))
+        )[0] == "network"
+
+    def test_tls_cert_carries_a_remedy_note(self):
+        """A kind with no ERROR_NOTES entry renders as the bare identifier.
+
+        The whole point of splitting this out of ``network`` is that the two
+        need different repairs, and that only reaches the operator through the
+        note. Without one the display trades one uninformative word for
+        another. ``test_every_deterministic_kind_has_a_note`` states the same
+        principle but iterates ``_DETERMINISTIC_REFRESH_ERRORS``, which is a
+        refresh-error list -- a usage-fetch kind is outside its loop, so it
+        cannot cover this.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        assert "tls-cert" in ERROR_NOTES
+        note = ERROR_NOTES["tls-cert"]
+        assert "SSL_CERT_FILE" in note
 
     def test_bad_response(self):
         try:
@@ -1527,3 +1645,118 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
 
         src = inspect.getsource(oauth.restore_bridge_titles)
         assert "from cswap_pin.proxy import titles_to_restore" in src
+
+
+class TestInvalidGrantTaxonomy:
+    """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
+    parse — top-level error == "invalid_grant" in the JSON body. Substring
+    hits inside other envelopes stay transient; invalid_client is a distinct
+    systemic kind, never a dead-token verdict."""
+
+    def _refresh_with_body(self, monkeypatch, code, body):
+        import urllib.error, io
+        creds = json.dumps({
+            "claudeAiOauth": {"refreshToken": "rt-x", "accessToken": "a"}
+        })
+
+        def raise_http(*a, **k):
+            raise urllib.error.HTTPError(
+                "url", code, "err", {}, io.BytesIO(body.encode())
+            )
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.urllib.request.urlopen", raise_http
+        )
+        return oauth.try_refresh_oauth_credentials(creds)
+
+    def test_rfc_invalid_grant_is_permanent(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 400, '{"error": "invalid_grant"}'
+        )
+        assert out.error == "invalid_grant"
+
+    def test_substring_in_other_envelope_is_transient(self, monkeypatch):
+        # the marker appears only inside a nested message — not a §5.2 error
+        out = self._refresh_with_body(
+            monkeypatch, 400,
+            '{"error": "server_error", "detail": "log mentions invalid_grant"}'
+        )
+        assert out.error == "transient"
+
+    def test_invalid_client_is_systemic_not_dead_token(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 401, '{"error": "invalid_client"}'
+        )
+        assert out.error == "invalid_client"
+
+    def test_unparseable_body_is_transient(self, monkeypatch):
+        out = self._refresh_with_body(monkeypatch, 400, "<html>oops</html>")
+        assert out.error == "transient"
+
+    def test_error_description_variant_still_permanent(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 400,
+            '{"error": "invalid_grant", "error_description": "revoked"}'
+        )
+        assert out.error == "invalid_grant"
+
+
+class TestNoRefreshTokenStructuralGuard:
+    """M3: ``no_refresh_token`` is permanent only for a structurally complete
+    OAuth dict genuinely missing the field — an unparseable/partial blob is
+    transient (a torn read must not condemn the slot)."""
+
+    def test_complete_dict_without_rt_is_permanent(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "a"}})
+        out = oauth.try_refresh_oauth_credentials(creds)
+        assert out.error == "no_refresh_token"
+
+    def test_unparseable_blob_is_transient(self):
+        out = oauth.try_refresh_oauth_credentials('{"claudeAiOa')  # torn read
+        assert out.error == "transient"
+
+    def test_non_dict_payload_is_transient(self):
+        out = oauth.try_refresh_oauth_credentials('"just-a-string"')
+        assert out.error == "transient"
+
+
+class TestConsumeBusyIsDeterministic:
+    """A busy consume gate must not fall through to a guaranteed 401.
+
+    `consume-busy` means another process holds the gate — the token in hand is
+    known-expired, so calling the usage endpoint with it 401s every time, and
+    the retry re-enters the gate and gets busy again. The kind then arrives as
+    generic "refresh-failed", hiding the distinct kind this PR added and
+    spending a request per pass to learn nothing.
+    """
+
+    def test_a_busy_gate_does_not_spend_a_doomed_request(self):
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(None, "consume-busy"),
+            )
+        assert out.error == "consume-busy", out.error
+        usage.assert_not_called()
+
+    def test_every_deterministic_kind_has_a_note(self):
+        """The reason these kinds stay distinct is the note they carry.
+
+        ``try_fetch_usage_for_account`` keeps a deterministic kind rather than
+        collapsing it to "refresh-failed" because "ERROR_NOTES renders the
+        remedy for each" — a kind with no note renders the bare identifier,
+        which is strictly worse than the generic string it displaced.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        missing = [
+            k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
+        ]
+        assert not missing, missing

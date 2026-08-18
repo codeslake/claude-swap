@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 
@@ -541,6 +542,60 @@ def _unmap_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _unclaimed_command(argv: list[str]) -> None:
+    """Handle `cswap unclaimed [--purge ID]` — inspect or drop a stash row.
+
+    The stash holds credential bytes a switch or a consume gate could not
+    attribute to a slot. Rows normally clear themselves (the next gate pass
+    adopts or retires them), but two states need a human: a row whose bytes
+    are unreadable until a keychain is unlocked or a mode is fixed, and one
+    whose metadata was lost, which no pass can ever adopt. ``--json`` lists
+    only bare ids, so without this there is nothing to look at and nothing to
+    drop short of hand-editing the manifest.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} unclaimed",
+        description=(
+            "List stashed credential entries, or purge one by id. "
+            "Purging deletes the bytes — recovery is /login + `cswap add`."
+        ),
+    )
+    parser.add_argument(
+        "--purge",
+        metavar="ID",
+        help="Delete this entry's bytes and manifest row",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        entries = switcher.list_unclaimed_credentials()
+
+        if args.purge:
+            if args.purge not in entries:
+                error(f"Error: no unclaimed entry {args.purge}")
+                sys.exit(1)
+            switcher._store._remove_unclaimed_credential(args.purge)
+            print(f"{accent('Purged')} {args.purge}")
+            return
+
+        if not entries:
+            print(dimmed("No unclaimed credential entries"))
+            return
+        for entry_id, meta in sorted(entries.items()):
+            slot = meta.get("configSlot") or "?"
+            reason = meta.get("reason") or "orphaned (no manifest row)"
+            print(f"{entry_id}  slot {slot}  {reason}")
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _swap_command(argv: list[str]) -> None:
     """Handle `cswap swap NUM|EMAIL|ALIAS NUM|EMAIL|ALIAS`.
 
@@ -1031,6 +1086,9 @@ Examples:
         sys.exit(130)
 
 
+_logger = logging.getLogger("claude-swap")
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1046,14 +1104,28 @@ def _use_native_tls() -> None:
     with its own bundled roots) is unaffected. ``truststore`` delegates to them.
 
     Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
-    the CLI over a TLS-trust nicety.
+    the CLI over a TLS-trust nicety — but SAY SO, because the fallback is not
+    trust-neutral. Measured on macOS 2026-08-17: the OS keychains carry 173
+    unique roots and stdlib loads 128, of which 67 are trusted by the OS and
+    not by stdlib. Four of those sit in /Library/Keychains/System.keychain,
+    where an administrator installs a corporate MITM CA. So a swallowed
+    failure here can withdraw the exact root the machine was configured with,
+    and the user is then told by ``ERROR_NOTES["tls-cert"]`` to trust the CA in
+    a store nothing is reading. One WARNING costs nothing on the healthy path,
+    which never reaches it.
     """
     try:
         import truststore
 
         truststore.inject_into_ssl()
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning(
+            "native TLS trust unavailable (%s: %s) — falling back to stdlib "
+            "ssl, which does not read the OS certificate store; a CA trusted "
+            "only there will not verify",
+            type(e).__name__,
+            e,
+        )
 
 
 def main() -> None:
@@ -1090,6 +1162,9 @@ def main() -> None:
         return
     if argv and argv[0] == "unmap":
         _unmap_command(argv[1:])
+        return
+    if argv and argv[0] == "unclaimed":
+        _unclaimed_command(argv[1:])
         return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
@@ -1140,6 +1215,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
+  %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
