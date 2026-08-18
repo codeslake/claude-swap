@@ -675,3 +675,95 @@ def _persist(
             f"Warning: failed to save refreshed token for account {account_num} ({email}). "
             f"If the next refresh fails, re-run `cswap --add-account` after logging in."
         )
+
+
+_BRIDGE_SESSIONS_URL = "https://api.anthropic.com/v1/code/sessions"
+
+
+def _bridge_headers(access_token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "anthropic-client-platform": "cli",
+    }
+
+
+def _list_bridge_sessions(access_token: str) -> list[dict] | None:
+    """The account's cloud sessions, or ``None`` when the call failed.
+
+    NONE IS NOT AN EMPTY LISTING. A caller that reads a failed request as "no
+    bridges" would go on to act on no evidence; every caller here has to be
+    able to tell the two apart.
+    """
+    req = urllib.request.Request(
+        f"{_BRIDGE_SESSIONS_URL}?limit=100", headers=_bridge_headers(access_token)
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:  # noqa: BLE001 — cosmetic repair, never fatal
+        _logger.debug("bridge listing failed: %r", e)
+        return None
+    items = data.get("data") or data.get("sessions") or []
+    return items if isinstance(items, list) else None
+
+
+def _put_bridge_title(access_token: str, session_id: str, title: str) -> bool:
+    """Rename one cloud session. PUT, not PATCH — measured, PATCH is 405."""
+    req = urllib.request.Request(
+        f"{_BRIDGE_SESSIONS_URL}/{session_id}",
+        data=json.dumps({"title": title}).encode("utf-8"),
+        headers=_bridge_headers(access_token),
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            return True
+    except Exception as e:  # noqa: BLE001
+        _logger.debug("bridge rename failed for %s: %r", session_id, e)
+        return False
+
+
+def restore_bridge_titles(access_token: str, names: dict) -> int:
+    """Put each live session's own name back on its cloud bridge.
+
+    WHY THIS EXISTS HERE AND NOT IN THE PROXY. cswap-pin already implements
+    this, and it has exactly one caller: `_sweep_bridges_after_connect`, which
+    runs when a `POST /v1/code/sessions` REACHES the proxy. So the repair is
+    triggered by the very thing it exists to survive. Measured 2026-08-17: all
+    24 claude processes carried `HTTPS_PROXY=127.0.0.1:9901` because Claude
+    Code reads the `~/.claude.json` env block once at boot and the pin wiring
+    landed after they exec'd. Nothing reached the proxy, nothing was restored,
+    and a session sat under `Fix Claude AI session naming issue` until it was
+    renamed by hand.
+
+    THE POLICY STAYS IN cswap-pin. `titles_to_restore` decides what to touch —
+    only a listed bridge whose title the server invented, never one a human
+    typed — and duplicating that judgement here is how the two copies drift.
+    This module contributes the transport it already has, nothing more.
+
+    Returns the number renamed. NEVER RAISES: the caller is
+    `AutoSwitchEngine.tick()`, which is documented "Never raises", and a
+    cosmetic repair must not be able to end a tick that was about to prevent a
+    rate-limit lockout.
+    """
+    try:
+        from cswap_pin.proxy import titles_to_restore
+    except Exception:  # noqa: BLE001 — the pin is an optional extra
+        return 0
+    try:
+        sessions = _list_bridge_sessions(access_token)
+        if not sessions:
+            # Covers both None (could not ask) and [] (nothing listed). Neither
+            # is a reason to rename anything.
+            return 0
+        done = 0
+        for sid, want in titles_to_restore(sessions, names):
+            if _put_bridge_title(access_token, sid, want):
+                done += 1
+                _logger.info("restored the cloud title for %s to %r", sid, want)
+        return done
+    except Exception as e:  # noqa: BLE001 — see the docstring
+        _logger.debug("bridge title restore failed: %r", e)
+        return 0

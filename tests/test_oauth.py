@@ -1379,3 +1379,151 @@ class TestFetchOauthProfile:
             "401" in r.message and "pre-fix" in r.message
             for r in caplog.records
         )
+
+
+class TestBridgeTitleRestoreRunsWithoutTheProxy:
+    """The restore must not depend on the proxy it exists to survive.
+
+    cswap-pin already implements it, with exactly one caller —
+    `_sweep_bridges_after_connect` — so it fires only when a
+    `POST /v1/code/sessions` REACHES the proxy. Measured 2026-08-17: all 24
+    claude processes carried HTTPS_PROXY=127.0.0.1:9901 (CCF), because Claude
+    Code reads ~/.claude.json's env block once at boot and the pin wiring
+    landed after they exec'd. Nothing reached the proxy, nothing was restored,
+    and a session sat under `Fix Claude AI session naming issue` until it was
+    renamed by hand.
+
+    WHAT IS TESTED HERE IS THE TRANSPORT AND THE GUARDS. The POLICY — which
+    titles may be touched — stays in cswap-pin and is tested there; asserting
+    it again here would be a second copy to drift. The one thing this file must
+    prove about the policy is that the REAL one is wired, and that is the last
+    case.
+
+    A FIRST VERSION OF THIS CLASS WAS ALL TAUTOLOGY, worth recording because it
+    passed. `cswap_pin` is an optional extra and is not importable in this
+    environment, so `restore_bridge_titles` returned 0 from its ImportError
+    guard before reaching anything — three of four cases went green against an
+    implementation that never ran.
+    """
+
+    def _policy(self, monkeypatch, fn):
+        """Install a fake `cswap_pin.proxy.titles_to_restore`.
+
+        The transport is what this class owns, so the decision is injected
+        rather than imported — and injecting it is also what makes these cases
+        run at all on a machine without the extra.
+        """
+        import sys
+        import types
+
+        mod = types.ModuleType("cswap_pin.proxy")
+        mod.titles_to_restore = fn
+        pkg = types.ModuleType("cswap_pin")
+        pkg.proxy = mod
+        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
+        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", mod)
+
+    def test_every_title_the_policy_names_is_put_back(self, monkeypatch):
+        from claude_swap import oauth
+
+        calls = []
+        self._policy(monkeypatch, lambda sessions, names: [("cse_a", "slack")])
+        monkeypatch.setattr(oauth, "_list_bridge_sessions",
+                            lambda tok: [{"id": "cse_a", "title": "invented"}])
+        monkeypatch.setattr(oauth, "_put_bridge_title",
+                            lambda tok, sid, title: calls.append((sid, title)) or True)
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 1
+        assert calls == [("cse_a", "slack")], calls
+
+    def test_the_policy_naming_nothing_puts_nothing(self, monkeypatch):
+        """THE CONTROL. Without it, "renames what the policy names" also passes
+        on a version that renames unconditionally — and that version reverts
+        every name set in the claude.ai web app, permanently."""
+        from claude_swap import oauth
+
+        calls = []
+        self._policy(monkeypatch, lambda sessions, names: [])
+        monkeypatch.setattr(oauth, "_list_bridge_sessions",
+                            lambda tok: [{"id": "cse_b", "title": "a name I typed"}])
+        monkeypatch.setattr(oauth, "_put_bridge_title",
+                            lambda tok, sid, title: calls.append((sid, title)) or True)
+        assert oauth.restore_bridge_titles("tok", {"cse_b": "local"}) == 0
+        assert calls == [], calls
+
+    def test_a_listing_that_failed_is_not_read_as_an_empty_one(self, monkeypatch):
+        """`None` means "could not ask", never "nothing there". The policy must
+        not even be consulted — handing it an empty listing is how a rename
+        happens on no evidence."""
+        from claude_swap import oauth
+
+        seen = []
+        self._policy(monkeypatch,
+                     lambda sessions, names: seen.append(sessions) or [])
+        monkeypatch.setattr(oauth, "_list_bridge_sessions", lambda tok: None)
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+        assert seen == [], "the policy was asked to judge a listing we never got"
+
+    def test_a_rename_that_fails_is_not_counted(self, monkeypatch):
+        """The count is what a caller logs. Counting an attempt would report a
+        repair that did not happen — the shape this whole area keeps producing.
+        """
+        from claude_swap import oauth
+
+        self._policy(monkeypatch, lambda sessions, names: [("cse_a", "slack")])
+        monkeypatch.setattr(oauth, "_list_bridge_sessions",
+                            lambda tok: [{"id": "cse_a", "title": "invented"}])
+        monkeypatch.setattr(oauth, "_put_bridge_title",
+                            lambda tok, sid, title: False)
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+
+    def test_it_never_raises_into_its_caller(self, monkeypatch):
+        """`AutoSwitchEngine.tick()` is documented "Never raises". A cosmetic
+        repair must not end a tick that was about to prevent a lockout."""
+        from claude_swap import oauth
+
+        def boom(tok):
+            raise RuntimeError("upstream on fire")
+
+        self._policy(monkeypatch, lambda sessions, names: [])
+        monkeypatch.setattr(oauth, "_list_bridge_sessions", boom)
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+
+    def test_a_host_without_the_pin_extra_loses_the_repair_not_the_tick(self):
+        """cswap-pin is optional and ships on its own schedule."""
+        import sys
+
+        from claude_swap import oauth
+
+        saved = {k: sys.modules.pop(k, None)
+                 for k in ("cswap_pin", "cswap_pin.proxy")}
+        sys.modules["cswap_pin"] = None  # force ImportError on import
+        try:
+            assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+        finally:
+            sys.modules.pop("cswap_pin", None)
+            for k, v in saved.items():
+                if v is not None:
+                    sys.modules[k] = v
+
+    def test_the_real_policy_is_the_one_wired(self):
+        """The only claim here that the injected cases cannot make.
+
+        They prove the transport calls SOMETHING; this proves it is cswap-pin's
+        decision and not a second copy. It needs the optional extra, so it does
+        not run on a machine without it — and a skip reads exactly like a pass,
+        so the reason says so out loud rather than being silently absent.
+        """
+        import pytest
+
+        pytest.importorskip(
+            "cswap_pin.proxy",
+            reason="THIS CASE DID NOT RUN: cswap-pin is not installed here, so "
+                   "nothing in this file has checked that the real policy is "
+                   "wired. CI installs the [pin] extra and does check it.",
+        )
+        import inspect
+
+        from claude_swap import oauth
+
+        src = inspect.getsource(oauth.restore_bridge_titles)
+        assert "from cswap_pin.proxy import titles_to_restore" in src

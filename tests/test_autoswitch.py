@@ -6716,3 +6716,64 @@ class TestReviewFindings202:
         assert sw.trigger == "at-limit"
 
 
+
+
+class TestTheEngineActuallyRunsTheTitleRestore:
+    """Wiring, not logic — the half that keeps being the one that is missing.
+
+    The restore existed in cswap-pin, was correct, and had one caller that
+    could not fire; that is how a session sat under a server-invented title for
+    hours on 2026-08-17. Removing the call from `tick` must therefore break a
+    test, or the same gap reopens the next time someone tidies this method.
+    """
+
+    def _engine(self, monkeypatch):
+        from claude_swap import autoswitch
+
+        eng = object.__new__(autoswitch.AutoSwitchEngine)
+        return eng
+
+    def test_tick_calls_the_restore(self, monkeypatch):
+        from claude_swap import autoswitch
+
+        called = []
+        monkeypatch.setattr(
+            autoswitch.AutoSwitchEngine, "_restore_bridge_titles_if_due",
+            lambda self: called.append(True))
+        monkeypatch.setattr(
+            autoswitch.AutoSwitchEngine, "_tick_inner",
+            lambda self: autoswitch.TickOutcome.NO_ACTION)
+        eng = self._engine(monkeypatch)
+        assert eng.tick() is autoswitch.TickOutcome.NO_ACTION
+        assert called == [True], "tick no longer runs the title restore"
+
+    def test_a_restore_that_explodes_does_not_fail_the_tick(self, monkeypatch):
+        """It is called BEFORE the try in `tick`, so this is not theoretical:
+        an unguarded raise there would end a tick that was about to prevent a
+        rate-limit lockout. The method owns its own guard; this pins that."""
+        from claude_swap import autoswitch
+
+        monkeypatch.setattr(
+            autoswitch.AutoSwitchEngine, "_tick_inner",
+            lambda self: autoswitch.TickOutcome.NO_ACTION)
+        eng = self._engine(monkeypatch)
+        # The real method, with the pin import failing and the clock at zero:
+        # it must return quietly rather than propagate.
+        eng._bridge_titles_next_at = 0.0
+        eng.tick()  # no raise
+
+    def test_the_cadence_is_honoured(self, monkeypatch):
+        """Ticks are frequent; a listing per tick would put this next to usage
+        polling on the wire for a repair that is needed once in a blue moon."""
+        import time
+
+        from claude_swap import autoswitch
+
+        eng = self._engine(monkeypatch)
+        eng._bridge_titles_next_at = time.time() + 10_000
+        seen = []
+        monkeypatch.setattr(autoswitch, "oauth", type(
+            "O", (), {"restore_bridge_titles": staticmethod(
+                lambda *a: seen.append(a))})())
+        eng._restore_bridge_titles_if_due()
+        assert seen == [], "the restore ran while it was not due"

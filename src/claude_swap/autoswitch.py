@@ -842,6 +842,7 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
+        self._restore_bridge_titles_if_due()
         try:
             return self._tick_inner()
         except ClaudeSwitchError as e:
@@ -852,6 +853,59 @@ class AutoSwitchEngine:
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
             return TickOutcome.ERROR
+
+    #: How often the restore may ask the API. Ticks are frequent and a re-mint
+    #: is rare, so this is a repair cadence, not a poll: one listing every few
+    #: minutes catches a rename within a coffee break and never shows up next
+    #: to usage polling.
+    BRIDGE_TITLE_INTERVAL_S = 300.0
+
+    def _restore_bridge_titles_if_due(self) -> None:
+        """Put locally-named sessions' names back on their cloud bridges.
+
+        WHY THE ENGINE OWNS THIS. cswap-pin implements the repair and has
+        exactly one caller — `_sweep_bridges_after_connect` — so it fires only
+        when a `POST /v1/code/sessions` REACHES the proxy. The repair is
+        triggered by the very thing it exists to survive. Measured 2026-08-17:
+        all 24 claude processes carried `HTTPS_PROXY=127.0.0.1:9901` (the cache
+        proxy) because Claude Code reads `~/.claude.json`'s env block once at
+        boot and the pin wiring landed after they had exec'd. Nothing reached
+        the proxy, nothing was restored, and a session sat under a
+        server-invented title until it was renamed by hand.
+
+        This engine has none of that coupling: it runs on a timer, it is the
+        thing that rotates accounts — so it is present at the moment bridges
+        are re-minted — and LIVE is single-instance, so two of them cannot both
+        PUT.
+
+        NEVER RAISES. `tick` is documented that way and a cosmetic repair must
+        not end a tick that was about to prevent a lockout.
+        """
+        now = time.time()
+        if now < getattr(self, "_bridge_titles_next_at", 0.0):
+            return
+        self._bridge_titles_next_at = now + self.BRIDGE_TITLE_INTERVAL_S
+        try:
+            from cswap_pin.proxy import live_bridge_names
+        except Exception:  # noqa: BLE001 — the pin is an optional extra
+            return
+        try:
+            names = live_bridge_names()
+            if not names:
+                return
+            number = self.switcher.current_account_number()
+            if not number:
+                return
+            email = self.switcher.account_email(number)
+            creds = self.switcher.read_account_credentials(number, email)
+            token = _access_token_of(creds)
+            if not token:
+                return
+            done = oauth.restore_bridge_titles(token, names)
+            if done:
+                _logger.info("restored %d cloud bridge title(s)", done)
+        except Exception as e:  # noqa: BLE001 — see the docstring
+            _logger.debug("bridge title restore skipped: %r", e)
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
@@ -2309,3 +2363,25 @@ class AutoSwitchEngine:
                     )
                 )
             self._wake.wait(delay)
+
+
+def _access_token_of(credentials) -> str | None:
+    """The bearer inside a stored credential blob, or ``None``.
+
+    Tolerant on purpose: an API-key account is a bare string with no bearer at
+    all, a malformed blob is not an emergency, and the only caller's whole job
+    is optional. Anything it cannot read is "no token", never a raise.
+    """
+    if not credentials:
+        return None
+    try:
+        raw = json.loads(credentials) if isinstance(credentials, str) else credentials
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(raw, dict):
+        return None
+    section = raw.get("claudeAiOauth")
+    if not isinstance(section, dict):
+        return None
+    token = section.get("accessToken")
+    return str(token) if token else None
