@@ -937,11 +937,40 @@ class AutoSwitchEngine:
             token = _access_token_of(creds)
             if not token:
                 return
-            done = oauth.restore_bridge_titles(token, names)
-            if done:
-                _logger.info("restored %d cloud bridge title(s)", done)
+            done, outcome = oauth.restore_bridge_titles(token, names)
+            self._report_bridge_titles(outcome, done)
         except Exception as e:  # noqa: BLE001 — see the docstring
             _logger.debug("bridge title restore skipped: %r", e)
+            self._report_bridge_titles(f"raised:{type(e).__name__}", 0)
+
+    def _report_bridge_titles(self, outcome: str, done: int) -> None:
+        """Say it when it CHANGES, and only then.
+
+        The previous version was `if done: _logger.info(...)`, so a run that
+        renamed nothing said nothing — and five different reasons for renaming
+        nothing were all that same silence, including the one that was live for
+        107 minutes (`list-failed`, every HTTPS call dying on
+        CERTIFICATE_VERIFY_FAILED). The user found the wrong session names
+        before any log did.
+
+        A 300 s timer that logs every pass is a log nobody reads by morning,
+        so the fix is not "log always" — it is transitions. `renamed` is worth
+        an INFO every time it happens because it is an action, not a state;
+        everything else speaks once and then holds its peace until it differs.
+        """
+        if outcome == "renamed":
+            _logger.info("restored %d cloud bridge title(s)", done)
+            self._bridge_titles_last = outcome
+            return
+        if outcome == getattr(self, "_bridge_titles_last", None):
+            return
+        self._bridge_titles_last = outcome
+        # `list-failed` and a raise are faults: something is wrong and nobody
+        # asked for it. The rest are ordinary states worth one line when they
+        # begin.
+        loud = outcome == "list-failed" or outcome.startswith("raised:")
+        (_logger.warning if loud else _logger.info)(
+            "cloud bridge titles: %s", outcome)
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None

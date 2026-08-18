@@ -829,7 +829,7 @@ def _put_bridge_title(access_token: str, session_id: str, title: str) -> bool:
         return False
 
 
-def restore_bridge_titles(access_token: str, names: dict) -> int:
+def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
     """Put each live session's own name back on its cloud bridge.
 
     WHY THIS EXISTS HERE AND NOT IN THE PROXY. cswap-pin already implements
@@ -847,27 +847,45 @@ def restore_bridge_titles(access_token: str, names: dict) -> int:
     typed — and duplicating that judgement here is how the two copies drift.
     This module contributes the transport it already has, nothing more.
 
-    Returns the number renamed. NEVER RAISES: the caller is
-    `AutoSwitchEngine.tick()`, which is documented "Never raises", and a
-    cosmetic repair must not be able to end a tick that was about to prevent a
-    rate-limit lockout.
+    Returns ``(renamed, outcome)``. THE SECOND VALUE EXISTS BECAUSE THE FIRST
+    CANNOT TELL THE CASES APART: five distinct states all produced 0 — the
+    extra missing, the listing failing, the listing empty, nothing needing a
+    rename, every PUT refused — and the caller only spoke when it was
+    non-zero. Measured 2026-08-17: this ran ~20 times over 107 minutes with
+    every listing dying on CERTIFICATE_VERIFY_FAILED, and nothing anywhere
+    said so; the user found their cloud session names wrong before any log
+    did.
+
+    NEVER RAISES: the caller is `AutoSwitchEngine.tick()`, which is documented
+    "Never raises", and a cosmetic repair must not be able to end a tick that
+    was about to prevent a rate-limit lockout.
     """
     try:
         from cswap_pin.proxy import titles_to_restore
     except Exception:  # noqa: BLE001 — the pin is an optional extra
-        return 0
+        return 0, "no-extra"
     try:
         sessions = _list_bridge_sessions(access_token)
+        if sessions is None:
+            # COULD NOT ASK. Distinct from an empty listing: this is the state
+            # that persisted for hours unnoticed, and it is the one worth
+            # waking someone for.
+            return 0, "list-failed"
         if not sessions:
-            # Covers both None (could not ask) and [] (nothing listed). Neither
-            # is a reason to rename anything.
-            return 0
+            return 0, "no-bridges"
         done = 0
-        for sid, want in titles_to_restore(sessions, names):
+        wanted = list(titles_to_restore(sessions, names))
+        for sid, want in wanted:
             if _put_bridge_title(access_token, sid, want):
                 done += 1
                 _logger.info("restored the cloud title for %s to %r", sid, want)
-        return done
+        if not wanted:
+            return 0, "nothing-to-rename"
+        if not done:
+            # Listed fine, had work, renamed none: every PUT was refused. A
+            # different fault from every other zero here.
+            return 0, "all-puts-refused"
+        return done, "renamed"
     except Exception as e:  # noqa: BLE001 — see the docstring
         _logger.debug("bridge title restore failed: %r", e)
-        return 0
+        return 0, f"raised:{type(e).__name__}"

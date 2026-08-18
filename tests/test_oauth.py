@@ -1550,7 +1550,7 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
                             lambda tok: [{"id": "cse_a", "title": "invented"}])
         monkeypatch.setattr(oauth, "_put_bridge_title",
                             lambda tok, sid, title: calls.append((sid, title)) or True)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 1
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (1, "renamed")
         assert calls == [("cse_a", "slack")], calls
 
     def test_the_policy_naming_nothing_puts_nothing(self, monkeypatch):
@@ -1565,7 +1565,8 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
                             lambda tok: [{"id": "cse_b", "title": "a name I typed"}])
         monkeypatch.setattr(oauth, "_put_bridge_title",
                             lambda tok, sid, title: calls.append((sid, title)) or True)
-        assert oauth.restore_bridge_titles("tok", {"cse_b": "local"}) == 0
+        assert oauth.restore_bridge_titles("tok", {"cse_b": "local"}) == (
+            0, "nothing-to-rename")
         assert calls == [], calls
 
     def test_a_listing_that_failed_is_not_read_as_an_empty_one(self, monkeypatch):
@@ -1578,7 +1579,8 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
         self._policy(monkeypatch,
                      lambda sessions, names: seen.append(sessions) or [])
         monkeypatch.setattr(oauth, "_list_bridge_sessions", lambda tok: None)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
+            0, "list-failed"), "a failed listing must be distinguishable"
         assert seen == [], "the policy was asked to judge a listing we never got"
 
     def test_a_rename_that_fails_is_not_counted(self, monkeypatch):
@@ -1592,7 +1594,8 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
                             lambda tok: [{"id": "cse_a", "title": "invented"}])
         monkeypatch.setattr(oauth, "_put_bridge_title",
                             lambda tok, sid, title: False)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
+            0, "all-puts-refused")
 
     def test_it_never_raises_into_its_caller(self, monkeypatch):
         """`AutoSwitchEngine.tick()` is documented "Never raises". A cosmetic
@@ -1604,7 +1607,8 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
 
         self._policy(monkeypatch, lambda sessions, names: [])
         monkeypatch.setattr(oauth, "_list_bridge_sessions", boom)
-        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+        assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
+            0, "raised:RuntimeError")
 
     def test_a_host_without_the_pin_extra_loses_the_repair_not_the_tick(self):
         """cswap-pin is optional and ships on its own schedule."""
@@ -1616,7 +1620,8 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
                  for k in ("cswap_pin", "cswap_pin.proxy")}
         sys.modules["cswap_pin"] = None  # force ImportError on import
         try:
-            assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == 0
+            assert oauth.restore_bridge_titles("tok", {"cse_a": "slack"}) == (
+                0, "no-extra")
         finally:
             sys.modules.pop("cswap_pin", None)
             for k, v in saved.items():

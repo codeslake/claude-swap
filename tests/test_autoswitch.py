@@ -6942,6 +6942,79 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         with pytest.raises(RuntimeError):
             harness.engine.tick()
 
+    def test_a_restore_that_can_do_nothing_says_so_ONCE(self, harness,
+                                                        monkeypatch, caplog):
+        """FIVE STATES, ONE RETURN VALUE, AND A CALLER THAT ONLY SPOKE ON WIN.
+
+        `restore_bridge_titles` returned a count, and every distinct failure
+        collapsed to 0: the extra missing, the listing failing, the listing
+        empty, nothing needing a rename, every PUT refused. The caller was
+        `if done: _logger.info(...)`, so all five were the same silence as a
+        perfect run.
+
+        Measured 2026-08-17: the engine ran this ~20 times over 107 minutes
+        with every listing dying on CERTIFICATE_VERIFY_FAILED
+        (`_list_bridge_sessions` swallows to debug and returns None), and the
+        user's cloud session names stayed wrong with nothing in any log. The
+        symptom reached them before any signal did.
+
+        ONCE, not every tick: this runs on a 300 s timer, so a broken state
+        that logs each pass is a log nobody reads by morning.
+
+        THE FAKE EXTRA IS THE POINT, not scaffolding. `cswap_pin` is an
+        optional package and is absent here, so without it the engine returns
+        at its import guard and this test would pass having executed none of
+        the code it names — which is exactly how the first version of it
+        passed. The `reached` assertion below is what stops that.
+        """
+        import logging
+        import sys
+        import types
+
+        from claude_swap import oauth
+
+        reached = []
+        fake = types.ModuleType("cswap_pin.proxy")
+        fake.live_bridge_names = lambda: {"cse_x": "my-session"}
+        fake.titles_to_restore = lambda sessions, names: []
+        pkg = types.ModuleType("cswap_pin")
+        pkg.proxy = fake
+        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
+        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
+
+        def listing_is_dead(_tok):
+            reached.append(True)
+            return None
+        monkeypatch.setattr(oauth, "_list_bridge_sessions", listing_is_dead)
+
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+            assert reached, (
+                "the engine never reached the listing — this test would have "
+                "certified silence it never executed")
+            warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert warns, "a restore that could do nothing said nothing"
+            assert "list-failed" in warns[0].getMessage(), warns[0].getMessage()
+
+            caplog.clear()
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+            assert not [r for r in caplog.records
+                        if r.levelno >= logging.WARNING], (
+                "the same broken outcome logged twice — on a 300s timer that "
+                "is a log nobody reads")
+
+            # AND RECOVERY IS ITS OWN TRANSITION. A watch that goes quiet on
+            # the way back up cannot be trusted to have meant anything on the
+            # way down.
+            caplog.clear()
+            monkeypatch.setattr(oauth, "_list_bridge_sessions", lambda _t: [])
+            harness.engine._bridge_titles_next_at = 0.0
+            harness.engine._restore_bridge_titles_if_due()
+            msgs = [r.getMessage() for r in caplog.records]
+            assert any("no-bridges" in m for m in msgs), msgs
+
     def test_the_real_restore_is_guarded_and_returns_quietly(self, harness):
         """The real method, on a machine whose optional extra may be absent and
         whose clock is at zero: it must return rather than propagate. This is
