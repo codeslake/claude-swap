@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import ssl
 import urllib.error
 import urllib.request
@@ -813,15 +814,14 @@ def _pin_ca_fingerprint():
         return None
     if not ca:
         return None
+    # A CA THAT NAMES A PATH WE CANNOT STAT IS NOT THE SAME STATE AS NO PIN AT
+    # ALL, and collapsing the two hands the no-pin caller a context built for a
+    # pin. Distinct key, so each caches its own.
     try:
-        import os
-
-        return (str(ca), os.stat(ca).st_mtime_ns)
+        stamp = os.stat(ca).st_mtime_ns
     except OSError:
-        # A CA THAT NAMES A PATH WE CANNOT STAT IS NOT THE SAME STATE AS NO
-        # PIN AT ALL, and collapsing the two hands the no-pin caller a context
-        # built for a pin. Distinct key, so each caches its own.
-        return (str(ca), None)
+        stamp = None
+    return (str(ca), stamp)
 
 
 def _pin_aware_ssl_context():

@@ -952,9 +952,9 @@ class AutoSwitchEngine:
             if not names:
                 self._report_bridge_titles("no-live-names", 0)
                 return
-            number, why = self._bridge_owner_number()
+            number = self._bridge_owner_number()
             if not number:
-                self._report_bridge_titles(why, 0)
+                self._report_bridge_titles("no-account", 0)
                 return
             email = self.switcher.account_email(number)
             creds = self.switcher.read_account_credentials(number, email)
@@ -968,7 +968,7 @@ class AutoSwitchEngine:
             _logger.debug("bridge title restore skipped: %r", e)
             self._report_bridge_titles(f"raised:{type(e).__name__}", 0)
 
-    def _bridge_owner_number(self) -> tuple[str | None, str]:
+    def _bridge_owner_number(self) -> str | None:
         """Which account's bearer can SEE these bridges — the pinned one.
 
         THE REPAIR WAS AUTHENTICATING AS THE ACTIVE ACCOUNT, and a pin exists
@@ -991,17 +991,19 @@ class AutoSwitchEngine:
         in the roster. That is the bug with a longer fuse: we have no
         credential for the account that owns the bridges, and saying so once
         is worth more than a repair that cannot work and does not admit it.
+        Both ways of having no usable account report `no-account`; splitting
+        them is a distinction the log has never needed, and the caller can
+        split it the day one of them shows up alone.
         """
         from . import pin
 
         pinned = pin.pinned_email(self.switcher)
         if not pinned:
-            number = self.switcher.current_account_number()
-            return (number, "") if number else (None, "no-account")
+            return self.switcher.current_account_number()
         for number in self.switcher.switchable_account_numbers():
             if self.switcher.account_email(number) == pinned:
-                return number, ""
-        return None, "pin-account-not-in-roster"
+                return number
+        return None
 
     def _report_bridge_titles(self, outcome: str, done: int) -> None:
         """Say it when it CHANGES, and only then.
@@ -1032,12 +1034,12 @@ class AutoSwitchEngine:
         # AND SO ARE THE THREE THAT USED TO BE BARE `return`s. `no-token` is a
         # slot whose credential yields no bearer — an API-key login, an
         # unreadable blob, a locked keychain — and it repeats on every 300 s
-        # pass forever without repairing anything. `pin-account-not-in-roster`
-        # is a pin naming an account this machine has no credential for. Both
-        # are "wrong and nobody asked for it", which is the line this splits
-        # on. `no-live-names` is not: no live bridges is an ordinary state.
-        loud = (outcome in ("list-failed", "no-token", "no-account",
-                            "pin-account-not-in-roster")
+        # pass forever without repairing anything. `no-account` is no usable
+        # account to authenticate as, whether that is no active one or a pin
+        # naming one this machine has no credential for. Both are "wrong and
+        # nobody asked for it", which is the line this splits on.
+        # `no-live-names` is not: no live bridges is an ordinary state.
+        loud = (outcome in ("list-failed", "no-token", "no-account")
                 or outcome.startswith("raised:"))
         (_logger.warning if loud else _logger.info)(
             "cloud bridge titles: %s", outcome)

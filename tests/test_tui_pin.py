@@ -15,6 +15,8 @@ import contextlib
 import io
 import types
 
+from functools import partial
+
 import pytest
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -419,7 +421,7 @@ class TestThePinTuiSurface:
                 with contextlib.redirect_stdout(buf), pytest.raises(
                     ClaudeSwitchError, match="cloud pin"
                 ):
-                    screen._repin_or_say_so(fake)
+                    screen._run_pin_op(partial(screen._repin, fake))
                 assert buf.getvalue() == "", (
                     "the message was printed as well as raised, so the modal "
                     f"carries it twice: {buf.getvalue()!r}")
@@ -429,7 +431,7 @@ class TestThePinTuiSurface:
                 pin.repin_current = lambda _sw: True
                 buf = io.StringIO()
                 with contextlib.redirect_stdout(buf):
-                    screen._repin_or_say_so(fake)
+                    screen._run_pin_op(partial(screen._repin, fake))
                 assert buf.getvalue().strip(), (
                     "a successful repair said nothing, which is the silence "
                     "this case exists to remove, in the other direction")

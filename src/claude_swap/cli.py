@@ -1153,13 +1153,9 @@ def main() -> None:
     # SUPPRESSED, NOT MOVED. Running it after the dispatch would leave the pin
     # commands themselves on stdlib trust, and the warning exists because that
     # difference is real.
-    try:
-        from claude_swap.appearance import pin_invocation_is_script_consumed
+    from claude_swap.appearance import pin_invocation_is_script_consumed
 
-        _quiet_tls = pin_invocation_is_script_consumed(argv)
-    except Exception:  # noqa: BLE001 — appearance is cosmetic, never fatal
-        _quiet_tls = False
-    _use_native_tls(quiet=_quiet_tls)
+    _use_native_tls(quiet=pin_invocation_is_script_consumed(argv))
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`

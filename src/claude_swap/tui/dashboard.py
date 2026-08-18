@@ -99,38 +99,32 @@ class DashboardScreen(Screen):
                 return
         except Exception:  # noqa: BLE001 — a badge-level question, never fatal
             return
+        # THROUGH `_run_pin_op`, like every other pin action in this class.
+        # `repin_current` returns False and never raises, and handed straight
+        # to `_start_action` that False vanished: `run_action` builds
+        # `ActionResult(True, ...)` for any fn that does not raise and this one
+        # prints nothing, so `_action_done` found an empty first line and
+        # notified nothing. The repair ran on mount, failed, held `app.busy`
+        # for its duration, and the ⚠ cloud UNPINNED badge stayed lit with no
+        # explanation. `_run_pin_op` already prints on success and raises
+        # `ClaudeSwitchError` on failure so the modal opens — a second
+        # reporting path was the wrong way to say the same thing.
         self.app._start_action(
             "Repairing the cloud pin",
-            partial(self._repin_or_say_so, self.app.switcher),
+            partial(self._run_pin_op, partial(self._repin, self.app.switcher)),
         )
 
     @staticmethod
-    def _repin_or_say_so(switcher) -> None:
-        """`repin_current` returns False and never raises — so say it out loud.
-
-        Handed straight to `_start_action`, that False vanished: `run_action`
-        builds `ActionResult(True, ...)` for any fn that does not raise, its
-        docstring says "Returns False on anything unexpected", and it prints
-        nothing. So `_action_done` found an empty first line and notified
-        nothing at all. On mount, against a daemon publishing `unpinnable`,
-        the repair ran, failed, held `app.busy` for its duration — making the
-        user's next keystroke answer "Another action is still running" — and
-        the ⚠ cloud UNPINNED badge simply stayed lit with no explanation.
-
-        Every sibling pin action in this file goes through `_run_pin_op`, which
-        raises `ClaudeSwitchError` precisely so the modal opens. This one
-        bypassed it, so it gets the same treatment here rather than a fifth
-        way of reporting.
-        """
+    def _repin(switcher) -> tuple[bool, str]:
         from claude_swap import pin as _pin
 
-        if not _pin.repin_current(switcher):
-            raise ClaudeSwitchError(
-                "Could not repair the cloud pin. The daemon serving now "
-                "cannot mint the pinned token — `cswap pin --heal`, or "
-                "`cswap pin <account>` to re-apply it."
-            )
-        print("Cloud pin repaired")
+        if _pin.repin_current(switcher):
+            return True, "Cloud pin repaired"
+        return False, (
+            "Could not repair the cloud pin. The daemon serving now cannot "
+            "mint the pinned token — `cswap pin --heal`, or "
+            "`cswap pin <account>` to re-apply it."
+        )
 
     # -- menu plumbing --------------------------------------------------------
 
