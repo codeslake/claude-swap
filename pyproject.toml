@@ -129,7 +129,7 @@ menubar = ["rumps>=0.4.0"]
 # red. That is the check WORKING: a package that cannot be imported is broken
 # for everyone who installs it, and the platform that noticed is not the
 # platform at fault.
-pin = ["cswap-pin>=0.1.108"]
+pin = ["cswap-pin>=0.1.112"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
