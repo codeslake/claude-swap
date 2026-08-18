@@ -1375,6 +1375,60 @@ class TestTheWiringCanAlwaysBeRemoved:
                 f"{cfg.parent.name} left wired — its sessions still dial a dead port"
             )
 
+    def test_a_spent_budget_still_attempts_every_path(self, tmp_path, monkeypatch):
+        """THE SAME STARVATION, ONE RUNNER-SPEED AWAY.
+
+        The fair share stopped path 1 from CLAIMING the whole budget, but the
+        loop still had `if left <= 0: continue` — so path 1 only has to
+        OVERSHOOT its share for path 2 to be skipped without a single attempt.
+        Measured on this branch's Windows CI 2026-08-18: the sibling case red
+        with `attempted` holding the session lock alone, while twenty local
+        runs on Linux were green. The overshoot needs a slow machine, which is
+        why it hid.
+
+        Here the budget is spent before the loop starts. A zero share must
+        still take a FREE lock, because `proper_lockfile` tries `os.mkdir`
+        before it looks at its deadline.
+        """
+        from contextlib import contextmanager
+
+        import claude_swap.paths as paths
+        from claude_swap import claude_locks, pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        session = self._wired(tmp_path / "session")
+        default = self._wired(tmp_path / "home")
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: session)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: default)
+
+        real_proper_lockfile = claude_locks.proper_lockfile
+        attempted = []
+
+        @contextmanager
+        def _recording_lockfile(lock_dir, **kwargs):
+            attempted.append(lock_dir)
+            with real_proper_lockfile(lock_dir, **kwargs):
+                yield
+
+        monkeypatch.setattr(claude_locks, "proper_lockfile", _recording_lockfile)
+
+        # NO BUDGET AT ALL. Both locks are free, so both must still be taken.
+        changed = pin.clear_wiring(ClaudeAccountSwitcher(), timeout=0.0)
+
+        for cfg in (session, default):
+            lock = cfg.parent / (cfg.name + ".lock")
+            assert lock in attempted, (
+                f"{cfg.name} under {cfg.parent.name} was never attempted with "
+                "the budget spent — a slow first path silently leaves the "
+                f"second config wired. attempted={attempted}")
+        assert changed is True, (
+            "both configs were wired and free, and the clear reported nothing "
+            "removed")
+        for cfg in (session, default):
+            assert "_cswapPinWiredKeys" not in json.loads(cfg.read_text()), (
+                f"{cfg} still carries the wiring after a clear that says it "
+                "changed something")
+
     def test_a_contended_first_path_does_not_starve_a_free_second(
         self, tmp_path, monkeypatch
     ):

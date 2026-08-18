@@ -582,9 +582,21 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
     deadline = _time.monotonic() + timeout
     changed = False
     for i, path in enumerate(paths):
-        left = deadline - _time.monotonic()
-        if left <= 0:
-            continue  # budget spent; the next launch heals what is left
+        # EVERY PATH IS ATTEMPTED, even with the budget gone. `if left <= 0:
+        # continue` was here, and it is the same starvation the fair share
+        # below was introduced to fix, one runner-speed away: path 1 only has
+        # to OVERSHOOT its share for path 2 to be skipped without a single
+        # attempt. Measured on this branch's Windows CI 2026-08-18 —
+        # `test_a_contended_first_path_does_not_starve_a_free_second` red with
+        # `attempted` holding the session lock alone — while twenty local runs
+        # on Linux were green, because the overshoot needs a slow machine.
+        #
+        # A zero share is not a skip: `proper_lockfile` tries `os.mkdir`
+        # BEFORE it checks its deadline, so a FREE lock is taken instantly and
+        # a contended one fails at once. The cost of the change is a few
+        # syscalls past the budget; the cost of the skip was `cswap pin
+        # --clear` returning with the second config still wired.
+        left = max(0.0, deadline - _time.monotonic())
         # FAIR SHARE of what remains, not "however much is left". Handing the
         # first path the whole remaining budget let a config that stayed
         # contended for the entire call consume it all, so a SECOND path
