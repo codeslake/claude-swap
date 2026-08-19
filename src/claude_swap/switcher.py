@@ -2020,43 +2020,11 @@ class ClaudeAccountSwitcher:
         the no-backup direct-activation path). Use :meth:`has_live_login` to
         tell the two ``None`` cases apart.
         """
-        identity = self._get_current_account()
+        identity = self._live_login_identity()
         if identity is None:
             return None
         data = self._get_sequence_data() or {}
-        email, org_uuid = identity
-        # THE IDENTITY FILE NOW CARRIES TWO FACTS, and this reads the other
-        # one. `_perform_switch` writes the PINNED account's oauthAccount
-        # there so a live Remote Control bridge survives a rotation, which
-        # means a match against the pin says "this is the bridge owner", not
-        # "this is the live login".
-        #
-        # The distinction is not cosmetic: the pin routes IDENTITY and never
-        # inference — that still authenticates from `.credentials.json` — so
-        # the pinned slot burns no quota and its headroom never falls. An
-        # auto-switch engine handed the pinned slot reports below-threshold
-        # forever while the account actually serving requests walks into the
-        # lockout the engine exists to prevent. Raised by review after the
-        # splice shipped and before the first rotation could trigger it.
-        #
-        # The roster is the other witness, and the switch updates it in the
-        # SAME transaction that writes the config, so it cannot lag.
-        #
-        # THE DOCSTRING'S REFUSAL TO FALL BACK IS INTACT WHERE IT MATTERS.
-        # It exists so an UNMANAGED login never resolves to a guessed slot.
-        # A login matching the pin is not unmanaged — it is a value cswap
-        # itself wrote one line earlier. Everything else still returns None.
-        try:
-            from claude_swap import pin as _pin
-
-            pinned = _pin.pinned_identity_email(self)
-        except Exception:  # noqa: BLE001 — an optional extra cannot break this
-            pinned = None
-        if pinned and email == pinned:
-            recorded = data.get("activeAccountNumber")
-            if recorded is not None:
-                return str(recorded)
-        return self._find_account_slot(data, email, org_uuid)
+        return self._find_account_slot(data, *identity)
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
@@ -3001,6 +2969,52 @@ class ClaudeAccountSwitcher:
         organization_uuid = oauth.get("organizationUuid", "") or ""
         return (email, organization_uuid)
 
+    def _live_login_identity(self) -> "tuple[str, str] | None":
+        """(email, org) of the LIVE LOGIN, which is not always what the file says.
+
+        `~/.claude.json`'s oauthAccount carries two facts now. Claude Code
+        reads it as the owner of any bridge it creates, and `_perform_switch`
+        writes the PINNED account there so a live Remote Control session
+        survives a rotation. cswap reads the same field to answer "who is
+        logged in", and after a rotation that answer is the pin.
+
+        TEN sites re-derived that answer from `_get_current_account()` plus
+        `_find_account_slot()`. Fixing them one at a time is how the second
+        was found after the first was fixed, so they ask this instead.
+
+        `_get_current_account` KEEPS its literal meaning — what the config
+        holds — because `_live_identity_matches` is a TOCTOU re-check that
+        must compare against the literal live value, and a caller re-reading
+        the config under a lock is asking a different question from a caller
+        asking who is logged in.
+
+        When the config names the pin, the roster is the other witness: the
+        switch updates `activeAccountNumber` in the SAME transaction that
+        writes the config, so it cannot lag. Anything else is returned
+        unchanged, so an UNMANAGED login still resolves to nothing — which is
+        the guarantee `current_account_number`'s docstring exists to keep.
+        """
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        email, org_uuid = identity
+        try:
+            from claude_swap import pin as _pin
+
+            pinned = _pin.pinned_identity_email(self)
+        except Exception:  # noqa: BLE001 — an optional extra cannot break this
+            return identity
+        if not pinned or email != pinned:
+            return identity
+        data = self._get_sequence_data() or {}
+        recorded = data.get("activeAccountNumber")
+        if recorded is None:
+            return identity
+        slot = (data.get("accounts") or {}).get(str(recorded))
+        if not isinstance(slot, dict) or not slot.get("email"):
+            return identity
+        return (slot["email"], slot.get("organizationUuid", "") or "")
+
     def _live_identity_matches(self, email: str, org_uuid: str) -> bool:
         """Whether the live config identity is (email, org_uuid) right now.
 
@@ -3340,7 +3354,10 @@ class ClaudeAccountSwitcher:
             except ValueError as e:
                 raise ValidationError(str(e)) from e
 
-        identity = self._get_current_account()
+        # THE LIVE LOGIN. This decides whose backup gets refreshed, so
+        # reading the identity file directly would refresh the PIN's
+        # slot with the active account's credential.
+        identity = self._live_login_identity()
         if identity is None:
             raise ConfigError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid = identity
@@ -3846,7 +3863,12 @@ class ClaudeAccountSwitcher:
         other slot reads its backup copy.
         """
         data = self._get_sequence_data_migrated() or {}
-        current_identity = self._get_current_account()
+        # THE LIVE LOGIN, not what the file literally says: this drives
+        # `is_active`, which is the `(active)` marker in `cswap list` and
+        # the `active` flag in `list --json`. Reading the config alone
+        # tells the user the PIN is their active account while another
+        # slot serves every request.
+        current_identity = self._live_login_identity()
 
         # Find active account number by (email, organizationUuid) composite key
         active_num = None
@@ -5380,7 +5402,8 @@ class ClaudeAccountSwitcher:
 
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
-        identity = self._get_current_account()
+        # THE LIVE LOGIN — this payload reports who is active.
+        identity = self._live_login_identity()
         if identity is None:
             return {"schemaVersion": SCHEMA_VERSION, "active": None}
         current_email, current_org_uuid = identity
@@ -5438,7 +5461,9 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_status_payload()
 
-        identity = self._get_current_account()
+        # THE LIVE LOGIN — this prints who is active, and the identity file
+        # names the PIN after a rotation. See `_live_login_identity`.
+        identity = self._live_login_identity()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
             return None
@@ -5594,7 +5619,10 @@ class ClaudeAccountSwitcher:
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
-        identity = self._get_current_account()
+        # THE LIVE LOGIN. This decides which slot is being switched AWAY
+        # from; the identity file names the PIN after a rotation, so reading
+        # it directly would treat the pinned slot as the outgoing one.
+        identity = self._live_login_identity()
 
         # Ensure org fields are migrated before checking composite key
         self._get_sequence_data_migrated()
@@ -6011,7 +6039,7 @@ class ClaudeAccountSwitcher:
         # reconcile it.
         provenance: dict | None = None
         if not force and data:
-            identity = self._get_current_account()
+            identity = self._live_login_identity()
             if identity is not None:
                 cur_slot = self._find_account_slot(data, identity[0], identity[1])
                 if cur_slot == target_account:
@@ -6141,7 +6169,9 @@ class ClaudeAccountSwitcher:
         result["live"] = live
         if not live:
             return result
-        identity = self._get_current_account()
+        # THE LIVE LOGIN: the slot read below is the one whose stored
+        # credential should match what is live.
+        identity = self._live_login_identity()
         if identity is None:
             return result
         data = self._get_sequence_data() or {}

@@ -635,7 +635,9 @@ def import_accounts(
     # live login, a plain switch would back the (possibly stale) live
     # credentials up over it (issue #79) — point at the explicit activation
     # path instead.
-    identity = switcher._get_current_account()
+    # THE LIVE LOGIN: seeds activeAccountNumber, so the pin's
+    # identity here would record the wrong slot as active.
+    identity = switcher._live_login_identity()
     if identity is not None and final is not None:
         live_slot = switcher._find_account_slot(final, identity[0], identity[1])
         if live_slot is not None and live_slot in written_slots:

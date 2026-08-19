@@ -7572,6 +7572,93 @@ class TestTheSpliceMustNotCostTheEngineItsActiveAccount:
         assert sw.current_account_number() == "6"
 
 
+class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
+    """Ten sites recomputed it; one was fixed. This pins the rest.
+
+    The identity file names the PIN now, so a site that answers "which slot
+    is active" by reading it is answering the wrong question. Two tests: the
+    one a person actually sees, and a structural one so a NEW copy of those
+    two lines cannot appear without being noticed.
+    """
+
+    def test_the_active_marker_a_person_reads_is_not_the_pin(
+            self, tmp_path, monkeypatch):
+        """`cswap list` and its json payload both come from
+        `_build_accounts_info`, so this is what the user is told."""
+        from claude_swap import switcher as _sw
+
+        roster = {"activeAccountNumber": 5, "accounts": {
+            "1": {"email": "pinned@example.com", "organizationUuid": "org-1"},
+            "5": {"email": "serving@example.com", "organizationUuid": "org-1"},
+        }}
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_current_account",
+            lambda self: ("pinned@example.com", "org-1"), raising=False)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_sequence_data",
+            lambda self: roster, raising=False)
+        monkeypatch.setattr(
+            "claude_swap.pin._pinned_email_now",
+            lambda s: ("pinned@example.com", "org-1"))
+
+        assert sw.current_account_number() == "5", "precondition"
+
+        # THE PRODUCTION SOURCE, not a copy of it. An earlier version of this
+        # test re-ran the two lines itself and therefore asserted what the
+        # TEST did — it stayed red after the fix landed, because the code it
+        # was checking lived in the test file.
+        data = sw._get_sequence_data() or {}
+        identity = sw._live_login_identity()
+        active_num = sw._find_account_slot(data, *identity)
+        assert active_num == "5", (
+            "the account list would mark the PINNED slot (active) while "
+            "another slot serves every request — a person reading their own "
+            "account list is told the wrong thing, and so is anything "
+            "automating on `list --json`"
+        )
+
+    def test_no_new_copy_of_the_two_lines_appears_unnoticed(self):
+        """The structural half. Grepping for names found two of ten; asking
+        the question by SHAPE found all of them, so assert the shape.
+
+        A site is listed here because it re-derives, not because it is
+        wrong — `_perform_switch` classifying an outgoing credential wants
+        the LIVE credential and is a different question. The list is a
+        tripwire: adding to it should be a deliberate edit.
+        """
+        import ast
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+        found = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                calls = {n.func.attr for n in ast.walk(fn)
+                         if isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Attribute)}
+                if {"_get_current_account", "_find_account_slot"} <= calls:
+                    found.append(f"{path.name}:{fn.name}")
+        # THE CONTROL: without it an empty walk passes vacuously.
+        assert len(list(root.rglob("*.py"))) > 5, "the walk found no modules"
+        # NINE OF THE TEN NOW ASK `_live_login_identity`. The one left is
+        # not an oversight: `_perform_switch` uses it to classify the
+        # OUTGOING credential, which is a question about the live credential
+        # rather than about which slot is active, and the review raised it
+        # separately. Listing it here keeps this test a tripwire for NEW
+        # copies rather than a to-do list.
+        known = {
+            "switcher.py:_perform_switch",
+        }
+        assert set(found) <= known, (
+            "a NEW site re-derives the active slot from the identity file, "
+            f"which now names the pin: {sorted(set(found) - known)}"
+        )
+
+
 class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
     """The identity file decides a live bridge's OWNER, so while a pin is set
     it has to name the pin.
