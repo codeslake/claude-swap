@@ -7644,15 +7644,18 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
                     found.append(f"{path.name}:{fn.name}")
         # THE CONTROL: without it an empty walk passes vacuously.
         assert len(list(root.rglob("*.py"))) > 5, "the walk found no modules"
-        # NINE OF THE TEN NOW ASK `_live_login_identity`. The one left is
-        # not an oversight: `_perform_switch` uses it to classify the
-        # OUTGOING credential, which is a question about the live credential
-        # rather than about which slot is active, and the review raised it
-        # separately. Listing it here keeps this test a tripwire for NEW
-        # copies rather than a to-do list.
-        known = {
-            "switcher.py:_perform_switch",
-        }
+        # ALL TEN NOW ASK `_live_login_identity`, so the expected set is
+        # EMPTY and this is a pure tripwire.
+        #
+        # `_perform_switch` was the last, and it looked like a different
+        # question — it classifies the OUTGOING credential rather than asking
+        # which slot is active. Tracing it settled that: the outgoing
+        # credential lives in `.credentials.json`, which the pin never
+        # touches, so it belongs to the roster's active account — exactly
+        # what the helper returns. The site even initialised `current_account`
+        # from the roster and then overwrote it with the config-derived slot,
+        # so the correct value was already there and was being discarded.
+        known: set = set()
         assert set(found) <= known, (
             "a NEW site re-derives the active slot from the identity file, "
             f"which now names the pin: {sorted(set(found) - known)}"

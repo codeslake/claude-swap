@@ -6531,7 +6531,20 @@ class ClaudeAccountSwitcher:
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
             to_ref = account_ref(int(target_account), target_email)
-            current_identity = self._get_current_account()
+            # THE LIVE LOGIN, and the correct value was already in
+            # `current_account` from the roster one line up before this
+            # overwrote it. The outgoing credential lives in
+            # `.credentials.json`, which the pin never touches, so it belongs
+            # to the roster's active account — while the identity file names
+            # the PIN after a rotation.
+            #
+            # Reading the file here classified the live credential against the
+            # PINNED slot: online that is "foreign", so every auto-rotation
+            # stashed and warned and the outgoing account never received its
+            # rotated token; offline it fails open and writes another
+            # account's credential into the pinned slot, which is the one
+            # credential that must stay good. Raised by review.
+            current_identity = self._live_login_identity()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
                 current_account = self._find_account_slot(
