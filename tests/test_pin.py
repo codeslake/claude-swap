@@ -7494,6 +7494,84 @@ class TestClearPinCapturesEvidenceBeforeAnythingUnwires:
             f"so a half-removed wiring is invisible to it: {order}")
 
 
+class TestTheSpliceMustNotCostTheEngineItsActiveAccount:
+    """Writing the pin into the identity file must not move "who is active".
+
+    `~/.claude.json`'s oauthAccount had ONE meaning and now carries two: the
+    bridge owner (what the splice needs) and the live login (what
+    `current_account_number` reads). The auto-switch engine reads the second
+    to decide whose headroom to evaluate, and the pin routes identity, not
+    inference — so a pinned slot burns no quota and its headroom never falls.
+    Left unfixed, the engine reports below-threshold forever while the
+    account actually serving requests walks into the lockout it exists to
+    prevent.
+
+    Found by review before the first rotation after deploy could trigger it.
+    """
+
+    def _switcher(self, tmp_path, monkeypatch, config_email, pin_email,
+                  roster):
+        import json
+
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        cfg = tmp_path / "claude.json"
+        cfg.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": config_email, "organizationUuid": "org-1"}}))
+        monkeypatch.setattr(sw, "config_file", cfg, raising=False)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_current_account",
+            lambda self: (config_email, "org-1"), raising=False)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_sequence_data",
+            lambda self: roster, raising=False)
+        monkeypatch.setattr(
+            "claude_swap.pin._pinned_email_now",
+            lambda s: (pin_email, "org-1") if pin_email else None)
+        return sw
+
+    ROSTER = {"activeAccountNumber": 6, "accounts": {
+        "6": {"email": "active@example.com", "organizationUuid": "org-1"},
+        "2": {"email": "pinned@example.com", "organizationUuid": "org-1"},
+    }}
+
+    def test_the_engine_still_sees_the_account_that_burns_the_quota(
+            self, tmp_path, monkeypatch):
+        """The identity file names the PIN — the rotated state — and the
+        answer must still be the account inference is billed to."""
+        sw = self._switcher(tmp_path, monkeypatch,
+                            config_email="pinned@example.com",
+                            pin_email="pinned@example.com",
+                            roster=self.ROSTER)
+        assert sw.current_account_number() == "6", (
+            "the engine would evaluate the PINNED slot's headroom, which "
+            "never falls because the pin routes identity and not inference — "
+            "so it reports below-threshold forever while the account "
+            "actually serving requests hits the lockout"
+        )
+
+    def test_an_unmanaged_login_is_still_None(self, tmp_path, monkeypatch):
+        """The fallback must not become a guess. A login in NEITHER the
+        roster nor the pin is the case `current_account_number`'s docstring
+        refuses to answer, and it must keep refusing."""
+        sw = self._switcher(tmp_path, monkeypatch,
+                            config_email="stranger@example.com",
+                            pin_email="pinned@example.com",
+                            roster=self.ROSTER)
+        assert sw.current_account_number() is None, (
+            "an unmanaged login must never resolve to a slot"
+        )
+
+    def test_with_no_pin_the_answer_is_unchanged(self, tmp_path, monkeypatch):
+        """The control. With no pin the identity file means what it always
+        meant, and the reading must be byte-identical to before."""
+        sw = self._switcher(tmp_path, monkeypatch,
+                            config_email="active@example.com",
+                            pin_email=None, roster=self.ROSTER)
+        assert sw.current_account_number() == "6"
+
+
 class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
     """The identity file decides a live bridge's OWNER, so while a pin is set
     it has to name the pin.

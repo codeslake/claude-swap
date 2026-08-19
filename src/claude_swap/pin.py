@@ -268,6 +268,26 @@ def pinned_email(switcher) -> str | None:
     return pin[0] if pin else None
 
 
+def pinned_identity_email(switcher) -> "str | None":
+    """The pinned account's email as cswap's OWN file has it, or None.
+
+    Public because `switcher.current_account_number` needs it: the splice
+    writes the pinned identity into `~/.claude.json`, and that function reads
+    the same field to answer a DIFFERENT question, so it has to be able to
+    tell the two apart. Reaching `_pinned_email_now` from there would put
+    back the exact violation this module's boundary was cleaned up to remove.
+
+    Reads cswap's own settings rather than the package, for the reason
+    `_pinned_email_now` documents: the package may be absent or broken, and
+    this question must still be answerable then. Never raises.
+    """
+    try:
+        pinned = _pinned_email_now(switcher)
+        return pinned[0] if pinned else None
+    except Exception:  # noqa: BLE001 — an optional extra cannot break a read
+        return None
+
+
 def identity_for_config(switcher) -> "dict | None":
     """The `oauthAccount` the config should name while a pin is set, or None.
 

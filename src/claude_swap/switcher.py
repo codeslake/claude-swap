@@ -2025,6 +2025,37 @@ class ClaudeAccountSwitcher:
             return None
         data = self._get_sequence_data() or {}
         email, org_uuid = identity
+        # THE IDENTITY FILE NOW CARRIES TWO FACTS, and this reads the other
+        # one. `_perform_switch` writes the PINNED account's oauthAccount
+        # there so a live Remote Control bridge survives a rotation, which
+        # means a match against the pin says "this is the bridge owner", not
+        # "this is the live login".
+        #
+        # The distinction is not cosmetic: the pin routes IDENTITY and never
+        # inference — that still authenticates from `.credentials.json` — so
+        # the pinned slot burns no quota and its headroom never falls. An
+        # auto-switch engine handed the pinned slot reports below-threshold
+        # forever while the account actually serving requests walks into the
+        # lockout the engine exists to prevent. Raised by review after the
+        # splice shipped and before the first rotation could trigger it.
+        #
+        # The roster is the other witness, and the switch updates it in the
+        # SAME transaction that writes the config, so it cannot lag.
+        #
+        # THE DOCSTRING'S REFUSAL TO FALL BACK IS INTACT WHERE IT MATTERS.
+        # It exists so an UNMANAGED login never resolves to a guessed slot.
+        # A login matching the pin is not unmanaged — it is a value cswap
+        # itself wrote one line earlier. Everything else still returns None.
+        try:
+            from claude_swap import pin as _pin
+
+            pinned = _pin.pinned_identity_email(self)
+        except Exception:  # noqa: BLE001 — an optional extra cannot break this
+            pinned = None
+        if pinned and email == pinned:
+            recorded = data.get("activeAccountNumber")
+            if recorded is not None:
+                return str(recorded)
         return self._find_account_slot(data, email, org_uuid)
 
     def has_live_login(self) -> bool:
