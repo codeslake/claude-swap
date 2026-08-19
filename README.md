@@ -250,11 +250,22 @@ Shows every account's 5h / 7d / spend usage and switches with a click (specific 
 <details>
 <summary>Keep Remote Control and Artifacts on one account while inference follows the swap</summary>
 
-Needs the `pin` extra:
+Needs the `pin` extra, and an account to point it at:
 
 ```bash
 uv tool install 'claude-swap[pin]'   # or: pipx install 'claude-swap[pin]'
+cswap list                           # the numbers come from here
 cswap pin 2
+```
+
+Reading this on the branch, before the extra is in a release? Then the line
+above installs the last PyPI build, which has no pin in it — and it warns
+rather than failing, so you only find out when `cswap pin` is not a command.
+Install from the branch instead (verified on a clean HOME with nothing but
+`claude` on PATH):
+
+```bash
+uv tool install "claude-swap[pin] @ git+https://github.com/codeslake/claude-swap@feat/pin-package-seam"
 ```
 
 Swapping accounts moves *everything*, including two things that are not inference:
