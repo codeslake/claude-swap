@@ -1848,7 +1848,21 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
         # AND THE SEAM RESOLVES THE REAL PACKAGE. `_impl` is what makes
         # `impl.titles_to_restore` the package's function rather than any
         # object; importorskip above already proved the package is here.
-        assert pin._impl().titles_to_restore.__module__ == "cswap_pin.proxy"
+        #
+        # NOT ON WINDOWS, and the reason is the contract rather than the
+        # runner. `_impl` RAISES there by design — the proxy holds its daemon
+        # lock with fcntl.flock and refcounts through a FIFO, so there is no
+        # real package to resolve and "resolves the real one" is not a
+        # question that has an answer. `is_available` is the seam's own way of
+        # saying so, so ask it rather than naming a platform here.
+        #
+        # This is the seam being STRICTER than the four bypasses it replaced:
+        # each of those degraded silently on a platform where the pin cannot
+        # exist, and no single site had to admit it. The two asserts above
+        # still run everywhere, so the wiring claim is not lost — only the
+        # resolution half, which Windows cannot make.
+        if pin.is_available():
+            assert pin._impl().titles_to_restore.__module__ == "cswap_pin.proxy"
 
 
 class TestInvalidGrantTaxonomy:
