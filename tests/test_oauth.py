@@ -1563,21 +1563,27 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
     """
 
     def _policy(self, monkeypatch, fn):
-        """Install a fake `cswap_pin.proxy.titles_to_restore`.
+        """Install a fake policy AT THE SEAM.
 
         The transport is what this class owns, so the decision is injected
         rather than imported — and injecting it is also what makes these cases
         run at all on a machine without the extra.
-        """
-        import sys
-        import types
 
-        mod = types.ModuleType("cswap_pin.proxy")
-        mod.titles_to_restore = fn
-        pkg = types.ModuleType("cswap_pin")
-        pkg.proxy = mod
-        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
-        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", mod)
+        INJECTED AT `claude_swap.pin`, NOT INTO sys.modules, since oauth.py
+        stopped importing the package directly. That is not a workaround: the
+        seam IS the policy boundary now, so patching it is patching exactly
+        what the class docstring says is not ours. The old sys.modules
+        injection also no longer reaches the code, deliberately — `_impl`
+        resolves through `find_spec`, and a bare `types.ModuleType` has no
+        `__spec__`, which it treats as "not installed" (`except ValueError`).
+
+        `is_available` too, because the guard and the call are separate
+        questions and a fake policy with no available seam would return
+        "no-extra" before reaching the transport under test.
+        """
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
+        monkeypatch.setattr("claude_swap.pin.titles_to_restore",
+                            lambda sessions, names: list(fn(sessions, names)))
 
     def test_the_bridge_calls_trust_our_own_proxy_without_an_env_var(self):
         """A python client of the pin must ADD our CA, never REPLACE the store.
@@ -1642,9 +1648,13 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
                 self.loaded.append(cafile)
 
         def build(ca):
-            """Run the builder with `cswap_pin.proxy.ca_path_for_trust -> ca`."""
-            import sys
-            import types
+            """Run the builder with `pin.ca_path_for_trust -> ca`.
+
+            AT THE SEAM, not sys.modules: oauth.py asks `claude_swap.pin` now,
+            and the seam already collapses "no extra" and "extra raised" to
+            None, which is the only distinction this builder ever made.
+            """
+            from claude_swap import pin as _pin
 
             spy = Recorder()
             # THE CACHE IS PROCESS-WIDE, so a build under a different CA state
@@ -1652,24 +1662,15 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
             # ONE SLOT now rather than a dict — see `_PIN_CTX_SLOT`, which
             # replaced an entry-per-CA map that never evicted.
             oauth._PIN_CTX_SLOT = None
-            mod = types.ModuleType("cswap_pin.proxy")
-            mod.ca_path_for_trust = lambda: ca
-            pkg = types.ModuleType("cswap_pin")
-            pkg.proxy = mod
             real_ctx = ssl.create_default_context
-            saved = {k: sys.modules.get(k) for k in ("cswap_pin", "cswap_pin.proxy")}
-            sys.modules["cswap_pin"] = pkg
-            sys.modules["cswap_pin.proxy"] = mod
+            real_ca = _pin.ca_path_for_trust
+            _pin.ca_path_for_trust = lambda: ca
             ssl.create_default_context = lambda *a, **k: spy
             try:
                 return spy, oauth._pin_aware_ssl_context()
             finally:
                 ssl.create_default_context = real_ctx
-                for k, v in saved.items():
-                    if v is None:
-                        sys.modules.pop(k, None)
-                    else:
-                        sys.modules[k] = v
+                _pin.ca_path_for_trust = real_ca
 
         # A PIN IS INSTALLED AND HAS A CA.
         spy, ctx = build("/somewhere/pin-proxy/ca.pem")
@@ -1828,10 +1829,26 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
         )
         import inspect
 
-        from claude_swap import oauth
+        from claude_swap import oauth, pin
 
-        src = inspect.getsource(oauth.restore_bridge_titles)
-        assert "from cswap_pin.proxy import titles_to_restore" in src
+        # BOTH HOPS, because there are two now. oauth.py stopped importing the
+        # package directly — it asks the seam, and the seam asks the package.
+        # Checking only the first hop would pass on a seam that returned a
+        # hardcoded list, which is the exact second copy this case exists to
+        # forbid.
+        caller = inspect.getsource(oauth.restore_bridge_titles)
+        assert "titles_to_restore" in caller, "the transport calls nothing"
+        assert "_pin.titles_to_restore" in caller, (
+            "the transport must go through the seam, not around it")
+
+        seam = inspect.getsource(pin.titles_to_restore)
+        assert "impl.titles_to_restore" in seam, (
+            "the seam must forward to cswap-pin, not decide anything itself")
+
+        # AND THE SEAM RESOLVES THE REAL PACKAGE. `_impl` is what makes
+        # `impl.titles_to_restore` the package's function rather than any
+        # object; importorskip above already proved the package is here.
+        assert pin._impl().titles_to_restore.__module__ == "cswap_pin.proxy"
 
 
 class TestInvalidGrantTaxonomy:

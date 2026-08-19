@@ -853,12 +853,11 @@ def _pin_ca_fingerprint():
     None when there is no pin at all — a real key, not an error: it caches the
     plain default context for machines without the extra.
     """
-    try:
-        from cswap_pin.proxy import ca_path_for_trust
+    # THROUGH THE SEAM. `pin.ca_path_for_trust` already returns None for
+    # "cannot ask", so the guard that used to live here is the seam's now.
+    from claude_swap import pin as _pin
 
-        ca = ca_path_for_trust()
-    except Exception:  # noqa: BLE001 — the extra is not installed
-        return None
+    ca = _pin.ca_path_for_trust()
     if not ca:
         return None
     # A CA THAT NAMES A PATH WE CANNOT STAT IS NOT THE SAME STATE AS NO PIN AT
@@ -931,13 +930,10 @@ def _pin_aware_ssl_context():
         return _PIN_CTX_SLOT[1]
 
     ctx = ssl.create_default_context()
+    from claude_swap import pin as _pin
+
     try:
-        from cswap_pin.proxy import ca_path_for_trust
-    except Exception:  # noqa: BLE001 — the pin is an optional extra
-        _PIN_CTX_SLOT = (key, ctx)
-        return ctx
-    try:
-        ca = ca_path_for_trust()
+        ca = _pin.ca_path_for_trust()
         if ca:
             ctx.load_verify_locations(cafile=str(ca))
     except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
@@ -1044,9 +1040,9 @@ def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
     "Never raises", and a cosmetic repair must not be able to end a tick that
     was about to prevent a rate-limit lockout.
     """
-    try:
-        from cswap_pin.proxy import titles_to_restore
-    except Exception:  # noqa: BLE001 — the pin is an optional extra
+    from claude_swap import pin as _pin
+
+    if not _pin.is_available():
         return 0, "no-extra"
     try:
         sessions = _list_bridge_sessions(access_token)
@@ -1057,7 +1053,11 @@ def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
             return 0, "list-failed"
         if not sessions:
             return 0, "no-bridges"
-        wanted = list(titles_to_restore(sessions, names))
+        wanted = _pin.titles_to_restore(sessions, names)
+        if wanted is None:
+            # The extra went away between the check above and here, or the
+            # package raised. Same outcome as never having it: nothing to do.
+            return 0, "no-extra"
         # THE ZERO-OUTCOME IS DECIDED BEFORE THE LOOP IT PRECEDES. This sat
         # BELOW the loop, so the empty case walked a body that cannot execute
         # before being detected and a reader had to prove the loop was a no-op

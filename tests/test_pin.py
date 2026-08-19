@@ -219,6 +219,41 @@ class TestImportSafeWithoutTheExtra:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr[-900:]
 
+    def test_only_pin_py_names_cswap_pin_at_all(self):
+        """The sibling of the module-scope test above, one step further in.
+
+        That one keeps a top-level import from making cswap refuse to start.
+        This one keeps the SEAM from spreading: a function-scope
+        `from cswap_pin.proxy import x` is import-safe and still wrong,
+        because it puts package knowledge in a core module and copies the
+        try/except guard once per site. Four such sites had accumulated in
+        oauth.py and autoswitch.py, each re-implementing the same guard, so
+        moving one package function meant editing five files instead of one.
+
+        pin.py is the seam and is exempt by name — naming the package is
+        precisely its job.
+        """
+        import ast
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+        offenders = []
+        for path in root.rglob("*.py"):
+            if path.name == "pin.py":
+                continue
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""]
+                if any(n.split(".")[0] == "cswap_pin" for n in names):
+                    offenders.append(f"{path.name}:{node.lineno}")
+        assert not offenders, (
+            "only pin.py may name cswap_pin; go through a public passthrough "
+            f"instead: {offenders}"
+        )
+
 
 @pytest.fixture
 def posix(monkeypatch):
@@ -7477,6 +7512,7 @@ class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
 
     def test_the_pinned_accounts_identity_is_used(self, tmp_path,
                                                   monkeypatch):
+        from claude_swap import pin
         from claude_swap import switcher as _sw
 
         sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
@@ -7488,7 +7524,7 @@ class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
             '{"oauthAccount": {"accountUuid": "PIN-UUID",'
             ' "emailAddress": "pinned@example.com"}}')
 
-        got = sw._pinned_identity_oauth()
+        got = pin.identity_for_config(sw)
         assert got == {"accountUuid": "PIN-UUID",
                        "emailAddress": "pinned@example.com"}, (
             "the switch would name the account being switched TO, and every "
@@ -7499,25 +7535,26 @@ class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
         """None on every doubt. The caller then keeps the account it was
         switching to, which is what shipped for months -- an optional feature
         must never be able to block or corrupt a switch."""
+        from claude_swap import pin
         from claude_swap import switcher as _sw
 
         sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
 
         monkeypatch.setattr("claude_swap.pin._pinned_email_now",
                             lambda s: None)
-        assert sw._pinned_identity_oauth() is None, "no pin set"
+        assert pin.identity_for_config(sw) is None, "no pin set"
 
         monkeypatch.setattr("claude_swap.pin._pinned_email_now",
                             lambda s: ("pinned@example.com", ""))
         sw._resolve_account_identifier = lambda ident: None
-        assert sw._pinned_identity_oauth() is None, "pin names no known slot"
+        assert pin.identity_for_config(sw) is None, "pin names no known slot"
 
         sw._resolve_account_identifier = lambda ident: "2"
         sw._read_account_config = lambda num, email: ""
-        assert sw._pinned_identity_oauth() is None, "no stored config"
+        assert pin.identity_for_config(sw) is None, "no stored config"
 
         sw._read_account_config = lambda num, email: "{not json"
-        assert sw._pinned_identity_oauth() is None, "unreadable config"
+        assert pin.identity_for_config(sw) is None, "unreadable config"
 
         sw._read_account_config = lambda num, email: '{"oauthAccount": {}}'
-        assert sw._pinned_identity_oauth() is None, "empty identity"
+        assert pin.identity_for_config(sw) is None, "empty identity"

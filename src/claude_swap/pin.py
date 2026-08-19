@@ -268,6 +268,93 @@ def pinned_email(switcher) -> str | None:
     return pin[0] if pin else None
 
 
+def identity_for_config(switcher) -> "dict | None":
+    """The `oauthAccount` the config should name while a pin is set, or None.
+
+    THE SEAM ANSWERS, THE SWITCHER ASKS. This used to live in switcher.py,
+    where it resolved the pinned slot, read that slot's stored config and
+    parsed the identity out — pin policy computed by cswap core, reaching a
+    PRIVATE of this module to get started. Both halves were a boundary
+    violation and the cswap session raised it.
+
+    IT BELONGS HERE, NOT IN THE PACKAGE. The obvious destination was
+    `cswap_pin.proxy`, and it is wrong: `_pinned_email_now` is documented to
+    never ask the package, because the clear path must work when the package
+    is exactly what is broken. The remaining steps read cswap's OWN backup
+    store, which the package has no business knowing the layout of. Putting
+    this there would invert the dependency instead of merely blurring it.
+
+    None ON EVERY DOUBT — no pin, no stored config for it, an unreadable
+    record. The caller then keeps the account being switched to, which is the
+    behaviour that shipped for months. An optional feature must never be able
+    to block a switch.
+    """
+    import json as _json
+
+    try:
+        pinned = _pinned_email_now(switcher)
+        if not pinned or not pinned[0]:
+            return None
+        num = switcher._resolve_account_identifier(pinned[0])
+        if not num:
+            return None
+        raw = switcher._read_account_config(str(num), pinned[0])
+        if not raw:
+            return None
+        oauth = _json.loads(raw).get("oauthAccount")
+        return oauth if isinstance(oauth, dict) and oauth else None
+    except Exception:  # noqa: BLE001 — never block a switch
+        return None
+
+
+def ca_path_for_trust():
+    """The pin's CA bundle path, or None when the extra is absent.
+
+    ONE GUARD, ONE FILE. This and the three below exist because four core
+    modules imported `cswap_pin.proxy` directly, each re-implementing the same
+    try/except. Behaviour was safe; the cost was that moving one package
+    function meant editing five files, and that the seam this module exists to
+    be had four holes around it.
+
+    None is "cannot ask", never "asked and got nothing" — every caller here
+    treats the two the same, so the collapse is honest. A caller that needs to
+    tell them apart should not use this.
+    """
+    impl = _live_impl()
+    if impl is None:
+        return None
+    try:
+        return impl.ca_path_for_trust()
+    except Exception:  # noqa: BLE001 — an optional extra cannot break trust
+        return None
+
+
+def live_bridge_names() -> "dict[str, str] | None":
+    """Bridge id -> the name its session wants, or None when unavailable."""
+    impl = _live_impl()
+    if impl is None:
+        return None
+    try:
+        return impl.live_bridge_names()
+    except Exception:  # noqa: BLE001 — a cosmetic repair must not end a tick
+        return None
+
+
+def titles_to_restore(sessions, names) -> "list | None":
+    """Bridges the server titles wrongly, or None when the extra is absent.
+
+    THE POLICY STAYS IN cswap-pin — this only carries the call across. What
+    to touch is the package's decision, and deliberately not repeated here.
+    """
+    impl = _live_impl()
+    if impl is None:
+        return None
+    try:
+        return list(impl.titles_to_restore(sessions, names))
+    except Exception:  # noqa: BLE001 — a cosmetic repair must not end a tick
+        return None
+
+
 def pin_is_applying(switcher) -> bool | None:
     """Whether the daemon serving right now can actually mint the pinned token.
 

@@ -6955,21 +6955,16 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         Driven with a clock that jumps per PUT rather than by sleeping, so the
         case measures the budget rather than the machine it runs on.
         """
-        import sys
-        import types
 
         from claude_swap import oauth as _oauth
 
-        # `titles_to_restore` is imported INSIDE the function from
-        # cswap_pin.proxy — the policy deliberately lives in the pin — so the
-        # stub goes in sys.modules, not on the oauth module.
-        fake = types.ModuleType("cswap_pin.proxy")
-        fake.titles_to_restore = (
-            lambda sessions, names: [(x["id"], "mine") for x in sessions])
-        pkg = types.ModuleType("cswap_pin")
-        pkg.proxy = fake
-        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
-        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
+        # The policy deliberately lives in the pin, so the stub goes at the
+        # seam that carries it, never on the oauth module.
+        self._seam(
+            monkeypatch,
+            titles_to_restore=(
+                lambda sessions, names: [(x["id"], "mine") for x in sessions]),
+        )
 
         now = [1000.0]
         monkeypatch.setattr(_oauth.time, "monotonic", lambda: now[0])
@@ -7021,16 +7016,12 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         gate the demoted one PUTs against the same bridges as the live one.
         """
         import logging
-        import sys
-        import types
 
-        fake = types.ModuleType("cswap_pin.proxy")
-        fake.live_bridge_names = lambda: {"cse_x": "my-session"}
-        fake.titles_to_restore = lambda sessions, names: [("cse_x", "my-session")]
-        pkg = types.ModuleType("cswap_pin")
-        pkg.proxy = fake
-        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
-        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
+        self._seam(
+            monkeypatch,
+            live_bridge_names=lambda: {"cse_x": "my-session"},
+            titles_to_restore=lambda sessions, names: [("cse_x", "my-session")],
+        )
 
         put = []
         monkeypatch.setattr(
@@ -7085,19 +7076,15 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         passed. The `reached` assertion below is what stops that.
         """
         import logging
-        import sys
-        import types
 
         from claude_swap import oauth
 
         reached = []
-        fake = types.ModuleType("cswap_pin.proxy")
-        fake.live_bridge_names = lambda: {"cse_x": "my-session"}
-        fake.titles_to_restore = lambda sessions, names: []
-        pkg = types.ModuleType("cswap_pin")
-        pkg.proxy = fake
-        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
-        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
+        self._seam(
+            monkeypatch,
+            live_bridge_names=lambda: {"cse_x": "my-session"},
+            titles_to_restore=lambda sessions, names: [],
+        )
 
         def listing_is_dead(_tok):
             reached.append(True)
@@ -7154,21 +7141,33 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         harness.engine._restore_bridge_titles_if_due()
         assert seen == [], "the restore ran while it was not due"
 
+    def _seam(self, monkeypatch, **fns):
+        """The optional extra, present, INSTALLED AT THE SEAM.
+
+        Four cases below each built the same `types.ModuleType("cswap_pin")`
+        stub into sys.modules. That stopped reaching the code when autoswitch
+        and oauth were rewired to ask `claude_swap.pin` instead of importing
+        the package: `pin._impl` resolves through `find_spec`, and a bare
+        ModuleType has no `__spec__`, which it treats as not-installed
+        (`except ValueError`) — on purpose.
+
+        WITHOUT THIS the cases return at the availability guard having run
+        none of the code they name, which is exactly how the first version of
+        the sibling case in test_oauth.py passed.
+        """
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
+        for name, fn in fns.items():
+            monkeypatch.setattr(f"claude_swap.pin.{name}", fn)
+
     def _fake_pin_module(self, monkeypatch, names=None):
         """The optional extra, present. Without it every case below returns at
         the import guard having executed none of the code it names — the way
         the first version of the sibling case passed."""
-        import sys
-        import types
-
-        fake = types.ModuleType("cswap_pin.proxy")
-        fake.live_bridge_names = lambda: (names or {"cse_x": "my-session"})
-        fake.titles_to_restore = lambda sessions, names_: []
-        pkg = types.ModuleType("cswap_pin")
-        pkg.proxy = fake
-        monkeypatch.setitem(sys.modules, "cswap_pin", pkg)
-        monkeypatch.setitem(sys.modules, "cswap_pin.proxy", fake)
-        return fake
+        self._seam(
+            monkeypatch,
+            live_bridge_names=lambda: (names or {"cse_x": "my-session"}),
+            titles_to_restore=lambda sessions, names_: [],
+        )
 
     def test_the_token_belongs_to_the_account_that_owns_the_bridges(
         self, harness, monkeypatch

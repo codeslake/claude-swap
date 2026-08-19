@@ -929,9 +929,9 @@ class AutoSwitchEngine:
         # clock and still moved `_bridge_titles_next_at` forward — a timer
         # kept for work that cannot happen. Cheap: the import is cached after
         # the first miss.
-        try:
-            from cswap_pin.proxy import live_bridge_names
-        except Exception:  # noqa: BLE001 — the pin is an optional extra
+        from claude_swap import pin as _pin
+
+        if not _pin.is_available():
             return
         # THE ENGINE'S CLOCK, like the other thirteen time reads in this class.
         # This one called the module's `time.time()`, so a test that advances
@@ -970,7 +970,7 @@ class AutoSwitchEngine:
             # `no-token` one is the persistent shape: an API-key slot, an
             # unreadable blob or a locked keychain makes it None on every
             # 300 s pass forever, and nothing said so.
-            names = live_bridge_names()
+            names = _pin.live_bridge_names()
             if not names:
                 self._report_bridge_titles("no-live-names", 0)
                 return

@@ -995,31 +995,6 @@ class ClaudeAccountSwitcher:
         if pruned:
             print(dimmed(f"Removed {pruned} directory mapping(s) for this account"))
 
-    def _pinned_identity_oauth(self) -> "dict | None":
-        """The pinned account's stored `oauthAccount`, or None.
-
-        None whenever anything is uncertain -- no pin, no stored config for
-        it, an unreadable record -- because the caller then keeps the account
-        being switched to, which is the behaviour that shipped for months. An
-        optional feature must never be able to block a switch.
-        """
-        try:
-            from claude_swap import pin as _pin
-
-            pinned = _pin._pinned_email_now(self)
-            if not pinned or not pinned[0]:
-                return None
-            num = self._resolve_account_identifier(pinned[0])
-            if not num:
-                return None
-            raw = self._read_account_config(str(num), pinned[0])
-            if not raw:
-                return None
-            oauth = json.loads(raw).get("oauthAccount")
-            return oauth if isinstance(oauth, dict) and oauth else None
-        except Exception:  # noqa: BLE001 — never block a switch
-            return None
-
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -6555,10 +6530,15 @@ class ClaudeAccountSwitcher:
                 # Inference is NOT affected: it authenticates from
                 # `.credentials.json`, which still follows the switch. This
                 # field is identity, not authority.
-                identity_oauth = target_oauth
-                pin_oauth = self._pinned_identity_oauth()
-                if pin_oauth:
-                    identity_oauth = pin_oauth
+                #
+                # ASK THE SEAM, DO NOT COMPUTE IT. `pin.identity_for_config`
+                # owns this: resolving the pinned slot and reading its stored
+                # identity is pin policy, and doing it here also meant
+                # reaching a PRIVATE of pin.py. Raised by the cswap session.
+                from claude_swap import pin as _pin
+
+                pin_oauth = _pin.identity_for_config(self)
+                identity_oauth = pin_oauth or target_oauth
 
                 # Snapshot live state so a mid-operation failure can be
                 # undone, config identity or not: a wiped or half-written
@@ -6949,7 +6929,9 @@ class ClaudeAccountSwitcher:
                 #
                 # Same contract as the other path: splice when a pin resolves,
                 # byte-identical to before when it does not.
-                pin_oauth_ord = self._pinned_identity_oauth()
+                from claude_swap import pin as _pin
+
+                pin_oauth_ord = _pin.identity_for_config(self)
                 identity_section = pin_oauth_ord or oauth_section
                 current_config_data = self._read_json(config_path)
                 self._refresh_policy_cache()
