@@ -308,6 +308,23 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
+def fetch_policy_limits() -> dict | None:
+    """The active credential's org-policy document, or None if unaskable.
+
+    A module-level seam so the switch path has ONE thing to stub, and so the
+    credential read lives beside the call that needs it rather than inside a
+    method that also writes files.
+    """
+    try:
+        raw = json.loads(get_credentials_path().read_text(encoding="utf-8"))
+        token = (raw.get("claudeAiOauth") or {}).get("accessToken")
+    except Exception:  # noqa: BLE001 — no credential, nothing to ask with
+        return None
+    if not token:
+        return None
+    return oauth.fetch_policy_limits(token)
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -500,36 +517,48 @@ class ClaudeAccountSwitcher:
             return None
         return data
 
-    def _drop_policy_cache(self) -> None:
-        """Forget the previous account's org-policy answer.
+    def _refresh_policy_cache(self) -> None:
+        """Re-ask the org-policy question as the account that is now active.
 
         Claude Code caches `GET /api/claude_code/policy_limits` in
-        `<config home>/policy-limits.json` and every gate check reads it —
+        `<config home>/policy-limits.json`, and every gate check reads it:
         `/remote-control` resolves `Ms('allow_remote_control')` -> `Hcd()` ->
         that file. The fetch carries whatever account was ACTIVE, the file is
-        machine-wide, and nothing rewrites it when the account changes.
+        machine-wide, and nothing rewrote it when the account changed — so one
+        account's restrictions gated every session on the machine, including
+        accounts the server places no restriction on at all.
 
-        MEASURED: a cached file written hours earlier under a restricted org
-        said `allow_remote_control: {allowed: false}` while the server, asked
-        with the current active credential, returned no such restriction. Every
-        session on the machine was refused Remote Control with "disabled by
-        your organization's policy" — one account's answer serving for all the
-        others, with no expiry anyone could wait out.
+        DELETING IT IS NOT THE FIX, and the first cut of this did exactly that.
+        Read out of the binary:
 
-        Removing it grants nothing: the next gate check re-reads, finds nothing
-        cached, and CC re-asks under the account that is now active. What it
-        stops is one account's restrictions outliving that account.
+            function Ms(e){ let t=Hcd()
+              if(!t){ if(aK_.has(e)){ if(fK()) return !1 } return !0 } ... }
 
-        NEVER RAISES. This runs inside the switch transaction, and a switch
-        must not fail because a cache file could not be unlinked — the worst
-        case of leaving it is the state we already had.
+        With NO document, a gate in that set returns FALSE. **Absent means
+        DENIED**, so dropping the file would refuse Remote Control to every
+        session started after a switch — a stale-answer bug turned into a
+        guaranteed outage.
+
+        A FAILED FETCH LEAVES THE OLD ANSWER. It may be wrong for this account;
+        absent is wrong for every account. Never raises, for the same reason:
+        a switch must not fail over a cache file, and the worst case of doing
+        nothing is the state we already had.
         """
         try:
-            (get_claude_config_home() / "policy-limits.json").unlink()
-        except FileNotFoundError:
-            pass
+            doc = fetch_policy_limits()
+        except Exception as exc:  # noqa: BLE001 — see the docstring
+            self._logger.debug("policy refresh failed, keeping the old answer:"
+                               " %r", exc)
+            return
+        if not isinstance(doc, dict):
+            return
+        try:
+            path = get_claude_config_home() / "policy-limits.json"
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(doc), encoding="utf-8")
+            tmp.replace(path)          # atomic: no reader sees half a document
         except OSError as exc:
-            self._logger.debug("could not drop the policy cache: %r", exc)
+            self._logger.debug("could not write the policy cache: %r", exc)
 
     def _salvage_unreadable(
         self, path: Path, emit_output: bool, warnings_out: list[str]
@@ -6597,7 +6626,7 @@ class ClaudeAccountSwitcher:
                             del salvage
                         self._write_json(config_path, target_config_data)
                     config_written = True
-                    self._drop_policy_cache()
+                    self._refresh_policy_cache()
 
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
@@ -6852,7 +6881,7 @@ class ClaudeAccountSwitcher:
                 # config for good. Absent/unreadable both fall to the same
                 # salvage-then-replace the direct-activation branch uses.
                 current_config_data = self._read_json(config_path)
-                self._drop_policy_cache()
+                self._refresh_policy_cache()
                 if current_config_data is not None:
                     current_config_data["oauthAccount"] = oauth_section
                     self._write_json(config_path, current_config_data)

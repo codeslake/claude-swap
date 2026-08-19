@@ -5140,33 +5140,33 @@ class TestSwitchSkipsBrokenSlots:
         # Stale sequence reference to a missing account record.
         assert s._account_is_switchable("99") is False
 
-    def test_a_switch_drops_the_previous_accounts_policy_cache(
-        self, temp_home: Path
+    def test_a_switch_refreshes_the_policy_cache_and_never_leaves_it_absent(
+        self, temp_home: Path, monkeypatch
     ):
         """THE POLICY BELONGS TO THE ACCOUNT, THE CACHE IS MACHINE-WIDE.
 
         Claude Code caches `GET /api/claude_code/policy_limits` in
-        `~/.claude/policy-limits.json` and reads it on every gate check —
-        `/remote-control` resolves through `Ms('allow_remote_control')` ->
-        `Hcd()` -> that file. The fetch carries whatever account is ACTIVE, and
-        nothing rewrites the file when the account changes.
+        `<config home>/policy-limits.json`; `/remote-control` resolves
+        `Ms('allow_remote_control')` -> `Hcd()` -> that file. The fetch carries
+        whatever account is ACTIVE, the file is machine-wide, and nothing
+        rewrote it when the account changed — so one account's restrictions
+        gated every session on the machine, including accounts with no such
+        restriction.
 
-        MEASURED. The cached file, written hours earlier while a restricted org
-        was active, said
+        AND DELETING IT IS NOT THE FIX, which the first cut of this got wrong.
+        Read out of the binary:
 
-            allow_remote_control: {allowed: false}
+            function Ms(e){ let t=Hcd()
+              if(!t){ if(aK_.has(e)){ if(fK()) return !1 } return !0 } ... }
 
-        while the server, asked with the CURRENT active credential, returned no
-        such restriction. Every session on the machine was refused Remote
-        Control with "disabled by your organization's policy" — one account's
-        policy applied to all the others, for hours, with no way back short of
-        removing the file. Removing it let a LIVE session recover without a
-        restart, so the verdict is re-read from disk rather than pinned in
-        memory for the process's lifetime.
+        With NO document, a gate in that set returns FALSE. Absent means
+        DENIED, not "unknown, allow" — so dropping the file would refuse
+        Remote Control to every session started after a switch until some poll
+        landed, turning a stale-answer bug into a guaranteed outage.
 
-        So the switch has to drop it: the next gate check then re-asks under
-        the account that is actually active. This grants nothing — it stops one
-        account's answer from being served for another's.
+        So: ask the server with the account that is now active, and write down
+        what it says. A fetch that fails leaves the old file in place, which is
+        no worse than today and never worse than absent.
         """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
@@ -5177,6 +5177,10 @@ class TestSwitchSkipsBrokenSlots:
         policy.write_text(json.dumps(
             {"restrictions": {"allow_remote_control": {"allowed": False}}}))
 
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits", lambda: fresh)
+
         (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
             {"claudeAiOauth": {"accessToken": "sk-live-1",
                                "refreshToken": "rt-live-1"}}))
@@ -5186,10 +5190,46 @@ class TestSwitchSkipsBrokenSlots:
 
         s.switch()
 
-        assert not policy.exists(), (
-            "the previous account's policy answer survived the switch, so its "
-            "restrictions keep gating every session on this machine under an "
-            "account they no longer describe")
+        assert policy.exists(), (
+            "the cache was left ABSENT, and absent is DENIED — every session "
+            "started after this switch would be refused Remote Control")
+        assert json.loads(policy.read_text()) == fresh, (
+            "the previous account's answer survived the switch, so its "
+            "restrictions keep gating sessions under an account they no "
+            "longer describe")
+
+    def test_a_failed_policy_fetch_leaves_the_old_answer_rather_than_none(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL. Absent is denied, so a refresh that cannot reach the
+        server must not clear the file — the old answer may be wrong for this
+        account, but no answer is wrong for every account."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        stale = {"restrictions": {"allow_remote_control": {"allowed": True}}}
+        policy.write_text(json.dumps(stale))
+
+        def _boom():
+            raise OSError("no network")
+
+        monkeypatch.setattr("claude_swap.switcher.fetch_policy_limits", _boom)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert json.loads(policy.read_text()) == stale, (
+            "a failed fetch cleared the cache; absent is DENIED, so that is "
+            "strictly worse than the answer it replaced")
 
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
