@@ -995,6 +995,31 @@ class ClaudeAccountSwitcher:
         if pruned:
             print(dimmed(f"Removed {pruned} directory mapping(s) for this account"))
 
+    def _pinned_identity_oauth(self) -> "dict | None":
+        """The pinned account's stored `oauthAccount`, or None.
+
+        None whenever anything is uncertain -- no pin, no stored config for
+        it, an unreadable record -- because the caller then keeps the account
+        being switched to, which is the behaviour that shipped for months. An
+        optional feature must never be able to block a switch.
+        """
+        try:
+            from claude_swap import pin as _pin
+
+            pinned = _pin._pinned_email_now(self)
+            if not pinned or not pinned[0]:
+                return None
+            num = self._resolve_account_identifier(pinned[0])
+            if not num:
+                return None
+            raw = self._read_account_config(str(num), pinned[0])
+            if not raw:
+                return None
+            oauth = json.loads(raw).get("oauthAccount")
+            return oauth if isinstance(oauth, dict) and oauth else None
+        except Exception:  # noqa: BLE001 — never block a switch
+            return None
+
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -6513,6 +6538,27 @@ class ClaudeAccountSwitcher:
                 target_oauth = target_config_data.get("oauthAccount")
                 if not target_oauth:
                     raise SwitchError("Invalid oauthAccount in backup")
+                # THE IDENTITY FILE NAMES THE PIN WHILE ONE IS SET, and that
+                # is what keeps Remote Control alive across this switch.
+                # Claude Code takes a live bridge's OWNER from this field at
+                # creation; the authenticated-account slot holds the same
+                # account, so its identity check passes at once, latches, and
+                # the one path that would later adopt the server's answer is
+                # never reached. Every rotation after that compares the PINNED
+                # account (which is what `/api/oauth/validate` answers, since
+                # the pin swaps that route) against an owner frozen as
+                # whichever account happened to be active, and tears the
+                # bridge down. Measured 2026-08-19: 24 torn-off bridges across
+                # three machines in a day, several per rotation, seconds
+                # apart.
+                #
+                # Inference is NOT affected: it authenticates from
+                # `.credentials.json`, which still follows the switch. This
+                # field is identity, not authority.
+                identity_oauth = target_oauth
+                pin_oauth = self._pinned_identity_oauth()
+                if pin_oauth:
+                    identity_oauth = pin_oauth
 
                 # Snapshot live state so a mid-operation failure can be
                 # undone, config identity or not: a wiped or half-written
@@ -6616,7 +6662,7 @@ class ClaudeAccountSwitcher:
                         # falsy form sent it down the salvage branch and told
                         # the user it "could not be parsed", which is the same
                         # ""-vs-None conflation this branch exists to separate.
-                        existing_config["oauthAccount"] = target_oauth
+                        existing_config["oauthAccount"] = identity_oauth
                         self._write_json(config_path, existing_config)
                     else:
                         if config_path.exists():

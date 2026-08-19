@@ -7457,3 +7457,67 @@ class TestClearPinCapturesEvidenceBeforeAnythingUnwires:
         assert order[:2] == ["snapshot", "apply_pin"], (
             "the survivor evidence was captured after the call that unwires, "
             f"so a half-removed wiring is invisible to it: {order}")
+
+
+class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
+    """The identity file decides a live bridge's OWNER, so while a pin is set
+    it has to name the pin.
+
+    Read out of Claude Code 2.1.236: the owner is taken from
+    `~/.claude.json`'s `oauthAccount` when the bridge is created, the
+    authenticated-account slot holds the same account, so CC's identity check
+    passes at once and LATCHES -- and the one path that would later adopt the
+    server's answer is never reached again. Every rotation after that compares
+    the PINNED account, which is what `/api/oauth/validate` answers because
+    the pin swaps that route, against an owner frozen as whichever account was
+    active that day. Mismatch means teardown. Measured 2026-08-19: 24 bridges
+    torn off across three machines in one day, several per rotation, seconds
+    apart.
+    """
+
+    def test_the_pinned_accounts_identity_is_used(self, tmp_path,
+                                                  monkeypatch):
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        monkeypatch.setattr(
+            "claude_swap.pin._pinned_email_now",
+            lambda s: ("pinned@example.com", "org-1"))
+        sw._resolve_account_identifier = lambda ident: "2"
+        sw._read_account_config = lambda num, email: (
+            '{"oauthAccount": {"accountUuid": "PIN-UUID",'
+            ' "emailAddress": "pinned@example.com"}}')
+
+        got = sw._pinned_identity_oauth()
+        assert got == {"accountUuid": "PIN-UUID",
+                       "emailAddress": "pinned@example.com"}, (
+            "the switch would name the account being switched TO, and every "
+            "bridge created after it dies at the next rotation")
+
+    def test_anything_uncertain_keeps_the_switch_target(self, tmp_path,
+                                                        monkeypatch):
+        """None on every doubt. The caller then keeps the account it was
+        switching to, which is what shipped for months -- an optional feature
+        must never be able to block or corrupt a switch."""
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: None)
+        assert sw._pinned_identity_oauth() is None, "no pin set"
+
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("pinned@example.com", ""))
+        sw._resolve_account_identifier = lambda ident: None
+        assert sw._pinned_identity_oauth() is None, "pin names no known slot"
+
+        sw._resolve_account_identifier = lambda ident: "2"
+        sw._read_account_config = lambda num, email: ""
+        assert sw._pinned_identity_oauth() is None, "no stored config"
+
+        sw._read_account_config = lambda num, email: "{not json"
+        assert sw._pinned_identity_oauth() is None, "unreadable config"
+
+        sw._read_account_config = lambda num, email: '{"oauthAccount": {}}'
+        assert sw._pinned_identity_oauth() is None, "empty identity"
