@@ -6670,6 +6670,18 @@ class ClaudeAccountSwitcher:
                                 config_path, emit_output, warnings_out
                             )
                             del salvage
+                        # THE OTHER WRITE, and it bypassed the pin. This
+                        # branch writes the target's WHOLE stored config —
+                        # `oauthAccount` included — so splicing the pin into
+                        # the sibling branch alone left the identity naming
+                        # the account being switched to whenever the live
+                        # config was absent or unreadable. Caught in review by
+                        # the cswap session before this shipped; the two
+                        # branches are alternatives of one call and both had
+                        # to carry it.
+                        if pin_oauth:
+                            target_config_data = dict(target_config_data)
+                            target_config_data["oauthAccount"] = identity_oauth
                         self._write_json(config_path, target_config_data)
                     config_written = True
                     self._refresh_policy_cache()
