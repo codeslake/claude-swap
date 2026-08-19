@@ -1869,8 +1869,13 @@ class ClaudeAccountSwitcher:
         bare ``cswap switch`` rotation, and the ``best`` / ``next-available``
         strategies all skip disabled slots. The account stays managed and is
         still a valid explicit ``cswap switch <num|email>`` target, so you can
-        park an account without losing its stored login. Re-enabling restores
+        park an account without losing its stored login -- though with an engine
+        running that explicit switch holds only until its next tick (below). Re-enabling restores
         it to rotation in its original sequence position.
+
+        Skipping applies to the ACTIVE slot too, not just to candidates: a
+        running engine leaves a disabled active on its next tick, under the
+        ``disabled-active`` trigger (see `AutoSwitchEngine._tick_inner`).
 
         Raises:
             ConfigError: no accounts are managed yet, or the email is ambiguous.
@@ -1906,8 +1911,9 @@ class ClaudeAccountSwitcher:
             active = data.get("activeAccountNumber")
             if str(active) == account_num:
                 print(dimmed(
-                    "  It is the active account — it stays live until you switch "
-                    "away; it just won't be an automatic switch target."
+                    "  It is the active account — a running auto-switch will move "
+                    "off it on its next tick (trigger: disabled-active). With auto "
+                    "not running it stays live until you switch away."
                 ))
             if not self.switchable_account_numbers():
                 warning(

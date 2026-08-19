@@ -9131,3 +9131,341 @@ class TestFreshenRoutesThroughGate:
         assert verdict == "ok"
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
+
+
+class TestDisabledActiveAccount:
+    """A DISABLED account the engine is sitting on must be left at once.
+
+    `set_account_disabled`'s own docstring already promises it: "the
+    auto-switch engine ... skip[s] disabled slots".
+    `switchable_account_numbers()` honours that for CANDIDATES; nothing
+    applies it to `current`. Reported and measured: a disabled, metered account
+    with no 5h/7d window held the active slot while the engine reported
+    `active-usage-unknown 1/3 before failover`, and it kept being billed for as
+    long as it sat there. `autoswitch.py` contains ZERO references to `disabled`
+    (control: switcher.py 36, cli.py 3, so the zero is a real absence rather
+    than a broken grep).
+    """
+
+    def test_disabled_active_leaves_even_when_its_usage_reads_low(self, harness):
+        """The case no gate can reach: the row reads FINE and reads LOW.
+
+        `unhealthy_ticks` cannot help here — nothing is unhealthy. The engine
+        reports below-threshold and parks on a slot the user withdrew from
+        rotation, indefinitely.
+        """
+        harness.switcher.set_account_disabled("1", True)
+        outcome = harness.tick_with_usage({
+            "1": _usage(50), "2": _usage(40), "3": _usage(10),
+        })
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert outcome is TickOutcome.SWITCHED, (
+            f"parked on a disabled active; no-switch reasons={reasons}"
+        )
+        assert harness.active_number() == 3, "must land on the best candidate"
+
+    def test_disabled_active_does_not_route_through_the_transient_gate(self, harness):
+        """The measured acct7 shape: disabled AND no readable window.
+
+        `unhealthy_ticks` is for TRANSIENT unreadability (network, lock
+        contention, a failed refresh). `disabled` is a deterministic fact read
+        from our own sequence.json, and an account with no quota window is
+        unreadable permanently — so the 3-tick wait is guaranteed waste. At the
+        TUI's measured ~5-minute cadence that is ~15 minutes of spending an
+        account the user asked auto not to use.
+        """
+        harness.switcher.set_account_disabled("1", True)
+        outcome = harness.tick_with_usage({
+            "1": None, "2": _usage(40), "3": _usage(10),
+        })
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert "active-usage-unknown" not in reasons, (
+            f"disabled must not spend the transient gate; reasons={reasons}"
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_control_an_ENABLED_active_still_obeys_the_threshold(self, harness):
+        """CONTROL. Without it, a fix that switches on every tick would pass
+        both tests above and break the whole policy."""
+        outcome = harness.tick_with_usage({
+            "1": _usage(50), "2": _usage(40), "3": _usage(10),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+
+class TestDisableMessageMatchesTheNewBehaviour:
+    """`cswap disable` told the user the OLD contract in so many words.
+
+    Before `disabled-active` existed, disabling the active slot printed "it
+    stays live until you switch away; it just won't be an automatic switch
+    target" — accurate then, and a promise the engine now breaks on its next
+    tick. A message that describes behaviour the code no longer has is worse
+    than no message: it is the reason the reporter thought auto was broken.
+    """
+
+    def test_disabling_the_active_slot_does_not_promise_it_stays(
+        self, harness, capsys
+    ):
+        harness.switcher.set_account_disabled("1", True)
+        out = capsys.readouterr().out
+        # The contract, not a substring. "stays live until you switch away" is
+        # still TRUE with no engine running, and saying so is useful — the old
+        # message's defect was stating it UNCONDITIONALLY, which its distinctive
+        # tail is the marker for. A first version of this test forbade the
+        # phrase outright and failed a message that was already correct.
+        assert "it just won't be an automatic switch target" not in out, (
+            "still the unconditional pre-disabled-active promise:\n" + out
+        )
+        assert "disabled-active" in out, (
+            "the active case must name the trigger that will move off it:\n" + out
+        )
+        assert "next tick" in out, (
+            "must say WHEN, or 'auto will move' reads as someday:\n" + out
+        )
+
+    def test_control_disabling_a_NON_active_slot_says_nothing_about_moving(
+        self, harness, capsys
+    ):
+        """CONTROL: the notice is scoped to the ACTIVE slot. Without this, a
+        message printed unconditionally would satisfy the test above."""
+        harness.switcher.set_account_disabled("2", True)
+        out = capsys.readouterr().out
+        assert "Disabled Account-2" in out
+        assert "active account" not in out, out
+
+
+class TestDisabledActiveReviewFindings:
+    """Three gaps a reviewer found in the first cut of `disabled-active`.
+
+    Each was MEASURED by the reviewer, not inferred, and each is the kind that
+    survives a green suite: the API-key gate returns before the new branch, the
+    escalation collector was never told about the new trigger, and the trigger
+    STRING — the whole load-bearing argument for a new name — was pinned by
+    nothing at all.
+    """
+
+    @staticmethod
+    def _mark_api_key(harness, num: int) -> None:
+        data = harness.switcher._get_sequence_data()
+        data["accounts"][str(num)]["kind"] = "api_key"
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+
+    def test_a_disabled_API_KEY_active_is_left_too(self, harness):
+        """The API-key gate returns NO_ACTION BEFORE the disabled branch.
+
+        `include_api_key_accounts` governs whether an API-key account may be a
+        switch TARGET. It must not govern whether the engine may LEAVE one —
+        and `cswap disable` has just promised the user it will.
+        """
+        self._mark_api_key(harness, 1)
+        harness.switcher.set_account_disabled("1", True)
+        outcome = harness.tick_with_usage({
+            "1": None, "2": _usage(40), "3": _usage(10),
+        })
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert "active-api-key" not in reasons, (
+            f"stranded on a disabled API-key active; reasons={reasons}"
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+
+    def test_control_an_ENABLED_api_key_active_is_still_left_alone(self, harness):
+        """CONTROL. The API-key gate must keep working for enabled accounts —
+        without this, deleting the gate entirely would pass the test above."""
+        self._mark_api_key(harness, 1)
+        outcome = harness.tick_with_usage({
+            "1": None, "2": _usage(40), "3": _usage(10),
+        })
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["active-api-key"]
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+
+    def test_it_escalates_the_candidate_fetch_before_choosing(self, harness):
+        """`disabled-active` must not decide on a stale candidate snapshot.
+
+        The module documents the invariant at `_collect_scheduled_usage`:
+        at-limit, proactive and ordinary failover "never run on the
+        pre-escalation snapshot — those triggers imply the escalation
+        condition". `escalate` keys only on the ACTIVE row's headroom, so a
+        disabled active reading comfortably below the band satisfies neither
+        leg and the switch is decided on candidate data up to
+        CANDIDATE_MAX_INTERVAL_S old. Measured by the reviewer: it switched
+        onto an account that was never fetched that tick.
+        """
+        harness.switcher.set_account_disabled("1", True)
+        fetch_sets: list[set] = []
+        entries = {
+            n: _entry_for(v, harness.clock.now)
+            for n, v in {"1": _usage(50), "2": _usage(40), "3": _usage(10)}.items()
+        }
+
+        def spying(*args, **kwargs):
+            # Record what the tick ASKED to refresh, then answer with the canned
+            # rows. A first version wrapped the real collector, which has no
+            # network here — it failed BLOCKED on "fetch failed", i.e. for the
+            # wrong reason entirely.
+            fetch_sets.append(set(kwargs.get("fetch") or ()))
+            return entries
+
+        with patch.object(
+            harness.switcher, "usage_entries_by_account", side_effect=spying
+        ):
+            outcome = harness.engine.tick()
+
+        every = set().union(*fetch_sets) if fetch_sets else set()
+        assert "3" in every, (
+            "chose a candidate it never refreshed this tick; "
+            f"fetch sets were {fetch_sets}"
+        )
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_the_trigger_string_itself_is_pinned(self, harness):
+        """Renaming the trigger to "at-limit" passed all 2248 tests.
+
+        The name is load-bearing precisely because of what it is NOT in: every
+        downstream gate keys on `trigger in ("proactive", "consume-first")`, and
+        "at-limit" would re-enter tuples the design says it must stay out of.
+        The CLI notice also tells the user to look for this exact string, so the
+        two can desynchronise silently.
+        """
+        harness.switcher.set_account_disabled("1", True)
+        harness.tick_with_usage({
+            "1": _usage(50), "2": _usage(40), "3": _usage(10),
+        })
+        switches = [e for e in harness.events if e.kind == "switch"]
+        assert [e.trigger for e in switches] == ["disabled-active"]
+        assert harness.state()["leftTrigger"] == "disabled-active"
+
+
+class TestReEnableIsNotBarredByTheNoReturnBar:
+    """Re-enabling a slot the engine left must let it come back.
+
+    The COMMON shapes, outside the band. Something WAS broken here, narrowly:
+    see `TestDisabledActiveDepartureDoesNotBarTheReEnabledSlot` for the band
+    (active_h 7..10, a peer inside a window at most 4 points wide above the
+    hysteresis line, no usable resets_at — 8 of 160 swept shapes) and the fix.
+    These four shapes sit outside it and released even before that fix; they are
+    kept because a first pass measured only these and concluded the whole
+    finding was unreproducible.
+
+    The premise is real: `disabled-active` departing an unreadable active
+    persists ``leftHeadroom: null, leftRecoveryAt: null, leftTrigger:
+    "disabled-active"``, and `_left_account_recovered` keys
+    `is_failover_snapshot` on ``left_trigger == "failover"`` — False here — so a
+    null-baseline record is read on the ordinary legs. A review swept
+    `_left_account_recovered` in isolation over 324 fleet shapes, found 84 (26%)
+    where that fork changes the answer, and reported a stranded engine.
+
+    Measured end to end through `tick()`, these shapes do not strand: the bar is
+    consulted (`_left_account_recovered` runs) and returns True on each,
+    including the mediocre-peer and 99%-active ones — the latter has
+    ``active_h=1``, where the band is empty. Four passing shapes were never
+    evidence that the finding was wrong, only that they were the wrong four.
+
+    The reason it is right that it releases: the bar stops ping-ponging back to
+    an account left for a QUOTA reason. This departure was a POLICY one, and the
+    slot cannot be a candidate again until the user re-enables it — which is
+    itself the signal that they want it back.
+    """
+
+    def test_a_re_enabled_account_is_reachable_again(self, harness):
+        harness.switcher.set_account_disabled("1", True)
+        first = harness.tick_with_usage({
+            "1": None, "2": _usage(95), "3": _usage(40),
+        })
+        assert first is TickOutcome.SWITCHED
+        assert harness.active_number() == 3
+        st = harness.state()
+        assert st["leftTrigger"] == "disabled-active"
+        assert st["leftHeadroom"] is None, "the null baseline is the whole point"
+
+        harness.switcher.set_account_disabled("1", False)
+        harness.clock.advance(3600)          # past any cooldown
+        second = harness.tick_with_usage({
+            "1": _usage(5), "2": _usage(95), "3": _usage(95),
+        })
+        assert second is TickOutcome.SWITCHED, (
+            "stranded: the no-return bar held against a slot the user "
+            f"explicitly re-enabled. events={harness.kinds()}"
+        )
+        assert harness.active_number() == 1
+
+    def test_control_a_FAILOVER_departure_still_obeys_its_own_legs(self, harness):
+        """CONTROL. The release must be scoped to `disabled-active`; a real
+        failover snapshot keeps the behaviour it already had, so this cannot be
+        fixed by disabling the bar wholesale."""
+        harness.tick_with_usage({"1": None, "2": _usage(40), "3": _usage(10)})
+        harness.tick_with_usage({"1": None, "2": _usage(40), "3": _usage(10)})
+        out = harness.tick_with_usage({"1": None, "2": _usage(40), "3": _usage(10)})
+        assert out is TickOutcome.SWITCHED
+        assert harness.state()["leftTrigger"] == "failover"
+
+
+class TestDisabledActiveDepartureDoesNotBarTheReEnabledSlot:
+    """The narrow band where the null-baseline snapshot really does strand.
+
+    A `disabled-active` departure off an unreadable active persists
+    ``leftHeadroom: null, leftRecoveryAt: null``. `_left_account_recovered`
+    keys `is_failover_snapshot` on ``left_trigger == "failover"``, so this
+    record runs the ORDINARY legs — which the code says are "only reached once
+    a real baseline is confirmed to exist". There is none, so the headroom leg
+    is skipped by its isinstance guard and the recovery leg compares against
+    `inf`; the bar holds.
+
+    It needs six things at once, which is why a first sweep of four shapes
+    missed it entirely: null-baseline departure, re-enable, a proactive tick,
+    ``active_h >= 7``, a peer inside a window at most 4 points wide above the
+    hysteresis line, and that peer reporting a pct with NO usable ``resets_at``
+    (any usable reset releases via the recovery leg instead). Measured: 8 of
+    160 swept shapes fork on the bar, at
+    ``active_h=7 peer=17 | 8/19 | 9/19,20,21 | 10/20,21,23``.
+
+    Rare, but deterministic — and re-enabling a slot is the user saying they
+    want it back, which is the one moment a bar against it is plainly wrong.
+    """
+
+    def test_the_re_enabled_slot_is_reachable_inside_the_band(self, harness):
+        harness.switcher.set_account_disabled("1", True)
+        first = harness.tick_with_usage({
+            "1": None, "2": _usage(95), "3": _usage(10),
+        })
+        # Guard the instrument before trusting the verdict: a sweep of this
+        # shape that skips it reported 160/160 "stranded" with the active never
+        # having moved, which is impossible.
+        assert first is TickOutcome.SWITCHED and harness.active_number() == 3, (
+            "t1 instrument broken — the departure never happened"
+        )
+        st = harness.state()
+        assert st["leftTrigger"] == "disabled-active"
+        assert st["leftHeadroom"] is None and st["leftRecoveryAt"] is None
+
+        harness.switcher.set_account_disabled("1", False)
+        harness.clock.advance(10_000)
+        second = harness.tick_with_usage({
+            "1": _usage(80),   # peer_h = 20
+            "2": _usage(99),   # h = 1, unusable
+            "3": _usage(91),   # active_h = 9 -> proactive
+        })
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert second is TickOutcome.SWITCHED, (
+            f"barred from a slot the user re-enabled; reasons={reasons}"
+        )
+        assert harness.active_number() == 1
+
+    def test_control_the_bar_still_holds_for_a_NON_reenabled_barred_slot(
+        self, harness
+    ):
+        """CONTROL. Releasing on `disabled-active` must not release the bar
+        generally — an ordinary proactive departure keeps its own legs, so this
+        cannot be fixed by returning True unconditionally."""
+        first = harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(1), "3": _usage(99),
+        })
+        assert first is TickOutcome.SWITCHED
+        assert harness.state()["leftTrigger"] == "proactive"
+        assert harness.state()["leftHeadroom"] is not None, (
+            "an ordinary departure must record a real baseline"
+        )

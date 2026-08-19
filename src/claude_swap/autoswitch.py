@@ -382,7 +382,8 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    # proactive | at-limit | failover | consume-first | disabled-active
+    trigger: str
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -1186,9 +1187,15 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
+        # `include_api_key_accounts` decides whether an API-key account may be a
+        # switch TARGET. It must not decide whether the engine may LEAVE one:
+        # this gate returns before the disabled branch below, so a disabled
+        # API-key active was stranded exactly as the OAuth one was — while
+        # `cswap disable` had just promised the user it would be moved off.
         if (
             self.switcher.account_kind_for(current) == "api_key"
             and not settings.include_api_key_accounts
+            and not self.switcher.is_account_disabled(current)
         ):
             self._emit(
                 NoSwitchEvent(
@@ -1199,7 +1206,46 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
-        if active_headroom is not None:
+        # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
+        # from automatic selection and `switchable_account_numbers()` honours
+        # that for CANDIDATES, but nothing applied it to the slot the engine is
+        # sitting ON — so auto parked there indefinitely. Reported and measured:
+        # a disabled, metered account with no 5h/7d window held the active slot
+        # and kept being billed for as long as it sat there.
+        #
+        # Decided BEFORE headroom, because neither branch below can reach it. A
+        # readable low row answers `below-threshold` and parks; an unreadable one
+        # spends `unhealthy_ticks`, a gate for TRANSIENT failure (network, lock
+        # contention, a failed refresh). `disabled` is neither: it is read from
+        # our own sequence.json, so a retry cannot change it, and an account with
+        # no quota window is unreadable permanently. Three ticks is 3 minutes at
+        # the default 60s interval and 18 at the 360s the reporter was running —
+        # either way, minutes of spending an account the user asked auto to
+        # leave alone, waiting on a retry that cannot succeed.
+        #
+        # Its own trigger name rather than "at-limit": every gate on the
+        # SWITCHING path keys on `trigger in ("proactive", "consume-first")`, so
+        # a new value falls to the at-limit/failover side — no cooldown, no
+        # no-return bar, no hysteresis — which is what "leave now" needs.
+        # Reusing "at-limit" would also lie in the event log and in
+        # `state["leftTrigger"]`.
+        #
+        # ONE gate keys on a trigger by NAME and is not that tuple:
+        # `_left_account_recovered`'s `is_failover_snapshot`
+        # (`left_trigger == "failover"`). A `disabled-active` departure off an
+        # unreadable active therefore persists `leftHeadroom: null,
+        # leftRecoveryAt: null` and is read on the ordinary legs rather than the
+        # failover ones. Raised in review as a strand; measured NOT to be one —
+        # `_left_account_recovered` returns True (release) on every shape probed
+        # end to end, and `TestReEnableIsNotBarredByTheNoReturnBar` pins that a
+        # re-enabled slot is reachable again. Named here because the next reader
+        # will have the same suspicion and deserves the measurement, not a
+        # rediscovery.
+        if self.switcher.is_account_disabled(current):
+            self._unhealthy_ticks = 0
+            self._idle_hold_since = None
+            trigger = "disabled-active"
+        elif active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
@@ -1868,6 +1914,21 @@ class AutoSwitchEngine:
         barred = str(came_from)
         if "leftHeadroom" not in state:
             return True          # pre-upgrade record: genuinely no evidence
+        if state.get("leftTrigger") == "disabled-active":
+            # The departure reason is gone the moment the user re-enables the
+            # slot, and re-enabling is exactly what makes it a candidate again —
+            # so there is nothing here for the bar to protect against.
+            #
+            # It also cannot answer honestly below: a `disabled-active`
+            # departure off an unreadable active writes (None, None), and
+            # `is_failover_snapshot` keys on `left_trigger == "failover"`, so
+            # the record runs the ORDINARY legs, which assume a baseline that
+            # does not exist. Measured: 8 of 160 swept shapes strand, in a band
+            # at most 4 points wide (active_h 7..10 with a peer just above the
+            # hysteresis line and no usable resets_at) — narrow, but
+            # deterministic, and `no-qualifying-candidate` BLOCKED is what the
+            # user gets after asking for the account back.
+            return True
         h = headroom.get(barred)
         left_headroom = state.get("leftHeadroom")
         left_recovery = state.get("leftRecoveryAt")
@@ -2219,7 +2280,9 @@ class AutoSwitchEngine:
         active usage unknown (failover must not run on stale candidate data).
         At-limit, proactive, and ordinary unknown-usage failover selection
         never runs on the pre-escalation snapshot — those triggers imply the
-        escalation condition (the deliberate exception: an owned-and-expired
+        escalation condition. ``disabled-active`` does not imply it (a disabled
+        active can read comfortably below the band), so it is named explicitly
+        in ``escalate`` below rather than arriving through a headroom condition (the deliberate exception: an owned-and-expired
         active is excluded above, so a post-idle-hold failover can run
         without escalating). The consume-first trigger can fire outside the
         escalation band, so it instead decides *provisionally* on the stored
@@ -2322,7 +2385,13 @@ class AutoSwitchEngine:
         if threshold is None:
             threshold = self.settings.threshold
         escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            # A disabled active switches on ANY headroom, including one sitting
+            # comfortably below the band — which satisfies neither leg below, so
+            # without this the choice runs on candidate rows up to
+            # CANDIDATE_MAX_INTERVAL_S old. Measured in review: it switched onto
+            # an account it had not fetched that tick.
+            self.switcher.is_account_disabled(current)
+            or (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
                 and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
