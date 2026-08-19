@@ -76,6 +76,7 @@ from claude_swap.printer import (
 )
 from claude_swap.paths import (
     get_backup_root,
+    get_claude_config_home,
     get_credentials_path,
     get_default_claude_config_home,
     get_global_config_path,
@@ -498,6 +499,37 @@ class ClaudeAccountSwitcher:
                 )
             return None
         return data
+
+    def _drop_policy_cache(self) -> None:
+        """Forget the previous account's org-policy answer.
+
+        Claude Code caches `GET /api/claude_code/policy_limits` in
+        `<config home>/policy-limits.json` and every gate check reads it —
+        `/remote-control` resolves `Ms('allow_remote_control')` -> `Hcd()` ->
+        that file. The fetch carries whatever account was ACTIVE, the file is
+        machine-wide, and nothing rewrites it when the account changes.
+
+        MEASURED: a cached file written hours earlier under a restricted org
+        said `allow_remote_control: {allowed: false}` while the server, asked
+        with the current active credential, returned no such restriction. Every
+        session on the machine was refused Remote Control with "disabled by
+        your organization's policy" — one account's answer serving for all the
+        others, with no expiry anyone could wait out.
+
+        Removing it grants nothing: the next gate check re-reads, finds nothing
+        cached, and CC re-asks under the account that is now active. What it
+        stops is one account's restrictions outliving that account.
+
+        NEVER RAISES. This runs inside the switch transaction, and a switch
+        must not fail because a cache file could not be unlinked — the worst
+        case of leaving it is the state we already had.
+        """
+        try:
+            (get_claude_config_home() / "policy-limits.json").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self._logger.debug("could not drop the policy cache: %r", exc)
 
     def _salvage_unreadable(
         self, path: Path, emit_output: bool, warnings_out: list[str]
@@ -6565,6 +6597,7 @@ class ClaudeAccountSwitcher:
                             del salvage
                         self._write_json(config_path, target_config_data)
                     config_written = True
+                    self._drop_policy_cache()
 
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
@@ -6819,6 +6852,7 @@ class ClaudeAccountSwitcher:
                 # config for good. Absent/unreadable both fall to the same
                 # salvage-then-replace the direct-activation branch uses.
                 current_config_data = self._read_json(config_path)
+                self._drop_policy_cache()
                 if current_config_data is not None:
                     current_config_data["oauthAccount"] = oauth_section
                     self._write_json(config_path, current_config_data)

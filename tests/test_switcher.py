@@ -5140,6 +5140,57 @@ class TestSwitchSkipsBrokenSlots:
         # Stale sequence reference to a missing account record.
         assert s._account_is_switchable("99") is False
 
+    def test_a_switch_drops_the_previous_accounts_policy_cache(
+        self, temp_home: Path
+    ):
+        """THE POLICY BELONGS TO THE ACCOUNT, THE CACHE IS MACHINE-WIDE.
+
+        Claude Code caches `GET /api/claude_code/policy_limits` in
+        `~/.claude/policy-limits.json` and reads it on every gate check —
+        `/remote-control` resolves through `Ms('allow_remote_control')` ->
+        `Hcd()` -> that file. The fetch carries whatever account is ACTIVE, and
+        nothing rewrites the file when the account changes.
+
+        MEASURED. The cached file, written hours earlier while a restricted org
+        was active, said
+
+            allow_remote_control: {allowed: false}
+
+        while the server, asked with the CURRENT active credential, returned no
+        such restriction. Every session on the machine was refused Remote
+        Control with "disabled by your organization's policy" — one account's
+        policy applied to all the others, for hours, with no way back short of
+        removing the file. Removing it let a LIVE session recover without a
+        restart, so the verdict is re-read from disk rather than pinned in
+        memory for the process's lifetime.
+
+        So the switch has to drop it: the next gate check then re-asks under
+        the account that is actually active. This grants nothing — it stops one
+        account's answer from being served for another's.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps(
+            {"restrictions": {"allow_remote_control": {"allowed": False}}}))
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert not policy.exists(), (
+            "the previous account's policy answer survived the switch, so its "
+            "restrictions keep gating every session on this machine under an "
+            "account they no longer describe")
+
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
         s = self._setup(temp_home)
