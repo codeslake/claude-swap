@@ -6938,16 +6938,32 @@ class ClaudeAccountSwitcher:
                 # assignment` with no salvage copy, losing the user's torn
                 # config for good. Absent/unreadable both fall to the same
                 # salvage-then-replace the direct-activation branch uses.
+                # THE PIN OWNS THE IDENTITY HERE TOO. This is the ORDINARY
+                # rotation path — the one an auto-switch takes — and the
+                # direct-activation branch above had the splice while this one
+                # did not, so the fix covered the rarer path and missed the
+                # traffic that actually tears bridges off. Caught by the cswap
+                # session with a live instrument and two passing controls:
+                # force_activate wrote the pin, no-pin wrote the target, and
+                # the ordinary rotation wrote the target while a pin was set.
+                #
+                # Same contract as the other path: splice when a pin resolves,
+                # byte-identical to before when it does not.
+                pin_oauth_ord = self._pinned_identity_oauth()
+                identity_section = pin_oauth_ord or oauth_section
                 current_config_data = self._read_json(config_path)
                 self._refresh_policy_cache()
                 if current_config_data is not None:
-                    current_config_data["oauthAccount"] = oauth_section
+                    current_config_data["oauthAccount"] = identity_section
                     self._write_json(config_path, current_config_data)
                 else:
                     if config_path.exists():
                         self._salvage_unreadable(
                             config_path, emit_output, warnings_out
                         )
+                    if pin_oauth_ord:
+                        target_config_data = dict(target_config_data)
+                        target_config_data["oauthAccount"] = identity_section
                     self._write_json(config_path, target_config_data)
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
