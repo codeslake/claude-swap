@@ -3668,6 +3668,13 @@ class TestTheLockProbeActuallyProbes:
     call, never runs under test. Inverting both returns (True<->False) left
     the suite at 150 passed.
 
+    THE HOST'S, NOT THE PACKAGE'S -- unlike everything else `_pinwiring()`
+    reaches. `_config_lock_is_free` stayed in cswap because `wire_launch_env`
+    stayed, and the package's copy was deleted as a duplicate. Aiming these at
+    `_pinwiring()` made them AttributeError against the paired code while the
+    suite stayed green against an older released wheel that still had it, and
+    left the copy production actually calls untested.
+
     Drives the REAL function against a real lock directory in `tmp_path`, no
     monkeypatch of `_config_lock_is_free` itself. `get_global_config_path` is
     pointed at a tmp path the same way `TestHealNeverTearsDownAServingPin`
@@ -3698,7 +3705,7 @@ class TestTheLockProbeActuallyProbes:
         lock_dir = cfg.parent / (cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
             start = _time.monotonic()
-            held_result = _pinwiring()._config_lock_is_free(0.3)
+            held_result = pin._config_lock_is_free(0.3)
             elapsed = _time.monotonic() - start
 
         assert held_result is False, "answered True while the lock was held"
@@ -3713,7 +3720,7 @@ class TestTheLockProbeActuallyProbes:
         # broken fixture made the held probe return False for some reason
         # unrelated to the real lock, this would also fail — it is what rules
         # that out.
-        assert _pinwiring()._config_lock_is_free(1.0) is True, (
+        assert pin._config_lock_is_free(1.0) is True, (
             "a free probe on the same path after release did not answer True "
             "— the held-case False above is not trustworthy without this"
         )
@@ -3748,12 +3755,12 @@ class TestTheLockProbeActuallyProbes:
         monkeypatch.setattr(
             paths, "get_default_global_config_path", lambda: default_cfg)
 
-        assert _pinwiring()._config_lock_is_free(0.3) is True, (
+        assert pin._config_lock_is_free(0.3) is True, (
             "precondition: with neither lock held the probe must say free")
 
         lock_dir = default_cfg.parent / (default_cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
-            held = _pinwiring()._config_lock_is_free(0.3)
+            held = pin._config_lock_is_free(0.3)
 
         assert held is False, (
             "the DEFAULT config's lock was held and the probe said free — the "
@@ -8236,7 +8243,7 @@ class TestTheRepairPinsTheIDENTITYToo:
         monkeypatch.setattr("claude_swap.pin._live_impl",
                             lambda: self._impl_recording(calls))
         monkeypatch.setattr("claude_swap.pin.identity_for_config",
-                            lambda s: {"accountUuid": "PIN-UUID",
+                            lambda s, **_k: {"accountUuid": "PIN-UUID",
                                        "emailAddress": "pinned@example.com"})
 
         assert pin.repin_current(sw) is True
@@ -8265,7 +8272,7 @@ class TestTheRepairPinsTheIDENTITYToo:
         monkeypatch.setattr("claude_swap.pin._live_impl",
                             lambda: self._impl_recording(calls))
         monkeypatch.setattr("claude_swap.pin.identity_for_config",
-                            lambda s: None)
+                            lambda s, **_k: None)
 
         assert pin.repin_current(sw) is True
         assert calls[0]["identity"] is None
@@ -8603,3 +8610,89 @@ class TestSetPinNamesTheAccountItIsPinning:
                                         "accountUuid": "UUID-2"}, (
             "re-pinning to B wrote A into the config, so every bridge minted "
             "afterwards is owned by the account that was UNPINNED")
+
+
+class TestAnAmbiguousAddressStillNamesThePin:
+    """One address in two slots must not silence the splice.
+
+    `identity_for_config` falls back to `_resolve_account_identifier(email)`
+    when it is given no slot, and that RAISES on an address that names two
+    slots -- cswap's own documented personal+org pattern. The function-wide
+    except turns the raise into None, and None means "leave the config alone",
+    so the repair and the rollback would re-pin and silently not name
+    themselves. Nothing surfaces it: both paths report success.
+
+    Measured on the fleet when this was written: 7 slots, 0 addresses in more
+    than one slot. Latent, not live -- and it goes live the first time someone
+    adds a personal account at the address of an org one, which this codebase
+    documents as supported.
+    """
+
+    def _sw(self):
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        # THE SHAPE: one address, two slots, different orgs.
+        roster = {"accounts": {
+            "1": {"email": "shared@example.com", "organizationUuid": "org-A"},
+            "2": {"email": "shared@example.com", "organizationUuid": "org-B"},
+        }}
+        sw._get_sequence_data = lambda: roster
+
+        def _ambiguous(_identifier):
+            from claude_swap.exceptions import ConfigError
+            raise ConfigError("matches multiple accounts")
+
+        sw._resolve_account_identifier = _ambiguous
+        sw._read_account_config = lambda num, email: (
+            '{"oauthAccount": {"emailAddress": "%s", "accountUuid": "UUID-%s"}}'
+            % (email, num))
+        return sw
+
+    def test_the_repair_names_the_right_one_of_the_two(self, monkeypatch):
+        from claude_swap import pin
+
+        seen = []
+
+        class _Impl:
+            @staticmethod
+            def load_pin(_backup_dir):
+                return ("shared@example.com", "org-B")
+
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                seen.append(identity)
+                return True
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _Impl)
+        assert pin.repin_current(self._sw()) is True
+        assert seen, "apply_pin was never reached -- the test proves nothing"
+        assert seen[0] == {"emailAddress": "shared@example.com",
+                           "accountUuid": "UUID-2"}, (
+            "the repair could not tell the two slots apart, handed None, and "
+            "left the config naming whatever was active -- while reporting "
+            f"success. got {seen[0]!r}")
+
+    def test_the_org_is_what_picks_between_them(self, monkeypatch):
+        """Same address, the OTHER org, must select the OTHER slot. Without
+        this the test above passes on any implementation that happens to
+        return the first row."""
+        from claude_swap import pin
+
+        seen = []
+
+        class _Impl:
+            @staticmethod
+            def load_pin(_backup_dir):
+                return ("shared@example.com", "org-A")
+
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                seen.append(identity)
+                return True
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _Impl)
+        assert pin.repin_current(self._sw()) is True
+        assert seen[0]["accountUuid"] == "UUID-1", (
+            f"the org did not decide which slot was meant: {seen[0]!r}")

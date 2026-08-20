@@ -965,6 +965,26 @@ def pinned_identity(switcher) -> "tuple[str, str] | None":
         return None
 
 
+def _slot_for(switcher, email: "str | None", org_uuid: "str | None"):
+    """The roster slot for ``(email, org_uuid)``, or None when it cannot tell.
+
+    Callers pass this to :func:`identity_for_config` so it never has to resolve
+    an ADDRESS. `_resolve_account_identifier` raises on an address that names
+    two slots, and that raise becomes a silent "leave the config alone" -- on
+    the one roster shape the composite key exists for.
+
+    None is honest: the caller then gets today's behaviour rather than a wrong
+    slot.
+    """
+    if not email:
+        return None
+    try:
+        return switcher._find_account_slot(
+            switcher._get_sequence_data() or {}, email, org_uuid or "")
+    except Exception:  # noqa: BLE001 — a lookup must not break a repair
+        return None
+
+
 def identity_for_config(switcher, email: str | None = None,
                         num: str | None = None) -> "dict | None":
     """The `oauthAccount` the config should name while a pin is set, or None.
@@ -1130,8 +1150,17 @@ def repin_current(switcher) -> bool:
         # `~/.claude.json` still names whichever account is active - and
         # Claude Code takes that field as the OWNER of every bridge it mints
         # afterwards, which is the teardown the splice exists to prevent.
+        # ASK ABOUT `email`, the account this call is re-pinning. The bare
+        # form reads the RECORD, which `load_pin` above read too, so it
+        # happens to agree here — and that is an accident of two readers
+        # sharing a file, not a property of this function. `set_pin` had the
+        # same shape and was WRONG, because there the record had not been
+        # written yet. Say which account is meant and the question stops
+        # depending on who else read what.
         return bool(impl.apply_pin(switcher, email, org,
-                                   identity=identity_for_config(switcher)))
+                                   identity=identity_for_config(
+                                       switcher, email=email,
+                                       num=_slot_for(switcher, email, org))))
     except Exception:  # noqa: BLE001 — a repair must not take its caller down
         return False
 
@@ -1239,8 +1268,11 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
         # the record leaves Claude Code minting every later bridge under the
         # account whose pin just failed. Asked about `before` explicitly,
         # because the record still names the failure at this point.
-        _impl().splice_config_identity(
-            identity_for_config(switcher, email=before[0] if before else None))
+        _impl().splice_config_identity(identity_for_config(
+            switcher,
+            email=before[0] if before else None,
+            num=_slot_for(switcher, before[0] if before else None,
+                          before[1] if before and len(before) > 1 else None)))
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
     return _pinned_email_now(switcher) == before
