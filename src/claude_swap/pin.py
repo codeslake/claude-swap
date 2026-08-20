@@ -52,11 +52,6 @@ def _certdir(switcher):
     return w._certdir(switcher.backup_dir)
 
 
-def _each_config(level=None):
-    w = _w()
-    if w is None:
-        return []
-    return w._each_config() if level is None else w._each_config(level)
 
 
 def _port_of_config(path):
@@ -72,14 +67,8 @@ def _port_answers(port, timeout=None):
         port, timeout)
 
 
-def _ledger_path(config_path):
-    w = _w()
-    return None if w is None else w._ledger_path(config_path)
 
 
-def _wire_mark_of(raw, config_path=None):
-    w = _w()
-    return None if w is None else w._wire_mark_of(raw, config_path)
 
 
 def _dead_wired_configs(switcher, connect_timeout: float = 2.0) -> list:
@@ -93,14 +82,6 @@ def _dead_wired_configs(switcher, connect_timeout: float = 2.0) -> list:
         backup_root=getattr(switcher, "backup_dir", None))
 
 
-def _log_unresolvable(get, exc, level=None):
-    w = _w()
-    if w is None:
-        return
-    if level is None:
-        w._log_unresolvable(get, exc)
-    else:
-        w._log_unresolvable(get, exc, level)
 
 
 # -- clear_wiring stays HERE, deliberately ------------------------------------

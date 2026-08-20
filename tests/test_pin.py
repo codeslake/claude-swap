@@ -8483,3 +8483,47 @@ class TestClearingHandsBackTheLiveAccount:
         pin.clear_pin(sw)
         assert calls, "the clear did not run at all"
         assert calls[0]["identity"] is None
+
+
+class TestNoNameIsDefinedTwiceInThisModule:
+    """A second `def` of the same name silently wins, and nothing notices.
+
+    Splitting the wiring subsystem out left FOUR forwarding shims
+    (`_each_config`, `_ledger_path`, `_wire_mark_of`, `_log_unresolvable`)
+    near the top of pin.py while restoring `clear_wiring` put the real
+    implementations back further down. Python keeps the LAST definition, so
+    the shims never ran -- and the whole suite stayed green, because both
+    versions return the same values. A duplicate definition is invisible to
+    every test that only checks behaviour.
+
+    It matters here more than in most modules: this file is deliberately half
+    forwarders into an optional package and half local implementations for
+    when that package is gone. Those two halves have the same names on
+    purpose, so the one mistake this layout invites is exactly this one.
+    """
+
+    def test_no_duplicate_top_level_definitions(self):
+        import ast
+        import collections
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+        checked = 0
+        problems = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            checked += 1
+            names = collections.Counter(
+                n.name for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.ClassDef)))
+            for name, count in sorted(names.items()):
+                if count > 1:
+                    problems.append(f"{path.name}:{name} x{count}")
+        # THE CONTROL: an empty walk would pass vacuously, and this guard's
+        # whole value is that it fires on a file nobody thought to look at.
+        assert checked > 5, f"the walk found only {checked} modules"
+        assert not problems, (
+            "a name is defined more than once at module level; the LAST one "
+            f"wins and the earlier is dead code nothing will report: {problems}"
+        )
