@@ -177,8 +177,7 @@ def _port_of_config(path) -> int | None:
     return port if 0 < port <= 65535 else None
 
 
-def _dead_wired_configs(_switcher, connect_timeout: float = 2.0, *,
-                        backup_root=None) -> list:
+def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     """Every wired config whose OWN port is not answering — and no more.
 
     THE VERDICT IS MACHINE-WIDE; THE ACT MUST NOT BE. `_wired_port_is_serving`
@@ -1413,11 +1412,23 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
         # the record leaves Claude Code minting every later bridge under the
         # account whose pin just failed. Asked about `before` explicitly,
         # because the record still names the failure at this point.
-        _impl().splice_config_identity(identity_for_config(
-            switcher,
-            email=before[0] if before else None,
-            num=_slot_for(switcher, before[0] if before else None,
-                          before[1] if before and len(before) > 1 else None)))
+        # WHOSE NAME GOES BACK. Restoring a previous pin means that pin;
+        # restoring NOTHING means the live login, exactly as `clear_pin`
+        # decides it. Without the second case a failed FIRST pin left its own
+        # account named in a config the record no longer mentions and nobody
+        # is logged in as — the command reported failure and handed the
+        # machine to it anyway.
+        if before:
+            _back = identity_for_config(
+                switcher, email=before[0],
+                num=_slot_for(switcher, before[0],
+                              before[1] if len(before) > 1 else None))
+        else:
+            _live = switcher._live_login_identity()
+            _back = identity_for_config(
+                switcher, email=_live[0],
+                num=switcher.current_account_number()) if _live else None
+        _impl().splice_config_identity(_back)
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
     return _pinned_email_now(switcher) == before

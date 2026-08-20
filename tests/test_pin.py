@@ -8707,3 +8707,185 @@ class TestAnAmbiguousAddressStillNamesThePin:
         assert pin.repin_current(self._sw()) is True
         assert seen[0]["accountUuid"] == "UUID-1", (
             f"the org did not decide which slot was meant: {seen[0]!r}")
+
+
+class TestTheDetectorSurvivesThePackageBeingGone:
+    """`clear_wiring` is in cswap because the case it exists for is the package
+    being broken or gone -- and it only ever runs on what `_dead_wired_configs`
+    returns. So that verdict has to be reachable without the extra, or the
+    guarantee is decoration.
+
+    It was not, for one commit. The detectors were moved into `cswap_pin` and
+    the host kept shims that returned `None` / `[]` when the import failed --
+    silently, because "an optional extra cannot break a read". A wiring left
+    behind by a dead install then pointed every new session at a port nothing
+    serves, and the one command that could remove it could not see it.
+
+    THE CONTROL IS THE WHOLE TEST. An empty list is the correct answer when
+    nothing is wired AND the answer a silently-degraded shim gives, so a dead
+    port being found proves nothing on its own. The live port on the same path
+    must come back clean, or a detector that says "dead" to everything passes.
+    """
+
+    def _block_cswap_pin(self, monkeypatch):
+        import sys
+
+        class _Block:
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] == "cswap_pin":
+                    raise ImportError(f"No module named {name!r}")
+                return None
+
+        # monkeypatch restores both on teardown, so the block cannot leak into
+        # another test in the same worker.
+        monkeypatch.setattr(sys, "meta_path", [_Block(), *sys.meta_path])
+        for mod in [m for m in sys.modules if m.startswith("cswap_pin")]:
+            monkeypatch.delitem(sys.modules, mod)
+
+    def test_a_dead_wiring_is_still_found_and_a_live_one_is_not(
+            self, tmp_path, monkeypatch):
+        import json
+        import socket
+
+        from claude_swap import pin
+
+        self._block_cswap_pin(monkeypatch)
+        assert pin._live_impl() is None, (
+            "the import block did not take, so this test proves nothing")
+
+        cfg = tmp_path / "claude.json"
+        monkeypatch.setattr(pin, "_each_config", lambda *a: [cfg])
+
+        class _SW:
+            backup_dir = tmp_path
+
+        def wire(port):
+            cfg.write_text(json.dumps({
+                "env": {"HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                        "CSWAP_PIN_PORT": str(port)},
+                "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+            }))
+
+        wire(1)                      # nothing serves port 1
+        dead = pin._dead_wired_configs(_SW(), connect_timeout=0.2)
+        assert [p.name for p in dead] == ["claude.json"], (
+            "with the package gone the detector went blind, so `cswap pin "
+            "--clear` cannot see the wiring it exists to remove")
+
+        srv = socket.socket()
+        try:
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            wire(srv.getsockname()[1])
+            live = pin._dead_wired_configs(_SW(), connect_timeout=1.0)
+        finally:
+            srv.close()
+        assert live == [], (
+            "a SERVING wiring was reported dead; unwiring it would unpin a "
+            f"healthy session: {live}")
+
+    def test_certdir_is_a_real_path_without_the_package(self, tmp_path,
+                                                        monkeypatch):
+        """`serving_port` does `_certdir(switcher) / "proxy.json"`, outside its
+        own try. A None here was a TypeError out of a function whose docstring
+        promises it works with the package absent."""
+        from pathlib import Path
+
+        from claude_swap import pin
+
+        self._block_cswap_pin(monkeypatch)
+
+        class _SW:
+            backup_dir = tmp_path
+
+        got = pin._certdir(_SW())
+        assert isinstance(got, Path), f"not a path: {got!r}"
+        assert got == Path(tmp_path) / "pin-proxy"
+        assert pin.serving_port(_SW()) is None, (
+            "no daemon here, so None -- but it must RETURN it, not raise")
+
+
+class TestARollbackWithNothingToRestoreStillClearsTheName:
+    """The FIRST pin on a machine, failing, was the case with no owner.
+
+    `_restore_pin(switcher, before)` puts the record back. When `before` is
+    None -- nothing was pinned before, so this is a first pin that failed --
+    `apply_pin(None, None)` CLEARS the record, and the identity lookup then has
+    nothing to resolve and returns None. None means "leave the field alone", so
+    `~/.claude.json` keeps naming the account whose pin just failed.
+
+    That field is what Claude Code reads as the owner of every bridge it mints
+    afterwards. So the failure path of `cswap pin` handed the machine to an
+    account that is not pinned, is not logged in, and that the record no longer
+    mentions -- while the command correctly reported failure.
+
+    `clear_pin` already had the answer one function away: when there is no pin
+    to name, name the LIVE LOGIN. Same question, same source.
+
+    Mutation-resistant by construction: the surviving-M2 measurement showed
+    the `before`-is-a-pin case cannot distinguish `email=before[0]` from the
+    record fallback, because `apply_pin` has already rewritten the record by
+    then. Only this case can.
+    """
+
+    def _sw(self, live=("serving@example.com", "org-LIVE")):
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        sw._live_login_identity = lambda: live
+        sw.current_account_number = lambda: "3"
+        sw._resolve_account_identifier = lambda email: "3"
+        sw._get_sequence_data = lambda: {"accounts": {
+            "3": {"email": "serving@example.com", "organizationUuid": "org-LIVE"}}}
+        sw._read_account_config = lambda num, email: (
+            '{"oauthAccount": {"emailAddress": "%s", "accountUuid": "UUID-%s"}}'
+            % (email, num))
+        return sw
+
+    def _impl(self, spliced, record):
+        class _Impl:
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                record["value"] = (email, org_uuid) if email else None
+                return True
+
+            @staticmethod
+            def splice_config_identity(identity):
+                spliced.append(identity)
+                return True
+        return _Impl
+
+    def test_a_failed_first_pin_hands_the_config_to_the_live_login(
+            self, monkeypatch):
+        from claude_swap import pin
+
+        spliced, record = [], {"value": ("failed@example.com", "org-F")}
+        monkeypatch.setattr(pin, "_impl",
+                            lambda: self._impl(spliced, record))
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: record["value"])
+
+        assert pin._restore_pin(self._sw(), None) is True
+        assert spliced, "splice_config_identity was never reached"
+        assert spliced[-1] == {"emailAddress": "serving@example.com",
+                               "accountUuid": "UUID-3"}, (
+            "the rollback left `~/.claude.json` naming the account whose pin "
+            "just failed, so every bridge minted afterwards is owned by an "
+            f"account nothing is pinned to and nobody is logged in as: "
+            f"{spliced[-1]!r}")
+
+    def test_no_live_login_leaves_the_field_alone(self, monkeypatch):
+        """None is not an erasure. With nothing logged in there is no correct
+        owner to write, and a blank one is worse than a stale one -- the next
+        switch rewrites it."""
+        from claude_swap import pin
+
+        spliced, record = [], {"value": ("failed@example.com", "org-F")}
+        monkeypatch.setattr(pin, "_impl",
+                            lambda: self._impl(spliced, record))
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: record["value"])
+
+        assert pin._restore_pin(self._sw(live=None), None) is True
+        assert spliced[-1] is None
