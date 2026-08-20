@@ -1841,9 +1841,16 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
         assert "_pin.titles_to_restore" in caller, (
             "the transport must go through the seam, not around it")
 
+        # THREE HOPS NOW: oauth -> pin.titles_to_restore -> pin._ask ->
+        # the package. The passthroughs were collapsed onto one caller, so
+        # checking only the named wrapper would pass on a wrapper that
+        # decided something itself.
         seam = inspect.getsource(pin.titles_to_restore)
-        assert "impl.titles_to_restore" in seam, (
-            "the seam must forward to cswap-pin, not decide anything itself")
+        assert '_ask("titles_to_restore"' in seam, (
+            "the seam must forward, not decide anything itself")
+        asker = inspect.getsource(pin._ask)
+        assert "getattr(impl, name)" in asker, (
+            "the shared caller must reach the package by name")
 
         # AND THE SEAM RESOLVES THE REAL PACKAGE. `_impl` is what makes
         # `impl.titles_to_restore` the package's function rather than any

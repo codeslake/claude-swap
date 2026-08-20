@@ -309,21 +309,36 @@ def identity_for_config(switcher) -> "dict | None":
     behaviour that shipped for months. An optional feature must never be able
     to block a switch.
     """
-    import json as _json
-
     try:
-        pinned = _pinned_email_now(switcher)
-        if not pinned or not pinned[0]:
+        email = pinned_identity_email(switcher)
+        if not email:
             return None
-        num = switcher._resolve_account_identifier(pinned[0])
+        num = switcher._resolve_account_identifier(email)
         if not num:
             return None
-        raw = switcher._read_account_config(str(num), pinned[0])
+        raw = switcher._read_account_config(str(num), email)
         if not raw:
             return None
-        oauth = _json.loads(raw).get("oauthAccount")
+        oauth = json.loads(raw).get("oauthAccount")
         return oauth if isinstance(oauth, dict) and oauth else None
     except Exception:  # noqa: BLE001 — never block a switch
+        return None
+
+
+def _ask(name: str, *args):
+    """Call `name` on the package, or None when it cannot be asked.
+
+    The three passthroughs below were the same six lines three times. None
+    means "cannot ask", never "asked and got nothing" — every caller treats
+    those the same, so the collapse is honest. A caller that needs to tell
+    them apart should not use these.
+    """
+    impl = _live_impl()
+    if impl is None:
+        return None
+    try:
+        return getattr(impl, name)(*args)
+    except Exception:  # noqa: BLE001 — an optional extra cannot break a caller
         return None
 
 
@@ -340,24 +355,12 @@ def ca_path_for_trust():
     treats the two the same, so the collapse is honest. A caller that needs to
     tell them apart should not use this.
     """
-    impl = _live_impl()
-    if impl is None:
-        return None
-    try:
-        return impl.ca_path_for_trust()
-    except Exception:  # noqa: BLE001 — an optional extra cannot break trust
-        return None
+    return _ask("ca_path_for_trust")
 
 
 def live_bridge_names() -> "dict[str, str] | None":
     """Bridge id -> the name its session wants, or None when unavailable."""
-    impl = _live_impl()
-    if impl is None:
-        return None
-    try:
-        return impl.live_bridge_names()
-    except Exception:  # noqa: BLE001 — a cosmetic repair must not end a tick
-        return None
+    return _ask("live_bridge_names")
 
 
 def titles_to_restore(sessions, names) -> "list | None":
@@ -366,13 +369,7 @@ def titles_to_restore(sessions, names) -> "list | None":
     THE POLICY STAYS IN cswap-pin — this only carries the call across. What
     to touch is the package's decision, and deliberately not repeated here.
     """
-    impl = _live_impl()
-    if impl is None:
-        return None
-    try:
-        return list(impl.titles_to_restore(sessions, names))
-    except Exception:  # noqa: BLE001 — a cosmetic repair must not end a tick
-        return None
+    return _ask("titles_to_restore", sessions, names)
 
 
 def pin_is_applying(switcher) -> bool | None:
