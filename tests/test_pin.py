@@ -8997,3 +8997,76 @@ class TestTheRosterCanNameThePinWhenNoBackupCan:
                             lambda _s: ("pinned@example.com", "org-PIN"))
         assert pin.identity_for_config(
             self._sw(stored="", roster_uuid="")) is None
+
+
+class TestTheSeamCanBeAskedWhichSlotIsPinned:
+    """cswap core needs the pinned SLOT, and had no public way to ask.
+
+    The autoswitch tick wants to keep the rotation off the pinned account, so
+    that the pin's own window stays for Remote Control instead of being spent
+    by ordinary inference. That is a question about the pin, so it belongs on
+    this seam — the alternative was cswap reaching into `_slot_for`, or
+    re-deriving the answer from proxy.json and drifting from it.
+
+    THE COMPOSITE, NOT THE EMAIL. Two managed slots can share one address
+    across organizations, and this fleet's roster already has such a pair. A
+    reader keyed on the address alone picks whichever comes first and is wrong
+    half the time, silently.
+
+    NEVER RAISES. This runs on a 15-60s tick beside the switch; an exception
+    here would take the autoswitch down over a question it only asked for an
+    optimisation.
+    """
+
+    def _sw(self, rows):
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw._get_sequence_data = lambda: {"accounts": rows}
+        sw._find_account_slot = lambda data, email, org: next(
+            (n for n, a in (data.get("accounts") or {}).items()
+             if a.get("email") == email
+             and (not org or a.get("organizationUuid") == org)), None)
+        return sw
+
+    def test_it_names_the_slot(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-A"))
+        sw = self._sw({"1": {"email": "pinned@example.com",
+                             "organizationUuid": "org-A"},
+                       "5": {"email": "other@example.com"}})
+        assert pin.pinned_slot(sw) == "1"
+
+    def test_the_org_decides_when_two_slots_share_an_address(self, monkeypatch):
+        """THE CASE THE COMPOSITE EXISTS FOR. Keyed on the email alone this
+        returns slot 1 and the rotation would reserve the wrong account."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: ("shared@example.com", "org-B"))
+        sw = self._sw({"1": {"email": "shared@example.com",
+                             "organizationUuid": "org-A"},
+                       "2": {"email": "shared@example.com",
+                             "organizationUuid": "org-B"}})
+        assert pin.pinned_slot(sw) == "2", (
+            "the address alone chose the slot, so a fleet with two accounts "
+            "at one address reserves the wrong one")
+
+    def test_no_pin_is_None_not_an_error(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_pinned_email_now", lambda _s: None)
+        assert pin.pinned_slot(self._sw({})) is None
+
+    def test_a_switcher_that_raises_is_survived(self, monkeypatch):
+        """THE TICK PATH. An exception here stops the autoswitch over a
+        question it asked only to be tidy."""
+        from claude_swap import pin
+
+        def boom(_s):
+            raise RuntimeError("settings.json was mid-write")
+
+        monkeypatch.setattr(pin, "_pinned_email_now", boom)
+        assert pin.pinned_slot(object()) is None

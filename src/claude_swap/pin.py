@@ -1127,6 +1127,34 @@ def _live_login_for_config(switcher) -> "dict | None":
                                num=switcher.current_account_number())
 
 
+def pinned_slot(switcher) -> "str | None":
+    """The roster slot the pin names, or None when it cannot be told.
+
+    THE SEAM cswap core asks so it does not have to re-derive this. The
+    autoswitch tick wants to keep the rotation off the pinned account — the
+    pin's own window is what Remote Control spends, and ordinary inference on
+    the same slot drains it. That is a question about the pin, so it is
+    answered here rather than from proxy.json, which would drift.
+
+    ON THE COMPOSITE, NOT THE ADDRESS: two managed slots can share one email
+    across organizations, and this roster already has such a pair. Keyed on
+    the address alone the answer is whichever comes first, silently wrong for
+    the other.
+
+    NEVER RAISES, because it runs on a 15-60 second tick beside the switch.
+    None is the honest answer to "cannot tell", and the caller then behaves
+    exactly as it does today.
+    """
+    try:
+        ident = _pinned_email_now(switcher)
+    except Exception:  # noqa: BLE001 — a tick must not die on a tidy question
+        return None
+    if not ident:
+        return None
+    email, org = ident
+    return _slot_for(switcher, email, org)
+
+
 def _slot_for(switcher, email: "str | None", org_uuid: "str | None"):
     """The roster slot for ``(email, org_uuid)``, or None when it cannot tell.
 
