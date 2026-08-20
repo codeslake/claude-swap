@@ -31,55 +31,23 @@ from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
 _logger = logging.getLogger("claude-swap")
 
-# -- helpers that moved to `cswap_pin.wiring`, borrowed back ------------------
-
-
-def _w():
-    """`cswap_pin.wiring`, or None when the extra is not installed."""
-    try:
-        from cswap_pin import wiring
-    except Exception:  # noqa: BLE001 — an optional extra cannot break a read
-        return None
-    return wiring
-
-
-def _certdir(switcher):
-    # A CALLER MAY HAVE NO SWITCHER. The verdict this feeds is machine-wide,
-    # and the pre-move version never required one either.
-    w = _w()
-    if w is None or switcher is None:
-        return None
-    return w._certdir(switcher.backup_dir)
-
-
-
-
-def _port_of_config(path):
-    w = _w()
-    return None if w is None else w._port_of_config(path)
-
-
-def _port_answers(port, timeout=None):
-    w = _w()
-    if w is None:
-        return False
-    return w._port_answers(port) if timeout is None else w._port_answers(
-        port, timeout)
+# -- wiring helpers, and they live here ---------------------------------------
 
 
 
 
 
 
-def _dead_wired_configs(switcher, connect_timeout: float = 2.0) -> list:
-    w = _w()
-    if w is None:
-        return []
-    return w._dead_wired_configs(
-        switcher, connect_timeout=connect_timeout,
-        # SAME REASON AS `_certdir`: this answer is machine-wide and callers
-        # are allowed to have no switcher.
-        backup_root=getattr(switcher, "backup_dir", None))
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -95,6 +63,183 @@ def _dead_wired_configs(switcher, connect_timeout: float = 2.0) -> list:
 #
 # `wire_launch_env` is the opposite case and DID move: with no package there is
 # nothing to wire, and returning `env` unchanged is the whole correct answer.
+
+
+# -- the wiring detectors live HERE, with the remover they drive -------------
+#
+# `clear_wiring` is in cswap because the case it exists for is the package
+# being broken or gone. These decide WHETHER it runs, so putting them in the
+# package moved the guarantee out from under its own function: with the extra
+# absent they answered "nothing is wired" and the stay-behind remover became
+# unreachable. `serving_port`, `--get_certdir` and `--set_port` each say in
+# their own comments that they work without the package; `_certdir` returning
+# None made the first of those a TypeError.
+#
+# None of this is pin policy. It is path arithmetic on cswap's backup dir, a
+# read of cswap's own config, a loopback connect, and a verdict over cswap's
+# own files.
+
+
+def _certdir(switcher):
+    """Where the pin keeps its own files. One definition, so a layout change
+    is one edit rather than a grep.
+
+    THIS DOCSTRING HAS BEEN FALSE TWICE. It first said "all three go through
+    it now" while two sites still spelled `backup_dir / "pin-proxy"`
+    themselves; those were routed here, and the SAME diff then grew two more —
+    `pin_is_applying` and `--get_certdir`, the command whose entire purpose is
+    being the single authority on this path. A prose claim about a grep is a
+    claim nothing checks, so it drifts every time somebody needs the path in a
+    hurry.
+
+    `test_the_certdir_literal_appears_exactly_once` is what makes it true now.
+    Adding a third spelling fails the suite instead of aging into another
+    aspirational sentence."""
+    from pathlib import Path
+
+    return Path(switcher.backup_dir) / "pin-proxy"
+
+
+def _port_answers(port: int, connect_timeout: float) -> bool:
+    """Does a loopback connect to ``port`` succeed? The one probe, once.
+
+    Extracted because two callers need it and they need DIFFERENT shapes of
+    the answer: :func:`_wired_port_is_serving` wants the machine-wide AND,
+    :func:`_dead_wired_configs` wants it per config. Two copies of the probe
+    would be two places for a timeout or an exception class to drift.
+    """
+    import socket
+
+    # INSIDE THE TRY, both of them. `socket.socket()` raises `OSError` on fd
+    # exhaustion (EMFILE/ENFILE) and it sat OUTSIDE — so on a starved box the
+    # probe raised through `_wired_port_is_serving`, which `heal` calls twice
+    # with no guard, out of the function whose docstring promises "never
+    # raises: this is called from the status line every few seconds". Nothing
+    # about "can I reach this port" should be able to end the command that
+    # answers it.
+    # AND `sock` IS BOUND FIRST, or the fix moves the raise instead of
+    # removing it: with the construction inside the `try`, a failing
+    # `socket()` leaves the name unbound and `finally` raises
+    # `UnboundLocalError` — not an `OSError`, so it escapes the handler that
+    # was just widened to catch it.
+    sock = None
+    try:
+        sock = socket.socket()
+        sock.settimeout(connect_timeout)
+        sock.connect(("127.0.0.1", port))
+    except OSError:
+        return False
+    finally:
+        if sock is not None:
+            sock.close()
+    return True
+
+
+def _port_of_config(path) -> int | None:
+    """The pin port ONE config file names, or None when it names none, is
+    unreadable, or malformed. The single-file read :func:`_wired_ports`
+    builds on, so a config's own answer is asked once.
+
+    RANGE-CHECKED HERE, at the read, not at the probe. A value outside
+    0-65535 is not a port at all — `int()` accepts it happily, but
+    `socket.connect` raises `OverflowError` for it, a type
+    `_wired_port_is_serving` never catches (it only catches `OSError`), and
+    both its call sites inside `heal` sit OUTSIDE its bottom `try`. That
+    turned a malformed `CSWAP_PIN_PORT` (any hand-edit or future writer bug,
+    e.g. 99999, 70000, -1, 4294967296) into a traceback out of `cswap pin
+    --heal` — called from the status line on a timer, where `heal`
+    documents "never raises". Treating it as "no opinion" here, at the
+    source, means every downstream consumer inherits the fix for free.
+    """
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        # ONLY A PORT THIS TOOL WIRED. The marker is the receipt; a
+        # ``CSWAP_PIN_PORT`` without one was put there by something else, and
+        # its liveness says nothing about ours. Reading it anyway let a foreign
+        # dead port make the staleness verdict True while OUR wiring was marked
+        # and serving — and ``heal`` then tore down the healthy one. The
+        # marker check lived only in ``_wiring_present``, one scope up, so
+        # every port-level consumer inherited the gap.
+        #
+        # THROUGH ``_wire_mark_of``, not a fresh isinstance. That helper exists
+        # because two readers of this same marker disagreed once and `--clear`
+        # never converged; a third reader written here would be a fourth
+        # opinion on one fact. It is the stricter test — a marker must be a
+        # NON-EMPTY list — and asking it here is what makes "names a port" and
+        # "is wired" the same question everywhere.
+        if _wire_mark_of(raw, path) is None:
+            return None
+        env = raw.get("env") or {}
+        port = int(env.get("CSWAP_PIN_PORT") or 0)
+    except Exception:  # noqa: BLE001 — unreadable/unwired: no opinion
+        return None
+    return port if 0 < port <= 65535 else None
+
+
+def _dead_wired_configs(_switcher, connect_timeout: float = 2.0, *,
+                        backup_root=None) -> list:
+    """Every wired config whose OWN port is not answering — and no more.
+
+    THE VERDICT IS MACHINE-WIDE; THE ACT MUST NOT BE. `_wired_port_is_serving`
+    is AND over every wired config on purpose, so one dead config makes the
+    whole machine "not serving" — correct, because a live session config must
+    not mask a dead default config. But `clear_wiring` is unconditional over
+    every wired config, and composing the two unwired the OTHER config's live,
+    correctly-routed pin:
+
+        session cfg -> 42967 (LIVE)   default cfg -> 39967 (DEAD)
+        stale verdict : True      ->  clear_wiring strips BOTH
+
+    which is this file's own rule broken by its own code path — see the
+    capitals at the top of :func:`heal`. The per-config answer was already
+    computed by `_port_of_config`; it just was not used to decide WHICH.
+
+    THIS LIST IS ALSO THE STALENESS VERDICT, one bool wide: "should any wiring
+    be removed" is exactly "is any wired config's own port dead". A separate
+    ``_wiring_is_stale`` predicate held that answer until every call site moved
+    here, and it was deleted rather than kept as a one-line shim — one decision
+    with two implementations is how the two drift apart, which this module's
+    header warns about and which its `clear_wiring` call sites had already
+    demonstrated.
+
+    "Is any of this cswap's to condemn at all" is asked by
+    :func:`_port_of_config`, once per config, and not again here — see the
+    comment below for what that replaced.
+    """
+    # BOTH GUARDS THAT STOOD HERE ARE ENFORCED ONE SCOPE DOWN, and asking
+    # them again was a leftover from before they moved. `_port_of_config`
+    # runs `_wire_mark_of` itself and range-checks the port, so a config
+    # without cswap's marker and a config whose port cannot be read BOTH
+    # yield None and are skipped by the comprehension below — which is also
+    # what made `_wired_ports()` (the same comprehension over the same
+    # reader) unable to change this answer.
+    #
+    # Measured: deleting the line cost 0 of 2013 tests, and it was costing
+    # two extra passes over `.claude.json` on the launch path — a file that
+    # is megabytes on a real machine.
+    #
+    # THE TWO FACTS IT WAS KEEPING ARE STILL TRUE, and both are documented
+    # where they are now enforced (`_port_of_config`):
+    #
+    #   A foreign `CSWAP_PIN_PORT` with no marker — a future `cswap-pin`
+    #   that stops writing it, or an unrelated var of the same name — must
+    #   not make this list non-empty, or `heal` reports "Removed a cloud pin
+    #   wiring…" over a byte-for-byte unchanged config. Nothing is ever
+    #   mutated (`_clear_wiring_locked` refuses a markerless file); the
+    #   damage is entirely in the VERDICT.
+    #
+    #   "I CANNOT TELL" IS NOT "IT IS DEAD". A config carrying the marker
+    #   with no readable port satisfies "wired" and "not serving" at once,
+    #   and the launch path tore it down against a proxy that may be
+    #   perfectly live. Per-config, that read sees None and the config is
+    #   skipped rather than cleared — which is what makes the ACT per-config
+    #   while the verdict stays machine-wide.
+    return [
+        path
+        for path in _each_config()
+        if (port := _port_of_config(path)) and not _port_answers(port, connect_timeout)
+    ]
 
 
 def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:

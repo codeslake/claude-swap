@@ -16,15 +16,23 @@ import pytest
 from claude_swap.exceptions import ClaudeSwitchError
 
 def _pinwiring():
-    """The module the wiring helpers actually live in.
+    """The module the wiring helpers actually live in: `claude_swap.pin`.
 
-    They moved to `cswap_pin.wiring`; `claude_swap.pin` keeps a forwarding shim
-    so callers did not have to change. A test that patches the SHIM injects
-    into a name nothing calls on the way down — green, and proving nothing.
+    They spent one commit in `cswap_pin.wiring` and came back. The detectors
+    -- `_certdir`, `_port_of_config`, `_port_answers`, `_dead_wired_configs` --
+    decide WHETHER `clear_wiring` runs, and `clear_wiring` is in cswap
+    precisely because the case it exists for is the package being gone. With
+    the detectors in the package they answered "nothing is wired" without it,
+    so the remover became unreachable and `serving_port` raised a TypeError on
+    a `None / "proxy.json"`.
+
+    Kept as an indirection rather than inlined because the point it makes is
+    still live: patch the module production actually calls, not a forwarder.
+    That is now this one.
     """
-    from cswap_pin import wiring
+    from claude_swap import pin
 
-    return wiring
+    return pin
 
 
 
@@ -7384,15 +7392,18 @@ class TestTheCertdirPathHasOneSpelling:
 
     def test_the_certdir_literal_appears_exactly_once(self):
         import ast
+        import inspect
         from pathlib import Path
 
-        # THE FILE THAT OWNS THE PATH. `_certdir` moved to the package with
-        # the rest of the wiring subsystem, and it took the one spelling with
-        # it — read it there, or this counts zero and the message below
-        # describes a second spelling that does not exist.
-        import cswap_pin.wiring as _w
+        # THE FILE THAT OWNS THE PATH, resolved from the function rather than
+        # named. `_certdir` has now moved twice — into the package and back —
+        # and each move silently changed which file this counts, once to ZERO
+        # while the message still said "more than one place". Ask the function
+        # where it lives and the guard cannot be aimed at the wrong subject
+        # again.
+        from claude_swap import pin as _owner
 
-        src = Path(_w.__file__).read_text()
+        src = Path(inspect.getsourcefile(_owner._certdir)).read_text()
         tree = ast.parse(src)
         # STRING CONSTANTS IN THE AST, not lines matching a phrase. The first
         # version grepped for the literal and caught `_certdir`'s own docstring
