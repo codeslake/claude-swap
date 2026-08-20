@@ -6578,19 +6578,9 @@ class ClaudeAccountSwitcher:
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
             to_ref = account_ref(int(target_account), target_email)
-            # THE LIVE LOGIN, and the correct value was already in
-            # `current_account` from the roster one line up before this
-            # overwrote it. The outgoing credential lives in
-            # `.credentials.json`, which the pin never touches, so it belongs
-            # to the roster's active account — while the identity file names
-            # the PIN after a rotation.
-            #
-            # Reading the file here classified the live credential against the
-            # PINNED slot: online that is "foreign", so every auto-rotation
-            # stashed and warned and the outgoing account never received its
-            # rotated token; offline it fails open and writes another
-            # account's credential into the pinned slot, which is the one
-            # credential that must stay good. Raised by review.
+            # The outgoing credential lives in `.credentials.json`, which
+            # the pin never touches, so it belongs to the roster's active
+            # account — not to whoever the identity file names.
             current_identity = self._live_login_identity()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
@@ -6858,17 +6848,11 @@ class ClaudeAccountSwitcher:
             except PermissionError:
                 raise ConfigError("Permission denied reading Claude config")
 
-            # UN-SPLICE BEFORE IT IS ARCHIVED. The four backup writes below
-            # store this blob as the OUTGOING slot's config, and under a pin
-            # its `oauthAccount` is the PIN's, not the slot's. Stored that
-            # way it outlives the pin: `pin --clear` does not rewrite it, and
-            # the next switch back reads it and puts the pin's identity into
-            # the live config again with nothing left to explain why.
-            #
-            # Fixed here rather than at the four writes, or in
-            # `_write_account_config` — that writer also moves configs
-            # between slots during a renumber, where rewriting the identity
-            # would be wrong.
+            # UN-SPLICE BEFORE IT IS ARCHIVED. The backup writes below store
+            # this blob as the OUTGOING slot's config, and under a pin its
+            # `oauthAccount` is the pin's. Stored that way it outlives the
+            # pin. Done here and not in `_write_account_config`, which also
+            # moves configs between slots during a renumber.
             if current_account and current_email:
                 original_config = self._config_naming_slot(
                     original_config, current_account, current_email
@@ -7055,17 +7039,9 @@ class ClaudeAccountSwitcher:
                 # assignment` with no salvage copy, losing the user's torn
                 # config for good. Absent/unreadable both fall to the same
                 # salvage-then-replace the direct-activation branch uses.
-                # THE PIN OWNS THE IDENTITY HERE TOO. This is the ORDINARY
-                # rotation path — the one an auto-switch takes — and the
-                # direct-activation branch above had the splice while this one
-                # did not, so the fix covered the rarer path and missed the
-                # traffic that actually tears bridges off. Caught by the cswap
-                # session with a live instrument and two passing controls:
-                # force_activate wrote the pin, no-pin wrote the target, and
-                # the ordinary rotation wrote the target while a pin was set.
-                #
-                # Same contract as the other path: splice when a pin resolves,
-                # byte-identical to before when it does not.
+                # The ordinary rotation path, and it splices on the same
+                # contract as the direct-activation branch above: the pin's
+                # identity when one resolves, unchanged when it does not.
                 from claude_swap import pin as _pin
 
                 pin_oauth_ord = _pin.identity_for_config(self)

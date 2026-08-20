@@ -145,7 +145,12 @@ def proper_lockfile(
             try:
                 os.utime(lock_dir)
             except OSError:
-                return  # lock stolen/removed; nothing left to keep alive
+                # GONE vs MERELY FAILED, and the old code could not tell them
+                # apart: it returned on any OSError, so one transient failure
+                # disarmed the heartbeat while the lock was still held and a
+                # waiter could steal it as stale CONFIG_STALENESS_S later.
+                if not lock_dir.exists():
+                    return  # stolen or removed; nothing left to keep alive
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
