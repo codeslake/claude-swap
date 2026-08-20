@@ -1020,6 +1020,45 @@ class ClaudeAccountSwitcher:
             return False
         return True
 
+    def _config_naming_slot(
+        self, config: str, account_num: str, email: str
+    ) -> str:
+        """`config` with its `oauthAccount` set to the slot's own identity.
+
+        The inverse of the pin splice, for the moment a live config is
+        archived as a slot's backup. Returns the input unchanged on any
+        doubt — a backup that is merely stale beats one this could not parse.
+        """
+        try:
+            data = json.loads(config)
+            if not isinstance(data, dict) or "oauthAccount" not in data:
+                return config
+            # THE ROSTER FIRST, and this order is the whole correctness of
+            # the repair. Asking the slot's STORED config who it belongs to
+            # trusts a file that may already carry the pin: measured on a real
+            # backup, the lookup returned the pin, decided it already matched,
+            # and changed nothing. The roster is the index of which slot is
+            # whose; the stored config is only a fallback for a slot the
+            # roster has not caught up with.
+            row = (self._get_sequence_data() or {}).get(
+                "accounts", {}).get(str(account_num)) or {}
+            own = None
+            if row.get("email"):
+                own = {"emailAddress": row["email"],
+                       "organizationUuid": row.get("organizationUuid", "") or ""}
+            else:
+                stored = self._read_account_config(account_num, email)
+                if stored:
+                    own = json.loads(stored).get("oauthAccount")
+            if not isinstance(own, dict) or not own:
+                return config
+            if data["oauthAccount"] == own:
+                return config
+            data["oauthAccount"] = own
+            return json.dumps(data)
+        except Exception:  # noqa: BLE001 — never block a switch
+            return config
+
     def _write_account_config(
         self, account_num: str, email: str, config: str
     ) -> None:
@@ -3024,8 +3063,16 @@ class ClaudeAccountSwitcher:
         and a mismatch means the live store is no longer the caller's account
         — nothing there is its to adopt, consume, or overwrite. Compares the
         organization too: two managed slots may share an email across orgs.
+
+        Asks `_live_login_identity`, not the config field directly. The splice
+        writes the pin there and it STAYS, so a literal read answers False for
+        the account that is logged in on every pass, not for a race window —
+        which silently disabled the rotated-backup resync and deferred the
+        usage fetch to USAGE_TOKEN_EXPIRED. It still detects a switch or a
+        /login landing in the gap, because both move the roster inside the
+        same critical section.
         """
-        identity = self._get_current_account()
+        identity = self._live_login_identity()
         return identity is not None and identity == (email, org_uuid or "")
 
     def _resolved_matches_slot_identity(
@@ -6810,6 +6857,22 @@ class ClaudeAccountSwitcher:
                 raise ConfigError("Claude config file not found")
             except PermissionError:
                 raise ConfigError("Permission denied reading Claude config")
+
+            # UN-SPLICE BEFORE IT IS ARCHIVED. The four backup writes below
+            # store this blob as the OUTGOING slot's config, and under a pin
+            # its `oauthAccount` is the PIN's, not the slot's. Stored that
+            # way it outlives the pin: `pin --clear` does not rewrite it, and
+            # the next switch back reads it and puts the pin's identity into
+            # the live config again with nothing left to explain why.
+            #
+            # Fixed here rather than at the four writes, or in
+            # `_write_account_config` — that writer also moves configs
+            # between slots during a renumber, where rewriting the identity
+            # would be wrong.
+            if current_account and current_email:
+                original_config = self._config_naming_slot(
+                    original_config, current_account, current_email
+                )
 
             transaction = SwitchTransaction(
                 original_credentials=original_creds,

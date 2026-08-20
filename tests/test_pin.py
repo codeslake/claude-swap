@@ -7572,6 +7572,119 @@ class TestTheSpliceMustNotCostTheEngineItsActiveAccount:
         assert sw.current_account_number() == "6"
 
 
+class TestAnArchivedConfigNamesItsOwnSlot:
+    """A slot's stored config must name that slot, never the pin.
+
+    `_perform_switch` archives the live config as the outgoing slot's backup.
+    Under a pin that blob's `oauthAccount` is the pin's, so the backup names
+    someone else — and it outlives the pin: `pin --clear` does not rewrite it,
+    and the next switch back reads it and puts the pin's identity into the
+    live config again with nothing left to explain why.
+    """
+
+    def _sw(self, monkeypatch, stored_for_slot):
+        import json as _json
+
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_read_account_config",
+            lambda self, num, email: stored_for_slot.get(str(num)),
+            raising=False)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_sequence_data",
+            lambda self: {"accounts": {
+                "5": {"email": "serving@example.com",
+                      "organizationUuid": "org-1"}}}, raising=False)
+        return sw
+
+    PIN_ID = {"emailAddress": "pinned@example.com",
+              "organizationUuid": "org-1"}
+    OWN_ID = {"emailAddress": "serving@example.com",
+              "organizationUuid": "org-1"}
+
+    def test_the_pins_identity_is_replaced_by_the_slots_own(self, monkeypatch):
+        import json as _json
+
+        sw = self._sw(monkeypatch, {"5": _json.dumps({"oauthAccount": self.OWN_ID})})
+        live = _json.dumps({"oauthAccount": self.PIN_ID, "other": "kept"})
+        out = _json.loads(sw._config_naming_slot(live, "5", "serving@example.com"))
+        assert out["oauthAccount"] == self.OWN_ID, (
+            "the outgoing slot's backup would name the pin, permanently, and "
+            "feed the pin's identity back into the live config on the next "
+            "switch to it"
+        )
+        assert out["other"] == "kept", "the rest of the config must survive"
+
+    def test_no_stored_config_falls_back_to_the_roster(self, monkeypatch):
+        import json as _json
+
+        sw = self._sw(monkeypatch, {})
+        live = _json.dumps({"oauthAccount": self.PIN_ID})
+        out = _json.loads(sw._config_naming_slot(live, "5", "serving@example.com"))
+        assert out["oauthAccount"]["emailAddress"] == "serving@example.com"
+
+    def test_unparsable_is_returned_untouched(self, monkeypatch):
+        """The control. A backup that is merely stale beats one this mangled."""
+        sw = self._sw(monkeypatch, {})
+        assert sw._config_naming_slot("not json", "5", "x@example.com") == "not json"
+
+
+class TestTheIdentityRecheckMustSeeTheLiveLogin:
+    """The under-lock re-check has to recognise the account that is logged in.
+
+    It compares against the config identity, which the splice makes the pin
+    persistently — so for the active slot it answers False every pass, and
+    for the pin it answers True. Both callers act on that: the rotated-backup
+    resync returns without writing, and the usage fetch defers to
+    USAGE_TOKEN_EXPIRED.
+    """
+
+    def _sw(self, monkeypatch, config_email, pin_email, roster):
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_current_account",
+            lambda self: (config_email, "org-1"), raising=False)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_sequence_data",
+            lambda self: roster, raising=False)
+        monkeypatch.setattr(
+            "claude_swap.pin._pinned_email_now",
+            lambda s: (pin_email, "org-1") if pin_email else None)
+        return sw
+
+    ROSTER = {"activeAccountNumber": 3, "accounts": {
+        "1": {"email": "pinned@example.com", "organizationUuid": "org-1"},
+        "3": {"email": "serving@example.com", "organizationUuid": "org-1"},
+    }}
+
+    def test_it_recognises_the_serving_account(self, monkeypatch):
+        sw = self._sw(monkeypatch, config_email="pinned@example.com",
+                      pin_email="pinned@example.com", roster=self.ROSTER)
+        assert sw._live_identity_matches("serving@example.com", "org-1"), (
+            "the rotated-backup resync returns without writing and the usage "
+            "fetch defers, every pass, for the account that is logged in"
+        )
+
+    def test_it_does_not_answer_yes_for_the_pin(self, monkeypatch):
+        sw = self._sw(monkeypatch, config_email="pinned@example.com",
+                      pin_email="pinned@example.com", roster=self.ROSTER)
+        assert not sw._live_identity_matches("pinned@example.com", "org-1"), (
+            "the pin is not the live login; saying yes here lets a caller "
+            "adopt or overwrite the pinned slot with another account's bytes"
+        )
+
+    def test_with_no_pin_it_is_unchanged(self, monkeypatch):
+        """The control."""
+        sw = self._sw(monkeypatch, config_email="serving@example.com",
+                      pin_email=None, roster=self.ROSTER)
+        assert sw._live_identity_matches("serving@example.com", "org-1")
+        assert not sw._live_identity_matches("pinned@example.com", "org-1")
+
+
 class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
     """Ten sites recomputed it; one was fixed. This pins the rest.
 
