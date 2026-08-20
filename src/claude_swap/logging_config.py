@@ -20,6 +20,25 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
         return super()._open()
 
 
+def decision_logger(log_dir: Path) -> logging.Logger:
+    """A per-engine logger for the auto-switch tick reasoning.
+
+    Instantiated directly rather than via ``getLogger``: one engine owns it, so
+    it has no parent to spill into claude-swap.log, whose 1MB x 3 rotation
+    holds the switch history a per-tick record would evict.
+    """
+    logger = logging.Logger("claude-swap.decisions", logging.INFO)
+    handler = _LazyDirRotatingFileHandler(
+        log_dir / "autoswitch-decisions.log",
+        maxBytes=1024 * 1024, backupCount=2, delay=True,
+    )
+    # No `asctime`: that is naive LOCAL time, and every other record of the
+    # same decision -- `event.ts`, `to_json()`, the usage cache -- is UTC. The
+    # caller puts the event's own stamp in the message so the two can be joined.
+    logger.addHandler(handler)
+    return logger
+
+
 def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
     """Setup logging with file and optional console output.
 
