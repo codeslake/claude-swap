@@ -8328,7 +8328,7 @@ class TestARolledBackPinDoesNotLeaveItsNameBehind:
                             lambda s: ("old@example.com", "org-OLD"))
         monkeypatch.setattr(
             "claude_swap.pin.identity_for_config",
-            lambda s, email=None: {"emailAddress": "old@example.com",
+            lambda s, email=None, **_k: {"emailAddress": "old@example.com",
                                    "accountUuid": "OLD-UUID"})
 
         assert pin._restore_pin(self._sw(), ("old@example.com", "org-OLD"))
@@ -8358,7 +8358,7 @@ class TestARolledBackPinDoesNotLeaveItsNameBehind:
         monkeypatch.setattr("claude_swap.pin._pinned_email_now",
                             lambda s: ("old@example.com", "org-OLD"))
         monkeypatch.setattr("claude_swap.pin.identity_for_config",
-                            lambda s, email=None: {"emailAddress": "x"})
+                            lambda s, email=None, **_k: {"emailAddress": "x"})
 
         assert pin._restore_pin(self._sw(), ("old@example.com", "org-OLD"))
 
@@ -8434,8 +8434,8 @@ class TestClearingHandsBackTheLiveAccount:
                             lambda *a, **k: True)
         monkeypatch.setattr(
             "claude_swap.pin.identity_for_config",
-            lambda s, email=None: ({"emailAddress": email}
-                                   if email == live_email else None))
+            lambda s, email=None, **_k: ({"emailAddress": email}
+                                        if email == live_email else None))
         return pin
 
     def _sw(self, live_email):
@@ -8443,6 +8443,11 @@ class TestClearingHandsBackTheLiveAccount:
         sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
         sw.backup_dir = "/nowhere"
         sw._live_login_identity = lambda: (live_email, "org-LIVE")
+        # THE SLOT, because `clear_pin` hands it over rather than making
+        # `identity_for_config` re-derive it from an address that may name two
+        # slots. A stub narrower than the real switcher reads as a production
+        # bug; this method exists on it.
+        sw.current_account_number = lambda: "1"
         return sw
 
     def test_the_live_account_is_handed_to_the_clear(self, monkeypatch):
@@ -8527,3 +8532,74 @@ class TestNoNameIsDefinedTwiceInThisModule:
             "a name is defined more than once at module level; the LAST one "
             f"wins and the earlier is dead code nothing will report: {problems}"
         )
+
+
+class TestSetPinNamesTheAccountItIsPinning:
+    """`set_pin` handed `apply_pin` the identity of the PREVIOUS pin.
+
+    `identity_for_config(switcher)` with no email resolves whatever the RECORD
+    currently says, and Python evaluates that argument before `apply_pin` runs
+    -- so it reads the state from before the call it is an argument to. Two
+    ways wrong, and the first is the whole feature:
+
+        first pin ever   record empty      -> None       -> no splice at all
+        re-pin A -> B    record still A    -> A identity -> config names A
+
+    Measured on a live machine: the pin record said one account, the config
+    named a second, and all 13 live bridges were owned by a third. `cswap pin`
+    reported success throughout, because the record it prints is the one thing
+    that DID get written.
+
+    The `email` parameter this needs already exists -- it was added one commit
+    earlier for `_restore_pin`, and this call site never started using it.
+    """
+
+    def _wire(self, monkeypatch, seen, record):
+        from claude_swap import pin
+
+        class _Impl:
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                seen.append({"pinning": email, "identity": identity})
+                record["value"] = (email, org_uuid)   # apply_pin's save_pin
+                return True
+
+        monkeypatch.setattr(pin, "_impl", lambda: _Impl)
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: record["value"])
+        monkeypatch.setattr(pin, "_restore_pin", lambda _s, _b: True)
+        return pin
+
+    def _sw(self):
+        from claude_swap import switcher as _sw
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        sw.resolve_account = lambda email: ("1",)
+        sw._account_kind = lambda num: "oauth"
+        sw._resolve_account_identifier = lambda email: {
+            "a@example.com": "1", "b@example.com": "2"}.get(email)
+        sw._read_account_config = lambda num, email: (
+            '{"oauthAccount": {"emailAddress": "%s", "accountUuid": "UUID-%s"}}'
+            % (email, num))
+        return sw
+
+    def test_the_first_pin_ever_still_names_itself(self, monkeypatch):
+        seen, record = [], {"value": None}
+        pin = self._wire(monkeypatch, seen, record)
+        ok, _msg = pin.set_pin(self._sw(), "a@example.com", "org-A", num="1")
+        assert ok
+        assert seen, "apply_pin was never reached -- the test proves nothing"
+        assert seen[0]["identity"] == {"emailAddress": "a@example.com",
+                                       "accountUuid": "UUID-1"}, (
+            "the first pin on a machine handed identity=None, so nothing "
+            "spliced and the pin was inert until some later switch")
+
+    def test_a_re_pin_names_the_new_account_not_the_old(self, monkeypatch):
+        seen, record = [], {"value": ("a@example.com", "org-A")}
+        pin = self._wire(monkeypatch, seen, record)
+        ok, _msg = pin.set_pin(self._sw(), "b@example.com", "org-B", num="2")
+        assert ok
+        assert seen[-1]["identity"] == {"emailAddress": "b@example.com",
+                                        "accountUuid": "UUID-2"}, (
+            "re-pinning to B wrote A into the config, so every bridge minted "
+            "afterwards is owned by the account that was UNPINNED")

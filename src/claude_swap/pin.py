@@ -965,13 +965,24 @@ def pinned_identity(switcher) -> "tuple[str, str] | None":
         return None
 
 
-def identity_for_config(switcher, email: str | None = None) -> "dict | None":
+def identity_for_config(switcher, email: str | None = None,
+                        num: str | None = None) -> "dict | None":
     """The `oauthAccount` the config should name while a pin is set, or None.
 
     ``email`` asks about a DIFFERENT account than the one currently recorded.
-    The rollback needs it: by the time it runs, the record has already been
-    overwritten by the pin that failed, so "whatever is recorded" is the wrong
-    answer and the only right one is the account being restored.
+    Two callers need it. The rollback, because by the time it runs the record
+    has already been overwritten by the pin that failed; and ``set_pin``,
+    because this argument is evaluated BEFORE ``apply_pin`` writes the record,
+    so the no-argument form there resolves the outgoing pin.
+
+    ``num`` is the slot a caller ALREADY resolved, and passing it skips the
+    lookup entirely. That matters because `_resolve_account_identifier` RAISES
+    when one address matches two slots -- cswap's own documented personal+org
+    pattern -- and the function-wide except turns that into ``None``, which
+    means "leave the config alone". So on exactly the roster the composite work
+    exists for, the splice silently did nothing. `set_pin` says the same thing
+    about its own re-derivation in its own comment; this is that lesson one
+    function along.
 
     THE SEAM ANSWERS, THE SWITCHER ASKS. This used to live in switcher.py,
     where it resolved the pinned slot, read that slot's stored config and
@@ -995,7 +1006,7 @@ def identity_for_config(switcher, email: str | None = None) -> "dict | None":
         email = email or pinned_identity_email(switcher)
         if not email:
             return None
-        num = switcher._resolve_account_identifier(email)
+        num = num or switcher._resolve_account_identifier(email)
         if not num:
             return None
         raw = switcher._read_account_config(str(num), email)
@@ -1442,7 +1453,9 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # switch rewrites it; a blank owner would be worse than a stale one.
     try:
         _live = switcher._live_login_identity()
-        _back_to = identity_for_config(switcher, email=_live[0]) if _live else None
+        _back_to = (identity_for_config(
+            switcher, email=_live[0],
+            num=switcher.current_account_number()) if _live else None)
     except Exception:  # noqa: BLE001 — nothing optional may block a clear
         _back_to = None
     try:
@@ -1563,9 +1576,14 @@ def set_pin(
         # cswap's backup store, whose layout the package has no business
         # knowing (see `identity_for_config`). So cswap looks it up and the
         # package applies it, which is the split this seam exists for.
+        # ASK ABOUT `email`, NOT ABOUT THE RECORD. Python evaluates this
+        # argument BEFORE `apply_pin` runs, and `apply_pin` is what writes the
+        # record — so the no-argument form resolves the PREVIOUS pin: None on
+        # a first pin (nothing splices, the pin is inert) and the outgoing
+        # account on a re-pin (the config names what was just unpinned).
         started = _impl().apply_pin(
             switcher, email, org_uuid,
-            identity=identity_for_config(switcher))
+            identity=identity_for_config(switcher, email=email, num=num))
     except Exception as exc:  # noqa: BLE001 — a traceback tells a user nothing
         rolled = _restore_pin(switcher, before)
         return False, (
