@@ -1192,10 +1192,28 @@ def identity_for_config(switcher, email: str | None = None,
         if not num:
             return None
         raw = switcher._read_account_config(str(num), email)
-        if not raw:
-            return None
-        oauth = json.loads(raw).get("oauthAccount")
-        return oauth if isinstance(oauth, dict) and oauth else None
+        oauth = json.loads(raw).get("oauthAccount") if raw else None
+        if isinstance(oauth, dict) and oauth.get("accountUuid"):
+            return oauth
+        # A machine that has never switched INTO the pinned account has no
+        # stored config to copy, and None here makes `_perform_switch` fall
+        # back to the account being switched TO — so the pin never reaches
+        # `~/.claude.json` and every bridge is owned by whoever is active.
+        # The roster answers: its `uuid` IS the account uuid a stored config
+        # calls `accountUuid`. A stored config still wins when it has one,
+        # because it also carries displayName and organizationName, which
+        # Claude Code writes and the roster has never held.
+        row = ((switcher._get_sequence_data() or {})
+               .get("accounts", {}).get(str(num)) or {})
+        uuid = (row.get("uuid") or "").strip()
+        if not uuid:
+            # Claude Code compares an owner on account uuid AND org uuid, so an
+            # identity without one is no better than None — and None at least
+            # means "leave the field alone".
+            return oauth if isinstance(oauth, dict) and oauth else None
+        return {"emailAddress": row.get("email") or email,
+                "organizationUuid": row.get("organizationUuid") or "",
+                "accountUuid": uuid}
     except Exception:  # noqa: BLE001 — never block a switch
         return None
 

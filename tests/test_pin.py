@@ -8391,6 +8391,12 @@ class TestIdentityForConfigCanBeAskedAboutAnySlot:
         sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
         sw._resolve_account_identifier = lambda ident: "2"
         sw._read_account_config = lambda num, email: stored
+        # THE ROSTER TOO, because the real switcher has one and
+        # `identity_for_config` now consults it when a stored config carries no
+        # accountUuid. A stub narrower than the real callee reads as a
+        # production regression when the fixture is what is missing. No `uuid`
+        # here, so the stored config still decides these cases.
+        sw._get_sequence_data = lambda: {"accounts": {"2": {}}}
         return sw
 
     def test_an_explicit_email_wins_over_the_record(self, monkeypatch):
@@ -8917,3 +8923,77 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
 
         assert pin._restore_pin(self._sw(live=None), None) is True
         assert spliced[-1] is None
+
+
+class TestTheRosterCanNameThePinWhenNoBackupCan:
+    """A machine with no stored account config could never name its pin.
+
+    `identity_for_config` copies the pinned slot's STORED config, and a machine
+    that has not switched into that account since the store was created has
+    none. It then returns None, `_perform_switch` falls back to the account
+    being switched TO, and the pin never reaches `~/.claude.json` — so every
+    bridge is owned by whoever happens to be active and dies at the next
+    rotation. Requirement 1 cannot hold there at all.
+
+    Measured on a machine in this fleet: zero stored configs, and a live
+    identity carrying only emailAddress and organizationUuid — which is also
+    useless, because Claude Code compares a bridge's owner on account uuid AND
+    organization uuid.
+
+    THE ROSTER HAS BOTH. Every row carries `email`, `organizationUuid` and
+    `uuid`, and `uuid` IS the account uuid — the same field the stored config
+    calls `accountUuid`. So the fallback is not a guess: it is the same two
+    facts from cswap's own index.
+
+    RICHER WINS. A stored config carries displayName, organizationName and the
+    rest, and Claude Code writes those itself; the roster cannot. So the backup
+    is still preferred and this only fills a gap that would otherwise be None.
+    """
+
+    def _sw(self, stored, roster_uuid="UUID-1"):
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw._resolve_account_identifier = lambda ident: "1"
+        sw._read_account_config = lambda num, email: stored
+        sw._get_sequence_data = lambda: {"accounts": {"1": {
+            "email": "pinned@example.com",
+            "organizationUuid": "org-PIN",
+            "uuid": roster_uuid}}}
+        return sw
+
+    def test_no_stored_config_still_names_the_pin(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-PIN"))
+        got = pin.identity_for_config(self._sw(stored=""))
+        assert got == {"emailAddress": "pinned@example.com",
+                       "organizationUuid": "org-PIN",
+                       "accountUuid": "UUID-1"}, (
+            "a machine with no stored config cannot name its pin, so every "
+            f"bridge it mints is owned by the active account: {got!r}")
+
+    def test_a_stored_config_is_still_preferred(self, monkeypatch):
+        """It carries fields the roster does not have and Claude Code does."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-PIN"))
+        rich = ('{"oauthAccount": {"emailAddress": "pinned@example.com", '
+                '"accountUuid": "FROM-BACKUP", "displayName": "Someone"}}')
+        got = pin.identity_for_config(self._sw(stored=rich))
+        assert got["accountUuid"] == "FROM-BACKUP", got
+        assert got.get("displayName") == "Someone", (
+            "the roster fallback overwrote a richer stored identity")
+
+    def test_a_roster_row_without_a_uuid_is_not_used(self, monkeypatch):
+        """THE CONTROL. Without a uuid the fallback would write the same
+        2-key identity that cannot satisfy CC's owner comparison — the state
+        this exists to escape. None is honest; a useless answer is not."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-PIN"))
+        assert pin.identity_for_config(
+            self._sw(stored="", roster_uuid="")) is None
