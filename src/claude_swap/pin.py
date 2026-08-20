@@ -1109,6 +1109,24 @@ def pinned_identity(switcher) -> "tuple[str, str] | None":
         return None
 
 
+def _live_login_for_config(switcher) -> "dict | None":
+    """The identity the config should carry when NO pin is being named.
+
+    Both callers reach this by the same route -- a clear, and a rollback with
+    nothing to restore -- and both mean "hand the machine back to whoever is
+    actually logged in". `_live_login_identity` un-splices, which is the
+    point: under a pin the config names the pin, and the account that has been
+    SERVING is the one the config should name once the pin is gone.
+
+    None on any doubt, which the package reads as "leave the field alone".
+    """
+    live = switcher._live_login_identity()
+    if not live:
+        return None
+    return identity_for_config(switcher, email=live[0],
+                               num=switcher.current_account_number())
+
+
 def _slot_for(switcher, email: "str | None", org_uuid: "str | None"):
     """The roster slot for ``(email, org_uuid)``, or None when it cannot tell.
 
@@ -1424,10 +1442,7 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
                 num=_slot_for(switcher, before[0],
                               before[1] if len(before) > 1 else None))
         else:
-            _live = switcher._live_login_identity()
-            _back = identity_for_config(
-                switcher, email=_live[0],
-                num=switcher.current_account_number()) if _live else None
+            _back = _live_login_for_config(switcher)
         _impl().splice_config_identity(_back)
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
@@ -1640,10 +1655,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # pin is gone. None on any doubt leaves the field alone, and the next
     # switch rewrites it; a blank owner would be worse than a stale one.
     try:
-        _live = switcher._live_login_identity()
-        _back_to = (identity_for_config(
-            switcher, email=_live[0],
-            num=switcher.current_account_number()) if _live else None)
+        _back_to = _live_login_for_config(switcher)
     except Exception:  # noqa: BLE001 — nothing optional may block a clear
         _back_to = None
     try:
