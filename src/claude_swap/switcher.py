@@ -1052,8 +1052,10 @@ class ClaudeAccountSwitcher:
             # whole dict to the synthesis can never be equal, so without this
             # the rewrite fired on EVERY switch, pin or no pin, and the loss
             # outlives the pin: nothing rewrites a backup afterwards.
+            slot_org = row.get("organizationUuid", "") or ""
             if isinstance(here, dict) and slot_email and \
-                    here.get("emailAddress") == slot_email:
+                    here.get("emailAddress") == slot_email and \
+                    (here.get("organizationUuid") or "") == slot_org:
                 return config
             own = None
             if slot_email:
@@ -1062,14 +1064,24 @@ class ClaudeAccountSwitcher:
                 # fallback when there is none.
                 stored = self._read_account_config(account_num, email)
                 if stored:
-                    kept = json.loads(stored).get("oauthAccount")
+                    # ITS OWN GUARD. This parse sits inside the function-wide
+                    # try, so a torn backup raised and the bare except handed
+                    # the config back UNCHANGED — under a pin, archiving the
+                    # pin. A bad backup must cost the full identity, not the
+                    # repair.
+                    try:
+                        kept = json.loads(stored).get("oauthAccount")
+                    except (ValueError, TypeError):
+                        kept = None
+                    # THE COMPOSITE. A backup that names the right address in
+                    # the wrong org is another slot's, or the pin's.
                     if isinstance(kept, dict) and \
-                            kept.get("emailAddress") == slot_email:
+                            kept.get("emailAddress") == slot_email and \
+                            (kept.get("organizationUuid") or "") == slot_org:
                         own = kept
                 if own is None:
                     own = {"emailAddress": slot_email,
-                           "organizationUuid": row.get(
-                               "organizationUuid", "") or ""}
+                           "organizationUuid": slot_org}
             else:
                 stored = self._read_account_config(account_num, email)
                 if stored:

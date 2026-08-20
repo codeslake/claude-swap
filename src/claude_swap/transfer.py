@@ -229,6 +229,11 @@ def export_accounts(
             if not config_path.exists():
                 raise ConfigError("Claude config file not found")
             config_text = config_path.read_text(encoding="utf-8")
+            # UN-SPLICE IT. `_slim_config` keeps `oauthAccount` and drops the
+            # rest, so under a pin the export records the PIN as this slot's
+            # identity — and `import` writes that as the destination machine's
+            # backup for the slot, on a machine that may have no pin at all.
+            config_text = switcher._config_naming_slot(config_text, num, email)
         else:
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)

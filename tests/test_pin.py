@@ -7707,6 +7707,71 @@ class TestAnArchivedConfigNamesItsOwnSlot:
             "own full identity sat in its backup — accountUuid lost on the "
             "one path that exists to restore the right account")
 
+    def test_two_slots_sharing_an_email_are_told_apart_by_org(
+            self, monkeypatch):
+        """cswap keys an account on (email, organizationUuid), and
+        `_live_identity_matches` says outright that two managed slots may share
+        an email across orgs. Comparing the address alone makes the pinned slot
+        and the outgoing slot indistinguishable, so the pin's uuid and org get
+        archived verbatim as the OTHER slot's backup — the corruption this
+        function exists to prevent, outliving the pin.
+        """
+        import json as _json
+
+        from claude_swap import switcher as _sw
+
+        shared = "shared@example.com"
+        pin_id = {"emailAddress": shared, "accountUuid": "uuid-PIN",
+                  "organizationUuid": "org-PIN", "organizationName": "Pin Org"}
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_read_account_config",
+            lambda self, num, email: None, raising=False)
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_sequence_data",
+            lambda self: {"accounts": {
+                "2": {"email": shared, "organizationUuid": "org-SERVING"}}},
+            raising=False)
+
+        out = _json.loads(sw._config_naming_slot(
+            _json.dumps({"oauthAccount": dict(pin_id)}), "2", shared))
+        assert out["oauthAccount"].get("organizationUuid") == "org-SERVING", (
+            "the pin's org was archived as this slot's own — two slots that "
+            "share an address were told apart by the address")
+        assert out["oauthAccount"].get("accountUuid") != "uuid-PIN", (
+            "the pin's accountUuid was archived, and Claude Code identifies "
+            "an account by exactly that")
+
+    def test_a_torn_backup_does_not_abort_the_repair(self, monkeypatch):
+        """The backup parse sits inside the function-wide try, so an
+        unparsable file raised and the bare except returned the config
+        UNCHANGED — under a pin, archiving the pin. A bad backup must cost the
+        full identity, not the repair itself.
+        """
+        import json as _json
+
+        sw = self._sw(monkeypatch, {"5": "{tor"})
+        out = _json.loads(sw._config_naming_slot(
+            _json.dumps({"oauthAccount": dict(self.PIN_ID)}),
+            "5", "serving@example.com"))
+        assert out["oauthAccount"]["emailAddress"] == "serving@example.com", (
+            "a torn backup let the pin's identity through into the archive")
+
+    def test_a_backup_naming_a_third_party_is_not_trusted(self, monkeypatch):
+        """The stored identity is only the slot's own if it says so. One that
+        names somebody else is another slot's file, or the pin's."""
+        import json as _json
+
+        sw = self._sw(monkeypatch, {"5": _json.dumps(
+            {"oauthAccount": {"emailAddress": "someone-else@example.com",
+                              "accountUuid": "uuid-THIRD",
+                              "organizationUuid": "org-1"}})})
+        out = _json.loads(sw._config_naming_slot(
+            _json.dumps({"oauthAccount": dict(self.PIN_ID)}),
+            "5", "serving@example.com"))
+        assert out["oauthAccount"]["emailAddress"] == "serving@example.com", (
+            "a backup naming a third party was archived as this slot's own")
+
     def test_no_stored_config_falls_back_to_the_roster(self, monkeypatch):
         import json as _json
 
