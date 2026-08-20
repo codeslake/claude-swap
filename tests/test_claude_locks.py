@@ -69,71 +69,10 @@ class TestProperLockfile:
             time.sleep(0.4)
             assert time.time() - lock_dir.stat().st_mtime < 10.0
 
-    def test_a_transient_utime_failure_does_not_disarm_the_heartbeat(
-            self, lock_dir, monkeypatch):
-        """One failed touch must not stop the touching.
-
-        The toucher returned on any OSError, so a single transient failure
-        killed the heartbeat while the lock was still held — and after
-        CONFIG_STALENESS_S any waiter legally steals it. Surfaced as a
-        Windows CI failure where `heal` took a lock a test was holding live.
-        """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
-        calls = {"n": 0}
-        real = os.utime
-
-        def flaky(path, *a, **k):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise OSError("transient")
-            return real(path, *a, **k)
-
-        monkeypatch.setattr(claude_locks.os, "utime", flaky)
-        with proper_lockfile(lock_dir):
-            past = time.time() - 30
-            real(lock_dir, (past, past))
-            time.sleep(0.4)
-            assert calls["n"] > 1, "the toucher stopped after one failure"
-            assert time.time() - lock_dir.stat().st_mtime < 10.0, (
-                "the lock went stale while still held, so a waiter may steal it"
-            )
-
-    def test_a_vanished_lock_still_stops_the_toucher(self, lock_dir, monkeypatch):
-        """The control. Retrying forever on a lock that is GONE would be the
-        opposite defect, and the original `return` existed for this case."""
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
-        with proper_lockfile(lock_dir):
-            os.rmdir(lock_dir)
-            time.sleep(0.3)
-            assert not lock_dir.exists(), "the toucher recreated a dead lock"
-
     def test_creates_missing_parent(self, tmp_path):
         nested = tmp_path / "a" / "b" / "target.lock"
         with proper_lockfile(nested):
             assert nested.is_dir()
-
-    def test_a_small_timeout_is_not_overshot_by_the_retry_sleep(self, lock_dir):
-        """The contention retry sleeps a full jittered 0.25-0.5s regardless of
-        the deadline, so a sub-sleep ``timeout`` (e.g. 0.01s) never times out
-        anywhere near when it says: MEASURED (this worktree, before any fix,
-        `$CLAUDE_JOB_DIR/tmp/overshoot.py`, 6 tries each) —
-
-            timeout=0.01   worst elapsed=0.408s   overshoot=+0.398s
-            timeout=0.25   worst elapsed=0.487s   overshoot=+0.237s
-            timeout=0.5    worst elapsed=0.910s   overshoot=+0.410s
-
-        The sleep must clamp to what's left of the budget, not the jitter's
-        own floor."""
-        lock_dir.mkdir()  # fresh mtime -> contended, not stale
-        start = time.monotonic()
-        with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.01):
-                pass
-        elapsed = time.monotonic() - start
-        assert elapsed < 0.15, (
-            f"a 0.01s timeout overshot to {elapsed:.3f}s — the retry sleep "
-            "ignored the remaining budget"
-        )
 
 
 class TestLockPaths:

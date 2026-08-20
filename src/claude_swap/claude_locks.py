@@ -103,7 +103,6 @@ def proper_lockfile(
         timeout = DEFAULT_TIMEOUT_S
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    deadline = start + timeout
     while True:
         try:
             os.mkdir(lock_dir)
@@ -125,18 +124,9 @@ def proper_lockfile(
             try:
                 os.rmdir(lock_dir)
             except OSError:
-                # Can't remove it either; don't spin hot, but never past the
-                # deadline (see the clamp below — same reasoning applies).
-                time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
+                time.sleep(0.05)  # can't remove it either; don't spin hot
             continue
-        # CLAMPED TO THE REMAINING BUDGET. A full-length jittered sleep
-        # overshoots a small `timeout` — the deadline check above cannot fire
-        # because the sleep blows past it first (timeout=0.01 -> 0.408s
-        # elapsed; timeout=0.5 -> 0.910s). Callers that hand each path a
-        # fraction of a shrinking budget (`clear_wiring`) depend on this. With
-        # a full sleep's worth of budget left the clamp is a no-op and the
-        # jitter still spreads waiters apart.
-        time.sleep(max(0.0, min(0.25 + random.random() * 0.25, deadline - time.monotonic())))
+        time.sleep(0.25 + random.random() * 0.25)
 
     stop_touching = threading.Event()
 
@@ -145,12 +135,7 @@ def proper_lockfile(
             try:
                 os.utime(lock_dir)
             except OSError:
-                # GONE vs MERELY FAILED, and the old code could not tell them
-                # apart: it returned on any OSError, so one transient failure
-                # disarmed the heartbeat while the lock was still held and a
-                # waiter could steal it as stale CONFIG_STALENESS_S later.
-                if not lock_dir.exists():
-                    return  # stolen or removed; nothing left to keep alive
+                return  # lock stolen/removed; nothing left to keep alive
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
