@@ -115,7 +115,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cswap-pin", marker = "extra == 'pin'", specifier = ">=0.1.112" },
+    { name = "cswap-pin", marker = "extra == 'pin'", specifier = ">=0.1.134" },
     { name = "keyring", marker = "sys_platform == 'win32'", specifier = ">=25.0.0" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
     { name = "textual", specifier = ">=8.2.8,<9" },
