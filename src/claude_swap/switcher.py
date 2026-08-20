@@ -1042,17 +1042,41 @@ class ClaudeAccountSwitcher:
             # roster has not caught up with.
             row = (self._get_sequence_data() or {}).get(
                 "accounts", {}).get(str(account_num)) or {}
+            slot_email = row.get("email")
+            here = data["oauthAccount"]
+            # ALREADY OURS — LEAVE EVERY FIELD ALONE. The roster carries an
+            # email and an org and nothing else, so anything built from it is
+            # a two-key identity; a real one also carries `accountUuid`,
+            # `organizationName`, `organizationRole` and `displayName`, and
+            # Claude Code identifies an account by the uuid. Comparing the
+            # whole dict to the synthesis can never be equal, so without this
+            # the rewrite fired on EVERY switch, pin or no pin, and the loss
+            # outlives the pin: nothing rewrites a backup afterwards.
+            if isinstance(here, dict) and slot_email and \
+                    here.get("emailAddress") == slot_email:
+                return config
             own = None
-            if row.get("email"):
-                own = {"emailAddress": row["email"],
-                       "organizationUuid": row.get("organizationUuid", "") or ""}
+            if slot_email:
+                # It names someone else. The stored backup is the only place a
+                # FULL identity for this slot exists; the roster is the
+                # fallback when there is none.
+                stored = self._read_account_config(account_num, email)
+                if stored:
+                    kept = json.loads(stored).get("oauthAccount")
+                    if isinstance(kept, dict) and \
+                            kept.get("emailAddress") == slot_email:
+                        own = kept
+                if own is None:
+                    own = {"emailAddress": slot_email,
+                           "organizationUuid": row.get(
+                               "organizationUuid", "") or ""}
             else:
                 stored = self._read_account_config(account_num, email)
                 if stored:
                     own = json.loads(stored).get("oauthAccount")
             if not isinstance(own, dict) or not own:
                 return config
-            if data["oauthAccount"] == own:
+            if here == own:
                 return config
             data["oauthAccount"] = own
             return json.dumps(data)
@@ -6853,11 +6877,6 @@ class ClaudeAccountSwitcher:
             # `oauthAccount` is the pin's. Stored that way it outlives the
             # pin. Done here and not in `_write_account_config`, which also
             # moves configs between slots during a renumber.
-            if current_account and current_email:
-                original_config = self._config_naming_slot(
-                    original_config, current_account, current_email
-                )
-
             transaction = SwitchTransaction(
                 original_credentials=original_creds,
                 original_config=original_config,
@@ -6865,6 +6884,17 @@ class ClaudeAccountSwitcher:
                 original_email=current_email,
                 config_path=config_path,
             )
+
+            # AFTER THE TRANSACTION, DELIBERATELY. `rollback` restores
+            # `original_config` to the LIVE `~/.claude.json`, so un-splicing
+            # above this handed the error path a config naming the outgoing
+            # slot — the pin dropped and the bridge died on a failed switch,
+            # silently. Strings are immutable: the transaction keeps the live
+            # bytes, the archive writes below take the un-spliced value.
+            if current_account and current_email:
+                original_config = self._config_naming_slot(
+                    original_config, current_account, current_email
+                )
 
             try:
                 # Step 1: Backup current account. Position in ~/.claude.json

@@ -540,7 +540,11 @@ class SessionManager:
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
             # refresh token.
-            current = self.switcher._get_current_account()
+            # THE LOGIN, NOT THE IDENTITY FILE. Under a pin that file names
+            # the pinned account, so asking for the pinned account while
+            # another one serves took this fast path and exec'd claude with
+            # the SERVING account's environment.
+            current = self.switcher._live_login_identity()
             if current is not None and current == (email, org_uuid):
                 print(
                     dimmed(

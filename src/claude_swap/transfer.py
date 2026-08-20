@@ -201,8 +201,11 @@ def export_accounts(
     else:
         target_nums = sorted(accounts_map.keys(), key=int)
 
-    # Identify the live active account (live vault has fresher tokens than backup)
-    current_identity = switcher._get_current_account()
+    # Identify the live active account (live vault has fresher tokens than
+    # backup). THE LOGIN, NOT THE IDENTITY FILE: under a pin that file names
+    # the pinned account, so this marked the wrong slot active and exported
+    # the serving account's live credential into the pinned account's record.
+    current_identity = switcher._live_login_identity()
 
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:

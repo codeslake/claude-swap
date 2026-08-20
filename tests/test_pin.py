@@ -7572,6 +7572,35 @@ class TestTheSpliceMustNotCostTheEngineItsActiveAccount:
         assert sw.current_account_number() == "6"
 
 
+class TestAFailedSwitchKeepsThePin:
+    """Rollback restores the LIVE bytes, not the archived ones.
+
+    `_perform_switch` un-splices the config it archives as the outgoing slot's
+    backup. `SwitchTransaction` holds a copy of the same string to restore on
+    failure — but that copy goes to `~/.claude.json`, where the pin's identity
+    is what keeps a live Remote Control bridge attached. Un-splice above the
+    transaction and a failed switch quietly drops the pin.
+    """
+
+    def test_the_transaction_is_built_on_the_config_before_the_unsplice(self):
+        import inspect
+
+        from claude_swap import switcher as _sw
+
+        src = inspect.getsource(_sw.ClaudeAccountSwitcher._perform_switch)
+
+        # Both statements exist; the ORDER is the behaviour.
+        i_txn = src.find("transaction = SwitchTransaction(")
+        i_fix = src.find("self._config_naming_slot(")
+        assert i_txn != -1 and i_fix != -1, (
+            "one of the two statements is gone — this test no longer "
+            "describes the code it is guarding")
+        assert i_txn < i_fix, (
+            "the config is un-spliced before the transaction captures it, so "
+            "`rollback` restores a live config naming the outgoing slot "
+            "instead of the pin — a failed switch kills the bridge")
+
+
 class TestAnArchivedConfigNamesItsOwnSlot:
     """A slot's stored config must name that slot, never the pin.
 
@@ -7603,6 +7632,46 @@ class TestAnArchivedConfigNamesItsOwnSlot:
               "organizationUuid": "org-1"}
     OWN_ID = {"emailAddress": "serving@example.com",
               "organizationUuid": "org-1"}
+    # WHAT A REAL ONE LOOKS LIKE. The two above are the shape the roster
+    # synthesis produces, so a test built only on them cannot see a synthesis
+    # replacing a richer identity — which is what happens on every switch.
+    FULL_OWN_ID = {"emailAddress": "serving@example.com",
+                   "accountUuid": "acct-uuid-1234",
+                   "organizationUuid": "org-1",
+                   "organizationName": "Serving Org",
+                   "organizationRole": "admin",
+                   "displayName": "Serving Person"}
+
+    def test_a_healthy_identity_is_not_truncated_to_the_roster_row(
+            self, monkeypatch):
+        """The roster knows a slot's email and org and NOTHING ELSE.
+
+        Synthesising the archived identity from it drops `accountUuid`,
+        `organizationName`, `organizationRole` and `displayName` — and the
+        blob is what a later switch-back writes into `~/.claude.json`, what
+        `setup_session` seeds a session profile from, and what the pin splices
+        as the bridge owner. Claude Code identifies an account by
+        `accountUuid`; an identity without one is not the same identity.
+
+        Measured before the fix, with NO pin involved:
+            in : emailAddress, accountUuid, organizationUuid,
+                 organizationName, organizationRole, displayName
+            out: emailAddress, organizationUuid
+        """
+        import json as _json
+
+        sw = self._sw(monkeypatch, {})
+        config = _json.dumps({"oauthAccount": dict(self.FULL_OWN_ID),
+                              "other": "kept"})
+        out = _json.loads(sw._config_naming_slot(
+            config, "5", "serving@example.com"))
+        assert out["oauthAccount"] == self.FULL_OWN_ID, (
+            "an identity that already named its own slot was replaced by the "
+            "roster's two fields — every switch, pin or not, and the loss "
+            "outlives the pin because nothing rewrites the backup")
+        assert out["other"] == "kept"
+
+
 
     def test_the_pins_identity_is_replaced_by_the_slots_own(self, monkeypatch):
         import json as _json
@@ -7616,6 +7685,27 @@ class TestAnArchivedConfigNamesItsOwnSlot:
             "switch to it"
         )
         assert out["other"] == "kept", "the rest of the config must survive"
+
+    def test_the_replacement_is_the_slots_full_identity_not_two_keys(
+            self, monkeypatch):
+        """A pinned config IS replaced — with what the slot really is.
+
+        The roster carries an email and an org. The slot's stored backup
+        carries the whole identity, and `accountUuid` is what Claude Code
+        matches on, so synthesising from the roster here fixes the name and
+        loses the account.
+        """
+        import json as _json
+
+        sw = self._sw(monkeypatch, {"5": _json.dumps(
+            {"oauthAccount": dict(self.FULL_OWN_ID)})})
+        config = _json.dumps({"oauthAccount": dict(self.PIN_ID)})
+        out = _json.loads(sw._config_naming_slot(
+            config, "5", "serving@example.com"))
+        assert out["oauthAccount"] == self.FULL_OWN_ID, (
+            "the pin was replaced by the roster's two fields while the slot's "
+            "own full identity sat in its backup — accountUuid lost on the "
+            "one path that exists to restore the right account")
 
     def test_no_stored_config_falls_back_to_the_roster(self, monkeypatch):
         import json as _json
@@ -7753,7 +7843,13 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
                 calls = {n.func.attr for n in ast.walk(fn)
                          if isinstance(n, ast.Call)
                          and isinstance(n.func, ast.Attribute)}
-                if {"_get_current_account", "_find_account_slot"} <= calls:
+                # ANY READER, NOT ONE SHAPE. This required
+                # `_find_account_slot` alongside, so it matched only the
+                # sites that resolve the identity to a SLOT — and missed
+                # `export_accounts` and the session launch fast path, which
+                # compare the tuple directly. Both were real wrong-account
+                # bugs and both were invisible here.
+                if "_get_current_account" in calls:
                     found.append(f"{path.name}:{fn.name}")
         # THE CONTROL: without it an empty walk passes vacuously.
         assert len(list(root.rglob("*.py"))) > 5, "the walk found no modules"
@@ -7768,7 +7864,23 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
         # what the helper returns. The site even initialised `current_account`
         # from the roster and then overwrote it with the config-derived slot,
         # so the correct value was already there and was being discarded.
-        known: set = set()
+        # THE ALLOW-LIST, ONE REASON EACH. Everything else must ask
+        # `_live_login_identity`; these three ask about the FILE on purpose.
+        known: set = {
+            # Presence only — "is there any live login at all", which is
+            # exactly what the file answers and the roster cannot.
+            "switcher.py:has_live_login",
+            "menubar.py:on_refresh_creds",
+            # The helper itself: it reads the file in order to un-splice it.
+            "switcher.py:_live_login_identity",
+            # Runs before any account exists, so no pin can be set yet.
+            "switcher.py:_first_run_setup",
+            # `ast.walk` descends into nested functions, so the OUTER one is
+            # credited with its inner reader's call. `on_refresh_creds` is
+            # defined inside `run`; listing both is the cost of a walk that
+            # does not track scope, and the inner name is the one that matters.
+            "menubar.py:run",
+        }
         assert set(found) <= known, (
             "a NEW site re-derives the active slot from the identity file, "
             f"which now names the pin: {sorted(set(found) - known)}"
