@@ -6731,6 +6731,16 @@ class ClaudeAccountSwitcher:
                 # `.credentials.json`, which still follows the switch. This
                 # field is identity, not authority.
                 #
+                # AND THE IDENTITY IS THE PIN'S, NOT THE ACTIVE ACCOUNT'S.
+                # Under a pin this field stops answering "who is logged in"
+                # and answers "who owns the bridges", because Claude Code
+                # compares a bridge pointer against THIS field by name and no
+                # field of our own invention would be read. Anything that
+                # needs the active account reads `activeAccountNumber` from
+                # sequence.json, which no pin touches — a statusline that
+                # kept reading here showed the pin's usage under the active
+                # account's label.
+                #
                 # ASK THE SEAM, DO NOT COMPUTE IT. `pin.identity_for_config`
                 # owns this: resolving the pinned slot and reading its stored
                 # identity is pin policy, and doing it here also meant

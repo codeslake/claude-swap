@@ -400,7 +400,13 @@ def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     Claude records the logged-in account in the profile's ``.claude.json``
     ``oauthAccount`` and rewrites it on every (re-)login, so this reflects the
     profile's *current* identity — which an in-session ``/login`` can re-point
-    at a different account than the slot the profile was created for. Returns
+    at a different account than the slot the profile was created for.
+
+    THE PROFILE'S FILE, NOT THE GLOBAL ONE, and under a pin that distinction
+    decides the answer. A pin splices the pinned identity into the GLOBAL
+    ``~/.claude.json`` only, so this still reports who the profile is logged
+    in as. Read the global file here instead and every profile would report
+    the pin. Returns
     ``(email, organization_uuid)`` with ``""`` for a missing org, or ``None``
     when no identity is readable (missing dir/file/field).
     """
