@@ -126,73 +126,6 @@ def test_expired_token_with_no_refresh_token_skips_the_profile_fetch(
     assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
 
 
-def test_add_refuses_an_expired_foreign_credential_a_refresh_would_revive(
-    temp_home: Path, mock_claude_config: Path,
-):
-    """An expired ACCESS token is not "already dead" when a refresh token is
-    present: cswap itself revives exactly such credentials at switch time
-    (``session.py``'s ``_bootstrap``). So the guard must refresh before
-    giving up, then resolve identity from the REFRESHED token -- merely
-    dropping the skip is not enough, since ``fetch_oauth_profile`` on the
-    still-expired original token would just 401 and return None (advisory,
-    fail-open), silently storing the foreign credential either way."""
-    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
-    EXPIRED_FOREIGN = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-ant-oat01-THEIRS-STALE", "refreshToken": "rt-theirs",
-        "expiresAt": 1}})
-    REFRESHED_FOREIGN = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-ant-oat01-THEIRS-FRESH", "refreshToken": "rt-theirs-2",
-        "expiresAt": 99999999999000}})
-
-    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED_FOREIGN), \
-         patch("claude_swap.oauth.refresh_oauth_credentials",
-               return_value=REFRESHED_FOREIGN) as mock_refresh, \
-         patch("claude_swap.oauth.fetch_oauth_profile",
-               return_value={"uuid": "u-other", "email": "other@example.com",
-                             "organizationUuid": ""}) as mock_fetch:
-        with pytest.raises((ConfigError, ValidationError)):
-            s.add_account(slot=7, assume_yes=True)
-
-    mock_refresh.assert_called_once_with(EXPIRED_FOREIGN)
-    mock_fetch.assert_called_once_with("sk-ant-oat01-THEIRS-FRESH")
-    assert "7" not in s._get_sequence_data().get("accounts", {})
-
-
-def test_CONTROL_expired_own_credential_still_registers_after_a_refresh(
-    temp_home: Path, mock_claude_config: Path,
-):
-    """Same refresh-then-verify path, agreeing identity: registration must
-    still succeed, and the credential it stores is the one it VERIFIED.
-
-    A refresh grant may return a rotated ``refresh_token``, and accepting one
-    retires its predecessor server-side. Storing the pre-refresh bytes would
-    leave the slot holding a refresh token the server has already invalidated,
-    so the next switch's refresh reads as a dead lineage. ``session.py``
-    persists its own refresh result for exactly this reason."""
-    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
-    EXPIRED_OWN = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-ant-oat01-MINE-STALE", "refreshToken": "rt-mine",
-        "expiresAt": 1}})
-    REFRESHED_OWN = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-ant-oat01-MINE-FRESH", "refreshToken": "rt-mine-2",
-        "expiresAt": 99999999999000}})
-
-    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED_OWN), \
-         patch("claude_swap.oauth.refresh_oauth_credentials", return_value=REFRESHED_OWN), \
-         patch("claude_swap.oauth.fetch_oauth_profile",
-               return_value={"uuid": "u-ax", "email": "ax@example.com",
-                             "organizationUuid": ""}):
-        s.add_account(slot=7, assume_yes=True)
-
-    assert s._get_sequence_data()["accounts"]["7"]["email"] == "ax@example.com"
-    stored = s._read_account_credentials("7", "ax@example.com")
-    assert json.loads(stored)["claudeAiOauth"]["refreshToken"] == "rt-mine-2", (
-        "the refresh grant may ROTATE the refresh token, which invalidates the "
-        "old one server-side; storing the pre-refresh bytes leaves the slot "
-        "holding a refresh token the server has already retired"
-    )
-
-
 def test_CONTROL_expired_credential_whose_refresh_fails_still_registers(
     temp_home: Path, mock_claude_config: Path,
 ):
@@ -253,9 +186,13 @@ def test_add_refuses_a_foreign_credential_on_refresh_in_place(
     regardless of whether the resolved profile's org is structurally absent
     (personal account) or empty.
 
-    Not a corner: the menu bar's "Refresh credentials", the TUI's "Add
-    current login", and a plain `cswap` switch's auto-add all take this
-    branch. Here the slot already carries the RIGHT label, so an unguarded
+    Not a corner: the menu bar's "Refresh current credentials"
+    (`on_refresh_creds`) and "From current login" (`on_add_login`), and the
+    TUI's "Add current login", all call `add_account` with no slot and take
+    this branch. `cswap`'s auto-add does
+    NOT -- it fires only when the active account is unmanaged, and this branch
+    requires that it IS managed, the same predicate on the same two arguments.
+    Here the slot already carries the RIGHT label, so an unguarded
     refresh silently swaps in another account's bytes underneath a label
     that still reads correctly -- the exact field defect this module exists
     to close.
@@ -430,3 +367,273 @@ def test_CONTROL_personal_account_empty_org_still_registers(
         s.add_account(slot=8, assume_yes=True)
 
     assert s._get_sequence_data()["accounts"]["8"]["email"] == "ax@example.com"
+
+
+def test_an_expired_credential_is_unresolvable_and_never_consumes_a_grant(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The guard must not POST a refresh grant.
+
+    Everywhere else that act is a coordinated transition: under the account
+    FileLock plus CC's credential locks, with the successor written to BOTH
+    the backup and the active store, because an accepted rotation retires its
+    predecessor server-side. A bare refresh here rotates the lineage and then
+    stores the successor only in the slot backup -- the active store keeps the
+    spent generation and the running session's next refresh gets
+    ``invalid_grant``. On the refusal path it is worse: the guard raises and
+    the rotated credential is dropped, so the only usable copy of that
+    lineage's live generation is gone while the error says nothing changed.
+
+    Expired therefore means unresolvable, exactly like an offline profile
+    fetch: register, fail-open, and leave the grant alone.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    EXPIRED = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-STALE", "refreshToken": "rt-live",
+        "expiresAt": 1}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED), \
+         patch("claude_swap.oauth.refresh_oauth_credentials") as mock_refresh, \
+         patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
+        s.add_account(slot=7, assume_yes=True)
+
+    mock_refresh.assert_not_called()
+    mock_fetch.assert_not_called()
+    assert "7" in s._get_sequence_data().get("accounts", {})
+
+
+def test_a_matching_uuid_accepts_even_when_the_email_changed(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """Uuid first: an account whose email changed is still that account.
+
+    The config carries the address it was registered under; the profile
+    carries today's. Refusing on the address alone rejects a legitimate add
+    after an email change, which the codebase's own comparator
+    (``_resolved_matches_slot_identity``) avoids by comparing uuids first.
+    """
+    s = ClaudeAccountSwitcher()
+    s._setup_directories()
+    s._init_sequence_file()
+    s._get_claude_config_path().write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "old@example.com", "organizationUuid": "",
+        "accountUuid": "u-same"}}), encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-same", "email": "new@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=7, assume_yes=True)
+
+    assert "7" in s._get_sequence_data().get("accounts", {})
+
+
+def test_a_recycled_email_under_a_different_uuid_is_refused(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The other direction: the same address can belong to another account.
+
+    Email-only accepts a deleted-and-recreated account under a recycled
+    address, which is precisely the drift this guard exists to catch.
+    """
+    s = ClaudeAccountSwitcher()
+    s._setup_directories()
+    s._init_sequence_file()
+    s._get_claude_config_path().write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "ax@example.com", "organizationUuid": "",
+        "accountUuid": "u-registered"}}), encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-recreated", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account(slot=7, assume_yes=True)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
+def test_an_expired_FOREIGN_credential_registers_and_that_is_deliberate(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The case this guard knowingly does NOT catch, so nobody "fixes" it back.
+
+    An expired foreign token could be revived and unmasked by a refresh, and
+    an earlier revision did exactly that. It was removed: the POST consumes a
+    grant, and consuming one is a coordinated transition everywhere else in
+    this codebase -- under the account FileLock and CC's credential locks,
+    with the successor persisted to BOTH stores because an accepted rotation
+    retires its predecessor server-side. A bare refresh here strands the
+    active store on the spent generation, and on the refusal path throws away
+    the only live copy of that lineage.
+
+    So expired means unresolvable and the add proceeds, fail-open, exactly
+    like an offline profile fetch. Catching expired-foreign belongs on the
+    consume-gate machinery, not here. The field incident's shape -- a LIVE
+    token -- is still caught, which is what this guard is for.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    EXPIRED_FOREIGN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-THEIRS-STALE", "refreshToken": "rt-theirs",
+        "expiresAt": 1}})
+
+    with patch.object(s, "_read_capture_credentials", return_value=EXPIRED_FOREIGN), \
+         patch("claude_swap.oauth.refresh_oauth_credentials") as mock_refresh, \
+         patch("claude_swap.oauth.fetch_oauth_profile") as mock_fetch:
+        s.add_account(slot=7, assume_yes=True)
+
+    # The point is not just that it registers -- it is that no grant moved.
+    mock_refresh.assert_not_called()
+    mock_fetch.assert_not_called()
+    assert "7" in s._get_sequence_data().get("accounts", {})
+
+
+def test_an_unverifiable_ownership_check_says_so_out_loud(
+    temp_home: Path, mock_claude_config: Path, capsys,
+):
+    """Fail-open must not be silent.
+
+    The guard proceeds on an unresolvable answer by design -- offline, a 401,
+    schema drift -- but registering with the ownership question unanswered is
+    exactly the state the field incident was in. Say it, so the user can
+    re-run somewhere the check can complete.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+        s.add_account(slot=7, assume_yes=True)
+
+    out = capsys.readouterr().out
+    assert "7" in s._get_sequence_data().get("accounts", {}), "premise: it must still register"
+    assert "could not" in out.lower() or "unverified" in out.lower(), (
+        f"fail-open was silent; stdout was: {out!r}"
+    )
+
+
+def test_a_login_landing_during_the_guards_network_window_is_refused(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The identity verified must be the identity stored.
+
+    `add_account` reads `.claude.json` for the identity, verifies the
+    credential against it over the network, and reads the config AGAIN for the
+    fields it writes. A `/login` landing in that window pairs one account's
+    token with another's metadata -- the same LABELLED-one/CONTAINS-another
+    shape this guard exists to close, arriving by a different door.
+
+    A config snapshot alone cannot see it: the credential can move too. The
+    fingerprint of what was verified must still be what is about to be stored.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    cfg = s._get_claude_config_path()
+
+    def login_lands(token):
+        # A different account signs in while the profile lookup is in flight.
+        cfg.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "someone-else@example.com", "organizationUuid": "",
+            "accountUuid": "u-someone-else"}}), encoding="utf-8")
+        return {"uuid": "u-ax", "email": "ax@example.com", "organizationUuid": ""}
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile", side_effect=login_lands):
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account(slot=7, assume_yes=True)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
+def test_a_matching_uuid_does_not_excuse_a_different_org(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """I2: the uuid arm must not skip the org check.
+
+    `_resolved_matches_slot_identity` ANDs the org in and calls "a matching
+    email under a different org" definitively another account. Returning early
+    on a uuid match accepts exactly that, and it also makes the org-mismatch
+    message unreachable for any config Claude Code wrote -- every such config
+    carries an accountUuid.
+    """
+    s = ClaudeAccountSwitcher()
+    s._setup_directories(); s._init_sequence_file()
+    s._get_claude_config_path().write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "ax@example.com", "organizationUuid": "",
+        "accountUuid": "u-ax"}}), encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": "org-X"}):
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account(slot=7, assume_yes=True)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
+def test_a_null_account_uuid_does_not_trip_the_commit_time_recheck(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """I3: `null` on one side and "" on the other must not read as a change.
+
+    `_get_current_identity_triple` normalises with `or ""`; the second read did
+    not, so a JSON null made the recheck refuse with a message naming the SAME
+    address as both before and after -- and no re-run could clear it.
+    """
+    s = ClaudeAccountSwitcher()
+    s._setup_directories(); s._init_sequence_file()
+    s._get_claude_config_path().write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "ax@example.com", "organizationUuid": "",
+        "accountUuid": None}}), encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=7, assume_yes=True)
+
+    acct = s._get_sequence_data().get("accounts", {}).get("7")
+    assert acct is not None
+    # And the null must not reach the roster either: `"uuid": None` in
+    # sequence.json is absorbed downstream today, which is exactly how it
+    # would survive unnoticed until something stops absorbing it.
+    assert acct.get("uuid") == "", f"stored uuid is {acct.get('uuid')!r}, not ''"
+
+
+def test_the_refresh_in_place_path_also_refuses_a_login_in_the_window(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """C1: the recheck must cover BOTH write paths, not just the create one.
+
+    `slot=None` on an already-registered account is the branch the menu bar,
+    the TUI and a bare `cswap --add-account` all take -- the dominant one. It
+    reads `.claude.json` a second time for the blob it stores, and a later
+    switch installs that blob's `oauthAccount` as the identity. So a `/login`
+    in the guard's window puts account B's identity on slot A's credential:
+    the field incident, through the door the other path already closed.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=7, assume_yes=True)
+    assert "7" in s._get_sequence_data().get("accounts", {}), "premise: registered"
+
+    cfg = s._get_claude_config_path()
+
+    def login_lands(token):
+        cfg.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "someone-else@example.com", "organizationUuid": "",
+            "accountUuid": "u-other"}}), encoding="utf-8")
+        return {"uuid": "u-ax", "email": "ax@example.com", "organizationUuid": ""}
+
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile", side_effect=login_lands):
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account(assume_yes=True)          # slot=None -> refresh in place
+
+    blob = s.configs_dir / ".claude-config-7-ax@example.com.json"
+    stored = json.loads(blob.read_text())
+    assert stored["oauthAccount"]["emailAddress"] == "ax@example.com", (
+        f"slot 7's stored config now says {stored['oauthAccount']['emailAddress']}"
+    )
