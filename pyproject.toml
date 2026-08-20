@@ -136,7 +136,7 @@ menubar = ["rumps>=0.4.0"]
 # feature. 0.1.112 was neither a security nor an API floor — it republished
 # 0.1.111's code past a red macOS fixture — so nothing was being held back by
 # leaving it.
-pin = ["cswap-pin>=0.1.134"]
+pin = ["cswap-pin>=0.1.135"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"
