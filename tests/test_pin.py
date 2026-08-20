@@ -7572,6 +7572,61 @@ class TestTheSpliceMustNotCostTheEngineItsActiveAccount:
         assert sw.current_account_number() == "6"
 
 
+class TestAddAccountWillNotRecordASplicedIdentity:
+    """`add_account` half-trusted the field the pin forges.
+
+    The email and org came from `_live_login_identity`, which un-splices; the
+    uuid and org NAME came straight from `oauthAccount` three lines later, and
+    the archived config was the raw blob. Under a splice the roster row became
+    (serving email, pin org, pin uuid), and `_find_account_slot` — which
+    matches on the pair — then found nothing, leaving the live login unmanaged.
+
+    It refuses rather than repairing because `accountUuid` exists nowhere but
+    the forged field. There is no correct value to write, and a row nobody can
+    find is worse than a command that stops and says why.
+    """
+
+    def test_a_spliced_config_is_refused_with_a_reason(self):
+        import ast
+        import inspect
+
+        from claude_swap import switcher as _sw
+
+        src = inspect.getsource(_sw.ClaudeAccountSwitcher.add_account)
+        cap = src.find('oauth_data.get("accountUuid"')
+        assert cap != -1, "the identity capture moved; this guard is blind"
+        before = src[:cap]
+        assert 'oauth_data.get("emailAddress") not in' in before, (
+            "nothing checks the identity file against the un-spliced answer "
+            "before reading the uuid out of it, so a pinned machine records a "
+            "roster row that `_find_account_slot` can never match")
+        assert "pin --clear" in before, (
+            "the refusal does not say how to proceed — a stop with no way "
+            "forward is a worse answer than the wrong row it prevents")
+
+        cond = before[before.index("if oauth_data"):]
+        assert "current_email" in cond.split(":", 1)[0], (
+            "the check compares the identity file against something other "
+            "than the un-spliced answer, so it cannot tell a splice from a "
+            "genuine login as that account")
+
+    def test_the_refresh_archive_un_splices_like_the_switch_one(self):
+        """`_config_naming_slot` had exactly one production caller. The
+        refresh-in-place archive writes the same kind of blob — a live config
+        kept as a slot's backup — and skipped it."""
+        import inspect
+
+        from claude_swap import switcher as _sw
+
+        src = inspect.getsource(_sw.ClaudeAccountSwitcher.add_account)
+        writes = src.count("_write_account_config(")
+        assert writes == 2, f"expected two archive sites, found {writes}"
+        assert "_config_naming_slot(" in src, (
+            "neither archive in add_account un-splices, so a pinned machine "
+            "stores the pin as that slot's identity — and it outlives the "
+            "pin, because nothing rewrites a backup")
+
+
 class TestAFailedSwitchKeepsThePin:
     """Rollback restores the LIVE bytes, not the archived ones.
 

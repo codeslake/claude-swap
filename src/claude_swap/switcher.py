@@ -3474,7 +3474,15 @@ class ClaudeAccountSwitcher:
                 raise ConfigError("Permission denied reading Claude config")
 
             self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
+            # UN-SPLICE IT, like the archive in `_perform_switch`. This
+            # is the same kind of write — a live config kept as a slot's
+            # backup — and under a pin the raw blob names the pin, which
+            # outlives it because nothing rewrites a backup afterwards.
+            self._write_account_config(
+                account_num, current_email,
+                self._config_naming_slot(
+                    current_config, account_num, current_email),
+            )
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (current_email, current_org_uuid)}
             )
@@ -3585,6 +3593,24 @@ class ClaudeAccountSwitcher:
         # Get account UUID and org fields
         config_data = self._read_json(config_path)
         oauth_data = config_data.get("oauthAccount", {})
+        # NOT FROM A SPLICED CONFIG. `current_email`/`current_org_uuid` above
+        # already un-splice, but these three come straight from the field the
+        # pin overwrites — so under a splice the row would be written as
+        # (serving email, pin org, pin uuid) and `_find_account_slot` would
+        # then match nothing, leaving the live login unmanaged.
+        #
+        # REFUSING, NOT REPAIRING: the roster records the email and the org, so
+        # those are recoverable, but `accountUuid` exists nowhere else. There
+        # is no correct value to write, and a row nobody can find is worse than
+        # a command that stops and says why.
+        if oauth_data and oauth_data.get("emailAddress") not in (
+                None, "", current_email):
+            raise ConfigError(
+                "The cloud pin is rewriting this machine's account identity, "
+                "so the account you are adding cannot be read correctly "
+                "(its accountUuid is not recoverable while the pin is set). "
+                "Run `cswap pin --clear`, add the account, then re-pin."
+            )
         account_uuid = oauth_data.get("accountUuid", "")
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
         organization_name = oauth_data.get("organizationName", "") or ""
@@ -3611,6 +3637,11 @@ class ClaudeAccountSwitcher:
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
+        # NO UN-SPLICE HERE, AND IT NEEDS NONE. This slot's roster row is
+        # written just below, so `_config_naming_slot` would find nothing
+        # to name it with. What protects this line is the refusal beside
+        # the identity capture above: a config the pin has rewritten
+        # cannot reach it.
         self._write_account_config(account_num, current_email, current_config)
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (current_email, organization_uuid)}

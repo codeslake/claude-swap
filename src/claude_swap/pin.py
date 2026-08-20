@@ -268,44 +268,6 @@ def pinned_email(switcher) -> str | None:
     return pin[0] if pin else None
 
 
-def pinned_email_now(switcher) -> "str | None":
-    """The pinned account's email as cswap's OWN file has it, or None.
-
-    NOT the same question as `pinned_email`, which asks the package and
-    answers None whenever it is absent or broken. This reads
-    `settings.json -> remoteControl`, so it still answers when the package is
-    exactly what is broken — which is why the clear and set paths use it, and
-    why a badge wants it: blanking the pin because the optional extra hiccuped
-    tells the user their pin is gone when it is not.
-
-    Never raises.
-    """
-    try:
-        pinned = _pinned_email_now(switcher)
-        return pinned[0] if pinned else None
-    except Exception:  # noqa: BLE001 — an optional extra cannot break a read
-        return None
-
-
-def wiring_present(switcher) -> bool:
-    """Whether the pin's env wiring is in place. Never raises."""
-    try:
-        return bool(_wiring_present(switcher))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def safe_error(exc: object) -> str:
-    """An exception rendered for display, with URL userinfo removed.
-
-    Public because three call sites outside this module render pin failures,
-    and the scrub is the reason they must not use `str(exc)`: the text comes
-    from an optional third-party package, and a proxy URL carrying
-    `user:secret@host` in a message would otherwise reach a menu label.
-    """
-    return _safe(exc)
-
-
 def pinned_identity_email(switcher) -> "str | None":
     """The pinned account's email as cswap's OWN file has it, or None.
 
@@ -319,7 +281,11 @@ def pinned_identity_email(switcher) -> "str | None":
     `_pinned_email_now` documents: the package may be absent or broken, and
     this question must still be answerable then. Never raises.
     """
-    return pinned_email_now(switcher)
+    try:
+        pinned = _pinned_email_now(switcher)
+        return pinned[0] if pinned else None
+    except Exception:  # noqa: BLE001 — an optional extra cannot break a read
+        return None
 
 
 def identity_for_config(switcher) -> "dict | None":
