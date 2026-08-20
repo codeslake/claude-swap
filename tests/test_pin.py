@@ -8829,15 +8829,43 @@ class TestARollbackWithNothingToRestoreStillClearsTheName:
     """
 
     def _sw(self, live=("serving@example.com", "org-LIVE")):
+        """THE REAL `_live_login_identity`, not a stub of it.
+
+        Stubbing it hid the whole defect: the real one un-splices only while
+        the config identity equals the PIN RECORD, and `apply_pin(None, None)`
+        destroys that record before the lookup ran. A lambda returning the
+        live login regardless passes whether the fix works or is a no-op.
+        """
+        import json
+        import tempfile
+        from pathlib import Path
+
         from claude_swap import switcher as _sw
 
+        root = Path(tempfile.mkdtemp())
+        cfg = root / "claude.json"
+        # `apply_pin` has already spliced the FAILED account here -- unless
+        # the case is "nothing is logged in", which has to mean the config
+        # names NO account. Writing one and calling it absent would model a
+        # state that cannot occur.
+        cfg.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "failed@example.com",
+            "organizationUuid": "org-F"}} if live else {}))
         sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        sw.backup_dir = "/nowhere"
-        sw._live_login_identity = lambda: live
+        sw.backup_dir = root
+        sw._get_claude_config_path = lambda: cfg
+        sw._get_sequence_data = lambda: {
+            "activeAccountNumber": 3,
+            "accounts": {"3": {"email": live[0] if live else "",
+                               "organizationUuid": live[1] if live else "",
+                               "uuid": "UUID-3"}}} if live else {}
         sw.current_account_number = lambda: "3"
         sw._resolve_account_identifier = lambda email: "3"
-        sw._get_sequence_data = lambda: {"accounts": {
-            "3": {"email": "serving@example.com", "organizationUuid": "org-LIVE"}}}
+        # NO SECOND `_get_sequence_data`. One was left here from an earlier
+        # cut, it had no `activeAccountNumber`, and being later it WON — so the
+        # un-splice bailed and this test blamed production for the fixture.
+        # The same shape the duplicate-def guard cannot see: an assignment, not
+        # a def.
         sw._read_account_config = lambda num, email: (
             '{"oauthAccount": {"emailAddress": "%s", "accountUuid": "UUID-%s"}}'
             % (email, num))

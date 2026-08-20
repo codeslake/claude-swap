@@ -1422,6 +1422,25 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
     was never touched, so a message claiming "may still name <email>" was
     telling the user to go check a state the code could already disprove.
     """
+    # RESOLVED BEFORE THE CALL THAT DESTROYS ITS INPUT. `apply_pin(None,
+    # None)` drops the pin record, and `_live_login_identity` un-splices only
+    # while the config still equals that record — so asking afterwards returns
+    # the config as `apply_pin` just spliced it, i.e. the account whose pin
+    # failed. Measured: serving@ before the call, failed@ after it. `clear_pin`
+    # has always resolved first; this is the sibling that did not.
+    # SEPARATELY GUARDED, and resolved BEFORE the call that destroys its
+    # input. `apply_pin(None, None)` drops the pin record, and
+    # `_live_login_identity` un-splices only while the config still equals that
+    # record — so asking afterwards returns the account whose pin just failed.
+    # Its own `try` because the two have different contracts: naming the config
+    # is best-effort, restoring the RECORD is the job, and a raising lookup
+    # sharing the guard below skipped `apply_pin` entirely.
+    _back = None
+    if not before:
+        try:
+            _back = _live_login_for_config(switcher)
+        except Exception:  # noqa: BLE001 — a name must not cost the rollback
+            _back = None
     try:
         _impl().apply_pin(switcher, *(before or (None, None)))
         # AND THE CONFIG, which the record alone does not put back. `apply_pin`
@@ -1437,12 +1456,12 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
         # is logged in as — the command reported failure and handed the
         # machine to it anyway.
         if before:
+            # Safe to ask now: `apply_pin` has just RESTORED this record, so
+            # the lookup sees the state it is naming. The None case cannot,
+            # which is why it is resolved above.
             _back = identity_for_config(
                 switcher, email=before[0],
-                num=_slot_for(switcher, before[0],
-                              before[1] if len(before) > 1 else None))
-        else:
-            _back = _live_login_for_config(switcher)
+                num=_slot_for(switcher, before[0], before[1]))
         _impl().splice_config_identity(_back)
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
