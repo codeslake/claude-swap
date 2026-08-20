@@ -1070,9 +1070,11 @@ class ClaudeAccountSwitcher:
                     # pin. A bad backup must cost the full identity, not the
                     # repair.
                     try:
-                        kept = json.loads(stored).get("oauthAccount")
+                        _parsed = json.loads(stored)
                     except (ValueError, TypeError):
-                        kept = None
+                        _parsed = None
+                    kept = (_parsed.get("oauthAccount")
+                            if isinstance(_parsed, dict) else None)
                     # THE COMPOSITE. A backup that names the right address in
                     # the wrong org is another slot's, or the pin's.
                     if isinstance(kept, dict) and \
@@ -1085,7 +1087,12 @@ class ClaudeAccountSwitcher:
             else:
                 stored = self._read_account_config(account_num, email)
                 if stored:
-                    own = json.loads(stored).get("oauthAccount")
+                    try:
+                        _parsed = json.loads(stored)
+                    except (ValueError, TypeError):
+                        _parsed = None
+                    own = (_parsed.get("oauthAccount")
+                           if isinstance(_parsed, dict) else None)
             if not isinstance(own, dict) or not own:
                 return config
             if here == own:
@@ -3076,10 +3083,17 @@ class ClaudeAccountSwitcher:
         try:
             from claude_swap import pin as _pin
 
-            pinned = _pin.pinned_identity_email(self)
+            pinned = _pin.pinned_identity(self)
         except Exception:  # noqa: BLE001 — an optional extra cannot break this
             return identity
-        if not pinned or email != pinned:
+        # THE COMPOSITE. Comparing the email alone cannot tell a splice from a
+        # genuine `claude /login` into a SAME-EMAIL sibling — a personal
+        # account at the address of an org one, which this codebase states is
+        # legitimate. That login rewrites `oauthAccount` without moving
+        # `activeAccountNumber`, so an email-only test read it as a splice and
+        # handed back the roster's slot: the refresh path then wrote the
+        # personal credential over the org account's stored backup.
+        if not pinned or (email, org_uuid) != pinned:
             return identity
         data = self._get_sequence_data() or {}
         recorded = data.get("activeAccountNumber")
@@ -3603,8 +3617,16 @@ class ClaudeAccountSwitcher:
         # those are recoverable, but `accountUuid` exists nowhere else. There
         # is no correct value to write, and a row nobody can find is worse than
         # a command that stops and says why.
-        if oauth_data and oauth_data.get("emailAddress") not in (
-                None, "", current_email):
+        # THE COMPOSITE, NOT THE EMAIL. Two managed slots may share an address
+        # across organizations — the premise `_config_naming_slot` was fixed
+        # for one function away — so an email-only comparison passes under a
+        # splice whenever the pin and the serving slot share one, and the code
+        # below then reads `accountUuid` straight out of the forged field. By
+        # then `_delete_account_files` has already run.
+        if oauth_data and (oauth_data.get("emailAddress") or "") and (
+                (oauth_data.get("emailAddress") or "",
+                 oauth_data.get("organizationUuid") or "")
+                != (current_email, current_org_uuid)):
             raise ConfigError(
                 "The cloud pin is rewriting this machine's account identity, "
                 "so the account you are adding cannot be read correctly "

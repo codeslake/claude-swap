@@ -129,7 +129,14 @@ menubar = ["rumps>=0.4.0"]
 # red. That is the check WORKING: a package that cannot be imported is broken
 # for everyone who installs it, and the platform that noticed is not the
 # platform at fault.
-pin = ["cswap-pin>=0.1.112"]
+# 0.1.134 IS A CORRECTNESS FLOOR, not the freshness one the comment above
+# describes. This branch calls `cswap_pin.wiring` (the wiring subsystem moved
+# there) and `apply_pin(identity=...)` (the pin now names itself in the live
+# config). Below 0.1.134 both are AttributeError at the shim, not a degraded
+# feature. 0.1.112 was neither a security nor an API floor — it republished
+# 0.1.111's code past a red macOS fixture — so nothing was being held back by
+# leaving it.
+pin = ["cswap-pin>=0.1.134"]
 
 [project.urls]
 Homepage = "https://github.com/realiti4/claude-swap"

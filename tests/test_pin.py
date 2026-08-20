@@ -15,6 +15,19 @@ import pytest
 
 from claude_swap.exceptions import ClaudeSwitchError
 
+def _pinwiring():
+    """The module the wiring helpers actually live in.
+
+    They moved to `cswap_pin.wiring`; `claude_swap.pin` keeps a forwarding shim
+    so callers did not have to change. A test that patches the SHIM injects
+    into a name nothing calls on the way down — green, and proving nothing.
+    """
+    from cswap_pin import wiring
+
+    return wiring
+
+
+
 
 def _cfg(tmp_path, name, port=None, *, marker=True):
     """A `.claude.json` under its own dir: wired to `port`, or unwired.
@@ -1800,7 +1813,7 @@ class TestClearReachesBothConfigsWithTheExtraINSTALLED:
 
         # The extra IS installed and apply_pin succeeds — the path that had no
         # clear_wiring call at all. It unwires only what its own resolver sees.
-        def apply_pin(switcher, email, org):
+        def apply_pin(switcher, email, org, **kw):
             session.write_text(json.dumps({"env": {}}))
             return False
 
@@ -2327,7 +2340,7 @@ class TestTheRollbackVerdictIsNotFooledByShape:
         class _I:
             n = 0
 
-            def apply_pin(self, sw, email, org):
+            def apply_pin(self, sw, email, org, **kw):
                 _I.n += 1
                 if _I.n == 1:
                     # The ORIGINAL set_pin call: writes the new pin, then the
@@ -2494,7 +2507,7 @@ class TestPurgeDoesNotStrandTheWiring:
 
         class _Impl:
             @staticmethod
-            def apply_pin(switcher, email, org_uuid):
+            def apply_pin(switcher, email, org_uuid, **kw):
                 # `backup_dir` IS what the rmtree takes, and `pin-proxy/` is
                 # inside it — so its presence dates the call against the
                 # deletion without seeding anything.
@@ -2885,7 +2898,7 @@ class TestAFailedClearIsNotReportedAsSuccess:
         """The control: when the record genuinely survives, say so."""
         impl = (
             "class _I:\n"
-            "    def apply_pin(self, *a): raise OSError('disk full')\n"
+            "    def apply_pin(self, *a, **k): raise OSError('disk full')\n"
             "def _impl_factory(): return _I()\n"
             # the record cannot be cleared either
             "import claude_swap.pin as _p\n"
@@ -2901,7 +2914,7 @@ class TestAFailedClearIsNotReportedAsSuccess:
         impl = (
             "import json as _j\n"
             "class _I:\n"
-            "    def apply_pin(self, sw, *a):\n"
+            "    def apply_pin(self, sw, *a, **kw):\n"
             "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
             "def _impl_factory(): return _I()\n"
         )
@@ -2959,7 +2972,7 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
         # ClaudeSwitchError and so reached the user as a traceback.
         impl = (
             "class _I:\n"
-            "    def apply_pin(self, *a): raise FileExistsError('pin-proxy')\n"
+            "    def apply_pin(self, *a, **k): raise FileExistsError('pin-proxy')\n"
             "def _impl_factory(): return _I()\n"
         )
         r = self._run(tmp_path, impl)
@@ -2973,7 +2986,7 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
         # follow-up note was the only signal; the word "Pinned" still went out.
         impl = (
             "class _I:\n"
-            "    def apply_pin(self, *a): return False\n"
+            "    def apply_pin(self, *a, **k): return False\n"
             "def _impl_factory(): return _I()\n"
         )
         r = self._run(tmp_path, impl)
@@ -2995,7 +3008,7 @@ class TestTheSetPathIsAsHonestAsTheClearPath:
             "import json\n"
             "from pathlib import Path as _P\n"
             "class _I:\n"
-            "    def apply_pin(self, sw, email, org):\n"
+            "    def apply_pin(self, sw, email, org, **kw):\n"
             "        p = _P(sw.backup_dir) / 'settings.json'\n"
             "        raw = json.loads(p.read_text()) if p.exists() else {}\n"
             "        if email:\n"
@@ -3246,7 +3259,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
         impl = (
             "import json as _j\n"
             "class _I:\n"
-            "    def apply_pin(self, sw, *a):\n"
+            "    def apply_pin(self, sw, *a, **kw):\n"
             "        (sw.backup_dir / 'settings.json').write_text(_j.dumps({}))\n"
             "def _impl_factory(): return _I()\n"
         )
@@ -3266,7 +3279,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
             "import json as _j\n"
             "class _I:\n"
             "    calls = []\n"
-            "    def apply_pin(self, sw, email, org):\n"
+            "    def apply_pin(self, sw, email, org, **kw):\n"
             "        _I.calls.append(email)\n"
             "        if email is not None and len(_I.calls) == 1:\n"
             "            (sw.backup_dir / 'settings.json').write_text(\n"
@@ -3286,7 +3299,7 @@ class TestAnActionReportedDoneMustReReadWhatItChanged:
     def test_an_api_key_account_is_refused(self, tmp_path):
         impl = (
             "class _I:\n"
-            "    def apply_pin(self, *a): raise AssertionError('must not be reached')\n"
+            "    def apply_pin(self, *a, **k): raise AssertionError('must not be reached')\n"
             "def _impl_factory(): return _I()\n"
         )
         import subprocess
@@ -3685,7 +3698,7 @@ class TestTheLockProbeActuallyProbes:
         lock_dir = cfg.parent / (cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
             start = _time.monotonic()
-            held_result = pin._config_lock_is_free(0.3)
+            held_result = _pinwiring()._config_lock_is_free(0.3)
             elapsed = _time.monotonic() - start
 
         assert held_result is False, "answered True while the lock was held"
@@ -3700,7 +3713,7 @@ class TestTheLockProbeActuallyProbes:
         # broken fixture made the held probe return False for some reason
         # unrelated to the real lock, this would also fail — it is what rules
         # that out.
-        assert pin._config_lock_is_free(1.0) is True, (
+        assert _pinwiring()._config_lock_is_free(1.0) is True, (
             "a free probe on the same path after release did not answer True "
             "— the held-case False above is not trustworthy without this"
         )
@@ -3735,12 +3748,12 @@ class TestTheLockProbeActuallyProbes:
         monkeypatch.setattr(
             paths, "get_default_global_config_path", lambda: default_cfg)
 
-        assert pin._config_lock_is_free(0.3) is True, (
+        assert _pinwiring()._config_lock_is_free(0.3) is True, (
             "precondition: with neither lock held the probe must say free")
 
         lock_dir = default_cfg.parent / (default_cfg.name + ".lock")
         with proper_lockfile(lock_dir, timeout=5):
-            held = pin._config_lock_is_free(0.3)
+            held = _pinwiring()._config_lock_is_free(0.3)
 
         assert held is False, (
             "the DEFAULT config's lock was held and the probe said free — the "
@@ -4538,7 +4551,7 @@ class TestHealADeadPin:
 
         monkeypatch.setattr(pin, "_impl", lambda: _Mutating)
         monkeypatch.setattr(pin, "_pinned_email_now", lambda _sw: ("c@e.com", None))
-        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+        monkeypatch.setattr(_pinwiring(), "_dead_wired_configs", lambda *a, **k: [])
 
         caller_env = {"PATH": "/usr/bin"}
         sw = types.SimpleNamespace(backup_dir=tmp_path)
@@ -5162,9 +5175,7 @@ class TestHealNeverTearsDownAServingPin:
         sw, cfg = self._wired_to(tmp_path, 0)
         self._paths(monkeypatch, cfg)
         monkeypatch.setattr(pin, "_live_impl", lambda: None)
-        monkeypatch.setattr(
-            pin,
-            "_dead_wired_configs",
+        monkeypatch.setattr(_pinwiring(), "_dead_wired_configs",
             lambda switcher, **_k: (_ for _ in ()).throw(RuntimeError("disk gone")),
         )
 
@@ -5678,7 +5689,7 @@ class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
             # The premise: without this the assertion below could pass because
             # the fixture never built the masking shape.
             assert pin._wired_ports(), "no port anywhere — nothing to mask with"
-            assert pin._port_of_config(bad) is None, "the bad port reads fine"
+            assert _pinwiring()._port_of_config(bad) is None, "the bad port reads fine"
 
             changed, message = pin.heal(sw)
 
@@ -7368,8 +7379,13 @@ class TestTheCertdirPathHasOneSpelling:
         import ast
         from pathlib import Path
 
-        src = (Path(__file__).parent.parent
-               / "src" / "claude_swap" / "pin.py").read_text()
+        # THE FILE THAT OWNS THE PATH. `_certdir` moved to the package with
+        # the rest of the wiring subsystem, and it took the one spelling with
+        # it — read it there, or this counts zero and the message below
+        # describes a second spelling that does not exist.
+        import cswap_pin.wiring as _w
+
+        src = Path(_w.__file__).read_text()
         tree = ast.parse(src)
         # STRING CONSTANTS IN THE AST, not lines matching a phrase. The first
         # version grepped for the literal and caught `_certdir`'s own docstring
@@ -7388,6 +7404,12 @@ class TestTheCertdirPathHasOneSpelling:
             if isinstance(n, ast.Constant) and n.value == "pin-proxy"
             and id(n) not in docstrings
         ]
+        # ZERO AND TWO ARE DIFFERENT FAILURES and used to read the same. Zero
+        # means the spelling left this file — the guard is looking at the
+        # wrong subject and proves nothing; two means the drift it exists for.
+        assert spellings, (
+            "no `pin-proxy` literal in the file that owns the path — the "
+            "spelling moved and this guard is now watching nothing")
         assert len(spellings) == 1, (
             "the certdir path is spelled in more than one place, so a layout "
             f"change moves some callers and strands the rest: lines "
@@ -7427,13 +7449,13 @@ class TestAnUnreadableSidecarIsNotAnAbsentOne:
         cfg.write_text("{}")
         led = tmp_path / "pin-wiring" / "deadbeef.json"
         led.parent.mkdir(parents=True)
-        monkeypatch.setattr(pin, "_ledger_path", lambda _c: led)
+        monkeypatch.setattr(_pinwiring(), "_ledger_path", lambda _c: led)
 
         # ABSENT: the ordinary state on a machine that was never pinned. It
         # must stay silent, or the warning is noise on every launch and the
         # next person deletes it.
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            assert pin._read_ledger(cfg) == {}
+            assert _pinwiring()._read_ledger(cfg) == {}
         assert not [r for r in caplog.records
                     if r.levelno >= logging.WARNING], (
             "an absent receipt warned; that is every unpinned machine, and a "
@@ -7444,7 +7466,7 @@ class TestAnUnreadableSidecarIsNotAnAbsentOne:
         caplog.clear()
         led.write_text("{not json")
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            assert pin._read_ledger(cfg) == {}, (
+            assert _pinwiring()._read_ledger(cfg) == {}, (
                 "the return changed; the 56 verified sidecar/config pairs "
                 "depend on it staying an empty dict")
         warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -7586,8 +7608,16 @@ class TestAddAccountWillNotRecordASplicedIdentity:
     find is worse than a command that stops and says why.
     """
 
-    def test_a_spliced_config_is_refused_with_a_reason(self):
-        import ast
+    def test_a_shared_email_across_orgs_is_still_a_splice(self):
+        """The guard compared the EMAIL, and two managed slots may share one.
+
+        Under a splice where the pin and the serving slot have the same
+        address, an email-only comparison passes and `add_account` goes on to
+        read `accountUuid` out of the forged field — after
+        `_delete_account_files` has already run. The roster row then collides
+        with the pin's identity while the real login has no row at all, and
+        nothing rewrites a backup, so it outlives `pin --clear`.
+        """
         import inspect
 
         from claude_swap import switcher as _sw
@@ -7595,36 +7625,125 @@ class TestAddAccountWillNotRecordASplicedIdentity:
         src = inspect.getsource(_sw.ClaudeAccountSwitcher.add_account)
         cap = src.find('oauth_data.get("accountUuid"')
         assert cap != -1, "the identity capture moved; this guard is blind"
-        before = src[:cap]
-        assert 'oauth_data.get("emailAddress") not in' in before, (
-            "nothing checks the identity file against the un-spliced answer "
-            "before reading the uuid out of it, so a pinned machine records a "
-            "roster row that `_find_account_slot` can never match")
-        assert "pin --clear" in before, (
+        guard = src[:cap]
+        assert "pin --clear" in guard, (
             "the refusal does not say how to proceed — a stop with no way "
-            "forward is a worse answer than the wrong row it prevents")
+            "forward is worse than the wrong row it prevents")
 
-        cond = before[before.index("if oauth_data"):]
-        assert "current_email" in cond.split(":", 1)[0], (
-            "the check compares the identity file against something other "
-            "than the un-spliced answer, so it cannot tell a splice from a "
-            "genuine login as that account")
+        # THE SHIPPED CONDITION, lifted and EVALUATED. A copy of the condition
+        # restated in the test proves only that the copy agrees with itself —
+        # which is how the version this replaces stayed green on the bug.
+        cond = guard[guard.rindex("if oauth_data"):]
+        cond = cond[len("if "):cond.index(":\n")].replace("\n", " ")
+        assert "organizationUuid" in cond and "current_org_uuid" in cond, (
+            "the shipped guard does not consult the organization, so it "
+            "cannot tell a splice from a login as a same-email sibling")
 
-    def test_the_refresh_archive_un_splices_like_the_switch_one(self):
-        """`_config_naming_slot` had exactly one production caller. The
-        refresh-in-place archive writes the same kind of blob — a live config
-        kept as a slot's backup — and skipped it."""
-        import inspect
+        shared = "shared@example.com"
+        for oauth_org, live_org, want in (
+                ("org-PIN", "org-SERVING", True),   # a splice, same email
+                ("org-SAME", "org-SAME", False),    # a genuine login
+        ):
+            env = {"oauth_data": {"emailAddress": shared,
+                                  "organizationUuid": oauth_org},
+                   "current_email": shared,
+                   "current_org_uuid": live_org}
+            fires = bool(eval(cond, {}, env))  # noqa: S307 — our own source
+            assert fires is want, (
+                f"the shipped guard fired={fires} for identity-file org "
+                f"{oauth_org!r} against live org {live_org!r}; wanted {want}. "
+                "An email-only comparison passes the splice row, and the "
+                "roster row written after it can never be found again")
+
+    def test_the_un_splice_needs_the_org_too(self, monkeypatch):
+        """`_live_login_identity` decided on the email alone.
+
+        A person may hold a personal account at the address of an org one.
+        `claude /login` into the personal one rewrites `oauthAccount` and does
+        NOT move `activeAccountNumber`, so an email-only test read that as a
+        splice and handed back the roster's slot — and the refresh path then
+        wrote the personal credential over the org account's stored backup.
+        """
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        shared = "a@x.com"
+
+        def _sw_with(config_id, pin_id, roster_id):
+            sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+            monkeypatch.setattr(
+                _sw.ClaudeAccountSwitcher, "_get_current_account",
+                lambda self, _c=config_id: _c)
+            monkeypatch.setattr(
+                _sw.ClaudeAccountSwitcher, "_get_sequence_data",
+                lambda self, _r=roster_id: {
+                    "activeAccountNumber": 2,
+                    "accounts": {"2": {"email": _r[0],
+                                       "organizationUuid": _r[1]}}})
+            monkeypatch.setattr(_pin, "pinned_identity", lambda s, _p=pin_id: _p)
+            return sw
+
+        # A REAL SPLICE: the config's org IS the pin's. The un-splice fires.
+        sw = _sw_with((shared, "org-PIN"), (shared, "org-PIN"),
+                      (shared, "org-LIVE"))
+        assert sw._live_login_identity() == (shared, "org-LIVE"), (
+            "the un-splice did not fire on a genuine splice, so every reader "
+            "asking who is logged in gets the pin instead")
+
+        # AN EXTERNAL LOGIN to a same-email sibling: the config is HONEST.
+        sw2 = _sw_with((shared, ""), (shared, "org-PIN"), (shared, "org-LIVE"))
+        assert sw2._live_login_identity() == (shared, ""), (
+            "an external login to a same-email sibling was read as a splice, "
+            "so the roster's slot came back and the refresh path would write "
+            "this credential over the other account's stored backup")
+
+    def test_a_non_dict_backup_is_torn_too(self, monkeypatch):
+        """`null` and `[]` parse but have no `.get`.
+
+        The guard caught `(ValueError, TypeError)`; `.get` on a non-dict raises
+        AttributeError, which is not in that tuple, so it fell to the
+        function-wide bare except and returned the config UNCHANGED — under a
+        pin, archiving the pin. That is the outcome the guard exists to stop,
+        reached by the two inputs it did not name.
+        """
+        import json
 
         from claude_swap import switcher as _sw
 
-        src = inspect.getsource(_sw.ClaudeAccountSwitcher.add_account)
-        writes = src.count("_write_account_config(")
-        assert writes == 2, f"expected two archive sites, found {writes}"
-        assert "_config_naming_slot(" in src, (
-            "neither archive in add_account un-splices, so a pinned machine "
-            "stores the pin as that slot's identity — and it outlives the "
-            "pin, because nothing rewrites a backup")
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        config = json.dumps({"oauthAccount": {
+            "emailAddress": "pinned@example.com",
+            "organizationUuid": "org-PIN", "accountUuid": "uuid-PIN"}})
+        # THE ROSTER NAMES THE SLOT, as it does in production. Without a row
+        # the function takes the branch that has no fallback to fall back TO,
+        # which is a different defect and not the one under test.
+        monkeypatch.setattr(
+            _sw.ClaudeAccountSwitcher, "_get_sequence_data",
+            lambda self: {"accounts": {"2": {
+                "email": "serving@example.com",
+                "organizationUuid": "org-SERVING"}}})
+
+        for backup in ("null", "[]", '"a string"', "{torn"):
+            monkeypatch.setattr(
+                _sw.ClaudeAccountSwitcher, "_read_account_config",
+                lambda self, n, e, _b=backup: _b)
+            out = json.loads(sw._config_naming_slot(
+                config, "2", "serving@example.com"))
+            got = out.get("oauthAccount") or {}
+            assert got.get("emailAddress") != "pinned@example.com", (
+                f"a {backup!r} backup left the PIN in the archived config, and "
+                "that backup outlives `pin --clear` because nothing rewrites "
+                "one")
+            assert got.get("emailAddress") == "serving@example.com", (
+                f"a {backup!r} backup did not fall back to the roster row; "
+                f"got {got!r}")
+
+    # MOVED TO THE PACKAGE. The splice rule is `cswap_pin.proxy`'s now —
+    # `apply_pin(identity=...)` — and its test went with it, as
+    # `case_a_pin_names_itself_in_the_live_config`. A copy here would test a
+    # shim that only forwards, which is the vacuous-injection shape: green,
+    # and proving nothing about the code that runs.
+
 
 
 class TestAFailedSwitchKeepsThePin:
