@@ -984,8 +984,13 @@ def pinned_identity(switcher) -> "tuple[str, str] | None":
         return None
 
 
-def identity_for_config(switcher) -> "dict | None":
+def identity_for_config(switcher, email: str | None = None) -> "dict | None":
     """The `oauthAccount` the config should name while a pin is set, or None.
+
+    ``email`` asks about a DIFFERENT account than the one currently recorded.
+    The rollback needs it: by the time it runs, the record has already been
+    overwritten by the pin that failed, so "whatever is recorded" is the wrong
+    answer and the only right one is the account being restored.
 
     THE SEAM ANSWERS, THE SWITCHER ASKS. This used to live in switcher.py,
     where it resolved the pinned slot, read that slot's stored config and
@@ -1006,7 +1011,7 @@ def identity_for_config(switcher) -> "dict | None":
     to block a switch.
     """
     try:
-        email = pinned_identity_email(switcher)
+        email = email or pinned_identity_email(switcher)
         if not email:
             return None
         num = switcher._resolve_account_identifier(email)
@@ -1127,7 +1132,14 @@ def repin_current(switcher) -> bool:
         if not pin:
             return False
         email, org = pin[0], (pin[1] if len(pin) > 1 else None)
-        return bool(impl.apply_pin(switcher, email, org))
+        # NAME THE PIN IN THE LIVE CONFIG, exactly as `set_pin` does. Without
+        # `identity=` the parameter defaults to None and the splice returns
+        # early, so the repair restores a serving daemon while
+        # `~/.claude.json` still names whichever account is active - and
+        # Claude Code takes that field as the OWNER of every bridge it mints
+        # afterwards, which is the teardown the splice exists to prevent.
+        return bool(impl.apply_pin(switcher, email, org,
+                                   identity=identity_for_config(switcher)))
     except Exception:  # noqa: BLE001 — a repair must not take its caller down
         return False
 
@@ -1229,6 +1241,14 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
     """
     try:
         _impl().apply_pin(switcher, *(before or (None, None)))
+        # AND THE CONFIG, which the record alone does not put back. `apply_pin`
+        # splices `~/.claude.json` BEFORE it starts the proxy, so a pin that
+        # failed to start has already written its account there; restoring only
+        # the record leaves Claude Code minting every later bridge under the
+        # account whose pin just failed. Asked about `before` explicitly,
+        # because the record still names the failure at this point.
+        _impl().splice_config_identity(
+            identity_for_config(switcher, email=before[0] if before else None))
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
     return _pinned_email_now(switcher) == before
@@ -1432,9 +1452,21 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # `purge` gets this right by capturing before it calls US; the old comment
     # claimed parity with it, and was only true relative to `clear_wiring`.
     before = wired_env_keys(switcher)
+    # WHOSE IDENTITY THE CONFIG CARRIES AFTERWARDS. The package cannot work
+    # this out — resolving an account to its stored identity means reading
+    # cswap's backup store — so the clear hands it over, the same split as
+    # `set_pin`. `_live_login_identity` un-splices, which is the point: the
+    # account that has been serving is the one the config should name once the
+    # pin is gone. None on any doubt leaves the field alone, and the next
+    # switch rewrites it; a blank owner would be worse than a stale one.
+    try:
+        _live = switcher._live_login_identity()
+        _back_to = identity_for_config(switcher, email=_live[0]) if _live else None
+    except Exception:  # noqa: BLE001 — nothing optional may block a clear
+        _back_to = None
     try:
         impl = _impl()
-        impl.apply_pin(switcher, None, None)
+        impl.apply_pin(switcher, None, None, identity=_back_to)
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
         # THE RECORD IS CSWAP'S OWN FILE, so clear it here rather than
         # reporting that the package could not. With the extra uninstalled,

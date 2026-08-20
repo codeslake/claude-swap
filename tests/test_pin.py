@@ -7497,7 +7497,11 @@ class TestClearPinCapturesEvidenceBeforeAnythingUnwires:
 
         class _Impl:
             @staticmethod
-            def apply_pin(switcher, *_a):
+            # `**_k` so a new keyword on the real call cannot make this
+            # double reject it: the rejection raises inside `clear_pin`'s own
+            # except, the append never happens, and this reads as an ORDER
+            # failure when nothing about the order moved.
+            def apply_pin(switcher, *_a, **_k):
                 order.append("apply_pin")
 
         monkeypatch.setattr(pin, "_impl", lambda: _Impl)
@@ -8190,3 +8194,292 @@ class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
 
         sw._read_account_config = lambda num, email: '{"oauthAccount": {}}'
         assert pin.identity_for_config(sw) is None, "empty identity"
+
+
+class TestTheRepairPinsTheIDENTITYToo:
+    """`repin_current` is the ONLY re-pin that runs without a person, and it
+    was the only one that did not name the pin in the live config.
+
+    `set_pin` hands `apply_pin` an `identity=`; `repin_current` called the
+    same function with three positional arguments and nothing else, so the
+    parameter defaulted to None and `splice_config_identity` returned early.
+    The repair therefore restored a serving daemon while leaving
+    `~/.claude.json` naming whichever account happened to be active -- which
+    is the state every bridge minted afterwards inherits, and the exact defect
+    the splice exists to prevent.
+
+    It matters because of WHEN it runs: an `unpinnable` daemon means the pin
+    is set and the credential is unreadable, so this fires unattended, and a
+    repair that half-works reads as a repair that worked.
+    """
+
+    def _impl_recording(self, calls):
+        class _Impl:
+            @staticmethod
+            def load_pin(_backup_dir):
+                return ("pinned@example.com", "org-1")
+
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                calls.append({"email": email, "org_uuid": org_uuid,
+                              "identity": identity})
+                return True
+        return _Impl
+
+    def test_the_repair_carries_the_identity(self, monkeypatch):
+        from claude_swap import pin
+        from claude_swap import switcher as _sw
+
+        calls = []
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        monkeypatch.setattr("claude_swap.pin._live_impl",
+                            lambda: self._impl_recording(calls))
+        monkeypatch.setattr("claude_swap.pin.identity_for_config",
+                            lambda s: {"accountUuid": "PIN-UUID",
+                                       "emailAddress": "pinned@example.com"})
+
+        assert pin.repin_current(sw) is True
+        assert calls, "apply_pin was never reached -- the test proves nothing"
+        assert calls[0]["identity"] == {
+            "accountUuid": "PIN-UUID",
+            "emailAddress": "pinned@example.com"}, (
+            "the unattended repair re-pinned without naming the pin in "
+            "`~/.claude.json`, so every bridge minted after it is owned by "
+            "whichever account was active and dies at the next rotation")
+
+    def test_an_unresolvable_identity_still_repairs(self, monkeypatch):
+        """None is not a reason to refuse the repair.
+
+        `identity_for_config` returns None on every doubt, and a serving
+        daemon beats a stopped one -- the splice is the better outcome, not
+        the precondition. This is the same direction `set_pin` takes: it
+        passes whatever the lookup gave, including None.
+        """
+        from claude_swap import pin
+        from claude_swap import switcher as _sw
+
+        calls = []
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        monkeypatch.setattr("claude_swap.pin._live_impl",
+                            lambda: self._impl_recording(calls))
+        monkeypatch.setattr("claude_swap.pin.identity_for_config",
+                            lambda s: None)
+
+        assert pin.repin_current(sw) is True
+        assert calls[0]["identity"] is None
+
+    def test_a_lookup_that_raises_does_not_take_the_repair_down(
+            self, monkeypatch):
+        """`repin_current` promises False, never an exception -- its callers
+        are a menu render and a background watcher."""
+        from claude_swap import pin
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        monkeypatch.setattr("claude_swap.pin._live_impl",
+                            lambda: self._impl_recording([]))
+
+        def _boom(_s):
+            raise RuntimeError("the backup store is unreadable")
+
+        monkeypatch.setattr("claude_swap.pin.identity_for_config", _boom)
+        assert pin.repin_current(sw) is False
+
+
+class TestARolledBackPinDoesNotLeaveItsNameBehind:
+    """A FAILED `cswap pin` had already rewritten the live config.
+
+    `apply_pin` splices `~/.claude.json` and THEN starts the proxy, so by the
+    time it returns False the new account is already named there. `set_pin`
+    then calls `_restore_pin`, which put the RECORD back and left the config
+    alone -- so `cswap pin` reported failure, `cswap pin` read back the old
+    account, and every bridge minted afterwards was owned by the account that
+    failed to pin. The three states disagreed and only the invisible one was
+    driving Claude Code.
+    """
+
+    def _sw(self):
+        from claude_swap import switcher as _sw
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        return sw
+
+    def test_the_config_goes_back_to_the_pin_that_is_restored(self,
+                                                              monkeypatch):
+        from claude_swap import pin
+
+        spliced = []
+
+        class _Impl:
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                return True
+
+            @staticmethod
+            def splice_config_identity(identity):
+                spliced.append(identity)
+                return True
+
+        monkeypatch.setattr("claude_swap.pin._impl", lambda: _Impl)
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("old@example.com", "org-OLD"))
+        monkeypatch.setattr(
+            "claude_swap.pin.identity_for_config",
+            lambda s, email=None: {"emailAddress": "old@example.com",
+                                   "accountUuid": "OLD-UUID"})
+
+        assert pin._restore_pin(self._sw(), ("old@example.com", "org-OLD"))
+        assert spliced, (
+            "the rollback restored the record and left `~/.claude.json` "
+            "naming the account whose pin had just failed")
+        assert spliced[-1] == {"emailAddress": "old@example.com",
+                               "accountUuid": "OLD-UUID"}
+
+    def test_a_splice_that_fails_does_not_change_the_verdict(self,
+                                                             monkeypatch):
+        """The verdict is the RECORD re-read, as it already was. Naming the
+        pin in the config is best-effort everywhere else for the same reason:
+        a config that cannot be written is a worse pin, not a failed one."""
+        from claude_swap import pin
+
+        class _Impl:
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                return True
+
+            @staticmethod
+            def splice_config_identity(identity):
+                raise OSError("read-only home")
+
+        monkeypatch.setattr("claude_swap.pin._impl", lambda: _Impl)
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("old@example.com", "org-OLD"))
+        monkeypatch.setattr("claude_swap.pin.identity_for_config",
+                            lambda s, email=None: {"emailAddress": "x"})
+
+        assert pin._restore_pin(self._sw(), ("old@example.com", "org-OLD"))
+
+
+class TestIdentityForConfigCanBeAskedAboutAnySlot:
+    """It answered only about the CURRENT pin, so a caller restoring a
+    DIFFERENT one had no way to ask. Defaulting to the pin keeps every
+    existing caller unchanged."""
+
+    def _sw(self, monkeypatch, stored):
+        from claude_swap import switcher as _sw
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw._resolve_account_identifier = lambda ident: "2"
+        sw._read_account_config = lambda num, email: stored
+        return sw
+
+    def test_an_explicit_email_wins_over_the_record(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("pinned@example.com", "org-1"))
+        sw = self._sw(monkeypatch,
+                      '{"oauthAccount": {"emailAddress": "asked@example.com"}}')
+        got = pin.identity_for_config(sw, email="asked@example.com")
+        assert got == {"emailAddress": "asked@example.com"}
+
+    def test_no_email_still_means_the_pin(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("pinned@example.com", "org-1"))
+        sw = self._sw(monkeypatch,
+                      '{"oauthAccount": {"emailAddress": "pinned@example.com"}}')
+        assert pin.identity_for_config(sw) == {
+            "emailAddress": "pinned@example.com"}
+
+    def test_no_pin_and_no_email_is_still_None(self, monkeypatch):
+        from claude_swap import pin
+
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: None)
+        sw = self._sw(monkeypatch, '{"oauthAccount": {"emailAddress": "x"}}')
+        assert pin.identity_for_config(sw) is None
+
+
+class TestClearingHandsBackTheLiveAccount:
+    """`--clear` has to say WHOSE identity the config should carry now.
+
+    The package cannot work that out: resolving an account to its stored
+    identity means reading cswap's backup store, and teaching the package that
+    layout is the dependency inversion the seam exists to prevent. So cswap
+    looks up the account that is actually serving and hands it over, exactly
+    as `set_pin` hands over the pinned one.
+
+    Without it the cleared pin stays named in `~/.claude.json`, and Claude
+    Code keeps minting bridges owned by an account nothing is pinned to.
+    """
+
+    def _wire(self, monkeypatch, calls, live_email):
+        from claude_swap import pin
+
+        class _Impl:
+            @staticmethod
+            def apply_pin(_sw, email, org_uuid, identity=None):
+                calls.append({"email": email, "identity": identity})
+                return False
+
+        monkeypatch.setattr("claude_swap.pin._impl", lambda: _Impl)
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("expin@example.com", "org-EX"))
+        monkeypatch.setattr("claude_swap.pin.wired_env_keys", lambda s: {})
+        monkeypatch.setattr("claude_swap.pin.clear_wiring",
+                            lambda *a, **k: True)
+        monkeypatch.setattr(
+            "claude_swap.pin.identity_for_config",
+            lambda s, email=None: ({"emailAddress": email}
+                                   if email == live_email else None))
+        return pin
+
+    def _sw(self, live_email):
+        from claude_swap import switcher as _sw
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        sw._live_login_identity = lambda: (live_email, "org-LIVE")
+        return sw
+
+    def test_the_live_account_is_handed_to_the_clear(self, monkeypatch):
+        calls = []
+        pin = self._wire(monkeypatch, calls, "serving@example.com")
+        pin.clear_pin(self._sw("serving@example.com"))
+        assert calls, "apply_pin was never reached -- the test proves nothing"
+        assert calls[0]["email"] is None, "this is the CLEAR call"
+        assert calls[0]["identity"] == {"emailAddress": "serving@example.com"}, (
+            "the clear did not say who owns the config now, so it keeps "
+            "naming the account that was just unpinned")
+
+    def test_no_live_login_is_not_a_failure(self, monkeypatch):
+        """None means "could not look one up", and the package then leaves the
+        field alone. A clear must work when nothing is logged in."""
+        from claude_swap import pin as _p
+
+        calls = []
+        pin = self._wire(monkeypatch, calls, "serving@example.com")
+        sw = self._sw("serving@example.com")
+        sw._live_login_identity = lambda: None
+        pin.clear_pin(sw)
+        assert calls[0]["identity"] is None
+        assert _p is pin
+
+    def test_a_switcher_that_raises_does_not_block_the_clear(self,
+                                                             monkeypatch):
+        """`--clear` is the command a user reaches for when the pin is broken.
+        Nothing optional may stop it."""
+        calls = []
+        pin = self._wire(monkeypatch, calls, "serving@example.com")
+        sw = self._sw("serving@example.com")
+
+        def _boom():
+            raise RuntimeError("the config is unreadable")
+
+        sw._live_login_identity = _boom
+        pin.clear_pin(sw)
+        assert calls, "the clear did not run at all"
+        assert calls[0]["identity"] is None
