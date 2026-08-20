@@ -5099,6 +5099,7 @@ class ClaudeAccountSwitcher:
         current_num: str | None,
         models: tuple[str, ...] = (),
         usage: dict | None = None,
+        current_at_limit: bool = False,
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
@@ -5139,6 +5140,14 @@ class ClaudeAccountSwitcher:
         if usage is None:
             usage = self._usage_by_account()
         current_headroom = oauth.account_headroom(usage.get(str(current_num)), models)
+        if current_at_limit:
+            # The caller measured the limit somewhere the poll cannot see (the
+            # pin proxy's 429 on /v1/messages). Its percentage is not just
+            # stale, it is a LOWER bound: the usage endpoint 429s the account
+            # under load, and a frozen last_good then outranks every healthy
+            # candidate. Zero, so any candidate with real headroom wins and a
+            # field of exhausted ones still reports "exhausted".
+            current_headroom = 0.0
         if current_headroom is None:
             # Can't measure where the user is → can't prove any target is
             # better. Stay rather than risk moving onto a worse account.
@@ -5623,6 +5632,7 @@ class ClaudeAccountSwitcher:
         json_output: bool = False,
         models: tuple[str, ...] = (),
         model_source: str | None = None,
+        current_at_limit: bool = False,
     ) -> dict | None:
         """Switch to next account in sequence.
 
@@ -5779,7 +5789,7 @@ class ClaudeAccountSwitcher:
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
-                current_num, models, best_usage
+                current_num, models, best_usage, current_at_limit
             )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
@@ -7469,3 +7479,29 @@ class ClaudeAccountSwitcher:
             print(f"\n{dimmed('No claude-swap data found to remove.')}")
 
         print(f"\n{accent('Purge complete.')}")
+
+
+def switch_off_at_limit_account(switcher: "ClaudeAccountSwitcher") -> dict:
+    """Leave an account an out-of-band observer measured as rate-limited.
+
+    For the pin proxy, which sees a 429 on ``/v1/messages`` before Claude Code
+    arms its client-side retry wait. Once that wait is armed no request leaves
+    the client, so nothing outside it can clear it — the proxy's own response
+    is the last moment anyone can act, and this is what it calls there.
+
+    Not an engine tick, and it must not become one: a LIVE engine holds
+    ``.auto-live.lock`` for its whole lifetime, so a second engine demotes
+    itself to dry-run and switches nothing. Nor does it need one — ``at-limit``
+    already skips the cooldown, the no-return bar and hysteresis, which is what
+    ``strategy="best"`` does anyway.
+
+    Returns the ordinary ``--json`` switch payload. ``switched: false`` with
+    ``reason: "candidates-exhausted"`` means nothing has headroom, and the
+    caller should relay the 429 unchanged.
+
+    Its presence is the capability probe: a proxy running against an older
+    claude-swap finds no such symbol and relays the 429 as before.
+    """
+    return switcher.switch(
+        strategy="best", json_output=True, current_at_limit=True
+    )

@@ -34,6 +34,7 @@ from claude_swap.switcher import (
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
+    switch_off_at_limit_account,
 )
 from claude_swap import macos_keychain as _kc
 from claude_swap.exceptions import ClaudeSwitchError
@@ -14130,3 +14131,170 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestCurrentAtLimitOverridesTheFrozenPct:
+    """`current_at_limit=True` — a caller measured the limit off the poll.
+
+    The account under load is the one the usage endpoint 429s, so the slot
+    needing a current number has the oldest, and `decision_value()` serves a
+    frozen `last_good` as a valid lower bound. A usage lower bound is a
+    HEADROOM UPPER bound: right for a destination, wrong for the account being
+    left, which then outranks every candidate and `best` reports `stay`.
+
+    The pin proxy sees a 429 on `/v1/messages` — earlier and stronger evidence
+    than any percentage, and the one signal nothing consumes today.
+    """
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num), email,
+            json.dumps({"claudeAiOauth": {
+                "accessToken": f"sk-{num}", "refreshToken": f"rt-{num}"}}),
+        )
+        s._write_account_config(
+            str(num), email,
+            json.dumps({"oauthAccount": {
+                "emailAddress": email, "accountUuid": f"uuid-{num}"}}),
+        )
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {
+            "email": email, "uuid": f"uuid-{num}",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    @staticmethod
+    def _usage(pct: float) -> dict:
+        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+
+    def test_a_frozen_low_active_still_loses_when_told_it_is_at_limit(
+        self, temp_home
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        # The live shape: the 429'd slot reads BETTER than the healthy one.
+        usage = {"1": self._usage(20.0), "2": self._usage(56.0)}
+
+        target, note = s._select_best_switchable(
+            "1", usage=usage, current_at_limit=True
+        )
+
+        assert (target, note) == ("2", "")
+
+    def test_the_same_call_without_the_flag_stays_put(self, temp_home):
+        # The control: 20% really does beat 56%, so only the flag can move it.
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        usage = {"1": self._usage(20.0), "2": self._usage(56.0)}
+
+        assert s._select_best_switchable("1", usage=usage) == (None, "stay")
+
+    def test_every_candidate_at_its_limit_is_still_exhausted(self, temp_home):
+        # The flag says "leave", never "leave for somewhere no better". With
+        # nowhere to go the caller must relay the 429 rather than burn a swap.
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        usage = {"1": self._usage(20.0), "2": self._usage(100.0)}
+
+        assert s._select_best_switchable(
+            "1", usage=usage, current_at_limit=True
+        ) == (None, "exhausted")
+
+    def test_an_unreadable_active_no_longer_blocks_the_escape(self, temp_home):
+        # Without the flag an unmeasurable active returns "current-unavailable"
+        # and stays, because nothing can be proven better. The flag IS the
+        # measurement, so the escape must not need a second one.
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        usage = {"2": self._usage(10.0)}
+
+        assert s._select_best_switchable("1", usage=usage) == (
+            None, "current-unavailable"
+        )
+        assert s._select_best_switchable(
+            "1", usage=usage, current_at_limit=True
+        ) == ("2", "")
+
+
+class TestSwitchOffAtLimitAccount:
+    """The seam the pin proxy calls when it sees a 429 on `/v1/messages`."""
+
+    def test_it_switches_and_names_the_account_it_landed_on(self, temp_home):
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "a@example.com")
+        seed(s, 2, "b@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"}
+        }))
+        usage = {"1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+                 "2": {"five_hour": {"pct": 56.0}, "seven_day": {"pct": 0.0}}}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = switch_off_at_limit_account(s)
+
+        assert result["switched"] is True
+        assert result["to"]["email"] == "b@example.com"
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_nowhere_to_go_reports_it_rather_than_switching(self, temp_home):
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "a@example.com")
+        seed(s, 2, "b@example.com")
+        # A live login is load-bearing: without one, switch() takes the
+        # fresh-machine path, which ignores the strategy entirely and rotates.
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"}
+        }))
+        usage = {"1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+                 "2": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0}}}
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = switch_off_at_limit_account(s)
+
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_it_does_not_build_an_engine(self, temp_home):
+        """A LIVE engine holds `.auto-live.lock` for its whole lifetime, so a
+        second engine demotes itself to dry-run and switches nothing. This
+        seam must therefore never route through one — and `at-limit` does not
+        need to, since it already skips cooldown, the no-return bar and
+        hysteresis. Measured on the live host: the TUI held the lock, so an
+        engine-tick version of this would have relayed every 429 untouched
+        while passing every test that did not hold the lock first."""
+        import inspect
+        import claude_swap.switcher as mod
+
+        src = inspect.getsource(switch_off_at_limit_account)
+        assert "AutoSwitchEngine" not in src
+        assert "AutoSwitchEngine" not in inspect.getsource(mod.__dict__[
+            "ClaudeAccountSwitcher"].switch)
