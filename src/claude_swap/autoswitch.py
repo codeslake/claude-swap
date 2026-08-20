@@ -46,12 +46,12 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
+from claude_swap.logging_config import decision_logger
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
     binding_pct,
 )
-from claude_swap.logging_config import decision_logger
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
@@ -705,11 +705,7 @@ class AutoSwitchEngine:
                 # cleanup of ours.
                 self.dry_run = True
                 self.demoted_from_live = True
-        # One writer, chosen by the lock that already answers who owns this
-        # machine: `RotatingFileHandler` has no cross-process interlock, and a
-        # TUI demoted to dry-run still emits every tick.
         self._decisions = None
-        self._on_promoted_to_live()
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
@@ -1037,7 +1033,6 @@ class AutoSwitchEngine:
                 return
             self.dry_run = False
             self.demoted_from_live = False
-            self._on_promoted_to_live()
         self._emit(
             ConfigWarningEvent(
                 message="the LIVE holder released the lock — this engine is "
@@ -2642,21 +2637,15 @@ class AutoSwitchEngine:
             return None
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
 
-    def _on_promoted_to_live(self) -> None:
-        """Bind the decision log to whoever currently owns the machine.
-
-        Called at construction and again from `_retry_live_promotion`: an
-        engine demoted at start-up can take the lock on any later tick, and
-        binding once would leave the engine that ends up switching accounts
-        writing nothing -- an empty file reads as "it never decided anything".
-        """
-        if self._decisions is None and self.settings.decision_log and not self.dry_run:
-            self._decisions = decision_logger(self.switcher.backup_dir)
-
     def _emit(self, event: AutoSwitchEvent) -> None:
-        # `human()` is the string the TUI panel renders, so the log and the
-        # screen cannot drift. Logged before the consumer, never after.
-        if self._decisions:
+        # `human()` is what the TUI panel renders, so log and screen cannot
+        # drift. Gated live, not on a snapshot: `stop()` sets `dry_run`, and an
+        # engine demoted at start-up can take the lock on any later tick. One
+        # writer per machine -- `RotatingFileHandler` has no cross-process
+        # interlock, and a TUI demoted to dry-run still emits every tick.
+        if self.settings.decision_log and not self.dry_run:
+            if self._decisions is None:
+                self._decisions = decision_logger(self.switcher.backup_dir)
             self._decisions.info("%s %s", event.ts, event.human())
 
         # NOTHING AFTER `stop()` GOES BACK TO THE CONSUMER. In the TUI
@@ -2767,7 +2756,6 @@ class AutoSwitchEngine:
             # can raise after this `stop()`, leaving the screen pointing at the
             # stopped one.
             self.dry_run = True
-            self._decisions = None
             # Only when someone ELSE is running it. Called from the tick's own
             # thread the wait can never be satisfied — the flag is set by the
             # frame this call is standing on.

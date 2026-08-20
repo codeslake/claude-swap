@@ -9477,61 +9477,48 @@ class TestDecisionLog:
 
     def test_off_by_default(self, harness):
         assert harness.settings.decision_log is False
-        assert harness.engine._decisions is None
+        harness.engine._emit(NoSwitchEvent(reason="cooldown", detail="held"))
+        assert not (
+            harness.switcher.backup_dir / "autoswitch-decisions.log"
+        ).exists()
 
     def test_on_writes_beside_claude_swap_log_and_nowhere_else(
         self, temp_home, caplog
     ):
         h = EngineHarness(temp_home, decision_log=True)
-        # A demoted engine must not become a second writer to the same file.
-        assert h._make_engine(dry_run=True)._decisions is None
+        ev = NoSwitchEvent(reason="cooldown", detail="held")
 
         with caplog.at_level(logging.DEBUG):
-            h.engine._emit(NoSwitchEvent(reason="cooldown", detail="held"))
+            h.engine._emit(ev)
 
-        log = h.switcher.backup_dir / "autoswitch-decisions.log"
-        assert "cooldown" in log.read_text()
-        # Nothing reaches the root chain. The logger is instantiated directly
-        # rather than via `getLogger`, so it has no parent -- swapping that
-        # back would spill every tick into claude-swap.log, and this is what
-        # says so.
+        line = (h.switcher.backup_dir / "autoswitch-decisions.log").read_text()
+        # UTC, from `event.ts`: the file exists to be joined against the usage
+        # cache, and `%(asctime)s` is naive LOCAL.
+        assert line.startswith(f"{ev.ts} "), f"want {ev.ts!r}, got {line[:40]!r}"
+        assert "cooldown" in line
+        # No parent, so nothing reaches the root chain -- swapping the direct
+        # `Logger(...)` back to `getLogger` would spill every tick into
+        # claude-swap.log, and this is what says so.
         assert "cooldown" not in caplog.text
 
-    def test_the_line_carries_the_event_UTC_stamp(self, temp_home):
-        # The point of the file is joining it against the usage cache, which is
-        # UTC. `%(asctime)s` is naive LOCAL -- four hours off on this box -- so
-        # the stamp comes from `event.ts`, the same one `to_json()` emits.
+    def test_the_writer_follows_the_LIVE_lock(self, temp_home):
+        # Only the holder writes, and the gate is read live: a demoted engine
+        # is silent, a stopped one goes silent, and one PROMOTED on a later
+        # tick starts. Through `_retry_live_promotion`, the real path -- an
+        # earlier version drove the bind hook directly and survived deleting
+        # its call site.
         h = EngineHarness(temp_home, decision_log=True)
-        ev = NoSwitchEvent(reason="cooldown", detail="held")
-        h.engine._emit(ev)
-        line = (h.switcher.backup_dir / "autoswitch-decisions.log").read_text()
-        assert line.startswith(ev.ts), f"want {ev.ts!r}, got {line[:40]!r}"
-        assert ev.ts.endswith("Z")
-
-    def test_an_engine_PROMOTED_to_live_starts_writing(self, temp_home):
-        # `_retry_live_promotion` flips `dry_run` back on a later tick. Binding
-        # the logger once at construction makes the engine that ends up owning
-        # the machine the one that logs nothing -- and an empty file reads as
-        # "it never decided anything", which is the question the file answers.
-        # Through `_retry_live_promotion`, the REAL path. Calling the hook
-        # directly would pass with the call site deleted -- measured, that
-        # mutation survived the first version of this test.
-        h = EngineHarness(temp_home, decision_log=True)
+        log = h.switcher.backup_dir / "autoswitch-decisions.log"
         demoted = h._make_engine(dry_run=True)
-        assert demoted._decisions is None
 
-        h.engine.stop()                   # the holder leaves; the lock frees
+        demoted._emit(NoSwitchEvent(reason="demoted", detail=""))
+        h.engine.stop()
+        h.engine._emit(NoSwitchEvent(reason="stopped", detail=""))
+        assert not log.exists(), "only the LIVE holder writes"
+
         demoted.demoted_from_live = True
         demoted._retry_live_promotion()
-
         assert demoted.dry_run is False, "the promotion itself did not happen"
-        assert demoted._decisions is not None
+        demoted._emit(NoSwitchEvent(reason="promoted", detail=""))
 
-    def test_a_STOPPED_engine_stops_writing(self, temp_home):
-        # stop() releases the lock; a successor may already own the file. The
-        # sink sits above the post-stop gate, so without this the drained
-        # engine keeps appending to a file it no longer owns.
-        h = EngineHarness(temp_home, decision_log=True)
-        assert h.engine._decisions is not None
-        h.engine.stop()
-        assert h.engine._decisions is None
+        assert "promoted" in log.read_text()
