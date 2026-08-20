@@ -1422,19 +1422,15 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
     was never touched, so a message claiming "may still name <email>" was
     telling the user to go check a state the code could already disprove.
     """
-    # RESOLVED BEFORE THE CALL THAT DESTROYS ITS INPUT. `apply_pin(None,
-    # None)` drops the pin record, and `_live_login_identity` un-splices only
-    # while the config still equals that record — so asking afterwards returns
-    # the config as `apply_pin` just spliced it, i.e. the account whose pin
-    # failed. Measured: serving@ before the call, failed@ after it. `clear_pin`
-    # has always resolved first; this is the sibling that did not.
-    # SEPARATELY GUARDED, and resolved BEFORE the call that destroys its
-    # input. `apply_pin(None, None)` drops the pin record, and
-    # `_live_login_identity` un-splices only while the config still equals that
-    # record — so asking afterwards returns the account whose pin just failed.
-    # Its own `try` because the two have different contracts: naming the config
-    # is best-effort, restoring the RECORD is the job, and a raising lookup
-    # sharing the guard below skipped `apply_pin` entirely.
+    # RESOLVED BEFORE THE CALL THAT DESTROYS ITS INPUT, in its own guard.
+    # `apply_pin(None, None)` drops the pin record, and `_live_login_identity`
+    # un-splices only while the config still equals that record — so asking
+    # afterwards returns the account whose pin just failed. Measured: serving@
+    # before the call, failed@ after it.
+    #
+    # The separate `try` is load-bearing: naming the config is best-effort,
+    # restoring the RECORD is the job, and a raising lookup sharing the guard
+    # below skipped `apply_pin` entirely.
     _back = None
     if not before:
         try:
