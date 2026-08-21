@@ -34,24 +34,6 @@ _logger = logging.getLogger("claude-swap")
 # -- wiring helpers, and they live here ---------------------------------------
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # -- clear_wiring stays HERE, deliberately ------------------------------------
 #
 # `cswap pin --clear` is priority 1 and this is the whole reason it lives in
@@ -911,12 +893,6 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     return env
 
 
-
-
-
-
-
-
 def _impl() -> ModuleType:
     """The pin implementation, or a clean error naming the fix.
 
@@ -1334,8 +1310,6 @@ def repin_current(switcher) -> bool:
 # -- launch integration ------------------------------------------------------
 
 
-
-
 # -- wiring removal ----------------------------------------------------------
 #
 # This half deliberately does NOT live in the optional package.
@@ -1356,10 +1330,6 @@ _LAUNCH_LOCK_BUDGET_S = 0.5
 # probe alone. Guessing "not serving" after 0.2s costs at worst one unwire the
 # next launch redoes; guessing wrong the other way costs a stalled launch.
 _LAUNCH_PROBE_S = 0.2
-
-
-
-
 
 
 def _pinned_email_now(switcher) -> tuple[str, str] | None:
@@ -1504,16 +1474,6 @@ def _clear_pin_record(switcher) -> None:
 # the old location stays readable indefinitely.
 
 
-
-
-
-
-
-
-
-
-
-
 def _wiring_present(_switcher) -> bool:
     """Does either config still carry a pin wiring?
 
@@ -1628,8 +1588,6 @@ def wired_config_paths(_switcher=None) -> list:
         if _wire_mark_of(raw, path) is not None:
             wired.append(path)
     return wired
-
-
 
 
 # -- command -----------------------------------------------------------------
@@ -1823,8 +1781,6 @@ def set_pin(
     return True, f"Pinned the cloud account (RC/artifacts) to {email}"
 
 
-
-
 def _wired_ports() -> list[int]:
     """Every pin port the configs name, in read order. Unreadable ones are
     absent rather than zero — "no opinion" and "port 0" are different facts.
@@ -1902,10 +1858,6 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     return bool(ports) and all(
         _port_answers(port, connect_timeout) for port in ports
     )
-
-
-
-
 
 
 def _nothing_to_heal(switcher) -> tuple[bool, str]:
@@ -2223,8 +2175,6 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
         return None
 
 
-
-
 def run(
     switcher,
     account: str | None,
@@ -2271,7 +2221,7 @@ def run(
             # while binding nothing gives a launch hook that did its job and a
             # session that dials a dead port anyway. The wiring is CSWAP'S OWN
             # record, so removing it needs no package at all: unpinned is a
-            # working session, wired-to-a-dead- port is not.
+            # working session, wired-to-a-dead-port is not.
             #
             # THE PROBE IS BUDGETED TOO, not just the lock below. Its default
             # is 2.0s, and a port that black-holes instead of refusing pays all

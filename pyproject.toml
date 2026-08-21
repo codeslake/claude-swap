@@ -33,109 +33,16 @@ classifiers = [
 
 [project.optional-dependencies]
 menubar = ["rumps>=0.4.0"]
-# FLOOR AT THE CURRENT RELEASE, and raise it with each one.
+# A CORRECTNESS FLOOR, not a freshness one, and it moves with each release.
 #
-# The argument this line used to carry was "no floor": a minimum is a constant
-# somebody has to remember to raise, and this one sat at 0.1.3 through
-# THIRTY-SIX releases, so `uv tool install 'claude-swap[pin]'` resolved a pin
-# from before the port handdown, the chain walk and the launch hook — while
-# the machine looked correctly installed. The user's dotfiles then grew 248
-# lines of installer to work around it. That history is real and it is why
-# 0.1.3 is not the answer either.
+# This branch calls `cswap_pin.wiring` and `apply_pin(identity=...)`; below
+# 0.1.134 both are AttributeError at the shim rather than a degraded feature.
+# A floor that nobody raises is worse than none -- this one sat at 0.1.3
+# through thirty-six releases while `uv tool install 'claude-swap[pin]'`
+# resolved a pin from before the port handdown, the chain walk and the launch
+# hook, on a machine that looked correctly installed.
 #
-# WHAT THAT ARGUMENT GOT WRONG: it reasoned as though cswap-pin were somebody
-# else's package whose cadence we cannot see. We own it. A floor here is not
-# betting on a third party's release schedule, it is naming the build this
-# extra was tested against — and the stale-floor failure above happened
-# because nobody raised it, not because floors are wrong.
-#
-# WHAT 0.1.68 BUYS, all of it measured and all of it in the pin's own tree:
-#   - the config is written 0600 via O_CREAT|O_EXCL and never widened. Before
-#     0.1.2 it took the umask (022 here) and the rename made 0644 permanent —
-#     and turning THIS EXTRA on is exactly what puts the proxy's credential in
-#     that file, as userinfo in HTTPS_PROXY.
-#   - /health carries `direct_last`, so a chain that fell back to a direct
-#     dial and recovered is still visible to a later probe. Before it, the
-#     daemon detected five such outages, wrote all five to daemon.log, and
-#     nobody read any of them.
-#   - the holder-crash path is covered by a test that waits for the whole
-#     lineage rather than for the port, which is what made every earlier
-#     reading of it wrong.
-#
-# WHAT 0.1.70 ADDS, and why the floor moves off 0.1.68:
-#   - save_pin writes settings.json byte-stably. Before it, `--clear` popped
-#     `remoteControl` and a re-pin appended it LAST, so atomic_write_json —
-#     insertion-ordered, no sort_keys — rewrote identical content in a
-#     different byte order. settings.json is symlinked into dotfiles, so a
-#     clear+re-pin cycle dirtied a TRACKED file on all three machines with a
-#     diff nobody could attribute. 0.1.68 and 0.1.69 both predate the fix.
-#
-# The seam itself does not need any of this: `heal`, `load_pin` and
-# `apply_pin` have byte-identical signatures from v0.1.0 through 0.1.70. The
-# floor is about the BEHAVIOUR around them, not the API.
-#
-# Not a live break today — `uv tool install` resolves newest-satisfying, so it
-# takes 0.1.70 regardless; 0.1.68/0.1.69 only get in when resolution has to
-# backtrack. Tightened because the floor is a statement about which build this
-# extra was tested against, and the untested ones write to a tracked file.
-#
-# WHY 0.1.77, and why this one is not a preference:
-#   - 0.1.75 and 0.1.76 cannot be IMPORTED on Windows. They resolve
-#     `signal.SIGUSR1` at module scope and Windows has no such attribute, so
-#     `import cswap_pin.proxy` raises AttributeError before any of their code
-#     runs. This extra is what puts them on a Windows machine, and CI caught it
-#     the moment the floor moved onto them:
-#         AttributeError: module 'signal' has no attribute 'SIGUSR1'
-#         .venv\Lib\site-packages\cswap_pin\proxy.py:4503
-#     0.1.77 resolves both POSIX-only signals with getattr and declines the
-#     paths that need them.
-#   - 0.1.72 tried to close the deploy gap from inside the daemon and made it
-#     WORSE (2 s -> ~9 s). Reverted in 0.1.73, but the range still admits it.
-#   - 0.1.74 is the one that matters. Its daemon asks its holder to replace it
-#     by SIGUSR1, and assumed the holder could hear it. On an upgrade the holder
-#     is ALWAYS the previous release, which has no handler, and USR1 unhandled
-#     TERMINATES. Measured on host-a: the ask killed the holder, port
-#     36301 went REFUSED for 30 s, and only a standby noticing the free port
-#     brought it back. On a machine with no standby left there is nothing to
-#     notice.
-#   - 0.1.75 makes the capability the holder's to advertise and refuses to
-#     signal one that has not; 0.1.76 retires a holder the deploy left on the
-#     previous release, which is the half that made every later deploy fall
-#     back to the slow path forever.
-#
-# So the floor is not "the newest we happened to test". Everything from 0.1.72
-# to 0.1.74 can take the port down on the next upgrade, and this extra is
-# exactly what installs the thing that does it.
-#
-# Verified on all three machines at 0.1.76: two overlapping daemons on one
-# socket during the handover, then the stale holder retired — 200/200, 200/200
-# and 45/45 completed requests, zero failures.
-#
-# RAISE THIS ON EVERY cswap-pin RELEASE. That is the maintenance cost, it is
-# accepted deliberately, and the pre-push hook in cswap-pin already warns when
-# src changes without a version bump — this is the other half of that.
-#
-# NO `; sys_platform != 'win32'` MARKER, and it has been proposed twice.
-# `pin._impl()` does refuse Windows outright, so the extra is unusable there
-# and the marker looks free. It is not: the dev group depends on
-# `claude-swap[pin]` precisely so `test_the_marker_still_matches_the_package_
-# that_writes_it` RUNS, and that test's own comment records what happened when
-# it did not — it "had never run once", on any platform, so the one check
-# standing between a rename in cswap-pin and `--clear` silently finding
-# nothing was decorative. A platform marker puts that skip back on Windows.
-#
-# The cost cited for the marker is that 0.1.75/0.1.76 could not be imported on
-# Windows (`signal.SIGUSR1` at module scope) and took this repo's Windows CI
-# red. That is the check WORKING: a package that cannot be imported is broken
-# for everyone who installs it, and the platform that noticed is not the
-# platform at fault.
-# 0.1.134 IS A CORRECTNESS FLOOR, not the freshness one the comment above
-# describes. This branch calls `cswap_pin.wiring` (the wiring subsystem moved
-# there) and `apply_pin(identity=...)` (the pin now names itself in the live
-# config). Below 0.1.134 both are AttributeError at the shim, not a degraded
-# feature. 0.1.112 was neither a security nor an API floor — it republished
-# 0.1.111's code past a red macOS fixture — so nothing was being held back by
-# leaving it.
+# cswap-pin's own CHANGELOG carries which release did what.
 pin = ["cswap-pin>=0.1.143"]
 
 [project.urls]
