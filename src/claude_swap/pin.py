@@ -854,15 +854,22 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
             # VALIDATED, NOT TRUSTED. This is the one value from the peer that
             # reaches `os.execvpe`, and execvpe sits OUTSIDE the launch's try —
             # so a wrong shape here is not a caught exception, it is the
-            # launch. It hands the child the PARENT's environ, dropping
-            # CLAUDE_CONFIG_DIR — so the session launches against the default
-            # login instead of the selected account, silently. An account-
-            # isolation break with no error anywhere. {"K": 41234}    execvpe
-            # raises TypeError out of the launch. The module's standing rule is
-            # that the peer may be wrong: `heal` re-reads state rather than
-            # believing a return value. Same rule here — anything that is not a
-            # str->str mapping degrades to an UNPINNED launch, which is the
-            # failure mode the rest of this file is built to tolerate.
+            # launch. The two shapes fail in opposite directions:
+            #
+            #   None              execvpe(argv, None) does NOT fail. It hands
+            #                     the child the PARENT's environ, dropping
+            #                     CLAUDE_CONFIG_DIR, so the session launches
+            #                     against the default login instead of the
+            #                     selected account. An account-isolation break
+            #                     with no error anywhere.
+            #   {"K": 41234}      execvpe raises TypeError out of the launch.
+            #
+            # The silent one is why this is a check and not a try. The module's
+            # standing rule is that the peer may be wrong: `heal` re-reads
+            # state rather than believing a return value. Same rule here —
+            # anything that is not a str->str mapping degrades to an UNPINNED
+            # launch, which is the failure mode the rest of this file is built
+            # to tolerate.
             if isinstance(wired, dict) and all(
                 isinstance(k, str) and isinstance(v, str) for k, v in wired.items()
             ):
@@ -2293,9 +2300,9 @@ def run(
             # BUDGETED, like the two probes below it.
             heal(switcher, connect_timeout=_LAUNCH_PROBE_S,
                  lock_timeout=_LAUNCH_LOCK_BUDGET_S)
-            # RE-READ, DO NOT TRUST THE RETURN. `pin-ensure` answers that by
-            # re-reading the config rather than believing the command, and the
-            # same exposure exists here — `heal` calls into `cswap_pin`, a PEER
+            # RE-READ, DO NOT TRUST THE RETURN. The question is whether a port
+            # is actually being served, and only the config and a connect can
+            # answer it — `heal` calls into `cswap_pin`, a PEER
             # on its own release schedule, so a version that reports success
             # while binding nothing gives a launch hook that did its job and a
             # session that dials a dead port anyway. The wiring is CSWAP'S OWN
@@ -2333,11 +2340,13 @@ def run(
         return 0
 
     if set_port is not None:
-        # WRITE THE PIN'S OWN SETTING, in the pin's own directory. It is not
-        # merely out of range: `bind()` reads 0 as "choose one for me", so
-        # persisting it would do the OPPOSITE of what a user typing it meant,
-        # while looking like it worked. Clearing is the one reading that cannot
-        # be mistaken.
+        # WRITE THE PIN'S OWN SETTING, in the pin's own directory.
+        #
+        # 0 CLEARS RATHER THAN PERSISTS, and it is not merely out of range:
+        # `bind()` reads 0 as "choose one for me", so persisting it would do
+        # the OPPOSITE of what a user typing it meant, while looking like it
+        # worked. Clearing is the one reading that cannot be mistaken. The
+        # `raw.pop` below is where that happens.
         from claude_swap.printer import error
 
         if set_port and not 0 < set_port <= 65535:
