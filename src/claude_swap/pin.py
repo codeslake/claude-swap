@@ -434,8 +434,9 @@ def _each_config(level: int = logging.DEBUG):
     rather than three loops. ``get_default_global_config_path`` calls
     ``Path.home()``, which raises ``RuntimeError`` when HOME is unset and the
     uid has no ``/etc/passwd`` entry (the standard rootless-container shape).
-    ``heal``'s docstring promises "never raises" because the status line calls
-    it on a timer, and ``_wired_ports`` sits on the path from ``heal`` through
+    ``heal``'s contract is "never raises" because a launch hook runs it before
+    every hand-launched ``claude``, and ``_wired_ports`` sits on the path from
+    ``heal`` through
     ``_wired_port_is_serving`` with no guard above it — an unguarded raise
     there reaches the status line's caller directly, so ``pin.heal(sw)``
     raises ``RuntimeError`` instead of returning ``(False, 'Could not heal…')``.
@@ -2009,25 +2010,52 @@ def heal(
             # version takes it instead of catching the symptom, so a TypeError
             # raised INSIDE heal is not mistaken for an old signature and
             # retried against a function that already ran.
-            # `follow_wrapped=False`, and `**kwargs` counts. The default
-            # follows `__wrapped__`, so a `functools.wraps` decorator that
-            # DROPS keywords reports `identity` present, the call raises
-            # TypeError, and the outer `except` swallows it -- losing heal
-            # entirely, which is the one thing this guard exists to prevent.
-            # A `**kwargs` signature has no `identity` parameter and accepts it
-            # anyway; without the second clause the carry would silently never
-            # be passed to such a version.
-            try:
-                _params = inspect.signature(
-                    impl.heal, follow_wrapped=False).parameters
-                _takes_identity = "identity" in _params or any(
+            # BOTH VIEWS MUST AGREE, and taking either alone is wrong in a way
+            # the other is not:
+            #
+            #   followed only   a `functools.wraps` wrapper that DROPS keywords
+            #                   reports the inner signature, so `identity` looks
+            #                   accepted, the call raises TypeError, and the
+            #                   outer `except` swallows it -- heal lost entirely
+            #   unfollowed only a transparent `wraps` wrapper is `(*a, **kw)`,
+            #                   which reads as VAR_KEYWORD and so as accepting,
+            #                   over an inner that does not -- the same loss,
+            #                   through the commoner decorator idiom
+            #
+            # `**kwargs` counts as accepting because a signature cannot say
+            # otherwise; that is an assumption about the callee, not a fact
+            # about it, and a version that FORWARDS kwargs to something
+            # stricter still raises. No signature test can see that one.
+            def _accepts(sig) -> bool:
+                params = sig.parameters
+                return "identity" in params or any(
                     p.kind is inspect.Parameter.VAR_KEYWORD
-                    for p in _params.values())
+                    for p in params.values())
+
+            try:
+                _takes_identity = (
+                    _accepts(inspect.signature(impl.heal))
+                    and _accepts(inspect.signature(impl.heal,
+                                                   follow_wrapped=False)))
             except (TypeError, ValueError):
                 _takes_identity = False
-            _healed = (impl.heal(switcher.backup_dir,
-                                 identity=identity_for_config(switcher))
-                       if _takes_identity else impl.heal(switcher.backup_dir))
+            # THROUGH `_slot_for`, like every other caller. The bare form makes
+            # `identity_for_config` resolve an ADDRESS, and
+            # `_resolve_account_identifier` RAISES when one address names two
+            # slots -- the documented personal+org roster. The function-wide
+            # except turns that into None, the package leaves the field alone,
+            # and the drift this carry exists to stop continues untouched on
+            # exactly the roster the composite key was built for.
+            _pin_id = pinned_identity(switcher)
+            _healed = (
+                impl.heal(switcher.backup_dir,
+                          identity=identity_for_config(
+                              switcher,
+                              email=_pin_id[0] if _pin_id else None,
+                              num=_slot_for(switcher,
+                                            _pin_id[0] if _pin_id else None,
+                                            _pin_id[1] if _pin_id else None)))
+                if _takes_identity else impl.heal(switcher.backup_dir))
             if _healed and _wired_port_is_serving(
                 switcher, connect_timeout=connect_timeout
             ):
@@ -2061,9 +2089,9 @@ def heal(
     # during a credential refresh. With the lock held, a wiring present and the
     # port dead, `heal` answers (False, "Nothing to heal") over an outage in
     # progress and the wiring survives. That is this file's signature defect,
-    # in the channel that matters most: the status line calls `heal` on a
-    # timer, so during the exact failure it exists to report, the user's only
-    # signal said everything was fine.
+    # in the channel that matters most: `heal` is what a launch runs to find
+    # this, so during the exact failure it exists to report, the only signal
+    # anyone had said everything was fine.
     #
     # RE-READ AFTER CLEAR_WIRING, exactly as clear_pin already does — its bool
     # is True when ANY of the two configs changed, not when BOTH did. With the
@@ -2077,8 +2105,8 @@ def heal(
     # the marker with no readable CSWAP_PIN_PORT satisfied it and got torn down
     # here — the exact shape `_dead_wired_configs`' second guard (see its
     # docstring) declares must not be read as "the proxy is dead". `heal` is
-    # the worse of the two call sites to leave unguarded: the status line calls
-    # it on a timer, unattended, while the launch path runs once.
+    # the worse of the two call sites to leave unguarded: `--ensure` reaches it
+    # before EVERY hand-launched claude, while `--heal` is the one-shot.
     try:
         # THE DEAD CONFIGS, NOT "THE WIRING". The list IS the same question
         # one bool wide, and asking it as a bool is what let a machine-wide

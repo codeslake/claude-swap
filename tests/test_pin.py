@@ -9269,3 +9269,118 @@ class TestTheLaunchCarriesTheOwnerFieldToThePackage:
         assert seen.get("called") == sw.backup_dir, (
             "the wrapper was called with a keyword it drops, so heal raised "
             "into the surrounding except and stopped happening")
+
+    def test_a_transparent_wrapper_over_a_positional_inner_is_not_trusted(
+            self, tmp_path, monkeypatch):
+        """THE COMMONER DECORATOR IDIOM, and the hole the first fix opened.
+
+        `@functools.wraps(fn) def w(*args, **kwargs)` is the shape almost
+        every decorator has. Its own signature is `(*a, **kw)` -- VAR_KEYWORD,
+        so "accepts" by the unfollowed view -- over an inner that takes no
+        `identity`. Trusting that raises TypeError into the surrounding
+        `except` and loses heal entirely, which is the outcome the probe
+        exists to prevent. Only the FOLLOWED view can see the inner, and only
+        the unfollowed one can see a wrapper that drops keywords, so both have
+        to agree.
+        """
+        import functools
+
+        seen = {}
+
+        def _inner(backup_dir):
+            seen["called"] = backup_dir
+            return False
+
+        @functools.wraps(_inner)
+        def _transparent(*args, **kwargs):
+            return _inner(*args, **kwargs)
+
+        class _W:
+            heal = staticmethod(_transparent)
+
+        sw = self._run(tmp_path, monkeypatch, _W())
+        assert seen.get("called") == sw.backup_dir, (
+            "a transparent wrapper over a positional-only heal was handed a "
+            "keyword it cannot pass on, so heal raised and stopped happening")
+
+
+class TestTheCarrySurvivesAnAddressThatNamesTwoSlots:
+    """THE ROSTER THE COMPOSITE KEY EXISTS FOR, and the carry was a no-op on it.
+
+    `identity_for_config` resolves an ADDRESS when the caller does not hand it
+    a slot, and `_resolve_account_identifier` RAISES when one address names two
+    -- the documented personal+org shape. The function-wide except turns that
+    into None, the package leaves the field alone, and the drift the carry
+    exists to stop continues untouched.
+
+    The other cases in this file stub `identity_for_config`, so they witness
+    that SOMETHING is carried and never WHICH. This one leaves it real and
+    stubs only the store underneath it.
+    """
+
+    def _sw(self, tmp_path):
+        import json
+        import types
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {"CSWAP_PIN_PORT": "1"}}))
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda path, data: path.write_text(
+                json.dumps(data, indent=2), encoding="utf-8"),
+        )
+        return sw, cfg
+
+    def test_the_identity_still_reaches_the_package(self, tmp_path,
+                                                    monkeypatch):
+        import json
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw, cfg = self._sw(tmp_path)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path",
+                            lambda: cfg)
+
+        # ONE ADDRESS, TWO SLOTS. Resolving it by address is what raises.
+        def _raises(_ident):
+            from claude_swap.exceptions import ConfigError
+            raise ConfigError("two slots share this address")
+
+        sw._resolve_account_identifier = _raises
+        sw._read_account_config = lambda num, email: (
+            json.dumps({"oauthAccount": {"accountUuid": "PIN-UUID",
+                                         "emailAddress": "shared@example.com"}})
+            if num == "2" else "")
+        sw._get_sequence_data = lambda: {"accounts": {
+            "1": {"email": "shared@example.com", "organizationUuid": "ORG-A"},
+            "2": {"email": "shared@example.com", "organizationUuid": "ORG-B"},
+        }}
+        # The real composite lookup, copied rather than stubbed to a constant:
+        # the point of this case is that resolving by (email, org) succeeds
+        # where resolving by address alone raises.
+        sw._find_account_slot = staticmethod(
+            lambda data, email, org: next(
+                (num for num, acct in (data.get("accounts") or {}).items()
+                 if acct.get("email") == email
+                 and acct.get("organizationUuid", "") == org),
+                None))
+        monkeypatch.setattr(pin, "_pinned_email_now",
+                            lambda _s: ("shared@example.com", "ORG-B"))
+
+        seen = {}
+
+        class _I:
+            def heal(self, backup_dir, identity=None):
+                seen["identity"] = identity
+                return False
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _I())
+        pin.heal(sw)
+        assert seen.get("identity") is not None, (
+            "the carry handed the package None on a roster where one address "
+            "names two slots, so the owner field drifts exactly as before")
+        assert seen["identity"]["accountUuid"] == "PIN-UUID"
