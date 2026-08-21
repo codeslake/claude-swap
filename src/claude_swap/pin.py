@@ -93,10 +93,10 @@ def _port_answers(port: int, connect_timeout: float) -> bool:
     # INSIDE THE TRY, both of them. `socket.socket()` raises `OSError` on fd
     # exhaustion (EMFILE/ENFILE) and it sat OUTSIDE — so on a starved box the
     # probe raised through `_wired_port_is_serving`, which `heal` calls twice
-    # with no guard, out of the function whose docstring promises "never
-    # raises: this is called from the status line every few seconds". Nothing
-    # about "can I reach this port" should be able to end the command that
-    # answers it.
+    # with no guard, out of the function whose contract is "never raises".
+    # Nothing about "can I reach this port" should be able to end the command
+    # that answers it -- and `heal`'s callers are a launch hook and a repair
+    # someone is waiting on, so ending it is ending those.
     # AND `sock` IS BOUND FIRST, or the fix moves the raise instead of
     # removing it: with the construction inside the `try`, a failing
     # `socket()` leaves the name unbound and `finally` raises
@@ -127,9 +127,9 @@ def _port_of_config(path) -> int | None:
     both its call sites inside `heal` sit OUTSIDE its bottom `try`. That
     turned a malformed `CSWAP_PIN_PORT` (any hand-edit or future writer bug,
     e.g. 99999, 70000, -1, 4294967296) into a traceback out of `cswap pin
-    --heal` — called from the status line on a timer, where `heal`
-    documents "never raises". Treating it as "no opinion" here, at the
-    source, means every downstream consumer inherits the fix for free.
+    --heal`, out of the function whose contract is "never raises". Treating
+    it as "no opinion" here, at the source, means every downstream consumer
+    inherits the fix for free.
     """
 
     try:
@@ -1947,8 +1947,12 @@ def heal(
        a dead port is not. The fallback the shell provides (the corporate proxy,
        or nothing) is what the user had before they ever pinned.
 
-    Never raises: this is called from the status line every few seconds, and a
-    health check that can break the prompt is worse than the fault it reports.
+    Never raises. NOT because a timer calls it -- nothing does, and this
+    docstring claimed a status-line caller for long enough that a review
+    re-tuned budgets for one. Its two callers are `cswap pin --ensure`, which
+    an rc file runs before every hand-launched ``claude``, and a hand-run
+    ``cswap pin --heal``. Both are a LAUNCH or a repair someone is waiting on,
+    and a health check that can end either is worse than the fault it reports.
 
     ``connect_timeout`` is every loopback probe below, and it is a keyword the
     LAUNCH path must pass. The default is right for a hand-run ``--heal``, and
@@ -1992,12 +1996,11 @@ def heal(
             # gives `heal() -> (True, "Restored the cloud pin")` with the wired
             # port not serving, so the status line shows healthy while every
             # session dials a dead port.
-            # THE OWNER FIELD RIDES ALONG, because this is the launch. The
-            # package re-asserts `oauthAccount` when handed the identity, and
-            # only the host can supply it: the value lives in cswap's per-slot
-            # config backup, which a switch archives FROM the live config — so
-            # under a pin that backup already names the pin, and a package
-            # reading it back would be reading our own writing.
+            # THE OWNER FIELD RIDES ALONG. The package owns that behaviour and
+            # documents it; the host's part is only that it must LOOK THE
+            # IDENTITY UP rather than let the package read it, because the
+            # value lives in cswap's per-slot config backup and the package
+            # has no business knowing that layout.
             #
             # ASKED, NOT ASSUMED. The package is a peer on its own release
             # schedule, and one that predates this argument raises TypeError
@@ -2006,9 +2009,20 @@ def heal(
             # version takes it instead of catching the symptom, so a TypeError
             # raised INSIDE heal is not mistaken for an old signature and
             # retried against a function that already ran.
+            # `follow_wrapped=False`, and `**kwargs` counts. The default
+            # follows `__wrapped__`, so a `functools.wraps` decorator that
+            # DROPS keywords reports `identity` present, the call raises
+            # TypeError, and the outer `except` swallows it -- losing heal
+            # entirely, which is the one thing this guard exists to prevent.
+            # A `**kwargs` signature has no `identity` parameter and accepts it
+            # anyway; without the second clause the carry would silently never
+            # be passed to such a version.
             try:
-                _takes_identity = "identity" in inspect.signature(
-                    impl.heal).parameters
+                _params = inspect.signature(
+                    impl.heal, follow_wrapped=False).parameters
+                _takes_identity = "identity" in _params or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in _params.values())
             except (TypeError, ValueError):
                 _takes_identity = False
             _healed = (impl.heal(switcher.backup_dir,
@@ -2487,7 +2501,7 @@ def _warn_if_bridges_disagree(pin, current) -> None:
     """Say so when the live bridges do not belong to the account we pinned.
 
     THE STATUS LINE REPORTS THE PIN, WHICH IS WHAT WE WROTE — never what the
-    machine has. Measured 2026-08-17, three accounts at once:
+    machine has. Measured with three accounts at once:
 
         the line said       acct1@example.com    pinned, acct 1
         the live bridge was org A                 acct 2

@@ -9145,3 +9145,127 @@ class TestAnUnreadableConfigIsNotACleanOne:
         cfg = self._config(tmp_path, '{"env": "HTTPS_PROXY"}')
         assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}
 
+
+
+class TestTheLaunchCarriesTheOwnerFieldToThePackage:
+    """THE CARRY ITSELF HAD NO WITNESS, which is the defect it was written to
+    fix arriving in the fix.
+
+    Every fake impl in this file declares `heal(self, backup_dir)`, so the
+    signature probe answered False for all of them and the `identity=` call --
+    the only new production line -- was never executed by any test. A typo in
+    the keyword, a wrong argument, or deleting the carry outright all shipped
+    green.
+
+    Both shapes are driven here because the probe has two jobs: hand the
+    identity to a package that takes it, and stay positional for one that does
+    not. A test of only the first would pass while the second raised TypeError
+    into an `except Exception` that silently loses heal altogether.
+    """
+
+    def _sw(self, tmp_path):
+        import json
+        import types
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        cfg = tmp_path / ".claude.json"
+        cfg.write_text(json.dumps({"env": {"CSWAP_PIN_PORT": "1"}}))
+        return (
+            types.SimpleNamespace(
+                backup_dir=backup,
+                _write_json=lambda path, data: path.write_text(
+                    json.dumps(data, indent=2), encoding="utf-8"
+                ),
+            ),
+            cfg,
+        )
+
+    def _paths(self, monkeypatch, cfg):
+        import claude_swap.paths as paths
+
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+    IDENT = {"emailAddress": "pinned@example.com", "accountUuid": "PIN-UUID"}
+
+    def _run(self, tmp_path, monkeypatch, impl):
+        from claude_swap import pin
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: impl)
+        monkeypatch.setattr(pin, "identity_for_config",
+                            lambda _sw, **_kw: self.IDENT)
+        pin.heal(sw)
+        return sw
+
+    def test_a_package_that_takes_it_receives_the_pinned_identity(
+            self, tmp_path, monkeypatch):
+        seen = {}
+
+        class _I:
+            def heal(self, backup_dir, identity=None):
+                seen["identity"] = identity
+                return False
+
+        self._run(tmp_path, monkeypatch, _I())
+        assert seen.get("identity") == self.IDENT, (
+            "the launch did not hand the package the pin's identity, so the "
+            "owner field is left to drift between switches")
+
+    def test_a_package_that_does_not_is_still_called_positionally(
+            self, tmp_path, monkeypatch):
+        """THE CONTROL, and the more dangerous half. An older package raises
+        TypeError on the keyword, inside an `except Exception` that would
+        swallow it -- so heal would stop happening at all, silently."""
+        seen = {}
+
+        class _Old:
+            def heal(self, backup_dir):
+                seen["called"] = backup_dir
+                return False
+
+        sw = self._run(tmp_path, monkeypatch, _Old())
+        assert seen.get("called") == sw.backup_dir, (
+            "heal was never reached on a package predating the argument")
+
+    def test_a_kwargs_signature_counts_as_taking_it(self, tmp_path,
+                                                    monkeypatch):
+        """`**kwargs` has no `identity` parameter and accepts it anyway. A
+        membership test alone silently never passes the carry to such a
+        version."""
+        seen = {}
+
+        class _Kw:
+            def heal(self, backup_dir, **kw):
+                seen.update(kw)
+                return False
+
+        self._run(tmp_path, monkeypatch, _Kw())
+        assert seen.get("identity") == self.IDENT
+
+    def test_a_wrapper_that_drops_keywords_is_not_trusted(self, tmp_path,
+                                                          monkeypatch):
+        """`inspect.signature` follows `__wrapped__` by default and would
+        report the INNER signature -- so a decorator that drops keywords looks
+        like it takes one, the call raises, and heal is lost."""
+        import functools
+
+        seen = {}
+
+        def _inner(backup_dir, identity=None):
+            return False
+
+        @functools.wraps(_inner)
+        def _drops(backup_dir):
+            seen["called"] = backup_dir
+            return False
+
+        class _W:
+            heal = staticmethod(_drops)
+
+        sw = self._run(tmp_path, monkeypatch, _W())
+        assert seen.get("called") == sw.backup_dir, (
+            "the wrapper was called with a keyword it drops, so heal raised "
+            "into the surrounding except and stopped happening")
