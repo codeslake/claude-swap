@@ -9270,6 +9270,54 @@ class TestTheLaunchCarriesTheOwnerFieldToThePackage:
             "the wrapper was called with a keyword it drops, so heal raised "
             "into the surrounding except and stopped happening")
 
+
+    def test_the_launch_budget_is_offered_to_a_package_that_takes_it(
+            self, tmp_path, monkeypatch):
+        """`lock_timeout` bounds OUR config lock, and the splice inside the
+        package takes the SAME one. Without passing it, a contended launch
+        pays the package's own default twice -- once for the splice, once for
+        the wiring after it -- against a caller that budgets half a second."""
+        from claude_swap import pin
+
+        seen = {}
+
+        class _I:
+            def heal(self, backup_dir, identity=None, lock_timeout=None):
+                seen["lock_timeout"] = lock_timeout
+                return False
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: _I())
+        monkeypatch.setattr(pin, "identity_for_config",
+                            lambda _sw, **_kw: self.IDENT)
+        pin.heal(sw, lock_timeout=0.5)
+        assert seen.get("lock_timeout") == 0.5, (
+            "the package was left on its own lock budget, ten times what this "
+            "caller allows itself")
+
+    def test_CONTROL_a_package_without_it_is_not_handed_it(self, tmp_path,
+                                                           monkeypatch):
+        """An older package raises TypeError on the keyword, inside an
+        `except Exception` that would swallow it and lose heal entirely."""
+        from claude_swap import pin
+
+        seen = {}
+
+        class _Old:
+            def heal(self, backup_dir, identity=None):
+                seen["called"] = backup_dir
+                return False
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: _Old())
+        monkeypatch.setattr(pin, "identity_for_config",
+                            lambda _sw, **_kw: self.IDENT)
+        pin.heal(sw, lock_timeout=0.5)
+        assert seen.get("called") == sw.backup_dir, (
+            "heal was never reached on a package predating the budget")
+
     def test_a_transparent_wrapper_over_a_positional_inner_is_not_trusted(
             self, tmp_path, monkeypatch):
         """THE COMMONER DECORATOR IDIOM, and the hole the first fix opened.

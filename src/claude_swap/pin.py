@@ -2026,36 +2026,47 @@ def heal(
             # otherwise; that is an assumption about the callee, not a fact
             # about it, and a version that FORWARDS kwargs to something
             # stricter still raises. No signature test can see that one.
-            def _accepts(sig) -> bool:
+            def _accepts(sig, name: str = "identity") -> bool:
                 params = sig.parameters
-                return "identity" in params or any(
+                return name in params or any(
                     p.kind is inspect.Parameter.VAR_KEYWORD
                     for p in params.values())
 
-            try:
-                _takes_identity = (
-                    _accepts(inspect.signature(impl.heal))
-                    and _accepts(inspect.signature(impl.heal,
-                                                   follow_wrapped=False)))
-            except (TypeError, ValueError):
-                _takes_identity = False
-            # THROUGH `_slot_for`, like every other caller. The bare form makes
-            # `identity_for_config` resolve an ADDRESS, and
+            def _both(name: str) -> bool:
+                try:
+                    return (_accepts(inspect.signature(impl.heal), name)
+                            and _accepts(inspect.signature(
+                                impl.heal, follow_wrapped=False), name))
+                except (TypeError, ValueError):
+                    return False
+
+            _takes_identity = _both("identity")
+            # AND THE BUDGET, or the package waits ten times as long as this
+            # caller allows itself. `lock_timeout` bounds OUR config lock; the
+            # splice inside `heal` takes the SAME lock and had no way to hear
+            # about it, so a contended launch paid the package's default twice
+            # -- once for the splice, once for the wiring after it.
+            # THROUGH `_slot_for`, like every other caller. The bare form
+            # makes `identity_for_config` resolve an ADDRESS, and
             # `_resolve_account_identifier` RAISES when one address names two
             # slots -- the documented personal+org roster. The function-wide
             # except turns that into None, the package leaves the field alone,
             # and the drift this carry exists to stop continues untouched on
             # exactly the roster the composite key was built for.
-            _pin_id = pinned_identity(switcher)
-            _healed = (
-                impl.heal(switcher.backup_dir,
-                          identity=identity_for_config(
-                              switcher,
-                              email=_pin_id[0] if _pin_id else None,
-                              num=_slot_for(switcher,
-                                            _pin_id[0] if _pin_id else None,
-                                            _pin_id[1] if _pin_id else None)))
-                if _takes_identity else impl.heal(switcher.backup_dir))
+            #
+            # AND THE BUDGET RIDES WITH IT, or the package waits ten times as
+            # long as this caller allows itself: `lock_timeout` bounds OUR
+            # config lock, the splice inside `heal` takes the SAME lock, and
+            # it had no way to hear about it.
+            _kw = {}
+            if _takes_identity:
+                _pin_id = pinned_identity(switcher) or (None, None)
+                _kw["identity"] = identity_for_config(
+                    switcher, email=_pin_id[0],
+                    num=_slot_for(switcher, _pin_id[0], _pin_id[1]))
+            if lock_timeout is not None and _both("lock_timeout"):
+                _kw["lock_timeout"] = lock_timeout
+            _healed = impl.heal(switcher.backup_dir, **_kw)
             if _healed and _wired_port_is_serving(
                 switcher, connect_timeout=connect_timeout
             ):
