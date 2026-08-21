@@ -22,6 +22,7 @@ dependency is imported lazily inside the entry points, exactly as
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -1991,7 +1992,29 @@ def heal(
             # gives `heal() -> (True, "Restored the cloud pin")` with the wired
             # port not serving, so the status line shows healthy while every
             # session dials a dead port.
-            if impl.heal(switcher.backup_dir) and _wired_port_is_serving(
+            # THE OWNER FIELD RIDES ALONG, because this is the launch. The
+            # package re-asserts `oauthAccount` when handed the identity, and
+            # only the host can supply it: the value lives in cswap's per-slot
+            # config backup, which a switch archives FROM the live config — so
+            # under a pin that backup already names the pin, and a package
+            # reading it back would be reading our own writing.
+            #
+            # ASKED, NOT ASSUMED. The package is a peer on its own release
+            # schedule, and one that predates this argument raises TypeError
+            # on the keyword — inside this try, which would swallow it and
+            # silently lose heal altogether. `signature` answers whether this
+            # version takes it instead of catching the symptom, so a TypeError
+            # raised INSIDE heal is not mistaken for an old signature and
+            # retried against a function that already ran.
+            try:
+                _takes_identity = "identity" in inspect.signature(
+                    impl.heal).parameters
+            except (TypeError, ValueError):
+                _takes_identity = False
+            _healed = (impl.heal(switcher.backup_dir,
+                                 identity=identity_for_config(switcher))
+                       if _takes_identity else impl.heal(switcher.backup_dir))
+            if _healed and _wired_port_is_serving(
                 switcher, connect_timeout=connect_timeout
             ):
                 return True, "Restored the cloud pin"
@@ -2467,8 +2490,8 @@ def _warn_if_bridges_disagree(pin, current) -> None:
     machine has. Measured 2026-08-17, three accounts at once:
 
         the line said       acct1@example.com    pinned, acct 1
-        the live bridge was org da3631be…          acct 2
-        the login was       org b7e54904…          acct 3
+        the live bridge was org A                 acct 2
+        the login was       org B                 acct 3
 
     Thirteen live bridges, none on the pinned org, and this command reported
     "pinned" throughout. What ended the silence was the server answering

@@ -8173,10 +8173,20 @@ class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
         monkeypatch.setattr(
             "claude_swap.pin._pinned_email_now",
             lambda s: ("pinned@example.com", "org-1"))
-        sw._resolve_account_identifier = lambda ident: "2"
+        # THE STUBS MUST DISCRIMINATE, or this test cannot see which half of
+        # the identity tuple was passed. Argument-blind lambdas made
+        # `ident[0]` -> `ident[1]` -- the org uuid instead of the address --
+        # byte-identical to a clean suite. That slip makes the lookup return
+        # None, `identity_for_config` return None, and `pin_oauth or
+        # target_oauth` fall back to the account being switched TO, so the
+        # pin's identity never reaches the config and the splice this test
+        # exists for silently stops happening.
+        sw._resolve_account_identifier = lambda ident: (
+            "2" if ident == "pinned@example.com" else None)
         sw._read_account_config = lambda num, email: (
             '{"oauthAccount": {"accountUuid": "PIN-UUID",'
-            ' "emailAddress": "pinned@example.com"}}')
+            ' "emailAddress": "pinned@example.com"}}'
+            if (num, email) == ("2", "pinned@example.com") else "")
 
         got = pin.identity_for_config(sw)
         assert got == {"accountUuid": "PIN-UUID",
