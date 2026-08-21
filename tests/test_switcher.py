@@ -12300,3 +12300,14 @@ class TestThePolicyFetchIsBudgeted:
         assert sw.fetch_policy_limits() is None
         assert not called
 
+        # AND THE OTHER WAY THE TOKEN IS MISSING. The line above covers the
+        # absent FILE, which the `except` handles; a file that parses and
+        # carries no accessToken is the `if not token` branch, and deleting
+        # that guard left the suite byte-identical. The cost is one pointless
+        # `Bearer None` request inside the switch transaction.
+        empty = tmp_path / "tokenless.json"
+        empty.write_text(json.dumps({"claudeAiOauth": {}}))
+        monkeypatch.setattr(sw, "get_credentials_path", lambda: empty)
+        assert sw.fetch_policy_limits() is None
+        assert not called
+
