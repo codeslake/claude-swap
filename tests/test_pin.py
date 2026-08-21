@@ -9102,7 +9102,7 @@ class TestAnUnreadableConfigIsNotACleanOne:
         cfg.chmod(0o000)
         try:
             if os.access(cfg, os.R_OK):        # root reads anything
-                pytest.skip("running as root: an unreadable file cannot be made")
+                pytest.skip("cannot make an unreadable file here (root, or Windows)")
             left = self._pin().env_keys_survive({cfg: ["HTTPS_PROXY", "CSWAP_PIN_PORT"]})
         finally:
             cfg.chmod(0o600)

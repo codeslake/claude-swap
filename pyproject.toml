@@ -43,6 +43,10 @@ menubar = ["rumps>=0.4.0"]
 # hook, on a machine that looked correctly installed.
 #
 # cswap-pin's own CHANGELOG carries which release did what.
+#
+# NO `; sys_platform != 'win32'` MARKER, and it has been proposed twice.
+# The dev group installs this so the cswap-pin seam test runs on Windows
+# too; a marker makes that test decorative instead of red.
 pin = ["cswap-pin>=0.1.143"]
 
 [project.urls]

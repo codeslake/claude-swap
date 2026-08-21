@@ -12225,3 +12225,78 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestThePolicyFetchIsBudgeted:
+    """The switch transaction must not spend ten seconds asking about policy.
+
+    Both `_refresh_policy_cache` call sites sit INSIDE `_perform_switch` --
+    after the credential write and before `activeAccountNumber` is persisted --
+    so `urlopen`'s own 10s default widened the window in which the credentials
+    are the new account's and the roster still says the old one, on the path
+    the autoswitch engine drives right before a lockout.
+
+    THIS TEST EXISTS BECAUSE ITS ABSENCE WAS MEASURED. A reviewer reverted the
+    budget with `fetch_policy_limits.__defaults__ = (10.0,)` and the suite came
+    back byte-identical -- 2389 passed, 4 skipped. Both policy tests replace
+    this seam with a no-arg lambda, so by construction neither can observe a
+    timeout. The constant was a comment with no witness.
+    """
+
+    @staticmethod
+    def _creds(tmp_path):
+        p = tmp_path / ".credentials.json"
+        p.write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt"}}))
+        return p
+
+    def test_the_seam_hands_oauth_the_budget_and_not_the_default(
+            self, tmp_path, monkeypatch):
+        from claude_swap import switcher as sw
+
+        seen = {}
+
+        def _spy(token, timeout_s):
+            seen["token"], seen["timeout"] = token, timeout_s
+            return {"restrictions": {}}
+
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: self._creds(tmp_path))
+        monkeypatch.setattr(oauth, "fetch_policy_limits", _spy)
+
+        assert sw.fetch_policy_limits() == {"restrictions": {}}
+        assert seen["token"] == "sk-live"
+        # THE COMPARISON IS THE POINT, not the literal: this fails if someone
+        # "simplifies" the constant back to the fetch's own default.
+        assert seen["timeout"] == sw._POLICY_FETCH_BUDGET_S
+        assert seen["timeout"] < 10.0, (
+            "the switch transaction must be tighter than urlopen's default")
+
+    def test_an_explicit_budget_still_wins(self, tmp_path, monkeypatch):
+        """The seam keeps its parameter, so a caller that knows better can say
+        so -- and the suite's own no-arg stubs keep working because the budget
+        is a DEFAULT, not something the call site passes."""
+        from claude_swap import switcher as sw
+
+        seen = {}
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: self._creds(tmp_path))
+        monkeypatch.setattr(oauth, "fetch_policy_limits",
+                            lambda token, timeout_s: seen.setdefault("t", timeout_s))
+        sw.fetch_policy_limits(timeout_s=0.25)
+        assert seen["t"] == 0.25
+
+    def test_CONTROL_no_credential_means_no_fetch_at_all(
+            self, tmp_path, monkeypatch):
+        """Without this, the two above pass on a seam that calls oauth
+        unconditionally."""
+        from claude_swap import switcher as sw
+
+        called = []
+        monkeypatch.setattr(sw, "get_credentials_path",
+                            lambda: tmp_path / "absent.json")
+        monkeypatch.setattr(oauth, "fetch_policy_limits",
+                            lambda *a, **k: called.append(1))
+        assert sw.fetch_policy_limits() is None
+        assert not called
+

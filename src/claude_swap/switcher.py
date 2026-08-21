@@ -552,18 +552,9 @@ class ClaudeAccountSwitcher:
         a switch must not fail over a cache file, and the worst case of doing
         nothing is the state we already had.
         """
-        # THE BUDGET LIVES ON THE SEAM, not here: `fetch_policy_limits`
-        # defaults to `_POLICY_FETCH_BUDGET_S`, and the suite replaces
-        # this seam with a NO-ARG stub -- passing the budget from the call
-        # site breaks every one of those. Budgeted because both call sites
-        # are INSIDE the switch
-        # transaction — after the credential write and before
-        # `activeAccountNumber` is persisted. The default is 10s, so a
-        # black-holing endpoint widens the window in which the credentials are
-        # the new account's and the roster still says the old one, on the path
-        # the autoswitch engine drives right before a lockout. 2s is this
-        # module's usual budget, and a failed fetch already leaves the old
-        # answer standing.
+        # NO-ARG ON PURPOSE: the budget is the seam's own default (see
+        # `_POLICY_FETCH_BUDGET_S`), and the suite replaces this seam with a
+        # no-arg stub -- passing it from here breaks every one of those.
         try:
             doc = fetch_policy_limits()
         except Exception as exc:  # noqa: BLE001 — see the docstring

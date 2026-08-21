@@ -31,9 +31,6 @@ from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
 _logger = logging.getLogger("claude-swap")
 
-# -- wiring helpers, and they live here ---------------------------------------
-
-
 # -- clear_wiring stays HERE, deliberately ------------------------------------
 #
 # `cswap pin --clear` is priority 1 and this is the whole reason it lives in
@@ -1925,6 +1922,12 @@ def heal(
     lock_timeout: float | None = None,
 ) -> tuple[bool, str]:
     """Make the pin serving again, or make it harmless. ``(changed, message)``.
+
+    ``lock_timeout`` bounds OUR config lock, not the PACKAGE's. `impl.heal`
+    takes cswap-pin's own spawn lock with no timeout of ours to give it, so a
+    repair that has to spawn waits for whoever is already spawning. Bounded in
+    practice -- that holder is performing the repair, and flock releases on its
+    death -- but the budgets here do not cover it.
 
     A DEAD PIN MUST NOT TAKE THE SESSION WITH IT. Everything else here reacts
     to a launch, so when the daemon dies while sessions are up nothing brings
