@@ -308,7 +308,15 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
-def fetch_policy_limits() -> dict | None:
+#: How long the switch transaction may spend asking the policy question.
+#:
+#: Both callers sit INSIDE `_perform_switch` -- after the credential write and
+#: before `activeAccountNumber` is persisted -- so this bounds the window in
+#: which the two disagree. The fetch's own default is 10s.
+_POLICY_FETCH_BUDGET_S = 2.0
+
+
+def fetch_policy_limits(timeout_s: float = _POLICY_FETCH_BUDGET_S) -> "dict | None":
     """The active credential's org-policy document, or None if unaskable.
 
     A module-level seam so the switch path has ONE thing to stub, and so the
@@ -322,7 +330,7 @@ def fetch_policy_limits() -> dict | None:
         return None
     if not token:
         return None
-    return oauth.fetch_policy_limits(token)
+    return oauth.fetch_policy_limits(token, timeout_s=timeout_s)
 
 
 class ClaudeAccountSwitcher:
@@ -544,6 +552,18 @@ class ClaudeAccountSwitcher:
         a switch must not fail over a cache file, and the worst case of doing
         nothing is the state we already had.
         """
+        # THE BUDGET LIVES ON THE SEAM, not here: `fetch_policy_limits`
+        # defaults to `_POLICY_FETCH_BUDGET_S`, and the suite replaces
+        # this seam with a NO-ARG stub -- passing the budget from the call
+        # site breaks every one of those. Budgeted because both call sites
+        # are INSIDE the switch
+        # transaction — after the credential write and before
+        # `activeAccountNumber` is persisted. The default is 10s, so a
+        # black-holing endpoint widens the window in which the credentials are
+        # the new account's and the roster still says the old one, on the path
+        # the autoswitch engine drives right before a lockout. 2s is this
+        # module's usual budget, and a failed fetch already leaves the old
+        # answer standing.
         try:
             doc = fetch_policy_limits()
         except Exception as exc:  # noqa: BLE001 — see the docstring

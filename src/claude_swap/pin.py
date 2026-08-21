@@ -1573,9 +1573,14 @@ def _env_of_config(path) -> "dict | None":
     render as "it is clean" in the one message a purged user still gets.
     """
     try:
-        return json.loads(path.read_text(encoding="utf-8")).get("env") or {}
+        env = json.loads(path.read_text(encoding="utf-8")).get("env")
     except Exception:  # noqa: BLE001 — unreadable: no opinion
         return None
+    # A DICT OR NOTHING. A hand-edited `"env": "HTTPS_PROXY"` makes the
+    # caller's `n in env` a SUBSTRING test, which reports a survivor over a
+    # config that has no env block at all — the opposite failure to the one
+    # above, and out of the same message.
+    return env if isinstance(env, dict) else {}
 
 
 def env_keys_survive(before: dict) -> dict:

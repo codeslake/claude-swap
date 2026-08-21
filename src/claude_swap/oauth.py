@@ -793,7 +793,8 @@ _BRIDGE_SESSIONS_URL = "https://api.anthropic.com/v1/code/sessions"
 _POLICY_LIMITS_URL = "https://api.anthropic.com/api/claude_code/policy_limits"
 
 
-def fetch_policy_limits(access_token: str) -> dict | None:
+def fetch_policy_limits(access_token: str,
+                        timeout_s: float = 10.0) -> dict | None:
     """The org-policy document the SERVER returns for this credential.
 
     Claude Code caches this at `<config home>/policy-limits.json` and reads it
@@ -816,7 +817,7 @@ def fetch_policy_limits(access_token: str) -> dict | None:
     })
     try:
         with urllib.request.urlopen(
-            req, timeout=10, context=_pin_aware_ssl_context()
+            req, timeout=timeout_s, context=_pin_aware_ssl_context()
         ) as resp:
             data = json.loads(resp.read().decode())
     except Exception as e:  # noqa: BLE001 — a switch must not fail on this

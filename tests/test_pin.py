@@ -9070,3 +9070,68 @@ class TestTheSeamCanBeAskedWhichSlotIsPinned:
 
         monkeypatch.setattr(pin, "_pinned_email_now", boom)
         assert pin.pinned_slot(object()) is None
+
+
+class TestAnUnreadableConfigIsNotACleanOne:
+    """`env_keys_survive` must not report an un-checkable config as clean.
+
+    After a purge the record, cert dir and daemon state are gone and hand
+    editing is the only cure left, so this message is the last thing a
+    stranded user gets. A config that cannot be read still has its env block,
+    and "I could not open it" rendering as "it is clean" sends them away.
+
+    THIS TEST WAS ABSENT WHEN THE CONTRACT CHANGED. A reviewer restored the
+    old `{}`-on-unreadable body under an autouse fixture and the suite came
+    back byte-identical -- 2384 passed, 4 skipped, both ways. This branch is
+    the whole reason the return type moved from `{}` to None.
+    """
+
+    @staticmethod
+    def _config(tmp_path, body, name="unreadable.json"):
+        path = tmp_path / name
+        path.write_text(body)
+        return path
+
+    @staticmethod
+    def _pin():
+        from claude_swap import pin as pin_mod
+        return pin_mod
+
+    def test_an_unreadable_config_reports_every_captured_key(self, tmp_path):
+        cfg = self._config(tmp_path, '{"env": {"HTTPS_PROXY": "http://x"}}')
+        cfg.chmod(0o000)
+        try:
+            if os.access(cfg, os.R_OK):        # root reads anything
+                pytest.skip("running as root: an unreadable file cannot be made")
+            left = self._pin().env_keys_survive({cfg: ["HTTPS_PROXY", "CSWAP_PIN_PORT"]})
+        finally:
+            cfg.chmod(0o600)
+        assert left == {cfg: ["HTTPS_PROXY", "CSWAP_PIN_PORT"]}, (
+            "an unreadable config must count as surviving, not as clean")
+
+    def test_a_config_that_is_not_json_counts_as_surviving_too(self, tmp_path):
+        """The other way a config becomes un-checkable, and it needs no
+        permission bits -- so this arm runs as root too."""
+        cfg = self._config(tmp_path, "{not json")
+        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {
+            cfg: ["HTTPS_PROXY"]}
+
+    def test_CONTROL_a_readable_cleared_config_is_clean(self, tmp_path):
+        """Without this, the two above pass on a function that reports
+        everything as surviving."""
+        cfg = self._config(tmp_path, '{"env": {}}')
+        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}
+
+    def test_a_readable_config_that_KEPT_the_key_is_named(self, tmp_path):
+        cfg = self._config(tmp_path, '{"env": {"HTTPS_PROXY": "http://dead"}}')
+        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY", "GONE"]}) == {
+            cfg: ["HTTPS_PROXY"]}
+
+    def test_an_env_block_that_is_not_a_dict_is_not_searched_as_a_string(
+            self, tmp_path):
+        """A hand-edited `"env": "HTTPS_PROXY"` made `n in env` a SUBSTRING
+        test, so the key read as surviving over a config with no env block at
+        all."""
+        cfg = self._config(tmp_path, '{"env": "HTTPS_PROXY"}')
+        assert self._pin().env_keys_survive({cfg: ["HTTPS_PROXY"]}) == {}
+
