@@ -850,25 +850,14 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
             # what it returns was the missing half. One `dict()` here covers
             # the caller's object and the fallback path together.
             wired = pin.wire_env(dict(env), port, ca_path)
-            # VALIDATED, NOT TRUSTED. This is the one value from the peer that
-            # reaches `os.execvpe`, and execvpe sits OUTSIDE the launch's try —
-            # so a wrong shape here is not a caught exception, it is the
-            # launch. The two shapes fail in opposite directions:
-            #
-            #   None              execvpe(argv, None) does NOT fail. It hands
-            #                     the child the PARENT's environ, dropping
-            #                     CLAUDE_CONFIG_DIR, so the session launches
-            #                     against the default login instead of the
-            #                     selected account. An account-isolation break
-            #                     with no error anywhere.
-            #   {"K": 41234}      execvpe raises TypeError out of the launch.
-            #
-            # The silent one is why this is a check and not a try. The module's
-            # standing rule is that the peer may be wrong: `heal` re-reads
-            # state rather than believing a return value. Same rule here —
-            # anything that is not a str->str mapping degrades to an UNPINNED
-            # launch, which is the failure mode the rest of this file is built
-            # to tolerate.
+            # VALIDATED, NOT TRUSTED. This value reaches `os.execvpe`, which
+            # sits OUTSIDE the launch's try, so a wrong shape is the launch
+            # rather than a caught exception. `None` does not even fail: it
+            # hands the child the PARENT's environ, dropping
+            # CLAUDE_CONFIG_DIR, so the session runs against the default
+            # login. That silent one is why this is a check and not a try.
+            # Anything that is not a str->str mapping degrades to an UNPINNED
+            # launch, which this file is built to tolerate.
             if isinstance(wired, dict) and all(
                 isinstance(k, str) and isinstance(v, str) for k, v in wired.items()
             ):
@@ -2017,22 +2006,13 @@ def heal(
             # version takes it instead of catching the symptom, so a TypeError
             # raised INSIDE heal is not mistaken for an old signature and
             # retried against a function that already ran.
-            # BOTH VIEWS MUST AGREE, and taking either alone is wrong in a way
-            # the other is not:
-            #
-            #   followed only   a `functools.wraps` wrapper that DROPS keywords
-            #                   reports the inner signature, so `identity` looks
-            #                   accepted, the call raises TypeError, and the
-            #                   outer `except` swallows it -- heal lost entirely
-            #   unfollowed only a transparent `wraps` wrapper is `(*a, **kw)`,
-            #                   which reads as VAR_KEYWORD and so as accepting,
-            #                   over an inner that does not -- the same loss,
-            #                   through the commoner decorator idiom
-            #
-            # `**kwargs` counts as accepting because a signature cannot say
-            # otherwise; that is an assumption about the callee, not a fact
-            # about it, and a version that FORWARDS kwargs to something
-            # stricter still raises. No signature test can see that one.
+            # NEITHER VIEW ALONE IS SAFE. A `wraps` wrapper that DROPS
+            # keywords looks accepting when followed; a transparent `(*a,
+            # **kw)` one looks accepting when unfollowed. Both lose heal to a
+            # swallowed TypeError. `**kwargs` counts as accepting because a
+            # signature cannot say otherwise -- an assumption about the
+            # callee, and a version forwarding kwargs to something stricter
+            # still raises. No signature test can see that one.
             def _accepts(sig, name: str) -> bool:
                 params = sig.parameters
                 return name in params or any(
@@ -2353,8 +2333,7 @@ def run(
         # 0 CLEARS RATHER THAN PERSISTS, and it is not merely out of range:
         # `bind()` reads 0 as "choose one for me", so persisting it would do
         # the OPPOSITE of what a user typing it meant, while looking like it
-        # worked. Clearing is the one reading that cannot be mistaken. The
-        # `raw.pop` below is where that happens.
+        # worked. Clearing is the one reading that cannot be mistaken.
         from claude_swap.printer import error
 
         if set_port and not 0 < set_port <= 65535:
