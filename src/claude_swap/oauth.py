@@ -1007,6 +1007,13 @@ def _put_bridge_title(access_token: str, session_id: str, title: str) -> bool:
 #: no cap on how many there are. Smaller than one tick's usual cost on purpose:
 #: a repair that delays the switch is worse than a repair that finishes next
 #: pass, and the cadence is 300s so there always is a next pass.
+#:
+#: THE CEILING IS THIS PLUS ONE TIMEOUT, not this. The deadline is tested
+#: BEFORE each PUT, so a PUT begun just under it still gets its full 10s and
+#: the worst case is 30s. Left that way deliberately: refusing to start a PUT
+#: that might overrun would idle the last third of every pass, and shortening
+#: the timeout to the remaining budget would report a starved PUT as a refusal
+#: and turn `all-puts-refused` into a lie about the server.
 _BRIDGE_TITLE_BUDGET_S = 20.0
 
 
