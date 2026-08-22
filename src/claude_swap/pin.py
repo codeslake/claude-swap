@@ -436,10 +436,9 @@ def _each_config(level: int = logging.DEBUG):
     uid has no ``/etc/passwd`` entry (the standard rootless-container shape).
     ``heal``'s contract is "never raises" because a launch hook runs it before
     every hand-launched ``claude``, and ``_wired_ports`` sits on the path from
-    ``heal`` through
-    ``_wired_port_is_serving`` with no guard above it — an unguarded raise
-    there reaches the status line's caller directly, so ``pin.heal(sw)``
-    raises ``RuntimeError`` instead of returning ``(False, 'Could not heal…')``.
+    ``heal`` through ``_wired_port_is_serving`` with no guard above it — an
+    unguarded raise there leaves ``pin.heal(sw)`` raising ``RuntimeError`` at
+    the launch instead of returning ``(False, 'Could not heal…')``.
 
     A config this cannot even LOCATE has no opinion — a fact about ONE config,
     never a reason to abandon the other, which is why it continues rather than
@@ -1932,11 +1931,12 @@ def heal(
 ) -> tuple[bool, str]:
     """Make the pin serving again, or make it harmless. ``(changed, message)``.
 
-    ``lock_timeout`` bounds OUR config lock, not the PACKAGE's. `impl.heal`
-    takes cswap-pin's own spawn lock with no timeout of ours to give it, so a
-    repair that has to spawn waits for whoever is already spawning. Bounded in
-    practice -- that holder is performing the repair, and flock releases on its
-    death -- but the budgets here do not cover it.
+    ``lock_timeout`` bounds OUR config lock, and reaches the PACKAGE's config
+    lock too on a version that accepts it. What it does not reach is
+    cswap-pin's SPAWN lock, which `impl.heal` takes with no timeout of ours to
+    give it, so a repair that has to spawn waits for whoever is already
+    spawning. Bounded in practice -- that holder is performing the repair, and
+    flock releases on its death -- but no budget here covers it.
 
     A DEAD PIN MUST NOT TAKE THE SESSION WITH IT. Everything else here reacts
     to a launch, so when the daemon dies while sessions are up nothing brings
@@ -2002,8 +2002,8 @@ def heal(
             # schedule (see _impl): the seam cannot promise what a future
             # version returns. An impl that returns True while binding nothing
             # gives `heal() -> (True, "Restored the cloud pin")` with the wired
-            # port not serving, so the status line shows healthy while every
-            # session dials a dead port.
+            # port not serving, so the launch reports a repair that did not
+            # happen while every session it starts dials a dead port.
             # THE OWNER FIELD RIDES ALONG. The package owns that behaviour and
             # documents it; the host's part is only that it must LOOK THE
             # IDENTITY UP rather than let the package read it, because the
@@ -2033,26 +2033,34 @@ def heal(
             # otherwise; that is an assumption about the callee, not a fact
             # about it, and a version that FORWARDS kwargs to something
             # stricter still raises. No signature test can see that one.
-            def _accepts(sig, name: str = "identity") -> bool:
+            def _accepts(sig, name: str) -> bool:
                 params = sig.parameters
                 return name in params or any(
                     p.kind is inspect.Parameter.VAR_KEYWORD
                     for p in params.values())
 
             def _both(name: str) -> bool:
+                # THE UNFOLLOWED VIEW WINS WHEN IT NAMES THE PARAMETER, because
+                # that is the signature the call actually binds against: a
+                # compat shim that GROWS a keyword in a wrapper over its older
+                # inner accepts it, and following `__wrapped__` reports the
+                # inner, which does not. Requiring both views to agree can only
+                # turn a yes into a no, so every disagreement it invents is a
+                # carry dropped in silence.
+                #
+                # The agreement is still what decides a wrapper that says only
+                # `**kwargs` -- there the outer claims nothing, so the inner is
+                # the only evidence there is.
                 try:
+                    outer = inspect.signature(impl.heal, follow_wrapped=False)
+                    if name in outer.parameters:
+                        return True
                     return (_accepts(inspect.signature(impl.heal), name)
-                            and _accepts(inspect.signature(
-                                impl.heal, follow_wrapped=False), name))
+                            and _accepts(outer, name))
                 except (TypeError, ValueError):
                     return False
 
             _takes_identity = _both("identity")
-            # AND THE BUDGET, or the package waits ten times as long as this
-            # caller allows itself. `lock_timeout` bounds OUR config lock; the
-            # splice inside `heal` takes the SAME lock and had no way to hear
-            # about it, so a contended launch paid the package's default twice
-            # -- once for the splice, once for the wiring after it.
             # THROUGH `_slot_for`, like every other caller. The bare form
             # makes `identity_for_config` resolve an ADDRESS, and
             # `_resolve_account_identifier` RAISES when one address names two

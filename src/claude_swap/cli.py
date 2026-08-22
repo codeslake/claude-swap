@@ -226,6 +226,13 @@ Examples:
     # `claude`. In a bare-metal root shell that meant an error line on every
     # launch, and under `set -e` it aborted the rc file — from the one flag
     # documented as unable to fail.
+    #
+    # THE PROMISE IS ABOUT FAILURE, not about output. The package prints one
+    # line when it actually repairs the owner field, and that is the only
+    # receipt anyone gets that the repair happened — the route that would have
+    # prevented the drift was reverted for breaking cswap's own identity
+    # lookup, so this hook is where the defence lives now. It stays silent on
+    # the no-op path, which is every launch that had nothing to fix.
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         # AND THE PRINT, not only the exit. `_guard_root` calls `error()`

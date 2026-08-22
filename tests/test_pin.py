@@ -9271,6 +9271,48 @@ class TestTheLaunchCarriesTheOwnerFieldToThePackage:
             "into the surrounding except and stopped happening")
 
 
+    def test_a_wrapper_that_ADDS_the_keyword_is_trusted(self, tmp_path,
+                                                       monkeypatch):
+        """THE OTHER DIRECTION, and the shape a compat shim actually takes.
+
+        A package that grows `identity` in a wrapper over its older inner
+        genuinely accepts it -- the call binds against the WRAPPER. Following
+        `__wrapped__` reports the inner, which does not, so a probe that
+        requires both views to agree vetoes a package that would have worked
+        and the carry is dropped with nothing said. Requiring agreement can
+        only ever turn a yes into a no, so every disagreement it invents is a
+        silent loss.
+        """
+        import functools
+
+        from claude_swap import pin
+
+        seen = {}
+
+        def _inner(backup_dir):
+            return False
+
+        @functools.wraps(_inner)
+        def _adds(backup_dir, identity=None, lock_timeout=None):
+            seen["identity"] = identity
+            seen["lock_timeout"] = lock_timeout
+            return False
+
+        class _Shim:
+            heal = staticmethod(_adds)
+
+        sw, cfg = self._sw(tmp_path)
+        self._paths(monkeypatch, cfg)
+        monkeypatch.setattr(pin, "_live_impl", lambda: _Shim())
+        monkeypatch.setattr(pin, "identity_for_config",
+                            lambda _sw, **_kw: self.IDENT)
+        pin.heal(sw, lock_timeout=0.5)
+        assert seen.get("identity") == self.IDENT, (
+            "a wrapper that names `identity` was not handed one, so the pin "
+            "stops re-asserting the owner field on a package that supports it")
+        assert seen.get("lock_timeout") == 0.5, (
+            "and the launch budget was withheld from the same wrapper")
+
     def test_the_launch_budget_is_offered_to_a_package_that_takes_it(
             self, tmp_path, monkeypatch):
         """`lock_timeout` bounds OUR config lock, and the splice inside the
@@ -9407,15 +9449,12 @@ class TestTheCarrySurvivesAnAddressThatNamesTwoSlots:
             "1": {"email": "shared@example.com", "organizationUuid": "ORG-A"},
             "2": {"email": "shared@example.com", "organizationUuid": "ORG-B"},
         }}
-        # The real composite lookup, copied rather than stubbed to a constant:
-        # the point of this case is that resolving by (email, org) succeeds
-        # where resolving by address alone raises.
-        sw._find_account_slot = staticmethod(
-            lambda data, email, org: next(
-                (num for num, acct in (data.get("accounts") or {}).items()
-                 if acct.get("email") == email
-                 and acct.get("organizationUuid", "") == org),
-                None))
+        # THE REAL LOOKUP, NOT A COPY OF IT. Reimplementing it here leaves
+        # this case green against a stale duplicate on the day the composite
+        # key changes -- which is the one day it is supposed to speak.
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        sw._find_account_slot = ClaudeAccountSwitcher._find_account_slot
         monkeypatch.setattr(pin, "_pinned_email_now",
                             lambda _s: ("shared@example.com", "ORG-B"))
 
