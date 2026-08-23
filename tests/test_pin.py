@@ -9471,3 +9471,101 @@ class TestTheCarrySurvivesAnAddressThatNamesTwoSlots:
             "the carry handed the package None on a roster where one address "
             "names two slots, so the owner field drifts exactly as before")
         assert seen["identity"]["accountUuid"] == "PIN-UUID"
+
+
+class TestAnAddThatRefreshesThePinnedSlotRepairsThePin:
+    """Re-adding the pinned account is what makes its credential readable
+    again, and nothing re-asked the daemon.
+
+    Reported from a mac: logging in as the pinned account and running
+    `cswap add` brought the ACTIVE account straight back while the pin stayed
+    broken, because the daemon serving had already published `unpinnable` and
+    only a hand-run `cswap pin <n>` spawns a successor. The repair existed
+    (`repin_current`); the only automatic caller was the TUI dashboard's
+    `on_mount`, which does not re-run for a TUI that is already open.
+    """
+
+    def _switcher(self):
+        import logging
+
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw._logger = logging.getLogger("test-repin-after-add")
+        return sw
+
+    def _patch(self, monkeypatch, *, slot, applying, calls,
+               repaired=True, available=True):
+        monkeypatch.setattr("claude_swap.pin.is_available",
+                            lambda: available)
+        monkeypatch.setattr("claude_swap.pin.pinned_slot", lambda _s: slot)
+        monkeypatch.setattr("claude_swap.pin.pin_is_applying",
+                            lambda _s: applying)
+        monkeypatch.setattr("claude_swap.pin.repin_current",
+                            lambda _s: calls.append("repin") or repaired)
+
+    def test_a_daemon_that_cannot_mint_is_replaced(self, monkeypatch):
+        calls = []
+        self._patch(monkeypatch, slot="1", applying=False, calls=calls)
+        self._switcher()._repin_if_pin_slot_refreshed("1")
+        assert calls == ["repin"], (
+            "the add refreshed the pinned slot's credential and the daemon "
+            "had published that it cannot mint -- the one state the repair "
+            "exists for, and it did not run")
+
+    def test_a_healthy_pin_is_never_recycled(self, monkeypatch):
+        """CONTROL for the test above: same call, only `applying` differs."""
+        calls = []
+        self._patch(monkeypatch, slot="1", applying=True, calls=calls)
+        self._switcher()._repin_if_pin_slot_refreshed("1")
+        assert calls == [], (
+            "a serving daemon was restarted under live sessions for nothing")
+
+    def test_cannot_tell_reads_as_healthy(self, monkeypatch):
+        """`None` is "no extra, no daemon record, an unreadable one"."""
+        calls = []
+        self._patch(monkeypatch, slot="1", applying=None, calls=calls)
+        self._switcher()._repin_if_pin_slot_refreshed("1")
+        assert calls == []
+
+    def test_another_slot_is_not_the_pin(self, monkeypatch):
+        """Adding slot 3 says nothing about slot 1's credential."""
+        calls = []
+        self._patch(monkeypatch, slot="1", applying=False, calls=calls)
+        self._switcher()._repin_if_pin_slot_refreshed("3")
+        assert calls == []
+
+    def test_an_int_slot_still_matches(self, monkeypatch):
+        """`account_num` is a str everywhere in `add_account`, but the guard
+        compares against `pinned_slot`, whose value comes out of the roster.
+        Coerce rather than trust, or the repair silently never fires."""
+        calls = []
+        self._patch(monkeypatch, slot="1", applying=False, calls=calls)
+        self._switcher()._repin_if_pin_slot_refreshed(1)
+        assert calls == ["repin"]
+
+    def test_a_failed_repair_does_not_fail_the_add(self, monkeypatch, capsys):
+        calls = []
+        self._patch(monkeypatch, slot="1", applying=False, calls=calls,
+                    repaired=False)
+        self._switcher()._repin_if_pin_slot_refreshed("1")   # must not raise
+        out = capsys.readouterr().out
+        assert "cswap pin 1" in out, (
+            "the pin is still broken and the user was told nothing")
+        assert "--heal" not in out, (
+            "`--heal` declines a daemon that IS serving, which is this state")
+
+    def test_a_raising_seam_does_not_fail_the_add(self, monkeypatch):
+        def _boom(_s):
+            raise RuntimeError("the daemon record is unreadable")
+
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
+        monkeypatch.setattr("claude_swap.pin.pinned_slot", _boom)
+        self._switcher()._repin_if_pin_slot_refreshed("1")   # must not raise
+
+    def test_no_extra_installed_is_a_no_op(self, monkeypatch):
+        calls = []
+        self._patch(monkeypatch, slot="1", applying=False, calls=calls,
+                    available=False)
+        self._switcher()._repin_if_pin_slot_refreshed("1")
+        assert calls == []
