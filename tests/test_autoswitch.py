@@ -1853,6 +1853,61 @@ class TestFreshening:
         mock_refresh.assert_not_called()
         assert h.active_number() == 1
 
+    def test_at_limit_says_a_running_session_is_not_rescued(self, temp_home):
+        """A switch changes the DEFAULT login. It cannot move a session-mode
+        instance, which runs with CLAUDE_CONFIG_DIR on its own profile and its
+        own `.credentials.json` — so escaping a limit for the account a live
+        `cswap run` is using leaves that session exactly as stuck as it was.
+
+        The engine already asks about live sessions, but only about the slot it
+        is switching TO (`_freshen_target`). It never asks about the one it is
+        LEAVING, which is the session that is actually blocked. The switch then
+        succeeds, the event says so, and the user is still at their limit with
+        nothing in the output saying why.
+
+        This does not make the switch wrong — the next session gets the healthy
+        account. It makes the SILENCE wrong.
+        """
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        # live pids for the ACTIVE slot only; the target must stay activatable
+        # or _freshen_target skips it and there is no switch to inspect.
+        with patch.object(
+            h.switcher,
+            "live_session_pids_for",
+            side_effect=lambda num, email: [4242] if num == "1" else [],
+        ):
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        joined = " ".join(sw.warnings).lower()
+        assert "4242" in joined and "session" in joined, (
+            "the escape must say that the live session-mode instance on the "
+            "account it just left is NOT moved by this switch — it names the "
+            f"pid so the user can act on it. warnings were: {sw.warnings!r}"
+        )
+
+    def test_control_no_live_session_carries_no_such_warning(self, temp_home):
+        """CONTROL. Without a live session on the active slot the warning must
+        be absent — otherwise the message is decoration rather than a fact."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+        with patch.object(
+            h.switcher, "live_session_pids_for", side_effect=lambda num, email: []
+        ):
+            outcome = h.tick_with_usage({"1": _usage(100), "2": _usage(10)})
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        joined = " ".join(sw.warnings).lower()
+        assert "session-mode" not in joined, (
+            f"no live session, so no live-session warning. got: {sw.warnings!r}"
+        )
+
     def test_live_session_near_expiry_is_skipped(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

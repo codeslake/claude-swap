@@ -2565,12 +2565,40 @@ class AutoSwitchEngine:
             state["leftTrigger"] = trigger
             atomic_write_json(self.state_path, state)
 
+        warnings = list(result.get("warnings", []))
+        # A SWITCH CHANGES THE DEFAULT LOGIN AND NOTHING ELSE. A session-mode
+        # instance runs with CLAUDE_CONFIG_DIR on its own profile, seeded with
+        # its own credentials, so the account it authenticates as cannot be
+        # moved from out here. Escaping a limit for the slot such a session is
+        # using therefore helps the NEXT session and leaves that one exactly as
+        # blocked as it was.
+        #
+        # The engine already asks about live sessions, but only about the slot
+        # it is switching TO (`_freshen_target`). Nobody asked about the one
+        # being LEFT — which is the session that is actually stuck — so the
+        # switch reported success and the user stayed at their limit with
+        # nothing saying why. Say it. The switch is still right; the silence
+        # was not.
+        departing = result.get("from") or {}
+        dep_num, dep_email = departing.get("number"), departing.get("email")
+        if dep_num and dep_email:
+            try:
+                pids = self.switcher.live_session_pids_for(str(dep_num), dep_email)
+            except Exception:  # noqa: BLE001 — a warning must never fail a switch
+                pids = []
+            if pids:
+                warnings.append(
+                    f"session-mode instance(s) still running on account "
+                    f"{dep_num}: {', '.join(str(p) for p in pids)} — a switch "
+                    f"moves the default login only, so those keep using "
+                    f"account {dep_num} until they exit and re-run `cswap run`"
+                )
         self._emit(
             SwitchEvent(
                 trigger=trigger,
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
-                warnings=result.get("warnings", []),
+                warnings=warnings,
             )
         )
         return TickOutcome.SWITCHED
