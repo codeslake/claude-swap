@@ -2089,6 +2089,18 @@ class AutoSwitchEngine:
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
+        # WHICH WINDOW BLOCKED US. `headroom` is `100 - max(all windows)`, the
+        # right number for "is this account usable at all" and the wrong one
+        # for "which account best escapes the window that just blocked me".
+        # At-limit skips every proactive gate, so the sort key is the only
+        # thing left choosing the target — and `-h` ranked a candidate with a
+        # spent 5h window above one whose 5h was untouched, because the second
+        # had a burnt weekly. Read once here; used only by the at-limit key.
+        escape_label = (
+            oauth.binding_window_label(usage.get(current), self._models)
+            if trigger == "at-limit"
+            else None
+        )
         # When NOTHING is below the threshold — the active account and every
         # candidate all in the 90s — "land somewhere healthy" has no answer,
         # and holding out for one costs the user the session. Sitting still
@@ -2254,7 +2266,21 @@ class AutoSwitchEngine:
                 # headroom breaks ties, then sequence order.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
-                key = (-h,)
+                # Escape ranking, on the axis that actually blocked us. Falls
+                # back to `-h` when the label is unknown (usage without window
+                # data) or the candidate does not report that window, so an
+                # account we cannot compare on the escape axis is ordered by
+                # the binding number rather than dropped. `h > 0` above still
+                # decides USABILITY, so a candidate blocked on some other
+                # window can never be selected by a good number here.
+                escape_h = (
+                    oauth.headroom_on_window(
+                        usage.get(num), escape_label, self._models
+                    )
+                    if escape_label
+                    else None
+                )
+                key = (-(escape_h if escape_h is not None else h),)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback

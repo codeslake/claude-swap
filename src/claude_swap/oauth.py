@@ -561,6 +561,39 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
+def binding_window_label(
+    usage: dict | None, models: Sequence[str] = ()
+) -> str | None:
+    """Label of the window this account is closest to hitting, or ``None``.
+
+    The companion to :func:`account_headroom`, which returns the binding
+    window's headroom and throws away WHICH window it was. An escape needs the
+    label: a 5-hour limit and a weekly limit want different targets, and a
+    ranking that cannot tell them apart optimises the wrong axis for one of
+    them.
+    """
+    windows = relevant_windows(usage, models)
+    if not windows:
+        return None
+    return max(windows, key=lambda w: w[1])[0]
+
+
+def headroom_on_window(
+    usage: dict | None, label: str, models: Sequence[str] = ()
+) -> float | None:
+    """Headroom on ONE named window, or ``None`` when it is not reported.
+
+    Deliberately NOT a floor on the others: callers pair it with
+    :func:`account_headroom`, which still decides whether an account is usable
+    at all. This decides only the ORDER among accounts already known usable,
+    so a high number here can never select an account blocked elsewhere.
+    """
+    for name, pct, _ in relevant_windows(usage, models):
+        if name == label:
+            return 100.0 - pct
+    return None
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.

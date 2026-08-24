@@ -3532,6 +3532,52 @@ class TestEveryAccountAboveThreshold:
         sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
 
+    def test_at_limit_ranks_on_the_window_that_actually_blocked(self, harness):
+        """Escaping a 5h limit must rank candidates by their 5h room.
+
+        `account_headroom` is `100 - max(5h, 7d, scoped...)` — the BINDING
+        window. That is the right number for "is this account usable at all"
+        and the wrong one for "which account best escapes the window that just
+        blocked me". At-limit skips every proactive gate, so the only thing
+        left deciding the target is the sort key, and that key was the max.
+
+        Active is blocked on 5h. Candidate 2 has a FULL 5h window and a burnt
+        weekly; candidate 3 has most of its 5h spent and a fresh weekly. Both
+        are usable, so neither is filtered — only the ORDER is at issue. For
+        the next five hours candidate 2 is worth 100 points of the axis that
+        blocked us and candidate 3 is worth 15, but max() scores them 10 and
+        15 and the old key took the one with almost no room where it counts.
+        """
+        outcome = harness.tick_with_usage({
+            "1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}},
+            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 90.0}},
+            "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert harness.active_number() == 2, (
+            "a 5h limit fired, so the escape must go to the account with the "
+            "most 5h room (2: 100 free) rather than the best worst-case "
+            "window (3: max(85,10)=85 -> headroom 15 beats 2's 10)"
+        )
+
+    def test_control_a_7d_limit_still_ranks_on_the_weekly_axis(self, harness):
+        """CONTROL for the case above, and it is what makes it a fix rather
+        than a preference. Flip which window blocks the active account and the
+        answer must flip with it — otherwise the change is "always prefer 5h",
+        which would be a different bug wearing this one's clothes."""
+        outcome = harness.tick_with_usage({
+            "1": {"five_hour": {"pct": 20.0},  "seven_day": {"pct": 100.0}},
+            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 90.0}},
+            "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 3, (
+            "a 7d limit fired, so the escape must go to the account with the "
+            "most WEEKLY room (3: 90 free) — the mirror of the case above"
+        )
+
 
 class TestRecoveryIsUsefulEitherClause:
     """The `or active_recovery_ts` leg of `_recovery_is_useful` had no
