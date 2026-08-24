@@ -133,7 +133,7 @@ class MenuBarSettings:
     def save(self, path: Path) -> None:
         """Write settings as pretty JSON, creating parent directories."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+        path.write_text(json.dumps(asdict(self), indent=2) + "\n", encoding="utf-8")
 
 
 # ---- pure display helpers (operate on the usage-window dict shape produced by

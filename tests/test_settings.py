@@ -355,3 +355,29 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestTheWrittenFileIsAWellFormedTextFile:
+    """A JSON file with no trailing newline is not a POSIX text file, and the
+    consequence is not cosmetic: an editor that adds one on save (vim's
+    default, most IDEs) fights this writer forever — save, cswap rewrites,
+    the byte is gone, save again. The file never settles.
+
+    Nothing about a repo is required for that; it is why the fix belongs in
+    the writer and not in whatever happens to track the file."""
+
+    def test_the_file_ends_with_a_newline(self, tmp_path):
+        p = tmp_path / "settings.json"
+        atomic_write_json(p, {"a": 1})
+        assert p.read_bytes().endswith(b"\n")
+
+    def test_exactly_one_newline_so_repeated_writes_do_not_grow_it(self, tmp_path):
+        p = tmp_path / "settings.json"
+        atomic_write_json(p, {"a": 1})
+        atomic_write_json(p, json.loads(p.read_text()))
+        assert not p.read_bytes().endswith(b"\n\n")
+
+    def test_it_still_parses(self, tmp_path):
+        p = tmp_path / "settings.json"
+        atomic_write_json(p, {"a": 1, "nested": {"b": [1, 2]}})
+        assert json.loads(p.read_text()) == {"a": 1, "nested": {"b": [1, 2]}}

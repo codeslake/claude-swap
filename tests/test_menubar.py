@@ -671,3 +671,20 @@ def test_the_plist_temp_name_is_not_shared_between_launches(
     assert str(os.getpid()) in seen[0], (
         f"temp name is not scoped to this process: {seen[0]}"
     )
+
+
+class TestTheSavedFileIsAWellFormedTextFile:
+    """Same defect as settings.py's writer, same reason it matters: an editor
+    that adds a trailing newline on save fights this one forever. cswap's own
+    config file, so cswap's to get right."""
+
+    def test_save_ends_the_file_with_a_newline(self, tmp_path):
+        p = tmp_path / "menubar_settings.json"
+        menubar.MenuBarSettings().save(p)
+        assert p.read_bytes().endswith(b"\n")
+
+    def test_a_saved_file_round_trips(self, tmp_path):
+        p = tmp_path / "menubar_settings.json"
+        original = menubar.MenuBarSettings(auto_switch_enabled=True)
+        original.save(p)
+        assert menubar.MenuBarSettings.load(p) == original
