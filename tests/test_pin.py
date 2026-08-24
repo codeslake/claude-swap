@@ -5489,6 +5489,11 @@ class TestANoteMustNotFailTheAction:
                                "pinnedOrganizationUuid": "org-1"}}))
         impl = self._impl(sw.backup_dir)
         impl.observed_bridge_owners = lambda: {"cse_a": "org-2"}
+        # The comparison is against the LITERAL config identity, which is what
+        # Claude Code compares a bridge's recorded owner to. Under a pin the
+        # config names the pin, so "org-1" here is that same value arriving by
+        # the route CC actually reads rather than from the pin file.
+        sw._get_current_account = lambda: ("pinned@example.com", "org-1")
         monkeypatch.setattr(pin, "_impl", lambda: impl)
 
         rc = pin.run(sw, None)
@@ -5513,6 +5518,7 @@ class TestANoteMustNotFailTheAction:
                                "pinnedOrganizationUuid": "org-1"}}))
         impl = self._impl(sw.backup_dir)
         impl.observed_bridge_owners = lambda: {"cse_a": "org-1"}
+        sw._get_current_account = lambda: ("pinned@example.com", "org-1")
         monkeypatch.setattr(pin, "_impl", lambda: impl)
 
         rc = pin.run(sw, None)
@@ -5526,6 +5532,76 @@ class TestANoteMustNotFailTheAction:
         # mutation SURVIVED. The stable half of that line is the sentence.
         assert "do not belong to it" not in out, (
             f"a machine whose bridges agree was warned at anyway: {out}")
+
+    def test_a_carried_pointer_is_not_reported_as_foreign_ownership(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """`bridgeOwnerAccountUuid` HAS TWO WRITERS THAT MEAN OPPOSITE THINGS.
+
+        Claude Code writes the bridge's true server-side owner while a session
+        runs. cswap-pin's `carry_live_pointers` writes the account now SIGNED
+        IN, deliberately, so CC's own comparison agrees and it REATTACHES
+        instead of minting a fresh bridge.
+
+        This warning's sentence — "the pin is in name only until those sessions
+        restart" — is about the next reattach, and CC never compares anything
+        to the pin: it compares the stored pointer to `~/.claude.json`'s
+        `oauthAccount`. So the question the sentence asks is the LOGIN's, while
+        the comparison was the PIN's. After a carry the field holds the login,
+        the pin comparison sees a difference, and we tell the user their pin is
+        in name only — describing the carry as the failure it exists to
+        prevent.
+
+        Here the login and the recorded owner AGREE (which is what a carry
+        produces) while the pin differs. Those sessions will reattach and keep
+        their history, so there is nothing to warn about.
+        """
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        (sw.backup_dir / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "pinned@example.com",
+                               "pinnedOrganizationUuid": "org-pin"}}))
+        # the LITERAL config identity — what CC actually compares against
+        sw._get_current_account = lambda: ("login@example.com", "org-login")
+        impl = self._impl(sw.backup_dir)
+        impl.observed_bridge_owners = lambda: {"cse_a": "org-login"}
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+
+        rc = pin.run(sw, None)
+        out = capsys.readouterr().out
+        assert rc == 0, "a status read must not fail the command"
+        assert "do not belong to it" not in out, (
+            "the recorded owner matches the LOGIN, which is exactly what a "
+            "carried pointer looks like and exactly what makes a reattach "
+            f"succeed. Warning here reports the pin doing its job: {out}")
+
+    def test_a_pointer_that_disagrees_with_the_LOGIN_is_still_reported(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """CONTROL for the case above, and the one that keeps the warning real.
+
+        A bridge whose recorded owner differs from the LOGIN is one CC will
+        mint over rather than reattach to — the session loses its history.
+        That is the thing worth saying, and moving the comparison must not
+        silence it.
+        """
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        (sw.backup_dir / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "pinned@example.com",
+                               "pinnedOrganizationUuid": "org-pin"}}))
+        sw._get_current_account = lambda: ("login@example.com", "org-login")
+        impl = self._impl(sw.backup_dir)
+        impl.observed_bridge_owners = lambda: {"cse_a": "org-stranger"}
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+
+        rc = pin.run(sw, None)
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "do not belong to it" in out, (
+            f"a bridge the login does not own will be minted over: {out}")
 
     def test_an_older_pin_package_without_the_reader_still_reports(
         self, tmp_path, monkeypatch, capsys
@@ -8141,6 +8217,12 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
             # defined inside `run`; listing both is the cost of a walk that
             # does not track scope, and the inner name is the one that matters.
             "menubar.py:run",
+            # THE REATTACH QUESTION, WHICH IS THE FILE'S BY DEFINITION. Claude
+            # Code decides reattach-or-mint by comparing a bridge's recorded
+            # owner to this field LITERALLY; it has no notion of un-splicing a
+            # pin. Asking `_live_login_identity` here would answer a question CC
+            # never asks and would re-report a carried pointer as foreign.
+            "pin.py:_warn_if_bridges_disagree",
         }
         assert set(found) <= known, (
             "a NEW site re-derives the active slot from the identity file, "

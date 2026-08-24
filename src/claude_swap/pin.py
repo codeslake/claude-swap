@@ -2473,7 +2473,7 @@ def run(
             current = None
         if current:
             print(f"Cloud account (RC/artifacts): {current[0]}")
-            _warn_if_bridges_disagree(pin, current)
+            _warn_if_bridges_disagree(pin, switcher)
         else:
             print(dimmed("No cloud account pinned"))
         return 0
@@ -2532,7 +2532,7 @@ def run(
     return 0
 
 
-def _warn_if_bridges_disagree(pin, current) -> None:
+def _warn_if_bridges_disagree(pin, switcher) -> None:
     """Say so when the live bridges do not belong to the account we pinned.
 
     THE STATUS LINE REPORTS THE PIN, WHICH IS WHAT WE WROTE — never what the
@@ -2570,15 +2570,39 @@ def _warn_if_bridges_disagree(pin, current) -> None:
         return
     if not isinstance(owners, dict):
         return
-    pinned_org = (current[1] if len(current) > 1 else "") or ""
-    if not pinned_org:
+    # COMPARE AGAINST THE CONFIG, NOT THE PIN. `bridgeOwnerAccountUuid` has two
+    # writers that mean opposite things: Claude Code records the bridge's true
+    # server-side owner, and cswap-pin's live carry writes the account now
+    # signed in so CC's own comparison agrees and it REATTACHES instead of
+    # minting. Neither is wrong; they answer different questions.
+    #
+    # This sentence asks the reattach question — will these sessions keep their
+    # history — and CC answers it by comparing the stored pointer to
+    # `.claude.json`'s `oauthAccount`. It never compares anything to the pin. So
+    # comparing against the pinned org read a carried pointer as foreign
+    # ownership and told the user their pin was "in name only" while the carry
+    # was doing exactly what it exists to do.
+    #
+    # `_get_current_account` is deliberate over `_live_login_identity`: the
+    # latter UN-SPLICES the pin to answer "who is logged in", and CC has no such
+    # notion — it compares against the literal field.
+    try:
+        live = switcher._get_current_account()
+    except Exception:  # noqa: BLE001 — a note must not fail the action
         return
-    other = sorted({o for o in owners.values() if o and o != pinned_org})
+    live_org = (live[1] if live and len(live) > 1 else "") or ""
+    if not live_org:
+        return
+    # `None` is dropped on purpose: an unrecorded owner is UNKNOWN, not a
+    # disagreement, and `observed_bridge_owners` keeps the key so the two stay
+    # distinguishable. Claiming a mismatch from unknown is the shape this
+    # warning exists to catch, one level up.
+    other = sorted({o for o in owners.values() if o and o != live_org})
     if not other:
         return
     warning(
         "the live Remote Control bridges do not belong to it: "
         f"{len(other)} other organization(s) — {', '.join(other)}. "
         "A reattach against a bridge this login does not own is refused by "
-        "the server; the pin is in name only until those sessions restart."
+        "the server; those sessions lose their history when they restart."
     )
