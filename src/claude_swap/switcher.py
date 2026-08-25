@@ -1904,25 +1904,40 @@ class ClaudeAccountSwitcher:
                     "  It is the active account — it stays live until you switch "
                     "away; it just won't be an automatic switch target."
                 ))
-            if not self.switchable_account_numbers():
-                # An empty rotation has two causes and only one is a disable.
-                # Advising `cswap enable` when the slots are merely unreadable
-                # (a locked keychain) points at a setting that is already right.
-                if any(
-                    self._account_is_switchable(str(num))
-                    for num in data.get("sequence", [])
-                ):
+            # An empty rotation has two causes and only one is a disable.
+            # Advising `cswap enable` when no slot is readable points at a
+            # setting that is already right.
+            #
+            # ONE walk. `_account_is_switchable` reads the credential store per
+            # slot and nothing caches it, so deriving the cause after
+            # `switchable_account_numbers()` would read every slot twice on
+            # this branch's own hot case — where each read is a keychain miss.
+            readable = [
+                n
+                for n in (str(x) for x in data.get("sequence", []))
+                if self._account_is_switchable(n)
+            ]
+            if not any(not self._disabled_from_data(data, n) for n in readable):
+                if readable:
                     warning(
                         "  No accounts remain in rotation — auto-switch and bare "
                         "switch have nothing to pick. Re-enable one with "
                         "cswap enable <num|email>."
                     )
                 else:
+                    # The keychain is a macOS backend. Off macOS the stored
+                    # `.enc` is the only one, and telling the user to unlock a
+                    # keychain names something that does not exist there.
+                    remedy = (
+                        "unlock the keychain, or re-add a slot"
+                        if self.platform == Platform.MACOS
+                        else "re-add a slot"
+                    )
                     warning(
                         "  No managed accounts have readable credentials/config "
                         "— auto-switch and bare switch have nothing to pick. "
-                        "Re-enabling changes nothing: unlock the keychain, or "
-                        "re-add a slot with cswap --add-account --slot <number>."
+                        f"Re-enabling changes nothing: {remedy} with "
+                        "cswap --add-account --slot <number>."
                     )
         else:
             print(dimmed("  It is back in the rotation."))

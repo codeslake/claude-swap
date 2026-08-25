@@ -713,10 +713,12 @@ class SessionManager:
                     f"re-add it: cswap --add-account --slot {account_num}"
                 )
             if outcome.error is not None:
-                warning(
+                msg = (
                     f"Could not refresh the token for Account-{account_num}; "
                     "continuing with the stored credentials."
                 )
+                warning(msg)
+                self._logger.warning(msg)
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:

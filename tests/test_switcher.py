@@ -8633,27 +8633,31 @@ class TestDisableEnableAccount:
 
         assert "No accounts remain in rotation" in capsys.readouterr().out
 
-    def test_disable_warns_about_credentials_when_others_are_unreadable(
+    def test_disable_warns_about_credentials_when_no_slot_is_readable(
         self, temp_home, capsys
     ):
         """An empty rotation from unreadable slots must not advise `cswap enable`.
 
         switchable_account_numbers() is empty when a slot is disabled OR when
         its stored credentials cannot be read. Only the first is fixed by
-        re-enabling; on a Mac with a locked keychain the advice points at a
-        setting that is already correct.
+        re-enabling, so the second needs the other remedy.
         """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
 
-        # Slot 2 stays ENABLED; its credentials simply cannot be read.
+        # NO slot is readable, INCLUDING the one being disabled — that is what
+        # this branch requires. Leaving slot 1 readable would make it a
+        # re-enable candidate and correctly select the other branch, because
+        # _account_is_switchable never consults the disabled flag.
         with patch.object(s, "_read_account_credentials", return_value=""):
             s.set_account_disabled("1", True)
 
         out = capsys.readouterr().out
         assert "cswap enable" not in out
-        assert "credential" in out
+        assert "readable credentials/config" in out
+        # _setup runs as LINUX, where there is no keychain to unlock.
+        assert "keychain" not in out.lower()
 
     # -- display -----------------------------------------------------------
 

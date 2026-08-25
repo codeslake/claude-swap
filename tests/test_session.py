@@ -403,6 +403,28 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
 
+    def test_the_refresh_failure_warning_outlives_the_terminal(
+        self, manager, auth_status_tracks_seed, monkeypatch, capsys, caplog
+    ):
+        """setup_session prints, then run() execs — print() is this message's
+        whole life. The wrapper blanks the main screen before the child starts,
+        and nothing else carries it: the status line names the account, not the
+        refresh that failed, so the user launches on a possibly-stale token
+        with no record anywhere. The sibling above proves it is printed; this
+        proves it is kept."""
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "consume_backup_grant",
+            lambda self, num, email, snap: oauth.RefreshOutcome(
+                None, "transient"
+            ),
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            manager.setup_session("2", share=False)
+
+        assert "Could not refresh" in capsys.readouterr().out
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Could not refresh the token for Account-2" in logged
+
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
     ):
