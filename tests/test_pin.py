@@ -9956,3 +9956,111 @@ class TestALoginAsThePinnedAccountIsNotASplice:
             live_tokens={"accessToken": "pin-new", "refreshToken": "pin-new-r"},
             stored_tokens=None)
         assert s._live_login_identity() == ("login@example.com", "org-login")
+
+
+class TestTheSwingIsNotADriftEvent:
+    """A guard that samples `oauthAccount` twice and refuses on a difference
+    refuses on the pin's own swing.
+
+    `add_account` verifies a credential over the network and re-reads the
+    config for the bytes it stores; a `/login` landing in that window pairs one
+    account's identity with another's token, which is worth refusing. Under a
+    pin the SAME field also moves with nobody logging in -- the switch splices
+    the pin in, the daemon's carry writes the account now signed in -- so the
+    guard fires on the swing and says "re-run when no other login is in
+    flight". There is no login, and re-running has the same odds.
+
+    That matters beyond the wording: `claude /login` as the pinned account
+    followed by `cswap add` IS the documented repair for a dead pin credential,
+    so the guard can refuse the repair it is standing in front of.
+
+    The discriminator is the credential, exactly as in
+    `TestALoginAsThePinnedAccountIsNotASplice`: the carry moves the config and
+    nothing else. This answer only ever SUPPRESSES a refusal, so it is False
+    whenever it cannot tell.
+    """
+
+    PIN = ("pinned@example.com", "org-pin")
+    LOGIN = ("login@example.com", "org-login", "uuid-login")
+
+    def _switcher(self, tmp_path, monkeypatch, *, live_tokens, stored_tokens):
+        import logging
+
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test-swing-not-drift")
+        s._get_sequence_data = lambda: {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"email": "login@example.com",
+                               "organizationUuid": "org-login"}}}
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        creds = tmp_path / ".credentials.json"
+        creds.write_text(json.dumps({"claudeAiOauth": live_tokens}))
+        monkeypatch.setattr(_sw, "get_credentials_path", lambda: creds)
+        if stored_tokens is None:
+            def _read(num, email):
+                raise RuntimeError("the keychain declined this process")
+        else:
+            def _read(num, email):
+                return json.dumps({"claudeAiOauth": stored_tokens})
+        s.read_account_credentials = _read
+        return s
+
+    SAME = {"accessToken": "login-a", "refreshToken": "login-r"}
+
+    def test_the_field_swinging_onto_the_pin_is_not_a_login(
+            self, tmp_path, monkeypatch):
+        s = self._switcher(tmp_path, monkeypatch,
+                           live_tokens=self.SAME, stored_tokens=self.SAME)
+        moved = s._identity_move_is_not_a_login(
+            self.LOGIN, (self.PIN[0], self.PIN[1], "uuid-pin"))
+        assert moved is True, (
+            "the credential never moved, so nobody logged in -- refusing here "
+            "blocks the very repair a pinned user runs `cswap add` for")
+
+    def test_the_field_swinging_BACK_off_the_pin_is_not_a_login_either(
+            self, tmp_path, monkeypatch):
+        """The swing has two directions and the guard sees both."""
+        s = self._switcher(tmp_path, monkeypatch,
+                           live_tokens=self.SAME, stored_tokens=self.SAME)
+        assert s._identity_move_is_not_a_login(
+            (self.PIN[0], self.PIN[1], "uuid-pin"), self.LOGIN) is True
+
+    def test_CONTROL_a_real_login_still_refuses(self, tmp_path, monkeypatch):
+        """The case the guard exists for. The credential moved with the field,
+        which is what a `/login` does and what a carry never does."""
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "pin-new", "refreshToken": "pin-new-r"},
+            stored_tokens=self.SAME)
+        assert s._identity_move_is_not_a_login(
+            self.LOGIN, (self.PIN[0], self.PIN[1], "uuid-pin")) is False
+
+    def test_CONTROL_a_move_between_two_accounts_that_are_not_the_pin(
+            self, tmp_path, monkeypatch):
+        """Neither sample is the pinned identity, so the pin did not do this
+        and has nothing to say about it."""
+        s = self._switcher(tmp_path, monkeypatch,
+                           live_tokens=self.SAME, stored_tokens=self.SAME)
+        assert s._identity_move_is_not_a_login(
+            self.LOGIN, ("third@example.com", "org-third", "uuid-third")
+        ) is False
+
+    def test_CONTROL_an_unreadable_store_refuses(self, tmp_path, monkeypatch):
+        """Unknown must not suppress a refusal: this answer only ever removes
+        one, and a refusal writes nothing."""
+        s = self._switcher(tmp_path, monkeypatch,
+                           live_tokens=self.SAME, stored_tokens=None)
+        assert s._identity_move_is_not_a_login(
+            self.LOGIN, (self.PIN[0], self.PIN[1], "uuid-pin")) is False
+
+    def test_CONTROL_no_pin_set_says_nothing(self, tmp_path, monkeypatch):
+        from claude_swap import pin as _pin
+
+        s = self._switcher(tmp_path, monkeypatch,
+                           live_tokens=self.SAME, stored_tokens=self.SAME)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+        assert s._identity_move_is_not_a_login(
+            self.LOGIN, ("other@example.com", "org-o", "uuid-o")) is False

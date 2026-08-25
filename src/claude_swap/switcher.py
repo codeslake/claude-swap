@@ -3092,6 +3092,47 @@ class ClaudeAccountSwitcher:
         organization_uuid = oauth.get("organizationUuid", "") or ""
         return (email, organization_uuid)
 
+    def _identity_move_is_not_a_login(self, before, now) -> bool:
+        """Did `oauthAccount` move for a PIN reason rather than a `/login`?
+
+        THE SEAM FOR A GUARD THAT WATCHES THAT FIELD FOR DRIFT. Under a pin the
+        field has a second writer -- the switch splices the pinned identity in,
+        and the daemon's carry writes the account now signed in -- so it swings
+        between the two on a minutes timescale with nobody logging in. A guard
+        that samples it twice and refuses on a difference refuses on the swing,
+        and tells the user to "re-run when no other login is in flight" when
+        there is no login and re-running has the same odds of catching it.
+
+        Same discriminator as :meth:`_live_login_identity`, for the same
+        reason: the carry moves the CONFIG and nothing else, while a `/login`
+        replaces the credential too. So the move is benign only when one of the
+        two samples is the pinned identity AND the live credential is still the
+        roster's active slot's.
+
+        FALSE WHEN IT CANNOT TELL, which is the safe direction HERE and the
+        opposite of the one `_live_login_identity` takes: this answer only ever
+        SUPPRESSES a refusal, and a refusal writes nothing.
+        """
+        try:
+            from claude_swap import pin as _pin
+
+            pinned = _pin.pinned_identity(self)
+        except Exception:  # noqa: BLE001 — an optional extra cannot break this
+            return False
+        if not pinned:
+            return False
+        pair = tuple(pinned)[:2]
+        if pair not in {tuple(t or ())[:2] for t in (before, now) if t}:
+            return False        # neither sample is the pin — not our doing
+        data = self._get_sequence_data() or {}
+        recorded = data.get("activeAccountNumber")
+        if recorded is None:
+            return False
+        slot = (data.get("accounts") or {}).get(str(recorded))
+        if not isinstance(slot, dict) or not slot.get("email"):
+            return False
+        return self._live_credential_is(str(recorded), slot["email"]) is True
+
     def _live_login_identity(self) -> "tuple[str, str] | None":
         """(email, org) of the LIVE LOGIN, which is not always what the file says.
 
