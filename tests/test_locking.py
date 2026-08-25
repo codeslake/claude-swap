@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import threading
 import time
 from pathlib import Path
 
@@ -77,8 +78,19 @@ class TestFileLock:
         try:
             slept = []
             real_sleep = time.sleep
+            mine = threading.get_ident()
 
             def recording(seconds):
+                # SCOPED. `locking.time` IS the `time` module, so this patch is
+                # process-global: an unscoped recorder collects every other
+                # thread's sleeps too. conftest documents that this suite
+                # leaves threads running, and `proper_lockfile`'s own retry
+                # loop sleeps 0.25-0.5s — a foreign 0.5 landing here fails the
+                # per-sleep invariant below on a correct implementation. The
+                # sibling in test_claude_locks.py carries this guard and its
+                # comment records that exact miss being measured.
+                if threading.get_ident() != mine:
+                    return real_sleep(seconds)      # not ours: leave it alone
                 slept.append((time.monotonic(), seconds))
                 return real_sleep(seconds)
 
@@ -121,12 +133,19 @@ class TestFileLock:
                     f"a single retry sleep of {seconds:.3f}s exceeds the "
                     f"whole {budget}s timeout"
                 )
-            # Kept alongside the invariant: this one catches an overshoot
-            # end to end, the invariant catches a flat sleep tuned under the
-            # wall-clock ceiling. Neither alone covers both.
-            assert elapsed < 0.05, (
-                f"a {budget}s timeout took {elapsed:.3f}s — the retry sleep "
-                "ignored the remaining budget"
+            # THE SUM, NOT THE WALL CLOCK. The per-sleep invariant above
+            # cannot see many small sleeps that are each legal and together
+            # overrun; that is what this adds. Measuring it as a wall-clock
+            # ceiling made it an OS-jitter test instead: `begin` is anchored
+            # before `mkdir(parents=...)` + `open()`, which run before
+            # `acquire` starts its own deadline, and this file runs on a
+            # Windows CI shard with -n 4 where a cold CreateFile can eat the
+            # whole margin and fail correct code. The sum has no anchor and
+            # no first-open in it.
+            total = sum(seconds for _at, seconds in slept)
+            assert total <= budget + 1e-6, (
+                f"retry sleeps totalled {total:.3f}s against a {budget}s "
+                "timeout — legal individually, an overshoot together"
             )
         finally:
             waiter.release()
