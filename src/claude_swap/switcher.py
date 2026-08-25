@@ -1905,11 +1905,25 @@ class ClaudeAccountSwitcher:
                     "away; it just won't be an automatic switch target."
                 ))
             if not self.switchable_account_numbers():
-                warning(
-                    "  No accounts remain in rotation — auto-switch and bare "
-                    "switch have nothing to pick. Re-enable one with "
-                    "cswap enable <num|email>."
-                )
+                # An empty rotation has two causes and only one is a disable.
+                # Advising `cswap enable` when the slots are merely unreadable
+                # (a locked keychain) points at a setting that is already right.
+                if any(
+                    self._account_is_switchable(str(num))
+                    for num in data.get("sequence", [])
+                ):
+                    warning(
+                        "  No accounts remain in rotation — auto-switch and bare "
+                        "switch have nothing to pick. Re-enable one with "
+                        "cswap enable <num|email>."
+                    )
+                else:
+                    warning(
+                        "  No managed accounts have readable credentials/config "
+                        "— auto-switch and bare switch have nothing to pick. "
+                        "Re-enabling changes nothing: unlock the keychain, or "
+                        "re-add a slot with cswap --add-account --slot <number>."
+                    )
         else:
             print(dimmed("  It is back in the rotation."))
 
