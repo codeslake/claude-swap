@@ -4957,7 +4957,7 @@ class TestHorizonAxisDoesNotFlap:
         WALKED PAST THE OLD BOUNDARY: the pre-fix dominance leg was a bare
         `h > active x RATIO`, which held only up to and including ratio
         exactly 2.00 (`active=2.0` pts) and opened on the very next cell
-        (`active=1.8`) — measured, on this fleet. The fixed leg adds a flat
+        (`active=1.8`) — measured on three machines. The fixed leg adds a flat
         `+SPENT_HEADROOM_PCT` on top of the ratio, so the boundary against
         this same 4.0-pt frozen
         peer moves from `active=2.0` to `active=0.5` — the walk below covers
@@ -5466,7 +5466,7 @@ class TestHorizonAxisDoesNotFlap:
         account frozen at 4 pts, the new active burning from 4 pts down past
         the exact boundary (98.2%) a bare dominance leg opens at —
         `4.0 > 1.8 x 2` — walked further still, to a bare sliver (99.9%,
-        0.1 pts). Measured on this exact fleet, the bare leg switched back
+        0.1 pts). Measured on a live rotation, the bare leg switched back
         to the frozen peer at 98.2%. This leaves the ORDINARY-path shape
         (`test_the_release_needs_the_barred_account_to_have_improved`) as
         the sibling proving the general

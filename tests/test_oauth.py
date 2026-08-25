@@ -1025,7 +1025,7 @@ class TestClassifyUsageError:
     def test_tls_cert_failure_is_not_flattened_to_network(self):
         """A MITM proxy with an untrusted CA must not read as a transport error.
 
-        Measured 2026-08-17 on host-a: every usage poll went through a
+        Measured on one host: every usage poll went through a
         TLS-terminating proxy whose CA urllib does not trust, so each one raised
 
             URLError(SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED]

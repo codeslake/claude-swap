@@ -8800,7 +8800,7 @@ class TestAnAmbiguousAddressStillNamesThePin:
     so the repair and the rollback would re-pin and silently not name
     themselves. Nothing surfaces it: both paths report success.
 
-    Measured on the fleet when this was written: 7 slots, 0 addresses in more
+    Measured on one roster: 7 slots, 0 addresses in more
     than one slot. Latent, not live -- and it goes live the first time someone
     adds a personal account at the address of an org one, which this codebase
     documents as supported.
@@ -9096,7 +9096,7 @@ class TestTheRosterCanNameThePinWhenNoBackupCan:
     bridge is owned by whoever happens to be active and dies at the next
     rotation. Requirement 1 cannot hold there at all.
 
-    Measured on a machine in this fleet: zero stored configs, and a live
+    Measured on one machine: zero stored configs, and a live
     identity carrying only emailAddress and organizationUuid — which is also
     useless, because Claude Code compares a bridge's owner on account uuid AND
     organization uuid.
