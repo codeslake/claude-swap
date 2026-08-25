@@ -476,13 +476,18 @@ def atomic_write_json(path: Path, data: dict) -> None:
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(target))
+        tmp_path = ""  # consumed by the publish; the name is not ours
         if sys.platform != "win32":
             os.chmod(str(target), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        # Only while the name is still ours. The three sibling writers keep
+        # this invariant; leaving it out here made the shared writer the one
+        # that could unlink a name the publish had already handed over.
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise

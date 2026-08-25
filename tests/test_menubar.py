@@ -56,7 +56,7 @@ def test_notification_identity_heals_corrupt_info_plist(tmp_path: Path):
     data = plistlib.loads(info.read_bytes())
     assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
     assert data["CFBundleName"] == "claude-swap"
-    assert list(executable.parent.glob("Info.plist.*.tmp")) == []
+    assert list(executable.parent.glob("Info.plist*.tmp")) == []
 
 
 def test_notification_identity_is_noop_off_macos(tmp_path: Path):
@@ -584,7 +584,7 @@ def test_a_failed_plist_replace_leaves_no_temp_file(tmp_path: Path, monkeypatch)
     # would still pass. The flag names the statement.
     assert fired["replace"], "premise: the injected replace was never reached"
     assert result is None, "premise: the failure path must have been taken"
-    assert list(executable.parent.glob("Info.plist.*.tmp")) == []
+    assert list(executable.parent.glob("Info.plist*.tmp")) == []
 
 
 def test_a_published_plist_is_not_unlinked_by_its_own_cleanup(

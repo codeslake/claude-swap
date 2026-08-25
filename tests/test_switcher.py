@@ -12163,23 +12163,26 @@ def test_a_ctrl_c_during_the_roster_move_leaves_no_temp_file(temp_home: Path, mo
 
 
 def test_a_failed_roster_write_leaves_no_temp_file(temp_home: Path, monkeypatch):
-    """The write that CREATES the temp must be inside the guard too.
+    """The call that CREATES the temp must be inside the guard too.
 
-    `write_text` opens, writes, closes; a failure after the open strands the
-    file. Guarding only the publish leaves the roster writer with the exact
-    defect the guard was added to close.
+    `os.open` creates the file before a single byte is written; a failure
+    anywhere after it strands the name. Guarding only the publish leaves the
+    roster writer with the exact defect the guard was added to close. The
+    injection sits at the first call after the create, which is where the
+    file exists and is still empty — the widest version of the case.
     """
+    if sys.platform == "win32":
+        pytest.skip("fchmod is POSIX-only; the create path differs on Windows")
+    from claude_swap import switcher as switcher_mod
+
     switcher = ClaudeAccountSwitcher()
     target = switcher.backup_dir / "sequence.json"
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    real_write = Path.write_text
-
-    def failing_write(self, *a, **kw):
-        real_write(self, *a, **kw)  # the file now exists on disk
+    def failing_fchmod(fd, mode):
         raise OSError("injected: no space left on device")
 
-    monkeypatch.setattr(Path, "write_text", failing_write)
+    monkeypatch.setattr(switcher_mod.os, "fchmod", failing_fchmod)
     with pytest.raises(OSError):
         switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
 
@@ -12313,6 +12316,45 @@ def test_a_destination_that_refuses_rename_is_written_through(
         # The chmod-on-the-temp design exists because a 0644 ~/.claude.json
         # once published a key world-readable; the write-through must carry it.
         assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
+    temp_home: Path, monkeypatch
+):
+    """`~/.claude.json` routes through this writer and can carry
+    `primaryApiKey` plus inline MCP credentials.
+
+    The mode is sampled during the read-back — the widest point of the window,
+    where the payload is fully on disk and the publish has not happened. The
+    umask is pinned to 022 because the assertion is otherwise vacuous: a
+    runner whose umask is already 077 gets 0600 from the unfixed code too.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(f".{os.getpid()}.tmp")
+
+    seen: list[int] = []
+    real_loads = json.loads
+
+    def spy(s, *a, **kw):
+        if temp.exists():
+            seen.append(temp.stat().st_mode & 0o777)
+        return real_loads(s, *a, **kw)
+
+    monkeypatch.setattr(switcher_mod.json, "loads", spy)
+    prev_umask = os.umask(0o022)
+    try:
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+    finally:
+        os.umask(prev_umask)
+
+    assert seen, "premise: the read-back never sampled the temp"
+    assert [oct(m) for m in seen] == ["0o600"] * len(seen)
 
 
 def test_a_failed_write_through_keeps_the_only_complete_copy(

@@ -269,21 +269,27 @@ class TestSwapAccounts:
     def test_write_json_publishes_only_after_chmod(
         self, temp_home: Path, sample_sequence_data: dict
     ):
-        """chmod runs on the temp file, making the rename the final commit —
-        a chmod failure must abort *without* publishing, otherwise callers
-        would roll files back around already-committed metadata."""
+        """The mode is set on the temp, so the rename is the final commit —
+        a mode failure must abort *without* publishing, otherwise callers
+        would roll files back around already-committed metadata.
+
+        The mode now lands at CREATION (`os.fchmod` on the open fd) rather
+        than after the payload is written, so the injection sits there. The
+        invariant is the same one and it is strictly stronger: the temp is
+        never world-readable at any point, not merely by the time it is
+        published."""
         if sys.platform == "win32":
-            pytest.skip("_write_json skips chmod on Windows (no POSIX file modes)")
+            pytest.skip("_write_json skips modes on Windows (no POSIX file modes)")
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data)
         before = switcher.sequence_file.read_text(encoding="utf-8")
 
-        def failing_chmod(path, mode):
-            raise OSError("chmod denied (injected)")
+        def failing_fchmod(fd, mode):
+            raise OSError("fchmod denied (injected)")
 
         # Scoped context: see H-1 comment above.
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr("claude_swap.switcher.os.chmod", failing_chmod)
+            mp.setattr("claude_swap.switcher.os.fchmod", failing_fchmod)
             with pytest.raises(OSError):
                 switcher._write_json(switcher.sequence_file, {"x": 1})
 

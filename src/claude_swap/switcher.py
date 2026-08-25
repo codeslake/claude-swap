@@ -564,7 +564,17 @@ class ClaudeAccountSwitcher:
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
 
         try:
-            temp_path.write_text(content, encoding="utf-8")
+            # 0600 AT CREATION. `write_text` uses the umask default, so the
+            # temp held the whole payload world-readable for the length of the
+            # write and the read-back below — and this writer publishes
+            # `~/.claude.json`, which can carry `primaryApiKey` and inline MCP
+            # credentials. fchmod as well as the open mode, because O_CREAT
+            # leaves a leftover temp's existing mode alone.
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                if sys.platform != "win32":
+                    os.fchmod(fh.fileno(), 0o600)
+                fh.write(content)
 
             # Validate written content
             try:
@@ -577,8 +587,6 @@ class ClaudeAccountSwitcher:
             # to a copy on ANY rename error, and that copy overwrites the
             # roster in place. (The EBUSY branch below is the one publish that
             # cannot be atomic, and it says so.)
-            if sys.platform != "win32":
-                os.chmod(temp_path, 0o600)
             try:
                 replace_with_retry(temp_path, path)
                 temp_path = None  # consumed by the publish; the name is not ours

@@ -131,9 +131,16 @@ class MenuBarSettings:
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:
-        """Write settings as pretty JSON, creating parent directories."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(asdict(self), indent=2) + "\n", encoding="utf-8")
+        """Write settings atomically, creating parent directories.
+
+        A truncate-then-write here loses the settings on an interrupt, and
+        `load` treats an unparseable file as absent and returns the DEFAULTS
+        without a word — so a Ctrl-C during a menu-bar toggle silently turns
+        auto-switch off. The shared helper does mkdir, 0600 and temp+replace.
+        """
+        from claude_swap.settings import atomic_write_json
+
+        atomic_write_json(path, asdict(self))
 
 
 # ---- pure display helpers (operate on the usage-window dict shape produced by
