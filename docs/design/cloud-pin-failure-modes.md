@@ -49,7 +49,7 @@ is a small fix worth making.
 | B5 | The pin RECORD itself is lost while the proxy keeps running | Provider reads no pin → returns None → every request leaves with the session's own bearer, and `.claude.json` still names a live proxy so nothing looks wrong | Yes — re-pin; but nothing detects it on its own |
 
 B5 is the only entry here that has actually happened, and it happened on
-all three machines at once, so it is worth the detail. Two independent bugs
+every machine at once, so it is worth the detail. Two independent bugs
 erased the `remoteControl` section from `settings.json` while the daemon
 and the wiring stayed healthy:
 
@@ -106,15 +106,16 @@ Linux, `OSError 42 "Protocol not available"` on macOS. Treating that raise as
 successor then bound a fresh port while the wiring still named the old one:
 
 ```
+# illustrative, not a verbatim transcript
 ignoring the handed-down fd 3: [Errno 42]
-serving on port 58062          # while the wiring named 53749
+serving on port <fresh>        # while the wiring named <old>
 ```
 
 A read failure reported as an absence — the same shape as B5 above, and why
 the probe now dials the address instead of trusting the option. It matters
 more than most: a Linux-green suite and a macOS fleet stranding its sessions
-produce identical output, and two of the three machines this runs on are the
-platform it broke on.
+produce identical output, and most machines this runs on are the platform it
+broke on.
 
 ## D. Concurrency
 

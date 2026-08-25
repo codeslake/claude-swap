@@ -966,13 +966,13 @@ def _live_impl() -> ModuleType | None:
     test that "proved" otherwise advanced a fake clock past the TTL, so it
     asserted the cache's own contract rather than the user's.
 
-    THE CONFIG READS AROUND IT WERE RE-RAISED AS A STALL AND RE-MEASURED
-    2026-08-18. `_root_entries` runs on the 3s watcher and reaches
+    THE CONFIG READS AROUND IT WERE RE-RAISED AS A STALL AND RE-MEASURED.
+    `_root_entries` runs on the 3s watcher and reaches
     `_wiring_present` and `_pinned_email_now`, each of which parses the global
-    config. On this fleet's real file: 175 KB, 1.1 ms per read+parse, so the
+    config. On one real config: 175 KB, 1.1 ms per read+parse, so the
     whole render tick spends ~5 ms of 3000 — 0.2%. The "megabytes on a real
     machine" that motivates `_dead_wired_configs`' own frugality is a
-    different machine's file, and none on this fleet is one. Cache it when a
+    different machine's file, and the one measured here is not. Cache it when a
     measurement shows a tick that matters, not because the shape looks
     expensive; the last cache here cost more than it saved.
     """

@@ -9170,7 +9170,8 @@ class TestTheSeamCanBeAskedWhichSlotIsPinned:
     re-deriving the answer from proxy.json and drifting from it.
 
     THE COMPOSITE, NOT THE EMAIL. Two managed slots can share one address
-    across organizations, and this fleet's roster already has such a pair. A
+    across organizations, and that is not hypothetical -- a real roster has
+    such a pair. A
     reader keyed on the address alone picks whichever comes first and is wrong
     half the time, silently.
 
