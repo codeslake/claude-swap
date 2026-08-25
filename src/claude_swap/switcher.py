@@ -1055,9 +1055,9 @@ class ClaudeAccountSwitcher:
                 "accounts", {}).get(str(account_num)) or {}
             slot_email = row.get("email")
             here = data["oauthAccount"]
-            # ALREADY OURS — LEAVE EVERY FIELD ALONE. The roster carries an
-            # email and an org and nothing else, so anything built from it is
-            # a two-key identity; a real one also carries `accountUuid`,
+            # ALREADY OURS — LEAVE EVERY FIELD ALONE. Anything built from the
+            # roster is still a PARTIAL identity — it carries the uuid, the org
+            # and a name, while a real one also carries
             # `organizationName`, `organizationRole` and `displayName`, and
             # Claude Code identifies an account by the uuid. Comparing the
             # whole dict to the synthesis can never be equal, so without this
@@ -1093,8 +1093,19 @@ class ClaudeAccountSwitcher:
                             (kept.get("organizationUuid") or "") == slot_org:
                         own = kept
                 if own is None:
+                    # THE UUID IS IN THE ROSTER ROW, so do not synthesise an
+                    # identity without it. Claude Code identifies an account by
+                    # `accountUuid` and compares a stored bridge pointer
+                    # against it; a backup written with only the two keys hands
+                    # a later switch a config CC cannot compare, and nothing
+                    # rewrites a backup afterwards. `pin.identity_for_config`
+                    # already reads `row["uuid"]` for exactly this reason.
                     own = {"emailAddress": slot_email,
                            "organizationUuid": slot_org}
+                    if row.get("uuid"):
+                        own["accountUuid"] = row["uuid"]
+                    if row.get("organizationName"):
+                        own["organizationName"] = row["organizationName"]
             else:
                 stored = self._read_account_config(account_num, email)
                 if stored:

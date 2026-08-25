@@ -1025,13 +1025,27 @@ class AutoSwitchEngine:
         """
         from . import pin
 
-        pinned = pin.pinned_email(self.switcher)
-        if not pinned:
+        # ASK THE SEAM. Two defects lived in the loop this replaces, and both
+        # end the same way — `_bridge_owner_number` returns None, the tick
+        # reports `no-account` on every pass, and requirement 2 never runs
+        # while nothing says so louder than one WARNING line.
+        #
+        # BY EMAIL: `account_email(n) == pinned` takes whichever slot comes
+        # first, and this roster holds a personal+org pair sharing one address.
+        # A coin flip picks the bearer, and the wrong one sees none of these
+        # bridges.
+        #
+        # OVER `switchable_account_numbers()`: that list EXCLUDES disabled
+        # slots, and disabling the pinned account is the only way today to keep
+        # the rotation off it. Pin a slot, disable it, and the pinned account
+        # is not in the list at all — so the loop fell through forever.
+        #
+        # `pinned_slot` resolves on the composite and does not filter on
+        # rotation eligibility, which is the right question here: we want the
+        # account's BEARER, not whether it is a rotation candidate.
+        if not pin.pinned_email(self.switcher):
             return self.switcher.current_account_number()
-        for number in self.switcher.switchable_account_numbers():
-            if self.switcher.account_email(number) == pinned:
-                return number
-        return None
+        return pin.pinned_slot(self.switcher)
 
     def _report_bridge_titles(self, outcome: str, done: int) -> None:
         """Say it when it CHANGES, and only then.

@@ -7189,6 +7189,10 @@ class TestTheEngineActuallyRunsTheTitleRestore:
 
         self._fake_pin_module(monkeypatch)
         monkeypatch.setattr(pin, "pinned_email", lambda sw: "c@example.com")
+        # THE SLOT COMES FROM THE SEAM NOW, on the composite. The loop this
+        # replaced matched on the address alone and read from
+        # `switchable_account_numbers()`, which excludes disabled slots.
+        monkeypatch.setattr(pin, "pinned_slot", lambda sw: "3")
 
         used = []
         real_read = harness.switcher.read_account_credentials
@@ -7265,3 +7269,63 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         assert not reached, (
             "the repair ran because the WALL clock said it was due, while the "
             "clock this engine was constructed with said it was not")
+
+
+class TestTheBridgeOwnerIsResolvedOnTheComposite:
+    """Two ways `_bridge_owner_number` returned None forever, both silent.
+
+    Its failure has one symptom: `no-account` on every 300s pass, requirement
+    2 never running, and a single WARNING line saying so. Nothing else marks
+    it, which is why both of these could sit.
+
+    BY EMAIL: the loop compared `account_email(n) == pinned_email` and took
+    whichever slot came first. This roster holds a personal+org pair sharing
+    one address, so the bearer was a coin flip and the wrong one sees none of
+    these bridges.
+
+    OVER `switchable_account_numbers()`: that list excludes DISABLED slots,
+    and disabling the pinned account is the only way today to keep the
+    rotation off it. Pin a slot, disable it, and the loop never found it.
+
+    `pin.pinned_slot` answers both — composite, and no rotation filter, which
+    is right because this wants the account's BEARER and not its eligibility.
+    """
+
+    def _engine(self, monkeypatch, *, pinned_email, slot):
+        import types
+
+        from claude_swap import autoswitch, pin
+
+        monkeypatch.setattr(pin, "pinned_email", lambda _sw: pinned_email)
+        monkeypatch.setattr(pin, "pinned_slot", lambda _sw: slot)
+        eng = autoswitch.AutoSwitchEngine.__new__(autoswitch.AutoSwitchEngine)
+        eng.switcher = types.SimpleNamespace(
+            current_account_number=lambda: "9",
+            # would answer for the WRONG slot if anything still asked it
+            switchable_account_numbers=lambda: ["1", "2"],
+            account_email=lambda n: "shared@example.com",
+        )
+        return eng
+
+    def test_a_pinned_slot_excluded_from_rotation_is_still_found(
+            self, monkeypatch):
+        """Pinned AND disabled — the only way today to keep rotation off it."""
+        eng = self._engine(monkeypatch,
+                           pinned_email="shared@example.com", slot="3")
+        assert eng._bridge_owner_number() == "3", (
+            "a pinned slot outside switchable_account_numbers resolved to "
+            "None — requirement 2 then never runs and only one WARNING says so")
+
+    def test_CONTROL_no_pin_still_falls_back_to_the_active_account(
+            self, monkeypatch):
+        eng = self._engine(monkeypatch, pinned_email=None, slot=None)
+        assert eng._bridge_owner_number() == "9"
+
+    def test_CONTROL_a_pin_the_seam_cannot_resolve_is_None_not_the_active_one(
+            self, monkeypatch):
+        """NO SILENT FALLBACK: with a pin set and its slot unresolvable we
+        have no credential for the account that owns the bridges, and saying
+        so once beats a repair that cannot work and does not admit it."""
+        eng = self._engine(monkeypatch,
+                           pinned_email="shared@example.com", slot=None)
+        assert eng._bridge_owner_number() is None

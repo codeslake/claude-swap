@@ -1048,11 +1048,14 @@ def _live_login_for_config(switcher) -> "dict | None":
 def pinned_slot(switcher) -> "str | None":
     """The roster slot the pin names, or None when it cannot be told.
 
-    THE SEAM cswap core asks so it does not have to re-derive this. The
-    autoswitch tick wants to keep the rotation off the pinned account — the
-    pin's own window is what Remote Control spends, and ordinary inference on
-    the same slot drains it. That is a question about the pin, so it is
-    answered here rather than from proxy.json, which would drift.
+    THE SEAM cswap core asks so it does not have to re-derive this. Its
+    callers today are `_repin_if_pin_slot_refreshed`, and the autoswitch
+    tick's `_bridge_owner_number`, which needs the pinned account's BEARER to
+    see the bridges it is about to rename.
+
+    Keeping the ROTATION off the pinned slot is a separate use this function
+    would also serve and nothing wires yet; do not read this docstring as
+    saying that it does.
 
     ON THE COMPOSITE, NOT THE ADDRESS: two managed slots can share one email
     across organizations, and this roster already has such a pair. Keyed on

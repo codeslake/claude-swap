@@ -9740,3 +9740,67 @@ class TestTheSwitchSplicePicksTheSlotNotTheAddress:
             "the composite default fired for an address the caller named: "
             + repr(seen))
         assert got is not None and got.get("accountUuid") == "PINNED-UUID"
+
+
+class TestTheRosterFallbackKeepsTheAccountUuid:
+    """A backup written without `accountUuid` hands CC nothing to compare.
+
+    `_config_naming_slot` falls back to the roster when a slot has no stored
+    backup — absent, torn, or already pin-contaminated, which is the migration
+    case on every existing machine. It built `{emailAddress, organizationUuid}`
+    and dropped the uuid, although the roster row carries it as `uuid` and
+    `pin.identity_for_config` reads exactly that field.
+
+    What that costs: the slot's backup now has an `oauthAccount` with no
+    account uuid. A later switch writes it verbatim into the live config, and
+    Claude Code — which identifies an account by uuid and compares a stored
+    bridge pointer against it — has nothing to compare. Requirement 1 cannot
+    hold for that slot, and nothing rewrites a backup afterwards.
+
+    The sibling case three above states the rule this broke: "an identity
+    without one is not the same identity."
+    """
+
+    def test_the_synthesised_identity_carries_the_uuid(self, tmp_path):
+        import json
+        import types
+
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        row = {"email": "a@example.com", "organizationUuid": "org-1",
+               "uuid": "ACCT-UUID-1", "organizationName": "Org One"}
+        sw._get_sequence_data = lambda: {"accounts": {"5": row}}
+        sw._read_account_config = lambda num, email: None   # no stored backup
+        cfg = {"oauthAccount": {"emailAddress": "someone-else@example.com",
+                                "organizationUuid": "org-9",
+                                "accountUuid": "OTHER"}}
+        out = sw._config_naming_slot(json.dumps(cfg), "5", "a@example.com")
+        got = json.loads(out).get("oauthAccount") or {}
+        assert got.get("accountUuid") == "ACCT-UUID-1", (
+            "the roster fallback dropped the account uuid it had in hand — "
+            "Claude Code then has nothing to compare a bridge pointer "
+            "against: " + repr(got))
+        assert got.get("emailAddress") == "a@example.com", got
+        assert got.get("organizationUuid") == "org-1", got
+
+    def test_CONTROL_a_roster_row_without_a_uuid_still_yields_the_two_keys(
+            self, tmp_path):
+        """The uuid is carried when present, never invented. An older roster
+        row that predates the field must still produce a usable identity."""
+        import json
+
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        sw._get_sequence_data = lambda: {"accounts": {
+            "5": {"email": "a@example.com", "organizationUuid": "org-1"}}}
+        sw._read_account_config = lambda num, email: None
+        cfg = {"oauthAccount": {"emailAddress": "b@example.com",
+                                "organizationUuid": "org-9"}}
+        out = sw._config_naming_slot(json.dumps(cfg), "5", "a@example.com")
+        got = json.loads(out).get("oauthAccount") or {}
+        assert got.get("emailAddress") == "a@example.com", got
+        assert "accountUuid" not in got, (
+            "a uuid was invented for a row that does not carry one: "
+            + repr(got))
