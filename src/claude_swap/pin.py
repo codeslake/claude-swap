@@ -1045,6 +1045,54 @@ def _live_login_for_config(switcher) -> "dict | None":
                                num=switcher.current_account_number())
 
 
+def identity_move_is_not_a_login(switcher, before, now) -> bool:
+    """Did `oauthAccount` move for a PIN reason rather than a `/login`?
+
+    IN THE SEAM, NOT ON THE SWITCHER, and that is not tidiness. A guard in
+    cswap core consults this; the answer is entirely about the pin, and a
+    second `def` of the same name in `ClaudeAccountSwitcher` is not an
+    overlay — it is a redefinition, and which body survives depends on the
+    order two branches merge. Measured: an upstream branch carrying a
+    `return False` stub and this branch carrying the real body produced a
+    tree where the stub won silently, each branch green alone.
+
+    THE SEAM FOR A GUARD THAT WATCHES THAT FIELD FOR DRIFT. Under a pin the
+    field has a second writer -- the switch splices the pinned identity in,
+    and the daemon's carry writes the account now signed in -- so it swings
+    between the two on a minutes timescale with nobody logging in. A guard
+    that samples it twice and refuses on a difference refuses on the swing,
+    and tells the user to "re-run when no other login is in flight" when
+    there is no login and re-running has the same odds of catching it.
+
+    Same discriminator as `ClaudeAccountSwitcher._live_login_identity`, for the same
+    reason: the carry moves the CONFIG and nothing else, while a `/login`
+    replaces the credential too. So the move is benign only when one of the
+    two samples is the pinned identity AND the live credential is still the
+    roster's active slot's.
+
+    FALSE WHEN IT CANNOT TELL, which is the safe direction HERE and the
+    opposite of the one `_live_login_identity` takes: this answer only ever
+    SUPPRESSES a refusal, and a refusal writes nothing.
+    """
+    try:
+        pinned = pinned_identity(switcher)
+    except Exception:  # noqa: BLE001 — a tidy question must not raise here
+        return False
+    if not pinned:
+        return False
+    pair = tuple(pinned)[:2]
+    if pair not in {tuple(t or ())[:2] for t in (before, now) if t}:
+        return False        # neither sample is the pin — not our doing
+    data = switcher._get_sequence_data() or {}
+    recorded = data.get("activeAccountNumber")
+    if recorded is None:
+        return False
+    slot = (data.get("accounts") or {}).get(str(recorded))
+    if not isinstance(slot, dict) or not slot.get("email"):
+        return False
+    return switcher._live_credential_is(str(recorded), slot["email"]) is True
+
+
 def pinned_slot(switcher) -> "str | None":
     """The roster slot the pin names, or None when it cannot be told.
 

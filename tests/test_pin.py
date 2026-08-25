@@ -9983,6 +9983,16 @@ class TestTheSwingIsNotADriftEvent:
     PIN = ("pinned@example.com", "org-pin")
     LOGIN = ("login@example.com", "org-login", "uuid-login")
 
+    @staticmethod
+    def _moved(switcher, before, now):
+        """THE SEAM FUNCTION, not a switcher method. It lives in `pin.py`
+        because a second `def` of the same name in `ClaudeAccountSwitcher` is
+        a redefinition rather than an overlay, and which body survives depends
+        on the order two branches merge."""
+        from claude_swap import pin as _pin_mod
+
+        return _pin_mod.identity_move_is_not_a_login(switcher, before, now)
+
     def _switcher(self, tmp_path, monkeypatch, *, live_tokens, stored_tokens):
         import logging
 
@@ -10014,7 +10024,7 @@ class TestTheSwingIsNotADriftEvent:
             self, tmp_path, monkeypatch):
         s = self._switcher(tmp_path, monkeypatch,
                            live_tokens=self.SAME, stored_tokens=self.SAME)
-        moved = s._identity_move_is_not_a_login(
+        moved = self._moved(s, 
             self.LOGIN, (self.PIN[0], self.PIN[1], "uuid-pin"))
         assert moved is True, (
             "the credential never moved, so nobody logged in -- refusing here "
@@ -10025,7 +10035,7 @@ class TestTheSwingIsNotADriftEvent:
         """The swing has two directions and the guard sees both."""
         s = self._switcher(tmp_path, monkeypatch,
                            live_tokens=self.SAME, stored_tokens=self.SAME)
-        assert s._identity_move_is_not_a_login(
+        assert self._moved(s, 
             (self.PIN[0], self.PIN[1], "uuid-pin"), self.LOGIN) is True
 
     def test_CONTROL_a_real_login_still_refuses(self, tmp_path, monkeypatch):
@@ -10035,7 +10045,7 @@ class TestTheSwingIsNotADriftEvent:
             tmp_path, monkeypatch,
             live_tokens={"accessToken": "pin-new", "refreshToken": "pin-new-r"},
             stored_tokens=self.SAME)
-        assert s._identity_move_is_not_a_login(
+        assert self._moved(s, 
             self.LOGIN, (self.PIN[0], self.PIN[1], "uuid-pin")) is False
 
     def test_CONTROL_a_move_between_two_accounts_that_are_not_the_pin(
@@ -10044,7 +10054,7 @@ class TestTheSwingIsNotADriftEvent:
         and has nothing to say about it."""
         s = self._switcher(tmp_path, monkeypatch,
                            live_tokens=self.SAME, stored_tokens=self.SAME)
-        assert s._identity_move_is_not_a_login(
+        assert self._moved(s, 
             self.LOGIN, ("third@example.com", "org-third", "uuid-third")
         ) is False
 
@@ -10053,7 +10063,7 @@ class TestTheSwingIsNotADriftEvent:
         one, and a refusal writes nothing."""
         s = self._switcher(tmp_path, monkeypatch,
                            live_tokens=self.SAME, stored_tokens=None)
-        assert s._identity_move_is_not_a_login(
+        assert self._moved(s, 
             self.LOGIN, (self.PIN[0], self.PIN[1], "uuid-pin")) is False
 
     def test_CONTROL_no_pin_set_says_nothing(self, tmp_path, monkeypatch):
@@ -10062,7 +10072,7 @@ class TestTheSwingIsNotADriftEvent:
         s = self._switcher(tmp_path, monkeypatch,
                            live_tokens=self.SAME, stored_tokens=self.SAME)
         monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
-        assert s._identity_move_is_not_a_login(
+        assert self._moved(s, 
             self.LOGIN, ("other@example.com", "org-o", "uuid-o")) is False
 
 
@@ -10077,6 +10087,16 @@ class TestTheSeamIsSubstitutableForAnUpstreamStub:
     unreadable, or carries no email, so the guard can hand this a None on
     either side without knowing it.
     """
+
+    @staticmethod
+    def _moved(switcher, before, now):
+        """THE SEAM FUNCTION, not a switcher method. It lives in `pin.py`
+        because a second `def` of the same name in `ClaudeAccountSwitcher` is
+        a redefinition rather than an overlay, and which body survives depends
+        on the order two branches merge."""
+        from claude_swap import pin as _pin_mod
+
+        return _pin_mod.identity_move_is_not_a_login(switcher, before, now)
 
     def _switcher(self, monkeypatch, *, pinned=("pinned@example.com", "org-pin")):
         import logging
@@ -10093,26 +10113,48 @@ class TestTheSeamIsSubstitutableForAnUpstreamStub:
         return s
 
     def test_None_before(self, monkeypatch):
-        assert self._switcher(monkeypatch)._identity_move_is_not_a_login(
+        assert self._moved(self._switcher(monkeypatch), 
             None, ("other@example.com", "org-o", "uuid-o")) is False
 
     def test_None_now(self, monkeypatch):
-        assert self._switcher(monkeypatch)._identity_move_is_not_a_login(
+        assert self._moved(self._switcher(monkeypatch), 
             ("other@example.com", "org-o", "uuid-o"), None) is False
 
     def test_None_both(self, monkeypatch):
-        assert self._switcher(monkeypatch)._identity_move_is_not_a_login(
+        assert self._moved(self._switcher(monkeypatch), 
             None, None) is False
 
     def test_it_takes_both_samples_POSITIONALLY(self, monkeypatch):
         """A keyword-only or renamed parameter breaks the substitution the
         moment upstream's stub names them differently."""
-        s = self._switcher(monkeypatch)
-        assert s._identity_move_is_not_a_login(None, None) is False
         import inspect
+
+        from claude_swap import pin as _pin_mod
+
+        s = self._switcher(monkeypatch)
+        assert self._moved(s, None, None) is False
         params = list(inspect.signature(
-            s._identity_move_is_not_a_login).parameters.values())
-        assert len(params) == 2
+            _pin_mod.identity_move_is_not_a_login).parameters.values())
+        assert [p.name for p in params] == ["switcher", "before", "now"], params
         assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
                    for p in params), [str(p) for p in params]
         assert all(p.default is inspect.Parameter.empty for p in params)
+
+    def test_the_switcher_carries_NO_definition_of_this_name(self):
+        """The whole reason the body moved. A `def` here and a `def` on the
+        branch that calls it are two definitions of one name in one class:
+        git merges both without a conflict because the merge base has neither,
+        and Python keeps the LAST one. Each branch is green alone and the pair
+        is not, which is the shape that cost a rebuild.
+
+        The seam module is the one place both branches can agree on.
+        """
+        import pathlib
+
+        from claude_swap import switcher as _sw
+
+        src = pathlib.Path(_sw.__file__).read_text()
+        assert "def _identity_move_is_not_a_login" not in src, (
+            "switcher.py defines this name again — a second def in the same "
+            "class is a redefinition, not an overlay, and which body survives "
+            "depends on the order two branches merge")
