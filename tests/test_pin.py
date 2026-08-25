@@ -9861,3 +9861,98 @@ class TestTheRosterFallbackKeepsTheAccountUuid:
         assert "accountUuid" not in got, (
             "a uuid was invented for a row that does not carry one: "
             + repr(got))
+
+
+class TestALoginAsThePinnedAccountIsNotASplice:
+    """The un-splice cannot read the config alone, because both states write
+    the SAME value into it.
+
+    `_perform_switch` writes the pinned identity into `oauthAccount` so a live
+    Remote Control session survives a rotation, and `_live_login_identity`
+    un-splices that back to the roster's active slot. But `claude /login` as
+    the pinned account writes byte-identical content there -- and that login
+    is the documented repair for a dead pin credential, the one
+    `_repin_if_pin_slot_refreshed` exists to finish.
+
+    Un-splicing it sends `add_account` the ACTIVE slot: the pin's fresh
+    credential is stored under the wrong account, the pin's own slot keeps the
+    dead one, and the repin is skipped because the slot it was handed is not
+    the pinned one. The repair path breaks end to end and prints
+    `Updated credentials for Account <active>` while doing it.
+
+    The credential is where the two differ. After a splice the roster's active
+    account is still the one authenticated; after a login it is not.
+    """
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def _switcher(self, tmp_path, monkeypatch, *, live_tokens, stored_tokens):
+        import logging
+
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test-login-vs-splice")
+        # the config names the PIN -- identical under both stories
+        s._get_current_account = lambda: self.PIN
+        s._get_sequence_data = lambda: {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"email": "login@example.com",
+                               "organizationUuid": "org-login"}}}
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+
+        creds = tmp_path / ".credentials.json"
+        creds.write_text(json.dumps({"claudeAiOauth": live_tokens}))
+        monkeypatch.setattr(_sw, "get_credentials_path", lambda: creds)
+        if stored_tokens is None:
+            def _read(num, email):
+                raise RuntimeError("the keychain declined this process")
+        else:
+            def _read(num, email):
+                return json.dumps({"claudeAiOauth": stored_tokens})
+        s.read_account_credentials = _read
+        return s
+
+    def test_a_fresh_login_as_the_pin_is_reported_as_the_pin(
+            self, tmp_path, monkeypatch):
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "pin-new", "refreshToken": "pin-new-r"},
+            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+        assert s._live_login_identity() == self.PIN, (
+            "the credential now live is the PIN's, so this is a login and not "
+            "a splice -- un-splicing it stores that credential under the "
+            "active slot and skips the repin the login was run to trigger")
+
+    def test_CONTROL_a_real_splice_is_still_un_spliced(
+            self, tmp_path, monkeypatch):
+        """Same config, same pin. Only the credential differs: it is still the
+        roster's active account, which is what a splice leaves behind."""
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "login-a", "refreshToken": "login-r"},
+            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+        assert s._live_login_identity() == ("login@example.com", "org-login")
+
+    def test_CONTROL_a_rotated_access_token_is_still_the_same_account(
+            self, tmp_path, monkeypatch):
+        """A refresh moves one token and not the other. Matching EITHER is what
+        keeps a refresh in flight from reading as a different account."""
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "login-a2", "refreshToken": "login-r"},
+            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+        assert s._live_login_identity() == ("login@example.com", "org-login")
+
+    def test_CONTROL_an_unreadable_store_is_not_a_mismatch(
+            self, tmp_path, monkeypatch):
+        """A Mac keychain that declines this process reads as absent while the
+        daemon above it reads the same slot fine. Folding that into "different
+        credential" switches the un-splice off on the machines it was written
+        for."""
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "pin-new", "refreshToken": "pin-new-r"},
+            stored_tokens=None)
+        assert s._live_login_identity() == ("login@example.com", "org-login")

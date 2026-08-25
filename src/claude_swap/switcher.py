@@ -3143,7 +3143,58 @@ class ClaudeAccountSwitcher:
         slot = (data.get("accounts") or {}).get(str(recorded))
         if not isinstance(slot, dict) or not slot.get("email"):
             return identity
+        # A SPLICE MOVES THE CONFIG AND NOTHING ELSE. Logging in AS the pinned
+        # account writes the same value into `oauthAccount` -- and that login
+        # is the documented repair for a dead pin credential -- so the two
+        # states are identical in the config and have to be told apart
+        # somewhere else. The credential is where they differ: after a splice
+        # the roster's active account is still the one authenticated, after a
+        # login it is not. Without this, the repair path reaches `add_account`
+        # naming the ACTIVE slot, stores the pin's fresh credential there, and
+        # leaves the pin's own slot holding the dead one -- and
+        # `_repin_if_pin_slot_refreshed` then sees the wrong slot and skips.
+        if self._live_credential_is(str(recorded), slot["email"]) is False:
+            return identity
         return (slot["email"], slot.get("organizationUuid", "") or "")
+
+    def _live_credential_is(self, num: str, email: str) -> "bool | None":
+        """Whether the credential in the live store is this slot's stored one.
+
+        THREE ANSWERS, and the third is the point. ``False`` means both stores
+        were read and neither token matched — positive evidence of a different
+        credential. ``None`` means one of them could not be read, which is an
+        ordinary state and not a mismatch: a Mac keychain that declines this
+        process reads as absent while the daemon above it reads the same slot
+        fine. Folding those two together would switch the un-splice off on
+        exactly the machines it was written for.
+
+        Compared on EITHER token, so rotating one of them does not read as a
+        different account. Measured against a seven-slot roster: the live pair
+        matched the roster's active slot on both tokens, and no other slot on
+        either.
+
+        NEVER RAISES: it runs on the path that answers "who is logged in".
+        """
+        def _oauth(blob):
+            if isinstance(blob, str):
+                blob = json.loads(blob)
+            return ((blob or {}).get("claudeAiOauth") or {})
+
+        try:
+            live = _oauth(json.loads(
+                get_credentials_path().read_text(encoding="utf-8")))
+        except Exception:  # noqa: BLE001 — unreadable is not a mismatch
+            return None
+        try:
+            mine = _oauth(self.read_account_credentials(num, email))
+        except Exception:  # noqa: BLE001 — unreadable is not a mismatch
+            return None
+        if not live or not mine:
+            return None
+        for key in ("refreshToken", "accessToken"):
+            if live.get(key) and live.get(key) == mine.get(key):
+                return True
+        return False
 
     def _live_identity_matches(self, email: str, org_uuid: str) -> bool:
         """Whether the live config identity is (email, org_uuid) right now.
