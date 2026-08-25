@@ -273,18 +273,10 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
     # getters `heal` calls UNCONDITIONALLY stay at DEBUG (see
     # `_log_unresolvable`).
     #
-    # THIS RECORD DOES NOT EXPLAIN AN UNREMOVABLE WIRING, and must not be read
-    # as if it did. On the flagship shape — read-only config dir, HOME
-    # resolvable — nothing raises here and it never fires; what fires is
-    # `heal`'s own "the config is locked" message. Make `Path.home()` raise too
-    # and this names `get_default_global_config_path` while the STUCK config is
-    # the one the other getter resolved fine. Put the wiring in the raising
-    # getter's config and `_wiring_present` cannot see it either, so `heal`
-    # answers "Nothing to heal" and never reaches this function. What names an
-    # unremovable wiring is the lock-failure WARNING at the bottom of this
-    # function. This record's job is the narrower one it can do: a config that
-    # could not be LOCATED is missing from `paths`, and `clear_wiring`'s bool
-    # is a claim about every path it REACHED.
+    # IT DOES NOT EXPLAIN AN UNREMOVABLE WIRING and must not be read as if it
+    # did — that is the lock-failure WARNING at the bottom of this function.
+    # This says only that a config could not be LOCATED, so it is missing
+    # from `paths`.
     paths = list(_each_config(logging.WARNING))
     if only is not None:
         # BY RESOLVED PATH, not by identity: the caller got its list from
@@ -1140,9 +1132,26 @@ def identity_for_config(switcher, email: str | None = None,
     """
     try:
         ident = pinned_identity(switcher)
+        asked = email                    # an address the CALLER named
         email = email or (ident[0] if ident else None)
         if not email:
             return None
+        if num is None and asked is None and ident:
+            # THE COMPOSITE, NOT THE ADDRESS, when the address is the pin's
+            # own. `_resolve_account_identifier` RAISES on one that names two
+            # slots; the caller-wide `except` turns that into None, and None
+            # here means "leave the config alone" — which on the switch path
+            # writes the account being switched TO as the bridge owner, the
+            # veto this whole seam exists to prevent. `_slot_for` is in this
+            # module for exactly that and every caller here already passes
+            # it; the two `_perform_switch` sites could not, because they do
+            # not know the pin's org. Defaulting it here covers them and any
+            # caller added later.
+            #
+            # Only when `asked` is None: a caller naming a DIFFERENT address
+            # is asking about another account, and the pin's org is not its
+            # org. That case keeps the address resolution it always had.
+            num = _slot_for(switcher, email, ident[1] if len(ident) > 1 else None)
         num = num or switcher._resolve_account_identifier(email)
         if not num:
             return None
@@ -2094,10 +2103,8 @@ def heal(
     # routine: the budget here is 0.5s and Claude Code holds the config lock
     # during a credential refresh. With the lock held, a wiring present and the
     # port dead, `heal` answers (False, "Nothing to heal") over an outage in
-    # progress and the wiring survives. That is this file's signature defect,
-    # in the channel that matters most: `heal` is what a launch runs to find
-    # this, so during the exact failure it exists to report, the only signal
-    # anyone had said everything was fine.
+    # progress and the wiring survives — a launch runs `heal` to FIND that
+    # outage, so the collapse hides it in the one channel meant to report it.
     #
     # RE-READ AFTER CLEAR_WIRING, exactly as clear_pin already does — its bool
     # is True when ANY of the two configs changed, not when BOTH did. With the

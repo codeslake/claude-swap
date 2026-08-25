@@ -9651,3 +9651,92 @@ class TestAnAddThatRefreshesThePinnedSlotRepairsThePin:
                     available=False)
         self._switcher()._repin_if_pin_slot_refreshed("1")
         assert calls == []
+
+
+class TestTheSwitchSplicePicksTheSlotNotTheAddress:
+    """THE TWO CALLERS REQUIREMENT 1 DEPENDS ON, and they could not pass a slot.
+
+    `identity_for_config` resolved an ADDRESS whenever the caller handed it no
+    `num`. `_resolve_account_identifier` RAISES on the documented personal+org
+    roster where one address names two slots; the function-wide `except` turns
+    that into None; and None on the switch path means "leave the config
+    alone", so `_perform_switch` writes the account being switched TO as the
+    bridge owner. Claude Code then compares a stored pointer against that and
+    vetoes the reattach — the session loses Remote Control.
+
+    Every caller inside `pin.py` worked around this by passing
+    `num=_slot_for(...)`. The two `_perform_switch` sites could not: they do
+    not know the pin's organization. The default now resolves on the
+    composite, which covers them and anything added later.
+
+    `TestTheCarrySurvivesAnAddressThatNamesTwoSlots` proves the same for
+    `heal` and never touches the switch path.
+    """
+
+    EMAIL, ORG_A, ORG_B = "shared@example.com", "org-a", "org-b"
+
+    def _switcher(self, tmp_path):
+        import json
+        import types
+
+        backup = tmp_path / "backup"
+        backup.mkdir(parents=True)
+        (backup / "3").mkdir()
+        (backup / "3" / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": self.EMAIL,
+                              "organizationUuid": self.ORG_B,
+                              "accountUuid": "PINNED-UUID"}}))
+
+        def _resolve(email):
+            raise ValueError(f"Email {email} is ambiguous")
+
+        return types.SimpleNamespace(
+            backup_dir=backup,
+            _resolve_account_identifier=_resolve,
+            _read_account_config=lambda num, email: (
+                (backup / str(num) / ".claude.json").read_text()
+                if (backup / str(num) / ".claude.json").exists() else None),
+            _load_sequence=lambda: {"accounts": {
+                "2": {"email": self.EMAIL, "organizationUuid": self.ORG_A},
+                "3": {"email": self.EMAIL, "organizationUuid": self.ORG_B},
+            }},
+        )
+
+    def test_an_ambiguous_address_still_yields_the_pinned_identity(
+            self, tmp_path, monkeypatch):
+        from claude_swap import pin
+
+        sw = self._switcher(tmp_path)
+        monkeypatch.setattr(pin, "pinned_identity",
+                            lambda _s: (self.EMAIL, self.ORG_B))
+        monkeypatch.setattr(pin, "_slot_for",
+                            lambda _s, email, org: "3"
+                            if (email, org) == (self.EMAIL, self.ORG_B)
+                            else None)
+        got = pin.identity_for_config(sw)
+        assert got is not None, (
+            "the seam returned None on an ambiguous address — the switch then "
+            "keeps the account being switched TO as the bridge owner, which "
+            "is requirement 1 breaking")
+        assert got.get("accountUuid") == "PINNED-UUID", got
+
+    def test_CONTROL_a_caller_naming_another_address_still_resolves_it(
+            self, tmp_path, monkeypatch):
+        """The composite default must apply ONLY to the pin's own address. A
+        caller asking about a DIFFERENT account (the rollback, `set_pin`) is
+        not asking about the pin's organization, and using it would answer
+        about the wrong slot."""
+        from claude_swap import pin
+
+        sw = self._switcher(tmp_path)
+        monkeypatch.setattr(pin, "pinned_identity",
+                            lambda _s: (self.EMAIL, self.ORG_B))
+        seen = []
+        monkeypatch.setattr(pin, "_slot_for",
+                            lambda _s, e, o: seen.append((e, o)))
+        sw._resolve_account_identifier = lambda email: "3"
+        got = pin.identity_for_config(sw, email="someone-else@example.com")
+        assert seen == [], (
+            "the composite default fired for an address the caller named: "
+            + repr(seen))
+        assert got is not None and got.get("accountUuid") == "PINNED-UUID"
