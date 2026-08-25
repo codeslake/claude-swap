@@ -1000,7 +1000,17 @@ class AutoSwitchEngine:
         if not self.demoted_from_live or self._stop.is_set():
             return
         lock = FileLock(self.switcher.backup_dir / LIVE_LOCK_FILENAME, timeout=0)
-        if not lock.acquire():
+        try:
+            if not lock.acquire():
+                return
+        except OSError:
+            # `tick()` promises it never raises, and this runs BEFORE its try —
+            # deliberately, because the preamble's ordering is load-bearing and
+            # documented. `acquire()` creates the lock's directory and file, so
+            # an unwritable backup_dir (a read-only remount, ENOSPC) escapes
+            # `tick()` entirely and `cswap auto --once` exits on a traceback
+            # instead of cli.py's documented 0/1/2/3 contract. Staying demoted
+            # one more tick is the right answer to "not obtainable right now".
             return
         # PUBLISH FIRST, THEN ASK — under `stop()`'s own lock. Acquiring and
         # publishing were two statements with a re-check between them, and a

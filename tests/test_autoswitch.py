@@ -7057,6 +7057,33 @@ class TestLiveLock:
         assert harness.active_number() == 1        # changed nothing
         assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
 
+    def test_tick_keeps_its_never_raises_promise_when_the_lock_dir_is_unwritable(
+        self, harness
+    ):
+        """`_retry_live_promotion` runs BEFORE tick()'s try, on purpose.
+
+        The preamble's ordering is load-bearing and documented, so the guard
+        belongs at the raising call rather than in a restructured tick. What
+        must hold either way is the docstring: tick() returns an outcome.
+        `cli.py` does `sys.exit(engine.tick().value)` with a documented
+        0/1/2/3 contract, and an escaping OSError replaces that with a
+        traceback and interpreter exit 1.
+        """
+        from claude_swap import autoswitch as autoswitch_mod
+
+        engine = harness._make_engine()          # demoted: the fixture holds LIVE
+        assert engine.demoted_from_live is True, (
+            "premise: only a demoted engine retries the promotion"
+        )
+
+        def unwritable(self, *a, **kw):
+            raise OSError(30, "Read-only file system")
+
+        with patch.object(autoswitch_mod.FileLock, "acquire", unwritable):
+            outcome = engine.tick()
+
+        assert isinstance(outcome, TickOutcome)
+
     def test_a_user_requested_dry_run_still_reports_switched(self, harness):
         """The other arm, which the demoted assertion must not take with it.
 

@@ -6842,16 +6842,18 @@ class ClaudeAccountSwitcher:
                         target_account, target_email, from_ref, to_ref, data
                     )
                 target_config = self._read_account_config(target_account, target_email)
-                if (not target_creds or not target_config) and self._keychain_blind():
+                # CONFIG ONLY. The credentials axis returned above, so
+                # `target_creds` is truthy here: a `not target_creds` disjunct
+                # could never contribute, and the second empty-slot return that
+                # sat below this was unreachable for the same reason. Removed
+                # rather than left to suggest this guard still covers the
+                # credential axis its message names.
+                if not target_config and self._keychain_blind():
                     raise SwitchError(
                         f"Account-{target_account}'s backup is in the macOS "
                         f"Keychain but it is unreadable right now (locked or "
                         f"no GUI session). Retry from a GUI terminal; do not "
                         f"re-add."
-                    )
-                if not target_creds:
-                    return self._switch_to_empty_slot(
-                        target_account, target_email, from_ref, to_ref, data
                     )
                 if not target_config:
                     target_config = self._rebuilt_config(
@@ -7204,16 +7206,18 @@ class ClaudeAccountSwitcher:
                     )
                 target_config = self._read_account_config(target_account, target_email)
 
-                if (not target_creds or not target_config) and self._keychain_blind():
+                # CONFIG ONLY. The credentials axis returned above, so
+                # `target_creds` is truthy here: a `not target_creds` disjunct
+                # could never contribute, and the second empty-slot return that
+                # sat below this was unreachable for the same reason. Removed
+                # rather than left to suggest this guard still covers the
+                # credential axis its message names.
+                if not target_config and self._keychain_blind():
                     raise SwitchError(
                         f"Account-{target_account}'s backup is in the macOS "
                         f"Keychain but it is unreadable right now (locked or "
                         f"no GUI session). Retry from a GUI terminal; do not "
                         f"re-add."
-                    )
-                if not target_creds:
-                    return self._switch_to_empty_slot(
-                        target_account, target_email, from_ref, to_ref, data
                     )
                 if not target_config:
                     target_config = self._rebuilt_config(
