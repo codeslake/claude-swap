@@ -5603,6 +5603,63 @@ class TestANoteMustNotFailTheAction:
         assert "do not belong to it" in out, (
             f"a bridge the login does not own will be minted over: {out}")
 
+    def _oscillating(self, tmp_path, monkeypatch, *, bridge_org):
+        """The PIN PHASE of `~/.claude.json`'s oscillating `oauthAccount`.
+
+        That field carries two facts and has two writers, and it swings between
+        the pin and the active login on a minutes timescale. Every input below
+        is identical in both phases except which account the field names, so
+        anything that changes its answer between them is answering "when did
+        this run", not "will these sessions keep their history".
+        """
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        (sw.backup_dir / "settings.json").write_text(json.dumps(
+            {"remoteControl": {"pinnedEmail": "pinned@example.com",
+                               "pinnedOrganizationUuid": "org-pin"}}))
+        # the field naming the PIN — one phase of the swing
+        sw._get_current_account = lambda: ("pinned@example.com", "org-pin")
+        # the roster, which does NOT oscillate: slot 2 is the active login
+        sw.current_account_number = lambda: "2"
+        sw._get_sequence_data_migrated = lambda: {"accounts": {
+            "2": {"email": "login@example.com", "organizationUuid": "org-login"}}}
+        impl = self._impl(sw.backup_dir)
+        impl.observed_bridge_owners = lambda: {"cse_a": bridge_org}
+        monkeypatch.setattr(pin, "_impl", lambda: impl)
+        return pin.run(sw, None)
+
+    def test_the_pin_phase_does_not_manufacture_a_disagreement(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Bridges owned by the ACTIVE LOGIN, caught in the pin phase.
+
+        This is the steady state under a working carry, and the previous
+        comparison called it a disagreement for as long as the swing sat on
+        the pin — the same bridges reading fine minutes later with nothing
+        changed. A warning that is a coin flip on when you ran the command is
+        one people stop reading.
+        """
+        rc = self._oscillating(tmp_path, monkeypatch, bridge_org="org-login")
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "do not belong to it" not in out, (
+            "the bridges are on the roster's ACTIVE slot, which is where a "
+            f"carried pointer sits; only the swing's phase differs: {out}")
+
+    def test_CONTROL_a_stranger_org_still_warns_in_that_same_phase(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The measured incident, in the phase above: bridges on an org that is
+        NEITHER the pin nor the active login. No phase of the swing makes those
+        reattach, and widening past this point would make the row unable to
+        fail."""
+        rc = self._oscillating(tmp_path, monkeypatch, bridge_org="org-stranger")
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "do not belong to it" in out, (
+            f"a bridge no phase of the field can name will be minted over: {out}")
+
     def test_an_older_pin_package_without_the_reader_still_reports(
         self, tmp_path, monkeypatch, capsys
     ):

@@ -2603,11 +2603,25 @@ def _warn_if_bridges_disagree(pin, switcher) -> None:
     live_org = (live[1] if live and len(live) > 1 else "") or ""
     if not live_org:
         return
+    # `oauthAccount` oscillates between the pin and the active login, so this
+    # sentence would otherwise be decided by WHEN the command ran. The roster's
+    # active slot does not oscillate. A bridge on NEITHER is the failure this
+    # exists to catch and still warns; the gate stays narrow, which is what
+    # keeps the carry itself honest.
+    reachable = {live_org}
+    try:
+        row = ((switcher._get_sequence_data_migrated() or {})
+               .get("accounts", {})
+               .get(str(switcher.current_account_number()), {}))
+        if row.get("organizationUuid"):
+            reachable.add(row["organizationUuid"])
+    except Exception:  # noqa: BLE001 — a note must not fail the action
+        pass
     # `None` is dropped on purpose: an unrecorded owner is UNKNOWN, not a
     # disagreement, and `observed_bridge_owners` keeps the key so the two stay
     # distinguishable. Claiming a mismatch from unknown is the shape this
     # warning exists to catch, one level up.
-    other = sorted({o for o in owners.values() if o and o != live_org})
+    other = sorted({o for o in owners.values() if o and o not in reachable})
     if not other:
         return
     warning(

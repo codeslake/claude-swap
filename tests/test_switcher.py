@@ -12311,3 +12311,87 @@ class TestThePolicyFetchIsBudgeted:
         assert sw.fetch_policy_limits() is None
         assert not called
 
+
+
+class TestTheDaemonOwnsThePolicyCacheWhenAPinIsSet:
+    """`policy-limits.json` is machine-wide and ABSENT MEANS DENIED, so which
+    process writes it decides whether Remote Control works at all.
+
+    cswap-pin's daemon already maintains it -- `sweep_policy_once`, on its
+    sweep beat, asked as the PIN, skipping the write when the document already
+    agrees. Refreshing it from the switch too is not a second opinion:
+
+      - BEHIND THE WIRING it is the same answer. The proxy swaps the bearer on
+        this exact route; traced live against the deployed daemon:
+        `GET /api/claude_code/policy_limits pinned=True swapped=True`, from a
+        `Python-urllib` client, which is this fetch and not Claude Code's.
+      - OUTSIDE IT the bearer is NOT swapped, so the answer is the ACTIVE
+        account's restrictions -- written into the file every pinned session
+        reads. That is the outage the daemon's version records having measured:
+        an enterprise denial reaching sessions pinned to an account the server
+        had not restricted, and `/remote-control` refused for hours.
+
+    So the switch pays a network round trip inside its own transaction for an
+    answer that is at best identical and at worst a machine-wide denial.
+    """
+
+    def _switcher(self):
+        import logging
+
+        from claude_swap import switcher as _sw
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test-policy-owner")
+        return s
+
+    def _run(self, monkeypatch, *, available, pinned):
+        from claude_swap import switcher as sw
+
+        calls = []
+        monkeypatch.setattr(sw, "fetch_policy_limits",
+                            lambda *a, **k: calls.append(1) or {"restrictions": {}})
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: available)
+        monkeypatch.setattr("claude_swap.pin.pinned_email", lambda _s: pinned)
+        monkeypatch.setattr(sw, "get_claude_config_home",
+                            lambda: (_ for _ in ()).throw(
+                                AssertionError("a skipped refresh must not "
+                                               "even resolve the cache path")))
+        self._switcher()._refresh_policy_cache()
+        return calls
+
+    def test_a_pinned_host_leaves_the_file_to_the_daemon(self, monkeypatch):
+        calls = self._run(monkeypatch, available=True,
+                          pinned="pinned@example.com")
+        assert calls == [], (
+            "the switch re-fetched a document the daemon already maintains -- "
+            "identical behind the wiring, and the ACTIVE account's "
+            "restrictions written machine-wide outside it")
+
+    def test_CONTROL_no_pin_set_still_refreshes(self, monkeypatch):
+        """Nothing else writes this file on an unpinned host, and Claude Code's
+        own poll is hourly and per-process -- a session started right after a
+        switch would read the previous account's answer."""
+        from claude_swap import switcher as sw
+
+        calls = []
+        monkeypatch.setattr(sw, "fetch_policy_limits",
+                            lambda *a, **k: calls.append(1) or None)
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: True)
+        monkeypatch.setattr("claude_swap.pin.pinned_email", lambda _s: None)
+        self._switcher()._refresh_policy_cache()
+        assert calls == [1]
+
+    def test_CONTROL_no_pin_package_still_refreshes(self, monkeypatch):
+        """The optional extra is absent, so there is no daemon to hand it to."""
+        from claude_swap import switcher as sw
+
+        calls = []
+        monkeypatch.setattr(sw, "fetch_policy_limits",
+                            lambda *a, **k: calls.append(1) or None)
+        monkeypatch.setattr("claude_swap.pin.is_available", lambda: False)
+        monkeypatch.setattr("claude_swap.pin.pinned_email",
+                            lambda _s: (_ for _ in ()).throw(
+                                AssertionError("asked the pin a question after "
+                                               "the availability guard said no")))
+        self._switcher()._refresh_policy_cache()
+        assert calls == [1]

@@ -311,8 +311,10 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 #: How long the switch transaction may spend asking the policy question.
 #:
 #: Both callers sit INSIDE `_perform_switch` -- after the credential write and
-#: before `activeAccountNumber` is persisted -- so this bounds the window in
-#: which the two disagree. The fetch's own default is 10s.
+#: before `activeAccountNumber` is persisted -- so it narrows the window in
+#: which the two disagree. NOT A WALL-CLOCK BOUND: urlopen applies this per
+#: blocking socket operation, so connect, handshake and each read get it
+#: separately. The fetch's own default is 10s.
 _POLICY_FETCH_BUDGET_S = 2.0
 
 
@@ -552,6 +554,23 @@ class ClaudeAccountSwitcher:
         a switch must not fail over a cache file, and the worst case of doing
         nothing is the state we already had.
         """
+        # THE PIN DAEMON OWNS THIS FILE when a pin is set: `sweep_policy_once`
+        # runs on its sweep beat, asks as the PIN -- the account every pinned
+        # session's requests go out as -- and skips the write when the document
+        # already agrees. Fetching here reaches the same answer anyway, because
+        # the proxy swaps the bearer on this exact route (traced live:
+        # `GET /api/claude_code/policy_limits pinned=True swapped=True`). What
+        # it can do is HARM: a cswap started outside the wiring is not swapped,
+        # so it writes the ACTIVE account's restrictions into a machine-wide
+        # file, which is the measured outage the daemon's version exists to
+        # prevent.
+        try:
+            from claude_swap import pin as _pin
+
+            if _pin.is_available() and _pin.pinned_email(self):
+                return
+        except Exception:  # noqa: BLE001 — a switch must not fail on this
+            pass
         # NO-ARG ON PURPOSE: the budget is the seam's own default (see
         # `_POLICY_FETCH_BUDGET_S`), and the suite replaces this seam with a
         # no-arg stub -- passing it from here breaks every one of those.
