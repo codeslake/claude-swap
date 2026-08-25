@@ -10064,3 +10064,55 @@ class TestTheSwingIsNotADriftEvent:
         monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
         assert s._identity_move_is_not_a_login(
             self.LOGIN, ("other@example.com", "org-o", "uuid-o")) is False
+
+
+class TestTheSeamIsSubstitutableForAnUpstreamStub:
+    """The call site must not know which body it got.
+
+    Upstream carries a stub that always returns False (nothing else writes the
+    field there, so a change IS a login and the refusal is correct). This
+    branch overlays the real one. For that to be a safe substitution the
+    signature has to be positional and BOTH samples have to tolerate `None` --
+    `_get_current_identity_triple` returns None when the config is missing,
+    unreadable, or carries no email, so the guard can hand this a None on
+    either side without knowing it.
+    """
+
+    def _switcher(self, monkeypatch, *, pinned=("pinned@example.com", "org-pin")):
+        import logging
+
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test-substitutable")
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: pinned)
+        s._get_sequence_data = lambda: (_ for _ in ()).throw(
+            AssertionError("reached the roster on a sample pair it cannot "
+                           "possibly be about"))
+        return s
+
+    def test_None_before(self, monkeypatch):
+        assert self._switcher(monkeypatch)._identity_move_is_not_a_login(
+            None, ("other@example.com", "org-o", "uuid-o")) is False
+
+    def test_None_now(self, monkeypatch):
+        assert self._switcher(monkeypatch)._identity_move_is_not_a_login(
+            ("other@example.com", "org-o", "uuid-o"), None) is False
+
+    def test_None_both(self, monkeypatch):
+        assert self._switcher(monkeypatch)._identity_move_is_not_a_login(
+            None, None) is False
+
+    def test_it_takes_both_samples_POSITIONALLY(self, monkeypatch):
+        """A keyword-only or renamed parameter breaks the substitution the
+        moment upstream's stub names them differently."""
+        s = self._switcher(monkeypatch)
+        assert s._identity_move_is_not_a_login(None, None) is False
+        import inspect
+        params = list(inspect.signature(
+            s._identity_move_is_not_a_login).parameters.values())
+        assert len(params) == 2
+        assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+                   for p in params), [str(p) for p in params]
+        assert all(p.default is inspect.Parameter.empty for p in params)
