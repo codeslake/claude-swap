@@ -3037,6 +3037,41 @@ class ClaudeAccountSwitcher:
         )
 
 
+    def _reject_credential_drift_since_verify(self, verified: str) -> None:
+        """Refuse when the credential store rotated during the ownership check.
+
+        The identity guard sees a ``/login`` because that moves
+        ``oauthAccount``. A plain refresh of the SAME account does not: the
+        identity is unchanged and only the credential moved. Storing the
+        pre-refresh bytes hands the slot a generation the server has already
+        retired, so the slot's next refresh gets ``invalid_grant``.
+
+        ``credential_fingerprint`` is LINEAGE identity -- it hashes the refresh
+        token, so an access-token-only rotation compares equal on purpose. A
+        difference therefore means the lineage advanced, not merely that bytes
+        changed.
+
+        Unreadable is UNVERIFIABLE, not a refusal: this can only ever add a
+        refusal, and a store that cannot be re-read is the fail-open case the
+        ownership guard already treats that way.
+        """
+        try:
+            now = self._read_capture_credentials()
+        except Exception:  # noqa: BLE001 -- unreadable is unverifiable
+            return
+        if not now:
+            return
+        before = oauth.credential_fingerprint(verified)
+        after = oauth.credential_fingerprint(now)
+        if before is None or after is None or before == after:
+            return
+        raise ConfigError(
+            "The stored credential rotated while it was being verified. "
+            "Nothing was changed. Registering the pre-rotation generation "
+            "would hand the slot a credential the server has already "
+            "retired. Re-run when no refresh is in flight."
+        )
+
     def _reject_foreign_credential_capture(
         self, creds: str, email: str, org_uuid: str, account_uuid: str
     ) -> str:
@@ -3408,6 +3443,7 @@ class ClaudeAccountSwitcher:
                 current_creds, current_email, current_org_uuid,
                 current_account_uuid,
             )
+            self._reject_credential_drift_since_verify(current_creds)
             # THE TRIPLE THAT WAS READ, never a rebuild from the unpacked
             # names. A sibling change overwrites two of them with an un-spliced
             # email and org while leaving the third literal, and the mix
@@ -3527,6 +3563,7 @@ class ClaudeAccountSwitcher:
         current_creds = self._reject_foreign_credential_capture(
             current_creds, current_email, current_org_uuid, current_account_uuid
         )
+        self._reject_credential_drift_since_verify(current_creds)
 
         config_path = self._get_claude_config_path()
         try:

@@ -543,6 +543,45 @@ def test_a_login_landing_during_the_guards_network_window_is_refused(
     assert "7" not in s._get_sequence_data().get("accounts", {})
 
 
+def test_a_refresh_landing_in_the_guards_window_is_refused(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """The credential verified must be the credential stored.
+
+    A `/login` moves `oauthAccount`, so the identity guard sees it. A plain
+    refresh of the SAME account does not: the identity is unchanged and only
+    the credential moved. Storing the pre-refresh bytes hands the slot a
+    generation the server has already retired, so the slot's next refresh gets
+    `invalid_grant` -- the failure this PR's own refusal path exists to avoid.
+
+    A config snapshot cannot see this; only the credential's own fingerprint
+    can.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+
+    def creds(tag):
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-" + tag,
+            "refreshToken": "sk-ant-ort01-" + tag,
+            "expiresAt": 9999999999999}})
+
+    live = {"v": creds("OLD")}
+
+    def rotates_during_lookup(token):
+        live["v"] = creds("NEW")
+        return {"uuid": "u-ax", "email": "ax@example.com",
+                "organizationUuid": ""}
+
+    with patch.object(s, "_read_capture_credentials",
+                      side_effect=lambda *a, **k: live["v"]), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               side_effect=rotates_during_lookup):
+        with pytest.raises((ConfigError, ValidationError)):
+            s.add_account(slot=7, assume_yes=True)
+
+    assert "7" not in s._get_sequence_data().get("accounts", {})
+
+
 def test_a_matching_uuid_does_not_excuse_a_different_org(
     temp_home: Path, mock_claude_config: Path,
 ):
