@@ -7536,7 +7536,8 @@ class TestTheCertdirPathHasOneSpelling:
         # again.
         from claude_swap import pin as _owner
 
-        src = Path(inspect.getsourcefile(_owner._certdir)).read_text()
+        src = Path(inspect.getsourcefile(_owner._certdir)).read_text(
+            encoding="utf-8")
         tree = ast.parse(src)
         # STRING CONSTANTS IN THE AST, not lines matching a phrase. The first
         # version grepped for the literal and caught `_certdir`'s own docstring
@@ -10153,8 +10154,93 @@ class TestTheSeamIsSubstitutableForAnUpstreamStub:
 
         from claude_swap import switcher as _sw
 
-        src = pathlib.Path(_sw.__file__).read_text()
+        src = pathlib.Path(_sw.__file__).read_text(encoding="utf-8")
         assert "def _identity_move_is_not_a_login" not in src, (
             "switcher.py defines this name again — a second def in the same "
             "class is a redefinition, not an overlay, and which body survives "
             "depends on the order two branches merge")
+
+
+class TestASourceFileIsReadAsUTF8:
+    """A source file's encoding is UTF-8 by definition (PEP 3120), so the
+    platform default is never the right answer for reading one.
+
+    This file already explains the trap at length — the port lint reads every
+    test in the tree and had to learn it the hard way — but the knowledge sat
+    in a comment and nothing enforced it. A case added later read
+    `switcher.py` with `read_text()`, was green on linux and both macs, and
+    could only ever be red on the Windows runner, where the default is cp1252
+    and the file carries a byte it has no mapping for:
+
+        UnicodeDecodeError: 'charmap' codec can't decode byte 0x8f
+        C:\\...\\Lib\\encodings\\cp1252.py:23
+
+    One job red, four green, and the assertion itself was correct — it simply
+    could not read its own subject there. A property described in prose is not
+    a property the tree has.
+
+    SCOPED TO SOURCE READS. A test reading JSON it wrote itself is ASCII by
+    construction and unaffected; flagging those would be 200 lines of noise
+    for no defect. The discriminator is what the expression names —
+    `__file__`, `getsourcefile`, `getsource`, or a `.py` path.
+    """
+
+    def test_no_test_reads_a_source_file_with_the_platform_default(self):
+        import ast
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent
+        srcish = ("__file__", "getsourcefile", "getsource", ".py")
+        offenders = []
+        for path in sorted(root.glob("*.py")) + [root / "conftest.py"]:
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "read_text"):
+                    continue
+                if any(k.arg == "encoding" for k in node.keywords):
+                    continue
+                seg = ast.get_source_segment(text, node) or ""
+                line = text.splitlines()[node.lineno - 1]
+                # THE LINT'S OWN LITERALS, which it must contain to look for
+                # them. Scoped to this file, so a same-named helper elsewhere
+                # cannot borrow the exemption.
+                if path.resolve() == pathlib.Path(__file__).resolve() and \
+                        "srcish" in line:
+                    continue
+                if any(m in seg or m in line for m in srcish):
+                    offenders.append(f"{path.name}:{node.lineno}: {line.strip()}")
+        assert not offenders, (
+            "a source file read with the platform default encoding — green "
+            "here, red on the Windows runner where it is cp1252:\n  "
+            + "\n  ".join(offenders))
+
+    def test_CONTROL_the_lint_sees_a_planted_offender(self):
+        """Without this the case above passes on a walk that matches nothing —
+        the failure mode every lint in this file has had at least once."""
+        import ast
+
+        planted = 'src = pathlib.Path(__file__).read_text()\n'
+        tree = ast.parse(planted)
+        found = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "read_text"
+                 and not any(k.arg == "encoding" for k in n.keywords)]
+        assert len(found) == 1, "the walk cannot see an offender at all"
+
+    def test_CONTROL_an_explicit_encoding_is_not_flagged(self):
+        import ast
+
+        clean = 'src = pathlib.Path(__file__).read_text(encoding="utf-8")\n'
+        tree = ast.parse(clean)
+        flagged = [n for n in ast.walk(tree)
+                   if isinstance(n, ast.Call)
+                   and isinstance(n.func, ast.Attribute)
+                   and n.func.attr == "read_text"
+                   and not any(k.arg == "encoding" for k in n.keywords)]
+        assert not flagged, "the lint would flag a correct read"
