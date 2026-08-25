@@ -3030,40 +3030,24 @@ class ClaudeAccountSwitcher:
         now = self._get_current_identity_triple()
         if now == verified:
             return
-        if self._identity_move_is_not_a_login(verified, now):
-            return
+        # THE PIN GIVES THIS FIELD A SECOND WRITER, so a move is not always a
+        # login. The discriminator lives in the pin package and the name exists
+        # nowhere else: a method here plus a function there is one name in two
+        # places, and a method here plus a method there is a redefinition git
+        # merges without a conflict.
+        try:
+            from claude_swap import pin as _pin
+
+            if _pin.identity_move_is_not_a_login(self, verified, now) is True:
+                return
+        except Exception:  # noqa: BLE001 -- an optional extra cannot break this
+            pass
         raise ConfigError(
             f"The active account changed while {verified[0]} was being "
             f"verified (now {(now[0] if now else '') or 'unknown'}). Nothing "
             f"was changed. Re-run when no other login is in flight."
         )
 
-    def _identity_move_is_not_a_login(
-        self, before: tuple[str, str, str] | None, now: tuple[str, str, str] | None
-    ) -> bool:
-        """Whether an identity change since verify was something OTHER than a login.
-
-        With nothing but ``/login`` writing ``oauthAccount``, a change to it IS a
-        login and the refusal above is correct. The pin gives the field a SECOND
-        writer, so the discriminator belongs to the pin package and this only
-        consults it.
-
-        Delegation and not a body here: a second ``def`` of this name on the
-        switcher is a redefinition rather than an overlay, and which body
-        survives depends on merge order.
-
-        False whenever it cannot tell — an absent pin package, an older one
-        without the function, or one that raises. This answer only ever
-        SUPPRESSES a refusal and a refusal writes nothing, so unknown has to
-        keep refusing.
-        """
-        try:
-            from claude_swap import pin as _pin
-
-            answer = _pin.identity_move_is_not_a_login(self, before, now)
-        except Exception:  # noqa: BLE001 — an optional extra cannot break this
-            return False
-        return answer is True
 
     def _reject_foreign_credential_capture(
         self, creds: str, email: str, org_uuid: str, account_uuid: str

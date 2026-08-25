@@ -647,127 +647,93 @@ def test_the_refresh_in_place_path_also_refuses_a_login_in_the_window(
 # from this side; the overlay pins its own.
 
 
-def test_the_drift_guard_consults_the_overlay_seam(
-    temp_home: Path, mock_claude_config: Path
-):
-    """The CALL must exist, not just the method.
+def _fake_pin(monkeypatch, answer=None, *, attr=True, raises=False):
+    """Stand in for the pin package, which this repo does not ship.
 
-    Without this, deleting the call site leaves the suite green: the default
-    answer is False, so a guard that never asks behaves identically to one
-    that asks and is told no.
-    """
-    s = _switcher(temp_home, mock_claude_config, "a@e.com")
-    verified = ("someone-else@e.com", "", "")
-    asked = []
-
-    def overlay(before, now):
-        asked.append((before, now))
-        return True
-
-    with patch.object(s, "_identity_move_is_not_a_login", overlay):
-        s._reject_identity_drift_since_verify(verified)   # must NOT raise
-
-    assert asked, "the guard never consulted the seam"
-    assert asked[0][0] == verified, "the seam was not given the verified sample"
-
-
-def test_the_default_answer_leaves_the_refusal_intact(
-    temp_home: Path, mock_claude_config: Path
-):
-    """False is the shipped answer and it must keep the guard refusing.
-
-    The other arm of the test above: with the real stub in place, the same
-    drift still raises. A seam that suppressed by default would silently
-    disable the guard for everyone.
-    """
-    s = _switcher(temp_home, mock_claude_config, "a@e.com")
-    assert s._identity_move_is_not_a_login(("x@e.com", "", ""), ("y@e.com", "", "")) is False
-    with pytest.raises(ConfigError, match="Re-run when no other login"):
-        s._reject_identity_drift_since_verify(("someone-else@e.com", "", ""))
-
-
-def test_the_seam_is_substitutable_by_signature(
-    temp_home: Path, mock_claude_config: Path
-):
-    """An overlay replaces this method, so the call site must not depend on a
-    shape only one of them has. Fails on a keyword-only parameter, a rename to
-    a default, or a third argument — the ways a substitution actually breaks.
-
-    Both samples may be None: `_get_current_identity_triple` returns None for a
-    missing, unreadable, or email-less config, and the guard passes both
-    through without looking.
-    """
-    import inspect
-
-    s = _switcher(temp_home, mock_claude_config, "a@e.com")
-    sig = inspect.signature(s._identity_move_is_not_a_login)
-    params = list(sig.parameters.values())
-    assert [p.name for p in params] == ["before", "now"]
-    assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
-    assert all(p.default is inspect.Parameter.empty for p in params)
-    for pair in ((None, None), (("a@e.com", "", ""), None), (None, ("a@e.com", "", ""))):
-        assert s._identity_move_is_not_a_login(*pair) is False
-
-
-def test_the_seam_delegates_to_the_pin_overlay_when_it_exists(
-    temp_home: Path, mock_claude_config: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """The seam must CONSULT the pin package, not carry a body of its own.
-
-    A second `def` of this name on the switcher is a redefinition, not an
-    overlay: both sides merge clean, Python keeps the last one, and which body
-    survives depends on merge order. So the discriminator lives in
-    `claude_swap.pin` and this method delegates to it.
-
-    Fails against a stub that returns False unconditionally, which is what the
-    delegation replaced.
+    The seam is a module function and not a method, so a test cannot patch it
+    onto the switcher -- it has to arrive the way the real one does, through
+    ``claude_swap.pin``.
     """
     import sys
     import types
 
     seen: list[tuple] = []
-
-    fake = types.ModuleType("claude_swap.pin")
-
-    def identity_move_is_not_a_login(switcher, before, now):
-        seen.append((switcher, before, now))
-        return True
-
-    fake.identity_move_is_not_a_login = identity_move_is_not_a_login
-    monkeypatch.setitem(sys.modules, "claude_swap.pin", fake)
-
-    s = _switcher(temp_home, mock_claude_config, "a@e.com")
-    before, now = ("x@e.com", "", ""), ("y@e.com", "", "")
-    assert s._identity_move_is_not_a_login(before, now) is True
-    assert seen == [(s, before, now)], "the switcher goes through as the first positional"
+    mod = types.ModuleType("claude_swap.pin")
+    if attr:
+        def identity_move_is_not_a_login(switcher, before, now):
+            seen.append((switcher, before, now))
+            if raises:
+                raise RuntimeError("the keychain declined this process")
+            return answer
+        mod.identity_move_is_not_a_login = identity_move_is_not_a_login
+    monkeypatch.setitem(sys.modules, "claude_swap.pin", mod)
+    return seen
 
 
-def test_the_seam_is_false_when_the_pin_package_cannot_answer(
+def test_the_drift_guard_consults_the_pin_package(
     temp_home: Path, mock_claude_config: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Unknown keeps refusing, in every way the overlay can be unavailable.
+    """A True from the pin package suppresses the refusal, and the call shape
+    is part of the contract: positional, switcher first.
+
+    Under a pin the field has a SECOND writer -- the switch splices the pinned
+    identity in and the daemon's carry writes the account now signed in -- so
+    it moves with nobody logging in. Refusing there blocks the `/login` +
+    `cswap add` repair the refusal is standing in front of.
+    """
+    seen = _fake_pin(monkeypatch, answer=True)
+    s = _switcher(temp_home, mock_claude_config, "a@e.com")
+    verified = ("someone-else@e.com", "", "")
+    s._reject_identity_drift_since_verify(verified)
+    assert len(seen) == 1, "the guard did not consult the pin package"
+    assert seen[0][0] is s, "the switcher must arrive as the first positional"
+    assert seen[0][1] == verified
+
+
+def test_the_refusal_stands_in_every_way_the_pin_cannot_answer(
+    temp_home: Path, mock_claude_config: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Unknown keeps refusing.
 
     This answer only ever SUPPRESSES a refusal and a refusal writes nothing, so
-    an absent module, an older one without the function, and one that raises
-    must all read as False rather than as permission.
+    an absent package, one without the function, one that raises, and one that
+    answers anything but True all have to leave the guard raising. The absent
+    case is the only path that runs upstream, where there is no pin package at
+    all.
     """
     import sys
-    import types
 
     s = _switcher(temp_home, mock_claude_config, "a@e.com")
-    pair = (("x@e.com", "", ""), ("y@e.com", "", ""))
+    verified = ("someone-else@e.com", "", "")
 
     monkeypatch.setitem(sys.modules, "claude_swap.pin", None)
-    assert s._identity_move_is_not_a_login(*pair) is False, "no pin package"
+    with pytest.raises(ConfigError, match="Re-run when no other login"):
+        s._reject_identity_drift_since_verify(verified)
 
-    older = types.ModuleType("claude_swap.pin")
-    monkeypatch.setitem(sys.modules, "claude_swap.pin", older)
-    assert s._identity_move_is_not_a_login(*pair) is False, "pin without the function"
+    for kwargs in ({"attr": False}, {"raises": True}, {"answer": False},
+                   {"answer": "yes"}):
+        _fake_pin(monkeypatch, **kwargs)
+        with pytest.raises(ConfigError, match="Re-run when no other login"):
+            s._reject_identity_drift_since_verify(verified)
 
-    def boom(switcher, before, now):
-        raise RuntimeError("the keychain declined this process")
 
-    angry = types.ModuleType("claude_swap.pin")
-    angry.identity_move_is_not_a_login = boom
-    monkeypatch.setitem(sys.modules, "claude_swap.pin", angry)
-    assert s._identity_move_is_not_a_login(*pair) is False, "pin that raises"
+def test_the_switcher_defines_no_body_for_the_seam(
+    temp_home: Path, mock_claude_config: Path
+):
+    """The property that actually prevents the collision, asserted by NAME.
+
+    A `def` here and a `def` on the branch that supplies the discriminator are
+    two definitions of one name in one class: the merge base has neither, so
+    git takes both without a conflict and Python keeps the last one. Each
+    branch is green alone and the pair is not.
+
+    A signature contract does not catch it -- `inspect.signature` reads
+    whichever body won, so it stays green while the wrong one is winning.
+    """
+    import pathlib
+
+    from claude_swap import switcher as _sw
+
+    src = pathlib.Path(_sw.__file__).read_text(encoding="utf-8")
+    assert "def identity_move_is_not_a_login" not in src
+    assert "def _identity_move_is_not_a_login" not in src
