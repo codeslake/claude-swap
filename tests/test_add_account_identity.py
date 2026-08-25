@@ -737,3 +737,45 @@ def test_the_switcher_defines_no_body_for_the_seam(
     src = pathlib.Path(_sw.__file__).read_text(encoding="utf-8")
     assert "def identity_move_is_not_a_login" not in src
     assert "def _identity_move_is_not_a_login" not in src
+
+
+def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
+    temp_home: Path, mock_claude_config: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Identity, not equality, and the distinction is the whole point.
+
+    The caller unpacks the config triple into three names and a sibling change
+    overwrites two of them with an un-spliced email and org while leaving the
+    third literal. Rebuilding the tuple from those names then hands this guard
+    a mix describing no real account -- one account's address with another's
+    uuid -- which cannot match a fresh read, so the guard refuses every time
+    rather than only on a race.
+
+    A rebuilt tuple can still compare EQUAL here, so `==` would pass against
+    the defect. `is` does not.
+    """
+    s = _switcher(temp_home, mock_claude_config, "a@e.com")
+    read = s._get_current_identity_triple()
+    assert read is not None, "fixture must produce a readable identity"
+
+    got: list = []
+    monkeypatch.setattr(
+        type(s), "_reject_identity_drift_since_verify",
+        lambda self, verified: got.append(verified),
+    )
+    monkeypatch.setattr(type(s), "_get_current_identity_triple", lambda self: read)
+    with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": read[2], "email": read[0],
+                             "organizationUuid": read[1]}):
+        try:
+            s.add_account(slot=7, assume_yes=True)
+        except Exception:
+            pass
+
+    assert got, "the guard was never called"
+    assert got[0] is read, (
+        "the guard was handed a REBUILT tuple; it must receive the object "
+        "_get_current_identity_triple returned, or a sibling change that "
+        "overwrites one of the unpacked names silently poisons it"
+    )

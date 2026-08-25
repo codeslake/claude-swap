@@ -3420,8 +3420,13 @@ class ClaudeAccountSwitcher:
                 current_creds, current_email, current_org_uuid,
                 current_account_uuid,
             )
-            self._reject_identity_drift_since_verify(
-                (current_email, current_org_uuid, current_account_uuid))
+            # THE TRIPLE THAT WAS READ, never a rebuild from the unpacked
+            # names. A sibling change overwrites two of them with an un-spliced
+            # email and org while leaving the third literal, and the mix
+            # describes no real account -- so the guard would compare it against
+            # a fresh read, never match, and refuse every time instead of only
+            # on a race.
+            self._reject_identity_drift_since_verify(identity)
 
             config_path = self._get_claude_config_path()
             try:
@@ -3550,8 +3555,7 @@ class ClaudeAccountSwitcher:
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
         organization_name = oauth_data.get("organizationName", "") or ""
 
-        self._reject_identity_drift_since_verify(
-            (current_email, current_org_uuid, current_account_uuid))
+        self._reject_identity_drift_since_verify(identity)
 
         # Now safe to perform destructive cleanup (new account data is in memory)
         if displace_slot:
