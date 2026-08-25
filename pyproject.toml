@@ -107,6 +107,15 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# A THREAD THAT DIES ON AN EXCEPTION FAILS THE RUN. Unhandled, it is only a
+# warning, and a warning in a list of ~50 is read by nobody: one sat on every
+# run for as long as anyone had looked, EBADF here and WinError 10038 on the
+# Windows job, from a fixture's accept loop meeting its own closed listener.
+# The fix is a `try/except OSError` at the exit condition; this is what makes
+# the next one fail instead of joining the list.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
 # Parallel by default. The suite is ~1900 tests of mostly-idle work (file
 # locks, subprocess fakes, Textual pilots), so wall clock was dominated by
 # doing them one at a time, not by any single slow test: 25 ms/test spread

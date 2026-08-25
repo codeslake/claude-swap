@@ -4014,10 +4014,21 @@ class TestHealADeadPin:
                 srv.bind(("127.0.0.1", port))
                 srv.listen(8)
                 revived["srv"] = srv
-                threading.Thread(
-                    target=lambda: [srv.accept()[0].close() for _ in iter(int, 1)],
-                    daemon=True,
-                ).start()
+                def _accept_until_closed():
+                    # CLOSING THE LISTENER IS HOW THIS ENDS, so the OSError
+                    # that raises is the exit condition and not a failure.
+                    # Unhandled, it surfaced as a
+                    # PytestUnhandledThreadExceptionWarning on every run —
+                    # EBADF here, WinError 10038 on the Windows runner — in a
+                    # suite whose warning list is meant to be read.
+                    try:
+                        while True:
+                            srv.accept()[0].close()
+                    except OSError:
+                        pass
+
+                threading.Thread(target=_accept_until_closed,
+                                 daemon=True).start()
                 return True
 
         monkeypatch.setattr(pin, "_live_impl", lambda: _I())
