@@ -3030,18 +3030,6 @@ class ClaudeAccountSwitcher:
         now = self._get_current_identity_triple()
         if now == verified:
             return
-        # THE PIN GIVES THIS FIELD A SECOND WRITER, so a move is not always a
-        # login. The discriminator lives in the pin package and the name exists
-        # nowhere else: a method here plus a function there is one name in two
-        # places, and a method here plus a method there is a redefinition git
-        # merges without a conflict.
-        try:
-            from claude_swap import pin as _pin
-
-            if _pin.identity_move_is_not_a_login(self, verified, now) is True:
-                return
-        except Exception:  # noqa: BLE001 -- an optional extra cannot break this
-            pass
         raise ConfigError(
             f"The active account changed while {verified[0]} was being "
             f"verified (now {(now[0] if now else '') or 'unknown'}). Nothing "
