@@ -707,3 +707,67 @@ def test_the_seam_is_substitutable_by_signature(
     assert all(p.default is inspect.Parameter.empty for p in params)
     for pair in ((None, None), (("a@e.com", "", ""), None), (None, ("a@e.com", "", ""))):
         assert s._identity_move_is_not_a_login(*pair) is False
+
+
+def test_the_seam_delegates_to_the_pin_overlay_when_it_exists(
+    temp_home: Path, mock_claude_config: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The seam must CONSULT the pin package, not carry a body of its own.
+
+    A second `def` of this name on the switcher is a redefinition, not an
+    overlay: both sides merge clean, Python keeps the last one, and which body
+    survives depends on merge order. So the discriminator lives in
+    `claude_swap.pin` and this method delegates to it.
+
+    Fails against a stub that returns False unconditionally, which is what the
+    delegation replaced.
+    """
+    import sys
+    import types
+
+    seen: list[tuple] = []
+
+    fake = types.ModuleType("claude_swap.pin")
+
+    def identity_move_is_not_a_login(switcher, before, now):
+        seen.append((switcher, before, now))
+        return True
+
+    fake.identity_move_is_not_a_login = identity_move_is_not_a_login
+    monkeypatch.setitem(sys.modules, "claude_swap.pin", fake)
+
+    s = _switcher(temp_home, mock_claude_config, "a@e.com")
+    before, now = ("x@e.com", "", ""), ("y@e.com", "", "")
+    assert s._identity_move_is_not_a_login(before, now) is True
+    assert seen == [(s, before, now)], "the switcher goes through as the first positional"
+
+
+def test_the_seam_is_false_when_the_pin_package_cannot_answer(
+    temp_home: Path, mock_claude_config: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Unknown keeps refusing, in every way the overlay can be unavailable.
+
+    This answer only ever SUPPRESSES a refusal and a refusal writes nothing, so
+    an absent module, an older one without the function, and one that raises
+    must all read as False rather than as permission.
+    """
+    import sys
+    import types
+
+    s = _switcher(temp_home, mock_claude_config, "a@e.com")
+    pair = (("x@e.com", "", ""), ("y@e.com", "", ""))
+
+    monkeypatch.setitem(sys.modules, "claude_swap.pin", None)
+    assert s._identity_move_is_not_a_login(*pair) is False, "no pin package"
+
+    older = types.ModuleType("claude_swap.pin")
+    monkeypatch.setitem(sys.modules, "claude_swap.pin", older)
+    assert s._identity_move_is_not_a_login(*pair) is False, "pin without the function"
+
+    def boom(switcher, before, now):
+        raise RuntimeError("the keychain declined this process")
+
+    angry = types.ModuleType("claude_swap.pin")
+    angry.identity_move_is_not_a_login = boom
+    monkeypatch.setitem(sys.modules, "claude_swap.pin", angry)
+    assert s._identity_move_is_not_a_login(*pair) is False, "pin that raises"

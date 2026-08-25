@@ -3043,22 +3043,27 @@ class ClaudeAccountSwitcher:
     ) -> bool:
         """Whether an identity change since verify was something OTHER than a login.
 
-        False here, and the default is the point rather than a placeholder.
-        With nothing but ``/login`` writing ``oauthAccount``, a change to it IS
-        a login and the refusal above is correct — so this must not suppress it.
+        With nothing but ``/login`` writing ``oauthAccount``, a change to it IS a
+        login and the refusal above is correct. The pin gives the field a SECOND
+        writer, so the discriminator belongs to the pin package and this only
+        consults it.
 
-        An overlay that knows of a SECOND writer replaces this. It answers True
-        only when it can positively identify the other writer, and False
-        whenever it cannot tell, because this answer only ever suppresses a
-        refusal and a refusal writes nothing: unknown has to keep refusing.
+        Delegation and not a body here: a second ``def`` of this name on the
+        switcher is a redefinition rather than an overlay, and which body
+        survives depends on merge order.
 
-        Substitutable by contract, not by convention: positional ``(before,
-        now)``, either sample may be None (``_get_current_identity_triple``
-        returns None for a missing, unreadable, or email-less config and this
-        guard passes both through unlooked-at), and no store read on a pair the
-        overlay cannot be about.
+        False whenever it cannot tell — an absent pin package, an older one
+        without the function, or one that raises. This answer only ever
+        SUPPRESSES a refusal and a refusal writes nothing, so unknown has to
+        keep refusing.
         """
-        return False
+        try:
+            from claude_swap import pin as _pin
+
+            answer = _pin.identity_move_is_not_a_login(self, before, now)
+        except Exception:  # noqa: BLE001 — an optional extra cannot break this
+            return False
+        return answer is True
 
     def _reject_foreign_credential_capture(
         self, creds: str, email: str, org_uuid: str, account_uuid: str
