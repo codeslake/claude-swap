@@ -7048,8 +7048,40 @@ class TestLiveLock:
             },
         ):
             outcome = second.tick()
-        assert outcome is TickOutcome.SWITCHED     # it *decided* to switch
-        assert harness.active_number() == 1        # but changed nothing
+        # NO_ACTION, not SWITCHED. `cli.py` documents 0 as "switched to
+        # another account" and this process switched nothing — the engine
+        # holding the LIVE lock is the one that will. Reporting 0 to a cron
+        # wrapper is a lie about the active account. The event still carries
+        # dry_run so the decision itself stays visible.
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1        # changed nothing
+        assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
+
+    def test_a_user_requested_dry_run_still_reports_switched(self, harness):
+        """The other arm, which the demoted assertion must not take with it.
+
+        `--dry-run` is a question: "what would you do?". SWITCHED answers it,
+        and that is the contract this engine had before demotion started
+        borrowing the same flag.
+        """
+        engine = harness.engine
+        engine.dry_run = True
+        assert engine.demoted_from_live is False, (
+            "premise: this engine is dry-run BY REQUEST, not by demotion"
+        )
+        events: list = []
+        engine.on_event = events.append
+        with patch.object(
+            harness.switcher,
+            "usage_entries_by_account",
+            return_value={
+                num: _entry_for(value, harness.clock.now)
+                for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+            },
+        ):
+            outcome = engine.tick()
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 1
         assert any(e.dry_run for e in events if isinstance(e, SwitchEvent))
 
     def test_stop_is_idempotent_and_reentrant(self, harness):
@@ -7704,6 +7736,78 @@ class TestLiveLock:
             f"stop() held the UI thread {blocked:.2f}s while the worker was "
             "waiting on that same thread to run its callback — the dashboard "
             "is frozen for the whole ceiling"
+        )
+
+    def test_stop_rereads_the_emit_gate_it_checked_before_waiting(
+        self, harness
+    ):
+        """The sibling above waits for the emit BEFORE calling `stop()`, so it
+        only ever drives the state the one-shot check already handled.
+
+        The uncovered case is the ordinary one: `stop()` arrives while the
+        worker is mid-tick and NOT yet emitting — inside a usage fetch, say.
+        The gate reads clear, the wait is entered, and only then does the
+        worker reach `_emit` and park on this thread. From that moment the
+        wait cannot be satisfied by anything, because the thread the worker
+        needs is the one sitting in it. A single read of the gate cannot see
+        that; the wait has to re-read it.
+
+        `_stop.set()` is the first statement of `stop()` and `_emit` has no
+        stop gate by design, so an emit after the check is guaranteed on every
+        path rather than being a narrow race.
+        """
+        import threading
+        import time
+
+        engine = harness.engine
+        in_tick = threading.Event()
+        release_worker = threading.Event()
+        ui_ran_callback = threading.Event()
+
+        def emit_blocks_until_ui_runs_it(event):
+            ui_ran_callback.wait(10.0)
+
+        engine.on_event = emit_blocks_until_ui_runs_it
+
+        def parked_usage(*_a, **_kw):
+            # The tick is underway and has emitted nothing yet.
+            in_tick.set()
+            release_worker.wait(10.0)
+            return {
+                num: _entry_for(value, harness.clock.now)
+                for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+            }
+
+        def worker():
+            with patch.object(
+                harness.switcher, "usage_entries_by_account", parked_usage
+            ):
+                engine.tick()
+
+        w = threading.Thread(target=worker, daemon=True)
+        w.start()
+        assert in_tick.wait(10.0), "premise: the worker reached the tick body"
+        assert not engine._emit_in_flight.is_set(), (
+            "premise: nothing has emitted yet, so the gate reads clear"
+        )
+        assert engine._tick_thread_id not in (None, threading.get_ident()), (
+            "premise: the tick is on the OTHER thread, so own_tick is False"
+        )
+
+        # Let the worker reach its emit only AFTER stop() is already waiting.
+        threading.Timer(0.3, release_worker.set).start()
+
+        t0 = time.monotonic()
+        engine.stop()
+        blocked = time.monotonic() - t0
+
+        ui_ran_callback.set()
+        w.join(10.0)
+
+        assert blocked < 5.0, (
+            f"stop() held the UI thread {blocked:.2f}s. The gate was clear "
+            "when it was read and set a moment later, so a one-shot check "
+            "commits the dashboard to the whole ceiling"
         )
 
     def test_stop_does_not_wait_on_a_tick_that_is_waiting_on_it(

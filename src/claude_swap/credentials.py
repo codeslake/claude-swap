@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -318,7 +319,14 @@ class CredentialStore:
         # Keychain. The two credential axes fail asymmetrically — an API-key
         # account has no OAuth item to deny, so the OAuth flag cannot stand in
         # for this one. Cleared at the top of each active read.
-        self._managed_read_failed: bool = False
+        # PER THREAD. The TUI's two refresh lanes, the auto engine's worker
+        # and the fetch pool share one store, and this verdict lives across
+        # several statements inside one read. As a plain attribute a sibling
+        # entering `_read_active_credentials` reset it mid-flight, and the
+        # first reader then returned ('', False, False) — a live, billing
+        # managed key reported as a genuinely empty slot, which is the exact
+        # lie this flag was added to stop.
+        self._managed_read_tls = threading.local()
         # Whether any Keychain op has actually FAILED this process. Distinct
         # from _keychain_usable_cache, which is where ops should be ROUTED and
         # which _pin_file_mode sets deliberately: a routing choice must not
@@ -656,6 +664,14 @@ class CredentialStore:
         # key reading as a genuinely empty slot.
         unreachable = keychain_failed or self._managed_read_failed
         return ActiveCredentials("", unreachable, unreachable)
+
+    @property
+    def _managed_read_failed(self) -> bool:
+        return getattr(self._managed_read_tls, "failed", False)
+
+    @_managed_read_failed.setter
+    def _managed_read_failed(self, value: bool) -> None:
+        self._managed_read_tls.failed = value
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.

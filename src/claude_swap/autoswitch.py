@@ -249,6 +249,10 @@ def _recovery_is_useful(
 # network time, not just the filesystem. Blocking the TUI's toggle forever is
 # still worse than the race, hence a ceiling rather than an unbounded wait.
 _STOP_SWITCH_WAIT_S = 30.0
+# How long the UI thread may be committed to the wait before it re-reads the
+# emit gate. Small enough that a toggle landing mid-emit is imperceptible,
+# large enough that the loop is not a spin.
+_STOP_WAIT_SLICE_S = 0.05
 
 
 class _EngineStopped(Exception):
@@ -2492,7 +2496,18 @@ class AutoSwitchEngine:
                     dry_run=True,
                 )
             )
-            return TickOutcome.SWITCHED
+            # DEMOTED IS NOT DRY-RUN. `__init__` sets `dry_run` when another
+            # engine holds the LIVE lock, which collapses "the user asked to
+            # see what would happen" onto "this process is not the one that
+            # acts" — the same conflation the `_stop` comment above records.
+            # A demoted `--once` returning 0 tells a cron wrapper it switched
+            # to another account, per cli.py's documented contract, when the
+            # active account is untouched. It took no action; say so.
+            return (
+                TickOutcome.NO_ACTION
+                if self.demoted_from_live
+                else TickOutcome.SWITCHED
+            )
 
         # Hold the state lock across the whole recheck -> switch -> record
         # sequence so two concurrent engines (loop + cron --once) make one
@@ -2833,10 +2848,23 @@ class AutoSwitchEngine:
             # circular wait `own_tick` closes for SIGTERM, one thread over.
             # The emit gate above stops the next one, but the worker already
             # inside a callback got past it.
+            # SLICED, because the emit gate has to be re-read. Testing it once
+            # and then blocking for the ceiling is a check-then-act: a worker
+            # that enters `on_event` AFTER the check parks on this very thread,
+            # and from then on the wait cannot be satisfied — we are holding
+            # the thread it needs. The one-shot form covered only the case
+            # where the worker was already emitting when stop() arrived.
+            finished = own_tick or self._tick_in_flight.is_set()
+            if not own_tick:
+                deadline = time.monotonic() + _STOP_SWITCH_WAIT_S
+                while not finished and not self._emit_in_flight.is_set():
+                    if time.monotonic() >= deadline:
+                        break
+                    finished = self._tick_in_flight.wait(_STOP_WAIT_SLICE_S)
             if (
                 not own_tick
                 and not self._emit_in_flight.is_set()
-                and not self._tick_in_flight.wait(_STOP_SWITCH_WAIT_S)
+                and not finished
             ):
                 # The ceiling is a deliberate trade — blocking a TUI toggle or
                 # a SIGTERM forever is worse than the race — but a silent one
