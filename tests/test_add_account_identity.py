@@ -637,3 +637,73 @@ def test_the_refresh_in_place_path_also_refuses_a_login_in_the_window(
     assert stored["oauthAccount"]["emailAddress"] == "ax@example.com", (
         f"slot 7's stored config now says {stored['oauthAccount']['emailAddress']}"
     )
+
+
+# ---- the overlay seam on the drift guard --------------------------------
+#
+# The guard reads `oauthAccount`, and in a deployment where something OTHER
+# than `/login` writes that field a change to it is not the event the refusal
+# names. The seam lets such a deployment say so. These three pin the contract
+# from this side; the overlay pins its own.
+
+
+def test_the_drift_guard_consults_the_overlay_seam(
+    temp_home: Path, mock_claude_config: Path
+):
+    """The CALL must exist, not just the method.
+
+    Without this, deleting the call site leaves the suite green: the default
+    answer is False, so a guard that never asks behaves identically to one
+    that asks and is told no.
+    """
+    s = _switcher(temp_home, mock_claude_config, "a@e.com")
+    verified = ("someone-else@e.com", "", "")
+    asked = []
+
+    def overlay(before, now):
+        asked.append((before, now))
+        return True
+
+    with patch.object(s, "_identity_move_is_not_a_login", overlay):
+        s._reject_identity_drift_since_verify(verified)   # must NOT raise
+
+    assert asked, "the guard never consulted the seam"
+    assert asked[0][0] == verified, "the seam was not given the verified sample"
+
+
+def test_the_default_answer_leaves_the_refusal_intact(
+    temp_home: Path, mock_claude_config: Path
+):
+    """False is the shipped answer and it must keep the guard refusing.
+
+    The other arm of the test above: with the real stub in place, the same
+    drift still raises. A seam that suppressed by default would silently
+    disable the guard for everyone.
+    """
+    s = _switcher(temp_home, mock_claude_config, "a@e.com")
+    assert s._identity_move_is_not_a_login(("x@e.com", "", ""), ("y@e.com", "", "")) is False
+    with pytest.raises(ConfigError, match="Re-run when no other login"):
+        s._reject_identity_drift_since_verify(("someone-else@e.com", "", ""))
+
+
+def test_the_seam_is_substitutable_by_signature(
+    temp_home: Path, mock_claude_config: Path
+):
+    """An overlay replaces this method, so the call site must not depend on a
+    shape only one of them has. Fails on a keyword-only parameter, a rename to
+    a default, or a third argument — the ways a substitution actually breaks.
+
+    Both samples may be None: `_get_current_identity_triple` returns None for a
+    missing, unreadable, or email-less config, and the guard passes both
+    through without looking.
+    """
+    import inspect
+
+    s = _switcher(temp_home, mock_claude_config, "a@e.com")
+    sig = inspect.signature(s._identity_move_is_not_a_login)
+    params = list(sig.parameters.values())
+    assert [p.name for p in params] == ["before", "now"]
+    assert all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
+    assert all(p.default is inspect.Parameter.empty for p in params)
+    for pair in ((None, None), (("a@e.com", "", ""), None), (None, ("a@e.com", "", ""))):
+        assert s._identity_move_is_not_a_login(*pair) is False

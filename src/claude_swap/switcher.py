@@ -3030,11 +3030,35 @@ class ClaudeAccountSwitcher:
         now = self._get_current_identity_triple()
         if now == verified:
             return
+        if self._identity_move_is_not_a_login(verified, now):
+            return
         raise ConfigError(
             f"The active account changed while {verified[0]} was being "
             f"verified (now {(now[0] if now else '') or 'unknown'}). Nothing "
             f"was changed. Re-run when no other login is in flight."
         )
+
+    def _identity_move_is_not_a_login(
+        self, before: tuple[str, str, str] | None, now: tuple[str, str, str] | None
+    ) -> bool:
+        """Whether an identity change since verify was something OTHER than a login.
+
+        False here, and the default is the point rather than a placeholder.
+        With nothing but ``/login`` writing ``oauthAccount``, a change to it IS
+        a login and the refusal above is correct — so this must not suppress it.
+
+        An overlay that knows of a SECOND writer replaces this. It answers True
+        only when it can positively identify the other writer, and False
+        whenever it cannot tell, because this answer only ever suppresses a
+        refusal and a refusal writes nothing: unknown has to keep refusing.
+
+        Substitutable by contract, not by convention: positional ``(before,
+        now)``, either sample may be None (``_get_current_identity_triple``
+        returns None for a missing, unreadable, or email-less config and this
+        guard passes both through unlooked-at), and no store read on a pair the
+        overlay cannot be about.
+        """
+        return False
 
     def _reject_foreign_credential_capture(
         self, creds: str, email: str, org_uuid: str, account_uuid: str
