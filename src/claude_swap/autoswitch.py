@@ -909,12 +909,13 @@ class AutoSwitchEngine:
         WHY THE ENGINE OWNS THIS. cswap-pin implements the repair and has
         exactly one caller — `_sweep_bridges_after_connect` — so it fires only
         when a `POST /v1/code/sessions` REACHES the proxy. The repair is
-        triggered by the very thing it exists to survive. Measured 2026-08-17:
-        all 24 claude processes carried `HTTPS_PROXY=127.0.0.1:9901` (the cache
-        proxy) because Claude Code reads `~/.claude.json`'s env block once at
-        boot and the pin wiring landed after they had exec'd. Nothing reached
-        the proxy, nothing was restored, and a session sat under a
-        server-invented title until it was renamed by hand.
+        triggered by the very thing it exists to survive. Measured on a
+        machine where every live claude process carried an `HTTPS_PROXY` from
+        BEFORE the pin was wired -- Claude Code reads `~/.claude.json`'s env
+        block once at boot, so a process that exec'd earlier keeps whatever
+        the block said then. Nothing reached the proxy, nothing was restored,
+        and a session sat under a server-invented title until it was renamed
+        by hand.
 
         This engine has none of that coupling: it runs on a timer, it is the
         thing that rotates accounts — so it is present at the moment bridges

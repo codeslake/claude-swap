@@ -1023,12 +1023,12 @@ def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
     WHY THIS EXISTS HERE AND NOT IN THE PROXY. cswap-pin already implements
     this, and it has exactly one caller: `_sweep_bridges_after_connect`, which
     runs when a `POST /v1/code/sessions` REACHES the proxy. So the repair is
-    triggered by the very thing it exists to survive. Measured 2026-08-17: all
-    24 claude processes carried `HTTPS_PROXY=127.0.0.1:9901` because Claude
-    Code reads the `~/.claude.json` env block once at boot and the pin wiring
-    landed after they exec'd. Nothing reached the proxy, nothing was restored,
-    and a session sat under `Fix Claude AI session naming issue` until it was
-    renamed by hand.
+    triggered by the very thing it exists to survive. Measured on a machine
+    where every live claude process carried an `HTTPS_PROXY` from BEFORE the
+    pin was wired -- Claude Code reads the `~/.claude.json` env block once at
+    boot, so a process that exec'd earlier keeps whatever the block said then.
+    Nothing reached the proxy, nothing was restored, and a session sat under a
+    server-invented title until it was renamed by hand.
 
     THE POLICY STAYS IN cswap-pin. `titles_to_restore` decides what to touch —
     only a listed bridge whose title the server invented, never one a human

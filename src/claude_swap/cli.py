@@ -138,8 +138,8 @@ Examples:
             "remove the wiring so sessions fall back instead of failing"
         ),
     )
-    # A QUERY, so consumers stop reading our files. Measured in the owner's
-    # dotfiles: `cc-update` opens pin-proxy/proxy.json at two hardcoded paths
+    # A QUERY, so consumers stop reading our files. Measured against an
+    # external updater: it opens pin-proxy/proxy.json at two hardcoded paths
     # and parses our schema, because a pinned session's HTTPS_PROXY names the
     # pin's own dynamic port and without that number every pinned session is
     # reported as bypassing the cache proxy. Nothing could ask, so the layout
@@ -154,8 +154,8 @@ Examples:
     )
     # THE SAME ARGUMENT, for the path. A session diagnosing the pin on a Mac
     # did not know the state directory is not at the Linux location, could not
-    # ask, and ran an unbounded `find` over ~/Library on the owner's personal
-    # laptop to get a string this process already holds. What cannot be asked
+    # ask, and ran an unbounded `find` over ~/Library on a Mac to get a
+    # string this process already holds. What cannot be asked
     # for gets searched for.
     parser.add_argument(
         "--get_certdir",
@@ -285,7 +285,7 @@ Examples:
         #
         # THROUGH `_safe`: the exception is built by an optional package and
         # the proxy's own URL carries `user:secret@`, which would otherwise
-        # print verbatim (`_safe` yields `http://***@127.0.0.1:9901/…`).
+        # print verbatim (`_safe` yields `http://***@127.0.0.1:PORT/…`).
         from claude_swap.pin import _safe
 
         error(f"Error: the cloud pin is installed but not usable: {_safe(e)}")

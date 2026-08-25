@@ -4320,7 +4320,7 @@ class TestHealADeadPin:
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
         """`--get_port` exists so consumers stop reading our files.
 
-        Measured in the owner's dotfiles: `cc-update` opens
+        Measured against an external tool that updates Claude Code: it opens
         `pin-proxy/proxy.json` at TWO hardcoded paths and parses our schema,
         because a pinned session's HTTPS_PROXY names the pin's own dynamic
         port and without that number every pinned session is reported as
@@ -4373,7 +4373,7 @@ class TestHealADeadPin:
 
         A session diagnosing the pin on a Mac did not know where the state
         directory lives (it is not the Linux path), and nothing could tell it.
-        So it ran, over ssh, on the owner's personal laptop:
+        So it ran, over ssh, on a Mac:
 
             find ~/Library ~/.local/share -maxdepth 4 -name proxy.json ...
 

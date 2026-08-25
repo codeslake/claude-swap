@@ -5947,7 +5947,7 @@ class TestMacosKeychainFallback:
         assert s._use_keychain() is False          # pinned, stays file mode
 
     def test_write_fallback_clears_pending_read_reprobe(self, temp_home: Path, monkeypatch):
-        # The owner's edge: already in file mode from a read timeout with a
+        # The edge case: already in file mode from a read timeout with a
         # re-probe still pending, then a write leaves a stale item behind. The
         # write must clear that pending re-probe (pin) so it never resurrects.
         s = self._macos_switcher()

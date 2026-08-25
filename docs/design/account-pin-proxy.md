@@ -75,7 +75,7 @@ users with CCF, without CCF, and behind a corp proxy.
 | user | prior HTTPS_PROXY | cswap-proxy chains to |
 |---|---|---|
 | plain (no CCF, no corp) | (unset) | direct `net.connect` to api.anthropic.com |
-| CCF user (this user) | `http://127.0.0.1:9901` | CCF at 9901 (CCF then chains to corp) |
+| a user behind a local caching proxy | `http://127.0.0.1:<its port>` | that proxy (which may itself chain onward) |
 | corp-proxy user | `http://corp:8118` | corp proxy |
 
 cswap-proxy captures the inbound HTTPS_PROXY at launch and uses it as its own
@@ -150,5 +150,5 @@ reaped when idle. Follow a simplified version of CCF's supervise/refcount model
 
 ## PR
 
-Target upstream `realiti4/claude-swap` eventually; keep the proxy self-contained
-and CCF-agnostic so it stands alone. Hold PR until validated on both machines.
+Targets upstream `realiti4/claude-swap`; the proxy stays self-contained and
+agnostic about whatever sits upstream of it, so it stands alone.

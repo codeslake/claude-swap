@@ -1286,7 +1286,7 @@ def pin_is_applying(switcher) -> bool | None:
     THE SECOND QUESTION, and the one nothing asked. `pinned_email` answers
     "which account is it SET to", and every indicator the owner sees was lit on
     that alone: the TUI badge, the statusline, and `pin-coherence` — settings,
-    proxy.json, pid and port all agreeing. Measured on the owner's laptop, all
+    proxy.json, pid and port all agreeing. Measured on a Mac, all
     three read healthy while every request went out UNPINNED, because the daemon
     could not reach the macOS keychain and had marked its own record
     `unpinnable`. Nothing in this package had ever read that flag.
@@ -2215,7 +2215,7 @@ def heal(
                 )
             # NAME THE CONDITION, NOT A CAUSE THIS CANNOT KNOW. `clear_wiring`
             # catches every exception around the lock, so one message covered a
-            # held lock AND a config directory this user cannot write — and
+            # held lock AND a config directory the process cannot write — and
             # asserted the first for both. On the permission shape the advice
             # that followed ("re-run `cswap pin --heal`") can never come true:
             # re-running chmods nothing, so the user waits on a lock that was
@@ -2254,8 +2254,9 @@ def heal(
 def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     """The port a live pin daemon is serving, or None. CSWAP'S OWN RECORD.
 
-    Exists because nothing could ASK. Measured in the owner's dotfiles:
-    `cc-update` opens ``pin-proxy/proxy.json`` at TWO hardcoded paths and
+    Exists because nothing could ASK. Measured against an external tool that
+    updates Claude Code: it opens ``pin-proxy/proxy.json`` at TWO hardcoded
+    paths and
     parses our JSON schema, because a pinned session's ``HTTPS_PROXY`` names
     the pin's own dynamic port rather than the cache proxy's — and without
     that number every pinned session is reported as "the cache proxy was
@@ -2444,7 +2445,7 @@ def run(
         # THE OTHER THING NOBODY COULD ASK FOR, and the one that cost a user's
         # laptop real time. The state directory is not the same path on Darwin
         # as on Linux, and a session diagnosing the pin on a Mac had no way to
-        # ask — so it ran, over ssh, on the owner's personal machine:
+        # ask — so it ran, over ssh, on a Mac:
         #
         #     find ~/Library ~/.local/share -maxdepth 4 -name proxy.json ...
         #
