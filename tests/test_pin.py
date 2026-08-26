@@ -1507,11 +1507,17 @@ class TestTheWiringCanAlwaysBeRemoved:
         ``lock_dir`` it is asked to acquire.
 
         Runs at the REAL `_LAUNCH_LOCK_BUDGET_S` (0.5s), not a test-only
-        constant: with the lock's own retry sleep now clamped to the
-        remaining budget (see test_claude_locks.py), a 0.5s total split two
-        ways gives each path a real 0.25s rather than one jittered sleep
-        (0.25-0.5s) swallowing it whole — the fair-share arithmetic this test
-        guards is only meaningful once the sleep itself respects a deadline.
+        constant, so the arithmetic under test is the arithmetic that ships.
+
+        WHAT THIS DOES NOT ASSERT IS ELAPSED TIME, and the earlier wording
+        here claimed it could, on the strength of a clamp in
+        `proper_lockfile` that this branch does not carry (it is core cswap's,
+        and was reverted out on purpose). `claude_locks` still checks its
+        deadline and then sleeps 0.25-0.5s unclamped, so a single jittered
+        sleep can swallow a 0.5s budget whole and no timing assertion here
+        would be stable. Starvation is directly observable instead — "path 2
+        was never attempted" — which is what the recording wrapper below
+        asserts and what actually kills the mutant.
         """
         from contextlib import contextmanager
 
@@ -2775,6 +2781,20 @@ class TestClearRunsWithTheExtraGone:
         from claude_swap.pin import _WIRE_MARK
 
         assert proxy._WIRE_MARK == _WIRE_MARK
+
+        # THE RECEIPT'S PATH IS THE SAME KIND OF AGREEMENT AS ITS KEY, and it
+        # had no check. cswap and cswap-pin each derive
+        # `<backup>/pin-wiring/<sha256(config path)[:16]>.json` independently;
+        # change the directory name, the hash, or the truncation on either
+        # side and cswap reads an absent sidecar for a wiring that is really
+        # there -- so `--clear` reports "No cloud account pinned" over a live
+        # wiring, which is the exact failure the marker check above exists to
+        # prevent, one function along.
+        probe = tmp_path / "probe" / ".claude.json"
+        assert pin._ledger_path(probe) == proxy._ledger_path(probe), (
+            "cswap and cswap-pin disagree about where the wiring receipt "
+            "lives, so each writes a sidecar the other cannot find"
+        )
 
         backup = tmp_path / "backup"
         (backup / "pin-proxy").mkdir(parents=True)

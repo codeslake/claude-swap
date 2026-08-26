@@ -112,4 +112,11 @@ addopts = "-n auto --dist loadgroup"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
+    # Nothing consumes this yet -- it anticipates an autouse OAuth-profile fake
+    # that has not landed. Registered anyway, because an UNREGISTERED marker is
+    # a silent no-op: it raises PytestUnknownMarkWarning and the tests carrying
+    # it stay green while opting out of nothing. This branch turns an unhandled
+    # thread exception into an error on the argument that a warning in a long
+    # list is read by nobody; one it emits itself would be the first.
+    "no_oauth_profile_fake: opt out of an autouse OAuth-profile fake (the test drives fetch_oauth_profile itself)",
 ]

@@ -1,12 +1,12 @@
 # Account-Pin Proxy — design
 
-Status: IMPLEMENTED. Written 2026-07-30 as a design draft ("implementation
-pending"); the implementation shipped as PR #210, which moved the proxy into
-its own `cswap-pin` package behind the `claude-swap[pin]` extra. This document
-is kept as the RATIONALE — why a proxy at all, and what the forensics
-established — not as a description of the current call graph. Where the two
-disagree, the code wins. Runtime failure modes live in
-`cloud-pin-failure-modes.md`, which is maintained against the shipped build.
+Status: IMPLEMENTED, in the `cswap-pin` package behind the `claude-swap[pin]`
+extra. Kept as the RATIONALE -- why a proxy at all, and what the forensics
+established -- never as a description of the call graph; where the two
+disagree, the code wins. The draft's component breakdown and entry-point plan
+were cut when they shipped, because a superseded plan reads as documentation.
+Runtime failure modes live in `cloud-pin-failure-modes.md`, maintained against
+the shipped build.
 
 ## Problem
 
@@ -80,75 +80,3 @@ users with CCF, without CCF, and behind a corp proxy.
 
 cswap-proxy captures the inbound HTTPS_PROXY at launch and uses it as its own
 upstream. CCF is never modified.
-
-## Components
-
-### 1. `proxy.py` (NEW) — the MITM token-swap proxy
-
-Single-purpose port of CCF's forward-proxy transport, minus caching/extensions/
-downloads. Pieces (CCF references filled in from the port-spec analysis):
-- CONNECT server; MITM only `api.anthropic.com`, blind-tunnel the rest.
-- On-the-fly leaf cert under a generated CA (Python `cryptography`); CA path
-  handed back so the launcher can add it to `NODE_EXTRA_CA_CERTS`.
-- Parse the decrypted HTTP request; on matched routes rewrite the `Authorization`
-  header to the pinned token; relay upstream through the chained proxy.
-- Onward chaining: CONNECT-through the captured prior HTTPS_PROXY, or direct.
-
-Pin token source: read from cswap's own backup store for the pinned account
-(never the live/default credential that cswap swaps), and refresh it there —
-cswap is the single owner of the pin token, so no split-brain with the client.
-
-### 2. Pin state — which account is pinned
-
-Store the pin as an account identity (`(email, organizationUuid)` composite,
-mirroring `mappings.py`; slot numbers are not stable). Options, TBD in planning:
-a `SETTING_SPECS` entry (section `remoteControl`, key `account`) so
-`cswap config get/set` works, and/or a dedicated small store. The pin must be
-readable by the proxy and by every launch path.
-
-### 3. Entry points (must all honor the pin)
-
-- **`cswap run` / `cswap` exec path** (`session.py run` / `exec_default`,
-  `cli.py _run_command`): if a pin is set, start/reuse the proxy and wire
-  `HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` into the child env before exec.
-- **`cswap` config**: `cswap remote-control pin <account>` / `unpin` / `status`
-  (new subcommand) and/or a `SETTING_SPECS` key.
-- **TUI** (`tui/dashboard.py`): a "Remote-control pin…" menu row following the
-  `disable-menu` pattern (pick an account → set/clear pin), plus a badge on the
-  pinned account in `AccountsPanel`.
-- **Plain `cswap switch` + hand-run `claude`**: the proxy still needs to front
-  the session. If the user doesn't launch via cswap, cswap cannot wire the env —
-  document that pin requires launching through cswap (or provide a
-  `cswap env`-style eval snippet), TBD.
-
-### 4. Proxy lifecycle
-
-One proxy per pinned account, started on demand, shared across sessions,
-reaped when idle. Follow a simplified version of CCF's supervise/refcount model
-(details from the port spec). No caching state to manage.
-
-## What breaks / limits (accept)
-
-- **Already-misowned RC**: with the proxy fronting, the next ~8h refresh (also an
-  api.anthropic.com request) gets swapped to PIN → RC self-heals to PIN
-  (new `cse_*`, URL changes once). No manual fix.
-- **Already-misowned artifact**: cross-account republish is a hard 403/404 (no
-  client fallback-to-create). The proxy makes FUTURE publishes PIN-owned; past
-  artifacts under another account stay there (re-publish manually if needed).
-- **Double MITM** (CCF users): client must trust cswap-proxy CA *and* CCF CA via
-  NODE_EXTRA_CA_CERTS. Manage both.
-- **Not launched via cswap** → no env wiring → no pin. Documented constraint.
-
-## Testing
-
-- Unit: route matcher, header swap, chain-target parsing, cert generation
-  (no AKI pitfall).
-- Integration (Mac + host-a via `~/workspace/cswap`): with disk=account B and
-  pin=account A, assert a created code session and a listed frame are A-owned
-  (200 for A, 401/404 for B) while a `/v1/messages` call bills B.
-- Coexistence: run with CCF present (chain to 9901) and absent (direct).
-
-## PR
-
-Targets upstream `realiti4/claude-swap`; the proxy stays self-contained and
-agnostic about whatever sits upstream of it, so it stands alone.

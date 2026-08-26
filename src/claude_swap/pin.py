@@ -1060,6 +1060,18 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 # the pin must not wait on Claude Code's config lock at all, and one who did
 # must not wait long. Nothing is lost by giving up — an unremoved wiring is
 # retried on the next launch, and the caller fails open either way.
+#
+# THIS IS THE BUDGET REQUESTED, NOT THE CEILING OBSERVED, and the gap is not
+# ours to close from here. `proper_lockfile` checks its deadline and THEN
+# sleeps `0.25 + random() * 0.25` unclamped, so one acquisition can overrun by
+# a full jittered sleep; `_config_lock_is_free` spends this per config and
+# there are up to two. Worst case is therefore ~2.0s, not 0.5s.
+#
+# Clamping that sleep to the remaining budget is a one-line fix in
+# `claude_locks.py`, which is CORE cswap and deliberately out of this branch's
+# scope. Raising this number instead would be the wrong repair: it would make
+# the launch wait longer rather than less. Left as the request it is, with the
+# real ceiling named so nobody re-derives it from the constant.
 _LAUNCH_LOCK_BUDGET_S = 0.5
 
 # The same reasoning for the SERVING probe on that path. A refused connect on
@@ -1559,8 +1571,15 @@ def _nothing_to_heal(switcher) -> tuple[bool, str]:
     # Hoisted because it is loop-invariant and re-walks both configs and both
     # sidecars per unreadable path.
     receipts = wired_env_keys(switcher)
+    # UNREADABLE IS NOT CLEAN -- the rule `env_keys_survive` states in those
+    # words. `_env_of_config` returns None for a config it could not read, and
+    # `or ()` turned that into an empty set: the intersection was then empty
+    # for a reason that has nothing to do with the env block, and the config
+    # was reported as a leftover receipt with "nothing is misrouted" over a
+    # file nobody managed to look at.
     stale = [p for p in unreadable
-             if not (set(receipts.get(p, ())) & set(_env_of_config(p) or ()))]
+             if (env := _env_of_config(p)) is not None
+             and not (set(receipts.get(p, ())) & set(env))]
     if stale:
         return False, (
             "A leftover cloud pin receipt names "

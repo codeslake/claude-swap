@@ -582,13 +582,32 @@ class ClaudeAccountSwitcher:
             return
         if not isinstance(doc, dict):
             return
+        path = get_claude_config_home() / "policy-limits.json"
+        # THE PID IS IN THE NAME, like every other writer in this store. A
+        # fixed temp name is shared by every process writing this file, so two
+        # concurrent switches interleave their write and replace and the
+        # survivor can be one document's bytes under the other's rename --
+        # which an atomic rename cannot protect against, because the tearing
+        # happened before it.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
-            path = get_claude_config_home() / "policy-limits.json"
-            tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(doc), encoding="utf-8")
+            # CARRY THE MODE OVER, do not mint one. This is Claude Code's file,
+            # not ours; `os.replace` publishes the TEMP file's mode, so a fresh
+            # temp under an 022 umask silently widened a 0600 document to 0644.
+            # Preserving what is there invents no policy for another program's
+            # file, and a file that does not exist yet has no mode to keep.
+            try:
+                os.chmod(tmp, path.stat().st_mode & 0o777)
+            except OSError:
+                pass
             tmp.replace(path)          # atomic: no reader sees half a document
         except OSError as exc:
             self._logger.debug("could not write the policy cache: %r", exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     def _salvage_unreadable(
         self, path: Path, emit_output: bool, warnings_out: list[str]
@@ -669,8 +688,9 @@ class ClaudeAccountSwitcher:
         THE TEMP FILE STAYS BESIDE THE TARGET, not beside the link: they can
         be on different filesystems, and a cross-device rename is not atomic
         (`shutil.move` falls back to copy+unlink, which a reader can catch
-        half-written). Resolving only the final component keeps this a
-        same-directory rename on the side that matters.
+        half-written). `realpath` resolves every component, not just the last,
+        which is stricter than this needs and costs nothing -- what matters is
+        only that the temp file and the rename land in the resolved directory.
         """
         content = json.dumps(data, indent=2)
 
@@ -6988,7 +7008,6 @@ class ClaudeAccountSwitcher:
                             target_config_data["oauthAccount"] = identity_oauth
                         self._write_json(config_path, target_config_data)
                     config_written = True
-                    self._refresh_policy_cache()
 
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
@@ -7267,7 +7286,6 @@ class ClaudeAccountSwitcher:
                 pin_oauth_ord = _pin.identity_for_config(self)
                 identity_section = pin_oauth_ord or oauth_section
                 current_config_data = self._read_json(config_path)
-                self._refresh_policy_cache()
                 if current_config_data is not None:
                     current_config_data["oauthAccount"] = identity_section
                     self._write_json(config_path, current_config_data)
@@ -7311,9 +7329,24 @@ class ClaudeAccountSwitcher:
                 raise
 
         # Lock released. Safe to do network I/O and let persist callbacks
-        # re-acquire the lock from inside list_accounts(). All of this is display
-        # only — suppressed in JSON mode (the nested list_accounts() would
-        # otherwise leak human output onto the JSON stdout).
+        # re-acquire the lock from inside list_accounts().
+        #
+        # THE POLICY REFRESH IS NETWORK I/O, so it belongs on this side of the
+        # release. It ran inside the lock block above, whose own comment
+        # promises "no network while locks are held" -- and those are Claude
+        # Code's credential and config locks, which Claude Code itself blocks
+        # on during a token refresh. `_POLICY_FETCH_BUDGET_S` bounds each
+        # blocking socket operation, not the call, so connect plus handshake
+        # plus reads can hold them well past it.
+        #
+        # This does not widen the window it was placed to narrow: the network
+        # call IS that window and it is unchanged. What changes is who waits
+        # behind it. Once, not once per branch -- both switch paths reach here.
+        self._refresh_policy_cache()
+
+        # Display only below here — suppressed in JSON mode (the nested
+        # list_accounts() would otherwise leak human output onto the JSON
+        # stdout).
         if emit_output:
             print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
             try:
