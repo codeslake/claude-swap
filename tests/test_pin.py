@@ -10505,3 +10505,88 @@ class TestAddAccountRefusesASplicedIdentity:
         past = self._reached_the_guard(sw)
         with pytest.raises(past):
             sw.add_account()
+
+
+class TestAPinSwingIsNotALoginInFlight:
+    """`_reject_identity_drift_since_verify` samples `oauthAccount` twice and
+    refuses on any difference. Under a pin that field has a SECOND writer.
+
+    The switch splices the pinned identity in and the daemon's carry writes the
+    account now signed in, so it swings between the two with nobody logging in.
+    The guard then refuses `cswap add` for a `/login` that never happened, and
+    its advice -- re-run when no other login is in flight -- has the same odds
+    the next time, because nothing is in flight.
+
+    `pin.identity_move_is_not_a_login` exists to answer exactly this and its
+    docstring says a core guard consults it. Nothing does: grep finds the `def`
+    and this file, and zero call sites under `src/`.
+    """
+
+    def _switcher(self, samples):
+        """A switcher whose identity read returns `samples` in order."""
+        from claude_swap import switcher as _sw
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        it = iter(samples)
+        s._get_current_identity_triple = lambda: next(it)
+        return s
+
+    def test_the_guard_refuses_a_swing_nobody_caused(self, monkeypatch):
+        """RED: the pin moved the field, and the guard cannot tell."""
+        import pytest
+
+        from claude_swap import pin as _pin
+        from claude_swap.exceptions import ConfigError
+
+        verified = ("serving@example.com", "org-LIVE", "uuid-LIVE")
+        pinned = ("pinned@example.com", "org-PIN", "uuid-PIN")
+        s = self._switcher([pinned])
+        # The pin package CAN tell -- it is simply never asked.
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: pinned[:2])
+        monkeypatch.setattr(_pin, "identity_move_is_not_a_login",
+                            lambda *_a, **_k: True)
+        try:
+            s._reject_identity_drift_since_verify(verified)
+        except ConfigError as exc:
+            pytest.fail(
+                "add_account refused a move the pin package reports as benign: "
+                f"{exc}. The guard never consults it, so a pinned machine "
+                "cannot add an account while the carry is swinging"
+            )
+
+    def test_a_real_login_is_still_refused(self):
+        """THE CONTROL. Without it, wiring the softener in could be replaced by
+        deleting the guard and this file would not notice."""
+        import pytest
+
+        from claude_swap.exceptions import ConfigError
+
+        verified = ("a@example.com", "org-1", "uuid-1")
+        other = ("b@example.com", "org-2", "uuid-2")
+        s = self._switcher([other])
+        with pytest.raises(ConfigError, match="active account changed"):
+            s._reject_identity_drift_since_verify(verified)
+
+    def test_the_softener_has_a_production_caller(self):
+        """The structural half: a helper nothing calls is a helper that does not
+        run, however correct its body."""
+        import ast
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+        callers = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                f = node.func
+                name = getattr(f, "attr", None) or getattr(f, "id", None)
+                if name == "identity_move_is_not_a_login":
+                    callers.append(f"{path.name}:{node.lineno}")
+        assert len(list(root.rglob("*.py"))) > 5, "the walk found no modules"
+        assert callers, (
+            "pin.identity_move_is_not_a_login has no caller under src/. Its "
+            "docstring says a guard in cswap core consults it; the guard it "
+            "softens refuses on every pin swing without it"
+        )

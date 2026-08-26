@@ -3385,6 +3385,23 @@ class ClaudeAccountSwitcher:
         now = self._get_current_identity_triple()
         if now == verified:
             return
+        # A PIN GIVES THIS FIELD A SECOND WRITER. The switch splices the pinned
+        # identity in and the daemon's carry writes the account now signed in,
+        # so it swings between the two with nobody logging in -- and a guard
+        # that refuses on any difference refuses on the swing, advising a re-run
+        # that has the same odds because nothing is in flight.
+        #
+        # ASKED THROUGH THE SEAM, and False whenever it cannot tell: this answer
+        # only ever SUPPRESSES a refusal, and a refusal writes nothing. A
+        # machine without the extra keeps the strict guard, which is the right
+        # default when there is no second writer to explain the move.
+        try:
+            from claude_swap import pin as _pin
+
+            if _pin.identity_move_is_not_a_login(self, verified, now):
+                return
+        except Exception:  # noqa: BLE001 — an optional extra cannot add a refusal
+            pass
         raise ConfigError(
             f"The active account changed while {verified[0]} was being "
             f"verified (now {(now[0] if now else '') or 'unknown'}). Nothing "
