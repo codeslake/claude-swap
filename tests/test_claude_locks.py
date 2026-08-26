@@ -80,8 +80,16 @@ class TestProperLockfile:
             os.rmdir(lock_dir)
             os.mkdir(lock_dir)
             # mtimes are ms-coarse, so a bare mkdir can land on our own
-            # acquire stamp; a whole second back round-trips and cannot.
-            fresh = float(int(time.time()) - 1)
+            # acquire stamp and the case would then measure nothing. A whole
+            # second AHEAD both round-trips distinctly and is the direction a
+            # real takeover moves: the successor's mkdir stamps it now, which
+            # is later than ours. A second BACK also round-trips, but it asks
+            # the toucher to read a REWIND as somebody else's lock -- and the
+            # transient-failure case one screen up rewinds our own by 30s and
+            # requires the heartbeat to survive it. Only one of those two can
+            # hold on an mtime, and inode identity cannot separate them either
+            # (measured here: 200 rmdir+mkdir cycles, inode reused 200 times).
+            fresh = float(int(time.time()) + 1)
             os.utime(lock_dir, (fresh, fresh))
             time.sleep(0.25)  # at least one toucher tick
 
