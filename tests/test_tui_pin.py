@@ -1066,46 +1066,110 @@ class TestEveryBadgeSiteAsksTheSameQuestion:
     of them compares an address to a pin on its own again.
     """
 
-    def test_no_tui_site_matches_a_pin_on_the_email_alone(self):
+    # The pin readers. A pin value is whatever one of these returns, plus
+    # anything a module binds it to.
+    _PIN_READERS = ("pinned_identity", "pinned_email", "_pinned_email_now")
+
+    @classmethod
+    def _pin_valued(cls, tree):
+        """Names in this module that hold a pin value, aliases included.
+
+        Seeded from the readers' own names -- `pin.pinned_identity(...)`,
+        `self._pinned_identity` -- then propagated across plain assignments so
+        `p = pinned_identity` does not launder it. Two passes: the widgets
+        module already binds through an attribute and then re-binds locally.
+        """
+        import ast
+
+        def is_pin(node):
+            t = ast.unparse(node)
+            return any(r in t for r in cls._PIN_READERS)
+
+        names: set[str] = set()
+        for _ in range(2):
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                src_is_pin = is_pin(node.value) or (
+                    isinstance(node.value, ast.Name) and node.value.id in names)
+                if not src_is_pin:
+                    continue
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        names.add(tgt.id)
+        return names, is_pin
+
+    def test_no_tui_site_reads_a_pin_apart_from_the_predicate(self):
+        """A badge site must ask `account_is_pinned`, never take the pin apart.
+
+        Two shapes make a site answer on the address alone, and both are
+        invisible to a rule about what a comparison's operands are CALLED:
+
+        - `pinned_identity[0]` drops the org, so two slots sharing one address
+          both render pinned. Subscripting a pin value is the whole offence;
+          there is no correct reason for a TUI module to index one.
+        - `mine = acc.email` one line above the comparison removes the `.email`
+          attribute the address half was recognised by.
+
+        So the invariant is what the code DOES to a pin value, not what it
+        spells: in a TUI module a pin value may be tested for truth, stored,
+        and rendered, but never indexed and never compared to anything but a
+        constant. `is not None` stays legal; `== acc.email` does not.
+
+        The previous cut also carried an `inside_predicate` escape that walked
+        INTO the comparison looking for `account_is_pinned` -- the sanctioned
+        form is a call whose ARGUMENT is the address, with no comparison in it
+        at all, so the branch could never be taken by correct code. A condition
+        that cannot fire is not an exemption, it is a dead operand.
+        """
         import ast
         from pathlib import Path
 
         root = Path(__file__).resolve().parent.parent / "src" / "claude_swap" / "tui"
+        modules = sorted(root.rglob("*.py"))
         offenders = []
-        for path in sorted(root.rglob("*.py")):
+        for path in modules:
             tree = ast.parse(path.read_text(encoding="utf-8"))
+            pin_names, is_pin = self._pin_valued(tree)
+
+            def pin_valued(node):
+                return is_pin(node) or (
+                    isinstance(node, ast.Name) and node.id in pin_names)
+
             for node in ast.walk(tree):
+                if isinstance(node, ast.Subscript) and pin_valued(node.value):
+                    offenders.append(
+                        f"{path.name}:{node.lineno}  indexes a pin value: "
+                        f"{ast.unparse(node)}")
+                    continue
                 if not isinstance(node, ast.Compare):
+                    continue
+                sides = [node.left, *node.comparators]
+                if len(sides) != 2:
                     continue
                 # BY WHAT THE SIDE SAYS, not by its node type. Keying on
                 # `ast.Name` let `acc.email == pinned_identity[0]` through --
                 # a Subscript -- which is exactly the shape a regression takes
-                # once the composite is in scope. Measured: that mutation
-                # survived this guard until it read the unparsed text.
-                sides = [node.left, *node.comparators]
-                if len(sides) != 2:
-                    continue
+                # once the composite is in scope.
                 rendered = [ast.unparse(x) for x in sides]
                 has_email = any(
                     isinstance(x, ast.Attribute) and x.attr == "email" for x in sides)
-                # BY STRUCTURE, NOT BY AN OPERAND'S NAME. Requiring the text
-                # "pinned" on one side made the guard depend on what the
-                # variable happened to be called: `current == acc.email`, with
-                # `current = pin.pinned_email(...)` one line above, walked
-                # straight past it -- and that was the fourth badge site, found
-                # by a reviewer rather than by this. ANY `.email` comparison in
-                # a TUI module is now the offence; the sanctioned form calls
-                # `account_is_pinned` and compares nothing here.
-                inside_predicate = any(
-                    isinstance(a, ast.Call)
-                    and "account_is_pinned" in ast.unparse(a.func)
-                    for a in ast.walk(node))
-                if has_email and not inside_predicate:
-                    offenders.append(f"{path.name}:{node.lineno}  {rendered[0]} == {rendered[1]}")
+                pin_side = [i for i, x in enumerate(sides) if pin_valued(x)]
+                # A pin compared to a literal is a presence test, not a match.
+                against_constant = any(
+                    isinstance(sides[1 - i], ast.Constant) for i in pin_side)
+                if has_email or (pin_side and not against_constant):
+                    offenders.append(
+                        f"{path.name}:{node.lineno}  {rendered[0]} == {rendered[1]}")
         # THE CONTROL: an empty walk would pass vacuously.
-        assert len(list(root.rglob("*.py"))) > 2, "the walk found no TUI modules"
+        assert len(modules) > 2, "the walk found no TUI modules"
+        assert any(self._pin_valued(ast.parse(m.read_text(encoding="utf-8")))[0]
+                   for m in modules), (
+            "no TUI module binds a pin value — the alias tracker matched "
+            "nothing, so its half of this guard proves nothing"
+        )
         assert offenders == [], (
-            "a TUI site compares an address by hand instead of calling "
+            "a TUI site takes a pin apart instead of calling "
             "`pin.account_is_pinned`, so two slots sharing one address both "
             f"render as pinned: {offenders}"
         )

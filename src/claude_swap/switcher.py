@@ -4037,6 +4037,12 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            # `--slot N` reaches `_delete_account_files` through a different
+            # door than `remove_account`, and the pin can be naming what it
+            # destroys. A migration is NOT this: the account survives at
+            # another slot, and the pin is matched on the identity, not the
+            # number, so it stays valid.
+            self._clear_pin_if_removed(d_email, d_org)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -4250,6 +4256,12 @@ class ClaudeAccountSwitcher:
             del data["accounts"][d_num]
             self._write_json(self.sequence_file, data)
             self._prune_mappings(d_email, d_org)
+            # `--slot N` reaches `_delete_account_files` through a different
+            # door than `remove_account`, and the pin can be naming what it
+            # destroys. A migration is NOT this: the account survives at
+            # another slot, and the pin is matched on the identity, not the
+            # number, so it stays valid.
+            self._clear_pin_if_removed(d_email, d_org)
 
         if migrate_from:
             data = self._get_sequence_data()
@@ -4321,6 +4333,18 @@ class ClaudeAccountSwitcher:
             if not pinned:
                 return
             if (pinned[0] or "") != email or (pinned[1] or "") != (org_uuid or ""):
+                # THE COLLISION SPEAKS, the rest stays quiet. Two slots sharing
+                # one address across organizations is the whole reason this
+                # matches on the composite, and it is also the one case where
+                # the silence reads as "the clear did not run": the user
+                # removed the account they can see and the pin still names that
+                # address. A different address needs no word.
+                if (pinned[0] or "") == email:
+                    warning(
+                        f"Cloud pin: still on {email}, which is a different "
+                        f"organization from the slot just removed — that pin "
+                        f"is live, not a leftover"
+                    )
                 return
             ok, msg = _pin.clear_pin(self)
             warning(f"Cloud pin: {msg}")

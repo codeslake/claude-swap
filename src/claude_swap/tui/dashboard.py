@@ -207,7 +207,10 @@ class DashboardScreen(Screen):
                 # marketplace sync all follow the pin).
                 [(
                     "Cloud account (RC/artifacts)… "
-                    f"{pin.pinned_email(self.app.switcher) or 'none'}",
+                    # THE RECORD, which is what the badge reads. Asking the
+                    # package here made the row say `none` beside a lit badge
+                    # on every machine without the extra.
+                    f"{pin.pinned_email_recorded(self.app.switcher) or 'none'}",
                     "pin-menu",
                 )]
                 if (
@@ -385,13 +388,11 @@ class DashboardScreen(Screen):
         # the message said "re-run once it frees up".
         #
         # AND THE RECORD IS READ THE WAY `clear_pin` READS IT.
-        # `pinned_identity` asks the PACKAGE and answers None
-        # whenever it is absent or broken; `clear_pin` decides from
+        # `pinned_identity` and `clear_pin` both decide from
         # `_pinned_email_now`, which reads cswap's OWN settings.json and can
-        # still clear it. Gating on the package's answer hid the row for a
-        # record this repo can see and remove — one that re-pins the account
-        # the moment anything reinstalls the package. A gate must ask what the
-        # ACTION asks, or it hides work that exists.
+        # still clear a record with the extra absent. The gate keeps the
+        # explicit `_pinned_email_now` call so it reads as the same question
+        # the ACTION asks; a gate that asks less hides work that exists.
         if (
             pinned_identity
             or pin._pinned_email_now(self.app.switcher) is not None

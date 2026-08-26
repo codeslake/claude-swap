@@ -732,6 +732,22 @@ def pinned_email(switcher) -> str | None:
     return pin[0] if pin else None
 
 
+def pinned_email_recorded(switcher) -> str | None:
+    """The pinned address as cswap's OWN record has it, for display.
+
+    `pinned_email` asks the PACKAGE and answers None whenever it is absent, so
+    the Cloud row said `none` while the badge beside it -- which reads the
+    record through `pinned_identity` -- lit up on the same account. Every
+    unwire except `clear_pin` leaves exactly that state, so it is where the
+    row normally lands, not a corner.
+
+    The address only, and only for a label: a badge must still go through
+    `account_is_pinned`, because two slots may share one address.
+    """
+    identity = pinned_identity(switcher)
+    return identity[0] if identity else None
+
+
 def account_is_pinned(identity, email: str, org_uuid: str) -> bool:
     """Is ``(email, org_uuid)`` the pinned account?
 

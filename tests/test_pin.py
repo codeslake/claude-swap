@@ -2063,11 +2063,57 @@ class TestTheTuiSurfaceSurvivesTheSplit:
         assert "none" in labels[0], (
             f"the row does not say where the pin points: {labels[0]!r}"
         )
-        monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: "a@b.c")
+        monkeypatch.setattr(dashboard.pin, "_pinned_email_now",
+                            lambda sw: ("a@b.c", "org-A"))
         pinned = [label for label, action in screen._root_entries()
                   if action == "pin-menu"][0]
         assert "a@b.c" in pinned, (
             f"the row does not name the pinned account: {pinned!r}"
+        )
+
+
+    def test_the_row_names_the_pin_the_badge_lights_from(self, monkeypatch):
+        """Two readers of one fact, side by side, answering opposite.
+
+        `pinned_identity` -- what every badge site uses -- reads cswap's OWN
+        `settings.json`. `pinned_email` asks the PACKAGE. On a machine where
+        the extra is absent but the record survives (every `heal`, every
+        `wire_launch_env`, every `--ensure` leaves exactly that), the accounts
+        panel drew `○ cloud` on the account while the Cloud row one screen up
+        said `none`. The row's gate already admits that state deliberately, so
+        this is not a corner it fails to reach: it is the state it was built
+        for, rendered wrong.
+        """
+        import types
+        from claude_swap.tui import dashboard
+
+        monkeypatch.setattr(
+            dashboard.DashboardScreen,
+            "app",
+            property(lambda self: types.SimpleNamespace(
+                switcher=object(), snapshot=None)),
+            raising=False,
+        )
+        # THE ABSENT PACKAGE, and a record that outlived it.
+        monkeypatch.setattr(dashboard.pin, "is_available", lambda: False)
+        monkeypatch.setattr(dashboard.pin, "_live_impl", lambda: None)
+        monkeypatch.setattr(dashboard.pin, "_wiring_present", lambda sw: False)
+        monkeypatch.setattr(dashboard.pin, "_pinned_email_now",
+                            lambda sw: ("recorded@example.com", "org-R"))
+
+        screen = object.__new__(dashboard.DashboardScreen)
+        labels = [label for label, action in screen._root_entries()
+                  if action == "pin-menu"]
+        assert labels, "premise: the row is not shown, so it cannot be wrong"
+        # THE BADGE'S OWN READER, so the two are compared and not merely
+        # asserted about separately.
+        badge_lights = dashboard.pin.account_is_pinned(
+            dashboard.pin.pinned_identity(object()),
+            "recorded@example.com", "org-R")
+        assert badge_lights, "premise: the badge does not light, so nothing disagrees"
+        assert "recorded@example.com" in labels[0], (
+            "the badge names an account the row calls 'none': "
+            f"{labels[0]!r}"
         )
 
     def test_both_account_renderers_actually_render_the_badge(self):
@@ -10685,6 +10731,55 @@ class TestRemovingThePinnedAccountClearsThePin:
         assert "cleared" in said, f"the clear was not reported: {said!r}"
         assert "still names" not in said, (
             f"the success path reported a failure: {said!r}"
+        )
+
+    def test_a_same_address_sibling_says_why_the_pin_survived(self, monkeypatch):
+        """Silence here reads as "the fix did not run".
+
+        The composite is what stops one removal unpinning a live sibling, and
+        its whole subject is two slots sharing ONE address across
+        organizations. In exactly that case the user removes the account they
+        can see by name, the pin keeps naming that same address, and nothing
+        connects the two. A different address needs no word — nobody expects
+        removing `b@` to touch a pin on `a@` — so only the collision speaks.
+        """
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        cleared = []
+        monkeypatch.setattr(_pin, "_pinned_email_now",
+                            lambda _s: ("shared@example.com", "org-A"))
+        monkeypatch.setattr(_pin, "clear_pin",
+                            lambda _s: cleared.append(1) or (True, "cleared"))
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        buf = _pin_io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s._clear_pin_if_removed("shared@example.com", "org-B")
+
+        assert cleared == [], "the sibling's removal cleared a live pin"
+        said = buf.getvalue()
+        assert "shared@example.com" in said, (
+            "removing one of two slots at the same address left the pin on the "
+            f"other and said nothing: {said!r}"
+        )
+
+    def test_a_different_address_removal_stays_silent(self, monkeypatch):
+        """THE CONTROL. A note on every mismatch is a note on every removal."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        monkeypatch.setattr(_pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-P"))
+        monkeypatch.setattr(_pin, "clear_pin",
+                            lambda _s: (True, "cleared"))
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        buf = _pin_io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s._clear_pin_if_removed("someone-else@example.com", "org-X")
+        assert buf.getvalue() == "", (
+            f"an unrelated removal narrated the pin: {buf.getvalue()!r}"
         )
 
     def test_no_extra_installed_and_no_record_asks_the_package_nothing(

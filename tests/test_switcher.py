@@ -4612,6 +4612,105 @@ class TestAddAccountSlot:
         out = capsys.readouterr().out
         assert "Moved from slot 1" in out
 
+    def _pin_spy(self, monkeypatch, pinned):
+        """Patch the pin seam and return the list `clear_pin` appends to."""
+        from claude_swap import pin as _pin
+
+        cleared: list[int] = []
+        monkeypatch.setattr(_pin, "_pinned_email_now", lambda _s: pinned)
+        monkeypatch.setattr(
+            _pin, "clear_pin", lambda _s: (cleared.append(1), (True, "cleared"))[1]
+        )
+        return cleared
+
+    def test_displacing_the_pinned_account_clears_the_pin(
+        self, temp_home, monkeypatch
+    ):
+        """`--slot N` destroys the occupant, and the pin can be naming it.
+
+        `remove_account` clears the pin because removal is the moment cswap
+        knows its subject ceased to exist. `add_account --slot N` reaches the
+        same `_delete_account_files` through a different door and said nothing,
+        so displacing the pinned account left `settings.json` pointing at a
+        slot with no account: no proxy starts, the TUI still draws the Cloud
+        row, and nothing says why.
+        """
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home, email="pinned@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=1)
+
+        occupant = switcher._get_sequence_data()["accounts"]["1"]
+        pinned = (occupant["email"], occupant.get("organizationUuid", "") or "")
+        cleared = self._pin_spy(monkeypatch, pinned)
+
+        switcher = self._make_switcher(temp_home, email="newcomer@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account(slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["email"] == \
+            "newcomer@example.com", "premise: the occupant was not displaced"
+        assert cleared == [1], (
+            "the pinned account was displaced and the pin still names it"
+        )
+
+    def test_displacing_a_DIFFERENT_account_leaves_the_pin_alone(
+        self, temp_home, monkeypatch
+    ):
+        """THE CONTROL. Clearing unconditionally passes the case above and
+        unpins a live account every time any other slot is overwritten."""
+        fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        switcher = self._make_switcher(temp_home, email="bystander@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account(slot=1)
+
+        cleared = self._pin_spy(monkeypatch, ("pinned@example.com", "org-P"))
+
+        switcher = self._make_switcher(temp_home, email="newcomer@example.com")
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(fake_creds, False)), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account(slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["email"] == \
+            "newcomer@example.com", "premise: the occupant was not displaced"
+        assert cleared == [], (
+            "displacing an unrelated account cleared the pin"
+        )
+
+    def test_displacing_the_pinned_account_from_a_token_clears_the_pin(
+        self, temp_home, monkeypatch
+    ):
+        """`add_account_from_token --slot N` carries the same door."""
+        switcher = self._make_switcher(temp_home, email="unused@example.com")
+        with patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account_from_token("tok", "pinned@example.com", slot=1)
+
+        occupant = switcher._get_sequence_data()["accounts"]["1"]
+        pinned = (occupant["email"], occupant.get("organizationUuid", "") or "")
+        cleared = self._pin_spy(monkeypatch, pinned)
+
+        with patch.object(switcher, "_write_account_credentials"), \
+             patch.object(switcher, "_delete_account_credentials"), \
+             patch("builtins.input", return_value="y"):
+            switcher.add_account_from_token("tok2", "newcomer@example.com", slot=1)
+
+        assert switcher._get_sequence_data()["accounts"]["1"]["email"] == \
+            "newcomer@example.com", "premise: the occupant was not displaced"
+        assert cleared == [1], (
+            "the pinned account was displaced and the pin still names it"
+        )
+
     def test_migrate_with_occupied_target_cancel_preserves_old_slot(self, temp_home, capsys):
         """If migration target is occupied and user cancels, old slot must survive."""
         fake_creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
