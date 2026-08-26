@@ -388,6 +388,14 @@ class TestAPublishedFileIsNotUnlinkedByItsOwnCleanup:
     """Every sibling writer in this change got this guard; the shared one
     did not, and it is the writer with a statement AFTER the publish."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "the only statement after the publish is the POSIX-only chmod, so "
+            "on Windows nothing between the rename and the end of the try can "
+            "fail and the window has no trigger there"
+        ),
+    )
     def test_the_cleanup_does_not_take_a_name_the_publish_handed_over(
         self, tmp_path, monkeypatch
     ):
