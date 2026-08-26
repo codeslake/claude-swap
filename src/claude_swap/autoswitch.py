@@ -746,6 +746,10 @@ class AutoSwitchEngine:
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
         self._demotion_announced = not self.demoted_from_live
+        # Set by `_emit` when a consumer's pipe is gone; only `run_loop` reads
+        # it. `--once` never reaches that loop, which is why the emit records
+        # rather than raises.
+        self._consumer_gone = False
 
     def _announce_demotion(self) -> None:
         """Say once, on the first tick, that this engine lost the LIVE lock.
@@ -2633,6 +2637,13 @@ class AutoSwitchEngine:
             # events never made one act, it only removed the evidence.
             self.on_event(event)
         except Exception as exc:  # noqa: BLE001 — see below
+            # A BROKEN PIPE IS THE CONSUMER BEING GONE, and it is RECORDED
+            # rather than raised: `--once` must keep its 0/1/2/3 exit contract
+            # through a closed pipe, and this method cannot tell that mode from
+            # the loop. `run_loop` reads the flag and stops; nothing reads it on
+            # the `--once` path, so that contract is untouched.
+            if isinstance(exc, BrokenPipeError):
+                self._consumer_gone = True
             # A CONSUMER EXCEPTION IS NOT THE ENGINE'S FAILURE. `tick()`
             # documents "Never raises" but its `try` covers only
             # `_tick_inner`, so an emit from `_announce_demotion` /
@@ -2815,6 +2826,15 @@ class AutoSwitchEngine:
             # already sees whatever settings that wake announced.
             self._wake.clear()
             if self._stop.is_set():
+                return 0
+            # NOBODY IS LISTENING. `cswap auto --json | head -1` closes the pipe
+            # after one line; Python ignores SIGPIPE, so every later emit raises
+            # and used to be swallowed -- the engine kept ticking, kept
+            # switching accounts and kept holding `.auto-live.lock`, which also
+            # demotes any TUI opened afterwards, with nothing reaching a
+            # terminal. Releasing the lock is `stop`'s job and the caller's
+            # `finally` already does it.
+            if self._consumer_gone:
                 return 0
             try:
                 outcome = self.tick()

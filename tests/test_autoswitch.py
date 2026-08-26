@@ -9828,3 +9828,70 @@ class TestDecisionLog:
         demoted._emit(NoSwitchEvent(reason="promoted", detail=""))
 
         assert "promoted" in log.read_text()
+
+
+class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
+    """`_emit` swallows everything a consumer raises, and for `--once` that is
+    right: `cswap auto --once --json | head -1` must keep its 0/1/2/3 exit
+    contract when the pipe closes rather than turn into a traceback.
+
+    In LOOP mode the same swallow removes the only thing that used to stop the
+    process. `head` exits after one line, Python ignores SIGPIPE, and every
+    later print raises -- so the engine keeps ticking, keeps switching accounts
+    and keeps holding `.auto-live.lock`, which also demotes any TUI opened
+    afterwards. Nothing reaches a terminal.
+
+    THE DISCRIMINATOR IS THE MODE, NOT THE EXCEPTION, and `_emit` cannot see
+    the mode. So it records, and `run_loop` -- which `--once` never enters --
+    is what stops.
+    """
+
+    @staticmethod
+    def _no_waiting(engine, monkeypatch):
+        """The loop's own sleep is not the subject, and waiting it out is how
+        this case took two minutes and a mutant took four hundred seconds --
+        the very hang it is testing for. Wake immediately; the return value is
+        what the assertion reads.
+        """
+        monkeypatch.setattr(engine._wake, "wait", lambda _t=None: True)
+
+    def test_a_broken_pipe_ends_the_loop(self, harness, monkeypatch):
+        engine = harness.engine
+        self._no_waiting(engine, monkeypatch)
+        engine.on_event = lambda ev: (_ for _ in ()).throw(
+            BrokenPipeError(32, "Broken pipe")
+        )
+        assert engine.run_loop() == 0
+        assert engine._consumer_gone is True
+
+    def test_an_epipe_oserror_is_the_same_exception(self):
+        """Not a second path -- a PREMISE, and it is why the check is one
+        isinstance. `OSError(EPIPE, ...)` constructs a BrokenPipeError: Python
+        maps the errno to the subclass. A second clause reading `.errno` was
+        dead code, and the case that "covered" it was re-measuring the first.
+        """
+        import errno as _errno
+
+        assert isinstance(OSError(_errno.EPIPE, "Broken pipe"), BrokenPipeError)
+        assert not isinstance(OSError(_errno.ENOSPC, "No space"), BrokenPipeError)
+
+    def test_an_unrelated_consumer_error_does_not_end_it(self, harness):
+        """THE CONTROL. Stopping on any consumer error would turn a TUI
+        callback bug into a dead auto-switch engine, which is what the swallow
+        exists to prevent. Asserted on the FLAG, because ending the loop here
+        needs `stop()` and that would pass either way."""
+        engine = harness.engine
+        engine.on_event = lambda ev: (_ for _ in ()).throw(ValueError("a bug"))
+        engine._emit(ConfigWarningEvent(message="x"))
+        assert engine._consumer_gone is False
+
+    def test_a_full_disk_in_a_consumer_does_not_end_it(self, harness):
+        """The narrowing keys on the broken pipe, not on OSError at large."""
+        import errno as _errno
+
+        engine = harness.engine
+        engine.on_event = lambda ev: (_ for _ in ()).throw(
+            OSError(_errno.ENOSPC, "No space left")
+        )
+        engine._emit(ConfigWarningEvent(message="x"))
+        assert engine._consumer_gone is False
