@@ -29,8 +29,8 @@ account** — within any session, without changing how the user runs cswap.
 
 ## Why a proxy is the only mechanism (established by forensics)
 
-All three operations read a single global credential accessor (`ys()`/`_s()` in
-the 2.1.217 binary). There is no per-operation token selector wired to anything,
+All three operations read a single global credential accessor. There is no
+per-operation token selector wired to anything,
 no multi-account store, no live token override the client honors for RC (the
 `CLAUDE_CODE_OAUTH_TOKEN` env is rejected by RC's full-scope gate), and no
 RC/artifact lifecycle hook. Verified dead ends: org-uuid header (server derives

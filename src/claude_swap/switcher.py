@@ -533,23 +533,17 @@ class ClaudeAccountSwitcher:
         """Re-ask the org-policy question as the account that is now active.
 
         Claude Code caches `GET /api/claude_code/policy_limits` in
-        `<config home>/policy-limits.json`, and every gate check reads it:
-        `/remote-control` resolves `Ms('allow_remote_control')` -> `Hcd()` ->
-        that file. The fetch carries whatever account was ACTIVE, the file is
-        machine-wide, and nothing rewrote it when the account changed — so one
-        account's restrictions gated every session on the machine, including
-        accounts the server places no restriction on at all.
+        `<config home>/policy-limits.json`, and every org-policy gate reads it
+        -- `/remote-control` among them. The fetch carries whatever account was
+        ACTIVE, the file is machine-wide, and nothing rewrote it when the
+        account changed, so one account's restrictions gated every session on
+        the machine, including accounts the server places no restriction on.
 
         DELETING IT IS NOT THE FIX, and the first cut of this did exactly that.
-        Read out of the binary:
-
-            function Ms(e){ let t=Hcd()
-              if(!t){ if(aK_.has(e)){ if(fK()) return !1 } return !0 } ... }
-
-        With NO document, a gate in that set returns FALSE. **Absent means
-        DENIED**, so dropping the file would refuse Remote Control to every
-        session started after a switch — a stale-answer bug turned into a
-        guaranteed outage.
+        **Absent means DENIED for the gates in that set** -- observed: with the
+        file removed, `/remote-control` refuses. So dropping it would turn a
+        stale-answer bug into a guaranteed outage for every session started
+        after a switch.
 
         A FAILED FETCH LEAVES THE OLD ANSWER. It may be wrong for this account;
         absent is wrong for every account. Never raises, for the same reason:
