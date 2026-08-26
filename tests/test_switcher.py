@@ -12760,10 +12760,18 @@ def test_a_failed_write_through_does_not_keep_the_narrowed_mode(
     """
     from claude_swap import switcher as switcher_mod
 
+    import stat as stat_mod
+
     switcher = ClaudeAccountSwitcher()
     path = temp_home / ".claude.json"
     path.write_text('{"activeAccountNumber": 1}')
     os.chmod(path, 0o644)
+    # READ IT BACK rather than assuming 0644 landed. Windows honours only the
+    # write bit, so the same chmod yields 0666 there -- and the production
+    # narrowing is POSIX-only, so on Windows the property under test is that
+    # nothing moved at all. Comparing against what the file actually holds says
+    # the same thing on both.
+    before = stat_mod.S_IMODE(path.stat().st_mode)
 
     def busy(*_a, **_kw):
         raise OSError(errno.EBUSY, "Device or resource busy")
@@ -12777,11 +12785,8 @@ def test_a_failed_write_through_does_not_keep_the_narrowed_mode(
     with pytest.raises(ConfigError):
         switcher._write_json(path, {"activeAccountNumber": 2})
 
-    import stat as stat_mod
-
     mode = stat_mod.S_IMODE(path.stat().st_mode)
-    assert mode == 0o644, (
-        f"the destination was left at {oct(mode)} — the narrowing "
-        "outlived the write it was for, and nothing recorded what "
-        "to restore"
+    assert mode == before, (
+        f"the destination went {oct(before)} -> {oct(mode)} — the narrowing "
+        "outlived the write it was for, and nothing recorded what to restore"
     )
