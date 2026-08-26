@@ -1384,6 +1384,7 @@ class TestTokenAccountParsing:
         }
 
 
+@pytest.mark.no_oauth_profile_fake
 class TestFetchOauthProfile:
     """Access-token → account-identity resolution (/api/oauth/profile)."""
 

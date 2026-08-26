@@ -7820,25 +7820,37 @@ class TestAddAccountWillNotRecordASplicedIdentity:
         # THE SHIPPED CONDITION, lifted and EVALUATED. A copy of the condition
         # restated in the test proves only that the copy agrees with itself —
         # which is how the version this replaces stayed green on the bug.
-        cond = guard[guard.rindex("if oauth_data"):]
+        #
+        # THE TWO SIDES SWAPPED NAMES when the guard was hoisted above both
+        # paths: `current_email`/`current_org_uuid` are now the LITERAL config
+        # triple and `live_login` is the un-spliced answer, where before it was
+        # the other way round. The question is unchanged — do the identity file
+        # and the live login name the same (email, org) — so this case follows
+        # the condition rather than the names.
+        cond = guard[guard.rindex("if live_login"):]
         cond = cond[len("if "):cond.index(":\n")].replace("\n", " ")
-        assert "organizationUuid" in cond and "current_org_uuid" in cond, (
+        assert "current_org_uuid" in cond and "live_login" in cond, (
             "the shipped guard does not consult the organization, so it "
             "cannot tell a splice from a login as a same-email sibling")
 
         shared = "shared@example.com"
-        for oauth_org, live_org, want in (
-                ("org-PIN", "org-SERVING", True),   # a splice, same email
-                ("org-SAME", "org-SAME", False),    # a genuine login
+        for live, config_org, want in (
+                # a splice, same email: the file names the pin's org
+                ((shared, "org-SERVING"), "org-PIN", True),
+                # a genuine login as a same-email sibling: both agree
+                ((shared, "org-SAME"), "org-SAME", False),
+                # nothing to compare against is UNKNOWN, never a splice --
+                # refusing here would break add_account wherever the optional
+                # pin package is absent
+                (None, "org-ANY", False),
         ):
-            env = {"oauth_data": {"emailAddress": shared,
-                                  "organizationUuid": oauth_org},
+            env = {"live_login": live,
                    "current_email": shared,
-                   "current_org_uuid": live_org}
+                   "current_org_uuid": config_org}
             fires = bool(eval(cond, {}, env))  # noqa: S307 — our own source
             assert fires is want, (
-                f"the shipped guard fired={fires} for identity-file org "
-                f"{oauth_org!r} against live org {live_org!r}; wanted {want}. "
+                f"the shipped guard fired={fires} for live login {live!r} "
+                f"against identity-file org {config_org!r}; wanted {want}. "
                 "An email-only comparison passes the splice row, and the "
                 "roster row written after it can never be found again")
 
@@ -8278,7 +8290,15 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
                 # `export_accounts` and the session launch fast path, which
                 # compare the tuple directly. Both were real wrong-account
                 # bugs and both were invisible here.
-                if "_get_current_account" in calls:
+                # AND THE TRIPLE, WHICH DOES NOT GO THROUGH IT. A sibling
+                # change added `_get_current_identity_triple`, which reads
+                # `~/.claude.json` with `_read_json` directly — so a site that
+                # re-derives the identity through it was invisible to this
+                # tripwire while being exactly what the tripwire is for. Found
+                # by merging that change in: `add_account` swapped onto it and
+                # nothing here noticed.
+                if calls & {"_get_current_account",
+                            "_get_current_identity_triple"}:
                     found.append(f"{path.name}:{fn.name}")
         # THE CONTROL: without it an empty walk passes vacuously.
         assert len(list(root.rglob("*.py"))) > 5, "the walk found no modules"
@@ -8315,6 +8335,18 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
             # pin. Asking `_live_login_identity` here would answer a question CC
             # never asks and would re-report a carried pointer as foreign.
             "pin.py:_warn_if_bridges_disagree",
+            # THE TRIPLE'S OWN THREE, one reason each.
+            #
+            # It IS the file reader the un-splicer is built on.
+            "switcher.py:_get_current_account",
+            # A TOCTOU re-check, so it must compare against the literal live
+            # value — the same reason `_live_identity_matches` is exempt.
+            "switcher.py:_reject_identity_drift_since_verify",
+            # Reads the literal triple because the drift guard compares against
+            # it, and asks `_live_login_identity` BESIDE it: a mismatch is
+            # refused outright rather than un-spliced, because `accountUuid` is
+            # recoverable from nowhere else.
+            "switcher.py:add_account",
         }
         assert set(found) <= known, (
             "a NEW site re-derives the active slot from the identity file, "
@@ -10377,3 +10409,99 @@ class TestThePinFlagsAreMutuallyExclusive:
                     pass
             assert "not allowed with" not in err.getvalue(), (
                 f"--debug was refused beside {argv}: {err.getvalue()!r}")
+
+
+class TestAddAccountRefusesASplicedIdentity:
+    """`add_account` names every field it writes from `~/.claude.json`'s
+    `oauthAccount`, and under a pin that field names the PIN, not the login.
+
+    The refusal existed before this and sat at the `oauthAccount` read, which is
+    on the CREATE path only -- the refresh-in-place path returns several
+    hundred lines earlier, having already written the pin's names into the
+    serving slot's backup. It had no test at all, in either position: the
+    message string appeared once in `src/` and zero times in `tests/`.
+    """
+
+    def _sw(self, triple, live):
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        # Everything add_account touches BEFORE the guard, and nothing after --
+        # a stub reaching further would let the case pass on a build where the
+        # guard was deleted and something downstream happened to raise.
+        sw._refuse_session_shell = lambda: None
+        sw._setup_directories = lambda: None
+        sw._init_sequence_file = lambda: None
+        sw._migrate_org_fields = lambda: None
+        sw._get_current_identity_triple = lambda: triple
+        sw._live_login_identity = lambda: live
+        return sw
+
+    def _reached_the_guard(self, sw):
+        """Past the guard is measured by a SENTINEL on the next call, not by
+        'no exception' -- add_account raises for many reasons and a bare
+        pytest.raises(ConfigError) would pass on all of them."""
+        class _Past(Exception):
+            pass
+
+        def _boom(*_a, **_k):
+            raise _Past
+
+        sw._account_exists = _boom
+        return _Past
+
+    def test_a_spliced_config_is_refused_before_anything_is_written(self):
+        import pytest
+        from claude_swap.exceptions import ConfigError
+
+        sw = self._sw(("pinned@example.com", "org-PIN", "uuid-PIN"),
+                      ("serving@example.com", "org-LIVE"))
+        self._reached_the_guard(sw)
+        with pytest.raises(ConfigError, match="cloud pin is rewriting"):
+            sw.add_account()
+
+    def test_the_refusal_covers_the_refresh_in_place_path_too(self):
+        """The path the old placement missed. `_account_exists` is the FIRST
+        thing on it, so a build whose guard sits at the `oauthAccount` read
+        raises the sentinel here instead of refusing."""
+        import pytest
+        from claude_swap.exceptions import ConfigError
+
+        sw = self._sw(("pinned@example.com", "org-PIN", "uuid-PIN"),
+                      ("serving@example.com", "org-LIVE"))
+        past = self._reached_the_guard(sw)
+        try:
+            sw.add_account()
+        except ConfigError as exc:
+            assert "cloud pin is rewriting" in str(exc)
+        except past:
+            pytest.fail(
+                "add_account walked onto the refresh-in-place path with a "
+                "spliced identity: it will write the PIN's email and uuid into "
+                "the serving account's slot, and `_find_account_slot` will then "
+                "match nothing"
+            )
+        else:
+            pytest.fail("add_account neither refused nor reached the sentinel")
+
+    def test_an_unspliced_config_is_not_refused(self):
+        """THE CONTROL. Without it a guard that raised unconditionally would
+        pass both cases above."""
+        import pytest
+
+        sw = self._sw(("serving@example.com", "org-LIVE", "uuid-LIVE"),
+                      ("serving@example.com", "org-LIVE"))
+        past = self._reached_the_guard(sw)
+        with pytest.raises(past):
+            sw.add_account()
+
+    def test_no_live_login_at_all_is_not_a_splice(self):
+        """`_live_login_identity` returns None when it cannot look one up. That
+        is 'unknown', not 'mismatched', and refusing on it would break
+        add_account everywhere the optional pin package is absent."""
+        import pytest
+
+        sw = self._sw(("serving@example.com", "org-LIVE", "uuid-LIVE"), None)
+        past = self._reached_the_guard(sw)
+        with pytest.raises(past):
+            sw.add_account()
