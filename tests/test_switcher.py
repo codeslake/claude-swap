@@ -5451,6 +5451,44 @@ class TestSwitchSkipsBrokenSlots:
         # The login it replaced was captured first, so nothing was lost.
         assert s._read_account_credentials("1", "a@example.com")
 
+    def test_the_human_switch_says_it_landed_logged_out(
+        self, temp_home: Path, capsys
+    ):
+        """Human mode must not clear the login in silence.
+
+        Every other `_perform_switch` outcome prints under `emit_output`; the
+        empty-slot landing returns before that block, and `switch_to` builds
+        no result object off JSON, so the one switch that logs the machine out
+        was the one that said nothing at all.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+            },
+        }))
+
+        s.switch_to("2")
+
+        out = capsys.readouterr().out
+        assert "Account-2" in out, (
+            "the switch that logs the machine out printed nothing: "
+            f"{out!r}"
+        )
+        assert "/login" in out, (
+            "the user is now logged out and was not told how to recover: "
+            f"{out!r}"
+        )
+
     def test_a_landed_empty_slot_still_reads_as_active(self, temp_home: Path):
         """Landing logged-out must not make the slot invisible.
 

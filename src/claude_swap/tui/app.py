@@ -278,7 +278,18 @@ class CswapApp(App):
             if payload.get("switched"):
                 to = payload.get("to") or {}
                 target = to.get("email") or f"account {to.get('number')}"
-                self.notify(f"Switched to {target}", title="Switch")
+                if payload.get("needsLogin"):
+                    # Landing on a credential-less slot leaves the machine
+                    # LOGGED OUT. "Switched to <email>" describes that exactly
+                    # like a working account, and the recovery step (`/login`)
+                    # is only in the payload's own message.
+                    self.notify(
+                        str(payload.get("message") or f"Switched to {target}"),
+                        title="Switch",
+                        severity="warning",
+                    )
+                else:
+                    self.notify(f"Switched to {target}", title="Switch")
             else:
                 reason = str(payload.get("reason") or "no switch performed")
                 self.notify(reason, title="No switch", severity="warning")

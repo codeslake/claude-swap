@@ -2172,3 +2172,45 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
         ), active="9")
         assert out.index("a@x.com") < out.index("empty@x.com")
+
+
+@pytest.mark.asyncio
+class TestNeedsLoginIsReported:
+    """Landing on a credential-less slot logs the machine OUT.
+
+    `switch_to` reports that with `needsLogin`, and the notification path read
+    only `switched` — so the one switch that leaves the user unable to work
+    announced itself exactly like a working one.
+    """
+
+    class _EmptySlotSwitcher(FakeSwitcher):
+        def switch_to(
+            self, identifier: str, json_output: bool = False, force: bool = False
+        ) -> dict:
+            payload = super().switch_to(identifier, json_output, force)
+            payload["needsLogin"] = True
+            payload["reason"] = "switched-needs-login"
+            payload["message"] = (
+                f"Switched to Account-{identifier} "
+                f"(user{identifier}@example.com) — no stored login; run /login"
+            )
+            return payload
+
+    async def test_the_switch_notification_says_a_login_is_needed(self, tmp_path):
+        fake = self._EmptySlotSwitcher(
+            [make_account("1", active=True), make_account("2")], tmp_path
+        )
+        app = make_app(fake)
+        seen: list[tuple[str, dict]] = []
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.notify = lambda msg, **kw: seen.append((str(msg), kw))
+            app.do_switch("2")
+            await settle(pilot)
+
+        assert seen, "the switch produced no notification at all"
+        body = " ".join(m for m, _ in seen)
+        assert "/login" in body, (
+            f"a switch that logged the machine out reported a plain success: "
+            f"{seen!r}"
+        )

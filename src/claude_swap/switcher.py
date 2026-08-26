@@ -3748,30 +3748,20 @@ class ClaudeAccountSwitcher:
         if current_identity is None:
             # NO LIVE IDENTITY — but the ROSTER still knows which slot we are
             # on. Landing on a credential-less slot clears the live store by
-            # design (an active slot serving the previous account's token lies
-            # about whose quota is burning), and that made every account report
-            # is_active=False: no active mark anywhere, on the very slot the
-            # user had just moved to, until they logged in.
+            # design, which otherwise leaves no active mark anywhere, on the
+            # very slot the user just moved to.
             #
-            # Keyed on the CAUSE, not on `active_num is None`. That result has
-            # two causes and only this one licenses the roster's answer: a live
-            # identity that resolves to no slot means someone ran `/login` with
-            # an account never `cswap add`ed, and it belongs to NO slot.
-            # Falling back there marked the roster's slot active and handed it
-            # the stranger's live credential — measured: roster active = 2,
-            # live login stranger@, slot 2 (b@) reported active carrying
-            # STRANGER-TOKEN. The TUI then shows the stranger's usage under
-            # b@'s name, and with the ownership oracle unreachable that foreign
-            # utilization is recorded into the usage store keyed to slot 2,
-            # where it outlives the condition.
+            # Keyed on the CAUSE, not on `active_num is None`: that result has
+            # two causes, and only this one licenses the roster's answer. A
+            # live identity resolving to no slot means someone ran `/login`
+            # with an account never `cswap add`ed, so it belongs to NO slot —
+            # falling back there would mark the roster's slot active while it
+            # carries the stranger's token, and record the stranger's usage
+            # under that slot's name.
             #
-            # The two stores answer different questions. The roster is the
-            # authority on WHICH slot is active; the live store is the
-            # authority on what that slot currently holds. Deriving the first
-            # from the second let an empty answer to the second erase the
-            # first. Only consulted as a fallback, so a live identity still
-            # wins whenever there is one — an out-of-band `/login` or a switch
-            # by another surface must not be overruled by a stale roster.
+            # The roster is the authority on WHICH slot is active; the live
+            # store on what that slot currently holds. A fallback only, so a
+            # live identity still wins whenever there is one.
             roster_active = data.get("activeAccountNumber")
             if roster_active is not None:
                 active_num = str(roster_active)
@@ -6450,6 +6440,7 @@ class ClaudeAccountSwitcher:
         from_ref: dict | None,
         to_ref: dict,
         data: dict,
+        emit_output: bool = False,
     ) -> dict:
         """Land on a slot that has no stored login, logged out.
 
@@ -6475,46 +6466,22 @@ class ClaudeAccountSwitcher:
         """
         active = self._store._read_active_credentials()
         live = active.value
-        # m1: `live == "" and active.keychain_unavailable` used to sit
-        # alongside `active.degraded` here. `_read_active_credentials`'s only
-        # return path producing `value == ""` is the nothing-anywhere
-        # fallback -- `unreachable = keychain_failed or
-        # self._managed_read_failed; return ActiveCredentials("",
-        # unreachable, unreachable)` -- both flags come from that SAME
-        # variable, so whenever the dropped term could be True, `degraded` is
-        # already True too. Confirmed by mutation: deleting the term changed
-        # no test outcome across `TestSwitchSkipsBrokenSlots` (27 tests) or
-        # the full `test_switcher.py` (434 tests).
+        # PRESENT BUT UNREADABLE is not ABSENT, and both are falsy. `""` means
+        # nothing is there and clearing costs nothing; `None` means a
+        # credential exists and could not be read, so the stash cannot run
+        # while the clear still can — `unlink` needs a writable DIRECTORY, not
+        # a readable file — and this method is reached from the
+        # direct-activation path BEFORE its rollback snapshot.
+        #
+        # `degraded` is the same refusal one step further out: the Keychain
+        # read failed and the file covered it, and Claude Code writes
+        # rotations Keychain-only on macOS, so those bytes can be a superseded
+        # generation while the current one sits in the item we could not read.
+        # Deleting the original on their word is the strongest possible way to
+        # trust bytes flagged as untrustworthy.
+        #
+        # A successful stash is the license to clear, and there is none.
         if live is None or active.degraded:
-            # PRESENT BUT UNREADABLE — not the same as absent, and the two used
-            # to take the same branch because both are falsy. `""` means nothing
-            # is there and clearing costs nothing; `None` means a credential
-            # exists and we could not read it, so the stash cannot run and the
-            # clear below would delete the only copy. Measured on a real 0-mode
-            # file: the token was gone and the stash directory was empty, on a
-            # roster-imported slot with no backup either.
-            #
-            # `unlink` needs a writable DIRECTORY, not a readable file, so the
-            # clear succeeds precisely where the preservation cannot — and this
-            # method is reached from the direct-activation path BEFORE its
-            # rollback snapshot, so nothing downstream can put it back.
-            #
-            # `degraded` means the Keychain read failed and the plaintext file
-            # (or emptiness) covered it — and Claude Code writes rotations
-            # Keychain-only on macOS, so those bytes can be a SUPERSEDED
-            # generation while the current one sits in the item we could not
-            # read. The clear then deletes that item (attribute-only:
-            # `delete-generic-password` runs outside `_use_keychain`, so a
-            # read that times out under the statusline contention this module
-            # names, then a delete that succeeds once it clears, is
-            # ordinary), and the stash holds the stale copy. Measured: stash
-            # carries STALE-GEN-7, `CURRENT-GEN-9` exists nowhere.
-            # `ActiveCredentials.degraded` says these bytes must not be
-            # trusted; deleting the original on their word is the strongest
-            # possible way to trust them.
-            #
-            # Refusing is the same contract the stash already states: a
-            # successful stash is the license to overwrite, and there is none.
             raise CredentialReadError(
                 "The live credential may exist but cannot be read, so it "
                 "cannot be preserved before this slot's logged-out landing "
@@ -6531,61 +6498,31 @@ class ClaudeAccountSwitcher:
             )
         # BOTH axes. `_read_active_credentials` answers for OAuth *and* a
         # managed API key, so the stash above runs for either — but clearing
-        # only the OAuth one left a `primaryApiKey` behind and Claude Code kept
-        # authenticating as the account it belongs to, right after we announced
-        # "logged out". Measured: landing on an empty slot from an API-key
-        # account left `sk-ant-api03-...` live, `_build_accounts_info` marked
-        # the empty slot ACTIVE carrying it, and `--list` then raised a
-        # collision warning claiming a backup had been overwritten — which
-        # never happened. Same invariant as the docstring above: an active slot
-        # serving the previous account's credential lies about whose quota is
-        # burning, and a key bills per token while it lies.
+        # only the OAuth one leaves a `primaryApiKey` live, and Claude Code
+        # keeps authenticating (and billing) as the account it belongs to,
+        # right after this announced "logged out".
         residual_gone = self._store._clear_oauth_credential()
         # BOTH axes report. The managed item shadows `primaryApiKey` the way
         # the OAuth item shadows the file, and Claude Code reads it first.
         residual_gone = self._store._clear_managed_key() and residual_gone
-        # RE-READ, do not trust the calls. Both clears are best-effort by design
-        # — a down Keychain or a missing file warns and continues — so neither
-        # tells us whether the live store is actually empty. The `oauthAccount`
-        # pop below was unconditional, and a failed clear therefore produced
-        # exactly the state the landed-empty fallback is built to TRUST: no
-        # live identity, roster says slot N. The fallback marked slot N active
-        # and slot N read the live store, which still held the DEPARTED
-        # account's token.
+        # RE-READ, do not trust the calls: both clears are best-effort, so
+        # neither says whether the live store is actually empty. The
+        # `oauthAccount` pop below is what makes a failed clear dangerous — it
+        # produces exactly the state the landed-empty fallback TRUSTS (no live
+        # identity, roster says slot N), and slot N then reads the departed
+        # account's token. Refusing leaves roster and live store naming the
+        # same account, which is recoverable; the stash already ran.
         #
-        # Measured with the unlink failing (read-only mount, immutable bit):
-        # slot 2 active carrying DEPARTED-REFRESH while the switch reported
-        # "logged out". The macOS shape is likelier —
-        # `_delete_active_keychain_entry` swallows every exception and that
-        # path already documents a residual.
-        #
-        # Refusing here leaves the roster and the live store naming the SAME
-        # account, which is recoverable; popping the identity over a credential
-        # that is still live is the silent disagreement this method exists to
-        # prevent. The stash already ran, so nothing is lost by stopping.
-        # `!= ""`, not truthiness. `None` means a credential is PRESENT and
-        # unreadable, which is precisely "the clear did not succeed" — and it
-        # is falsy, so `if ...value:` let it through, collapsing the very
-        # distinction the refusal twenty lines above spends its length
-        # establishing. Reachable with nothing failing on the Keychain: the
-        # pre-clear read short-circuits there and never touches the
-        # `.credentials.json` shadow file (#86), so the earlier refusal cannot
-        # see it; the delete succeeds, the unlink fails, and the re-read
-        # reaches the file for the first time.
-        #
-        # `keychain_unavailable` too. `_delete_active_keychain_entry` calls
-        # `delete_password` directly and swallows every exception, so a failed
-        # delete does not flip the routing cache — but the re-read's own
-        # Keychain attempt DOES fail, and after its retries it falls through to
-        # the (now-cleared) file and returns `("", True, True)`. Empty and
-        # falsy, over a Keychain that still holds the departed token, which
-        # Claude Code reads BEFORE the file. The flag is the only witness.
-        # `residual_gone` because a READ cannot answer under a pinned file
-        # mode: nothing asks the Keychain there, so a surviving item is
-        # invisible to the check written to catch it. Measured, reads
-        # succeeding throughout — post-clear read `value='' unavailable=False`
-        # passed with the residual still present. The delete is the
-        # observation.
+        # Three witnesses, because none of them alone can answer:
+        #   `!= ""`  — `None` is PRESENT-and-unreadable, i.e. the clear did
+        #              not succeed, and it is falsy.
+        #   `keychain_unavailable` — a failed delete does not flip the routing
+        #              cache, so the re-read falls through to the (cleared)
+        #              file and returns `("", True, True)` over a Keychain
+        #              that still holds the departed token.
+        #   `residual_gone` — under a pinned file mode nothing asks the
+        #              Keychain at all, so a survivor is invisible to a READ.
+        #              The delete's own return is the observation.
         post = self._store._read_active_credentials()
         if post.value != "" or post.keychain_unavailable or not residual_gone:
             raise SwitchError(
@@ -6607,18 +6544,25 @@ class ClaudeAccountSwitcher:
             f"Switched to empty account {target_account} ({target_email}) — "
             f"logged out, awaiting login"
         )
+        note = (
+            f"Account-{target_account} has no stored credentials — you "
+            f"are now logged out. Run /login in Claude Code; the backup "
+            f"seeds itself on the next usage poll. (`cswap add` if it "
+            f"doesn't — seeding needs a reachable network and a "
+            f"non-degraded read.)"
+        )
+        # This return skips `_perform_switch`'s own emit block, so the one
+        # switch that clears the live login is the one that would otherwise
+        # say nothing; JSON callers read `needsLogin` instead.
+        if emit_output:
+            print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+            warning(note)
         return {
             "switched": True,
             "from": from_ref,
             "to": to_ref,
             "needsLogin": True,
-            "warnings": [
-                f"Account-{target_account} has no stored credentials — you "
-                f"are now logged out. Run /login in Claude Code; the backup "
-                f"seeds itself on the next usage poll. (`cswap add` if it "
-                f"doesn't — seeding needs a reachable network and a "
-                f"non-degraded read.)"
-            ],
+            "warnings": [note],
         }
 
     def _rebuilt_config(self, data: dict, account_num: str, email: str) -> str:
@@ -6648,25 +6592,23 @@ class ClaudeAccountSwitcher:
         clearing the live login would log the user out of a working account
         to reach one that was never actually empty.
 
-        PROBES when the cache is unset rather than reading None as "fine".
-        The cache is only filled by a real ``security`` call, and the paths
-        that matter most never make one: ``--force`` skips the live-identity
-        prefetch entirely (measured: zero keychain calls before this guard),
-        and a read satisfied by an ``.enc`` file short-circuits before the
-        keychain. So a locked keychain was indistinguishable from a probed
-        one, and the guard let the logout through. Failing closed costs a
-        spurious refusal; failing open costs a login.
+        PROBES when the cache is unset rather than reading ``None`` as
+        "fine". Only a real ``security`` call fills it, and the paths that
+        matter never make one — ``--force`` skips the live-identity prefetch,
+        and an ``.enc``-satisfied read short-circuits before the keychain — so
+        a locked keychain was otherwise indistinguishable from a probed one.
+        Failing closed costs a spurious refusal; failing open costs a login.
 
         Answers through ``_keychain_unreadable``, never the raw cache: a file
-        mode WE pinned also sets it False, and nothing failed there — the
-        credential went to the file deliberately, so an empty read means the
-        slot really is empty. Reading the flag raw sent a user switching to a
-        genuinely empty slot to "retry from a GUI terminal; do not re-add",
+        mode WE pinned also sets that cache, and nothing failed there, so an
+        empty read means the slot really is empty. The raw flag sent users
+        switching to a genuinely empty slot to "retry from a GUI terminal",
         the one remedy that cannot work.
         """
         if self.platform == Platform.MACOS and self._store._keychain_usable_cache is None:
             self._store._read_active_credentials()  # fills the cache
         return self._store._keychain_unreadable
+
     def _read_target_credentials(self, account_num: str, email: str) -> str:
         """The switch target's stored credential, or a SwitchError naming why.
 
@@ -6839,7 +6781,8 @@ class ClaudeAccountSwitcher:
                 )
                 if not target_creds:
                     return self._switch_to_empty_slot(
-                        target_account, target_email, from_ref, to_ref, data
+                        target_account, target_email, from_ref, to_ref, data,
+                        emit_output,
                     )
                 target_config = self._read_account_config(target_account, target_email)
                 # CONFIG ONLY. The credentials axis returned above, so
@@ -7202,7 +7145,8 @@ class ClaudeAccountSwitcher:
                 )
                 if not target_creds:
                     return self._switch_to_empty_slot(
-                        target_account, target_email, from_ref, to_ref, data
+                        target_account, target_email, from_ref, to_ref, data,
+                        emit_output,
                     )
                 target_config = self._read_account_config(target_account, target_email)
 

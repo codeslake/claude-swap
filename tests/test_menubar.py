@@ -556,3 +556,30 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     monkeypatch.setitem(sys.modules, "rumps", None)
     with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
         menubar.run(switcher=None)
+
+
+# --- switch notification -------------------------------------------------------
+
+def test_a_plain_switch_reports_the_propagation_delay():
+    title, body = menubar.switch_notification({"switched": True})
+    assert title == "Account switched"
+    assert "30s" in body
+
+
+def test_a_logged_out_landing_is_not_reported_as_a_working_switch():
+    """An empty slot is a valid destination and leaves the machine LOGGED OUT.
+
+    "Account switched / takes effect within ~30s" tells the user to wait for
+    an account that will never arrive; the recovery step is `/login`.
+    """
+    title, body = menubar.switch_notification({
+        "switched": True,
+        "needsLogin": True,
+        "message": "Switched to Account-2 (b@example.com) — no stored login; "
+                   "run /login",
+    })
+    assert "30s" not in body, (
+        f"a logged-out landing was reported as a switch that propagates: "
+        f"{title!r} {body!r}"
+    )
+    assert "/login" in body, f"the recovery step was dropped: {body!r}"
