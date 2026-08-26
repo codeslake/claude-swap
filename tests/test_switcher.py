@@ -12328,6 +12328,124 @@ def test_a_destination_that_refuses_rename_is_written_through(
         assert oct(target.stat().st_mode & 0o777) == "0o600"
 
 
+def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
+    temp_home: Path, monkeypatch
+):
+    """The chmod has to sit ABOVE the disown, not merely above the copy.
+
+    `_write_json` hands the temp's name to `source` and clears `temp_path` so a
+    dying copy leaves the complete content somewhere named. Anything that
+    raises AFTER that hand-off and BEFORE the copy is stranded instead: the
+    outer cleanup no longer owns the name and nothing prints it.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"chmod": False}
+
+    def interrupt_at_chmod(*_a, **_kw):
+        fired["chmod"] = True
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.os, "chmod", interrupt_at_chmod)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert fired["chmod"], "premise: the injected interrupt never fired"
+    strays = list(target.parent.glob("sequence.*.tmp"))
+    assert strays == [], f"an interrupt at the mode call stranded {strays}"
+
+
+def test_a_refused_mode_refuses_the_write_through(temp_home: Path, monkeypatch):
+    """A destination that cannot be narrowed must not receive the payload.
+
+    Nothing is committed at that point -- the chmod precedes the copy -- so
+    refusing costs a switch, while continuing publishes a credential the
+    destination did not previously hold, at a mode other users can read.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Previous content carries NO credential, so "it was already exposed" is
+    # false here: the write is what would expose one.
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def refused(*_a, **_kw):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.os, "chmod", refused)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert "primaryApiKey" not in target.read_text(encoding="utf-8"), (
+        "the payload was written to a destination whose mode could not be narrowed"
+    )
+
+
+def test_the_salvage_copy_is_never_wider_than_0600(temp_home: Path, monkeypatch):
+    """The unreadable-config copy carries the same payload and the same rule.
+
+    `shutil.copy` creates at the umask default and the mode was narrowed after,
+    so the copy held the content at 0644 for the width of that window -- and a
+    refused chmod aborted the switch while LEAVING the 0644 copy on disk.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+
+    switcher = ClaudeAccountSwitcher()
+    path = switcher.backup_dir / "sequence.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"primaryApiKey": "sk-ant-EXAMPLE"} not json', encoding="utf-8")
+    # 0644 ON PURPOSE, and it is the realistic state: `shutil.copy` CARRIES the
+    # source mode, so pinning the source at 0600 makes the copy 0600 whatever
+    # the code does and the case proves nothing. A config another writer left
+    # world-readable is exactly the one worth salvaging safely.
+    os.chmod(path, 0o644)
+
+    from claude_swap import switcher as switcher_mod
+
+    seen: list[int] = []
+    real_copy = switcher_mod.shutil.copyfile
+
+    def sampling_copy(src, dst, *a, **kw):
+        # Sampled between the copy and whatever narrows it: the widest point of
+        # the window, with the payload fully on disk.
+        result = real_copy(src, dst, *a, **kw)
+        seen.append(os.stat(dst).st_mode & 0o777)
+        return result
+
+    prev_umask = os.umask(0o022)
+    try:
+        monkeypatch.setattr(switcher_mod.shutil, "copyfile", sampling_copy)
+        switcher._salvage_unreadable(path, emit_output=False, warnings_out=[])
+    finally:
+        os.umask(prev_umask)
+
+    assert seen, "premise: no salvage file was created"
+    assert all(m == 0o600 for m in seen), (
+        f"the salvage copy existed at {[oct(m) for m in seen]} while it held the payload"
+    )
+
+
 def test_the_write_through_never_lands_the_secret_world_readable(
     temp_home: Path, monkeypatch
 ):
@@ -12424,51 +12542,13 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     assert [oct(m) for m in seen] == ["0o600"] * len(seen)
 
 
-def test_a_refused_mode_carry_does_not_fail_a_publish_that_landed(
-    temp_home: Path, monkeypatch, caplog, capsys
-):
-    """Once the bytes are through the mount the write is committed.
-
-    `shutil.copy` is `copyfile` + `copymode`, and `copymode`'s chmod is
-    unguarded — the same shape as the `copystat`/`utime` failure this branch
-    rejected `copy2` for, and reachable on a mount that refuses chmod. Raising
-    there makes the caller roll credentials back around a roster that WAS
-    written, which is the outcome `_write_json`'s own design forbids. The mode
-    is still wanted, so a refusal warns instead.
-    """
-    if sys.platform == "win32":
-        pytest.skip("POSIX modes only")
-    from claude_swap import switcher as switcher_mod
-
-    switcher = ClaudeAccountSwitcher()
-    target = switcher.backup_dir / "sequence.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
-
-    def busy(*_a, **_kw):
-        raise OSError(errno.EBUSY, "Device or resource busy")
-
-    real_chmod = os.chmod
-
-    def refuse_the_destination(path, *a, **kw):
-        if str(path) == str(target):
-            raise PermissionError(errno.EPERM, "Operation not permitted")
-        return real_chmod(path, *a, **kw)
-
-    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
-    monkeypatch.setattr(switcher_mod.os, "chmod", refuse_the_destination)
-
-    with caplog.at_level(logging.WARNING, logger="claude-swap"):
-        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
-
-    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
-    assert list(target.parent.glob("sequence.*.tmp")) == []
-    # The mode could not be set, so it must not pass in silence.
-    logged = " ".join(r.getMessage() for r in caplog.records)
-    assert "mode" in logged, f"a refused mode carry went unreported: {logged}"
-    # ...but on the LOG, not stdout: that is the `--json` envelope's channel,
-    # and a stray line there breaks every consumer's parse.
-    assert capsys.readouterr().out == "", "the mode warning reached stdout"
+# `test_a_refused_mode_carry_does_not_fail_a_publish_that_landed` lived here. It
+# asserted that a refused chmod warns rather than raises, on the reasoning that
+# "once the bytes are through the mount the write is committed" -- true while the
+# chmod sat BELOW the copy. It sits above it now, so a refusal happens with
+# nothing committed and the rollback it feared cannot occur. The contract it
+# guarded moved to `test_a_refused_mode_refuses_the_write_through`, which asserts
+# the destination does not receive the payload at all.
 
 
 def test_a_failed_write_through_names_the_copy_it_kept(temp_home: Path, monkeypatch):

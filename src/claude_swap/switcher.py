@@ -537,9 +537,21 @@ class ClaudeAccountSwitcher:
             salvage = path.with_name(f"{stem}.{n}")
             n += 1
         try:
-            shutil.copy(path, salvage)          # NOT copy2: mode is set below
-            if sys.platform != "win32":
-                os.chmod(salvage, 0o600)
+            # NARROW BEFORE THE BYTES, not after. The salvage holds the same
+            # payload as the config it copies, and `shutil.copy` CARRIES the
+            # source mode -- so a config another writer left at 0644 produced a
+            # 0644 copy of the credential, which a chmod below could only
+            # narrow afterwards and left permanently when refused. Created
+            # empty at 0600 (the name is fresh by the loop above, so O_EXCL
+            # cannot lose to us) and filled with `copyfile`, which truncates
+            # without touching the mode.
+            fd = os.open(salvage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                if sys.platform != "win32":
+                    os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+            shutil.copyfile(path, salvage)
         except OSError as e:
             raise SwitchError(
                 f"{path} could not be parsed and the salvage copy failed "
@@ -598,28 +610,34 @@ class ClaudeAccountSwitcher:
                 # mounting ~/.claude.json), so writing through is the only
                 # way to update it. Disowned before and reclaimed after, so
                 # a copy that dies part-way leaves the complete content.
+                # BEFORE THE COPY, and before the disown below. `copyfile`
+                # opens the destination `'wb'`: it truncates without touching
+                # the mode, so a chmod after it publishes the payload at
+                # whatever mode was already there. Above the disown for a
+                # second reason -- past that line the temp's name is held only
+                # by `source`, so anything raising in between strands it with
+                # nothing owning it and nothing printing where it went.
+                # `copy`/`copy2` cannot carry the mode instead: `copystat`'s
+                # `utime` fires after the bytes land, and a mount that refuses
+                # the rename can refuse that too.
+                if sys.platform != "win32":
+                    try:
+                        os.chmod(path, 0o600)
+                    except OSError as mode_err:
+                        # REFUSED, not logged. Nothing is committed at this
+                        # point, so refusing costs a switch; continuing writes
+                        # a credential the destination need not have held
+                        # before, at a mode other users can read.
+                        raise ConfigError(
+                            f"{path.name} could not be narrowed to 0600 "
+                            f"({mode_err}); refusing to write a credential "
+                            f"there. Fix the mode or the mount, then retry"
+                        ) from mode_err
                 source, temp_path = temp_path, None
                 kept = (
                     f"{path.name} may now be truncated; the complete content "
                     f"was kept at {source.name}"
                 )
-                # BEFORE the copy. `copyfile` opens the destination `'wb'`,
-                # truncating without touching its mode, so a chmod after it
-                # publishes the payload at whatever mode was already there --
-                # and a copy that dies part-way never reaches the call at all.
-                # `copy`/`copy2` cannot carry it instead: their mode and
-                # timestamp carries are unguarded, and a mount that refuses the
-                # rename refuses those too. Logged, not raised: the destination
-                # already holds the previous credential at that mode, so
-                # refusing the write protects nothing.
-                if sys.platform != "win32":
-                    try:
-                        os.chmod(path, 0o600)
-                    except OSError as mode_err:
-                        self._logger.warning(
-                            f"{path.name}'s mode could not be set to 0600 "
-                            f"({mode_err}); it may be readable by other users."
-                        )
                 try:
                     shutil.copyfile(source, path)
                 except OSError as copy_err:
