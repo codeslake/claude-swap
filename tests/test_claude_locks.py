@@ -59,6 +59,11 @@ class TestProperLockfile:
         # Nothing catches that: `pytest-timeout` is not a dependency and
         # neither CI job that runs this file sets `timeout-minutes`.
         def swept(path, *args, **kwargs):
+            # FILTERED. Unfiltered this rmdir'd every directory anything in
+            # the process created while it ran; `vanished` and `slow_utime`
+            # in this file both scope to the lock and this one did not.
+            if os.fspath(path) != os.fspath(lock_dir):
+                return real_mkdir(path, *args, **kwargs)
             assert time.monotonic() - started < 1.5, (
                 "the loop never reached its deadline"
             )
@@ -71,6 +76,42 @@ class TestProperLockfile:
                 pass
         elapsed = time.monotonic() - started
         assert elapsed < 1.5, f"a 0.3s budget took {elapsed:.2f}s"
+
+    def test_a_swept_name_does_not_pin_a_core_for_the_whole_budget(
+        self, lock_dir, monkeypatch
+    ):
+        """Ending at the deadline is not the same as waiting for it.
+
+        The swept arm falls through to the deadline, then stats a name that is
+        gone, then `continue`s -- so it never reaches the jittered sleep at the
+        bottom of the loop and retries as fast as the kernel will take it.
+        Measured on the branch before this: 25,184 mkdir attempts in 1.0s at
+        99% of one core, and `claude_credentials_lock` takes two locks, so a
+        9s default is ~18s of a pinned core. The sibling case above times the
+        budget and cannot see it: a hot spin and a patient wait both end at the
+        deadline.
+        """
+        real_mkdir = os.mkdir
+        attempts: list[int] = []
+
+        def swept(path, *args, **kwargs):
+            if os.fspath(path) != os.fspath(lock_dir):
+                return real_mkdir(path, *args, **kwargs)
+            attempts.append(1)
+            real_mkdir(path, *args, **kwargs)
+            os.rmdir(path)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", swept)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock_dir, timeout=0.3):
+                pass
+        assert attempts, "premise: the swept arm was never entered"
+        # A back-off of any sane size keeps a 0.3s budget in single digits;
+        # the unbounded spin was four orders of magnitude above this.
+        assert len(attempts) <= 30, (
+            f"{len(attempts)} attempts in a 0.3s budget — the swept arm is "
+            "spinning, not waiting"
+        )
 
     def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
         # Control: test_acquire_creates_and_release_removes above — a release
@@ -368,4 +409,64 @@ class TestAPermanentENOENTIsNotARetry:
         assert attempts["n"] <= 2, (
             f"{attempts['n']} mkdir attempts for a parent that cannot come "
             "back: that is a pinned core, not a retry"
+        )
+
+
+class TestTheBackstopIsReachableOnTheDeclaredFloor:
+    """An ini option the declared pytest cannot parse is not a backstop.
+
+    `faulthandler_exit_on_timeout` landed in pytest 9.0.0. Under 8.x it is an
+    unknown key: a `PytestConfigWarning` nobody reads, no abort, and the hang
+    the option exists to end. CI installs from `uv.lock` and is safe; an
+    editable install anywhere inside the declared range was not, and nothing
+    said so.
+    """
+
+    # option -> the first pytest that understands it
+    _INI_FLOORS = {"faulthandler_exit_on_timeout": (9, 0)}
+
+    @staticmethod
+    def _pyproject():
+        import tomllib
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        with open(root / "pyproject.toml", "rb") as fh:
+            return tomllib.load(fh), root
+
+    def test_the_declared_pytest_floor_understands_every_ini_option_used(self):
+        cfg, root = self._pyproject()
+        ini = cfg["tool"]["pytest"]["ini_options"]
+        used = {k: v for k, v in self._INI_FLOORS.items() if k in ini}
+        # THE DENOMINATOR. With no version-gated option declared there is no
+        # requirement, and an empty loop below would pass without looking.
+        assert used, (
+            "no version-gated ini option is declared — this guard has no "
+            f"subject; known ones: {sorted(self._INI_FLOORS)}"
+        )
+
+        specs = [d for d in cfg["dependency-groups"]["dev"]
+                 if d.split(">=")[0].strip() == "pytest"]
+        assert len(specs) == 1, f"expected one pytest dev spec, got {specs}"
+        declared = tuple(int(x) for x in specs[0].split(">=")[1].split(".")[:2])
+        for option, floor in used.items():
+            assert declared >= floor, (
+                f"`{option}` needs pytest >= {floor[0]}.{floor[1]} and the dev "
+                f"group declares >= {declared[0]}.{declared[1]}, so inside the "
+                "declared range the option is an unknown key and the backstop "
+                "is inert"
+            )
+
+    def test_the_lockfile_carries_the_same_floor(self):
+        """`uv sync --locked` fails on a specifier the lock disagrees with, so
+        a dependency edit is a two-file commit and a green suite never opens
+        the second one."""
+        cfg, root = self._pyproject()
+        spec = next(d for d in cfg["dependency-groups"]["dev"]
+                    if d.split(">=")[0].strip() == "pytest")
+        lock = (root / "uv.lock").read_text(encoding="utf-8")
+        needle = f'{{ name = "pytest", specifier = ">={spec.split(">=")[1]}" }}'
+        assert needle in lock, (
+            f"uv.lock does not carry {spec!r}; `uv sync --locked` refuses a "
+            "pyproject the lock was not regenerated for"
         )

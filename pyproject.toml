@@ -51,7 +51,12 @@ build-backend = "hatchling.build"
 packages = ["src/claude_swap"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
+# `pytest>=9.0`, NOT 8: `faulthandler_exit_on_timeout` below landed in
+# 9.0.0. On 8.x it is an unknown ini key -- a `PytestConfigWarning` in a
+# wall of output, no abort, and the hang the option exists to end. CI is
+# safe either way (`uv sync --locked`); an editable install inside the
+# declared range was not.
+dev = ["pytest>=9.0", "pytest-asyncio>=0.24", "pytest-xdist>=3.5"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

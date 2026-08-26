@@ -129,6 +129,14 @@ def proper_lockfile(
             # Swept between the two calls. Fall THROUGH to the deadline below,
             # never back to the top: a name swept on every attempt has to end
             # at the budget rather than spin until the sweeper stops.
+            #
+            # AND WAIT ON THE WAY. The fall-through reaches the deadline, then
+            # stats a name that is gone and `continue`s, so it never reaches
+            # the jittered sleep at the bottom -- ending at the budget while
+            # pinning a core for all of it. The ordinary "holder released
+            # between mkdir and stat" retry stays instant; only a name being
+            # swept out from under us backs off.
+            time.sleep(0.05)
         if time.monotonic() - start > timeout:
             raise ClaudeCodeLockTimeout(
                 f"Could not acquire {lock_dir.name} — Claude Code appears "
