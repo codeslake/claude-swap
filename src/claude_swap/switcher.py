@@ -4301,6 +4301,39 @@ class ClaudeAccountSwitcher:
         )
         self._repin_if_pin_slot_refreshed(account_num)
 
+    def _clear_pin_if_removed(self, email: str) -> None:
+        """Clear the cloud pin when the account it names is the one going away.
+
+        A pin that outlives its account is silent: `ensure_proxy` resolves the
+        slot, finds nothing and starts no proxy, while `settings.json` still
+        says pinned and the TUI still draws the Cloud row. Removal is the one
+        moment cswap knows the pin's subject just ceased to exist.
+
+        MATCHED ON THE ADDRESS ALONE, deliberately. Two slots may share one
+        across organizations, so this can clear a pin that named the sibling --
+        and that is the safe direction: a cleared pin is re-pinnable in one
+        command, while a dangling one is invisible until someone wonders why
+        Remote Control stopped. `clear_pin` re-reads both halves and reports,
+        so a clear that did nothing is not silent either.
+        """
+        try:
+            from claude_swap import pin as _pin
+
+            if not _pin.is_available():
+                return
+            pinned = _pin._pinned_email_now(self)
+            if not pinned or (pinned[0] or "") != email:
+                return
+            ok, msg = _pin.clear_pin(self)
+            warning(f"Cloud pin: {msg}")
+        except Exception as exc:  # noqa: BLE001 — removal already succeeded
+            # The account IS gone; failing here would report a removal that
+            # happened as an error. Say what was left behind instead.
+            warning(
+                f"the cloud pin still names {email}, which was just removed "
+                f"({exc}); run `cswap pin --clear`"
+            )
+
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
 
@@ -4388,6 +4421,10 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        # AFTER the roster write, not before: the pin's own clear re-reads the
+        # roster, and clearing first would have it resolve a slot that is still
+        # there.
+        self._clear_pin_if_removed(email)
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).

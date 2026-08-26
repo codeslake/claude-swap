@@ -1118,7 +1118,7 @@ class TestTheWiringCanAlwaysBeRemoved:
             import io
             from contextlib import redirect_stdout
 
-            buf = io.StringIO()
+            buf = _pin_io.StringIO()
             with redirect_stdout(buf):
                 rc = pin.run(sw, None, clear=True)
             out = buf.getvalue()
@@ -2491,7 +2491,7 @@ class TestPurgeDoesNotStrandTheWiring:
 
         sw = ClaudeAccountSwitcher()
         sw.backup_dir.mkdir(parents=True, exist_ok=True)
-        buf = io.StringIO()
+        buf = _pin_io.StringIO()
         with patch("builtins.input", return_value="y"), redirect_stdout(buf):
             sw.purge()
         return buf.getvalue()
@@ -10590,3 +10590,121 @@ class TestAPinSwingIsNotALoginInFlight:
             "docstring says a guard in cswap core consults it; the guard it "
             "softens refuses on every pin swing without it"
         )
+
+
+import contextlib
+import io as _pin_io
+
+
+class TestRemovingThePinnedAccountClearsThePin:
+    """`remove_account` deletes the slot and leaves `remoteControl` naming it.
+
+    The pin then points at an account that is gone: `ensure_proxy` resolves it,
+    finds nothing and starts no proxy, while `settings.json` still says pinned
+    and the TUI still draws the Cloud row. Nothing reports it, and the fix is
+    the account's own removal -- the one moment cswap knows the pin's subject
+    just ceased to exist.
+
+    The failure-modes doc lists this as B4 and names clearing it as work still
+    owed; this is that.
+    """
+
+    def _sw(self, tmp_path, pinned_email):
+        from claude_swap import switcher as _sw
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s.backup_dir = tmp_path
+        s._pinned_for_test = pinned_email
+        return s
+
+    def test_removing_the_pinned_account_asks_the_seam_to_clear(self, monkeypatch):
+        """RED: the removal path never mentions the pin."""
+        import ast
+        from pathlib import Path
+
+        src = Path(__file__).resolve().parent.parent / "src" / "claude_swap" / "switcher.py"
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "remove_account")
+        names = {getattr(c.func, "attr", None) or getattr(c.func, "id", None)
+                 for c in ast.walk(fn) if isinstance(c, ast.Call)}
+        assert names & {"clear_pin", "_clear_pin_if_removed"}, (
+            "remove_account does not clear the pin, so removing the pinned "
+            "account leaves settings.json naming it: no proxy starts, the TUI "
+            "still draws the Cloud row, and nothing says why"
+        )
+
+    def test_removing_a_DIFFERENT_account_leaves_the_pin_alone(self, tmp_path, monkeypatch):
+        """THE CONTROL. Clearing unconditionally would pass the case above and
+        unpin a live account every time any other slot is removed."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        calls = []
+        monkeypatch.setattr(_pin, "is_available", lambda: True)
+        monkeypatch.setattr(_pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-P"))
+        monkeypatch.setattr(_pin, "clear_pin",
+                            lambda _s: calls.append(1) or (True, "cleared"))
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s._clear_pin_if_removed("someone-else@example.com")
+        assert calls == [], (
+            "removing an unrelated account cleared the pin — every removal "
+            "would unpin whatever was live"
+        )
+
+    def test_it_clears_when_the_removed_account_IS_the_pinned_one(self, monkeypatch):
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        calls = []
+        monkeypatch.setattr(_pin, "is_available", lambda: True)
+        monkeypatch.setattr(_pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-P"))
+        monkeypatch.setattr(_pin, "clear_pin",
+                            lambda _s: calls.append(1) or (True, "cleared"))
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        buf = _pin_io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s._clear_pin_if_removed("pinned@example.com")
+        assert calls == [1], "the pinned account was removed and the pin stayed"
+        # THE OUTCOME, NOT JUST THE CALL. The handler swallows anything the
+        # body raises so a removal that already happened is never reported as
+        # an error -- which also hid a NameError in the success branch, and the
+        # call-count assertion above passed straight through it.
+        said = buf.getvalue()
+        assert "cleared" in said, f"the clear was not reported: {said!r}"
+        assert "still names" not in said, (
+            f"the success path reported a failure: {said!r}"
+        )
+
+    def test_no_extra_installed_asks_the_package_nothing(self, monkeypatch):
+        """A machine without the package has no pin to clear.
+
+        ASSERTED ON WHAT IS CALLED, not merely on "did not raise". Stubbing
+        `_pinned_email_now` alongside `is_available` makes the guard removable
+        without any case noticing -- measured: deleting the `is_available`
+        check left all four green. So the reads BELOW the guard raise here, and
+        reaching one is the failure.
+        """
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        def _boom(*_a, **_k):
+            raise AssertionError(
+                "the removal path read the pin on a machine with no extra "
+                "installed — the is_available guard is gone"
+            )
+
+        monkeypatch.setattr(_pin, "is_available", lambda: False)
+        monkeypatch.setattr(_pin, "_pinned_email_now", _boom)
+        monkeypatch.setattr(_pin, "clear_pin", _boom)
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        buf = _pin_io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s._clear_pin_if_removed("anyone@example.com")
+        # And silent: the handler would otherwise turn the AssertionError into
+        # a "still names" warning and this case would pass on the swallow.
+        assert buf.getvalue() == "", f"it spoke on a machine with no pin: {buf.getvalue()!r}"
