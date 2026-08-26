@@ -12488,6 +12488,53 @@ def test_the_write_through_never_lands_the_secret_world_readable(
     )
 
 
+def test_the_temp_is_created_narrow_on_a_name_that_does_not_exist(
+    temp_home: Path, monkeypatch
+):
+    """The 0600 in `os.open` is the ONLY thing narrowing a first-time temp.
+
+    On a fresh name `O_CREAT` honours its mode argument, so nothing else is
+    protecting the payload before `fchmod` runs -- and widening the literal
+    leaves the whole suite green, because the sibling case pre-creates its temp
+    at 0644 and measures a path where the argument is ignored.
+
+    The umask IS load-bearing here, unlike in that sibling: 0o600 & ~0o077 is
+    still 0o600, so a runner already at 077 cannot tell the literal apart from
+    a wider one.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(f".{os.getpid()}.tmp")
+    assert not temp.exists(), "premise: the temp name must be fresh for O_CREAT to apply its mode"
+
+    seen: list[int] = []
+    real_open = os.open
+
+    def sampling_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        if str(path) == str(temp):
+            seen.append(os.fstat(fd).st_mode & 0o777)
+        return fd
+
+    prev_umask = os.umask(0o022)
+    try:
+        monkeypatch.setattr(switcher_mod.os, "open", sampling_open)
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+    finally:
+        os.umask(prev_umask)
+
+    assert seen, "premise: the temp was never created through os.open"
+    assert seen[0] == 0o600, (
+        f"the temp was created at {oct(seen[0])}; on a fresh name the O_CREAT "
+        f"mode is what narrows it"
+    )
+
+
 def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     temp_home: Path, monkeypatch
 ):
