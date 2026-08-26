@@ -337,8 +337,8 @@ class AutoScreen(Screen):
                 # SET IS NOT APPLYING. This badge used to be lit by
                 # `pinned_email` alone, so it stayed green while the daemon
                 # could not mint the pinned token and every request went out
-                # unpinned — measured on a Mac, with the
-                # statusline and pin-coherence agreeing with it. `False` is the
+                # unpinned, with the statusline and the coherence check
+                # agreeing with it. `False` is the
                 # only value worth shouting about; `None` means "could not
                 # tell" and must read as healthy here, same rule as
                 # `pin_is_broken`.

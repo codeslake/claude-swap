@@ -527,7 +527,7 @@ class TestThePinBadgeDoesNotOverstate:
     def test_a_daemon_that_cannot_mint_is_not_a_healthy_pin(self, tmp_path):
         """SET is not APPLYING, and the badge was lit on SET alone.
 
-        Measured on a Mac: `○ cloud` in the TUI, `pinned#1` in the
+        Measured: `○ cloud` in the TUI, `pinned#1` in the
         statusline, `pin-coherence: OK` — settings, proxy.json, the daemon pid
         and the port all agreeing — while the daemon could not read the pinned
         account's credential and every request went out UNPINNED. The daemon

@@ -6847,35 +6847,20 @@ class ClaudeAccountSwitcher:
                 # THE IDENTITY FILE NAMES THE PIN WHILE ONE IS SET, and that
                 # is what keeps Remote Control alive across this switch.
                 # Claude Code takes a live bridge's OWNER from this field at
-                # creation; the authenticated-account slot holds the same
-                # account, so its identity check passes at once, latches, and
-                # the one path that would later adopt the server's answer is
-                # never reached. Every rotation after that compares the PINNED
-                # account (which is what `/api/oauth/validate` answers, since
-                # the pin swaps that route) against an owner frozen as
-                # whichever account happened to be active, and tears the
-                # bridge down. Measured 2026-08-19: 24 torn-off bridges across
-                # three machines in a day, several per rotation, seconds
-                # apart.
+                # creation and compares it on every rotation against what
+                # `/api/oauth/validate` answers — which the pin swaps — so an
+                # owner frozen as whichever account happened to be active
+                # tears the bridge down.
                 #
                 # Inference is NOT affected: it authenticates from
                 # `.credentials.json`, which still follows the switch. This
-                # field is identity, not authority.
+                # field is identity, not authority. Anything that needs the
+                # ACTIVE account reads `activeAccountNumber` from
+                # sequence.json, which no pin touches.
                 #
-                # AND THE IDENTITY IS THE PIN'S, NOT THE ACTIVE ACCOUNT'S.
-                # Under a pin this field stops answering "who is logged in"
-                # and answers "who owns the bridges", because Claude Code
-                # compares a bridge pointer against THIS field by name and no
-                # field of our own invention would be read. Anything that
-                # needs the active account reads `activeAccountNumber` from
-                # sequence.json, which no pin touches — a statusline that
-                # kept reading here showed the pin's usage under the active
-                # account's label.
-                #
-                # ASK THE SEAM, DO NOT COMPUTE IT. `pin.identity_for_config`
-                # owns this: resolving the pinned slot and reading its stored
-                # identity is pin policy, and doing it here also meant
-                # reaching a PRIVATE of pin.py. Raised by the cswap session.
+                # ASK THE SEAM, DO NOT COMPUTE IT: resolving the pinned slot
+                # and reading its stored identity is pin policy, and doing it
+                # here also meant reaching a PRIVATE of pin.py.
                 from claude_swap import pin as _pin
 
                 pin_oauth = _pin.identity_for_config(self)
@@ -6996,10 +6981,8 @@ class ClaudeAccountSwitcher:
                         # `oauthAccount` included — so splicing the pin into
                         # the sibling branch alone left the identity naming
                         # the account being switched to whenever the live
-                        # config was absent or unreadable. Caught in review by
-                        # the cswap session before this shipped; the two
-                        # branches are alternatives of one call and both had
-                        # to carry it.
+                        # config was absent or unreadable. The two branches
+                        # are alternatives of one call and both carry it.
                         if pin_oauth:
                             target_config_data = dict(target_config_data)
                             target_config_data["oauthAccount"] = identity_oauth
@@ -7078,11 +7061,6 @@ class ClaudeAccountSwitcher:
             except PermissionError:
                 raise ConfigError("Permission denied reading Claude config")
 
-            # UN-SPLICE BEFORE IT IS ARCHIVED. The backup writes below store
-            # this blob as the OUTGOING slot's config, and under a pin its
-            # `oauthAccount` is the pin's. Stored that way it outlives the
-            # pin. Done here and not in `_write_account_config`, which also
-            # moves configs between slots during a renumber.
             transaction = SwitchTransaction(
                 original_credentials=original_creds,
                 original_config=original_config,
@@ -7091,12 +7069,18 @@ class ClaudeAccountSwitcher:
                 config_path=config_path,
             )
 
+            # UN-SPLICE BEFORE IT IS ARCHIVED. The backup writes below store
+            # this blob as the OUTGOING slot's config, and under a pin its
+            # `oauthAccount` is the pin's — stored that way it outlives the
+            # pin. Done here rather than in `_write_account_config`, which
+            # also moves configs between slots during a renumber.
+            #
             # AFTER THE TRANSACTION, DELIBERATELY. `rollback` restores
             # `original_config` to the LIVE `~/.claude.json`, so un-splicing
-            # above this handed the error path a config naming the outgoing
-            # slot — the pin dropped and the bridge died on a failed switch,
-            # silently. Strings are immutable: the transaction keeps the live
-            # bytes, the archive writes below take the un-spliced value.
+            # above it would hand the error path a config naming the outgoing
+            # slot — dropping the pin and killing the bridge on a failed
+            # switch. Strings are immutable: the transaction keeps the live
+            # bytes and the archive writes below take the un-spliced value.
             if current_account and current_email:
                 original_config = self._config_naming_slot(
                     original_config, current_account, current_email
@@ -7447,32 +7431,22 @@ class ClaudeAccountSwitcher:
 
         # TEAR THE PIN DOWN FIRST — both halves, before the rmtree.
         #
-        # THE WIRING, because purge deletes backup_dir and takes the pin
-        # record, the cert dir and the daemon state with it, while
-        # .claude.json's env block is not in there and Claude Code applies it
-        # at boot. Left behind it points every hand-launched `claude` at a port
-        # nothing serves, with nothing remaining that knows how to remove it:
-        # exactly the stranding clear_wiring lives in this repo to prevent.
+        # THE WIRING, because purge deletes backup_dir while `.claude.json`'s
+        # env block is not in there and Claude Code applies it at boot. Left
+        # behind it points every hand-launched `claude` at a port nothing
+        # serves, with nothing left that knows how to remove it.
         #
-        # AND THE DAEMON, which unwiring does not touch: `clear_wiring` is "no
-        # proxy, no daemon and no credential — only a record cswap left", by
-        # its own docstring. The proxy is a SEPARATE PROCESS holding OAuth
-        # bearers, so an unwire-only purge left it listening after the user
-        # asked to remove ALL claude-swap data — and the rmtree then took the
-        # cert dir, `proxy.json` and daemon state, leaving nothing on the
-        # machine that names its port. `cswap pin --clear` could no longer find
-        # it and `kill` was the only cure for a process the user had no way to
-        # identify. `clear_pin` does both, and already tolerates a missing or
-        # broken package (it falls back to clearing the record itself), which
-        # is why it needs no guard here.
+        # AND THE DAEMON, which unwiring does not touch: the proxy is a
+        # SEPARATE PROCESS holding OAuth bearers, and the rmtree takes the
+        # cert dir and `proxy.json` with it, leaving nothing on the machine
+        # that names its port. `clear_pin` does both and already tolerates a
+        # missing or broken package, which is why it needs no guard here.
         #
-        # RE-READ AROUND IT, DO NOT TRUST A RETURN. Neither bool separates
-        # "there was nothing to remove" from "the lock was contended so this
-        # path was skipped", and both swallow per-path failures — only reading
-        # the configs tells ABSENT from FAILED, as pin.clear_pin and pin.heal
-        # already do. A survivor warns and the purge continues, like every
-        # other partial failure below; after this the user is the only one who
-        # can remove it, so the message names the file and the keys.
+        # RE-READ AROUND IT, DO NOT TRUST A RETURN: neither bool separates
+        # "nothing to remove" from "the lock was contended", so only reading
+        # the configs tells ABSENT from FAILED. A survivor warns and the purge
+        # continues, and the message names the file and the keys because after
+        # this the user is the only one who can remove it.
         from claude_swap import pin as _pin
 
         # CAPTURED BEFORE THE CLEAR, because the receipt is one of the things

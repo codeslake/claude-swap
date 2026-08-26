@@ -2,9 +2,9 @@
 
 Every way the pin can be silently absent, defeated, or lost, with the
 current behaviour and whether a session can recover without restarting.
-Written from a code audit plus live measurement on pmac (2026-07-28);
-section C re-verified against the shipped implementation on 2026-08-07,
-which is when C4 was added and C2's mechanism corrected.
+Written from a code audit plus live measurement on a mac; section C was
+re-verified against the shipped implementation, which is when C4 was
+added and C2's mechanism corrected.
 
 **Sections A, B, D, E are as first written and still hold.** B4 in
 particular is still an OPEN item, not a fixed one: `remove_account` does
@@ -128,8 +128,8 @@ broke on.
 `cswap run <n>` copies the account token into a session profile, so the
 same token then has two consumers — cswap's usage polling and the new
 session's own `fetchUtilization`. The usage budget is per token, and that
-doubling produced `http-429 per-token usage budget reached` twice on pmac
-tonight (21:30, 22:30), 2 minutes after a `cswap run 1`. The pin path never
+doubling produced `http-429 per-token usage budget reached` twice on a
+mac, each about 2 minutes after a `cswap run`. The pin path never
 touches `/api/oauth/usage` (0 calls in 433 traced requests) — this is a
 `cswap run` issue and belongs in its own PR.
 

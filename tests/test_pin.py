@@ -4371,9 +4371,9 @@ class TestHealADeadPin:
         """The same contract as `--get_port`, for the OTHER thing consumers
         cannot ask for — and the one that cost a user's laptop real time.
 
-        A session diagnosing the pin on a Mac did not know where the state
+        A consumer diagnosing the pin did not know where the state
         directory lives (it is not the Linux path), and nothing could tell it.
-        So it ran, over ssh, on a Mac:
+        So it ran:
 
             find ~/Library ~/.local/share -maxdepth 4 -name proxy.json ...
 
@@ -5479,7 +5479,7 @@ class TestANoteMustNotFailTheAction:
         """REPORTING THE PIN IS NOT REPORTING THE STATE.
 
         `Cloud account (RC/artifacts): …` prints `load_pin()` — the value this
-        code wrote itself. Measured 2026-08-17, three accounts at once:
+        code wrote itself. Measured with three accounts at once:
 
             cswap pin says      acct1@example.com     pinned, acct 1
             the live bridge is  org da3631be…           acct 2
@@ -8310,7 +8310,7 @@ class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
     server's answer is never reached again. Every rotation after that compares
     the PINNED account, which is what `/api/oauth/validate` answers because
     the pin swaps that route, against an owner frozen as whichever account was
-    active that day. Mismatch means teardown. Measured 2026-08-19: 24 bridges
+    active that day. Mismatch means teardown. Measured: 24 bridges
     torn off across three machines in one day, several per rotation, seconds
     apart.
     """
@@ -10256,3 +10256,101 @@ class TestASourceFileIsReadAsUTF8:
                    and n.func.attr == "read_text"
                    and not any(k.arg == "encoding" for k in n.keywords)]
         assert not flagged, "the lint would flag a correct read"
+
+
+class TestOneLoopbackProbe:
+    """`_port_answers` is documented as "The one probe, once", and its own
+    comment says two copies are two places for a timeout or an exception class
+    to drift. `serving_port` carried the second copy.
+    """
+
+    def test_serving_port_probes_through_port_answers(self, tmp_path,
+                                                      monkeypatch):
+        import json
+
+        from claude_swap import pin
+
+        (tmp_path / "pin-proxy").mkdir()
+        (tmp_path / "pin-proxy" / "proxy.json").write_text(
+            json.dumps({"port": 41234}), encoding="utf-8")
+
+        class _SW:
+            backup_dir = tmp_path
+
+        seen = []
+        monkeypatch.setattr(
+            pin, "_port_answers",
+            lambda port, timeout: seen.append((port, timeout)) or True)
+        assert pin.serving_port(_SW(), connect_timeout=0.25) == 41234
+        assert seen == [(41234, 0.25)], (
+            "serving_port opens its own socket instead of asking the module's "
+            f"one probe, so a change to _port_answers cannot reach it: {seen}")
+
+
+class TestThePinFlagsAreMutuallyExclusive:
+    """`cswap pin` takes exactly one of NUM|EMAIL / --clear / --heal /
+    --get_port / --get_certdir / --set_port / --ensure.
+
+    Every pair has to be refused, and refused with an exit code a shell can
+    branch on. A query that silently discarded an action would be
+    indistinguishable from having performed it.
+    """
+
+    ONE_OF = (["2"], ["--clear"], ["--heal"], ["--get_port"],
+              ["--get_certdir"], ["--set_port", "5"], ["--ensure"])
+
+    def test_every_pair_is_refused(self):
+        import itertools
+
+        import pytest
+
+        from claude_swap import cli
+
+        for a, b in itertools.combinations(self.ONE_OF, 2):
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(a + b)
+            assert exc.value.code == 2, (
+                f"{a + b} was not refused by the parser (exit "
+                f"{exc.value.code}); a discarded action reads as a performed "
+                "one")
+
+    def test_each_one_alone_still_parses(self, monkeypatch):
+        """The control: a matrix that refuses everything proves nothing."""
+        import pytest
+
+        from claude_swap import cli
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher",
+                            lambda **kw: object())
+        monkeypatch.setattr(cli, "_guard_root", lambda sw: None)
+        monkeypatch.setattr(cli, "_is_refused_root", lambda sw: False)
+        seen = []
+        monkeypatch.setattr(
+            "claude_swap.pin.run",
+            lambda sw, account, **kw: seen.append((account, kw)) or 0)
+        for argv in self.ONE_OF:
+            with pytest.raises(SystemExit) as exc:
+                cli._pin_command(list(argv))
+            assert exc.value.code == 0, f"{argv} was refused on its own"
+        assert len(seen) == len(self.ONE_OF), (
+            f"not every single flag reached pin.run: {seen}")
+
+    def test_debug_combines_with_all_of_them(self):
+        """`--debug` is not one of the exclusive set and must stay usable."""
+        import argparse
+        import io
+        import contextlib
+
+        import pytest
+
+        from claude_swap import cli
+
+        for argv in self.ONE_OF:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                try:
+                    cli._pin_command(list(argv) + ["--debug"])
+                except (SystemExit, argparse.ArgumentError):
+                    pass
+            assert "not allowed with" not in err.getvalue(), (
+                f"--debug was refused beside {argv}: {err.getvalue()!r}")

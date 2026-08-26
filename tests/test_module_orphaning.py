@@ -39,9 +39,8 @@ under `-n auto` this samples rather than proves. It is a tripwire on a
 condition that recurs, not a proof of its absence -- which is still strictly
 more than the list it replaces, because the list cannot fail at all.
 
-Written by the cswap session; placed here because 210 is the branch that
-carries the condition, and a guard that cannot fail on its own branch is the
-thing this repo spent the day deleting.
+Placed here because this is the branch that carries the condition: a guard
+that cannot fail on its own branch is not a guard.
 """
 
 from __future__ import annotations

@@ -126,11 +126,14 @@ Examples:
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
         """,
     )
-    parser.add_argument(
+    # EXACTLY ONE OF THESE. `--debug` stays outside the group; everything else
+    # is an action or a query, and a discarded one reads as a performed one.
+    one_of = parser.add_mutually_exclusive_group()
+    one_of.add_argument(
         "account", nargs="?", metavar="NUM|EMAIL", help="Account to pin to"
     )
-    parser.add_argument("--clear", action="store_true", help="Remove the pin")
-    parser.add_argument(
+    one_of.add_argument("--clear", action="store_true", help="Remove the pin")
+    one_of.add_argument(
         "--heal",
         action="store_true",
         help=(
@@ -144,7 +147,7 @@ Examples:
     # pin's own dynamic port and without that number every pinned session is
     # reported as bypassing the cache proxy. Nothing could ask, so the layout
     # and the schema became a compatibility surface we do not control.
-    parser.add_argument(
+    one_of.add_argument(
         "--get_port",
         action="store_true",
         help=(
@@ -152,12 +155,11 @@ Examples:
             "(exit 1 if none). For scripts: PORT=$(cswap pin --get_port)"
         ),
     )
-    # THE SAME ARGUMENT, for the path. A session diagnosing the pin on a Mac
-    # did not know the state directory is not at the Linux location, could not
-    # ask, and ran an unbounded `find` over ~/Library on a Mac to get a
-    # string this process already holds. What cannot be asked
-    # for gets searched for.
-    parser.add_argument(
+    # THE SAME ARGUMENT, for the path. The state directory is not at the same
+    # location on every platform, and nothing could ask for it — so a consumer
+    # ran an unbounded `find` over a home directory to get a string this
+    # process already holds. What cannot be asked for gets searched for.
+    one_of.add_argument(
         "--get_certdir",
         action="store_true",
         help=(
@@ -168,7 +170,7 @@ Examples:
     )
     # The WRITE side. Persisted in the pin's own settings file, not in
     # ~/.claude.json — that file is for what Claude Code reads.
-    parser.add_argument(
+    one_of.add_argument(
         "--set_port",
         type=int,
         metavar="N",
@@ -181,7 +183,7 @@ Examples:
     # a status line; this is called by an rc hook before every hand-launched
     # `claude`, where nothing of ours runs. Silent, always exit 0, and free
     # when nothing is wired.
-    parser.add_argument(
+    one_of.add_argument(
         "--ensure",
         action="store_true",
         help=(
@@ -191,27 +193,6 @@ Examples:
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
-    # `cswap pin 2 --clear` otherwise unpins and prints "Unpinned", giving no
-    # sign the 2 was discarded — indistinguishable from having pinned it.
-    if args.clear and args.account:
-        parser.error("--clear takes no account")
-    if args.heal and (args.account or args.clear):
-        parser.error("--heal takes no account and does not combine with --clear")
-    # Same rule as --clear/--heal: a query that silently discarded an action
-    # would be indistinguishable from having performed it.
-    if args.get_port and (args.account or args.clear or args.heal or args.ensure):
-        parser.error("--get_port takes no account and does not combine with other flags")
-    if args.get_certdir and (args.account or args.clear or args.heal
-                             or args.ensure or args.get_port):
-        parser.error(
-            "--get_certdir takes no account and does not combine with other flags"
-        )
-    if args.set_port is not None and (args.account or args.clear or args.heal
-                                      or args.ensure or args.get_port
-                                      or args.get_certdir):
-        parser.error("--set_port takes no account and does not combine with other flags")
-    if args.ensure and (args.account or args.clear or args.heal):
-        parser.error("--ensure takes no account and does not combine with other flags")
 
     from claude_swap.pin import run as pin_run
 
