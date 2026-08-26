@@ -474,12 +474,11 @@ def atomic_write_json(path: Path, data: dict) -> None:
     try:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         if sys.platform != "win32":
-            # On the fd, BEFORE the publish. Not for secrecy -- `mkstemp`
-            # opens at 0600 and a umask can only clear bits, so its temp is
-            # never wider. It is so the try block ends AT the publish: a
-            # chmod on the target afterwards is a statement that can fail
-            # once the rename has handed the temp name to whoever draws it
-            # next, which is the window every sibling here had to guard.
+            # On the fd, BEFORE the publish. Not for secrecy: `mkstemp`
+            # opens at 0600 and a umask only clears bits, so its temp is
+            # never wider. It is so the try block ends AT the publish — a
+            # chmod on the target after it can fail once the rename has
+            # handed the temp name to whoever draws it next.
             os.fchmod(fd, 0o600)
         os.close(fd)
         fd = -1

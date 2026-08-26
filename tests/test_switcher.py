@@ -12328,6 +12328,56 @@ def test_a_destination_that_refuses_rename_is_written_through(
         assert oct(target.stat().st_mode & 0o777) == "0o600"
 
 
+def test_the_write_through_never_lands_the_secret_world_readable(
+    temp_home: Path, monkeypatch
+):
+    """The chmod has to precede `copyfile`, not follow it.
+
+    `copyfile` opens the destination `'wb'`: it truncates without touching the
+    mode, so the payload lands at whatever Claude Code left there, which is
+    0644. A copy that dies part-way never reaches a chmod placed after it, and
+    a refused one leaves that mode permanently.
+
+    The umask is pinned to 022 because the assertion is otherwise vacuous: a
+    runner already at 077 gets 0600 from the unfixed order too.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    seen: list[int] = []
+    real_copyfile = switcher_mod.shutil.copyfile
+
+    def dying_copy(src, dst, *a, **kw):
+        real_copyfile(src, dst, *a, **kw)
+        seen.append(os.stat(dst).st_mode & 0o777)
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", dying_copy)
+    prev_umask = os.umask(0o022)
+    try:
+        with pytest.raises(ConfigError):
+            switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+    finally:
+        os.umask(prev_umask)
+
+    assert seen, "premise: the write-through never ran"
+    assert oct(seen[0]) == "0o600", (
+        f"the payload landed at {oct(seen[0])} and the copy then died; a chmod "
+        f"below the copy never runs at all"
+    )
+
+
 def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     temp_home: Path, monkeypatch
 ):
@@ -12335,9 +12385,13 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     `primaryApiKey` plus inline MCP credentials.
 
     The mode is sampled during the read-back — the widest point of the window,
-    where the payload is fully on disk and the publish has not happened. The
-    umask is pinned to 022 because the assertion is otherwise vacuous: a
-    runner whose umask is already 077 gets 0600 from the unfixed code too.
+    where the payload is fully on disk and the publish has not happened.
+
+    The temp is PRE-CREATED at 0644, which is the only state `fchmod` covers
+    and the one a reused pid produces: the open carries no `O_EXCL`, so an
+    existing name is reopened and `O_CREAT`'s mode argument is ignored. On a
+    name that does not exist the open already yields 0600 under any umask this
+    would run with, and the case passes with the `fchmod` deleted.
     """
     if sys.platform == "win32":
         pytest.skip("POSIX modes only")
@@ -12347,6 +12401,9 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     target = switcher.backup_dir / "sequence.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_suffix(f".{os.getpid()}.tmp")
+
+    temp.write_text("", encoding="utf-8")
+    os.chmod(temp, 0o644)
 
     seen: list[int] = []
     real_loads = json.loads

@@ -596,46 +596,41 @@ class ClaudeAccountSwitcher:
                     raise
                 # A bind-mounted destination pins the inode (a container
                 # mounting ~/.claude.json), so writing through is the only
-                # way to update it. Disowned before and reclaimed after: a
-                # copy that dies part-way must leave the complete content,
-                # and must say where, because nothing else names it.
+                # way to update it. Disowned before and reclaimed after, so
+                # a copy that dies part-way leaves the complete content.
                 source, temp_path = temp_path, None
-                try:
-                    shutil.copyfile(source, path)
-                except OSError as copy_err:
-                    raise ConfigError(
-                        f"{path.name} could not be updated in place "
-                        f"({copy_err}); it may now be truncated, and the "
-                        f"complete content was kept at {source.name}"
-                    ) from copy_err
-                except BaseException:
-                    # The Ctrl-C the rest of this change is about, at the one
-                    # publish that is not atomic. It has to stay an interrupt,
-                    # so the message cannot ride the exception: stderr, which
-                    # the `--json` envelope on stdout does not share.
-                    error(
-                        f"{path.name} may now be truncated; the complete "
-                        f"content was kept at {source.name}"
-                    )
-                    raise
-                temp_path = source
-                # `copyfile`, not `copy`/`copy2`: their mode and timestamp
-                # carries are unguarded, and a mount that refuses the rename
-                # refuses those too. Raising once the bytes are committed
-                # makes the caller roll back a write that worked, so the mode
-                # is set separately and a refusal is logged, not raised.
-                # LOGGED, not printed: `printer.warning` writes to stdout,
-                # which is where the `--json` envelope goes. Output policy
-                # belongs to `_perform_switch`, which owns `emit_output`.
+                kept = (
+                    f"{path.name} may now be truncated; the complete content "
+                    f"was kept at {source.name}"
+                )
+                # BEFORE the copy. `copyfile` opens the destination `'wb'`,
+                # truncating without touching its mode, so a chmod after it
+                # publishes the payload at whatever mode was already there --
+                # and a copy that dies part-way never reaches the call at all.
+                # `copy`/`copy2` cannot carry it instead: their mode and
+                # timestamp carries are unguarded, and a mount that refuses the
+                # rename refuses those too. Logged, not raised: the destination
+                # already holds the previous credential at that mode, so
+                # refusing the write protects nothing.
                 if sys.platform != "win32":
                     try:
                         os.chmod(path, 0o600)
                     except OSError as mode_err:
                         self._logger.warning(
-                            f"{path} was updated in place but its mode could "
-                            f"not be set to 0600 ({mode_err}); it may be "
-                            f"readable by other users."
+                            f"{path.name}'s mode could not be set to 0600 "
+                            f"({mode_err}); it may be readable by other users."
                         )
+                try:
+                    shutil.copyfile(source, path)
+                except OSError as copy_err:
+                    raise ConfigError(f"{kept} ({copy_err})") from copy_err
+                except BaseException:
+                    # An interrupt has to stay an interrupt, so the message
+                    # cannot ride it out. stderr, never stdout: that is the
+                    # `--json` envelope's channel.
+                    error(kept)
+                    raise
+                temp_path = source
         finally:
             # Every path where the name is still ours, including the Ctrl-C
             # no except can name. The EBUSY branch disowns it deliberately.
