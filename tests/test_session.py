@@ -132,12 +132,13 @@ def auth_status_tracks_seed(monkeypatch):
     """Fake `claude auth status --json`: logged in iff the profile is seeded.
 
     Reads CLAUDE_CONFIG_DIR from the probe env, so it also exercises that the
-    probe points at the right profile. Records every probe env for assertions.
+    probe points at the right profile.
+
+    It does NOT keep the envs it was handed. It did, for assertions nothing
+    ever wrote -- and a kept env dict is what a failing case prints.
     """
-    probe_envs: list[dict] = []
 
     def fake_run(cmd, env=None, **kwargs):
-        probe_envs.append(env)
         config_dir = Path(env["CLAUDE_CONFIG_DIR"])
         if (config_dir / ".credentials.json").exists():
             payload = {
@@ -151,7 +152,6 @@ def auth_status_tracks_seed(monkeypatch):
         return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(session_mod.subprocess, "run", fake_run)
-    return probe_envs
 
 
 @pytest.fixture
@@ -1301,6 +1301,27 @@ class TestMcpMirror:
 # ---------------------------------------------------------------------------
 # run() / exec handoff
 # ---------------------------------------------------------------------------
+
+
+def test_no_test_runs_with_an_outbound_hop_in_the_environment():
+    """An authenticated proxy in the operator's environment must not be visible.
+
+    Every double here forwards `os.environ` into the thing it fakes, and pytest
+    prints whatever a failing assertion touched -- so one unrelated red case
+    publishes `https://user:secret@host` into the log. cswap reads none of
+    these names, so removing them costs the suite nothing.
+
+    Vacuous on a runner that sets none of them, which is most CI. It is sharp
+    exactly where the exposure lives: a developer machine wired to a local
+    forward proxy.
+    """
+    from tests.conftest import OUTBOUND_HOP_ENV
+
+    present = [name for name in OUTBOUND_HOP_ENV if name in os.environ]
+    assert present == [], (
+        f"the suite is running with {present} set; a failing assertion that "
+        f"touches an env dict prints their values"
+    )
 
 
 class _ExecCalled(Exception):

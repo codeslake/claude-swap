@@ -443,6 +443,19 @@ def _make_fake_keyring() -> types.ModuleType:
     return mod
 
 
+# Every variable that can hand a child an outbound hop. The suite forwards
+# `os.environ` into its doubles and pytest prints whatever a failing assertion
+# touched, so an operator behind an authenticated proxy publishes that
+# credential on the first unrelated red case. cswap reads none of these names,
+# so the removal costs nothing.
+OUTBOUND_HOP_ENV = (
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+    "ALL_PROXY", "all_proxy",
+    "NO_PROXY", "no_proxy",
+)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     """Safety net: no test may read or write the developer's real ``$HOME``.
@@ -470,6 +483,8 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    for _hop in OUTBOUND_HOP_ENV:
+        monkeypatch.delenv(_hop, raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
     if "tmp_keychain" in request.fixturenames:
