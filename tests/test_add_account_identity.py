@@ -23,6 +23,7 @@ import pytest
 
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.exceptions import ConfigError, ValidationError
+import os
 
 CREDS = json.dumps({"claudeAiOauth": {
     "accessToken": "sk-ant-oat01-THEIRS", "refreshToken": "rt-theirs",
@@ -757,13 +758,24 @@ class TestTheStashNamesWhoCouldHaveWrittenIt:
 
         sw._stash_live_credential("{}", "foreign", "1", None)
 
+        # THE FIELD IS ALWAYS PRESENT, on every platform. An absent key and an
+        # empty list are different answers: absent means nobody asked, empty
+        # means asked and this platform cannot say.
         assert "writerCandidates" in seen, sorted(seen)
         cands = seen["writerCandidates"]
         assert isinstance(cands, list), cands
-        # this process is a candidate for anything written right now
-        assert any(str(__import__("os").getpid()) == str(c.get("pid"))
-                   for c in cands), cands
+
         for c in cands:
             assert "pid" in c and "argv" in c and "started" in c, c
             # NEVER token material, and never a full environment
             assert "env" not in c, c
+
+        # WHERE THE READING IS POSSIBLE, this process must be in it — a cap
+        # that drops the reader hides the one candidate every occurrence
+        # shares. Where it is not, empty is the honest answer and asserting a
+        # membership would demand a lie: /proc is what carries a start time
+        # without spawning anything, and Windows has no equivalent here.
+        if not os.path.isdir("/proc"):
+            assert cands == [], cands
+            return
+        assert any(str(os.getpid()) == str(c.get("pid")) for c in cands), cands

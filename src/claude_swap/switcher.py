@@ -322,6 +322,12 @@ def _writer_candidates(limit: int = 40) -> list[dict]:
     which is the honest answer rather than a partial one.
     """
     out: list[dict] = []
+    # ASKED, NOT INFERRED FROM AN EXCEPTION. Without this the platform
+    # contract held only because listdir happens to raise where /proc is
+    # absent — the right answer for the wrong reason, and a reason that a
+    # different filesystem layout can take away.
+    if not os.path.isdir("/proc"):
+        return out
     try:
         pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
