@@ -474,10 +474,9 @@ def atomic_write_json(path: Path, data: dict) -> None:
     try:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         if sys.platform != "win32":
-            # On the fd, BEFORE the publish. `mkstemp` masks its 0600 against
-            # the umask, so the mode is the caller's otherwise; and setting it
-            # on the published path instead leaves a statement that can fail
-            # after the rename has handed the temp name away.
+            # On the fd, BEFORE the publish: `mkstemp` masks its 0600
+            # against the umask, and a chmod on the published path would be
+            # a statement that can fail after the rename handed the name on.
             os.fchmod(fd, 0o600)
         os.close(fd)
         fd = -1

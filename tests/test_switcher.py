@@ -12290,43 +12290,11 @@ def test_a_destination_that_refuses_rename_is_written_through(
     `-v ~/.claude.json:/root/.claude.json` pins the inode, so `os.replace`
     raises EBUSY and writing through the mount is the only way to update it.
     `shutil.move` did this implicitly, for any error; only EBUSY earns it.
-    """
-    from claude_swap import switcher as switcher_mod
 
-    switcher = ClaudeAccountSwitcher()
-    target = switcher.backup_dir / "sequence.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
-
-    fired = {"replace": False}
-
-    def busy(*_a, **_kw):
-        fired["replace"] = True
-        raise OSError(errno.EBUSY, "Device or resource busy")
-
-    if sys.platform != "win32":
-        os.chmod(target, 0o644)
-    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
-    switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
-
-    assert fired["replace"], "premise: the injected EBUSY was never reached"
-    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
-    assert list(target.parent.glob("sequence.*.tmp")) == []
-    if sys.platform != "win32":
-        # The chmod-on-the-temp design exists because a 0644 ~/.claude.json
-        # once published a key world-readable; the write-through must carry it.
-        assert oct(target.stat().st_mode & 0o777) == "0o600"
-
-
-def test_a_write_through_survives_a_mount_that_refuses_timestamps(
-    temp_home: Path, monkeypatch
-):
-    """The mounts that refuse `rename` are the ones that refuse `utime`.
-
-    Only the bytes and the mode are wanted here. `copy2` also copies
-    timestamps, and `copystat` does not guard that call: a bind mount that
-    rejects it fails the publish AFTER the content has landed, turning a
-    switch that worked into one the caller rolls back.
+    The same mount refuses `utime`, so that is injected here too: `copystat`
+    does not guard the call, and `copy2` would fail the publish AFTER the
+    content had landed, turning a switch that worked into one the caller
+    rolls back.
     """
     from claude_swap import switcher as switcher_mod
 
@@ -12344,17 +12312,18 @@ def test_a_write_through_survives_a_mount_that_refuses_timestamps(
     def refused_utime(*_a, **_kw):
         raise PermissionError(errno.EPERM, "Operation not permitted")
 
+    if sys.platform != "win32":
+        os.chmod(target, 0o644)
     monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
     monkeypatch.setattr(os, "utime", refused_utime)
-
     switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
 
-    # Instrument guard: a publish that never went down the write-through
-    # branch would satisfy every assertion below for the wrong reason.
     assert fired["replace"], "premise: the injected EBUSY was never reached"
     assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
     assert list(target.parent.glob("sequence.*.tmp")) == []
     if sys.platform != "win32":
+        # The chmod-on-the-temp design exists because a 0644 ~/.claude.json
+        # once published a key world-readable; the write-through must carry it.
         assert oct(target.stat().st_mode & 0o777) == "0o600"
 
 

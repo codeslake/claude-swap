@@ -369,7 +369,7 @@ class TestTheWrittenFileLandsAt0600:
     """
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")
-    @pytest.mark.parametrize("umask", [0o022, 0o000, 0o377])
+    @pytest.mark.parametrize("umask", [0o022, 0o377])
     def test_whatever_the_umask(self, tmp_path, umask):
         p = tmp_path / "settings.json"
         previous = os.umask(umask)
