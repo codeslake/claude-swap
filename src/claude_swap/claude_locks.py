@@ -128,9 +128,8 @@ def proper_lockfile(
             continue
         time.sleep(0.25 + random.random() * 0.25)
 
-    # The mtime this holder last stamped: a takeover makes a new directory, so
-    # any other value at this path is somebody else's lock. Read back rather
-    # than assume what utime stored — a coarsened stamp would never match.
+    # A takeover makes a NEW directory, so any mtime but the one we stamped is
+    # somebody else's lock. Read back: a coarsened stamp never matches itself.
     stamped_ns = os.stat(lock_dir).st_mtime_ns
 
     stop_touching = threading.Event()
@@ -160,9 +159,7 @@ def proper_lockfile(
                 # Removing a successor's lock would leave its critical section
                 # with nothing on disk, so a third waiter takes it uncontested.
                 _logger.warning(
-                    "Lock %s was taken over while held; leaving the new "
-                    "holder's in place",
-                    lock_dir,
+                    "Lock %s was taken over while held; leaving it", lock_dir
                 )
         except FileNotFoundError:
             _logger.warning(

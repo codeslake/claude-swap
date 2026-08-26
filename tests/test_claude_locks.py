@@ -31,12 +31,8 @@ class TestProperLockfile:
         assert not lock_dir.exists()
 
     def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
-        """A stolen-and-recreated lock belongs to its new holder.
-
-        The control is test_acquire_creates_and_release_removes above: a
-        release that quietly stopped removing anything passes here and
-        fails there.
-        """
+        # Control: test_acquire_creates_and_release_removes above — a release
+        # that quietly stopped removing anything passes here and fails there.
         stolen_mtime = 1_000_000.0
         with proper_lockfile(lock_dir):
             # Deemed stale, removed, and re-created by somebody else.
@@ -48,18 +44,13 @@ class TestProperLockfile:
         assert os.stat(lock_dir).st_mtime == stolen_mtime
 
     def test_release_leaves_a_lock_a_running_toucher_saw(self, lock_dir, monkeypatch):
-        """A takeover is still a takeover after the toucher has run.
-
-        The toucher refreshed whatever sat at the path, so one tick later it
-        held the successor's mtime and the exit path removed their lock.
-        """
+        # A live toucher must not adopt the successor's stamp as its own.
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
         with proper_lockfile(lock_dir):
             os.rmdir(lock_dir)
             os.mkdir(lock_dir)
-            # A successor's toucher keeps it fresh. Stamp it: inode mtimes are
-            # ms-coarse, so a bare mkdir can land on our own acquire stamp. A
-            # whole second, one back, round-trips exactly and cannot collide.
+            # mtimes are ms-coarse, so a bare mkdir can land on our own
+            # acquire stamp; a whole second back round-trips and cannot.
             fresh = float(int(time.time()) - 1)
             os.utime(lock_dir, (fresh, fresh))
             time.sleep(0.25)  # at least one toucher tick
