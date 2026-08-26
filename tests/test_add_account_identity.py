@@ -718,3 +718,52 @@ def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
         "_get_current_identity_triple returned, or a sibling change that "
         "overwrites one of the unpacked names silently poisons it"
     )
+
+
+class TestTheStashNamesWhoCouldHaveWrittenIt:
+    """#117's writer is unidentified, and the stash is where that gets fixed.
+
+    The evidence already saved answers WHAT was written (both identities) and
+    WHEN (the credential's mtime). It does not answer WHO, and by the time
+    anyone reads the warning the candidates have exited. Measured 2026-08-25:
+    two foreign credentials landed 31 minutes apart, each belonging to a
+    DIFFERENT third account while the config kept naming the first — so it is
+    not a refresh (same account) and not a race (same account), it is somebody
+    logging in past cswap. Nothing recorded what was running at either moment,
+    so both are closed as unknown.
+
+    This is instrumentation, not a repair: it cannot stop the write, it makes
+    the NEXT one nameable.
+    """
+
+    def test_the_stash_records_the_processes_that_could_have_written_it(
+            self, tmp_path, monkeypatch):
+        from claude_swap import switcher as S
+
+        seen = {}
+
+        class _Store:
+            def _write_unclaimed_credential(self, blob, meta):
+                seen.update(meta)
+                return "entry-1"
+
+        sw = S.ClaudeAccountSwitcher.__new__(S.ClaudeAccountSwitcher)
+        sw._store = _Store()
+        sw._logger = __import__("logging").getLogger("t")
+        sw._read_json = lambda p: {"oauthAccount": {"emailAddress": "a@b.c"}}
+        sw._get_claude_config_path = lambda: tmp_path / ".claude.json"
+        monkeypatch.setattr(S, "get_credentials_path", lambda: tmp_path / "c.json")
+        (tmp_path / "c.json").write_text("{}")
+
+        sw._stash_live_credential("{}", "foreign", "1", None)
+
+        assert "writerCandidates" in seen, sorted(seen)
+        cands = seen["writerCandidates"]
+        assert isinstance(cands, list), cands
+        # this process is a candidate for anything written right now
+        assert any(str(__import__("os").getpid()) == str(c.get("pid"))
+                   for c in cands), cands
+        for c in cands:
+            assert "pid" in c and "argv" in c and "started" in c, c
+            # NEVER token material, and never a full environment
+            assert "env" not in c, c

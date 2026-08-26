@@ -300,6 +300,68 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
+import datetime as _dt
+
+
+def _writer_candidates(limit: int = 40) -> list[dict]:
+    """Processes that could have written the live credential, right now.
+
+    THE ONE THING THE STASH DOES NOT ALREADY RECORD. The saved evidence says
+    WHAT was written (both identities) and WHEN (the credential's mtime); by
+    the time a person reads the warning the candidates have exited, so every
+    occurrence closes as unknown. This is a list of suspects, not an answer:
+    it cannot say which one wrote the file, only which ones existed when it
+    was noticed.
+
+    NEVER the environment and never a token. argv can carry a secret a caller
+    typed, so it is truncated and the whole record is capped -- a stash entry
+    is read by a person, not parsed.
+
+    Linux-only by construction: /proc is how a process's start time is read
+    without spawning anything. On a platform without it the list is empty,
+    which is the honest answer rather than a partial one.
+    """
+    out: list[dict] = []
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return out
+    # NEWEST FIRST, AND THIS PROCESS ALWAYS. A write noticed now was made by
+    # something that existed a moment ago, so recency is the ranking — but a
+    # cap that drops us hides the one candidate every occurrence shares, and
+    # a suspect list missing the reader is misleading in the one direction
+    # that matters.
+    pids.sort(reverse=True)
+    me = os.getpid()
+    if me in pids:
+        pids.remove(me)
+    pids.insert(0, me)
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().replace(b"\0", b" ").decode(
+                    "utf-8", "replace"
+                ).strip()
+            st = os.stat(f"/proc/{pid}")
+        except OSError:
+            continue  # exited between listdir and read; not a candidate we can name
+        if not argv:
+            continue  # kernel thread
+        out.append(
+            {
+                "pid": pid,
+                "argv": argv[:160],
+                "started": _dt.datetime.fromtimestamp(
+                    st.st_ctime, tz=_dt.timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -6445,6 +6507,7 @@ class ClaudeAccountSwitcher:
                 "liveOauthAccount": live_oauth_account,
                 "resolvedIdentity": resolved,
                 "credentialsMtime": creds_mtime,
+                "writerCandidates": _writer_candidates(),
             },
         )
         self._logger.warning(
