@@ -406,3 +406,82 @@ class TestCcRefreshLockProtocol:
         with claude_config_lock(timeout=2.0):
             assert cfg.is_dir()
         assert not cfg.exists()
+
+
+class TestTheClampsSurviveWeakeningNotOnlyDeletion:
+    """`min(sleep, timeout)` is a no-op once most of the budget is spent.
+
+    The two cases that guard these clamps both use a timeout SMALLER than the
+    flat sleep (0.01 and 0.001), where `min(sleep, timeout)` and
+    `min(sleep, remaining)` are indistinguishable. Measured: weakening both
+    clamps to the whole timeout leaves the suite at 36/36 while the acquire
+    path overshoots by up to 0.5s, and at the production default the mutation
+    is a total no-op -- `proper_lockfile` is unbounded again.
+
+    The jitter is pinned, or the weakened form's overshoot is a random draw
+    that can land inside any fixed margin.
+    """
+
+    def test_a_timeout_above_the_sleep_still_bounds_the_call(
+        self, lock_dir, monkeypatch
+    ):
+        lock_dir.mkdir()  # fresh mtime -> contended, not stale
+        monkeypatch.setattr(claude_locks.random, "random", lambda: 1.0)
+        start = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock_dir, timeout=0.6):
+                pass
+        elapsed = time.monotonic() - start
+        # Correct: 0.5 then 0.1 -> 0.6. Weakened: 0.5 twice -> 1.0.
+        assert elapsed < 0.8, (
+            f"a 0.6s budget took {elapsed:.2f}s — the retry sleep clamped to "
+            "`timeout` rather than to what is left of it"
+        )
+
+    def test_the_rmdir_branch_clamps_to_what_is_left(
+        self, lock_dir, monkeypatch
+    ):
+        """Same weakening, the other clamp, read off the sleep ARGUMENTS.
+
+        A 0.05s flat sleep against a 0.175s budget overshoots by at most
+        0.05s, which wall-clock cannot separate from scheduling noise. What it
+        cannot hide is the shape: the correct clamp's LAST sleep is the
+        remainder and is therefore shorter than 0.05, while the weakened form
+        sleeps exactly 0.05 every time.
+        """
+        lock_dir.mkdir()
+        past = time.time() - claude_locks.CONFIG_STALENESS_S - 30
+        os.utime(lock_dir, (past, past))
+
+        real_rmdir = os.rmdir
+
+        def refuse(path, *a, **k):
+            if os.fspath(path) == os.fspath(lock_dir):
+                raise OSError(errno.EACCES, "cannot remove")
+            return real_rmdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "rmdir", refuse)
+
+        # Scoped to this thread: `claude_locks.time` IS the `time` module, so
+        # an unscoped patch records every other thread's sleeps too.
+        slept: list[float] = []
+        real_sleep = claude_locks.time.sleep
+        mine = threading.get_ident()
+
+        def recording(seconds):
+            if threading.get_ident() != mine:
+                return real_sleep(seconds)
+            slept.append(seconds)
+            return real_sleep(seconds)
+
+        monkeypatch.setattr(claude_locks.time, "sleep", recording)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock_dir, timeout=0.175):
+                pass
+        assert len(slept) >= 2, (
+            f"only {len(slept)} sleep(s) happened — the instrument, not the code"
+        )
+        assert min(slept) < 0.05, (
+            f"every sleep was a full {max(slept):.3f}s — the last one must be "
+            "the remainder of the budget, not the flat interval"
+        )
