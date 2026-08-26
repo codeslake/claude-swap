@@ -47,13 +47,23 @@ class TestProperLockfile:
         spin until the sweeper stops.
         """
         real_mkdir = os.mkdir
+        started = time.monotonic()
 
+        # THE BOUND IS ASSERTED WHERE IT IS REACHABLE. Both assertions below
+        # run only after `proper_lockfile` returns, so a loop that never exits
+        # -- `continue` instead of falling through to the deadline -- HANGS
+        # rather than failing: measured exit 124 with no test name printed,
+        # and under `-n auto` one spinning worker takes the whole run with it.
+        # Nothing catches that: `pytest-timeout` is not a dependency and
+        # neither CI job that runs this file sets `timeout-minutes`.
         def swept(path, *args, **kwargs):
+            assert time.monotonic() - started < 1.5, (
+                "the loop never reached its deadline"
+            )
             real_mkdir(path, *args, **kwargs)
             os.rmdir(path)
 
         monkeypatch.setattr(claude_locks.os, "mkdir", swept)
-        started = time.monotonic()
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(lock_dir, timeout=0.3):
                 pass

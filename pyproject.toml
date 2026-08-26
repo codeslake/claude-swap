@@ -65,6 +65,15 @@ pythonpath = ["src"]
 # store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
 # cores) and this box both get the cores they have.
 addopts = "-n auto --dist loadgroup"
+# A HANG BECOMES AN ABORT WITH STACKS, with no new dependency: pytest ships
+# both of these, and `exit_on_timeout` is what turns the dump into a failure
+# instead of a note in a job that keeps running. Neither CI job that runs the
+# lock tests sets `timeout-minutes`, and GitHub's default is 360 minutes, so
+# without this a spinning worker costs six hours and prints no test name.
+# Well above the whole suite's wall clock (~17s here, minutes on a 2-core
+# runner), so it can only fire on something that is not progressing.
+faulthandler_timeout = 600
+faulthandler_exit_on_timeout = true
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
