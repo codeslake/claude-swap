@@ -1808,12 +1808,18 @@ def run(
     the optional dependency is resolved here, at call time, not at import."""
     from claude_swap.printer import accent, dimmed, warning
 
+    # EVERY BRANCH ABOVE `_impl()` RUNS WITHOUT THE PACKAGE, and that ordering
+    # is the contract, not an accident: `--ensure`, `--set_port`, `--get_port`,
+    # `--get_certdir`, `--heal` and `--clear` are the commands a user reaches
+    # for when the pin is the broken thing. Each is answered from cswap's own
+    # files. Only pinning itself needs the package, so only it resolves one.
     if ensure:
         # The launch contract, which `--heal` deliberately does not make. An
         # rc hook calls this before EVERY `claude`, so it never fails (every
         # path exits 0, a raise included), stays silent, and is cheap on a
         # machine that never pinned. The irreducible part is the TRIGGER: a
-        # hand-launched `claude` execs
+        # hand-launched `claude` execs from the user's shell, and nothing of
+        # ours runs inside it.
         try:
             # NOTHING WIRED AND NOTHING RECORDED IS THE COMMON CASE.
             if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
@@ -1883,8 +1889,7 @@ def run(
         # A number on stdout and nothing else: this is read by `$(cswap pin
         # --get_port)`, so a prefix, a colour code or a "no pin set" sentence
         # would land INSIDE the caller's variable. Silence plus a nonzero exit
-        # lets a caller branch without string-matching. Before `_impl()`, like
-        # --heal and --clear: the question is most urgent when it is broken.
+        # lets a caller branch without string-matching.
         p = serving_port(switcher)
         if p is None:
             return 1
@@ -1894,16 +1899,14 @@ def run(
     if get_certdir:
         # The state directory is not at the same path on Darwin as on Linux,
         # and a layout that cannot be ASKED for is one every consumer has to
-        # SEARCH for. Before `_impl()` and a bare path, for the same reasons
-        # as --get_port; unlike it this does NOT probe, because "where does
-        # this host keep it" is true whether or not a daemon is up.
+        # SEARCH for. Unlike --get_port this does NOT probe: "where does this
+        # host keep it" is true whether or not a daemon is up.
         print(_certdir(switcher))
         return 0
 
     if heal_only:
-        # Deliberately before `_impl()`: healing must work when the package is
-        # missing or broken. Exit 0 either way, so this is safe in a timer or
-        # a shell chain. The budgets stay the HUMAN ones (`heal`'s 2.0s probe,
+        # Exit 0 either way, so this is safe in a timer or a shell chain.
+        # The budgets stay the HUMAN ones (`heal`'s 2.0s probe,
         # 9.0s lock) -- Claude Code holds `.claude.json.lock` routinely during
         # a credential refresh, and `--ensure` is the flag with the launch
         # budgets.
@@ -1912,9 +1915,7 @@ def run(
         return 0
 
     if clear:
-        # Works WITHOUT the package on purpose: `--clear` is what a user
-        # reaches for precisely when they have uninstalled the pin, and the
-        # wiring is cswap's own record. Any failure falls back, not just a
+        # Any failure falls back, not just a
         # missing package -- "installed but unusable" is the other way a user
         # ends up here. The same `clear_pin` the TUI calls: one decision, one
         # implementation, two renderings.
