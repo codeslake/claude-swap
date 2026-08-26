@@ -1825,9 +1825,8 @@ class ClaudeAccountSwitcher:
     def _empty_rotation_advice(self, any_readable: bool) -> str:
         """Why nothing is selectable, and the remedy that matches the cause.
 
-        Takes the verdict rather than re-deriving it: the caller has already
-        read every slot to reach this branch, and on a locked store each of
-        those reads is a subprocess and a logged warning.
+        Takes the verdict: the caller has already read every slot to reach
+        this branch, and on a locked store each read costs a subprocess.
 
         `_account_is_switchable` discards the absent-vs-unreadable verdict
         that `_read_account_credentials_ex` carries, so the second arm must

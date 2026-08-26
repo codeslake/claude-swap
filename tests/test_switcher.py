@@ -8663,16 +8663,13 @@ class TestDisableEnableAccount:
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
 
-        calls = []
-        real = s._account_is_switchable
         with patch.object(
-            s, "_account_is_switchable",
-            side_effect=lambda n: (calls.append(n), real(n))[1],
-        ):
+            s, "_account_is_switchable", wraps=s._account_is_switchable
+        ) as spy:
             s.set_account_disabled("1", True)   # rotation still has slot 2
             s.set_account_disabled("2", True)   # empties it: advice branch
 
-        assert len(calls) == 4, calls
+        assert spy.call_count == 4
 
     def test_disable_warns_about_credentials_when_no_slot_is_readable(
         self, temp_home, capsys
