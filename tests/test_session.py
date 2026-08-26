@@ -1315,12 +1315,38 @@ def test_no_test_runs_with_an_outbound_hop_in_the_environment():
     exactly where the exposure lives: a developer machine wired to a local
     forward proxy.
     """
-    from tests.conftest import OUTBOUND_HOP_ENV
+    from tests.conftest import outbound_hop_names
 
-    present = [name for name in OUTBOUND_HOP_ENV if name in os.environ]
+    present = outbound_hop_names(os.environ)
     assert present == [], (
         f"the suite is running with {present} set; a failing assertion that "
         f"touches an env dict prints their values"
+    )
+
+
+def test_the_hop_selection_is_by_shape_not_a_hand_written_list():
+    """`urllib` decides what an outbound hop is by SHAPE, so this must too.
+
+    `urllib.request.getproxies()` treats any ``<scheme>_proxy`` as a hop, and
+    the default opener installs a ``ProxyHandler`` built from it -- so the set
+    is open-ended and a literal tuple goes stale the first time an operator's
+    network needs SOCKS or FTP. What it misses is not a flag: it is a URL that
+    can carry ``user:secret@host``, which is the whole exposure.
+    """
+    from tests.conftest import outbound_hop_names
+
+    env = {
+        "HTTPS_PROXY": "x", "no_proxy": "y",          # the ones a list catches
+        "SOCKS_PROXY": "socks5://u:s@gw:1080",        # the ones it does not
+        "FTP_PROXY": "http://u:s@h:3128",
+        "NODE_USE_ENV_PROXY": "1",
+        "PATH": "/usr/bin", "PROXY_MODE": "z",        # controls: neither is a hop
+    }
+    assert outbound_hop_names(env) == [
+        "FTP_PROXY", "HTTPS_PROXY", "NODE_USE_ENV_PROXY", "SOCKS_PROXY", "no_proxy",
+    ], (
+        "the selection missed a hop urllib would read, or claimed one it would "
+        "not -- PROXY_MODE is not a hop and PATH is not either"
     )
 
 
