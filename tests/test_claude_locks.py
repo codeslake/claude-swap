@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import os
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -318,3 +320,52 @@ class TestCcRefreshLockProtocol:
         with claude_config_lock(timeout=2.0):
             assert cfg.is_dir()
         assert not cfg.exists()
+
+
+class TestAPermanentENOENTIsNotARetry:
+    """Only a SWEPT name wants the fall-through.
+
+    A missing parent (`~/.claude` removed or replaced between the
+    `parents=True` mkdir and `os.mkdir`) raises the same `FileNotFoundError`
+    and can never succeed, so the widened handler turned it into a full-budget
+    100%-CPU spin that then blamed Claude Code. Measured before the fix:
+    ~95,000 mkdir attempts per second, and at the production default that is
+    two locks x 9s of a pinned core.
+    """
+
+    def test_a_missing_parent_raises_at_once(self, tmp_path, monkeypatch):
+        gone = tmp_path / "gone"
+        gone.mkdir()
+        target = gone / "target.lock"
+
+        # THE WINDOW: the parent disappears AFTER `parents=True` ran, so the
+        # `os.mkdir` inside the loop can never succeed. `parents=True` is what
+        # makes a plain rmtree before the call insufficient — it just puts the
+        # directory back, and the lock is taken.
+        real_mkdir = os.mkdir
+        attempts = {"n": 0}
+
+        def vanished(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                attempts["n"] += 1
+                # REALLY GONE, not just the errno: the retry's own
+                # `parents=True` already ran, and whether the parent is there
+                # is the only thing that separates this from a swept name.
+                shutil.rmtree(gone, ignore_errors=True)
+            return real_mkdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", vanished)
+        start = time.monotonic()
+        with pytest.raises(FileNotFoundError):
+            with proper_lockfile(target, timeout=1.0):
+                pass
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.5, (
+            f"a permanent ENOENT burned {elapsed:.2f}s of the budget spinning "
+            f"over {attempts['n']} attempts instead of surfacing — and the "
+            "timeout then blames Claude Code"
+        )
+        assert attempts["n"] <= 2, (
+            f"{attempts['n']} mkdir attempts for a parent that cannot come "
+            "back: that is a pinned core, not a retry"
+        )

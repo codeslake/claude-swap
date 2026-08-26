@@ -64,14 +64,25 @@ pythonpath = ["src"]
 # 1929 passed / 4 skipped every time, three consecutive runs, real account
 # store hash unmoved. `auto` rather than a fixed number so CI runners (2-4
 # cores) and this box both get the cores they have.
-addopts = "-n auto --dist loadgroup"
+# `--max-worker-restart=0` IS PART OF THE BACKSTOP BELOW, not a tuning
+# knob. With the faulthandler set to exit on timeout, a wedged test kills
+# its worker -- and under `loadgroup` xdist then wedges in the
+# worker-replacement path instead of reporting the item. Measured on a
+# 41-test repo with one hanging case and a 3s budget:
+#   --dist loadgroup                      rc=124, 0 crash lines (HUNG)
+#   --dist load                           rc=1 in 5.4s, names the test
+#   --dist loadgroup --max-worker-restart=0  rc=1 in 4.2s, names the test
+# `--dist load` is not available here: conftest pins the real-keychain
+# group with `xdist_group`, which only `loadgroup` honours.
+addopts = "-n auto --dist loadgroup --max-worker-restart=0"
 # A HANG BECOMES AN ABORT WITH STACKS, with no new dependency: pytest ships
 # both of these, and `exit_on_timeout` is what turns the dump into a failure
 # instead of a note in a job that keeps running. Neither CI job that runs the
 # lock tests sets `timeout-minutes`, and GitHub's default is 360 minutes, so
 # without this a spinning worker costs six hours and prints no test name.
-# Well above the whole suite's wall clock (~17s here, minutes on a 2-core
-# runner), so it can only fire on something that is not progressing.
+# PER TEST, not per suite -- pytest arms it in a `pytest_runtest_protocol`
+# hookwrapper, so 600s is compared against the slowest SINGLE case (~10s
+# here), not against the run. Collection is not covered at all.
 faulthandler_timeout = 600
 faulthandler_exit_on_timeout = true
 asyncio_default_fixture_loop_scope = "function"

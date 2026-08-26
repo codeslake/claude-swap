@@ -63,7 +63,9 @@ jobs:
       - name: Run macOS Keychain tests (contract + real security wrapper)
         # faulthandler dumps every thread's stack if a test exceeds 60s — a
         # `security` call blocking on an invisible SecurityAgent dialog would
-        # otherwise hang the job with no clue where. The step timeout is the
-        # backstop that actually kills it.
+        # otherwise hang the job with no clue where. It now ABORTS the worker
+        # as well: `faulthandler_exit_on_timeout` is set repo-wide and this
+        # step overrides only the budget. So the step timeout is the second
+        # backstop, not the one that acts first.
         timeout-minutes: 5
         run: uv run pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py -v -o faulthandler_timeout=60

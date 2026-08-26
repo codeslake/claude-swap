@@ -118,10 +118,17 @@ def proper_lockfile(
         except FileExistsError:
             pass
         except FileNotFoundError:
+            # ONLY A SWEPT NAME RETRIES. The same errno arrives when the
+            # PARENT is gone -- removed or replaced after the `parents=True`
+            # above -- and that can never succeed, so the fall-through became a
+            # full-budget 100%-CPU spin (measured ~95,000 mkdir/s) ending in a
+            # timeout that blames Claude Code for a directory nobody has.
+            # The parent existing is what separates them, and it is one stat.
+            if not lock_dir.parent.is_dir():
+                raise
             # Swept between the two calls. Fall THROUGH to the deadline below,
             # never back to the top: a name swept on every attempt has to end
             # at the budget rather than spin until the sweeper stops.
-            pass
         if time.monotonic() - start > timeout:
             raise ClaudeCodeLockTimeout(
                 f"Could not acquire {lock_dir.name} — Claude Code appears "
