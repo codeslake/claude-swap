@@ -329,6 +329,39 @@ class TestSwapAccounts:
         assert slot_2.exists(), "account 2's profile was left under slot 1's key"
         assert slot_2.read_text() == "SLOT-2-HISTORY"
 
+    def test_swap_interrupted_just_past_a_move_still_reverses_it(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """An abort landing just PAST a rename must still undo that rename.
+
+        The rename and the record of it are two statements, and a signal is
+        delivered between them. Recording after the call returns therefore
+        loses a move that is already on disk, and the slot then serves the
+        other account's session history while the swap reports it aborted.
+        """
+        switcher = ClaudeAccountSwitcher()
+        email = self._same_email_slots(switcher, sample_sequence_data_with_org)
+
+        real_replace = os.replace
+        landed: list[str] = []
+
+        def interrupt_just_past_the_move(src, dst):
+            # One shot: the rollback's own reverse must run for real.
+            real_replace(src, dst)
+            if not landed and not str(dst).endswith(".swapping"):
+                landed.append(str(dst))
+                raise KeyboardInterrupt
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "replace", interrupt_just_past_the_move)
+            with pytest.raises(KeyboardInterrupt):
+                switcher.swap_accounts("1", "2")
+
+        assert landed, "the injected interrupt never fired"
+        slot_2 = switcher._session_dir("2", email) / "marker"
+        assert slot_2.exists(), "account 2's profile was left under slot 1's key"
+        assert slot_2.read_text() == "SLOT-2-HISTORY"
+
     def test_swap_interrupted_before_the_first_move_is_not_reversed(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
@@ -358,6 +391,38 @@ class TestSwapAccounts:
         assert tripped, "the injected interrupt never fired"
         assert self._marker(switcher, "1", email) == "SLOT-1-HISTORY"
         assert self._marker(switcher, "2", email) == "SLOT-2-HISTORY"
+
+    def test_swap_of_two_emails_still_reverses_the_move_on_failure(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The gate exists for the same-email case, but it guards both.
+
+        With two emails the four session-directory keys are distinct, so a
+        reverse that never runs is silent: the profiles just stay under the
+        keys the aborted swap handed them.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        emails = {
+            num: sample_sequence_data["accounts"][num]["email"] for num in ("1", "2")
+        }
+        for num, email in emails.items():
+            switcher._write_account_credentials(num, email, f"creds-{num}")
+            profile = switcher._session_dir(num, email)
+            profile.mkdir(parents=True, exist_ok=True)
+            (profile / "marker").write_text(f"SLOT-{num}-HISTORY")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                ClaudeAccountSwitcher, "_write_account_credentials", _refuse_write
+            )
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
+
+        for num, email in emails.items():
+            marker = switcher._session_dir(num, email) / "marker"
+            assert marker.exists(), f"slot {num}'s profile was not moved back"
+            assert marker.read_text() == f"SLOT-{num}-HISTORY"
 
     def test_swap_same_email_persistent_failure_keeps_staged_copy(
         self, temp_home: Path, sample_sequence_data_with_org: dict

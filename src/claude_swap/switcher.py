@@ -1151,10 +1151,11 @@ class ClaudeAccountSwitcher:
         if email_a == email_b:
             # Same email: the two slots' backup keys fully overlap, so every
             # write below overwrites the other account's material. Park
-            # durable copies first — a failure mid-write can then never leave
-            # a credential existing only in this process's memory. Outside the
-            # try: it can fail with nothing mutated, and the rollback restores
-            # by rewriting both slots, invalidating two live session profiles.
+            # durable copies first: a failure mid-write can then never leave a
+            # credential existing only in this process's memory. Kept outside
+            # the try because it can fail with nothing mutated, and a rollback
+            # is not free — it rewrites both slots, which drops both session
+            # profiles' stored credentials.
             staging = self._stage_overlap_material(
                 {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
             )
@@ -1333,9 +1334,13 @@ class ClaudeAccountSwitcher:
         profile from the relocated backups, so a skipped move costs at most
         that slot's session history.
 
-        Appends to ``moved`` as each directory lands, not at the end: an
-        abort can arrive on either side of any rename, and for a same-email
-        caller reversing a move that never ran IS a swap.
+        Appends to ``moved`` in a ``finally``, because an abort can arrive on
+        either side of a rename and the rename and its record are two
+        statements. ``exists()`` after an atomic rename is exactly "it
+        landed", and each guard above proved the destination free, so a
+        failed rename records nothing. Neither call can raise, so the
+        original exception is never masked. A same-email caller needs that
+        precision: for it, reversing a move that never ran IS a swap.
         """
         dir_a = self._session_dir(num_a, email_a)
         dir_b = self._session_dir(num_b, email_b)
@@ -1348,12 +1353,18 @@ class ClaudeAccountSwitcher:
                 staging = dir_a.with_name(dir_a.name + ".swapping")
                 os.replace(dir_a, staging)
             if dir_b.exists() and not new_b.exists():
-                os.replace(dir_b, new_b)
-                moved.append(new_b)
+                try:
+                    os.replace(dir_b, new_b)
+                finally:
+                    if new_b.exists():
+                        moved.append(new_b)
             if staging is not None and not new_a.exists():
-                os.replace(staging, new_a)
-                staging = None
-                moved.append(new_a)
+                try:
+                    os.replace(staging, new_a)
+                finally:
+                    if new_a.exists():
+                        staging = None
+                        moved.append(new_a)
         except OSError as e:
             self._logger.warning(f"Session profile move skipped during swap: {e}")
         finally:
@@ -1394,9 +1405,11 @@ class ClaudeAccountSwitcher:
         )
         failures = 0
         # Undo the session-profile exchange (same staging trick, reversed).
-        # Unlike the credential steps below, this one is not a no-op when its
-        # forward half never ran: it would exchange two untouched profiles.
+        # Unlike the credential steps below, this is not a no-op when its
+        # forward half never ran: with one email the two slots' keys are each
+        # other's destinations, so it would exchange two untouched profiles.
         if moved:
+            self._logger.error(f"Reversing {len(moved)} session-profile move(s)")
             self._swap_session_dirs(num_b, email_a, num_a, email_b, [])
         overlap = email_a == email_b
         for kind, num, email, original in (
