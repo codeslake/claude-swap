@@ -595,7 +595,7 @@ class CredentialStore:
         otherwise nudge the user into an unnecessary re-login.
         """
         keychain_failed = False
-        self._managed_read_failed = False
+        self._managed_read_tls.failed = False
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         #
         # READ THE ITEM FOR *THIS* PROFILE, NOT THE FIXED NAME.
@@ -662,16 +662,8 @@ class CredentialStore:
         # claim as "nothing" from a clean one, on EITHER axis. Folding the
         # managed read's own failure in is what stops an API-key account's live
         # key reading as a genuinely empty slot.
-        unreachable = keychain_failed or self._managed_read_failed
+        unreachable = keychain_failed or self._managed_read_tls.failed
         return ActiveCredentials("", unreachable, unreachable)
-
-    @property
-    def _managed_read_failed(self) -> bool:
-        return getattr(self._managed_read_tls, "failed", False)
-
-    @_managed_read_failed.setter
-    def _managed_read_failed(self, value: bool) -> None:
-        self._managed_read_tls.failed = value
 
     def _read_managed_key(self) -> str:
         """Read the active managed API key, or "" when absent. Non-mutating.
@@ -712,7 +704,7 @@ class CredentialStore:
                 # `_read_active_credentials` return ('', False, False),
                 # indistinguishable from an empty slot, while the key kept
                 # authenticating and billing per token.
-                self._managed_read_failed = True
+                self._managed_read_tls.failed = True
                 self._host._logger.warning(f"Managed-key Keychain read failed: {e}")
                 val = None
             if val:

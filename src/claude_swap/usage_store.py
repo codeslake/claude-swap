@@ -1169,37 +1169,20 @@ class UsageStore:
         must become fetch-eligible again so the next pass can prove the new
         token good. A no-op for rows with no strikes.
 
-        ``revoke_claim`` (default True) also fences out any fetch lease bound
-        to the OLD credential generation — needed by the credential-refresh
-        callers (login/add/import), whose whole premise is that lineage is
-        now dead. Callers with no credential change of their own to fence —
-        the collector's fingerprint-healed strike-clear reachable from a
-        lock-free, no-network ``fetch=set()`` read every 3s — must pass
-        ``revoke_claim=False``: nulling `claimId` there voids a DIFFERENT
-        collector's live, in-flight lease on ``record()``'s own fencing
-        field, discarding its measurement.
+        The defaults are for a caller that REWROTE the credential: that
+        lineage is dead, so its fetch lease and its whole failure history go
+        with it. The three keywords are the opposite caller — the collector,
+        which merely OBSERVES a strike heal from a lock-free ``fetch=set()``
+        read and has no credential change of its own to fence:
 
-        ``strike_only`` (default False) limits the clear to the STRIKE
-        fields (``authDeadStrikes``/``struckFingerprint``) and leaves
-        ``consecutiveFailures``/``lastError``/``backoffUntil`` untouched.
-        The five credential-refresh callers keep the default full clear — a
-        freshly written credential has no history at all, so a stale
-        backoff must not survive it either. Only the collector's
-        fingerprint-healed strike-clear passes ``strike_only=True``: that
-        call is evidence a STRIKE healed, not that the server's throttle
-        lifted, and unconditionally zeroing ``backoffUntil`` there would
-        re-open a token still inside its own 429 block — the same
-        "no credential change of its own to fence" reasoning ``revoke_claim``
-        already applies, extended to the throttle fields.
-
-        ``expected_fingerprints`` re-checks, UNDER THIS METHOD'S LOCK, that
-        a row's ``struckFingerprint`` still matches what the caller's
-        lock-free read observed before deciding to heal. The collector
-        decides on a lock-free :meth:`entries` snapshot and had no re-check
-        between that decision and this write — a fresh strike (or a
-        different collector's own heal) landing in that gap must not be
-        silently overwritten by a decision made against stale data. A row
-        whose current fingerprint no longer matches is left alone entirely.
+        ``revoke_claim=False`` keeps ``claimId``, the field ``record()``
+        fences on, so a different collector's in-flight lease survives.
+        ``strike_only=True`` keeps ``consecutiveFailures``/``lastError``/
+        ``backoffUntil``: a fingerprint that stopped matching is no evidence
+        the server's 429 throttle lifted. ``expected_fingerprints`` re-checks
+        ``struckFingerprint`` UNDER THIS METHOD'S LOCK against what that
+        lock-free read saw, so a strike landing in the gap is not overwritten
+        by a stale decision; a row that no longer matches is left alone.
         """
         nums = list(nums)
         if not nums:

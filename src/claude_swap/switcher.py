@@ -4681,66 +4681,30 @@ class ClaudeAccountSwitcher:
             if dead:
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif dead is None:
-                # Cannot determine (unreadable backup on a struck active
-                # slot): neither confirm the strike (would condemn an
-                # already-healed slot) nor heal it below (would erase a
-                # strike that may still hold). Setting a sentinel here — even
-                # USAGE_KEYCHAIN_UNAVAILABLE — would override
-                # decision_value()'s normal last_good serving (measured: it
-                # makes account_headroom() see None, which still drives the
-                # unhealthy-ticks counter to eventual failover — no better
-                # than guessing True). Set NO sentinel and fall through: the
-                # active credential itself is fine (it already cleared the
-                # first fingerprint check above), so a live measurement
-                # still serves from the entry's own last_good if fresh.
-                # This does NOT become a normal fetch candidate — measured:
-                # _row_eligible refuses any row with authDeadStrikes at
-                # threshold regardless of sentinel (usage_store.py), and
-                # due_candidate refuses on entry.token_dead() the same way,
-                # so a struck row is never reserved for a fetch on this
-                # path. The strike's real recovery is the Keychain
-                # capability cache's own re-probe on KEYCHAIN_RECHECK_COOLDOWN_S
-                # (credentials.py): once the Keychain answers again, the
-                # next collect pass re-evaluates the fingerprint compare
-                # against real bytes and clears the strike via the `elif`
-                # below, or confirms it still holds. This recovery path is
-                # now also how a DEGRADED active read reaches a verdict:
-                # `_entry_token_dead` skips the immediate
-                # fingerprint compare against the collector's own
-                # (possibly-stale) `creds` on a degraded read and falls
-                # through to this same backup-fallback machinery, so the
-                # degraded shape gets the identical treatment as an
-                # unreadable backup rather than an immediate confirm.
+                # CANNOT DETERMINE — no stored source could be examined. Do
+                # not confirm the strike (it condemns an already-healed slot)
+                # and do not heal it below (it erases one that may still
+                # hold). No sentinel either: any sentinel here overrides
+                # decision_value()'s last_good serving, so a readable
+                # measurement stops being served over an unreadable verdict.
+                # The row cannot leak into a fetch meanwhile — _row_eligible
+                # and due_candidate both refuse a struck row on their own.
+                # Recovery is the Keychain capability cache's re-probe: once
+                # it answers, the next pass compares real bytes and the
+                # `elif` below either clears the strike or confirms it.
                 pass
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
-                # generation — the fingerprint healed the verdict.
-                # Clear the stale strike ROW too: display and fetch
-                # eligibility (_row_eligible gates on the raw count) must
-                # agree, or the slot silently freezes at last-good.
+                # generation — the fingerprint healed the verdict. Clear the
+                # stale strike ROW too: display and fetch eligibility
+                # (_row_eligible gates on the raw count) must agree, or the
+                # slot silently freezes at last-good.
                 #
-                # revoke_claim=False: this call has no credential change of
-                # its own to fence. Reached from a lock-free, no-network
-                # `fetch=set()` read (the TUI's 3s poll among others),
-                # nulling `claimId` unconditionally would void a DIFFERENT,
-                # concurrent collector's live in-flight lease — the field
-                # `record()` fences its own write on — discarding that
-                # collector's measurement for a strike this call is merely
-                # observing, not causing.
-                #
-                # strike_only=True: this call is evidence a STRIKE healed
-                # (the fingerprint no longer matches), not evidence the
-                # server's own 429 throttle lifted — `backoffUntil` and
-                # `lastError` are the server's word, not this call's to
-                # erase (an unconditional clear here would re-open a token
-                # still inside its own throttle block).
-                #
-                # expected_fingerprints re-checks the row UNDER THE LOCK
-                # against what THIS lock-free read just saw: the decision
-                # to heal was made on `entries` above, with no re-check
-                # before this write, so a strike (or a different
-                # collector's own heal) landing in that gap must not be
-                # silently overwritten by a now-stale decision.
+                # This call OBSERVES a heal, it does not cause one, and it
+                # runs lock-free from a `fetch=set()` read — which is exactly
+                # what the three keywords below are for; see
+                # `clear_dead_token`. `entry.struck_fingerprint` is what THIS
+                # read saw, and the write re-checks it under the store lock.
                 self._usage_store.clear_dead_token(
                     [num], {num: identities[num]},
                     revoke_claim=False,
@@ -6565,15 +6529,28 @@ class ClaudeAccountSwitcher:
             "warnings": [note],
         }
 
-    def _rebuilt_config(self, data: dict, account_num: str, email: str) -> str:
-        """A config backup rebuilt from the roster record.
+    def _target_config(self, data: dict, account_num: str, email: str) -> str:
+        """The switch target's config backup, rebuilt from the roster if absent.
 
-        Reached when the credentials are present but the config backup is not.
-        Logging out there reported "no stored credentials" while the account's
-        credentials sat right beside it. The config is only ``oauthAccount``,
-        and every field of it lives in the sequence record, so it is rebuilt
-        rather than a working login thrown away.
+        CONFIG ONLY. Both callers route an absent CREDENTIAL to
+        :meth:`_switch_to_empty_slot` before reaching here, so nothing on that
+        axis is left for this to decide.
+
+        An unreadable Keychain must not be answered with "re-add the account":
+        the backup may be there and simply out of reach, so that case refuses.
+        A genuinely absent config is rebuilt instead — it is only
+        ``oauthAccount``, every field of which lives in the sequence record,
+        so a working login is not thrown away over a missing copy of it.
         """
+        config = self._read_account_config(account_num, email)
+        if config:
+            return config
+        if self._keychain_blind():
+            raise SwitchError(
+                f"Account-{account_num}'s backup is in the macOS Keychain "
+                f"but it is unreadable right now (locked or no GUI session). "
+                f"Retry from a GUI terminal; do not re-add."
+            )
         rec = (data.get("accounts") or {}).get(account_num) or {}
         return json.dumps({
             "oauthAccount": {
@@ -6784,24 +6761,9 @@ class ClaudeAccountSwitcher:
                         target_account, target_email, from_ref, to_ref, data,
                         emit_output,
                     )
-                target_config = self._read_account_config(target_account, target_email)
-                # CONFIG ONLY. The credentials axis returned above, so
-                # `target_creds` is truthy here: a `not target_creds` disjunct
-                # could never contribute, and the second empty-slot return that
-                # sat below this was unreachable for the same reason. Removed
-                # rather than left to suggest this guard still covers the
-                # credential axis its message names.
-                if not target_config and self._keychain_blind():
-                    raise SwitchError(
-                        f"Account-{target_account}'s backup is in the macOS "
-                        f"Keychain but it is unreadable right now (locked or "
-                        f"no GUI session). Retry from a GUI terminal; do not "
-                        f"re-add."
-                    )
-                if not target_config:
-                    target_config = self._rebuilt_config(
-                        data, target_account, target_email
-                    )
+                target_config = self._target_config(
+                    data, target_account, target_email
+                )
                 try:
                     target_config_data = json.loads(target_config)
                 except json.JSONDecodeError as exc:
@@ -7148,25 +7110,9 @@ class ClaudeAccountSwitcher:
                         target_account, target_email, from_ref, to_ref, data,
                         emit_output,
                     )
-                target_config = self._read_account_config(target_account, target_email)
-
-                # CONFIG ONLY. The credentials axis returned above, so
-                # `target_creds` is truthy here: a `not target_creds` disjunct
-                # could never contribute, and the second empty-slot return that
-                # sat below this was unreachable for the same reason. Removed
-                # rather than left to suggest this guard still covers the
-                # credential axis its message names.
-                if not target_config and self._keychain_blind():
-                    raise SwitchError(
-                        f"Account-{target_account}'s backup is in the macOS "
-                        f"Keychain but it is unreadable right now (locked or "
-                        f"no GUI session). Retry from a GUI terminal; do not "
-                        f"re-add."
-                    )
-                if not target_config:
-                    target_config = self._rebuilt_config(
-                        data, target_account, target_email
-                    )
+                target_config = self._target_config(
+                    data, target_account, target_email
+                )
 
                 # Step 3: Activate target account - credentials
                 self._write_credentials(

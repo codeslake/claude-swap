@@ -6451,6 +6451,55 @@ class TestSwitchSkipsBrokenSlots:
         cfg = json.loads((temp_home / ".claude.json").read_text())
         assert cfg["oauthAccount"]["emailAddress"] == "b@example.com"
 
+    def test_a_blind_keychain_refuses_rather_than_rebuilding_the_config(
+        self, temp_home: Path, monkeypatch
+    ):
+        """A config backup that is merely UNREADABLE must not be rebuilt.
+
+        The rebuild above is licensed by the backup being genuinely absent.
+        Behind a locked Keychain "absent" and "there but out of reach" read
+        the same, and rebuilding on that guess installs a config synthesized
+        from the roster over one that was never actually missing. Refuse.
+
+        Neither of the two switch paths had a test that fails when this
+        guard is removed: with `if False and ...` in front of it the whole
+        suite still passed.
+        """
+        from claude_swap.exceptions import SwitchError
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", config=False)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+            },
+        }))
+
+        s.platform = Platform.MACOS
+        from claude_swap import macos_keychain as _kc
+
+        def locked(*_a, **_kw):
+            raise _kc.KeychainError("locked")
+
+        for fn in ("get_password", "set_password", "delete_password"):
+            monkeypatch.setattr(_kc, fn, locked)
+
+        with pytest.raises(SwitchError, match="Keychain"):
+            s.switch_to("2")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 1, (
+            "landed on the slot on a config rebuilt from the roster while "
+            "the real backup was merely unreadable"
+        )
+
     def test_an_unmanaged_live_login_survives_landing_on_an_empty_slot(
         self, temp_home: Path
     ):

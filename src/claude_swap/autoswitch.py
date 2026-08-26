@@ -2688,12 +2688,11 @@ class AutoSwitchEngine:
             # check parks on this very thread, and the wait can never be
             # satisfied from then on.
             finished = own_tick or self._tick_in_flight.is_set()
-            if not own_tick:
-                deadline = time.monotonic() + _STOP_SWITCH_WAIT_S
-                while not finished and not self._emit_in_flight.is_set():
-                    if time.monotonic() >= deadline:
-                        break
-                    finished = self._tick_in_flight.wait(_STOP_WAIT_SLICE_S)
+            deadline = time.monotonic() + _STOP_SWITCH_WAIT_S
+            while not finished and not self._emit_in_flight.is_set():
+                if time.monotonic() >= deadline:
+                    break
+                finished = self._tick_in_flight.wait(_STOP_WAIT_SLICE_S)
             if (
                 not own_tick
                 and not self._emit_in_flight.is_set()
