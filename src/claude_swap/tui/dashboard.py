@@ -353,12 +353,16 @@ class DashboardScreen(Screen):
                 rows.append(("Remove the leftover pin wiring", "pin:clear"))
             rows.append(_BACK)
             return rows
-        current = pin.pinned_email(self.app.switcher)
+        # THE COMPOSITE, like every other badge site. Two managed slots may
+        # share one address across organizations, and an email-only test lights
+        # BOTH rows.
+        pinned_identity = pin.pinned_identity(self.app.switcher)
         snap = self.app.snapshot
         entries: MenuEntries = []
         for acc in (snap.accounts if snap else ()):
             name = f"{acc.alias} ({acc.email})" if acc.alias else acc.email
-            state = "  ○ cloud" if current == acc.email else ""
+            state = "  ○ cloud" if pin.account_is_pinned(
+                pinned_identity, acc.email, acc.org_uuid) else ""
             # An API-key account can never be pinned: sk-ant-api… is not OAuth
             # JSON, so every pinned request fails open. The CLI refuses it; the
             # menu says so instead of offering a row that reports success and
@@ -380,8 +384,8 @@ class DashboardScreen(Screen):
         # then hid the row while the root menu still showed the Cloud line and
         # the message said "re-run once it frees up".
         #
-        # AND THE RECORD IS READ THE WAY `clear_pin` READS IT. `current` comes
-        # from `pinned_email`, which asks the PACKAGE and answers None
+        # AND THE RECORD IS READ THE WAY `clear_pin` READS IT.
+        # `pinned_identity` asks the PACKAGE and answers None
         # whenever it is absent or broken; `clear_pin` decides from
         # `_pinned_email_now`, which reads cswap's OWN settings.json and can
         # still clear it. Gating on the package's answer hid the row for a
@@ -389,7 +393,7 @@ class DashboardScreen(Screen):
         # the moment anything reinstalls the package. A gate must ask what the
         # ACTION asks, or it hides work that exists.
         if (
-            current
+            pinned_identity
             or pin._pinned_email_now(self.app.switcher) is not None
             or pin._wiring_present(self.app.switcher)
         ):

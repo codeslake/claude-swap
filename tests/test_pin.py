@@ -1986,9 +1986,16 @@ class TestTheTuiSurfaceSurvivesTheSplit:
 
         from claude_swap.tui import dashboard
 
-        acc = types.SimpleNamespace(number="2", email="a@b.c", alias=None)
+        # `org_uuid`, because the badge asks the COMPOSITE: a stub without
+        # it passes only while the site still matches on the address.
+        acc = types.SimpleNamespace(
+            number="2", email="a@b.c", alias=None, org_uuid="")
         monkeypatch.setattr(dashboard.pin, "_impl", lambda: types.SimpleNamespace())
         monkeypatch.setattr(dashboard.pin, "pinned_email", lambda sw: "a@b.c")
+        # The badge reads the COMPOSITE now, so the stub must answer the
+        # seam the code actually calls.
+        monkeypatch.setattr(
+            dashboard.pin, "pinned_identity", lambda sw: ("a@b.c", ""))
         monkeypatch.setattr(
             dashboard.DashboardScreen,
             "app",
@@ -10648,7 +10655,7 @@ class TestRemovingThePinnedAccountClearsThePin:
                             lambda _s: calls.append(1) or (True, "cleared"))
 
         s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
-        s._clear_pin_if_removed("someone-else@example.com")
+        s._clear_pin_if_removed("someone-else@example.com", "org-X")
         assert calls == [], (
             "removing an unrelated account cleared the pin — every removal "
             "would unpin whatever was live"
@@ -10668,7 +10675,7 @@ class TestRemovingThePinnedAccountClearsThePin:
         s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
         buf = _pin_io.StringIO()
         with contextlib.redirect_stdout(buf):
-            s._clear_pin_if_removed("pinned@example.com")
+            s._clear_pin_if_removed("pinned@example.com", "org-P")
         assert calls == [1], "the pinned account was removed and the pin stayed"
         # THE OUTCOME, NOT JUST THE CALL. The handler swallows anything the
         # body raises so a removal that already happened is never reported as
@@ -10680,31 +10687,86 @@ class TestRemovingThePinnedAccountClearsThePin:
             f"the success path reported a failure: {said!r}"
         )
 
-    def test_no_extra_installed_asks_the_package_nothing(self, monkeypatch):
-        """A machine without the package has no pin to clear.
+    def test_no_extra_installed_and_no_record_asks_the_package_nothing(
+        self, monkeypatch
+    ):
+        """A machine with no RECORD has nothing to clear, extra or not.
 
-        ASSERTED ON WHAT IS CALLED, not merely on "did not raise". Stubbing
-        `_pinned_email_now` alongside `is_available` makes the guard removable
-        without any case noticing -- measured: deleting the `is_available`
-        check left all four green. So the reads BELOW the guard raise here, and
-        reaching one is the failure.
+        This used to gate on `is_available()`, which turned the whole fix off
+        on the one machine where a leftover record has nothing else to remove
+        it: `_pinned_email_now` reads cswap's OWN settings.json, and
+        `clear_pin` swallows the package failure and clears that file itself
+        ("this command must work when the pin does not"). So the record, not
+        the package, is what decides — and reaching `clear_pin` with no record
+        is the failure.
         """
         from claude_swap import pin as _pin
         from claude_swap import switcher as _sw
 
         def _boom(*_a, **_k):
             raise AssertionError(
-                "the removal path read the pin on a machine with no extra "
-                "installed — the is_available guard is gone"
+                "the removal path tried to clear a pin that was not recorded"
             )
 
         monkeypatch.setattr(_pin, "is_available", lambda: False)
-        monkeypatch.setattr(_pin, "_pinned_email_now", _boom)
+        monkeypatch.setattr(_pin, "_pinned_email_now", lambda _s: None)
         monkeypatch.setattr(_pin, "clear_pin", _boom)
         s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
         buf = _pin_io.StringIO()
         with contextlib.redirect_stdout(buf):
-            s._clear_pin_if_removed("anyone@example.com")
+            s._clear_pin_if_removed("anyone@example.com", "org-X")
         # And silent: the handler would otherwise turn the AssertionError into
         # a "still names" warning and this case would pass on the swallow.
         assert buf.getvalue() == "", f"it spoke on a machine with no pin: {buf.getvalue()!r}"
+
+    def test_a_same_email_sibling_removal_leaves_the_pin_alone(self, monkeypatch):
+        """The org is IN HAND at the call site, so matching on the address
+        alone is not a safe direction — it is a lost fact.
+
+        Two managed slots may share one address across organizations. Removing
+        the org-B slot cleared a pin that named org-A, and Remote Control then
+        stopped for an account nobody removed. `remove_account` already holds
+        `account_info["organizationUuid"]` when it calls this.
+        """
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        calls = []
+        monkeypatch.setattr(_pin, "is_available", lambda: True)
+        monkeypatch.setattr(_pin, "_pinned_email_now",
+                            lambda _s: ("shared@example.com", "org-A"))
+        monkeypatch.setattr(_pin, "clear_pin",
+                            lambda _s: calls.append(1) or (True, "cleared"))
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        s._clear_pin_if_removed("shared@example.com", "org-B")
+        assert calls == [], (
+            "removing the org-B sibling cleared a pin that named org-A"
+        )
+
+    def test_it_still_clears_when_the_extra_is_absent(self, monkeypatch):
+        """The gate turned the fix off on the one machine where it matters.
+
+        `_pinned_email_now` reads cswap's OWN settings.json and `clear_wiring`
+        works with the package blocked, so `is_available()` gates on something
+        neither half needs. A pin-less machine with a leftover record is
+        exactly where a dangling pin survives.
+        """
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        calls = []
+        monkeypatch.setattr(_pin, "is_available", lambda: False)
+        monkeypatch.setattr(_pin, "_pinned_email_now",
+                            lambda _s: ("pinned@example.com", "org-P"))
+        monkeypatch.setattr(_pin, "clear_pin",
+                            lambda _s: calls.append(1) or (True, "cleared"))
+
+        s = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        buf = _pin_io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            s._clear_pin_if_removed("pinned@example.com", "org-P")
+        assert calls == [1], (
+            "the pinned account was removed and the record was left behind "
+            "because the optional package is not installed"
+        )

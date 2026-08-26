@@ -1088,13 +1088,25 @@ class TestEveryBadgeSiteAsksTheSameQuestion:
                 rendered = [ast.unparse(x) for x in sides]
                 has_email = any(
                     isinstance(x, ast.Attribute) and x.attr == "email" for x in sides)
-                names_pin = any("pinned" in r for r in rendered)
-                if has_email and names_pin:
+                # BY STRUCTURE, NOT BY AN OPERAND'S NAME. Requiring the text
+                # "pinned" on one side made the guard depend on what the
+                # variable happened to be called: `current == acc.email`, with
+                # `current = pin.pinned_email(...)` one line above, walked
+                # straight past it -- and that was the fourth badge site, found
+                # by a reviewer rather than by this. ANY `.email` comparison in
+                # a TUI module is now the offence; the sanctioned form calls
+                # `account_is_pinned` and compares nothing here.
+                inside_predicate = any(
+                    isinstance(a, ast.Call)
+                    and "account_is_pinned" in ast.unparse(a.func)
+                    for a in ast.walk(node))
+                if has_email and not inside_predicate:
                     offenders.append(f"{path.name}:{node.lineno}  {rendered[0]} == {rendered[1]}")
         # THE CONTROL: an empty walk would pass vacuously.
         assert len(list(root.rglob("*.py"))) > 2, "the walk found no TUI modules"
         assert offenders == [], (
-            "a badge site compares an address to the pin directly, so two slots "
-            f"sharing one address both render as pinned: {offenders}"
+            "a TUI site compares an address by hand instead of calling "
+            "`pin.account_is_pinned`, so two slots sharing one address both "
+            f"render as pinned: {offenders}"
         )
 

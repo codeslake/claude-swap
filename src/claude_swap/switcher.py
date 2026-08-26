@@ -4295,7 +4295,7 @@ class ClaudeAccountSwitcher:
         )
         self._repin_if_pin_slot_refreshed(account_num)
 
-    def _clear_pin_if_removed(self, email: str) -> None:
+    def _clear_pin_if_removed(self, email: str, org_uuid: str) -> None:
         """Clear the cloud pin when the account it names is the one going away.
 
         A pin that outlives its account is silent: `ensure_proxy` resolves the
@@ -4303,20 +4303,24 @@ class ClaudeAccountSwitcher:
         says pinned and the TUI still draws the Cloud row. Removal is the one
         moment cswap knows the pin's subject just ceased to exist.
 
-        MATCHED ON THE ADDRESS ALONE, deliberately. Two slots may share one
-        across organizations, so this can clear a pin that named the sibling --
-        and that is the safe direction: a cleared pin is re-pinnable in one
-        command, while a dangling one is invisible until someone wonders why
-        Remote Control stopped. `clear_pin` re-reads both halves and reports,
-        so a clear that did nothing is not silent either.
+        MATCHED ON THE COMPOSITE. Two slots may share one address across
+        organizations, and `remove_account` already holds the org when it
+        calls this -- so address-only was not a safe direction, it was a
+        discarded fact that unpinned a live account whenever its same-email
+        sibling was removed.
+
+        NOT GATED ON THE PACKAGE. `_pinned_email_now` reads cswap's OWN
+        settings.json and `clear_pin` works with `cswap_pin` absent, so an
+        availability check turned this off on exactly the machine where a
+        leftover record has nothing else to remove it.
         """
         try:
             from claude_swap import pin as _pin
 
-            if not _pin.is_available():
-                return
             pinned = _pin._pinned_email_now(self)
-            if not pinned or (pinned[0] or "") != email:
+            if not pinned:
+                return
+            if (pinned[0] or "") != email or (pinned[1] or "") != (org_uuid or ""):
                 return
             ok, msg = _pin.clear_pin(self)
             warning(f"Cloud pin: {msg}")
@@ -4418,7 +4422,7 @@ class ClaudeAccountSwitcher:
         # AFTER the roster write, not before: the pin's own clear re-reads the
         # roster, and clearing first would have it resolve a slot that is still
         # there.
-        self._clear_pin_if_removed(email)
+        self._clear_pin_if_removed(email, account_info.get("organizationUuid", ""))
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
