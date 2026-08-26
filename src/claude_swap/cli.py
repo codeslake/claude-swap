@@ -705,17 +705,15 @@ Defaults live in settings.json in the backup root; flags override them.
             dry_run=args.dry_run,
         )
 
-        if args.once:
-            sys.exit(engine.tick().value)
-
-        # Loop mode: SIGTERM (systemd stop) and SIGINT (the Ctrl-C the banner
-        # below promises) both exit the loop cleanly. Without the SIGINT
-        # handler, KeyboardInterrupt is a BaseException — neither `except
+        # ARMED BEFORE THE `--once` BRANCH, not after. SIGTERM (systemd stop,
+        # a cron wrapper's timeout) and SIGINT (the Ctrl-C the loop banner
+        # promises) must be handled wherever `_perform` can run, and `--once`
+        # runs it. KeyboardInterrupt is a BaseException — neither `except
         # ClaudeSwitchError` nor `except Exception` in `tick()` catches it — so
-        # it propagated out of `_perform` between `switch_to` and the state
-        # write: the account switched, `lastSwitchAt` was never recorded, and
-        # the LIVE lock stayed held. The next engine then saw no cooldown and
-        # could switch again immediately.
+        # it propagates out of `_perform` between `switch_to` and the state
+        # write: the account switched, `lastSwitchAt` never recorded, the LIVE
+        # lock still held. The next engine then sees no cooldown and can
+        # switch again immediately.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
 
         def _interrupt(*_):
@@ -728,6 +726,10 @@ Defaults live in settings.json in the backup root; flags override them.
             engine.stop()
 
         signal.signal(signal.SIGINT, _interrupt)
+
+        if args.once:
+            sys.exit(engine.tick().value)
+
         if not args.json:
             print(
                 dimmed(

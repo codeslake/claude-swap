@@ -1068,6 +1068,53 @@ class TestAutoCommand:
             "interrupted at all"
         )
 
+    def test_once_is_interruptible_too(self, temp_home):
+        """`--once` exits before the handlers are installed, so it has none.
+
+        The half-written state the loop's handlers close is not a property of
+        the loop: `--once` takes the same `_perform` path, holds the same LIVE
+        lock, and a Ctrl-C between `switch_to` and the state write leaves the
+        account switched with no `lastSwitchAt`. Cron runs it, and a cron
+        wrapper's timeout kills with SIGTERM.
+
+        Asserts the handlers are in place WHEN THE TICK RUNS, not merely by
+        the end of the call: installing them after the tick would satisfy a
+        weaker assert and close nothing.
+        """
+        import signal as signal_mod
+
+        installed = {}
+        at_tick = {}
+
+        def record(sig, handler):
+            installed[sig] = handler
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def tick(self):
+                at_tick.update(installed)
+                from claude_swap.autoswitch import TickOutcome
+
+                return TickOutcome.NO_ACTION
+
+        with patch.object(signal_mod, "signal", record), \
+                patch("claude_swap.autoswitch.AutoSwitchEngine",
+                      return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        missing = {signal_mod.SIGINT, signal_mod.SIGTERM} - set(at_tick)
+        assert not missing, (
+            f"`--once` ran its tick with {sorted(s.name for s in missing)} "
+            "unhandled — a signal there leaves the account switched and "
+            "lastSwitchAt unwritten"
+        )
+
     def test_auto_flag_is_refused_where_it_does_nothing(self, capsys):
         """`--auto` is read only by the tui branch.
 
