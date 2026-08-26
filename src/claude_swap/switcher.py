@@ -1433,10 +1433,25 @@ class ClaudeAccountSwitcher:
             ("creds", num_b, email_b, creds_b),
             ("config", num_b, email_b, config_b),
         ) if wrote_backups else ()
+        # WHAT A RESTORE ACTUALLY DISPLACED. The purge below may only drop a
+        # `.prev` its own restore created, and `_retain_previous_backup`
+        # creates one exactly when the value it would displace differs from
+        # the one going in. Reading that here subsumes the `overlap` gate: in
+        # the two-email case the stored value always equals `original`, and in
+        # the same-email case an abort before any forward write lands leaves
+        # it equal too -- which is the state `overlap` alone could not see.
+        displaced: set[tuple[str, str]] = set()
         for kind, num, email, original in restores:
             try:
                 if original:
                     if kind == "creds":
+                        try:
+                            now, unread = self._store._read_account_credentials_ex(
+                                num, email)
+                        except Exception:  # noqa: BLE001 - a failed read must
+                            now, unread = original, True  # not widen the purge
+                        if not unread and now != original:
+                            displaced.add((num, email))
                         self._write_account_credentials(num, email, original)
                     else:
                         self._write_account_config(num, email, original)
@@ -1466,13 +1481,15 @@ class ClaudeAccountSwitcher:
                 except Exception as e:
                     failures += 1
                     self._logger.error(f"Rollback cleanup failed for slot {num}: {e}")
-        if wrote_backups and overlap and not failures:
-            # ONLY WHEN THE EMAILS MATCH. The forward pass writes through
-            # `(num_b, email_a)` and `(num_a, email_b)`; this purges
-            # `(num_a, email_a)` and `(num_b, email_b)`. With two emails those
-            # key sets are DISJOINT, so the purge would destroy a generation
-            # the swap never wrote through -- and the stored credentials are
-            # correct afterwards, so nothing signals the loss.
+        if wrote_backups and displaced and not failures:
+            # ONLY THE KEYS A RESTORE ABOVE ACTUALLY DISPLACED. Two states
+            # look identical from here and must not: a swap that wrote all
+            # four keys (the retained generation IS contamination) and one
+            # that aborted before the first write (it is the user's only
+            # recovery copy). Neither the emails nor `wrote_backups` separate
+            # them -- `wrote_backups` is armed one statement BEFORE the first
+            # write on purpose -- and the stored credentials are correct in
+            # both, so nothing else signals the loss.
             #
             # The restore writes above pushed the half-written material into
             # the keys' retained .prev generations; both keys now hold their

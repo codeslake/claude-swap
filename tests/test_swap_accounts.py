@@ -1,6 +1,7 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
 import contextlib
+import errno
 import copy
 import os
 import sys
@@ -930,3 +931,94 @@ class TestSwapUnreadableSourceIsNotAbsent:
             f"it announced a restore it then skipped entirely: {said!r}"
         )
         assert said, "nothing was logged at all — the rollback went silent"
+
+    def test_a_rollback_keeps_prev_when_no_forward_write_landed(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """SAME email, failure on the FIRST forward write. The `overlap` gate
+        does not reach this one.
+
+        `wrote_backups` is armed one statement BEFORE the first write, and the
+        comment prices that at "one needless restore". The restore is a no-op
+        by construction — `_retain_previous_backup` short-circuits when the
+        value it would displace equals the one going in — so no `.prev` is
+        created, the purge's premise ("the restore writes pushed the
+        half-written material into the retained generations") is false, and it
+        deletes the generation that was there before the swap began.
+
+        The condition that separates it from a legitimate purge is not the
+        emails: it is whether a restore DISPLACED anything.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"gen1-{num}")
+            switcher._write_account_credentials(num, email, f"gen2-{num}")
+
+        prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
+        assert all(p.exists() for p in prev.values()), (
+            "the fixture produced no .prev, so this would pass however the "
+            "purge behaves"
+        )
+
+        calls = {"n": 0}
+        real_write = switcher._write_account_credentials
+
+        def fail_first(num, mail, creds):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(errno.EIO, "the first forward write failed")
+            return real_write(num, mail, creds)
+
+        switcher._write_account_credentials = fail_first
+        try:
+            # OSError, not ConfigError: the forward write is not wrapped, and
+            # the rollback runs on the way out either way.
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
+        finally:
+            del switcher._write_account_credentials
+
+        alive = {n: p.exists() for n, p in prev.items()}
+        assert alive == {"1": True, "2": True}, (
+            f"the rollback purged .prev after a swap that wrote nothing: {alive}"
+        )
+
+    def test_a_rollback_drops_prev_it_really_did_contaminate(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The other half, and without it the purge is untested.
+
+        Measured: with the purge disabled outright the file stays green, so
+        every case here pins only that it does NOT fire. Same email, failure
+        at the COMMIT so all four forward writes landed — the restores then
+        push that half-written material into each key's retained generation,
+        and those really are contamination.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"gen1-{num}")
+            switcher._write_account_credentials(num, email, f"gen2-{num}")
+
+        prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
+        assert all(p.exists() for p in prev.values()), "no .prev to drop"
+
+        def failing_commit(*_a, **_kw):
+            raise ConfigError("commit failed")
+
+        switcher._write_json = failing_commit
+        try:
+            with pytest.raises(ConfigError):
+                switcher.swap_accounts("1", "2")
+        finally:
+            del switcher._write_json
+
+        alive = {n: p.exists() for n, p in prev.items()}
+        assert alive == {"1": False, "2": False}, (
+            f"a generation the rollback itself contaminated was kept: {alive}"
+        )
+        assert switcher._read_account_credentials("1", email) == "gen2-1"
+        assert switcher._read_account_credentials("2", email) == "gen2-2"
