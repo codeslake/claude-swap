@@ -59,24 +59,24 @@ cswap-proxy  (NEW, this feature)
       /v1/code/sessions*  → replace Authorization: Bearer <PIN token>
       /api/frame/*        → replace Authorization: Bearer <PIN token>
       everything else (esp. /v1/messages) → pass through unchanged
-  - chain onward to the PREVIOUS HTTPS_PROXY value (CCF 9901, corp proxy, or
+  - chain onward to the PREVIOUS HTTPS_PROXY value (a local caching proxy, a
     direct if none)
      │
      ▼
-(previous proxy, if any: CCF 9901 → corp 8118) → api.anthropic.com
+(previous proxy, if any: local cache → outbound proxy) → api.anthropic.com
 ```
 
-The proxy is generic: it does NOT know about CCF. It reads whatever HTTPS_PROXY
+The proxy is generic: it knows about no particular next hop. It reads whatever HTTPS_PROXY
 was set before cswap inserted itself and CONNECT-chains through it. Works for
-users with CCF, without CCF, and behind a corp proxy.
+users with a local caching proxy, without one, and behind an outbound proxy.
 
 ### Coexistence with other proxies (the three user classes)
 
 | user | prior HTTPS_PROXY | cswap-proxy chains to |
 |---|---|---|
-| plain (no CCF, no corp) | (unset) | direct `net.connect` to api.anthropic.com |
+| plain (no next hop) | (unset) | direct `net.connect` to api.anthropic.com |
 | a user behind a local caching proxy | `http://127.0.0.1:<its port>` | that proxy (which may itself chain onward) |
-| corp-proxy user | `http://corp:8118` | corp proxy |
+| behind an outbound proxy | `http://proxy.example:8080` | that proxy |
 
 cswap-proxy captures the inbound HTTPS_PROXY at launch and uses it as its own
-upstream. CCF is never modified.
+upstream. The next hop is never modified.
