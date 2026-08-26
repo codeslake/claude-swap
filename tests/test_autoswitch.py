@@ -9718,3 +9718,42 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
         )
         engine._emit(ConfigWarningEvent(message="x"))
         assert engine._consumer_gone is False
+
+
+class TestAClosedPipeDoesNotOutlastItsOwnSleep:
+    """The flag is read at the TOP of the loop, so the sleep it is set in runs
+    to completion first — up to `MAX_SLEEP_S` holding `.auto-live.lock`.
+
+    Measured before the fix: the loop slept 54s after the consumer was gone,
+    and a rival engine started in that window could not acquire LIVE. That is
+    the harm the broken-pipe fix names in its own message, arriving one sleep
+    later instead of never.
+    """
+
+    def test_the_loop_stops_within_the_tick_the_pipe_died_in(
+        self, harness, monkeypatch
+    ):
+        engine = harness.engine
+        slept: list[float] = []
+
+        real_wait = engine._wake.wait
+
+        def recording_wait(timeout=None):
+            # FAITHFUL TO `Event.wait`: a wait that returns because the event
+            # is SET is not a sleep. Replacing it outright makes `set()`
+            # unobservable, and the case then fails on a fixed engine --
+            # measured, it did.
+            if engine._wake.is_set():
+                return real_wait(0)
+            slept.append(timeout or 0.0)
+            return real_wait(0)
+
+        monkeypatch.setattr(engine._wake, "wait", recording_wait)
+        engine.on_event = lambda ev: (_ for _ in ()).throw(BrokenPipeError())
+
+        assert engine.run_loop() == 0
+        assert engine._consumer_gone is True
+        assert slept == [] or max(slept) == 0.0, (
+            f"the loop slept {max(slept):.1f}s after the consumer was gone, "
+            "holding the LIVE lock for a window a rival engine is demoted in"
+        )

@@ -813,13 +813,22 @@ class CredentialStore:
         """
         if self._host.platform != Platform.MACOS:
             return True
-        try:
-            macos_keychain.delete_password(
-                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
-            )
-        except Exception:
-            return False  # best-effort; a down Keychain can't be cleaned now
-        return True
+        # THE SAME SET THE READ WALKS. `_read_active_oauth_keychain` iterates
+        # `_active_oauth_keychain_services()`; deleting only the unsuffixed
+        # service left the item a custom profile actually uses in place, and
+        # a clean rc-44 on the one we did touch returned True -- so the
+        # landing believed the live store was empty while the read would
+        # still have found a token. The verdict must be about the same items
+        # the read is about.
+        cleared = True
+        for service in _active_oauth_keychain_services():
+            try:
+                macos_keychain.delete_password(
+                    service, macos_keychain.keychain_account_name()
+                )
+            except Exception:
+                cleared = False  # best-effort; a down Keychain can't be cleaned
+        return cleared
 
     def _write_credentials(self, credentials: str) -> None:
         """Write Claude Code's active credential, enforcing a single auth axis.

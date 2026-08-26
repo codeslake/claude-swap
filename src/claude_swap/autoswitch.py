@@ -2644,6 +2644,14 @@ class AutoSwitchEngine:
             # the `--once` path, so that contract is untouched.
             if isinstance(exc, BrokenPipeError):
                 self._consumer_gone = True
+                # AND WAKE THE SLEEP THIS WAS SET IN. `run_loop` reads the
+                # flag at the TOP, so without this the inter-tick sleep the
+                # emit happened inside runs to completion first -- up to
+                # MAX_SLEEP_S holding `.auto-live.lock`, which demotes every
+                # engine started in that window. Measured: 58s. `set()` on an
+                # Event is safe from any thread and `--once` never waits on
+                # it, so the exit contract is untouched.
+                self._wake.set()
             # A CONSUMER EXCEPTION IS NOT THE ENGINE'S FAILURE. `tick()`
             # documents "Never raises" but its `try` covers only
             # `_tick_inner`, so an emit from `_announce_demotion` /

@@ -271,3 +271,43 @@ class TestSecureStorageOverride:
         store = CredentialStore(_Host(tmp_path / "backups"))
         assert store._read_active_credentials().value == SECURE_PROFILE_CREDS
         assert seen == [keychain_service_name(str(secure))]
+
+
+class TestTheClearReachesEveryStoreTheReadDoes:
+    """The read walks `_active_oauth_keychain_services()`; the delete named
+    one service.
+
+    Under a custom profile the read resolves a SUFFIXED item while the delete
+    removed the unsuffixed one, returned True (a clean rc-44 is a success),
+    and the landing then believed the live store was empty. The two must
+    resolve the same set or the delete's verdict is about a different item
+    than the read's.
+    """
+
+    def test_the_delete_covers_the_same_services_the_read_walks(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap import credentials as creds_mod
+
+        class _Host:
+            platform = Platform.MACOS
+            _logger = logging.getLogger("claude-swap")
+
+        store = CredentialStore(_Host())
+        wanted = ["claude-suffixed", "Claude Code"]
+        monkeypatch.setattr(
+            creds_mod, "_active_oauth_keychain_services", lambda: wanted)
+
+        deleted: list[str] = []
+        monkeypatch.setattr(
+            creds_mod.macos_keychain, "keychain_account_name", lambda: "acct")
+        monkeypatch.setattr(
+            creds_mod.macos_keychain, "delete_password",
+            lambda service, account: deleted.append(service))
+
+        assert store._delete_active_keychain_entry() is True
+        assert deleted == wanted, (
+            f"the read walks {wanted} and the delete touched {deleted} — a "
+            "survivor in a store the read would have found keeps "
+            "authenticating under the new slot's name"
+        )

@@ -5545,7 +5545,7 @@ class TestSwitchSkipsBrokenSlots:
             f"{out!r}"
         )
 
-    def test_a_landed_empty_slot_still_reads_as_active(self, temp_home: Path):
+    def test_a_real_landing_on_an_empty_slot_still_reads_as_active(self, temp_home: Path):
         """Landing logged-out must not make the slot invisible.
 
         ``_build_accounts_info`` derives the active slot from the LIVE
@@ -14650,3 +14650,41 @@ class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
         s = self._setup(temp_home)
         out = self._land(s, [])
         assert len(out.get("warnings", [])) == 1, out
+
+
+def test_a_torn_config_vetoes_the_landing_before_anything_is_destroyed(
+    temp_home: Path, monkeypatch
+):
+    """The veto is a pure READ, so it must run before the unlink.
+
+    `_clear_oauth_credential()` removes `.credentials.json` first; only then
+    does `_clear_managed_key()` report False for a present-but-unreadable
+    `~/.claude.json`, and the refusal fires with the live credential already
+    gone. The command reports failure and has logged the user out — and no
+    rollback runs on this call site.
+
+    Nothing about the torn config becomes knowable by destroying the
+    credential, so the order is the whole defect.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    cred = temp_home / ".claude" / ".credentials.json"
+    cred.parent.mkdir(parents=True, exist_ok=True)
+    cred.write_text('{"claudeAiOauth": {"accessToken": "live"}}')
+    # Present and unreadable: `_read_global_config` collapses this to None.
+    (temp_home / ".claude.json").write_text("{ this is not json")
+
+    warnings_out: list[str] = []
+    data = {"activeAccountNumber": 1,
+            "accounts": {"1": {"email": "a@example.com"},
+                         "2": {"email": "b@example.com"}}}
+    with pytest.raises(SwitchError):
+        switcher._switch_to_empty_slot(
+            "2", "b@example.com", None, {"num": "2"}, data,
+            emit_output=False, warnings_out=warnings_out)
+
+    assert cred.exists(), (
+        "the landing refused AND deleted the live credential — the fact it "
+        "refused on was readable before the unlink"
+    )

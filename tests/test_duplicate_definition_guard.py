@@ -87,14 +87,25 @@ class TestNoModuleDefinesTheSameNameTwice:
     """
 
     def test_no_name_is_defined_twice_in_any_module_or_class(self):
+        """`tests/` TOO, and that is where it actually caught one.
+
+        Scanning `claude_swap/` alone left the suite unguarded against its own
+        shape of this bug: two same-named methods landed in one test class,
+        pytest collected ONE of them, and the one it dropped was the stronger
+        — it drove the real `switch_to` end to end while the survivor
+        hand-wrote the state. A guard that cannot see the file it lives in is
+        the failure mode it exists to name.
+        """
         import claude_swap
 
-        root = pathlib.Path(claude_swap.__file__).parent
+        roots = [pathlib.Path(claude_swap.__file__).parent,
+                 pathlib.Path(__file__).parent]
         offenders = [
             o
+            for root in roots
             for path in sorted(root.rglob("*.py"))
             for o in duplicate_names(
-                path.read_text(encoding="utf-8"), str(path.relative_to(root))
+                path.read_text(encoding="utf-8"), str(path.relative_to(root.parent))
             )
         ]
         assert not offenders, (

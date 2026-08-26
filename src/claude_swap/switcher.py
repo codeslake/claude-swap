@@ -6497,6 +6497,20 @@ class ClaudeAccountSwitcher:
         # only the OAuth one leaves a `primaryApiKey` live, and Claude Code
         # keeps authenticating (and billing) as the account it belongs to,
         # right after this announced "logged out".
+        # VETO BEFORE THE UNLINK. `_clear_managed_key` refuses on a config
+        # that is present-and-unreadable, and that is a pure READ -- nothing
+        # about it becomes knowable by destroying the credential first. Left
+        # below the clears it fired with `.credentials.json` already gone: the
+        # command reported failure AND logged the user out, and this call site
+        # returns before the first `record_step`, so no rollback runs.
+        cfg_path = get_global_config_path()
+        if cfg_path.exists() and self._store._read_global_config() is None:
+            raise SwitchError(
+                f"{cfg_path.name} is unreadable, so landing on an empty slot "
+                "cannot confirm the previous account's managed key was "
+                "cleared — and a survivor keeps authenticating under this "
+                "slot's name. Nothing was changed. Repair the file and retry."
+            )
         residual_gone = self._store._clear_oauth_credential()
         # BOTH axes report. The managed item shadows `primaryApiKey` the way
         # the OAuth item shadows the file, and Claude Code reads it first.
