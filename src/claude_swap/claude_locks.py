@@ -107,8 +107,20 @@ def proper_lockfile(
     while True:
         try:
             os.mkdir(lock_dir)
+            # Read back HERE, not after the loop. A waiter that judged this
+            # lock stale does stat-then-rmdir, and the holder can release and
+            # we can take the name in that gap -- its rmdir then removes the
+            # directory we just made. Outside the loop that raises
+            # FileNotFoundError out of a call documented to raise only
+            # ClaudeCodeLockTimeout.
+            stamped_ns = os.stat(lock_dir).st_mtime_ns
             break
         except FileExistsError:
+            pass
+        except FileNotFoundError:
+            # Swept between the two calls. Fall THROUGH to the deadline below,
+            # never back to the top: a name swept on every attempt has to end
+            # at the budget rather than spin until the sweeper stops.
             pass
         if time.monotonic() - start > timeout:
             raise ClaudeCodeLockTimeout(
@@ -130,8 +142,8 @@ def proper_lockfile(
         time.sleep(0.25 + random.random() * 0.25)
 
     # A takeover makes a NEW directory, so any mtime but the one we stamped is
-    # somebody else's lock. Read back: a coarsened stamp never matches itself.
-    stamped_ns = os.stat(lock_dir).st_mtime_ns
+    # somebody else's lock, and a coarsened stamp never matches itself -- which
+    # is why the value above is read back rather than assumed.
 
     stop_touching = threading.Event()
     # A refresh is a read-modify-write on stamped_ns that the release reads;

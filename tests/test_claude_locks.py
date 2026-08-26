@@ -31,6 +31,35 @@ class TestProperLockfile:
             assert lock_dir.is_dir()
         assert not lock_dir.exists()
 
+    def test_a_lock_swept_between_mkdir_and_stat_stays_bounded(
+        self, lock_dir, monkeypatch
+    ):
+        """The stamp read-back has to sit inside the retry loop.
+
+        A waiter that judged this lock stale does `stat` then `rmdir`; the
+        holder can release and we can take the name in that gap, and its rmdir
+        then removes OUR fresh directory. A read-back outside the loop raises
+        `FileNotFoundError` out of a function documented to raise only
+        `ClaudeCodeLockTimeout`.
+
+        Falling through to the deadline rather than restarting the loop above
+        it: a name swept on every attempt must still end at the budget, not
+        spin until the sweeper stops.
+        """
+        real_mkdir = os.mkdir
+
+        def swept(path, *args, **kwargs):
+            real_mkdir(path, *args, **kwargs)
+            os.rmdir(path)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", swept)
+        started = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock_dir, timeout=0.3):
+                pass
+        elapsed = time.monotonic() - started
+        assert elapsed < 1.5, f"a 0.3s budget took {elapsed:.2f}s"
+
     def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
         # Control: test_acquire_creates_and_release_removes above — a release
         # that quietly stopped removing anything passes here and fails there.
