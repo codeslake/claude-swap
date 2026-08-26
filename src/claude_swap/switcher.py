@@ -1405,8 +1405,15 @@ class ClaudeAccountSwitcher:
         staged pre-swap copies are kept on disk for manual recovery instead
         of being deleted.
         """
+        # DECIDED BEFORE IT IS ANNOUNCED. Every step below is gated on `moved`
+        # or `wrote_backups`, so an abort that mutated nothing skips all of
+        # them -- and the line still said both slots were being restored,
+        # which is the class of wrong text this change exists to remove.
+        will_restore = bool(moved) or wrote_backups
         self._logger.error(
-            f"Swap {num_a} <-> {num_b} failed mid-write; restoring both slots"
+            f"Swap {num_a} <-> {num_b} failed mid-write; "
+            + ("restoring both slots" if will_restore
+               else "nothing was written, so there is nothing to restore")
         )
         failures = 0
         # Unlike the credential steps below, this is not a no-op when its
@@ -1459,7 +1466,14 @@ class ClaudeAccountSwitcher:
                 except Exception as e:
                     failures += 1
                     self._logger.error(f"Rollback cleanup failed for slot {num}: {e}")
-        if wrote_backups and not failures:
+        if wrote_backups and overlap and not failures:
+            # ONLY WHEN THE EMAILS MATCH. The forward pass writes through
+            # `(num_b, email_a)` and `(num_a, email_b)`; this purges
+            # `(num_a, email_a)` and `(num_b, email_b)`. With two emails those
+            # key sets are DISJOINT, so the purge would destroy a generation
+            # the swap never wrote through -- and the stored credentials are
+            # correct afterwards, so nothing signals the loss.
+            #
             # The restore writes above pushed the half-written material into
             # the keys' retained .prev generations; both keys now hold their
             # exact originals, so those generations are pure contamination.

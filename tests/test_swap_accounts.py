@@ -1,5 +1,7 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
+import contextlib
+import copy
 import os
 import sys
 from pathlib import Path
@@ -17,6 +19,27 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 
 def _refuse_write(self, num, email, creds):
     raise OSError("disk full (injected)")
+
+
+
+@contextlib.contextmanager
+def caplog_at_error():
+    """Collect ERROR records from the switcher logger as plain strings."""
+    import logging
+
+    seen: list[str] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    logger = logging.getLogger("claude-swap")
+    h = _Sink(level=logging.ERROR)
+    logger.addHandler(h)
+    try:
+        yield seen
+    finally:
+        logger.removeHandler(h)
 
 
 class TestSwapAccounts:
@@ -780,3 +803,130 @@ class TestSwapUnreadableSourceIsNotAbsent:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["email"] == "account2@example.com"
         assert data["accounts"]["2"]["email"] == "account1@example.com"
+
+    def test_a_rollback_keeps_prev_generations_it_never_contaminated(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The purge is only correct when the two slots share one email.
+
+        The forward pass writes `(num_b, email_a)` and `(num_a, email_b)`; the
+        purge deletes `.prev` for `(num_a, email_a)` and `(num_b, email_b)`.
+        With two emails those key sets are DISJOINT, so the purge destroys a
+        generation the swap never touched — and the stored credentials are
+        still correct afterwards, so nothing signals the loss.
+        """
+        switcher = ClaudeAccountSwitcher()
+        # TWO EMAILS, which is the whole case: the shared-email fixture is the
+        # one shape where the purge's key set and the forward pass's coincide.
+        data = copy.deepcopy(sample_sequence_data_with_org)
+        emails = {"1": "account1@example.com", "2": "account2@example.com"}
+        for num, email in emails.items():
+            data["accounts"][num]["email"] = email
+            data["accounts"][num]["uuid"] = f"uuid-{num}"
+        self._write(switcher, data)
+        for num, email in emails.items():
+            switcher._write_account_credentials(num, email, f"gen1-{num}")
+            switcher._write_account_credentials(num, email, f"gen2-{num}")
+
+        prev = {
+            num: switcher._store._prev_backup_path(num, email)
+            for num, email in emails.items()
+        }
+        assert all(p.exists() for p in prev.values()), (
+            "the fixture never produced a .prev, so this test would pass "
+            "however the purge behaves"
+        )
+
+        # THE CONTROL. Without it a green result cannot separate "the purge
+        # spared them" from "the rollback never reached the purge".
+        purged: list[tuple[str, str]] = []
+        real_purge = switcher._store.delete_previous_backup
+        switcher._store.delete_previous_backup = (
+            lambda n, e: (purged.append((n, e)), real_purge(n, e))[1])
+
+        def failing_write(*_a, **_kw):
+            raise ConfigError("commit failed")
+
+        original = switcher._write_json
+        switcher._write_json = failing_write
+        try:
+            with pytest.raises(ConfigError):
+                switcher.swap_accounts("1", "2")
+        finally:
+            switcher._write_json = original
+            switcher._store.delete_previous_backup = real_purge
+        assert purged, (
+            "the rollback never reached the purge, so this case measures "
+            "nothing about it"
+        )
+
+        alive = {num: p.exists() for num, p in prev.items()}
+        assert alive == {"1": True, "2": True}, (
+            f"the rollback purged .prev for slots the swap never wrote "
+            f"through: {alive}; purge calls were {purged}"
+        )
+
+    def test_a_staging_abort_never_enters_the_rollback(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The hoist's own property, which its two observables do not pin.
+
+        Staging sits outside the `try` so an abort there cannot reach the
+        rollback at all. The existing case asserts untouched markers and live
+        session credentials, but the `moved` and `wrote_backups` gates produce
+        both of those independently — measured, moving the staging block back
+        INSIDE the `try` leaves the whole suite green. What only the hoist
+        gives is that the rollback is never entered, so that is what this
+        asserts.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-org")
+        switcher._write_account_credentials("2", email, "creds-personal")
+        # A leftover staging file is what makes staging refuse.
+        (switcher.credentials_dir / ".swap-staging-creds-1.json").write_text("{}")
+
+        entered: list[bool] = []
+        real = switcher._rollback_swap
+        switcher._rollback_swap = lambda *a, **kw: (
+            entered.append(True), real(*a, **kw))[1]
+        try:
+            with pytest.raises(ConfigError):
+                switcher.swap_accounts("1", "2")
+        finally:
+            switcher._rollback_swap = real
+
+        assert entered == [], (
+            "a staging abort reached the rollback — it reverses profiles and "
+            "rewrites both slots' credentials for a failure that mutated "
+            "nothing"
+        )
+
+    def test_a_rollback_that_restores_nothing_does_not_say_it_restored(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The opening line is emitted before anything is decided.
+
+        With `wrote_backups=False` and no moves, every step below it is
+        skipped — the reverse, the restores, the cleanup and the purge — and
+        the log still reads "restoring both slots". This PR opens by listing
+        three pieces of text that told the user the opposite of what happened.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-org")
+        switcher._write_account_credentials("2", email, "creds-personal")
+
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", email, "creds-org", "{}",
+                "2", email, "creds-personal", "{}",
+                staging={}, moved=[], wrote_backups=False,
+            )
+        said = " ".join(records)
+        assert "restoring both slots" not in said, (
+            f"it announced a restore it then skipped entirely: {said!r}"
+        )
+        assert said, "nothing was logged at all — the rollback went silent"
