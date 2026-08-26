@@ -559,11 +559,9 @@ class SessionManager:
             # refresh token.
             current = self.switcher._get_current_account()
             if current is not None and current == (email, org_uuid):
-                print(
-                    dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
-                        "default login — launching claude directly."
-                    )
+                self._note(
+                    f"Account-{account_num} ({email}) is already the active "
+                    "default login — launching claude directly."
                 )
                 self._exec(claude_bin, claude_args, env=dict(os.environ))
 
@@ -1109,11 +1107,9 @@ class SessionManager:
                 dest.unlink()
             elif dest.exists() and name not in managed:
                 # Pre-existing user data in the profile — never touch it.
-                print(
-                    dimmed(
-                        f"Not sharing {name}: the session profile already has "
-                        "its own copy."
-                    )
+                self._note(
+                    f"Not sharing {name}: the session profile already has "
+                    "its own copy."
                 )
                 continue
 
@@ -1345,11 +1341,9 @@ class SessionManager:
             # Merging moves files out from under any claude still running in
             # this profile, so only migrate when the profile is quiescent.
             if not profile_is_quiescent(session_dir):
-                print(
-                    dimmed(
-                        f"Not sharing {dest.name} yet: another session is "
-                        "using this profile — retrying on the next launch."
-                    )
+                self._note(
+                    f"Not sharing {dest.name} yet: another session is "
+                    "using this profile — retrying on the next launch."
                 )
                 return False
             try:
@@ -1358,11 +1352,9 @@ class SessionManager:
                 self._logger.warning(
                     f"Could not merge {dest.name} into {src}: {e}"
                 )
-                print(
-                    dimmed(
-                        f"Not sharing {dest.name}: merging the profile's "
-                        "existing history failed (see log)."
-                    )
+                self._note(
+                    f"Not sharing {dest.name}: merging the profile's "
+                    "existing history failed (see log)."
                 )
                 return False
             self._note(

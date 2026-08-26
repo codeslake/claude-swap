@@ -6894,3 +6894,28 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+
+
+class TestOneRemedyPerKindAcrossEverySurface:
+    """`ERROR_NOTES`'s own comment claims every surface renders through it.
+
+    A second dict in `autoswitch` covered four of the same kinds and the
+    wording had already drifted -- "run from a normal shell" against "run
+    cswap from a normal shell", "this slot's stashed successor" against "a
+    stashed successor" -- with nothing tying them. Someone editing the remedy
+    in one place ships a fix that `cswap run` and the TUI show and the tick
+    does not.
+    """
+
+    def test_the_tick_renders_the_same_text_as_every_other_surface(self):
+        from claude_swap.autoswitch import _SYSTEMIC_MESSAGES
+        from claude_swap.oauth import ERROR_NOTES
+
+        shared = sorted(set(_SYSTEMIC_MESSAGES) & set(ERROR_NOTES))
+        assert shared, "the two dicts share no kind — this compares nothing"
+        drifted = {k: (ERROR_NOTES[k], _SYSTEMIC_MESSAGES[k])
+                   for k in shared if ERROR_NOTES[k] != _SYSTEMIC_MESSAGES[k]}
+        assert not drifted, (
+            "the same failure kind reads differently depending on which "
+            f"surface reports it: {sorted(drifted)}"
+        )

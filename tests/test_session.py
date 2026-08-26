@@ -2915,3 +2915,47 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         assert "the successor is stashed" not in msg, (
             "promised a stash that never happened"
         )
+
+
+class TestEveryLaunchNoticeOutlivesTheBlank:
+    """The screen blank erases stdout, so a print-only notice reaches nobody.
+
+    This PR converted the success line in `_sync_sharing` to `_note` and left
+    two failure notices beside it on the same `run()` path. Measured: with a
+    non-quiescent profile the reason is printed and the log holds nothing, so
+    `--share-history` silently does not share and the explanation is gone.
+
+    STRUCTURAL, because a behavioural case per site invites the next one to be
+    added without one: no bare `print(dimmed(...))` may survive in the module
+    whose whole subject is notices that outlive the blank.
+    """
+
+    def test_no_launch_notice_is_print_only(self):
+        import ast
+        import pathlib
+
+        import claude_swap.session as session_mod
+
+        src = pathlib.Path(session_mod.__file__).read_text(encoding="utf-8")
+        offenders = []
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Call):
+                continue
+            if getattr(node.func, "id", "") != "print":
+                continue
+            if not node.args:
+                continue
+            inner = node.args[0]
+            if (isinstance(inner, ast.Call)
+                    and getattr(inner.func, "id", "") == "dimmed"):
+                offenders.append(node.lineno)
+        # `_note` IS the sanctioned print; exempting it by line keeps the rule
+        # "no bare print(dimmed(...))" rather than "no print at all".
+        note = next(n for n in ast.walk(ast.parse(src))
+                    if isinstance(n, ast.FunctionDef) and n.name == "_note")
+        offenders = [f"session.py:{n}" for n in offenders
+                     if not (note.lineno <= n <= note.end_lineno)]
+        assert offenders == [], (
+            "a launch notice is print-only, so the screen blank erases it and "
+            f"nothing records why: {offenders}. Use `_note`."
+        )
