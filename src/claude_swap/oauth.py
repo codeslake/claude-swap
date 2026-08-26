@@ -406,7 +406,7 @@ def _classify_usage_error(e: Exception) -> tuple[str, float | None]:
             return "timeout", None
         # A TLS handshake the SERVER answered and we refused is not a
         # transport failure, and calling it one sends you to DNS while the
-        # repair is a CA bundle. Measured 2026-08-17: a TLS-terminating proxy
+        # repair is a CA bundle. Measured: a TLS-terminating proxy
         # presented a CA urllib does not trust, every poll raised
         # URLError(SSLCertVerificationError), all of it stored as "network",
         # and one account sat unpolled for ten days with that one word as the
@@ -930,15 +930,22 @@ def _pin_aware_ssl_context():
     if _PIN_CTX_SLOT is not None and _PIN_CTX_SLOT[0] == key:
         return _PIN_CTX_SLOT[1]
 
+    # THE KEY CARRIES THE PATH, so the file loaded and the key it is cached
+    # under are ONE read. Asking the seam again here let the two disagree:
+    # `ca_path_for_trust` collapses every failure inside the optional package
+    # to None, so a None on the second read cached a context with no CA under
+    # a key that named one.
     ctx = ssl.create_default_context()
-    from claude_swap import pin as _pin
-
     try:
-        ca = _pin.ca_path_for_trust()
-        if ca:
-            ctx.load_verify_locations(cafile=str(ca))
+        if key:
+            ctx.load_verify_locations(cafile=key[0])
     except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
+        # NOT CACHED. The key is the CA's path and mtime and neither moves
+        # because a load failed, so caching this would freeze it for the life
+        # of the process — every later call dying CERTIFICATE_VERIFY_FAILED
+        # and swallowed to debug. Uncached, the next call retries.
         _logger.debug("bridge ssl context: pin CA not added: %r", e)
+        return ctx
     _PIN_CTX_SLOT = (key, ctx)
     return ctx
 
@@ -1039,7 +1046,7 @@ def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
     CANNOT TELL THE CASES APART: five distinct states all produced 0 — the
     extra missing, the listing failing, the listing empty, nothing needing a
     rename, every PUT refused — and the caller only spoke when it was
-    non-zero. Measured 2026-08-17: this ran ~20 times over 107 minutes with
+    non-zero. Measured: this ran ~20 times over 107 minutes with
     every listing dying on CERTIFICATE_VERIFY_FAILED, and nothing anywhere
     said so; the user found their cloud session names wrong before any log
     did.

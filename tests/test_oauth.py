@@ -1542,7 +1542,7 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
 
     cswap-pin already implements it, with exactly one caller —
     `_sweep_bridges_after_connect` — so it fires only when a
-    `POST /v1/code/sessions` REACHES the proxy. Measured 2026-08-17: all 24
+    `POST /v1/code/sessions` REACHES the proxy. Measured: all 24
     claude processes carried HTTPS_PROXY=127.0.0.1:9901 (CCF), because Claude
     Code reads ~/.claude.json's env block once at boot and the pin wiring
     landed after they exec'd. Nothing reached the proxy, nothing was restored,
@@ -2161,9 +2161,18 @@ class TestTheSslContextCacheHasACeiling:
 
         oauth._PIN_CTX_SLOT = None
         made = []
+
+        # A CONTEXT THAT ACCEPTS THE CA, because the fingerprint below says
+        # there is one. A bare `object()` made `load_verify_locations` an
+        # AttributeError, so this walked the no-CA path while claiming to
+        # regenerate a CA a hundred times.
+        class _Ctx:
+            def load_verify_locations(self, cafile=None):
+                pass
+
         monkeypatch.setattr(
             oauth.ssl, "create_default_context",
-            lambda *a, **k: made.append(1) or object())
+            lambda *a, **k: made.append(1) or _Ctx())
         # Each "regeneration" is a new mtime on the same path, which is what
         # the key is built from.
         for i in range(100):
@@ -2230,3 +2239,69 @@ class TestThePolicyFetchActuallyCarriesItsBudget:
         """THE CONTROL. One value can be matched by a literal that happens to
         agree; two cannot."""
         assert self._run(monkeypatch, 3.5)["timeout"] == 3.5
+
+
+class TestAFailedCaLoadIsNotCached:
+    """A transient failure must not outlive itself.
+
+    The cache is keyed on the CA file's path and mtime, and neither moves
+    because a load failed. So caching the fallback context under that key
+    freezes it for the life of the process: every later bridge listing,
+    profile fetch and usage poll goes out on a context that does not trust the
+    pin's CA, dies CERTIFICATE_VERIFY_FAILED, and is swallowed to debug --
+    which is the silent hours this helper exists to end.
+    """
+
+    def _spy_ctx(self, monkeypatch, oauth, ca, fail_load=False, second_ca=...):
+        loaded = []
+
+        class _Ctx:
+            def load_verify_locations(self, cafile=None):
+                if fail_load and not loaded:
+                    loaded.append(None)
+                    raise OSError("CA momentarily unreadable")
+                loaded.append(cafile)
+
+        monkeypatch.setattr(oauth.ssl, "create_default_context", _Ctx)
+        return loaded
+
+    def test_a_transient_load_failure_is_retried(self, tmp_path, monkeypatch):
+        from claude_swap import oauth, pin
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("cert", encoding="utf-8")
+        monkeypatch.setattr(oauth, "_PIN_CTX_SLOT", None)
+        monkeypatch.setattr(pin, "ca_path_for_trust", lambda: ca)
+        loaded = self._spy_ctx(monkeypatch, oauth, ca, fail_load=True)
+
+        oauth._pin_aware_ssl_context()
+        assert loaded == [None], f"the failure did not happen: {loaded}"
+        oauth._pin_aware_ssl_context()
+        assert loaded == [None, str(ca)], (
+            "the context built WITHOUT the pin CA was cached under the CA's "
+            "own path+mtime, so nothing can ever rebuild it: every later "
+            f"request dies CERTIFICATE_VERIFY_FAILED. {loaded}")
+
+    def test_the_ca_is_read_once_per_rebuild(self, tmp_path, monkeypatch):
+        """The key and the file loaded must come from ONE read.
+
+        `ca_path_for_trust` collapses every failure inside the optional
+        package to None, so asking it twice lets the two answers disagree: a
+        None on the second read caches a context with no CA under a key that
+        says one was there, and the key cannot move on its own.
+        """
+        from claude_swap import oauth, pin
+
+        ca = tmp_path / "ca.pem"
+        ca.write_text("cert", encoding="utf-8")
+        asked = []
+        monkeypatch.setattr(oauth, "_PIN_CTX_SLOT", None)
+        monkeypatch.setattr(pin, "ca_path_for_trust",
+                            lambda: asked.append(1) or ca)
+        self._spy_ctx(monkeypatch, oauth, ca)
+
+        oauth._pin_aware_ssl_context()
+        assert asked == [1], (
+            f"the CA was read {len(asked)} times to build one context, so the "
+            "key and the file loaded are two separate answers that can "
+            "disagree")

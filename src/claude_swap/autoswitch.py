@@ -1013,8 +1013,7 @@ class AutoSwitchEngine:
 
         It appeared to work whenever cswap's own process happened to sit
         behind the pin proxy, which rewrites the bearer on the way through —
-        a property of the machine's environment, not of this code, and one the
-        health sweep reports as FAIL on a third of this box's processes.
+        a property of the machine's environment, not of this code.
 
         NO SILENT FALLBACK TO THE ACTIVE ACCOUNT when the pinned email is not
         in the roster. That is the bug with a longer fuse: we have no
@@ -1067,9 +1066,15 @@ class AutoSwitchEngine:
             _logger.info("restored %d cloud bridge title(s)", done)
             self._bridge_titles_last = outcome
             return
-        if outcome == getattr(self, "_bridge_titles_last", None):
+        # DEDUP ON THE KIND, NOT THE COUNTS. `partial-3-of-40` carries its
+        # numbers in the outcome, so a persistently slow endpoint makes every
+        # pass a different string and the transition rule never fires — a line
+        # every 300 s forever, which is the noise this function exists to
+        # prevent.
+        kind = "".join("N" if c.isdigit() else c for c in outcome)
+        if kind == getattr(self, "_bridge_titles_last", None):
             return
-        self._bridge_titles_last = outcome
+        self._bridge_titles_last = kind
         # `list-failed` and a raise are faults: something is wrong and nobody
         # asked for it. The rest are ordinary states worth one line when they
         # begin.

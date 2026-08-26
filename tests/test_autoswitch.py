@@ -7060,7 +7060,7 @@ class TestTheEngineActuallyRunsTheTitleRestore:
         `if done: _logger.info(...)`, so all five were the same silence as a
         perfect run.
 
-        Measured 2026-08-17: the engine ran this ~20 times over 107 minutes
+        Measured: the engine ran this ~20 times over 107 minutes
         with every listing dying on CERTIFICATE_VERIFY_FAILED
         (`_list_bridge_sessions` swallows to debug and returns None), and the
         user's cloud session names stayed wrong with nothing in any log. The
@@ -7244,6 +7244,30 @@ class TestTheEngineActuallyRunsTheTitleRestore:
             "a slot whose credential yields no bearer renamed nothing and "
             "said nothing — indistinguishable from a healthy pass, forever")
         assert "token" in warns[0], warns[0]
+
+    def test_a_partial_pass_does_not_speak_every_time(self, harness, caplog):
+        """`_report_bridge_titles` speaks on a TRANSITION, and its docstring
+        says why: a 300 s timer that logs every pass is a log nobody reads by
+        morning.
+
+        `partial-3-of-40` carries its counts IN the outcome string, so a
+        persistently slow endpoint makes every pass a different "outcome" and
+        the dedup never fires. Forty stale titles against an endpoint that
+        fits a few PUTs into the 20 s budget then logs forever — the exact
+        noise this reporter exists to prevent.
+        """
+        import logging
+
+        with caplog.at_level(logging.INFO, logger="claude_swap.autoswitch"):
+            for done in (3, 5, 4):
+                harness.engine._report_bridge_titles(
+                    f"partial-{done}-of-40", done)
+
+        lines = [r.getMessage() for r in caplog.records
+                 if "bridge titles" in r.getMessage()]
+        assert len(lines) == 1, (
+            "a partial pass spoke on every tick because its counts are part "
+            f"of the outcome it dedups on: {lines}")
 
     def test_the_timer_reads_the_injected_clock(self, harness, monkeypatch):
         """THIRTEEN OTHER TIME READS IN THIS CLASS GO THROUGH `self.clock`.
