@@ -1905,17 +1905,13 @@ class ClaudeAccountSwitcher:
                     "away; it just won't be an automatic switch target."
                 ))
             # An empty rotation has two causes and only one is a disable, so
-            # the cause picks the remedy. Not switchable_account_numbers():
-            # it walks the same uncached per-slot credential reads, which on
-            # this branch's hot case are keychain misses.
+            # the cause picks the remedy. _account_is_switchable() never
+            # consults the disabled flag, so `readable` spans both.
             readable = [
                 n for n in map(str, data.get("sequence", []))
                 if self._account_is_switchable(n)
             ]
-            in_rotation = [
-                n for n in readable if not self._disabled_from_data(data, n)
-            ]
-            if not in_rotation:
+            if all(self._disabled_from_data(data, n) for n in readable):
                 if readable:
                     warning(
                         "  No accounts remain in rotation — auto-switch and bare "
@@ -1925,16 +1921,13 @@ class ClaudeAccountSwitcher:
                 else:
                     # A keychain exists only on macOS; naming it elsewhere
                     # points at something that is not there.
-                    remedy = (
-                        "unlock the keychain, or re-add a slot"
-                        if self.platform == Platform.MACOS
-                        else "re-add a slot"
-                    )
+                    unlock = ("unlock the keychain, or "
+                              if self.platform == Platform.MACOS else "")
                     warning(
                         "  No managed accounts have readable credentials/config "
                         "— auto-switch and bare switch have nothing to pick. "
-                        f"Re-enabling changes nothing: {remedy} with "
-                        "cswap --add-account --slot <number>."
+                        f"Re-enabling changes nothing: {unlock}re-add a slot "
+                        "with cswap --add-account --slot <number>."
                     )
         else:
             print(dimmed("  It is back in the rotation."))

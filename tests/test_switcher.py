@@ -8633,6 +8633,20 @@ class TestDisableEnableAccount:
 
         assert "No accounts remain in rotation" in capsys.readouterr().out
 
+    def test_disable_warns_about_nothing_while_a_slot_is_still_in_rotation(
+        self, temp_home, capsys
+    ):
+        """CONTROL for both warnings above. Every other test here asserts a
+        message is present, which a predicate that fired unconditionally would
+        also satisfy."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        s.set_account_disabled("1", True)  # 2 is readable and still enabled
+
+        assert "nothing to pick" not in capsys.readouterr().out
+
     def test_disable_warns_about_credentials_when_no_slot_is_readable(
         self, temp_home, capsys
     ):

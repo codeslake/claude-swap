@@ -1393,7 +1393,22 @@ class TestRun:
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
-    def test_the_scrub_warning_outlives_the_terminal_it_was_printed_to(
+    @pytest.mark.parametrize(
+        "env, logged_, not_logged",
+        [
+            (
+                {"ANTHROPIC_API_KEY": "sk-ant-key", "ANTHROPIC_AUTH_TOKEN": "tok"},
+                ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+                [],
+            ),
+            ({"CLAUDE_CONFIG_DIR": "/x"}, ["overriding it for this launch"], []),
+            # The control: with neither var set, both rows above would pass
+            # against a logger that warned unconditionally.
+            ({}, [], ["overriding it for this launch", "ANTHROPIC_API_KEY"]),
+        ],
+        ids=["scrub", "config_dir", "control"],
+    )
+    def test_the_launch_warnings_outlive_the_terminal(
         self,
         manager,
         capture_exec,
@@ -1401,53 +1416,24 @@ class TestRun:
         auth_status_tracks_seed,
         refresh_rotates,
         caplog,
+        env,
+        logged_,
+        not_logged,
     ):
         """The account is still carried by the status line after the exec;
-        "your env var was ignored" is carried by nothing."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
-        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            with pytest.raises(_ExecCalled):
-                manager.run("2", [])
-        logged = "\n".join(r.getMessage() for r in caplog.records)
-        assert "ANTHROPIC_API_KEY" in logged
-        assert "ANTHROPIC_AUTH_TOKEN" in logged
-
-    def test_the_config_dir_override_warning_outlives_the_terminal(
-        self,
-        manager,
-        capture_exec,
-        monkeypatch,
-        auth_status_tracks_seed,
-        refresh_rotates,
-        caplog,
-    ):
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            with pytest.raises(_ExecCalled):
-                manager.run("2", [])
-        logged = "\n".join(r.getMessage() for r in caplog.records)
-        assert "overriding it for this launch" in logged
-
-    def test_a_clean_launch_logs_no_warning(
-        self,
-        manager,
-        capture_exec,
-        monkeypatch,
-        auth_status_tracks_seed,
-        refresh_rotates,
-        caplog,
-    ):
-        """CONTROL. Without either condition the two records must be absent —
-        otherwise the assertions above pass on a logger that warns always."""
+        "the value you set was overridden" is carried by nothing."""
         for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CONFIG_DIR"):
             monkeypatch.delenv(var, raising=False)
+        for var, value in env.items():
+            monkeypatch.setenv(var, value)
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             with pytest.raises(_ExecCalled):
                 manager.run("2", [])
-        logged = "\n".join(r.getMessage() for r in caplog.records)
-        assert "overriding it for this launch" not in logged
-        assert "ANTHROPIC_API_KEY" not in logged
+        records = "\n".join(r.getMessage() for r in caplog.records)
+        for expected in logged_:
+            assert expected in records
+        for absent in not_logged:
+            assert absent not in records
 
     def test_fast_path_keeps_env_untouched(
         self, manager, capture_exec, monkeypatch
