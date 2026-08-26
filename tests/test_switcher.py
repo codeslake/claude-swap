@@ -12790,3 +12790,139 @@ def test_a_failed_write_through_does_not_keep_the_narrowed_mode(
         f"the destination went {oct(before)} -> {oct(mode)} — the narrowing "
         "outlived the write it was for, and nothing recorded what to restore"
     )
+
+
+def test_a_copy_that_never_opened_the_destination_leaves_it_alone(
+    temp_home: Path, monkeypatch
+):
+    """`_unnarrow` may only empty what `copyfile` already truncated.
+
+    `shutil.copyfile` raises before it opens the destination `'wb'` on four
+    paths — `SameFileError`, `SpecialFileError`, any failure opening the
+    SOURCE, and a signal anywhere in that prologue. In every one of them the
+    destination still holds its original bytes, and emptying it destroys a
+    live config the write never touched. At the merge base the copy fallback
+    left it fully intact, so undoing the narrowing this way is a regression
+    the narrowing-fix introduced.
+    """
+    import stat as stat_mod
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    original = '{"activeAccountNumber": 1}'
+    path.write_text(original)
+    os.chmod(path, 0o644)
+    before = stat_mod.S_IMODE(path.stat().st_mode)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def never_opened_dst(_src, _dst, *_a, **_kw):
+        # The source could not be read; `_dst` was never touched.
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", never_opened_dst)
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"activeAccountNumber": 2})
+
+    assert path.read_text() == original, (
+        f"the destination was emptied by a copy that never opened it: "
+        f"{path.read_text()!r}"
+    )
+    assert stat_mod.S_IMODE(path.stat().st_mode) == before, (
+        "the narrowing outlived the write it was for"
+    )
+
+
+@pytest.mark.parametrize("site", ["settings", "mappings", "session"])
+def test_a_stranded_temp_from_a_recycled_pid_does_not_wedge_the_write(
+    temp_home: Path, tmp_path: Path, site: str
+):
+    """`O_EXCL` on a pid-derived name is not the collision safety mkstemp gave.
+
+    `mkstemp` RETRIES on EEXIST; `O_EXCL` on a fixed name can only fail. A
+    SIGKILL (a container stop, an OOM) strands `.mappings-<pid>.tmp`, a later
+    process draws the same pid, and the write dies — and the handler then
+    unlinks a file it did not create, which is exactly what
+    `_stage_overlap_material` refuses to do.
+
+    A random suffix keeps I1's property (the name is known before the file
+    exists) AND mkstemp's collision profile.
+    """
+    d = tmp_path / "d"
+    d.mkdir()
+    if site == "settings":
+        from claude_swap.settings import atomic_write_json
+
+        target = d / "s.json"
+        stray = d / f".{target.name}.{os.getpid()}.tmp"
+        write = lambda: atomic_write_json(target, {"a": 1})
+    elif site == "mappings":
+        from claude_swap.mappings import MappingStore
+
+        store = MappingStore(d)
+        stray = d / f".mappings-{os.getpid()}.tmp"
+        write = lambda: store._write({})
+    else:
+        from claude_swap.session import SessionManager
+
+        mgr = SessionManager(ClaudeAccountSwitcher())
+        stray = d / f".cswap-shared-{os.getpid()}.tmp"
+        write = lambda: mgr._write_manifest(d / "m.json", [])
+
+    stray.write_text("a predecessor died holding this")
+    write()
+    assert stray.read_text() == "a predecessor died holding this", (
+        "the writer deleted a stranded file it did not create"
+    )
+
+
+@pytest.mark.parametrize("site", ["settings", "mappings", "session"])
+def test_an_interrupt_at_the_create_strands_nothing(
+    temp_home: Path, tmp_path: Path, monkeypatch, site: str
+):
+    """The BEHAVIOUR I1 is about, which its sibling case cannot see.
+
+    `test_no_writer_mints_its_temp_name_inside_the_syscall` injects no
+    interrupt: it makes `mkstemp` explode and calls each writer on its SUCCESS
+    path, so it only asserts "this module does not call mkstemp". Measured —
+    with `os.open` moved back outside the guard (the name still computed
+    first, so that premise holds) it stays green on a tree that strands the
+    temp. This one interrupts at the create and looks at the directory.
+    """
+    d = tmp_path / "d"
+    d.mkdir()
+    before = set(os.listdir(d))
+
+    real_open = os.open
+
+    def exploding(path, *a, **k):
+        fd = real_open(path, *a, **k)   # the file now exists
+        os.close(fd)
+        raise KeyboardInterrupt("inside the create")
+
+    if site == "settings":
+        from claude_swap import settings as mod
+        from claude_swap.settings import atomic_write_json
+
+        write = lambda: atomic_write_json(d / "s.json", {"a": 1})
+    elif site == "mappings":
+        from claude_swap import mappings as mod
+        from claude_swap.mappings import MappingStore
+
+        write = lambda: MappingStore(d)._write({})
+    else:
+        from claude_swap import session as mod
+        from claude_swap.session import SessionManager
+
+        write = lambda: SessionManager(
+            ClaudeAccountSwitcher())._write_manifest(d / "m.json", [])
+
+    monkeypatch.setattr(mod.os, "open", exploding)
+    with pytest.raises(KeyboardInterrupt):
+        write()
+
+    strays = sorted(set(os.listdir(d)) - before)
+    assert strays == [], f"an interrupt at the create left {strays}"

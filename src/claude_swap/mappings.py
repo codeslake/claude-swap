@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -129,7 +130,8 @@ class MappingStore:
         # interrupt there strands a temp nothing can name, and an interrupt
         # between the create and `fdopen` leaks the descriptor -- on Windows
         # that held handle is what makes the cleanup unlink fail.
-        tmp = str(self.path.parent / f".mappings-{os.getpid()}.tmp")
+        tmp = str(self.path.parent
+                  / f".mappings-{os.getpid()}.{secrets.token_hex(4)}.tmp")
         fd = -1
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

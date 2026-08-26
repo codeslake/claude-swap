@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -1425,7 +1426,8 @@ class SessionManager:
         # `mkstemp` mints the name inside the syscall, so an interrupt there
         # strands a temp nothing can name, and an interrupt before the handover
         # leaks the descriptor that makes a Windows unlink fail.
-        tmp = str(manifest_path.parent / f".cswap-shared-{os.getpid()}.tmp")
+        tmp = str(manifest_path.parent
+                  / f".cswap-shared-{os.getpid()}.{secrets.token_hex(4)}.tmp")
         fd = -1
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

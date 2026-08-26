@@ -667,17 +667,30 @@ class ClaudeAccountSwitcher:
                     f"{path.name} may now be truncated; the complete content "
                     f"was kept at {source.name}"
                 )
+                before_size = None
+                try:
+                    before_size = os.stat(path).st_size
+                except OSError:
+                    pass
+
                 def _unnarrow():
-                    # `copyfile` opens 'wb', so by here the destination is
-                    # already truncated and holds no original content. Empty it
-                    # outright before widening: an empty file at the old mode
-                    # leaks nothing, and the complete content is at `source`,
-                    # which `kept` names.
+                    # ONLY WHAT THE COPY ACTUALLY TRUNCATED. `copyfile` raises
+                    # on four paths BEFORE it opens the destination 'wb' --
+                    # SameFileError, SpecialFileError, any failure opening the
+                    # SOURCE, and a signal in that prologue -- and there the
+                    # destination still holds its original bytes. Emptying it
+                    # then destroys a live config the write never touched, so
+                    # the size is compared first: a truncation is visible as a
+                    # shrink, and only then is emptying safe (the complete
+                    # content is at `source`, which `kept` names).
                     if prior_mode is None or prior_mode == 0o600:
                         return
                     try:
-                        with open(path, "wb"):
-                            pass
+                        touched = (before_size is not None
+                                   and os.stat(path).st_size < before_size)
+                        if touched:
+                            with open(path, "wb"):
+                                pass
                         os.chmod(path, prior_mode)
                     except OSError:
                         pass  # best effort; `kept` still names the survivor

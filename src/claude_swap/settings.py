@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import secrets
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -472,7 +473,8 @@ def atomic_write_json(path: Path, data: dict) -> None:
     # THE NAME BEFORE THE FILE. `mkstemp` picks the name internally and opens
     # the file before it returns, so an interrupt in that window strands a temp
     # nothing can name. `O_EXCL` keeps the collision safety mkstemp gave.
-    tmp_path = str(target.parent / f".{target.name}.{os.getpid()}.tmp")
+    tmp_path = str(target.parent
+                   / f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     fd = -1
     try:
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
