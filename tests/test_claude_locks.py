@@ -114,6 +114,40 @@ class TestProperLockfile:
                 "the lock went stale while still held, so a waiter may steal it"
             )
 
+    def test_a_transient_failure_does_not_claim_the_lock_is_about_to_be_stolen(
+            self, lock_dir, monkeypatch, caplog):
+        """The sentence is only true of a failure that outlives the window.
+
+        "its mtime stops advancing, so a waiter may take it over as stale" is
+        the warning's own justification, and the arm fired on the FIRST
+        failure regardless — so a single hiccup that clears on the next tick
+        printed it while the mtime went on advancing and nothing was ever at
+        risk. Measured before this: 7 touches, a lock fresh throughout, one
+        warning saying the opposite.
+
+        Its sibling covers the persistent case with `fail_all`, so nothing
+        stood between the two.
+        """
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        touches, real = self._count_touches(
+            monkeypatch, lock_dir, fail_first=OSError("transient"))
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with proper_lockfile(lock_dir):
+                time.sleep(0.3)
+                # INSIDE THE HOLD: the release removes the directory, so the
+                # freshness this is about is unobservable afterwards.
+                age = time.time() - lock_dir.stat().st_mtime
+
+        assert touches["n"] > 2, "control: the toucher must have kept trying"
+        assert age < 5.0, (
+            "premise: the mtime really did stop advancing, so the warning "
+            "would have been true"
+        )
+        said = [r.getMessage() for r in caplog.records if "refresh" in r.getMessage()]
+        assert said == [], (
+            f"a hiccup that cleared was reported as imminent theft: {said}"
+        )
+
     def test_a_persistent_touch_failure_is_reported_once(
             self, lock_dir, monkeypatch, caplog):
         """A failure that never clears leaves the takeover unexplainable.
@@ -123,12 +157,17 @@ class TestProperLockfile:
         mtime advancing, and a waiter then legitimately steals a lock that is
         still held, with nothing anywhere recording why. One warning costs a
         bool; one per attempt would bury it.
+
+        OUTLIVING THE WINDOW is what the warning claims, so the window is
+        shortened here rather than waiting `CONFIG_STALENESS_S` for it. With
+        the default the failure never persists long enough and this case
+        stopped discriminating the moment the arm learned to ask.
         """
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
         touches, _ = self._count_touches(
             monkeypatch, lock_dir, fail_all=PermissionError("injected"))
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            with proper_lockfile(lock_dir):
+            with proper_lockfile(lock_dir, staleness=0.05):
                 time.sleep(0.3)
 
         assert touches["n"] > 1, "control: the toucher must have kept trying"
@@ -263,24 +302,61 @@ class TestProperLockfile:
         # measured, a foreign 0.5 landing in this list and failing a correct
         # implementation -- and flattens their pacing to a hot spin.
         # conftest.py documents that this suite leaves such threads running.
-        slept = []
+        # PER SLEEP AGAINST WHAT WAS LEFT, not a fixed ceiling on a 1ms
+        # budget. That budget IS the tolerance: a 1.0ms stall anywhere ahead
+        # of the first sleep spends it, the loop raises before sleeping at
+        # all, and the case failed blaming its own instrument. Measured:
+        # 0.8ms of injected `os.mkdir` stall passed, 1.0ms failed.
+        budget = 0.175
+        over: list[tuple[float, float]] = []
+        lefts: list[float] = []
         real_sleep = claude_locks.time.sleep
+        real_monotonic = claude_locks.time.monotonic
         mine = threading.get_ident()
+        anchor: list[float] = []
+
+        def anchoring():
+            t = real_monotonic()
+            if threading.get_ident() == mine and not anchor:
+                anchor.append(t)
+            return t
 
         def recording(seconds):
             if threading.get_ident() != mine:
                 return real_sleep(seconds)      # not ours: leave it alone
-            slept.append(seconds)
-            return real_sleep(0)
+            if not anchor:
+                # Nothing has read the clock inside the call yet, so
+                # there is no deadline to measure against.
+                return real_sleep(seconds)
+            left = budget - (real_monotonic() - anchor[0])
+            lefts.append(left)
+            if seconds > max(left, 0.0) + 0.005:
+                over.append((seconds, left))
+            return real_sleep(seconds)
 
+        monkeypatch.setattr(claude_locks.time, "monotonic", anchoring)
         monkeypatch.setattr(claude_locks.time, "sleep", recording)
         with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.001):
+            # CLEARED HERE, not at the patch. `claude_locks.time` IS the
+            # `time` module, so anything in this thread reading the clock
+            # between the two -- pytest's own machinery included -- would
+            # otherwise become the anchor. Past this line the only thing
+            # ahead of the code's `start` is a `mkdir`.
+            anchor.clear()
+            with proper_lockfile(lock_dir, timeout=budget):
                 pass
-        assert slept, "no retry sleep happened — the instrument, not the code"
-        assert max(slept) <= 0.001 + 1e-6, (
-            f"the rmdir-failure path slept {max(slept):.3f}s against a 0.001s "
-            "budget — it ignored the remaining time"
+        assert len(lefts) >= 2, (
+            f"only {len(lefts)} sleep(s) happened — the instrument, not the code"
+        )
+        assert min(lefts) < 0.05, (
+            f"the smallest remaining budget at a sleep was {min(lefts):.3f}s, "
+            "never below the flat 0.05 this separates — the run never entered "
+            "the region where the clamp is observable"
+        )
+        assert not over, (
+            f"{len(over)} sleep(s) ran past the deadline; worst slept "
+            f"{max(o for o, _ in over):.3f}s with {min(l for _, l in over):.3f}s "
+            "left — the rmdir-failure path ignored the remaining time"
         )
 
 
@@ -473,30 +549,65 @@ class TestTheClampsSurviveWeakeningNotOnlyDeletion:
         # an unscoped patch records every other thread's sleeps too.
         budget = 0.175
         over: list[tuple[float, float]] = []
-        n = 0
+        lefts: list[float] = []
         real_sleep = claude_locks.time.sleep
+        real_monotonic = claude_locks.time.monotonic
         mine = threading.get_ident()
-        start = time.monotonic()
+        # THE CODE'S OWN ANCHOR, NOT OURS. `start` taken out here sits before
+        # `mkdir(parents=True)` and, for `FileLock`, before an `open` too --
+        # a gap the case tolerated with a fixed 5ms. Under a starved runner
+        # that gap reached 95ms and the case failed on CORRECT code: measured
+        # 3 natural false failures in 44 SCHED_IDLE runs of the pristine tree.
+        # The first `monotonic()` inside the call IS the code's `start`.
+        anchor: list[float] = []
+
+        def anchoring():
+            t = real_monotonic()
+            if threading.get_ident() == mine and not anchor:
+                anchor.append(t)
+            return t
 
         def recording(seconds):
-            nonlocal n
             if threading.get_ident() != mine:
                 return real_sleep(seconds)
-            n += 1
-            left = budget - (time.monotonic() - start)
-            # A tick of slack: the clamp reads the clock a few instructions
-            # before we do, so an exactly-clamped sleep can measure marginally
-            # over. The defect it separates is a FLAT 0.05 against a remainder
-            # near zero, which is nowhere near this tolerance.
+            if not anchor:
+                # Nothing has read the clock inside the call yet, so
+                # there is no deadline to measure against.
+                return real_sleep(seconds)
+            left = budget - (real_monotonic() - anchor[0])
+            lefts.append(left)
+            # A tick of slack for the instructions between the clamp reading
+            # the clock and us reading it. With the anchor shared this is
+            # slack, not the thing holding the case up.
             if seconds > max(left, 0.0) + 0.005:
                 over.append((seconds, left))
             return real_sleep(seconds)
 
+        monkeypatch.setattr(claude_locks.time, "monotonic", anchoring)
         monkeypatch.setattr(claude_locks.time, "sleep", recording)
         with pytest.raises(ClaudeCodeLockTimeout):
+            # CLEARED HERE, not at the patch. `claude_locks.time` IS the
+            # `time` module, so anything in this thread reading the clock
+            # between the two -- pytest's own machinery included -- would
+            # otherwise become the anchor. Past this line the only thing
+            # ahead of the code's `start` is a `mkdir`.
+            anchor.clear()
             with proper_lockfile(lock_dir, timeout=budget):
                 pass
-        assert n >= 2, f"only {n} sleep(s) happened — the instrument, not the code"
+        assert len(lefts) >= 2, (
+            f"only {len(lefts)} sleep(s) happened — the instrument, not the code"
+        )
+        # THE DISCRIMINATING REGION. A clamp is only observable once the
+        # remainder falls below the sleep the code would otherwise take;
+        # loop latency can step over that window entirely, and then an
+        # unclamped flat 0.05 passes with nothing saying the run had no
+        # power. Measured: the anti-weakening mutant survives at 10ms and
+        # 50ms of injected loop latency without this.
+        assert min(lefts) < 0.05, (
+            f"the smallest remaining budget at a sleep was {min(lefts):.3f}s, "
+            "never below the flat 0.05 this separates — the run never entered "
+            "the region where the clamp is observable"
+        )
         assert not over, (
             f"{len(over)} sleep(s) ran past the deadline; worst slept "
             f"{max(o for o, _ in over):.3f}s with {min(l for _, l in over):.3f}s "

@@ -137,12 +137,15 @@ def proper_lockfile(
 
     stop_touching = threading.Event()
     warned = False
+    last_ok = time.time()
 
     def _touch() -> None:
-        nonlocal warned
+        nonlocal warned, last_ok
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             try:
                 os.utime(lock_dir)
+                last_ok = time.time()
+                continue
             except FileNotFoundError:
                 return  # gone; nothing left to keep alive
             except OSError as e:
@@ -153,10 +156,16 @@ def proper_lockfile(
                 # second syscall that can fail the same way and, from 3.14,
                 # an answer that reads absence out of a permission error.
                 #
-                # Once, not per attempt: a failure that never clears stops the
-                # mtime advancing, so the takeover that follows is legitimate
-                # and would otherwise arrive with nothing recording its cause.
-                if not warned:
+                # ONLY ONCE THE SENTENCE IS TRUE. "its mtime stops advancing,
+                # so a waiter may take it over as stale" describes a failure
+                # that outlives the staleness window; the arm fired on the
+                # FIRST one, so a hiccup that cleared on the next tick printed
+                # imminent theft over a lock that stayed fresh throughout.
+                #
+                # Once, not per attempt: a failure that never clears really
+                # does stop the mtime, and the takeover that follows would
+                # otherwise arrive with nothing recording its cause.
+                if not warned and time.time() - last_ok > staleness:
                     warned = True
                     _logger.warning(
                         "Could not refresh %s (%s); its mtime stops advancing, "
