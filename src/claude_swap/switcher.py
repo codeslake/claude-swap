@@ -1148,6 +1148,7 @@ class ClaudeAccountSwitcher:
         config_b = self._read_account_config(num_b, email_b)
 
         staging: dict[str, Path] = {}
+        swapped_dirs = False
         try:
             if email_a == email_b:
                 # Same email: the two slots' backup keys fully overlap, so
@@ -1163,6 +1164,7 @@ class ClaudeAccountSwitcher:
             # accounts share an email the two paths swap directly, so stage the
             # first through a temporary name.
             self._swap_session_dirs(num_a, email_a, num_b, email_b)
+            swapped_dirs = True
 
             # Set each destination key to its owner's exact state: write
             # material that exists, actively clear what doesn't. An empty
@@ -1210,7 +1212,7 @@ class ClaudeAccountSwitcher:
             self._rollback_swap(
                 num_a, email_a, creds_a, config_a,
                 num_b, email_b, creds_b, config_b,
-                staging,
+                staging, swapped_dirs,
             )
             raise
 
@@ -1369,6 +1371,7 @@ class ClaudeAccountSwitcher:
         creds_b: str,
         config_b: str,
         staging: dict[str, "Path"],
+        swapped_dirs: bool,
     ) -> None:
         """Best-effort restore of both slots after a failed swap mutation.
 
@@ -1385,8 +1388,14 @@ class ClaudeAccountSwitcher:
             f"Swap {num_a} <-> {num_b} failed mid-write; restoring both slots"
         )
         failures = 0
-        # Undo the session-profile exchange (same staging trick, reversed).
-        self._swap_session_dirs(num_b, email_a, num_a, email_b)
+        # Undo the session-profile exchange (same staging trick, reversed) —
+        # but ONLY if the forward move ran. Staging happens before it, so an
+        # abort there reaches here with nothing swapped, and an unconditional
+        # reverse would exchange two profiles nobody touched while the error
+        # says nothing was changed. The credential and roster steps below are
+        # already no-ops when their forward halves did not run; this one is not.
+        if swapped_dirs:
+            self._swap_session_dirs(num_b, email_a, num_a, email_b)
         overlap = email_a == email_b
         for kind, num, email, original in (
             ("creds", num_a, email_a, creds_a),

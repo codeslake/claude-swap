@@ -202,6 +202,73 @@ class TestSwapAccounts:
         assert data["accounts"]["1"]["organizationUuid"] == "org-uuid-5678"
         assert data["activeAccountNumber"] == 1
 
+    def test_swap_aborted_in_staging_leaves_the_session_dirs_alone(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """An abort before the forward move must not exchange session profiles.
+
+        Staging is the only step that runs ahead of ``_swap_session_dirs``, so
+        its failure is the one abort that reaches the rollback with nothing yet
+        swapped. An unconditional reverse move there exchanges two directories
+        nobody touched, while the error text says nothing was changed.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-org")
+        switcher._write_account_credentials("2", email, "creds-personal")
+        for num, marker in (("1", "SLOT-1-HISTORY"), ("2", "SLOT-2-HISTORY")):
+            profile = switcher._session_dir(num, email)
+            profile.mkdir(parents=True, exist_ok=True)
+            (profile / "marker").write_text(marker)
+
+        # A leftover staging file is what makes staging refuse.
+        (switcher.credentials_dir / ".swap-staging-creds-1.json").write_text("{}")
+
+        with pytest.raises(ConfigError):
+            switcher.swap_accounts("1", "2")
+
+        assert (
+            switcher._session_dir("1", email) / "marker"
+        ).read_text() == "SLOT-1-HISTORY"
+        assert (
+            switcher._session_dir("2", email) / "marker"
+        ).read_text() == "SLOT-2-HISTORY"
+
+    def test_swap_failing_after_the_move_still_restores_the_session_dirs(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """Control for the gate above: a failure AFTER the forward move must
+        still reverse it, or the gate would be a way to skip the rollback."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-org")
+        switcher._write_account_credentials("2", email, "creds-personal")
+        for num, marker in (("1", "SLOT-1-HISTORY"), ("2", "SLOT-2-HISTORY")):
+            profile = switcher._session_dir(num, email)
+            profile.mkdir(parents=True, exist_ok=True)
+            (profile / "marker").write_text(marker)
+
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+
+        def failing_write(self, num, email, creds):
+            raise OSError("disk full (injected)")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+            )
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
+
+        assert (
+            switcher._session_dir("1", email) / "marker"
+        ).read_text() == "SLOT-1-HISTORY"
+        assert (
+            switcher._session_dir("2", email) / "marker"
+        ).read_text() == "SLOT-2-HISTORY"
+
     def test_swap_same_email_persistent_failure_keeps_staged_copy(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
