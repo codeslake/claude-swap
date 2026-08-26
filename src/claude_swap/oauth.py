@@ -905,8 +905,8 @@ def _pin_aware_ssl_context():
         host-b      ambient 128  bundle 167  NOT — 27 missing
         host-c  ambient 128  bundle   2  NOT — 128 missing
 
-    So the writer that sets it correctly refuses on both Macs, and the repair
-    stays dead there. Loading our CA into a default context keeps every
+    So the writer that sets it correctly refuses on two of the three, and the
+    repair stays dead there. Loading our CA into a default context keeps every
     ambient root and needs no environment variable at all. Measured on
     host-c, same process and proxy:
 

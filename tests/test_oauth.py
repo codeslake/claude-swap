@@ -1603,7 +1603,7 @@ class TestBridgeTitleRestoreRunsWithoutTheProxy:
             host-b      ambient 128  bundle 167  NOT (27 missing)
             host-c  ambient 128  bundle   2  NOT (128 missing)
 
-        so the gate that writes it correctly refuses on both Macs, and the
+        so the gate that writes it correctly refuses on two of the three, and the
         restore stays broken there. Adding the CA to a default context keeps
         the system roots and needs no variable at all. Measured on
         host-c, same process, same proxy:
