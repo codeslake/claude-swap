@@ -37,7 +37,7 @@ from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel, usage_rows
+from claude_swap.tui.widgets import AccountsPanel, spend_row, usage_rows
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -367,13 +367,11 @@ class AutoScreen(Screen):
                 # `relevant_windows` excludes spend on purpose (a separate
                 # axis from a rate-limit window), so this row was the only
                 # place the same account read two different ways.
-                spend_row = next(
-                    (r for r in usage_rows(acc.usage.last_good, time.time())
-                     if r[0] == "$$"),
-                    None,
+                spend = spend_row(
+                    usage_rows(acc.usage.last_good, time.time())
                 )
-                if spend_row is not None:
-                    _label, spend_pct, spend_suffix, _full = spend_row
+                if spend is not None:
+                    _label, spend_pct, spend_suffix, _full = spend
                     entry.append("  $$ ", style=palette.muted)
                     entry.append(f"{spend_pct:.0f}%",
                                  style=palette.severity(spend_pct))

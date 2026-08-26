@@ -132,7 +132,7 @@ def usage_rows(
         reset, reset_full = _reset_parts(spend, now)
         suffix = f"{reset}  {amounts}" if reset else amounts
         suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
-        rows.append(("$$", float(spend["pct"]), suffix, suffix_full))
+        rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
@@ -240,6 +240,19 @@ def account_card_text(
     return text
 
 
+SPEND_LABEL = "$$"
+
+
+def spend_row(rows: list[tuple]) -> tuple | None:
+    """The pay-as-you-go spend row out of :func:`usage_rows`, or ``None``.
+
+    Both compact surfaces render spend, so the label lives here rather than
+    as a literal in each of them — the same reason `data.window_chip_label`
+    exists for a window.
+    """
+    return next((r for r in rows if r[0] == SPEND_LABEL), None)
+
+
 def mini_account_text(
     acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
 ) -> Text:
@@ -308,11 +321,11 @@ def mini_account_text(
     # that still reads perfectly healthy. From `usage_rows`, not a third
     # spelling of the same amounts.
     rows = usage_rows(last_good, now, fetched_at)
-    spend_row = next((r for r in rows if r[0] == "$$"), None)
-    if spend_row is not None:
+    spend = spend_row(rows)
+    if spend is not None:
         if parts:
             text.append(" · ", style=palette.track)
-        _label, pct, suffix, _full = spend_row
+        _label, pct, suffix, _full = spend
         color = palette.severity(pct)
         text.append("$$ ", style=palette.muted)
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
@@ -322,8 +335,8 @@ def mini_account_text(
         # Nothing above rendered — an account whose only window is a
         # per-model (scoped) limit below its cap (the maxed loop only counts
         # ones at/over 100) still has something to show via the same helper,
-        # rather than reading as no data at all. `rows` has no "$$" row here
-        # (spend_row was None, or `parts` would already be nonzero).
+        # rather than reading as no data at all. `rows` has no spend row
+        # here, or `parts` would already be nonzero.
         if not rows:
             text.append("usage unknown", style=palette.muted)
         for i, (label, pct, _suffix, _full) in enumerate(rows):

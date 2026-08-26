@@ -3750,31 +3750,19 @@ class ClaudeAccountSwitcher:
             current_email, current_org_uuid = current_identity
             active_num = self._find_account_slot(data, current_email, current_org_uuid)
         if current_identity is None:
-            # NO LIVE IDENTITY — but the ROSTER still knows which slot we are
-            # on. Landing on a credential-less slot clears the live store by
-            # design, which otherwise leaves no active mark anywhere, on the
-            # very slot the user just moved to.
+            # NO LIVE IDENTITY, and the slot itself is empty: only a
+            # logged-out landing produces that pair, and it is the one case
+            # with no active mark anywhere else to find.
             #
-            # Keyed on the CAUSE, not on `active_num is None`: that result has
-            # two causes, and only this one licenses the roster's answer. A
-            # live identity resolving to no slot means someone ran `/login`
-            # with an account never `cswap add`ed, so it belongs to NO slot —
-            # falling back there would mark the roster's slot active while it
-            # carries the stranger's token, and record the stranger's usage
-            # under that slot's name.
+            # Keyed on the CAUSE, not on `active_num is None` — a live
+            # identity resolving to no slot means someone ran `/login` with an
+            # account never `cswap add`ed, and marking the roster's slot
+            # active there records a stranger's usage under its name.
             #
-            # The roster is the authority on WHICH slot is active; the live
-            # store on what that slot currently holds. A fallback only, so a
-            # live identity still wins whenever there is one.
-            #
-            # AND ONLY WHEN THE SLOT IS ITSELF EMPTY. `current_identity is
-            # None` is also every ordinary logged-out state (`/logout`, a
-            # deleted credentials file, a fresh machine with an imported
-            # roster). Marking the slot active there routes its read at the
-            # EMPTY live store instead of its own intact backup, so a slot
-            # that showed usage starts reading as having no login. After the
-            # landing the slot has no backup either, which is what separates
-            # the two.
+            # The emptiness test is what keeps an ordinary logged-out state
+            # (`/logout`, a deleted credentials file, an imported roster) out:
+            # there the slot has an intact backup, and marking it active
+            # routes its read at the empty live store instead.
             roster_active = data.get("activeAccountNumber")
             if roster_active is not None:
                 roster_email = (
@@ -4857,24 +4845,16 @@ class ClaudeAccountSwitcher:
         if unreadable:
             return False
         # The stored source, as _build_accounts_info reports it: the LIVE
-        # credential for the active slot, the backup otherwise. A read that
-        # FAILED must not collapse to "" and reach _entry_token_dead's first
-        # fingerprint compare as though empty bytes were evidence --
-        # credential_fingerprint("") is None, and token_dead(stored_fp=None)
-        # skips the compare entirely, answering on the raw strike count
-        # alone before _entry_token_dead's own None-machinery ever runs.
-        # Mirrors the guard on the backup read above: an unreadable OR
-        # degraded (possibly-stale) read coerces to "not dead" here, the same
-        # conservative direction the docstring already commits to for
-        # _entry_token_dead's own None answer -- an ambiguous read must not
-        # silently authorize an overwrite the user never confirmed with
-        # --force.
+        # credential for the active slot, the backup otherwise. A FAILED read
+        # must not collapse to "": credential_fingerprint("") is None, and
+        # token_dead(stored_fp=None) skips the compare entirely and answers on
+        # the raw strike count. So all three axes coerce to "not dead", the
+        # same conservative direction _entry_token_dead's None commits to.
         #
-        # `.value is None` is the third axis and it is NOT covered by the two
-        # flags: off macOS the file-read-error arm returns
-        # `ActiveCredentials(None, False, False)` because there is no Keychain
-        # to fail, so on Linux/WSL/Windows `None` is the ONLY surviving signal
-        # that the read errored rather than the slot being genuinely empty.
+        # `.value is None` is not covered by the two flags: off macOS the
+        # file-read-error arm returns `ActiveCredentials(None, False, False)`
+        # because there is no Keychain to fail, so it is the ONLY signal there
+        # that the read errored rather than the slot being empty.
         if is_active:
             active = self._store._read_active_credentials()
             if (
@@ -6520,24 +6500,19 @@ class ClaudeAccountSwitcher:
         # BOTH axes report. The managed item shadows `primaryApiKey` the way
         # the OAuth item shadows the file, and Claude Code reads it first.
         residual_gone = self._store._clear_managed_key() and residual_gone
-        # RE-READ, do not trust the calls: both clears are best-effort, so
-        # neither says whether the live store is actually empty. The
-        # `oauthAccount` pop below is what makes a failed clear dangerous — it
-        # produces exactly the state the landed-empty fallback TRUSTS (no live
-        # identity, roster says slot N), and slot N then reads the departed
-        # account's token. Refusing leaves roster and live store naming the
-        # same account, which is recoverable; the stash already ran.
+        # RE-READ: both clears are best-effort, so neither says whether the
+        # live store is actually empty — and the `oauthAccount` pop below
+        # produces exactly the state the landed-empty fallback TRUSTS, so a
+        # failed clear leaves slot N serving the departed account's token.
         #
-        # Three witnesses, because none of them alone can answer:
-        #   `!= ""`  — `None` is PRESENT-and-unreadable, i.e. the clear did
-        #              not succeed, and it is falsy.
+        # Three witnesses, none sufficient alone:
+        #   `!= ""`  — `None` is PRESENT-and-unreadable, and it is falsy.
         #   `keychain_unavailable` — a failed delete does not flip the routing
-        #              cache, so the re-read falls through to the (cleared)
-        #              file and returns `("", True, True)` over a Keychain
-        #              that still holds the departed token.
+        #              cache, so the re-read falls through to the cleared FILE
+        #              over a Keychain that still holds the token.
         #   `residual_gone` — under a pinned file mode nothing asks the
-        #              Keychain at all, so a survivor is invisible to a READ.
-        #              The delete's own return is the observation.
+        #              Keychain, so a survivor is invisible to any read; the
+        #              delete's own return is the only observation.
         post = self._store._read_active_credentials()
         if post.value != "" or post.keychain_unavailable or not residual_gone:
             raise SwitchError(
