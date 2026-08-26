@@ -6419,6 +6419,7 @@ class ClaudeAccountSwitcher:
         to_ref: dict,
         data: dict,
         emit_output: bool = False,
+        warnings_out: list[str] | None = None,
     ) -> dict:
         """Land on a slot that has no stored login, logged out.
 
@@ -6553,7 +6554,13 @@ class ClaudeAccountSwitcher:
             "from": from_ref,
             "to": to_ref,
             "needsLogin": True,
-            "warnings": [note],
+            # APPENDED, never substituted. Step 1 classifies the OUTGOING
+            # credential and may already have appended the ownership-mismatch
+            # warning -- the one naming the slot whose credential was stashed
+            # and the command that puts it back. Returning `[note]` dropped it,
+            # and only for JSON callers: `_warn` had already printed it for a
+            # human. The TUI and the menu bar are JSON callers.
+            "warnings": [*(warnings_out or []), note],
         }
 
     def _target_config(self, data: dict, account_num: str, email: str) -> str:
@@ -6786,7 +6793,7 @@ class ClaudeAccountSwitcher:
                 if not target_creds:
                     return self._switch_to_empty_slot(
                         target_account, target_email, from_ref, to_ref, data,
-                        emit_output,
+                        emit_output, warnings_out,
                     )
                 target_config = self._target_config(
                     data, target_account, target_email
@@ -7135,7 +7142,7 @@ class ClaudeAccountSwitcher:
                 if not target_creds:
                     return self._switch_to_empty_slot(
                         target_account, target_email, from_ref, to_ref, data,
-                        emit_output,
+                        emit_output, warnings_out,
                     )
                 target_config = self._target_config(
                     data, target_account, target_email

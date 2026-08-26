@@ -14597,3 +14597,56 @@ class TestSwitchOffAtLimitAccount:
         assert "AutoSwitchEngine" not in src
         assert "AutoSwitchEngine" not in inspect.getsource(mod.__dict__[
             "ClaudeAccountSwitcher"].switch)
+
+
+class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
+    """`_switch_to_empty_slot` returned `"warnings": [note]`, replacing whatever
+    `_perform_switch` had already accumulated.
+
+    Step 1 classifies the OUTGOING credential and may append the ownership
+    mismatch warning -- the one naming the slot whose credential was stashed and
+    the command that puts it back. Step 2 then finds the target empty and takes
+    this early return, which dropped it.
+
+    Human callers still saw it: `_warn` printed at the time. JSON callers did
+    not, and the TUI and the menu bar are JSON callers -- so the recovery step
+    for a stashed credential reached nobody exactly where a person is least able
+    to reconstruct it.
+    """
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _land(self, s, earned):
+        return s._switch_to_empty_slot(
+            "2", "b@example.com", None, {"number": 2},
+            s._get_sequence_data(), False, warnings_out=earned,
+        )
+
+    def test_the_ownership_warning_survives_the_landing(self, temp_home: Path):
+        s = self._setup(temp_home)
+        earned = ["Credential ownership mismatch detected — run: cswap add --slot 2"]
+        out = self._land(s, list(earned))
+        joined = " ".join(out.get("warnings", []))
+        assert "cswap add --slot 2" in joined, (
+            "the landing replaced the accumulated warnings with its own note, "
+            f"so the stashed credential's recovery step is gone: {out}"
+        )
+
+    def test_its_own_note_is_still_there(self, temp_home: Path):
+        """THE CONTROL. Appending is not enough if it drops the note this
+        return exists to deliver."""
+        s = self._setup(temp_home)
+        out = self._land(s, ["earlier"])
+        joined = " ".join(out.get("warnings", []))
+        assert "no stored credentials" in joined, f"the landing note is gone: {out}"
+        assert out.get("needsLogin") is True
+
+    def test_no_earned_warnings_is_just_the_note(self, temp_home: Path):
+        s = self._setup(temp_home)
+        out = self._land(s, [])
+        assert len(out.get("warnings", [])) == 1, out
