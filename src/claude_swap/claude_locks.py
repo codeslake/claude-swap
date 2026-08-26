@@ -136,21 +136,34 @@ def proper_lockfile(
         time.sleep(max(0.0, min(0.25 + random.random() * 0.25, deadline - time.monotonic())))
 
     stop_touching = threading.Event()
+    warned = False
 
     def _touch() -> None:
+        nonlocal warned
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             try:
                 os.utime(lock_dir)
             except FileNotFoundError:
                 return  # gone; nothing left to keep alive
-            except OSError:
+            except OSError as e:
                 # Transient, so stay armed. Returning on ANY OSError disarmed
                 # the heartbeat on a lock still held, and CONFIG_STALENESS_S
                 # later a waiter could steal it. The errno already in hand is
                 # what separates the two; re-checking the path is both a
                 # second syscall that can fail the same way and, from 3.14,
                 # an answer that reads absence out of a permission error.
-                pass
+                #
+                # Once, not per attempt: a failure that never clears stops the
+                # mtime advancing, so the takeover that follows is legitimate
+                # and would otherwise arrive with nothing recording its cause.
+                if not warned:
+                    warned = True
+                    _logger.warning(
+                        "Could not refresh %s (%s); its mtime stops advancing, "
+                        "so a waiter may take it over as stale",
+                        lock_dir,
+                        e,
+                    )
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()

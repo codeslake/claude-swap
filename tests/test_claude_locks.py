@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import threading
 import time
@@ -71,7 +72,7 @@ class TestProperLockfile:
             time.sleep(0.4)
             assert time.time() - lock_dir.stat().st_mtime < 10.0
 
-    def _count_touches(self, monkeypatch, lock_dir, fail_first=None):
+    def _count_touches(self, monkeypatch, lock_dir, fail_first=None, fail_all=None):
         """Patch os.utime and count only the calls aimed at OUR lock.
 
         Keyed on the path, not on a global call counter: the module does
@@ -84,6 +85,8 @@ class TestProperLockfile:
         def counting(path, *a, **k):
             if not isinstance(path, int) and os.fspath(path) == os.fspath(lock_dir):
                 state["n"] += 1
+                if fail_all is not None:
+                    raise fail_all
                 if fail_first is not None and state["n"] == 1:
                     raise fail_first
             return real(path, *a, **k)
@@ -110,6 +113,27 @@ class TestProperLockfile:
             assert time.time() - lock_dir.stat().st_mtime < 10.0, (
                 "the lock went stale while still held, so a waiter may steal it"
             )
+
+    def test_a_persistent_touch_failure_is_reported_once(
+            self, lock_dir, monkeypatch, caplog):
+        """A failure that never clears leaves the takeover unexplainable.
+
+        Staying armed is right — the errno in hand is what separates transient
+        from gone — but a failure that outlives the staleness window stops the
+        mtime advancing, and a waiter then legitimately steals a lock that is
+        still held, with nothing anywhere recording why. One warning costs a
+        bool; one per attempt would bury it.
+        """
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        touches, _ = self._count_touches(
+            monkeypatch, lock_dir, fail_all=PermissionError("injected"))
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with proper_lockfile(lock_dir):
+                time.sleep(0.3)
+
+        assert touches["n"] > 1, "control: the toucher must have kept trying"
+        said = [r for r in caplog.records if "refresh" in r.getMessage()]
+        assert len(said) == 1, f"expected exactly one warning, got {len(said)}"
 
     @pytest.mark.parametrize("errno_", [errno.ESTALE, errno.EACCES, errno.EIO])
     def test_a_failure_that_is_not_absence_keeps_the_heartbeat(
