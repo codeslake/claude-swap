@@ -32,32 +32,16 @@ from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 
 _logger = logging.getLogger("claude-swap")
 
-# -- clear_wiring stays HERE, deliberately ------------------------------------
-#
-# `cswap pin --clear` is priority 1 and this is the whole reason it lives in
-# cswap rather than the optional package: the case it exists for is the package
-# being BROKEN or GONE. A wiring left behind by a dead install points every new
-# session at a port nothing serves, and only code that does not need the
-# package can remove it. Delegating this would make the one path that must
-# survive the package's death depend on the package.
-#
-# `wire_launch_env` is the opposite case and DID move: with no package there is
-# nothing to wire, and returning `env` unchanged is the whole correct answer.
+# `clear_wiring` stays here rather than in the optional package: the wiring it
+# removes strands every new session on a dead port, and the case it exists for
+# is that package being broken or gone.
 
 
-# -- the wiring detectors live HERE, with the remover they drive -------------
-#
-# `clear_wiring` is in cswap because the case it exists for is the package
-# being broken or gone. These decide WHETHER it runs, so putting them in the
-# package moved the guarantee out from under its own function: with the extra
-# absent they answered "nothing is wired" and the stay-behind remover became
-# unreachable. `serving_port`, `--get_certdir` and `--set_port` each say in
-# their own comments that they work without the package; `_certdir` returning
-# None made the first of those a TypeError.
-#
-# None of this is pin policy. It is path arithmetic on cswap's backup dir, a
-# read of cswap's own config, a loopback connect, and a verdict over cswap's
-# own files.
+# The wiring detectors stay here with the remover they drive. In the package
+# they answered "nothing is wired" whenever the extra was absent, which is
+# exactly when `clear_wiring` must still run. None of it is pin policy: path
+# arithmetic on cswap's backup dir, a read of cswap's own config, a loopback
+# connect.
 
 
 def _certdir(switcher):
@@ -82,18 +66,10 @@ def _port_answers(port: int, connect_timeout: float) -> bool:
     """
     import socket
 
-    # INSIDE THE TRY, both of them. `socket.socket()` raises `OSError` on fd
-    # exhaustion (EMFILE/ENFILE) and it sat OUTSIDE — so on a starved box the
-    # probe raised through `_wired_port_is_serving`, which `heal` calls twice
-    # with no guard, out of the function whose contract is "never raises".
-    # Nothing about "can I reach this port" should be able to end the command
-    # that answers it -- and `heal`'s callers are a launch hook and a repair
-    # someone is waiting on, so ending it is ending those.
-    # AND `sock` IS BOUND FIRST, or the fix moves the raise instead of
-    # removing it: with the construction inside the `try`, a failing
-    # `socket()` leaves the name unbound and `finally` raises
-    # `UnboundLocalError` — not an `OSError`, so it escapes the handler that
-    # was just widened to catch it.
+    # `socket.socket()` itself raises OSError on fd exhaustion, so it is
+    # inside the try; `sock` is bound first so `finally` cannot raise
+    # UnboundLocalError past the handler. This must never raise -- `heal`
+    # calls it unguarded.
     sock = None
     try:
         sock = socket.socket()
@@ -126,20 +102,10 @@ def _port_of_config(path) -> int | None:
 
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        # ONLY A PORT THIS TOOL WIRED. The marker is the receipt; a
-        # ``CSWAP_PIN_PORT`` without one was put there by something else, and
-        # its liveness says nothing about ours. Reading it anyway let a foreign
-        # dead port make the staleness verdict True while OUR wiring was marked
-        # and serving — and ``heal`` then tore down the healthy one. The
-        # marker check lived only in ``_wiring_present``, one scope up, so
-        # every port-level consumer inherited the gap.
-        #
-        # THROUGH ``_wire_mark_of``, not a fresh isinstance. That helper exists
-        # because two readers of this same marker disagreed once and `--clear`
-        # never converged; a third reader written here would be a fourth
-        # opinion on one fact. It is the stricter test — a marker must be a
-        # NON-EMPTY list — and asking it here is what makes "names a port" and
-        # "is wired" the same question everywhere.
+        # Only a port THIS tool wired: a ``CSWAP_PIN_PORT`` with no marker
+        # was put there by something else and its liveness says nothing about
+        # ours. Through ``_wire_mark_of`` so "names a port" and "is wired"
+        # stay the same question everywhere.
         if _wire_mark_of(raw, path) is None:
             return None
         env = raw.get("env") or {}
@@ -150,47 +116,27 @@ def _port_of_config(path) -> int | None:
 
 
 def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
-    """Every wired config whose OWN port is not answering — and no more.
+    """Every wired config whose OWN port is not answering -- and no more.
 
     THE VERDICT IS MACHINE-WIDE; THE ACT MUST NOT BE. `_wired_port_is_serving`
-    is AND over every wired config on purpose, so one dead config makes the
-    whole machine "not serving" — correct, because a live session config must
-    not mask a dead default config. But `clear_wiring` is unconditional over
-    every wired config, and composing the two unwired the OTHER config's live,
-    correctly-routed pin:
+    is AND over every wired config, so one dead config makes the whole machine
+    "not serving" -- correct, because a live session config must not mask a
+    dead default one. But `clear_wiring` is unconditional over every wired
+    config, and composing the two unwired the OTHER config's live pin:
 
         session cfg -> 42967 (LIVE)   default cfg -> 39967 (DEAD)
         stale verdict : True      ->  clear_wiring strips BOTH
 
-    which is this file's own rule broken by its own code path — see the
-    capitals at the top of :func:`heal`. The per-config answer was already
-    computed by `_port_of_config`; it just was not used to decide WHICH.
+    This list is also the staleness verdict, one bool wide: "should any wiring
+    be removed" is exactly "is any wired config's own port dead".
 
-    THIS LIST IS ALSO THE STALENESS VERDICT, one bool wide: "should any wiring
-    be removed" is exactly "is any wired config's own port dead". A separate
-    ``_wiring_is_stale`` predicate held that answer until every call site moved
-    here, and it was deleted rather than kept as a one-line shim — one decision
-    with two implementations is how the two drift apart, which this module's
-    header warns about and which its `clear_wiring` call sites had already
-    demonstrated.
-
-    "Is any of this cswap's to condemn at all" is asked by
-    :func:`_port_of_config`, once per config, and not again here — see the
-    comment below for what that replaced.
+    Whether any of it is cswap's to condemn at all is asked by
+    :func:`_port_of_config`, once per config, and not again here.
     """
-    # BOTH GUARDS ARE ENFORCED ONE SCOPE DOWN, in `_port_of_config`, and the
-    # facts they keep are these:
-    #
-    # A foreign `CSWAP_PIN_PORT` with no marker must not make this list
-    # non-empty, or `heal` reports "Removed a cloud pin wiring…" over a
-    # byte-for-byte unchanged config. Nothing is ever mutated; the damage is
-    # entirely in the VERDICT.
-    #
-    # "I CANNOT TELL" IS NOT "IT IS DEAD". A config carrying the marker with
-    # no readable port satisfies "wired" and "not serving" at once, and the
-    # launch path would tear it down against a proxy that may be live. Here
-    # that read is None and the config is skipped — which is what makes the
-    # ACT per-config while the verdict stays machine-wide.
+    # Both guards are enforced one scope down, in `_port_of_config`: an
+    # unmarked foreign port must not make this list non-empty, and "I cannot
+    # read the port" is not "the port is dead". Either would have the launch
+    # path tear down a wiring whose proxy may be live.
     return [
         path
         for path in _each_config()
@@ -201,47 +147,31 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
 def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
     """Remove a pin wiring from the global config. True when it removed one.
 
-    ``only`` narrows it to the given config paths. The default — every wired
-    config — is what ``cswap pin --clear`` means and must not change: the user
-    asked to be unpinned, and leaving one config wired is the stranding this
-    function exists to prevent. ``heal`` is the caller that needs less than
-    that, because its trigger is per-config (see :func:`_dead_wired_configs`)
-    while its remedy was not.
+    ``only`` narrows it to the given config paths. The default -- every wired
+    config -- is what ``cswap pin --clear`` means and must not change: leaving
+    one config wired is the stranding this function exists to prevent.
+    ``heal`` is the caller that needs less, because its trigger is per-config
+    (see :func:`_dead_wired_configs`) while its remedy was not.
 
     The pin writes its proxy address into ``.claude.json``'s env block and
     records which keys it wrote in ``_cswapPinWiredKeys``; this reads that
-    marker and puts the file back. It touches no proxy, no daemon and no
-    credential — only a record cswap left.
+    marker and puts the file back. Only keys the pin recorded are touched and
+    anything it displaced is restored, so a proxy the user set beforehand comes
+    back rather than being lost with ours. It touches no proxy, no daemon and
+    no credential.
 
     It has to be here rather than in the optional package because the failure
-    it prevents is caused by that package being GONE. Claude Code applies the
-    env block at boot, so a wiring naming a port nothing listens on makes
-    every hand-launched ``claude`` dial a dead proxy and retry forever. If the
-    only code able to remove it shipped in the pin package, uninstalling the
-    pin — the very thing an optional extra invites — would strand the wiring
-    permanently, with hand-editing ``.claude.json`` the sole cure.
-
-    Only keys the pin recorded are touched, and anything it displaced is
-    restored, so a proxy the user or their launcher set beforehand comes back
-    rather than being lost with ours.
+    it prevents is that package being GONE: the env block is applied at boot,
+    so a wiring naming a dead port makes every hand-launched ``claude`` dial it
+    forever, and only code that does not need the package can remove it.
     """
     from claude_swap.claude_locks import proper_lockfile
 
-    # BOTH configs, because the writing side resolves the same way this does:
-    # `CLAUDE_CONFIG_DIR` is set in the *child's* env dict, so a `cswap run`
-    # from a normal terminal wires ~/.claude.json while one from inside a
-    # session terminal wires that session's copy. Clearing only the resolved
-    # path leaves the other naming a dead port.
-    #
-    # WARNING, not DEBUG, and only here: this bool is a claim about every path
-    # reached, never that every path was reachable, so a config that could not
-    # be LOCATED has to leave a record. `heal` reaches this through
-    # `_dead_wired_configs`, which goes empty once the removal succeeds, so it
-    # logs once and goes quiet; the two getters `heal` calls unconditionally
-    # stay at DEBUG (see `_log_unresolvable`).
-    #
-    # It does NOT explain an UNREMOVABLE wiring — that is the lock-failure
-    # WARNING at the bottom of this function.
+    # Both configs: `CLAUDE_CONFIG_DIR` is set in the child's env, so a run
+    # from a normal terminal wires ~/.claude.json while one from a session
+    # terminal wires that session's copy. WARNING here only -- the return bool
+    # is a claim about every path REACHED, never that every path was
+    # reachable, so a config that could not be located has to leave a record.
     paths = list(_each_config(logging.WARNING))
     if only is not None:
         # BY RESOLVED PATH, not by identity: the caller got its list from
@@ -252,15 +182,10 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
         wanted = {str(p) for p in only}
         paths = [p for p in paths if str(p) in wanted]
 
-    # ONE LOCK PER PATH. The shared config lock derives its directory from
-    # get_global_config_path(), so a single lock around the loop guards one
-    # file and leaves the other rewritten unprotected — racing `cswap switch`
-    # and Claude Code, the whole-file clobber the lock exists to prevent.
-    #
-    # ``timeout`` is a TOTAL, not a per-file allowance. Passing it to each
-    # acquisition makes the worst case a multiple of the number of configs, so
-    # the launch path's sub-second cap silently becomes ~2x that (1.37-1.64s
-    # against a documented 0.5s).
+    # One lock per path: the shared config lock derives its directory from
+    # get_global_config_path(), so a single lock around the loop leaves the
+    # other file unprotected. ``timeout`` is a TOTAL, not per-file -- passing
+    # it to each acquisition makes the worst case a multiple of the configs.
     import time as _time
 
     # An UNTIMED call still gets a total. Leaving `None` lets each config
@@ -274,28 +199,14 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
     deadline = _time.monotonic() + timeout
     changed = False
     for i, path in enumerate(paths):
-        # EVERY PATH IS ATTEMPTED, even with the budget gone. `if left <= 0:
-        # continue` was here, and it is the same starvation the fair share
-        # below was introduced to fix, one runner-speed away: path 1 only has
-        # to OVERSHOOT its share for path 2 to be skipped without a single
-        # attempt. A zero share is not a skip: `proper_lockfile` tries
-        # `os.mkdir` BEFORE it checks its deadline, so a FREE lock is taken
-        # instantly and a contended one fails at once. The cost of the change
-        # is a few syscalls past the budget; the cost of the skip was `cswap
-        # pin --clear` returning with the second config still wired.
+        # Every path is attempted even with the budget gone: a zero share is
+        # not a skip, because `proper_lockfile` tries `os.mkdir` before it
+        # checks its deadline, so a free lock is still taken instantly.
         left = max(0.0, deadline - _time.monotonic())
-        # FAIR SHARE of what remains, not "however much is left". Handing the
-        # first path the whole remaining budget let a config that stayed
-        # contended for the entire call consume it all, so a SECOND path
-        # whose lock was completely free was skipped by the `left <= 0` check
-        # above without ever being tried: with the session lock held for the
-        # full 0.5s budget, `clear_wiring` returns False with BOTH configs
-        # still wired.
-        #
-        # Dividing by how many paths are still untried gives each one at
-        # least an equal slice of whatever time remains when its turn comes,
-        # while the running total can still never exceed `timeout` — each
-        # share is carved out of `left`, never added to it.
+        # Fair share of what remains, not all of it: one contended config
+        # would otherwise consume the whole budget and the next path -- whose
+        # lock may be free -- is never tried. Each share is carved out of
+        # `left`, so the running total can never exceed `timeout`.
         share = left / (len(paths) - i)
         try:
             with proper_lockfile(
@@ -304,19 +215,10 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
                 if _clear_wiring_locked(switcher, path):
                     changed = True
         except Exception as exc:  # noqa: BLE001
-            # A lock we cannot take is a reason to skip THIS file, not to
-            # abandon the other one — on the launch path a contended config
-            # must not fail the clear outright.
-            #
-            # BUT SAY WHICH FILE AND WHY: this is the ONLY record naming what
-            # stopped the unwire, and the getter WARNING above does not fire on
-            # that shape.
-            #
-            # WARNING FOR BOTH REACHABLE KINDS. `PermissionError` and
-            # `ClaudeCodeLockTimeout` both land here and the type does not
-            # separate transient from permanent, so splitting on it would
-            # silence the stuck machine this WARNING exists for. The transient
-            # case is self-limiting; the permanent one repeats forever.
+            # A lock we cannot take skips THIS file, never the other one.
+            # Say which and why: this is the only record naming what stopped
+            # the unwire. WARNING for both reachable kinds -- the exception
+            # type does not separate transient from permanent.
             _logger.warning("%s could not be unwired: %s", path, exc)
             continue
     return changed
@@ -362,42 +264,30 @@ def _clear_wiring_locked(switcher, path) -> bool:
         switcher._write_json(path, raw)
     except (OSError, ConfigError):
         return False
-    # AFTER the config write, never before. This is the receipt for what the
-    # config still holds; dropping it first and then failing to write the
-    # config would leave the proxy vars in place with nothing recording that
-    # they are ours — unremovable except by hand, the exact failure
-    # `clear_wiring` exists to prevent.
-    #
-    # GATED ON THE SIDECAR, not only the config. Both receipts have to go, or
-    # `_wiring_present` reads the survivor and the caller is told to re-run a
-    # command that cannot converge.
+    # After the config write, never before: this is the receipt for what the
+    # config still holds, and dropping it first then failing the config write
+    # leaves the proxy vars unremovable except by hand. Gated on the sidecar
+    # too, or `_wiring_present` reads the survivor and never converges.
     return _clear_ledger(path)
 
 
 def _each_config(level: int = logging.DEBUG):
     """Both global configs, in read order, de-duplicated, guards applied.
 
-    THE GETTER ITSELF CAN RAISE, and that is why this exists as one function
-    rather than three loops. ``get_default_global_config_path`` calls
-    ``Path.home()``, which raises ``RuntimeError`` when HOME is unset and the
-    uid has no ``/etc/passwd`` entry (the standard rootless-container shape).
-    ``heal``'s contract is "never raises" because a launch hook runs it before
-    every hand-launched ``claude``, and ``_wired_ports`` sits on the path from
-    ``heal`` through ``_wired_port_is_serving`` with no guard above it — an
-    unguarded raise there leaves ``pin.heal(sw)`` raising ``RuntimeError`` at
-    the launch instead of returning ``(False, 'Could not heal…')``.
+    THE GETTER ITSELF CAN RAISE, which is why this is one function rather than
+    three loops. ``get_default_global_config_path`` calls ``Path.home()``,
+    which raises ``RuntimeError`` when HOME is unset and the uid has no
+    ``/etc/passwd`` entry (the rootless-container shape). ``heal``'s contract
+    is "never raises", and ``_wired_ports`` sits on the path from ``heal``
+    through ``_wired_port_is_serving`` with no guard above it.
 
-    A config this cannot even LOCATE has no opinion — a fact about ONE config,
-    never a reason to abandon the other, which is why it continues rather than
-    propagating.
+    A config this cannot even LOCATE has no opinion -- a fact about ONE config,
+    never a reason to abandon the other.
 
-    ``level`` is the caller's, and only ``clear_wiring`` raises it to WARNING;
-    see the comment at that call site for why that one is allowed to be loud
-    and the two ``heal`` calls unconditionally are not.
+    ``level`` is the caller's, and only ``clear_wiring`` raises it to WARNING.
 
     De-duplicated because the two getters return the SAME path whenever
-    ``CLAUDE_CONFIG_DIR`` is unset, and every caller would otherwise do its
-    work on that config twice.
+    ``CLAUDE_CONFIG_DIR`` is unset.
     """
     from claude_swap.paths import (
         get_default_global_config_path,
@@ -463,6 +353,28 @@ def _clear_ledger(config_path) -> bool:
         return False
 
 
+def _nonempty_mark(raw: object) -> list | None:
+    """The receipt ``raw`` carries, only when it is a NON-EMPTY list.
+
+    The single spelling of "this mapping claims a wiring". Two readers of the
+    same marker once disagreed -- one accepted any truthy value, the other
+    required a non-empty list -- so a malformed marker satisfied one and not
+    the other and `--clear` never converged.
+    """
+    if not isinstance(raw, dict):
+        return None
+    mark = raw.get(_WIRE_MARK)
+    return mark if isinstance(mark, list) and mark else None
+
+
+def _saved_from(raw: object) -> dict:
+    """The displaced values ``raw`` records, or ``{}``."""
+    if not isinstance(raw, dict):
+        return {}
+    saved = raw.get(f"{_WIRE_MARK}Saved")
+    return dict(saved) if isinstance(saved, dict) else {}
+
+
 def _saved_of(raw: object, config_path=None) -> dict:
     """What the wiring displaced, from wherever the receipt lives.
 
@@ -472,80 +384,37 @@ def _saved_of(raw: object, config_path=None) -> dict:
     """
     if config_path is not None:
         side = _read_ledger(config_path)
-        if _WIRE_MARK in side:
-            # PAIRED WITH THE MARKER, not merely with the sidecar's existence.
-            # `_wire_mark_of` falls through to the config when the sidecar is
-            # EMPTY and the config carries a marker of its own; reading the
-            # displaced values from the sidecar in that case would restore one
-            # wiring's values over another wiring's keys — which is worse than
-            # restoring nothing, because it writes a proxy address that was
-            # never there.
-            side_mark = side.get(_WIRE_MARK)
-            if isinstance(side_mark, list) and side_mark:
-                saved = side.get(f"{_WIRE_MARK}Saved")
-                return dict(saved) if isinstance(saved, dict) else {}
-            if not (
-                isinstance(raw, dict)
-                and isinstance(raw.get(_WIRE_MARK), list)
-                and raw.get(_WIRE_MARK)
-            ):
-                saved = side.get(f"{_WIRE_MARK}Saved")
-                return dict(saved) if isinstance(saved, dict) else {}
-    if not isinstance(raw, dict):
-        return {}
-    saved = raw.get(f"{_WIRE_MARK}Saved")
-    return dict(saved) if isinstance(saved, dict) else {}
+        # Paired with the MARKER, not merely with the sidecar's existence:
+        # `_wire_mark_of` falls through to the config when the sidecar is empty
+        # and the config carries a marker of its own, and taking the sidecar's
+        # values there writes a proxy address that was never set.
+        if _WIRE_MARK in side and not (
+            _nonempty_mark(side) is None and _nonempty_mark(raw) is not None
+        ):
+            return _saved_from(side)
+    return _saved_from(raw)
 
 
 def _wire_mark_of(raw: object, config_path=None) -> list | None:
     """The marker THIS module wrote, or None. The single reader.
 
-    ``_wiring_present`` and ``_clear_wiring_locked`` both answer "is it
-    wired", and they disagreed: one accepted any truthy marker, the other
-    required a non-empty list. A malformed marker (a hand-edit, a format
-    change in a future cswap-pin) therefore satisfied the first and not the
-    second, so `--clear` reported "could not remove the wiring — re-run once
-    it frees up" forever: nothing was contended and nothing ever converged.
-
-    That single-reader property is what makes the sidecar safe to add: the
-    "read both locations" rule is written HERE, once, so every caller gets it
-    without knowing the receipt moved.
+    The "read both locations" rule is written HERE, once, so every caller gets
+    it without knowing the receipt moved; :func:`_nonempty_mark` holds the
+    shape test both locations are judged by.
     """
     if config_path is not None:
         side = _read_ledger(config_path)
-        ours = side.get(_WIRE_MARK)
-        if isinstance(ours, list) and ours:
+        ours = _nonempty_mark(side)
+        if ours:
             return ours
-        # AN EMPTY SIDECAR ANSWERS FOR THE SIDECAR, NOT FOR THE CONFIG.
-        #
-        # `--clear` empties it, and treating that as the final answer made
-        # a wiring written by an OLDER cswap-pin — which writes the config
-        # key and no sidecar, the compat promise stated above — invisible
-        # to every recovery path at once:
-        #
-        #     _wiring_present  False    _wired_ports  []
-        #     _dead_wired_configs []     clear_wiring  False
-        #     heal             (False, 'Nothing to heal')
-        #
-        # while `.claude.json` still named a proxy port. Every probe that
-        # could have caught the stranding reported healthy. The population
-        # is not exotic: the extra carries no floor, so an already-present
-        # `cswap-pin` is never upgraded, and anyone who installed the pin
-        # before the sidecar existed lands here on their first clear.
-        #
-        # What the empty sidecar DOES rule out is resurrecting a receipt
-        # the clear emptied — but only the one it emptied. A marker in the
-        # config is a receipt the clear never saw.
-        if _WIRE_MARK in side and not (
-            isinstance(raw, dict)
-            and isinstance(raw.get(_WIRE_MARK), list)
-            and raw.get(_WIRE_MARK)
-        ):
+        # An empty sidecar answers for the SIDECAR, not for the config. A
+        # wiring written by an older cswap-pin carries a config key and no
+        # sidecar; treating the empty sidecar as final made it invisible to
+        # every recovery path while `.claude.json` still named a proxy port.
+        # What it does rule out is resurrecting the receipt the clear emptied.
+        if _WIRE_MARK in side and _nonempty_mark(raw) is None:
             return None
-    if not isinstance(raw, dict):
-        return None
-    ours = raw.get(_WIRE_MARK)
-    return ours if isinstance(ours, list) and ours else None
+    return _nonempty_mark(raw)
 
 
 def _ledger_path(config_path):
@@ -597,22 +466,11 @@ def _read_ledger(config_path) -> dict:
         # and the next reader deletes it.
         return {}
     except Exception as exc:  # noqa: BLE001 — see below
-        # PRESENT AND UNREADABLE IS NOT ABSENT, even though both answer the two
-        # readers with `{}` — which is true, verified across all 56
-        # sidecar/config pairs, and only half the story.
-        #
-        # Current cswap-pin writes the receipt ONLY here; the config carries no
-        # marker. So a root-owned parent, a read-only mount or a truncated file
-        # makes a LIVE wiring invisible to every recovery path at once:
-        # `_wiring_present` False, `heal` -> "Nothing to heal", `--ensure` a
-        # no-op, and `purge` printing "Removed: Cloud pin wiring" — while
-        # `.claude.json` still names a dead HTTPS_PROXY that every hand-launched
-        # `claude` dials.
-        #
-        # The RETURN stays `{}` so that equivalence is untouched. What changes
-        # is that the operator hears about it, and it is said HERE because this
-        # is the single read point every caller already goes through — the
-        # property `_wire_mark_of`'s docstring claims for the read-both rule.
+        # Present-and-unreadable is not absent, even though both answer the
+        # readers with `{}`. cswap-pin writes the receipt only here, so an
+        # unreadable sidecar makes a LIVE wiring invisible to heal, purge and
+        # --ensure at once. The return stays `{}`; what changes is that the
+        # operator hears about it.
         _logger.warning(
             "%s exists but could not be read (%s), so it is treated as no pin "
             "receipt. If a pin IS wired, heal/purge/--ensure will all report "
@@ -625,24 +483,20 @@ def _read_ledger(config_path) -> dict:
 def _config_lock_is_free(budget: float) -> bool:
     """Can the config lock be taken within ``budget`` seconds?
 
-    A probe, not a hold — the caller re-locks immediately after. That race is
+    A probe, not a hold -- the caller re-locks immediately after. That race is
     deliberate: losing it costs one skipped unwire (the next launch heals it),
-    while the alternative is the launch itself waiting on the package's own
-    5-second lock timeout, which it has no way to shorten.
+    while the alternative is the launch waiting on the package's own 5-second
+    lock timeout, which it has no way to shorten.
 
-    BOTH CONFIGS, because the operation this gates acts on both. It probed
-    `get_global_config_path()` alone, and `clear_wiring` says why that is not
-    the same question: with `CLAUDE_CONFIG_DIR` set the two paths diverge, so
-    a free session config and a HELD `~/.claude.json` — a Claude Code
-    credential refresh, say — passed the probe. `unwire_if_dead` then blocked
-    on the package's own `claude_config_lock(timeout=5)`: a 5.3 s launch
-    stall, ten times the `_LAUNCH_LOCK_BUDGET_S` this guard exists to enforce,
-    reached THROUGH the guard.
+    BOTH CONFIGS, because the operation this gates acts on both. Probing
+    `get_global_config_path()` alone let a free session config and a HELD
+    `~/.claude.json` pass, and `unwire_if_dead` then blocked on the package's
+    `claude_config_lock(timeout=5)`: a 5.3s launch stall reached THROUGH the
+    guard.
 
-    The budget is per config rather than shared. Two configs is the maximum,
-    they are the same path whenever `CLAUDE_CONFIG_DIR` is unset (so the
-    common case pays once), and splitting a sub-second budget in half makes
-    each probe more likely to lose a race it would otherwise have won.
+    The budget is per config rather than shared: two is the maximum, they are
+    the same path whenever `CLAUDE_CONFIG_DIR` is unset, and splitting a
+    sub-second budget makes each probe likelier to lose a race it would win.
     """
     from claude_swap.claude_locks import proper_lockfile
 
@@ -675,23 +529,11 @@ def _log_unresolvable(get, exc: BaseException, level: int = logging.DEBUG) -> No
     path it REACHED. Why a wiring could not be REMOVED is a different record —
     the lock WARNING at the bottom of `clear_wiring`.
     """
-    # `stacklevel=3` ATTRIBUTES THE RECORD TO THE CONSUMER. Without it all
-    # three call sites' records are identical in origin — same `funcName`,
-    # same `pathname`, same `lineno` — so nothing downstream can tell the
-    # per-tick getters from the gated one, and a guard on this split can only
-    # key on LEVEL. With it, `record.funcName` is `_wiring_present` /
-    # `_wired_ports` / `clear_wiring`.
-    #
-    # THREE, NOT TWO, because the traversal is now one shared generator
-    # (`_each_config`) rather than three copies of the loop: 2 would name
-    # `_each_config` for all of them, which is precisely the collapse this
-    # argument exists to prevent. Verified against a generator AND a
-    # comprehension consumer — a comprehension reports its ENCLOSING function
-    # (inlined since 3.12; this project's floor), not a `<listcomp>` frame.
-    #
-    # Production output is UNCHANGED: `logging_config` formats
-    # "%(asctime)s - %(levelname)s - %(message)s" and never renders funcName,
-    # filename or lineno.
+    # `stacklevel=3` attributes the record to the consumer --
+    # `_wiring_present` / `_wired_ports` / `clear_wiring` -- rather than to
+    # the shared `_each_config` generator, so the per-tick getters can be told
+    # from the gated one. Three frames, not two, because the traversal is
+    # shared.
     _logger.log(level, "%s could not be resolved: %s", get.__name__, exc, stacklevel=3)
 
 
@@ -740,21 +582,10 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
     try:
         pin = _impl()
     except Exception:  # noqa: BLE001 — never block the launch
-        # No pin this launch, whatever the reason. A wiring a previous install
-        # left behind would otherwise outlive it and point every session at a
-        # dead port — see `clear_wiring`.
-        #
-        # ASK FIRST, LOCK ONLY IF THERE IS WORK, and ask whether the port is
-        # DEAD rather than merely wired: `_impl()` raising says nothing about
-        # the daemon, so a broken cryptography or a half-finished reinstall
-        # would otherwise strip the env block from a pin that is still
-        # answering every session wired to it.
-        #
-        # THE DEAD CONFIGS, NOT "THE WIRING". The verdict is machine-wide and
-        # the act must not be, or a live session config wired to a serving
-        # port is unwired because the OTHER config names a dead one. The probe
-        # is bounded well under the launch budget: a black-holed port must not
-        # turn a launch-path guard into a stall.
+        # No pin this launch, whatever the reason. Ask first and lock only if
+        # there is work, and ask whether the port is DEAD rather than merely
+        # wired: `_impl()` raising says nothing about the daemon. Per-config,
+        # because the verdict is machine-wide and the act must not be.
         try:
             dead = _dead_wired_configs(switcher, connect_timeout=_LAUNCH_PROBE_S)
             if dead:
@@ -777,35 +608,20 @@ def wire_launch_env(switcher, env: dict[str, str]) -> dict[str, str]:
             # one this function falls back to returning, which reaches
             # `os.execvpe` OUTSIDE the launch's try.
             wired = pin.wire_env(dict(env), port, ca_path)
-            # VALIDATED, NOT TRUSTED. This value reaches `os.execvpe`, which
-            # sits OUTSIDE the launch's try, so a wrong shape is the launch
-            # rather than a caught exception. `None` does not even fail: it
-            # hands the child the PARENT's environ, dropping
-            # CLAUDE_CONFIG_DIR, so the session runs against the default
-            # login. That silent one is why this is a check and not a try.
-            # Anything that is not a str->str mapping degrades to an UNPINNED
-            # launch, which this file is built to tolerate.
+            # Validated, not trusted: this reaches `os.execvpe`, which sits
+            # outside the launch's try. `None` does not even fail -- it hands
+            # the child the parent's environ, dropping CLAUDE_CONFIG_DIR.
             if isinstance(wired, dict) and all(
                 isinstance(k, str) and isinstance(v, str) for k, v in wired.items()
             ):
                 return wired
     except Exception:  # noqa: BLE001 — never block the launch
         pass
-    # No proxy this launch, whether ensure_proxy said so or died saying it.
-    # .claude.json's env block is applied at boot, so a wiring a previous
-    # launch left behind would send this child at a port nothing answers.
-    # ONE tail, not one per branch: duplicating it runs the unwire twice when
-    # the None path's own unwire raises.
-    #
-    # BOUNDED, like the no-package branch above. `unwire_if_dead` takes no
-    # timeout and uses the package's own claude_config_lock(timeout=5), so a
-    # held .claude.json.lock costs every `cswap run` 5.3s before it returns the
-    # env unchanged — and Claude Code holds that lock routinely while
-    # refreshing credentials.
-    #
-    # If the lock is not free right now, SKIP: the wiring is stale but the next
-    # launch heals it, and a launch that blocks is worse than a launch that is
-    # briefly unpinned — the whole reason this path fails open.
+    # No proxy this launch. The env block is applied at boot, so a wiring a
+    # previous launch left behind would send this child at a dead port. One
+    # tail, not one per branch. Bounded: `unwire_if_dead` uses the package's
+    # own 5s config lock and Claude Code holds that lock routinely, so if it
+    # is not free right now, skip -- the next launch heals it.
     try:
         if _config_lock_is_free(_LAUNCH_LOCK_BUDGET_S):
             pin.unwire_if_dead(_certdir(switcher))
@@ -844,15 +660,11 @@ def _impl() -> ModuleType:
     try:
         found = importlib.util.find_spec("cswap_pin.proxy") is not None
     except ImportError as exc:
-        # find_spec has to IMPORT the parent package to read its __path__, so a
-        # cswap_pin/__init__.py that raises surfaces here rather than below —
-        # and swallowing it is what turns "your cryptography is broken" into
-        # "install the package you already have". A package root raising
-        # ImportError("No module named 'cryptography'") propagates out of
-        # find_spec, not out of import_module.
-        #
-        # e.name is what tells them apart: absent -> 'cswap_pin', broken root
-        # -> whatever the package failed to import.
+        # find_spec has to IMPORT the parent package to read its __path__,
+        # so a `cswap_pin/__init__.py` that raises surfaces here rather than
+        # below. Swallowing it turns "your cryptography is broken" into
+        # "install the package you already have". `e.name` tells them apart:
+        # absent -> 'cswap_pin', broken root -> whatever it failed to import.
         if exc.name and not exc.name.startswith("cswap_pin"):
             raise
         found = False
@@ -860,21 +672,12 @@ def _impl() -> ModuleType:
         found = False
     if not found:
         raise ClaudeSwitchError(_install_hint())
-    # NO RUNTIME VERSION FLOOR. The extra's floor lives in ONE place, the
+    # NO RUNTIME VERSION FLOOR. The extra's floor lives in one place, the
     # `pin = ["cswap-pin>=X"]` requirement, exactly as the menubar extra
-    # declares `rumps>=0.4.0` and then only asks whether the import works.
-    #
-    # A hardcoded tuple here was the alternative, and it does not survive
-    # contact with the release cycle: cswap-pin ships on its own schedule, so
-    # every release of it would need a matching pull request against THIS
-    # project just to raise a constant. A gate whose maintenance depends on
-    # someone else's release cadence is a gate that goes stale, and a stale
-    # floor is worse than none — it refuses a package the installer has just
-    # chosen, with a message blaming the user's version.
-    #
-    # Keeping a released version out is an INSTALL-time job (the requirement,
-    # and whatever provisioning runs it), not something the seam re-litigates
-    # on every call.
+    # declares `rumps>=0.4.0` and then only asks whether the import works. A
+    # hardcoded tuple here would need a pull request against THIS project for
+    # every cswap-pin release, and a stale floor refuses a package the
+    # installer just chose. Keeping a release out is an install-time job.
     return importlib.import_module("cswap_pin.proxy")
 
 
@@ -883,33 +686,18 @@ def _live_impl() -> ModuleType | None:
 
     Both display helpers below need the same thing: resolve the package, and
     treat every failure as "no pin" rather than an error. Callers that ACT on
-    the pin use :func:`_impl` instead and report what it raises — hiding a
+    the pin use :func:`_impl` instead and report what it raises -- hiding a
     broken install is right for a badge and wrong for a command.
 
     ``invalidate_caches`` because a long-lived process caches each sys.path
     directory by mtime, so an install landing inside the same mtime tick stays
-    invisible without it — the "I installed it and the menu is still missing"
-    case.
+    invisible without it.
 
-    NOT MEMOISED, deliberately. A 1.0s TTL lived here, with a module-level
-    cache, a ``global``, and an autouse conftest fixture to reset it between
-    tests. Measured against what it bought: 185us per uncached call, and a
-    render tick makes 6 calls at 3 accounts / 13 at 10 — 1.11ms and 2.40ms
-    against POLL_INTERVAL_S of 3000ms, so 0.04-0.08% of one tick. It also
-    made the thing it was supposed to protect worse: an install landing
-    INSIDE the TTL window was invisible until the window expired, and the
-    test that "proved" otherwise advanced a fake clock past the TTL, so it
-    asserted the cache's own contract rather than the user's.
-
-    THE CONFIG READS AROUND IT WERE RE-RAISED AS A STALL AND RE-MEASURED.
-    `_root_entries` runs on the 3s watcher and reaches
-    `_wiring_present` and `_pinned_email_now`, each of which parses the global
-    config. On one real config: 175 KB, 1.1 ms per read+parse, so the
-    whole render tick spends ~5 ms of 3000 — 0.2%. The "megabytes on a real
-    machine" that motivates `_dead_wired_configs`' own frugality is a
-    different machine's file, and the one measured here is not. Cache it when a
-    measurement shows a tick that matters, not because the shape looks
-    expensive; the last cache here cost more than it saved.
+    NOT MEMOISED, deliberately. A 1.0s TTL lived here and made the case it was
+    meant to protect worse: an install landing inside the window stayed
+    invisible until it expired. Measured, an uncached call is 185us against a
+    3000ms poll interval. Cache it when a measurement shows a tick that
+    matters, not because the shape looks expensive.
     """
     import importlib
 
@@ -983,31 +771,25 @@ def _live_login_for_config(switcher) -> "dict | None":
 def identity_move_is_not_a_login(switcher, before, now) -> bool:
     """Did `oauthAccount` move for a PIN reason rather than a `/login`?
 
-    IN THE SEAM, NOT ON THE SWITCHER, and that is not tidiness. A guard in
-    cswap core consults this; the answer is entirely about the pin, and a
-    second `def` of the same name in `ClaudeAccountSwitcher` is not an
-    overlay — it is a redefinition, and which body survives depends on the
-    order two branches merge. Measured: an upstream branch carrying a
-    `return False` stub and this branch carrying the real body produced a
-    tree where the stub won silently, each branch green alone.
+    In the seam, not on the switcher: a second `def` of this name on
+    `ClaudeAccountSwitcher` is a redefinition, not an overlay, and which body
+    survives depends on the order two branches merge. Measured -- an upstream
+    branch carrying a `return False` stub silently won over this branch's real
+    body, each green alone.
 
-    THE SEAM FOR A GUARD THAT WATCHES THAT FIELD FOR DRIFT. Under a pin the
-    field has a second writer -- the switch splices the pinned identity in,
-    and the daemon's carry writes the account now signed in -- so it swings
-    between the two on a minutes timescale with nobody logging in. A guard
-    that samples it twice and refuses on a difference refuses on the swing,
-    and tells the user to "re-run when no other login is in flight" when
-    there is no login and re-running has the same odds of catching it.
+    Under a pin the field has a second writer: the switch splices the pinned
+    identity in, and the daemon's carry writes the account now signed in, so it
+    swings between the two with nobody logging in. A guard that samples it
+    twice and refuses on a difference refuses on the swing.
 
-    Same discriminator as `ClaudeAccountSwitcher._live_login_identity`, for the same
-    reason: the carry moves the CONFIG and nothing else, while a `/login`
-    replaces the credential too. So the move is benign only when one of the
-    two samples is the pinned identity AND the live credential is still the
-    roster's active slot's.
+    Same discriminator as `ClaudeAccountSwitcher._live_login_identity`: the
+    carry moves the CONFIG and nothing else, while a `/login` replaces the
+    credential too. So the move is benign only when one of the two samples is
+    the pinned identity AND the live credential is still the active slot's.
 
-    FALSE WHEN IT CANNOT TELL, which is the safe direction HERE and the
-    opposite of the one `_live_login_identity` takes: this answer only ever
-    SUPPRESSES a refusal, and a refusal writes nothing.
+    FALSE when it cannot tell -- the safe direction here, and the opposite of
+    `_live_login_identity`'s, because this answer only ever SUPPRESSES a
+    refusal and a refusal writes nothing.
     """
     try:
         pinned = pinned_identity(switcher)
@@ -1084,37 +866,22 @@ def identity_for_config(switcher, email: str | None = None,
     """The `oauthAccount` the config should name while a pin is set, or None.
 
     ``email`` asks about a DIFFERENT account than the one currently recorded.
-    Two callers need it. The rollback, because by the time it runs the record
-    has already been overwritten by the pin that failed; and ``set_pin``,
-    because this argument is evaluated BEFORE ``apply_pin`` writes the record,
-    so the no-argument form there resolves the outgoing pin.
+    Two callers need it: the rollback, because by then the record has already
+    been overwritten by the pin that failed; and ``set_pin``, because this
+    argument is evaluated BEFORE ``apply_pin`` writes the record.
 
-    ``num`` is the slot a caller ALREADY resolved, and passing it skips the
-    lookup entirely. That matters because `_resolve_account_identifier` RAISES
-    when one address matches two slots -- cswap's own documented personal+org
-    pattern -- and the function-wide except turns that into ``None``, which
-    means "leave the config alone". So on exactly the roster the composite work
-    exists for, the splice silently did nothing. `set_pin` says the same thing
-    about its own re-derivation in its own comment; this is that lesson one
-    function along.
+    ``num`` is a slot the caller already resolved, and passing it skips the
+    lookup. `_resolve_account_identifier` RAISES when one address matches two
+    slots -- cswap's documented personal+org pattern -- and the function-wide
+    except turns that into ``None``, meaning "leave the config alone". So on
+    exactly the roster the composite work exists for, the splice did nothing.
 
-    THE SEAM ANSWERS, THE SWITCHER ASKS. This used to live in switcher.py,
-    where it resolved the pinned slot, read that slot's stored config and
-    parsed the identity out — pin policy computed by cswap core, reaching a
-    PRIVATE of this module to get started. Both halves were a boundary
-    violation.
+    It belongs here rather than in the package: `_pinned_email_now` must never
+    ask the package, because the clear path has to work when the package is
+    what is broken, and the remaining steps read cswap's OWN backup store.
 
-    IT BELONGS HERE, NOT IN THE PACKAGE. The obvious destination was
-    `cswap_pin.proxy`, and it is wrong: `_pinned_email_now` is documented to
-    never ask the package, because the clear path must work when the package
-    is exactly what is broken. The remaining steps read cswap's OWN backup
-    store, which the package has no business knowing the layout of. Putting
-    this there would invert the dependency instead of merely blurring it.
-
-    None ON EVERY DOUBT — no pin, no stored config for it, an unreadable
-    record. The caller then keeps the account being switched to, which is the
-    behaviour that shipped for months. An optional feature must never be able
-    to block a switch.
+    None on every doubt -- no pin, no stored config for it, an unreadable
+    record. An optional feature must never be able to block a switch.
     """
     try:
         ident = pinned_identity(switcher)
@@ -1123,20 +890,12 @@ def identity_for_config(switcher, email: str | None = None,
         if not email:
             return None
         if num is None and asked is None and ident:
-            # THE COMPOSITE, NOT THE ADDRESS, when the address is the pin's
-            # own. `_resolve_account_identifier` RAISES on one that names two
-            # slots; the caller-wide `except` turns that into None, and None
-            # here means "leave the config alone" — which on the switch path
-            # writes the account being switched TO as the bridge owner, the
-            # veto this whole seam exists to prevent. `_slot_for` is in this
-            # module for exactly that and every caller here already passes
-            # it; the two `_perform_switch` sites could not, because they do
-            # not know the pin's org. Defaulting it here covers them and any
-            # caller added later.
-            #
-            # Only when `asked` is None: a caller naming a DIFFERENT address
-            # is asking about another account, and the pin's org is not its
-            # org. That case keeps the address resolution it always had.
+            # The COMPOSITE, not the address, when the address is the pin's
+            # own: `_resolve_account_identifier` raises on an address naming
+            # two slots, the caller-wide `except` turns that into None, and
+            # None here writes the account being switched TO as the bridge
+            # owner. Only when `asked` is None -- a caller naming a different
+            # address is asking about another account, whose org is not ours.
             num = _slot_for(switcher, email, ident[1] if len(ident) > 1 else None)
         num = num or switcher._resolve_account_identifier(email)
         if not num:
@@ -1147,12 +906,10 @@ def identity_for_config(switcher, email: str | None = None,
             return oauth
         # A machine that has never switched INTO the pinned account has no
         # stored config to copy, and None here makes `_perform_switch` fall
-        # back to the account being switched TO — so the pin never reaches
-        # `~/.claude.json` and every bridge is owned by whoever is active.
-        # The roster answers: its `uuid` IS the account uuid a stored config
-        # calls `accountUuid`. A stored config still wins when it has one,
-        # because it also carries displayName and organizationName, which
-        # Claude Code writes and the roster has never held.
+        # back to the account being switched TO. The roster answers: its
+        # `uuid` IS what a stored config calls `accountUuid`. A stored config
+        # still wins when it has one -- it also carries displayName and
+        # organizationName, which the roster has never held.
         row = ((switcher._get_sequence_data() or {})
                .get("accounts", {}).get(str(num)) or {})
         uuid = (row.get("uuid") or "").strip()
@@ -1274,20 +1031,13 @@ def repin_current(switcher) -> bool:
         if not pin:
             return False
         email, org = pin[0], (pin[1] if len(pin) > 1 else None)
-        # NAME THE PIN IN THE LIVE CONFIG, exactly as `set_pin` does. Without
-        # `identity=` the parameter defaults to None and the splice returns
-        # early, so the repair restores a serving daemon while `~/.claude.json`
-        # still names whichever account is active - and Claude Code takes that
-        # field as the OWNER of every bridge it mints afterwards, which is the
-        # teardown the splice exists to prevent.
-        #
-        # ASK ABOUT `email`, the account this call is re-pinning. The bare form
-        # reads the RECORD, which `load_pin` above read too, so it happens to
-        # agree here — and that is an accident of two readers sharing a file,
-        # not a property of this function. `set_pin` had the same shape and was
-        # WRONG, because there the record had not been written yet. Say which
-        # account is meant and the question stops depending on who else read
-        # what.
+        # Name the pin in the live config, exactly as `set_pin` does. Without
+        # `identity=` the splice returns early, so the repair restores a
+        # serving daemon while `~/.claude.json` still names whichever account
+        # is active -- and Claude Code takes that field as the OWNER of every
+        # bridge minted afterwards. Ask about `email`, the account this call
+        # is re-pinning: the bare form reads the record, which only happens to
+        # agree here because two readers share a file.
         return bool(impl.apply_pin(switcher, email, org,
                                    identity=identity_for_config(
                                        switcher, email=email,
@@ -1400,19 +1150,13 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
             _back = None
     try:
         _impl().apply_pin(switcher, *(before or (None, None)))
-        # AND THE CONFIG, which the record alone does not put back. `apply_pin`
-        # splices `~/.claude.json` BEFORE it starts the proxy, so a pin that
-        # failed to start has already written its account there; restoring only
-        # the record leaves Claude Code minting every later bridge under the
-        # account whose pin just failed. Asked about `before` explicitly,
-        # because the record still names the failure at this point.
-        #
-        # WHOSE NAME GOES BACK. Restoring a previous pin means that pin;
-        # restoring NOTHING means the live login, exactly as `clear_pin`
-        # decides it. Without the second case a failed FIRST pin left its own
-        # account named in a config the record no longer mentions and nobody is
-        # logged in as — the command reported failure and handed the machine to
-        # it anyway.
+        # And the config, which the record alone does not put back:
+        # `apply_pin` splices `~/.claude.json` BEFORE it starts the proxy, so
+        # a pin that failed to start has already written its account there.
+        # Restoring a previous pin means that pin; restoring NOTHING means the
+        # live login, exactly as `clear_pin` decides it -- without the second
+        # case a failed FIRST pin left its own account named in a config
+        # nobody is logged in as.
         if before:
             # Safe to ask now: `apply_pin` has just RESTORED this record, so
             # the lookup sees the state it is naming. The None case cannot,
@@ -1449,18 +1193,11 @@ def _clear_pin_record(switcher) -> None:
 # receipt saying WHICH keys are its own, so unwiring restores exactly what it
 # displaced and touches nothing else.
 #
-# THE ENV BLOCK CANNOT MOVE. Claude Code reads it out of `.claude.json` at
-# boot; that file IS the interface.
-#
-# THE RECEIPT CAN, and should: it is bookkeeping only cswap reads, and
-# `.claude.json` is the user's file — every key we leave in it is one more
-# thing a human editing that file can trip over, and two of them
-# (`_cswapPinWiredKeys`, `_cswapPinWiredKeysSaved`) are opaque unless you know
-# this code. READ BOTH, WRITE NEW. The sidecar is authoritative when present;
-# the config is still read for the copy every existing install has. A pin OLDER
-# than this change keeps writing the config key, and it must keep working — so
-# this is not a migration with a cutover, it is two readers and one writer, and
-# the old location stays readable indefinitely.
+# The env block cannot move: Claude Code reads it at boot, so that file IS the
+# interface. The receipt can, and did -- it is bookkeeping only cswap reads,
+# while `.claude.json` is the user's file. READ BOTH, WRITE NEW: a cswap-pin
+# older than this change still writes the config key and must keep working, so
+# this is two readers and one writer, not a migration with a cutover.
 
 
 def _wiring_present(_switcher) -> bool:
@@ -1584,14 +1321,10 @@ def wired_config_paths(_switcher=None) -> list:
 
 # -- the operations, shared by the CLI and the TUI ---------------------------
 #
-# THE VERDICT LIVES HERE, NOT AT EACH CALL SITE. One decision implemented twice
-# diverges: a fix lands on the CLI and its sibling in tui/dashboard.py keeps the
-# old behaviour, and the two front ends disagree without either looking wrong on
-# its own.
-#
-# So these return a (ok, message) the caller only has to render. A divergence
-# now needs someone to write a second copy of the logic rather than to forget a
-# line.
+# The verdict lives here, not at each call site: these return `(ok, message)`
+# the caller only has to render, so a divergence between the CLI and
+# tui/dashboard.py needs someone to write a second copy of the logic rather
+# than to forget a line.
 
 
 def clear_pin(switcher) -> tuple[bool, str]:
@@ -1603,16 +1336,10 @@ def clear_pin(switcher) -> tuple[bool, str]:
     skipped" — only the second is a failure, and the skip is deliberate.
     """
     had_pin = _pinned_email_now(switcher) is not None
-    # CAPTURED BEFORE THE FIRST THING THAT UNWIRES, which is `apply_pin`, not
-    # `clear_wiring`. This snapshot sat below both, so the survivor check ran
-    # against a config the package had ALREADY rewritten: a peer that removed
-    # the receipt but left the env keys (a partial rewrite, or the
-    # ledger-first/config-second split failing on the second half) produced an
-    # empty `before`, an empty `survivors`, and `(True, 'Unpinned the cloud
+    # Captured before the first thing that unwires, which is `apply_pin`, not
+    # `clear_wiring`. Below both, the survivor check ran against a config the
+    # package had already rewritten, and reported `(True, 'Unpinned the cloud
     # account')` over a config still naming a dead proxy port.
-    #
-    # `purge` gets this right by capturing before it calls US; the old comment
-    # claimed parity with it, and was only true relative to `clear_wiring`.
     before = wired_env_keys(switcher)
     # WHOSE IDENTITY THE CONFIG CARRIES AFTERWARDS. The package cannot work
     # this out — resolving an account to its stored identity means reading
@@ -1629,17 +1356,12 @@ def clear_pin(switcher) -> tuple[bool, str]:
         impl = _impl()
         impl.apply_pin(switcher, None, None, identity=_back_to)
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
-        # THE RECORD IS CSWAP'S OWN FILE, so clear it here rather than
+        # The record is cswap's own file, so clear it here rather than
         # reporting that the package could not. With the extra uninstalled,
-        # leaving it meant `--clear` failed, told the user to REINSTALL the
-        # package they had just removed (advice that inverts their intent and
-        # never converges — run 2 is identical), and then re-pinned the old
-        # account the moment anything reinstalled it, live, with no user
-        # action. Same for a too-old or broken-root package.
-        #
-        # This is the stranding clear_wiring was moved into this repo to
-        # prevent, one level up: the wiring is cswap's file and gets cleared,
-        # and settings.json -> remoteControl is equally cswap's file.
+        # leaving it made `--clear` fail, told the user to REINSTALL what they
+        # had just removed, and re-pinned the old account the moment anything
+        # did. `settings.json` -> `remoteControl` is as much cswap's file as
+        # the wiring `clear_wiring` was moved here to remove.
         _clear_pin_record(switcher)
     # AND THE SAME FALLBACK WHEN IT DID NOT RAISE. A peer whose `apply_pin`
     # RETURNS and clears nothing reaches the dead end the branch above exists
@@ -1698,19 +1420,13 @@ def set_pin(
     below was skipped entirely — accepting exactly the account it exists to
     reject.
     """
-    # REFUSED HERE, not at the call sites. An API-key account can never be
-    # pinned — `sk-ant-api…` is not OAuth JSON, so the provider returns None
-    # for every request and each one fails open: daemon spawned, badge lit,
-    # nothing pinned, ever. The TUI's row filter is a courtesy, not the
-    # enforcement: refresh_root_menu returns early below depth 1, so an open
-    # submenu is never rebuilt while the snapshot keeps updating, and a row
-    # that was OAuth when the menu was drawn pins an API-key account when it
-    # is selected.
-    #
-    # A kind we cannot READ is not permission to proceed. Swallowing the
-    # lookup turned an unreadable sequence.json into a silent skip of the
-    # refusal — the failure mode is identical to having no refusal at all,
-    # and it is invisible. Refuse loudly instead; the user can fix the store.
+    # Refused here, not at the call sites. An API-key account can never be
+    # pinned -- `sk-ant-api...` is not OAuth JSON, so the provider returns None
+    # for every request and each fails open: daemon spawned, badge lit,
+    # nothing pinned. The TUI's row filter is a courtesy, not the enforcement:
+    # an open submenu is never rebuilt, so a row that was OAuth when drawn can
+    # pin an API-key account when selected. A kind we cannot READ is refused
+    # too -- swallowing the lookup is indistinguishable from no refusal.
     if num is None:
         try:
             num = switcher.resolve_account(email)[0]
@@ -1733,19 +1449,13 @@ def set_pin(
         )
     before = _pinned_email_now(switcher)
     try:
-        # HAND OVER THE IDENTITY, do not apply it here. Once a pin is set the
-        # live config must name it — `oauthAccount` is what Claude Code reads
-        # to decide who OWNS a bridge — and that rule is pin functionality, so
-        # the package owns it. What cannot move is this LOOKUP: it reads
-        # cswap's backup store, whose layout the package has no business
-        # knowing (see `identity_for_config`). So cswap looks it up and the
-        # package applies it, which is the split this seam exists for.
-        #
-        # ASK ABOUT `email`, NOT ABOUT THE RECORD. Python evaluates this
-        # argument BEFORE `apply_pin` runs, and `apply_pin` is what writes the
-        # record — so the no-argument form resolves the PREVIOUS pin: None on a
-        # first pin (nothing splices, the pin is inert) and the outgoing
-        # account on a re-pin (the config names what was just unpinned).
+        # Hand over the identity, do not apply it here. Once a pin is set the
+        # live config must name it (`oauthAccount` is what Claude Code reads
+        # to decide who owns a bridge) and that rule is pin functionality. The
+        # LOOKUP cannot move: it reads cswap's backup store, whose layout the
+        # package has no business knowing. Ask about `email`, not about the
+        # record -- this argument is evaluated BEFORE `apply_pin` writes it,
+        # so the no-argument form resolves the PREVIOUS pin.
         started = _impl().apply_pin(
             switcher, email, org_uuid,
             identity=identity_for_config(switcher, email=email, num=num))
@@ -1785,44 +1495,30 @@ def _wired_port_is_serving(_switcher, connect_timeout: float = 2.0) -> bool:
     """Is the port the CONFIG names actually answering?
 
     NOT MEMOISED, and a reviewer proposing to cache it should read this first.
-    Every repeat sits AFTER something that can change the answer — a restart,
-    a clear whose lock was contended — so a cache is precisely the inference
-    those call sites refuse. The cost only bites on a port that DROPS: a
-    loopback port with nothing on it refuses instantly.
+    Every repeat sits AFTER something that can change the answer -- a restart,
+    a clear whose lock was contended -- so a cache is precisely the inference
+    those call sites refuse. The cost only bites on a port that DROPS: one
+    with nothing on it refuses instantly.
 
     Asks the thing that is about to be removed, rather than any state file.
     ``proxy.json`` is unlinked at the START of a respawn, so its absence is not
-    proof of death while the original daemon is still serving — deciding from
-    the record alone has already unwired a live pin once.
+    proof of death while the original daemon is still serving.
 
-    Works with the extra absent or broken: it is a loopback connect, not an
-    import. That matters because the uninstalled case is exactly when a user
-    can least afford a wrong answer in either direction.
+    Works with the extra absent or broken: a loopback connect, not an import.
 
     False when nothing is wired, when the port is unreadable, or when it
-    refuses — all of which mean "healing is allowed to proceed".
+    refuses -- all of which mean "healing is allowed to proceed".
 
     ``_switcher`` is unused (see :func:`_wiring_present`) but kept, and
     underscore-prefixed, for the same call-compatibility reason.
     """
-    # EVERY WIRED CONFIG MUST SERVE, not merely one of them.
-    #
-    # The two configs are written asymmetrically:
-    # `cswap_pin.wire_global_config` writes only the session config, while this
-    # reads both — the same asymmetry `clear_wiring` documents as its reason
-    # for clearing both. Answering on the FIRST config that serves lets a live
-    # session config mask a DEAD default config, so plain `claude` from a
-    # terminal boots against the dead one while `--heal` says "Nothing to
-    # heal":
-    #
-    #     session cfg -> 42967 (LIVE)   default cfg -> 39967 (DEAD)
-    #     _wired_port_is_serving : True      <- OR over both
-    #     heal()                 : (False, "Nothing to heal")
-    #     default cfg still names the dead port: True
-    #
-    # An unwired config is not a counter-example — it sends nobody anywhere.
-    # Only a config that NAMES a port has an opinion, and every such opinion
-    # has to be right for the pin to be serving.
+    # EVERY wired config must serve, not merely one of them. The two are
+    # written asymmetrically -- `cswap_pin.wire_global_config` writes only the
+    # session config while this reads both -- so answering on the first config
+    # that serves lets a live session config mask a dead default one, and
+    # plain `claude` from a terminal boots against the dead port while
+    # `--heal` says "Nothing to heal". An unwired config is not a
+    # counter-example: only a config that NAMES a port has an opinion.
     ports = _wired_ports()
     return bool(ports) and all(
         _port_answers(port, connect_timeout) for port in ports
@@ -1855,21 +1551,13 @@ def _nothing_to_heal(switcher) -> tuple[bool, str]:
     ]
     if not unreadable:
         return False, "Nothing to heal"
-    # TWO STATES REACH THAT LIST AND THEY NEED DIFFERENT SENTENCES. A config
-    # whose receipt names keys the env no longer has is not a broken port
-    # value — it is a LEFTOVER RECEIPT, and telling the user to fix a
-    # `CSWAP_PIN_PORT` that is not in the file is the same defect this
-    # message was added to remove.
-    #
-    # DETERMINISTIC, not rare: `_ledger_path` keys the sidecar on the config
-    # PATH, so a `.claude.json` deleted and recreated at the same path
-    # inherits the same receipt — which is what Claude Code recreating that
-    # file normally does. The `--clear` half of the advice does resolve it,
-    # which is what keeps the cost to one message.
-    # HOISTED, because it is loop-invariant and expensive. Called inside the
-    # comprehension it re-walked both configs and both sidecars once per
-    # unreadable path, on a file this module's own comment calls "megabytes on
-    # a real machine".
+    # Two states reach that list and they need different sentences. A config
+    # whose receipt names keys the env no longer has is a LEFTOVER RECEIPT,
+    # not a broken port value, and it is deterministic: `_ledger_path` keys
+    # the sidecar on the config PATH, so a `.claude.json` deleted and
+    # recreated inherits the same receipt.
+    # Hoisted because it is loop-invariant and re-walks both configs and both
+    # sidecars per unreadable path.
     receipts = wired_env_keys(switcher)
     stale = [p for p in unreadable
              if not (set(receipts.get(p, ())) & set(_env_of_config(p) or ()))]
@@ -1895,20 +1583,9 @@ def heal(
 ) -> tuple[bool, str]:
     """Make the pin serving again, or make it harmless. ``(changed, message)``.
 
-    ``lock_timeout`` bounds OUR config lock, and reaches the PACKAGE's config
-    lock too on a version that accepts it. What it does not reach is
-    cswap-pin's SPAWN lock, which `impl.heal` takes with no timeout of ours to
-    give it, so a repair that has to spawn waits for whoever is already
-    spawning. Bounded in practice -- that holder is performing the repair, and
-    flock releases on its death -- but no budget here covers it.
-
-    A DEAD PIN MUST NOT TAKE THE SESSION WITH IT. Everything else here reacts
-    to a launch, so when the daemon dies while sessions are up nothing brings
-    it back — and the stale wiring in ``.claude.json`` is applied at BOOT, so
-    new sessions inherit the dead port too and cannot start either: every
-    session on the box shows ``Unable to connect to API (ConnectionRefused)``
-    while the proxies behind the pin are healthy, and only a hand re-pin
-    clears it.
+    ``lock_timeout`` bounds OUR config lock, and the PACKAGE's config lock too
+    on a version that accepts it. It does not reach cswap-pin's SPAWN lock,
+    which `impl.heal` takes with no timeout of ours to give it.
 
     Two outcomes, in order of preference:
 
@@ -1916,62 +1593,39 @@ def heal(
        that address and their env is fixed at exec, so a daemon returning to it
        is picked up with no restart and nothing to reconnect.
     2. Failing that, REMOVE THE WIRING. Unpinned is a working session; wired to
-       a dead port is not. The fallback the shell provides (the corporate proxy,
-       or nothing) is what the user had before they ever pinned.
+       a dead port is not, because the stale wiring is applied at BOOT and new
+       sessions inherit the dead port too.
 
-    Never raises. NOT because a timer calls it -- nothing does, and this
-    docstring claimed a status-line caller for long enough that a review
-    re-tuned budgets for one. Its two callers are `cswap pin --ensure`, which
-    an rc file runs before every hand-launched ``claude``, and a hand-run
-    ``cswap pin --heal``. Both are a LAUNCH or a repair someone is waiting on,
-    and a health check that can end either is worse than the fault it reports.
+    Never raises. Its callers are `cswap pin --ensure`, run from an rc file
+    before every hand-launched ``claude``, and a hand-run ``cswap pin --heal``:
+    a launch, or a repair someone is waiting on.
 
-    ``connect_timeout`` is every loopback probe below, and it is a keyword the
-    LAUNCH path must pass. The default is right for a hand-run ``--heal``, and
-    wrong for ``--ensure``: that hook runs from an rc file before every
-    hand-launched ``claude``, and one call arms three probes here, so a port
-    that black-holes rather than refuses costs the launch 4.2s on the default.
-    Same defect the two call sites in this file already carry a budget for —
-    it was only invisible here because it lives one frame down.
+    ``connect_timeout`` is every loopback probe below, and the LAUNCH path must
+    pass it -- one call arms three probes, so a port that black-holes rather
+    than refuses costs the launch 4.2s on the ``--heal`` default.
     """
-    # A SERVING PIN IS NEVER **TORN DOWN**. That is what the guard protects,
-    # and the destructive operation is `clear_wiring` at the bottom — not the
-    # restart. Returning here on `serving`, before `impl.heal()` runs, makes a
-    # whole class of repair unreachable:
-    #
-    #   a daemon SERVING its wired port while running code we no longer ship
-    #
-    # is exactly the state an upgrade leaves behind, and it answers "Nothing to
-    # heal" forever. A wiring that names a DEAD port recycles, but that is the
-    # right outcome for the wrong reason.
-    #
-    # So the restart runs FIRST and the serving check gates only the unwire.
-    # `impl.heal` is safe to call in the serving case by construction: it
-    # returns False for "serving, wired, and current" and recycles only when
-    # the fingerprint says the daemon predates the installed code — rebinding
-    # the SAME port, so live sessions never see the swap.
+    # A serving pin is never TORN DOWN -- that is what the guard protects, and
+    # the destructive operation is `clear_wiring` at the bottom, not the
+    # restart. Returning on `serving` before `impl.heal()` runs makes a daemon
+    # that serves its wired port while running code we no longer ship
+    # unreachable, which is exactly what an upgrade leaves behind. So the
+    # restart runs FIRST and the serving check gates only the unwire;
+    # `impl.heal` returns False for "serving, wired and current" and rebinds
+    # the same port when it recycles, so live sessions never see the swap.
     impl = _live_impl()
     if impl is not None:
         try:
-            # `impl.heal` covers three states: a daemon that died, one that
-            # is serving while the config names nothing, and one that is
-            # serving but obsolete.
+            # `impl.heal` covers three states: a daemon that died, one
+            # serving while the config names nothing, and one serving but
+            # obsolete. Re-read the True as well as the False -- the package
+            # is a peer on its own release schedule, so an impl returning True
+            # while binding nothing would report success over a dead port.
             #
-            # RE-READ THE TRUE AS WELL AS THE FALSE. The package is a peer on
-            # its own release schedule (see `_impl`), so an impl that returns
-            # True while binding nothing would give (True, "Restored the cloud
-            # pin") over a wired port that is not serving.
-            #
-            # ASKED, NOT ASSUMED. A version predating a keyword raises
-            # TypeError on it, inside this try, which would swallow it and
-            # lose heal altogether. Probing the signature keeps a TypeError
-            # raised INSIDE heal from being mistaken for an old signature and
-            # retried against a function that already ran.
-            #
-            # NEITHER SIGNATURE VIEW ALONE IS SAFE: a `wraps` wrapper that
-            # DROPS keywords looks accepting when followed, a transparent
-            # `(*a, **kw)` one looks accepting when unfollowed. `**kwargs`
-            # counts as accepting because a signature cannot say otherwise.
+            # The signature is PROBED, not assumed: a version predating the
+            # keyword raises TypeError inside this try, which would swallow
+            # heal altogether. Neither signature view alone is safe -- a
+            # `wraps` wrapper that DROPS keywords looks accepting when
+            # followed, a transparent `(*a, **kw)` one when unfollowed.
             def _accepts(sig, name: str) -> bool:
                 params = sig.parameters
                 return name in params or any(
@@ -1979,17 +1633,12 @@ def heal(
                     for p in params.values())
 
             def _both(name: str) -> bool:
-                # THE UNFOLLOWED VIEW WINS WHEN IT NAMES THE PARAMETER, because
-                # that is the signature the call actually binds against: a
-                # compat shim that GROWS a keyword in a wrapper over its older
-                # inner accepts it, and following `__wrapped__` reports the
-                # inner, which does not. Requiring both views to agree can only
-                # turn a yes into a no, so every disagreement it invents is a
-                # carry dropped in silence.
-                #
-                # The agreement is still what decides a wrapper that says only
-                # `**kwargs` -- there the outer claims nothing, so the inner is
-                # the only evidence there is.
+                # The unfollowed view wins when it NAMES the parameter,
+                # because that is the signature the call binds against: a
+                # compat shim that grows a keyword over an older inner accepts
+                # it. Requiring both views to agree can only turn a yes into a
+                # no. Agreement still decides a wrapper claiming only
+                # `**kwargs`, where the inner is the only evidence there is.
                 try:
                     outer = inspect.signature(impl.heal, follow_wrapped=False)
                     if name in outer.parameters:
@@ -2000,18 +1649,12 @@ def heal(
                     return False
 
             _takes_identity = _both("identity")
-            # THROUGH `_slot_for`, like every other caller. The bare form
-            # makes `identity_for_config` resolve an ADDRESS, and
-            # `_resolve_account_identifier` RAISES when one address names two
-            # slots -- the documented personal+org roster. The function-wide
-            # except turns that into None, the package leaves the field alone,
-            # and the drift this carry exists to stop continues untouched on
-            # exactly the roster the composite key was built for.
-            #
-            # AND THE BUDGET RIDES WITH IT, or the package waits ten times as
-            # long as this caller allows itself: `lock_timeout` bounds OUR
-            # config lock, the splice inside `heal` takes the SAME lock, and
-            # it had no way to hear about it.
+            # Through `_slot_for`, like every other caller: the bare form
+            # makes `identity_for_config` resolve an ADDRESS, and that raises
+            # when one address names two slots (the personal+org roster this
+            # composite key was built for). And the budget rides with it, or
+            # the package waits ten times as long as this caller allows --
+            # the splice inside `heal` takes the same config lock.
             _kw = {}
             if _takes_identity:
                 _pin_id = pinned_identity(switcher) or (None, None)
@@ -2033,27 +1676,19 @@ def heal(
         if _wired_port_is_serving(switcher, connect_timeout=connect_timeout):
             return _nothing_to_heal(switcher)
     elif _wired_port_is_serving(switcher, connect_timeout=connect_timeout):
-        # No package, so nothing can restart OR recycle — but a serving pin is
-        # still a working one, and removing its wiring would unpin a healthy
-        # session. The guard has to survive the package being absent, which is
-        # exactly when a user can least afford a wrong answer.
-        #
-        # The port the WIRING names is the right question, not any state file:
-        # `_spawn_daemon` unlinks proxy.json as its first act, so a missing
-        # record is not proof of death while the original daemon still serves.
+        # No package, so nothing can restart or recycle -- but a serving pin
+        # is still a working one, and removing its wiring would unpin a
+        # healthy session. The port the WIRING names is the right question,
+        # not any state file: `_spawn_daemon` unlinks proxy.json as its first
+        # act, so a missing record is not proof of death.
         return _nothing_to_heal(switcher)
     # No package, or the restart failed. Either way the wiring must not
     # outlive the daemon it points at, and `clear_wiring` works WITHOUT the
-    # package on purpose — the wiring is cswap's own record.
-    #
-    # ASK `_dead_wired_configs`, NOT `_wiring_present`: the latter keys on the
-    # marker alone, so a config carrying it with no readable CSWAP_PIN_PORT
-    # would be torn down over a proxy that may be perfectly live.
-    #
-    # RE-READ AFTER THE CLEAR, and say which of the two happened.
-    # `clear_wiring`'s bool is True when ANY config changed and False both for
-    # "nothing to remove" and for "the lock was contended", so inferring the
-    # outcome hides a real outage in the one channel meant to report it.
+    # package on purpose. Ask `_dead_wired_configs`, not `_wiring_present`:
+    # the latter keys on the marker alone, so a config carrying it with no
+    # readable CSWAP_PIN_PORT would be torn down over a live proxy. Re-read
+    # after the clear -- `clear_wiring`'s bool is False both for "nothing to
+    # remove" and for "the lock was contended".
     try:
         # THE DEAD CONFIGS, NOT "THE WIRING". The list IS the same question
         # one bool wide, and asking it as a bool is what let a machine-wide
@@ -2063,16 +1698,12 @@ def heal(
         # and clear exactly what is dead — one probe round either way.
         dead = _dead_wired_configs(switcher, connect_timeout=connect_timeout)
         if dead:
-            # BUDGETED PER CALLER, like `connect_timeout` beside it:
-            # hardcoding the launch budget gave the HUMAN recovery command
-            # 0.5s, and Claude Code holds `.claude.json.lock` routinely.
-            #
-            # CAPTURED BEFORE THE CLEAR, against `dead` only, and read off the
-            # ENV BLOCK rather than the marker. A live config left wired on
-            # purpose is not a survivor, and a clear that rewrote the config
-            # but not the SIDECAR leaves a marker over launches that are
-            # already fine — both report "could not be removed" over a clear
-            # that did exactly what it meant to.
+            # Budgeted per caller, like `connect_timeout` beside it:
+            # hardcoding the launch budget gave the human recovery command
+            # 0.5s while Claude Code holds `.claude.json.lock` routinely.
+            # Captured before the clear, against `dead` only, and read off the
+            # ENV BLOCK rather than the marker -- a config left wired on
+            # purpose is not a survivor.
             wanted = {str(d) for d in dead}
             before = {
                 p: keys for p, keys in wired_env_keys(switcher).items()
@@ -2084,20 +1715,14 @@ def heal(
                     "Removed a cloud pin wiring whose proxy was gone. "
                     "sessions fall back to the proxy they had before the pin"
                 )
-            # NAME THE CONDITION, NOT A CAUSE THIS CANNOT KNOW. `clear_wiring`
-            # catches every exception around the lock, so one message covered a
-            # held lock AND a config directory the process cannot write — and
-            # asserted the first for both. On the permission shape the advice
-            # that followed ("re-run `cswap pin --heal`") can never come true:
-            # re-running chmods nothing, so the user waits on a lock that was
-            # never held while the fix is one command away.
-            #
-            # AND SAY WHERE THE CAUSE IS. `clear_wiring`'s WARNING carries the
-            # real exception, but `logging_config` attaches a console handler
-            # under `--debug` alone — so on an ordinary run this line is the
-            # whole of what the user sees, and it was pointing at the wrong
-            # thing. Naming one cause for a condition with two fails the same
-            # way as naming none.
+            # Name the condition, not a cause this cannot know.
+            # `clear_wiring` catches every exception around the lock, so one
+            # message covered a held lock AND an unwritable config directory
+            # and asserted the first for both -- on the permission shape
+            # "re-run `cswap pin --heal`" can never come true. And say where
+            # the cause is: `logging_config` attaches a console handler under
+            # `--debug` alone, so on an ordinary run this line is all the user
+            # sees.
             return False, (
                 "A cloud pin wiring points at a proxy that is gone, and it "
                 "could not be removed; re-run `cswap pin --heal`, or "
@@ -2106,53 +1731,37 @@ def heal(
             )
     except Exception as exc:  # noqa: BLE001
         return False, f"Could not heal the cloud pin ({_safe(exc)})"
-    # REFUSING TO ACT IS NOT A REASON TO REPORT THE ALL-CLEAR. A marker with no
-    # readable `CSWAP_PIN_PORT` reaches here because `_dead_wired_configs`
-    # declines to condemn it — correctly, "I cannot tell" is not "it is dead",
-    # see its second guard. But declining leaves the wiring in place, and this
-    # answered "Nothing to heal": the file's signature defect (the capitals
-    # above) through a different door. `cswap pin --heal` is the command this
-    # module's own messages send a stranded user to, and over a hand-edited or
-    # out-of-range port — the case `_port_of_config`'s range check exists for —
-    # it printed the all-clear.
-    #
-    # NOT A WOLF: today's writer always emits the port, so the normal wired
-    # machine never reaches this branch. `--ensure` discards the message
-    # entirely, so the launch path stays silent either way.
+    # Refusing to act is not a reason to report the all-clear. A marker with
+    # no readable `CSWAP_PIN_PORT` reaches here because `_dead_wired_configs`
+    # declines to condemn it, correctly -- but declining leaves the wiring in
+    # place, and `cswap pin --heal` is where this module's own messages send a
+    # stranded user. Not a wolf: today's writer always emits the port, and
+    # `--ensure` discards the message, so the launch path stays silent.
     return _nothing_to_heal(switcher)
 
 
 def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     """The port a live pin daemon is serving, or None. CSWAP'S OWN RECORD.
 
-    Exists because nothing could ASK. Measured against an external tool that
-    updates Claude Code: it opens ``pin-proxy/proxy.json`` at TWO hardcoded
-    paths and
-    parses our JSON schema, because a pinned session's ``HTTPS_PROXY`` names
-    the pin's own dynamic port rather than the cache proxy's — and without
-    that number every pinned session is reported as "the cache proxy was
-    bypassed" while it is in fact chained correctly. A consumer that cannot
-    ask reaches into our data dir, and then our LAYOUT and our SCHEMA become
-    a compatibility surface we cannot change without breaking scripts we do
-    not own.
+    Exists because nothing could ASK, and a consumer that cannot ask reaches
+    into our data dir instead -- which makes our LAYOUT and SCHEMA a
+    compatibility surface we cannot change without breaking scripts we do not
+    own. A pinned session's ``HTTPS_PROXY`` names the pin's own dynamic port,
+    so without this number such a session reads as bypassing whatever proxy
+    sits behind it.
 
     Read from the record rather than through the package, like
     :func:`_pinned_email_now`: the caller most likely to need this is one
-    diagnosing a failure, which is exactly when the package may be the thing
-    that is broken.
+    diagnosing a failure, which is when the package may be what is broken.
 
-    THE DAEMON'S RECORD, NOT THE CONFIG'S. These are different questions and
-    the caller is asking the first one: "which port is the proxy on", so that
-    a session seen using it can be recognised as chained rather than reported
-    as bypassing the cache proxy. The config's answer is "which port were
-    sessions TOLD to use", which is the same number in the healthy case and
-    deliberately not during a handover — `proxy.json` is what the daemon
-    itself publishes.
+    THE DAEMON'S RECORD, NOT THE CONFIG'S. "Which port is the proxy on" and
+    "which port were sessions told to use" are the same number in the healthy
+    case and deliberately not during a handover; `proxy.json` is what the
+    daemon itself publishes.
 
-    LIVENESS IS NOT ASSUMED. A recorded port whose daemon has died is the
-    stranding case this module keeps meeting, and answering with it would
-    send a caller to an address nothing serves. So the port is asked, not
-    inferred: a loopback connect, which also works with the package absent.
+    Liveness is not assumed: a recorded port whose daemon has died would send
+    the caller to an address nothing serves, so the port is probed with a
+    loopback connect, which also works with the package absent.
     """
     record = _certdir(switcher) / "proxy.json"
     try:
@@ -2181,20 +1790,11 @@ def run(
     from claude_swap.printer import accent, dimmed, warning
 
     if ensure:
-        # THE LAUNCH CONTRACT, which `--heal` deliberately does not make.
-        # An rc hook calls this before EVERY `claude`, so three properties
-        # matter more than the repair itself:
-        #
-        #   never fails    a launch is not optional and a pin is, so every
-        #                  path exits 0 — including a raise, which an rc hook
-        #                  would otherwise propagate into the launch
-        #   silent         a launch that prints has changed what the user sees
-        #                  for an optional feature
-        #   cheap when idle  a machine that never pinned must not pay for the
-        #                  repair path
-        #
-        # The irreducible part is the TRIGGER: a hand-launched `claude` execs
-        # from the user's shell and nothing of ours runs inside it.
+        # The launch contract, which `--heal` deliberately does not make. An
+        # rc hook calls this before EVERY `claude`, so it never fails (every
+        # path exits 0, a raise included), stays silent, and is cheap on a
+        # machine that never pinned. The irreducible part is the TRIGGER: a
+        # hand-launched `claude` execs
         try:
             # NOTHING WIRED AND NOTHING RECORDED IS THE COMMON CASE.
             if not _wiring_present(switcher) and _pinned_email_now(switcher) is None:
@@ -2202,18 +1802,14 @@ def run(
             # BUDGETED, like the two probes below it.
             heal(switcher, connect_timeout=_LAUNCH_PROBE_S,
                  lock_timeout=_LAUNCH_LOCK_BUDGET_S)
-            # RE-READ, DO NOT TRUST `heal`'s RETURN: only the config and a
+            # Re-read, do not trust `heal`'s return: only the config and a
             # connect can say whether a port is being served, and `cswap_pin`
-            # is a peer on its own release schedule.
-            #
-            # NOT DEAD CODE just because `heal` ran above it. `heal` clears the
-            # same dead set under the same lock budget, so a config Claude Code
-            # holds through a credential refresh leaves the verdict stale and
-            # drops through to here.
-            #
-            # Both the probe and the lock are budgeted: the default 2.0s probe
-            # is paid in full by a port that black-holes rather than refuses,
-            # on a hook that runs before EVERY hand-launched `claude`.
+            # is a peer on its own release schedule. Not dead code just
+            # because `heal` ran above -- it clears the same dead set under
+            # the same lock budget, so a config Claude Code holds through a
+            # credential refresh leaves the verdict stale and drops to here.
+            # Both the probe and the lock are budgeted, on a hook that runs
+            # before every hand-launched `claude`.
             dead = _dead_wired_configs(switcher, connect_timeout=_LAUNCH_PROBE_S)
             if dead:
                 # BUDGETED, like every other call on a launch path.
@@ -2239,14 +1835,11 @@ def run(
         if set_port and not 0 < set_port <= 65535:
             error(f"Not a port: {set_port}")
             return 1
-        # WRITTEN HERE, NOT THROUGH THE PACKAGE. The cert dir is CSWAP's own
+        # Written here, not through the package: the cert dir is CSWAP's own
         # directory and this is a plain JSON record, so requiring cswap-pin to
         # save it would make the setting unsettable in exactly the case a user
-        # is most likely to be fixing something — the same reason `--clear`
-        # and `--heal` do their half without the package.
-        #
-        # READ-MODIFY-WRITE: it is a SETTINGS file, so the next setting to
-        # land there must not be erased by the next --set_port.
+        # is fixing something. Read-modify-write, because it is a SETTINGS
+        # file and the next setting must not be erased by the next --set_port.
         try:
             d = _certdir(switcher)
             d.mkdir(parents=True, exist_ok=True)
@@ -2268,14 +1861,11 @@ def run(
         return 0
 
     if get_port:
-        # A NUMBER ON STDOUT AND NOTHING ELSE. This is read by `$(cswap pin
-        # --port)`, so a prefix, a colour code or a "no pin set" sentence
-        # would land INSIDE the caller's variable — turning every consumer
-        # back into a parser, which is the thing this flag removes. Silence
-        # plus a nonzero exit lets a caller branch without string-matching.
-        #
-        # BEFORE _impl(), for the same reason as --heal and --clear: the
-        # question is most urgent when the package is broken.
+        # A number on stdout and nothing else: this is read by `$(cswap pin
+        # --get_port)`, so a prefix, a colour code or a "no pin set" sentence
+        # would land INSIDE the caller's variable. Silence plus a nonzero exit
+        # lets a caller branch without string-matching. Before `_impl()`, like
+        # --heal and --clear: the question is most urgent when it is broken.
         p = serving_port(switcher)
         if p is None:
             return 1
@@ -2283,60 +1873,41 @@ def run(
         return 0
 
     if get_certdir:
-        # THE OTHER THING NOBODY COULD ASK FOR. The state directory is not at
-        # the same path on Darwin as on Linux, and a layout that cannot be
-        # ASKED for is one every consumer has to SEARCH for — an unbounded
-        # `find` over a home directory, for a string this process holds.
-        #
-        # BEFORE _impl() and printing a bare path, for the same two reasons as
-        # --get_port. Unlike --get_port it does NOT probe: "where does this
-        # host keep it" is true whether or not a daemon is up, and diagnosing
-        # a DEAD pin is exactly when it is asked.
+        # The state directory is not at the same path on Darwin as on Linux,
+        # and a layout that cannot be ASKED for is one every consumer has to
+        # SEARCH for. Before `_impl()` and a bare path, for the same reasons
+        # as --get_port; unlike it this does NOT probe, because "where does
+        # this host keep it" is true whether or not a daemon is up.
         print(_certdir(switcher))
         return 0
 
     if heal_only:
-        # Deliberately BEFORE _impl(): healing must work when the package is
+        # Deliberately before `_impl()`: healing must work when the package is
         # missing or broken. Exit 0 either way, so this is safe in a timer or
-        # a shell chain — a non-zero exit for "nothing was wrong" is noise in
-        # both.
-        #
-        # THE BUDGETS HERE STAY THE HUMAN ONES: `heal`'s defaults (2.0s probe,
-        # 9.0s lock). Hardcoding the launch budget gave the human recovery
-        # command 0.5s, and Claude Code holds `.claude.json.lock` routinely
-        # during a credential refresh. `--ensure` is the flag with the launch
-        # budgets; that split is the answer.
+        # a shell chain. The budgets stay the HUMAN ones (`heal`'s 2.0s probe,
+        # 9.0s lock) -- Claude Code holds `.claude.json.lock` routinely during
+        # a credential refresh, and `--ensure` is the flag with the launch
+        # budgets.
         changed, msg = heal(switcher)
         print(msg if changed else dimmed(msg))
         return 0
 
     if clear:
-        # Works WITHOUT the package on purpose: ``--clear`` is what a user
+        # Works WITHOUT the package on purpose: `--clear` is what a user
         # reaches for precisely when they have uninstalled the pin, and the
-        # wiring is cswap's own record (see clear_wiring). Any failure falls
-        # back, not just a missing package: "installed but unusable" (a broken
-        # cryptography) is the other way a user ends up here, and a traceback
-        # is the worst possible outcome for the one command whose job is to
-        # work when the pin does not.
-        #
-        # READ THE RECORD OURSELVES, not through the package. THE SAME
-        # clear_pin THE TUI CALLS. A second copy of this logic is how a refusal
-        # ends up in one front end and not the other. One decision, one
+        # wiring is cswap's own record. Any failure falls back, not just a
+        # missing package -- "installed but unusable" is the other way a user
+        # ends up here. The same `clear_pin` the TUI calls: one decision, one
         # implementation, two renderings.
         ok, msg = clear_pin(switcher)
         if not ok:
             warning(msg)
             return 1
-        # PRINT WHAT `clear_pin` DECIDED. This rendered the returned message
-        # only when it started with "No " and replaced every other one with
-        # "Unpinned the cloud account" — so the stale-receipt success, whose
-        # entire value is the PATH it names, reached the TUI (which prints
-        # `msg` verbatim) and never the CLI. Two front ends, one decision,
-        # opposite output: the divergence the shared `(ok, message)` pair
-        # exists to prevent, reintroduced by a startswith.
-        #
-        # The accent stays on the ordinary unpin, which is the common case and
-        # the only one whose wording this layer owns.
+        # Print what `clear_pin` decided. Rendering the returned message only
+        # when it started with "No " and replacing every other one hid the
+        # stale-receipt success, whose entire value is the PATH it names, from
+        # the CLI while the TUI printed it verbatim. The accent stays on the
+        # ordinary unpin, the only case whose wording this layer owns.
         print(
             f"{accent('Unpinned')} the cloud account"
             if msg == "Unpinned the cloud account"
@@ -2379,17 +1950,15 @@ def run(
         f"Account-{account_num} ({email})"
     )
 
-    # A re-pin takes effect under the live proxy: the pinned account is re-read
-    # per request, so nothing has to restart. The one thing it cannot move is a
-    # Remote Control session that is ALREADY open — the server fixed its owner
-    # at creation, so reconnecting inside it is what mints a new one under the
-    # new pin. Name those sessions instead of telling everyone to restart.
+    # A re-pin takes effect under the live proxy: the pinned account is
+    # re-read per request. The one thing it cannot move is a Remote Control
+    # session that is ALREADY open -- the server fixed its owner at creation,
+    # so reconnecting inside it is what mints a new one. Name those sessions
+    # instead of telling everyone to restart.
     #
-    # A NOTE MUST NOT FAIL THE ACTION. The pin is already applied and
-    # "Pinned…" has already printed; everything below is advice. Unguarded, a
-    # raise from the peer turned a SUCCEEDED pin into an error telling the
-    # user to run `--clear` — which would destroy it. The TUI's sibling call
-    # already guards this (dashboard.py, "a note must not fail the action").
+    # A note must not fail the action: the pin is applied and "Pinned..." has
+    # printed, so everything below is advice. Unguarded, a raise from the peer
+    # turned a SUCCEEDED pin into an error telling the user to run `--clear`.
     try:
         open_rc = pin.live_remote_control_sessions()
     except Exception:  # noqa: BLE001 — advice is not the operation
@@ -2413,29 +1982,21 @@ def run(
 def _warn_if_bridges_disagree(pin, switcher) -> None:
     """Say so when the live bridges do not belong to the account we pinned.
 
-    THE STATUS LINE REPORTS THE PIN, WHICH IS WHAT WE WROTE — never what the
-    machine has. Measured with three accounts at once:
+    The status line reports the PIN, which is what we wrote, never what the
+    machine has. Measured with three accounts at once: thirteen live bridges,
+    none on the pinned org, and the command reported "pinned" throughout. What
+    ended the silence was the server answering `API Error: 500` on a reattach,
+    which cost the user the session.
 
-        the line said       acct1@example.com    pinned, acct 1
-        the live bridge was org A                 acct 2
-        the login was       org B                 acct 3
-
-    Thirteen live bridges, none on the pinned org, and this command reported
-    "pinned" throughout. What ended the silence was the server answering
-    `API Error: 500` on a reattach, which cost the user the session.
-
-    NEVER FATAL, and that is the point of the guard rather than tidiness. This
-    is the second unguarded call into the optional package on this path; the
-    first turned a SUCCEEDED pin into `Error: … not usable` with advice to run
-    `--clear`, which would have destroyed it (see
-    TestANoteMustNotFailTheAction). `observed_bridge_owners` landed in
-    cswap-pin 0.1.85 and the two ship on separate schedules, so a host on an
-    older one must lose this extra line and keep the command.
+    NEVER FATAL. This is the second unguarded call into the optional package
+    on this path; the first turned a SUCCEEDED pin into `Error: ... not usable`
+    with advice to run `--clear`, which would have destroyed it.
+    `observed_bridge_owners` landed in cswap-pin 0.1.85 and the two ship on
+    separate schedules, so a host on an older one must lose this extra line and
+    keep the command.
 
     Only a bridge whose recorded owner DISAGREES is named. An unrecorded owner
-    (`None`) is not evidence of anything and stays quiet here — the reader keeps
-    that key so a caller can tell unknown from absent, which is a different
-    question than this one.
+    (`None`) is not evidence of anything and stays quiet.
     """
     # Imported here, like `run` does: `printer` is pulled in at call time
     # throughout this module, and a module-level import would be the one
@@ -2448,22 +2009,14 @@ def _warn_if_bridges_disagree(pin, switcher) -> None:
         return
     if not isinstance(owners, dict):
         return
-    # COMPARE AGAINST THE CONFIG, NOT THE PIN. `bridgeOwnerAccountUuid` has two
-    # writers that mean opposite things: Claude Code records the bridge's true
-    # server-side owner, and cswap-pin's live carry writes the account now
-    # signed in so CC's own comparison agrees and it REATTACHES instead of
-    # minting. Neither is wrong; they answer different questions.
-    #
-    # This sentence asks the reattach question — will these sessions keep their
-    # history — and CC answers it by comparing the stored pointer to
-    # `.claude.json`'s `oauthAccount`. It never compares anything to the pin. So
-    # comparing against the pinned org read a carried pointer as foreign
-    # ownership and told the user their pin was "in name only" while the carry
-    # was doing exactly what it exists to do.
-    #
-    # `_get_current_account` is deliberate over `_live_login_identity`: the
-    # latter UN-SPLICES the pin to answer "who is logged in", and CC has no such
-    # notion — it compares against the literal field.
+    # Compare against the CONFIG, not the pin. `bridgeOwnerAccountUuid` has
+    # two writers that mean opposite things: Claude Code records the bridge's
+    # true server-side owner, and cswap-pin's live carry writes the account
+    # now signed in so CC's own comparison agrees and it REATTACHES instead of
+    # minting. This sentence asks the reattach question, and CC answers it by
+    # comparing the stored pointer to `.claude.json`'s `oauthAccount` -- never
+    # to the pin. `_get_current_account` over `_live_login_identity` for the
+    # same reason: the latter UN-SPLICES the pin, and CC has no such notion.
     try:
         live = switcher._get_current_account()
     except Exception:  # noqa: BLE001 — a note must not fail the action

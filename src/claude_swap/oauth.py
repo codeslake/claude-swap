@@ -826,33 +826,22 @@ def fetch_policy_limits(access_token: str,
     return data if isinstance(data, dict) else None
 
 
-# One entry per distinct CA state. Bounded by construction: a machine has one
-# pin CA, so this holds one context, two across a regeneration.
-# ONE SLOT, NOT A DICT. Keyed on the CA's path and mtime, so a regenerated CA
-# inserts a new entry — and the old `SSLContext`, holding a full parsed copy of
-# the system trust store (~130 roots), stayed referenced forever. In `cswap
-# tui`, the menu-bar app or a long-running `cswap auto`, repeated re-pins grew
-# it monotonically. The docstring's "bounded by construction: a machine has one
-# pin CA" is true only until the CA is regenerated, which is exactly what a
-# re-pin does.
-#
-# A single slot gives the same hit rate for the same reason the dict did — the
-# key changes only when the CA does, and when it changes the old context is
-# dead — with a ceiling of one.
+# One slot, not a dict, keyed on the CA's path and mtime. A dict grew
+# monotonically across re-pins, each dead entry holding a full parsed copy of
+# the system trust store; a single slot has the same hit rate, because the key
+# changes only when the CA does and the old context is dead when it does.
 _PIN_CTX_SLOT: "tuple | None" = None
 
 
 def _pin_ca_fingerprint():
-    """What the cached context was built FOR — path and mtime, or None.
+    """What the cached context was built FOR -- path and mtime, or None.
 
-    A REGENERATED CA MUST NOT KEEP THE OLD CONTEXT, which is the only way a
+    A regenerated CA must not keep the old context, which is the only way a
     cache here can be wrong: `cswap pin` can mint a new CA at the same path,
-    and a context still trusting the old one fails every call afterwards with
-    exactly the error this helper exists to prevent. mtime answers that
-    without reading the file.
+    and a context still trusting the old one fails every call afterwards.
+    mtime answers that without reading the file.
 
-    None when there is no pin at all — a real key, not an error: it caches the
-    plain default context for machines without the extra.
+    None when there is no pin at all -- a real key, not an error.
     """
     # THROUGH THE SEAM. `pin.ca_path_for_trust` already returns None for
     # "cannot ask", so the guard that used to live here is the seam's now.
@@ -861,8 +850,8 @@ def _pin_ca_fingerprint():
     ca = _pin.ca_path_for_trust()
     if not ca:
         return None
-    # A CA THAT NAMES A PATH WE CANNOT STAT IS NOT THE SAME STATE AS NO PIN AT
-    # ALL, and collapsing the two hands the no-pin caller a context built for a
+    # A CA naming a path we cannot stat is not the same state as no pin at
+    # all; collapsing the two hands the no-pin caller a context built for a
     # pin. Distinct key, so each caches its own.
     try:
         stamp = os.stat(ca).st_mtime_ns
@@ -874,76 +863,52 @@ def _pin_ca_fingerprint():
 def _pin_aware_ssl_context():
     """A verifying context that ALSO trusts the pin's CA, if there is one.
 
-    NAMED FOR THE PROPERTY, NOT THE CALLER. It started as
-    `_bridge_ssl_context` because the bridge calls were the first to need it,
-    and this module has two more sites with the identical problem — profile
-    and usage. A helper named after its first caller is one the next caller
-    writes a second copy of.
+    Named for the property, not the caller: three sites in this module have
+    the identical problem -- profile, usage and the bridge calls.
 
-    TOKEN REFRESH IS NOT ONE OF THEM, and an earlier draft of this docstring
-    said it was, which is enough to make a reviewer file the missing `context=`
-    as a bug. The helper is only needed where the pin RE-SIGNS the host: it
-    MITMs `UPSTREAM_HOST` and blind-tunnels everything else, and
-    `OAUTH_TOKEN_URL` is on a different host, so that call is verified against
-    the real certificate by an ordinary default context. Adding ours there
-    would buy nothing and reload the system CA store on every refresh. The
-    relationship is pinned by a test rather than left here as prose, because
-    it holds between two packages and the day the pin re-signs a second host
-    it stops being true.
+    TOKEN REFRESH IS NOT ONE OF THEM. The helper is only needed where the pin
+    RE-SIGNS the host: it MITMs `UPSTREAM_HOST` and blind-tunnels everything
+    else, and `OAUTH_TOKEN_URL` is on a different host, so that call is
+    verified against the real certificate by an ordinary default context. A
+    test pins that relationship, because it holds between two packages.
 
     These calls are plain urllib through whatever proxy the session was wired
-    to. When that is the pin, it MITMs api.anthropic.com — so the default
-    context cannot verify it, every call dies CERTIFICATE_VERIFY_FAILED, and
-    `_list_bridge_sessions` swallows that to debug and returns None. That is
-    how the cloud session names stayed wrong for hours with nothing in any log.
+    to. When that is the pin it MITMs api.anthropic.com, so a default context
+    cannot verify it and every call dies CERTIFICATE_VERIFY_FAILED, which
+    `_list_bridge_sessions` swallows to debug.
 
-    ADD, NEVER REPLACE, and the difference is not cosmetic. `SSL_CERT_FILE`
-    REPLACES OpenSSL's file, so it is safe only where the bundle subsumes the
-    store it displaces. Measured per machine, by certificate SET:
-
-        host-a     ambient 124  bundle 126  safe
-        host-b      ambient 128  bundle 167  NOT — 27 missing
-        host-c  ambient 128  bundle   2  NOT — 128 missing
-
-    So the writer that sets it correctly refuses on two of the three, and the
-    repair stays dead there. Loading our CA into a default context keeps every
-    ambient root and needs no environment variable at all. Measured on
-    host-c, same process and proxy:
-
-        default ctx                 CERTIFICATE_VERIFY_FAILED
-        default ctx + our CA added  HTTP 200
+    ADD, NEVER REPLACE. `SSL_CERT_FILE` REPLACES OpenSSL's file, so it is safe
+    only where the bundle subsumes the store it displaces -- measured by
+    certificate SET across three machines, two were missing 27 and 128 roots
+    respectively, so the writer that sets it correctly refuses on both.
+    Loading our CA into a default context keeps every ambient root and needs
+    no environment variable.
 
     NEVER RAISES and never returns None: with no pin installed, or an
-    unreadable CA, the caller still gets an ordinary verifying context. An
-    optional extra must not be able to break a call that worked without it.
+    unreadable CA, the caller still gets an ordinary verifying context.
     """
-    # BUILT ONCE PER CA, NOT PER CALL. `create_default_context()` loads the
-    # whole system trust store (~130 certificates) and `load_verify_locations`
-    # parses ours on top — and this is on the polling path: once per account
-    # per usage poll, plus every profile fetch, every bridge listing and every
-    # rename. Nothing in the result changes unless the pin's CA file does, so
-    # the cache is keyed on that file's path and mtime and a regenerated CA
-    # invalidates it by itself.
+    # Built once per CA, not per call: `create_default_context()` loads the
+    # whole system trust store and this sits on the polling path. Nothing in
+    # the result changes unless the pin's CA file does, so the cache is keyed
+    # on that file's path and mtime.
     global _PIN_CTX_SLOT
 
     key = _pin_ca_fingerprint()
     if _PIN_CTX_SLOT is not None and _PIN_CTX_SLOT[0] == key:
         return _PIN_CTX_SLOT[1]
 
-    # THE KEY CARRIES THE PATH, so the file loaded and the key it is cached
-    # under are ONE read. Asking the seam again here let the two disagree:
-    # `ca_path_for_trust` collapses every failure inside the optional package
-    # to None, so a None on the second read cached a context with no CA under
-    # a key that named one.
+    # The key CARRIES the path, so the file loaded and the key it is cached
+    # under are one read. Asking the seam again let the two disagree:
+    # `ca_path_for_trust` collapses every failure to None, so a None on the
+    # second read cached a context with no CA under a key that named one.
     ctx = ssl.create_default_context()
     try:
         if key:
             ctx.load_verify_locations(cafile=key[0])
     except Exception as e:  # noqa: BLE001 — a missing CA is not a failed call
-        # NOT CACHED. The key is the CA's path and mtime and neither moves
+        # NOT CACHED: the key is the CA's path and mtime and neither moves
         # because a load failed, so caching this would freeze it for the life
-        # of the process — every later call dying CERTIFICATE_VERIFY_FAILED
-        # and swallowed to debug. Uncached, the next call retries.
+        # of the process. Uncached, the next call retries.
         _logger.debug("bridge ssl context: pin CA not added: %r", e)
         return ctx
     _PIN_CTX_SLOT = (key, ctx)
@@ -1027,33 +992,27 @@ _BRIDGE_TITLE_BUDGET_S = 20.0
 def restore_bridge_titles(access_token: str, names: dict) -> "tuple[int, str]":
     """Put each live session's own name back on its cloud bridge.
 
-    WHY THIS EXISTS HERE AND NOT IN THE PROXY. cswap-pin already implements
-    this, and it has exactly one caller: `_sweep_bridges_after_connect`, which
-    runs when a `POST /v1/code/sessions` REACHES the proxy. So the repair is
-    triggered by the very thing it exists to survive. Measured on a machine
-    where every live claude process carried an `HTTPS_PROXY` from BEFORE the
-    pin was wired -- Claude Code reads the `~/.claude.json` env block once at
-    boot, so a process that exec'd earlier keeps whatever the block said then.
-    Nothing reached the proxy, nothing was restored, and a session sat under a
-    server-invented title until it was renamed by hand.
+    WHY HERE AND NOT IN THE PROXY. cswap-pin implements this too, but its one
+    caller runs when a `POST /v1/code/sessions` REACHES the proxy -- so the
+    repair is triggered by the very thing it exists to survive. Measured on a
+    machine where every live claude process carried an `HTTPS_PROXY` from
+    BEFORE the pin was wired: nothing reached the proxy, nothing was restored,
+    and a session sat under a server-invented title until it was renamed by
+    hand.
 
-    THE POLICY STAYS IN cswap-pin. `titles_to_restore` decides what to touch —
+    THE POLICY STAYS IN cswap-pin. `titles_to_restore` decides what to touch --
     only a listed bridge whose title the server invented, never one a human
-    typed — and duplicating that judgement here is how the two copies drift.
-    This module contributes the transport it already has, nothing more.
+    typed. This module contributes the transport it already has, nothing more.
 
-    Returns ``(renamed, outcome)``. THE SECOND VALUE EXISTS BECAUSE THE FIRST
-    CANNOT TELL THE CASES APART: five distinct states all produced 0 — the
-    extra missing, the listing failing, the listing empty, nothing needing a
-    rename, every PUT refused — and the caller only spoke when it was
-    non-zero. Measured: this ran ~20 times over 107 minutes with
-    every listing dying on CERTIFICATE_VERIFY_FAILED, and nothing anywhere
-    said so; the user found their cloud session names wrong before any log
-    did.
+    Returns ``(renamed, outcome)``. The second value exists because the first
+    cannot tell the cases apart: five distinct states all produce 0, and the
+    caller only spoke when it was non-zero. Measured, this ran ~20 times over
+    107 minutes with every listing dying on CERTIFICATE_VERIFY_FAILED and
+    nothing anywhere said so.
 
-    NEVER RAISES: the caller is `AutoSwitchEngine.tick()`, which is documented
-    "Never raises", and a cosmetic repair must not be able to end a tick that
-    was about to prevent a rate-limit lockout.
+    NEVER RAISES: the caller is `AutoSwitchEngine.tick()`, documented "Never
+    raises", and a cosmetic repair must not end a tick that was about to
+    prevent a rate-limit lockout.
     """
     from claude_swap import pin as _pin
 

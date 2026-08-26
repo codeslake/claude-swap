@@ -141,12 +141,9 @@ Examples:
             "remove the wiring so sessions fall back instead of failing"
         ),
     )
-    # A QUERY, so consumers stop reading our files. Measured against an
-    # external updater: it opens pin-proxy/proxy.json at two hardcoded paths
-    # and parses our schema, because a pinned session's HTTPS_PROXY names the
-    # pin's own dynamic port and without that number every pinned session is
-    # reported as bypassing the cache proxy. Nothing could ask, so the layout
-    # and the schema became a compatibility surface we do not control.
+    # A query, so consumers stop reading our files: a pinned session's
+    # HTTPS_PROXY names the pin's own dynamic port, and with no way to ask for
+    # it the on-disk layout and schema become a compatibility surface.
     one_of.add_argument(
         "--get_port",
         action="store_true",
@@ -155,10 +152,9 @@ Examples:
             "(exit 1 if none). For scripts: PORT=$(cswap pin --get_port)"
         ),
     )
-    # THE SAME ARGUMENT, for the path. The state directory is not at the same
-    # location on every platform, and nothing could ask for it — so a consumer
-    # ran an unbounded `find` over a home directory to get a string this
-    # process already holds. What cannot be asked for gets searched for.
+    # The same argument, for the path: the state directory is not at the same
+    # location on every platform, and what cannot be asked for gets searched
+    # for -- an unbounded `find` over a home directory in one measured case.
     one_of.add_argument(
         "--get_certdir",
         action="store_true",
@@ -179,10 +175,9 @@ Examples:
             "the kernel picks the port, which is the default."
         ),
     )
-    # THE LAUNCH HOOK. `--heal` prints its verdict and is called by a human or
-    # a status line; this is called by an rc hook before every hand-launched
-    # `claude`, where nothing of ours runs. Silent, always exit 0, and free
-    # when nothing is wired.
+    # The launch hook: `--heal` prints its verdict for a human, while this is
+    # called by an rc hook before every hand-launched `claude`. Silent, always
+    # exit 0, free when nothing is wired.
     one_of.add_argument(
         "--ensure",
         action="store_true",
@@ -196,28 +191,18 @@ Examples:
 
     from claude_swap.pin import run as pin_run
 
-    # `--ensure` PROMISES SILENCE AND EXIT 0, and the promise has to cover
-    # everything it runs — not only `pin_run`. Both lines below sit outside
-    # that function: `_guard_root` calls `sys.exit(1)`, a SystemExit, which
-    # BaseException-derives and so passes through every handler here; and a
-    # switcher that cannot be constructed (migration collision, unwritable
-    # store) raises ClaudeSwitchError straight into the printing handler.
-    #
-    # The consumer is an rc hook that runs before every hand-launched
-    # `claude`. In a bare-metal root shell that meant an error line on every
-    # launch, and under `set -e` it aborted the rc file — from the one flag
-    # documented as unable to fail.
-    #
-    # THE PROMISE IS ABOUT FAILURE, not output. The package prints one line
-    # when it actually repairs the owner field; the no-op path is silent.
+    # `--ensure` promises silence and exit 0, and the promise has to cover
+    # everything it runs, not only `pin_run`. Both lines below sit outside that
+    # function: `_guard_root` raises SystemExit, which passes through every
+    # handler here, and a switcher that cannot be constructed raises
+    # ClaudeSwitchError into the printing handler. In a bare-metal root shell
+    # that meant an error line on every launch, and under `set -e` it aborted
+    # the rc file. The promise is about FAILURE, not output.
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
-        # AND THE PRINT, not only the exit. `_guard_root` calls `error()`
-        # BEFORE `sys.exit(1)`, and a handler can only catch the second half —
-        # so on the bare-metal root shell the guard names, the rc hook stayed
-        # silent in its exit code and emitted the refusal line before every
-        # hand-launched `claude`. Ask the same question instead of running the
-        # printing guard; `_is_refused_root` is that question.
+        # And the print, not only the exit: `_guard_root` calls `error()`
+        # BEFORE `sys.exit(1)` and a handler can only catch the second half.
+        # Ask the same question instead of running the printing guard.
         if args.ensure and _is_refused_root(switcher):
             sys.exit(0)
         _guard_root(switcher)
@@ -226,15 +211,11 @@ Examples:
         # user as one, even under a flag that promises never to fail.
         if args.ensure:
             sys.exit(0)
-        # RENDER WHAT THE SIBLINGS RENDER. The `except ClaudeSwitchError` that
-        # prints `Error: …` sits on the SECOND try, which wraps only
-        # `pin_run` — so the two faults the comment above names (migration
-        # collision, unwritable store) left `cswap pin` as a traceback while
-        # `cswap run` printed one line for the same cause. A traceback is the
-        # worst outcome for the command whose job is to work when the rest
-        # already does not. SystemExit still passes through untouched: it
-        # carries its own exit code and was raised by a guard that already
-        # printed.
+        # Render what the siblings render: the `except ClaudeSwitchError` that
+        # prints `Error: ...` wraps only `pin_run`, so the faults above left
+        # `cswap pin` as a traceback while `cswap run` printed one line for the
+        # same cause. SystemExit passes through untouched -- it carries its own
+        # exit code and was raised by a guard that already printed.
         if isinstance(exc, ClaudeSwitchError):
             error(f"Error: {exc}")
             sys.exit(1)
@@ -261,12 +242,9 @@ Examples:
     except Exception as e:  # noqa: BLE001
         # A broken package root is not a ClaudeSwitchError: `_impl` re-raises
         # the underlying ImportError so "installed but unusable" stays distinct
-        # from "not installed". Unrendered it reaches the user as a traceback,
-        # and this command has to stay usable when the pin does not.
-        #
-        # THROUGH `_safe`: the exception is built by an optional package and
-        # the proxy's own URL carries `user:secret@`, which would otherwise
-        # print verbatim (`_safe` yields `http://***@127.0.0.1:PORT/…`).
+        # from "not installed", and unrendered it reaches the user as a
+        # traceback. Through `_safe`, because the proxy's own URL carries
+        # userinfo and would otherwise print verbatim.
         from claude_swap.pin import _safe
 
         error(f"Error: the cloud pin is installed but not usable: {_safe(e)}")
@@ -401,10 +379,9 @@ Examples:
 def _is_refused_root(switcher: ClaudeAccountSwitcher) -> bool:
     """The state :func:`_guard_root` refuses, as a question rather than an act.
 
-    ONE RULE, TWO REACTIONS. `--ensure` also has to know about root, and its
-    contract is to say nothing — so it cannot call the guard, and re-deriving
-    "am I root outside a container" at its call site would be a second copy of
-    the rule that the next change to either one silently forks.
+    One rule, two reactions: `--ensure` also has to know about root and its
+    contract is to say nothing, so it cannot call the printing guard, and
+    re-deriving the rule at its call site would be a second copy of it.
     """
     if sys.platform == "win32":  # no euid; the guard does not apply
         return False
@@ -1089,15 +1066,13 @@ def _use_native_tls(quiet: bool = False) -> None:
     with its own bundled roots) is unaffected. ``truststore`` delegates to them.
 
     Best-effort: on any failure fall back to stdlib ``ssl`` rather than block
-    the CLI over a TLS-trust nicety — but SAY SO, because the fallback is not
-    trust-neutral. Measured on macOS 2026-08-17: the OS keychains carry 173
-    unique roots and stdlib loads 128, of which 67 are trusted by the OS and
-    not by stdlib. Four of those sit in /Library/Keychains/System.keychain,
-    where an administrator installs a corporate MITM CA. So a swallowed
-    failure here can withdraw the exact root the machine was configured with,
-    and the user is then told by ``ERROR_NOTES["tls-cert"]`` to trust the CA in
-    a store nothing is reading. One WARNING costs nothing on the healthy path,
-    which never reaches it.
+    the CLI over a TLS-trust nicety -- but SAY SO, because the fallback is not
+    trust-neutral. Measured on macOS, the OS keychains carry 173 unique roots
+    against stdlib's 128, and 67 are trusted by the OS and not by stdlib, four
+    of them in the system keychain where an administrator installs a corporate
+    MITM CA. A swallowed failure can withdraw the exact root the machine was
+    configured with, and ``ERROR_NOTES["tls-cert"]`` then sends the user to a
+    store nothing is reading.
     """
     try:
         import truststore
@@ -1124,19 +1099,12 @@ def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
     argv = sys.argv[1:]
-    # QUIET FOR THE INVOCATIONS THAT PROMISE SILENCE. This runs before the
-    # `pin` dispatch below, and its failure branch logs a multi-line WARNING
-    # with no handler configured — so `logging.lastResort` puts it on stderr.
-    # `pin --ensure` runs from an rc hook before EVERY hand-launched `claude`
-    # and its documented contract is "silent, never fails"; `--get_port` and
-    # `--get_certdir` print a bare value into `$(...)`. On a host where
-    # `truststore.inject_into_ssl()` cannot work — an unsupported platform, a
-    # stripped ssl module, a sandbox — that paragraph would print on every
-    # single shell launch.
-    #
-    # SUPPRESSED, NOT MOVED. Running it after the dispatch would leave the pin
-    # commands themselves on stdlib trust, and the warning exists because that
-    # difference is real.
+    # Quiet for the invocations that promise silence. The failure branch logs
+    # a WARNING with no handler configured, so `logging.lastResort` puts it on
+    # stderr -- and `pin --ensure` runs from an rc hook before EVERY
+    # hand-launched `claude` while `--get_port`/`--get_certdir` print a bare
+    # value into `$(...)`. Suppressed, not moved: running it after the dispatch
+    # would leave the pin commands themselves on stdlib trust.
     from claude_swap.appearance import pin_invocation_is_script_consumed
 
     _use_native_tls(quiet=pin_invocation_is_script_consumed(argv))
