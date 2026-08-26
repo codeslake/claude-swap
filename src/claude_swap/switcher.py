@@ -708,15 +708,28 @@ class ClaudeAccountSwitcher:
                     # died on an already-empty file leaves no partial to
                     # publish, which is the one case the pair cannot see and
                     # the one where there is nothing to see.
-                    if prior_mode is None or prior_mode == 0o600:
-                        return
+                    #
+                    # TWO OBLIGATIONS, NOT ONE. Emptying a partial is about the
+                    # CONTENT and applies on every platform; restoring the mode
+                    # is POSIX-only, and `prior_mode` is captured only there.
+                    # Gating both on it left Windows holding a truncated
+                    # credential -- measured in CI, `mode 0o666` with the
+                    # secret still in the file.
                     try:
                         st = os.stat(path)
                         touched = (before is not None
                                    and (st.st_size, st.st_mtime_ns) != before)
-                        if touched:
+                    except OSError:
+                        return  # `kept` still names the survivor
+                    if touched:
+                        try:
                             with open(path, "wb"):
                                 pass
+                        except OSError:
+                            pass
+                    if prior_mode is None or prior_mode == 0o600:
+                        return
+                    try:
                         os.chmod(path, prior_mode)
                     except OSError:
                         pass  # best effort; `kept` still names the survivor
