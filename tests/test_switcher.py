@@ -12264,12 +12264,12 @@ def test_a_non_ebusy_publish_failure_never_truncates_the_live_roster(
         fired["publish"] = True
         raise PermissionError(errno.EACCES, "Permission denied")
 
-    def recording_copy2(src, dst, *a, **kw):
+    def recording_copy(src, dst, *a, **kw):
         copies.append(str(dst))
         raise AssertionError("a non-EBUSY failure must not write through")
 
     monkeypatch.setattr(switcher_mod, "replace_with_retry", refused)
-    monkeypatch.setattr(switcher_mod.shutil, "copy2", recording_copy2)
+    monkeypatch.setattr(switcher_mod.shutil, "copy", recording_copy)
 
     with pytest.raises(OSError):
         switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
@@ -12315,6 +12315,46 @@ def test_a_destination_that_refuses_rename_is_written_through(
     if sys.platform != "win32":
         # The chmod-on-the-temp design exists because a 0644 ~/.claude.json
         # once published a key world-readable; the write-through must carry it.
+        assert oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_write_through_survives_a_mount_that_refuses_timestamps(
+    temp_home: Path, monkeypatch
+):
+    """The mounts that refuse `rename` are the ones that refuse `utime`.
+
+    Only the bytes and the mode are wanted here. `copy2` also copies
+    timestamps, and `copystat` does not guard that call: a bind mount that
+    rejects it fails the publish AFTER the content has landed, turning a
+    switch that worked into one the caller rolls back.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    fired = {"replace": False}
+
+    def busy(*_a, **_kw):
+        fired["replace"] = True
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def refused_utime(*_a, **_kw):
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(os, "utime", refused_utime)
+
+    switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    # Instrument guard: a publish that never went down the write-through
+    # branch would satisfy every assertion below for the wrong reason.
+    assert fired["replace"], "premise: the injected EBUSY was never reached"
+    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+    assert list(target.parent.glob("sequence.*.tmp")) == []
+    if sys.platform != "win32":
         assert oct(target.stat().st_mode & 0o777) == "0o600"
 
 
@@ -12376,12 +12416,12 @@ def test_a_failed_write_through_keeps_the_only_complete_copy(
     def busy(*_a, **_kw):
         raise OSError(errno.EBUSY, "Device or resource busy")
 
-    def truncating_copy2(src, dst, *a, **kw):
+    def truncating_copy(src, dst, *a, **kw):
         Path(dst).write_text('{"activeAcc', encoding="utf-8")
         raise OSError("injected: no space left on device")
 
     monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
-    monkeypatch.setattr(switcher_mod.shutil, "copy2", truncating_copy2)
+    monkeypatch.setattr(switcher_mod.shutil, "copy", truncating_copy)
 
     with pytest.raises(OSError):
         switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})

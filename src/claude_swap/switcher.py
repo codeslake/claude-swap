@@ -598,8 +598,10 @@ class ClaudeAccountSwitcher:
                 # (a container mounting ~/.claude.json). Not atomic, so the
                 # temp is disowned first and reclaimed only once the copy
                 # lands: a failure part-way must leave the complete content.
+                # `copy`, not `copy2`: `copystat`'s unguarded `utime` is
+                # refused by the same mounts that refuse the rename.
                 source, temp_path = temp_path, None
-                shutil.copy2(source, path)
+                shutil.copy(source, path)
                 temp_path = source
         finally:
             # Every path where the name is still ours, including the Ctrl-C
@@ -1294,7 +1296,8 @@ class ClaudeAccountSwitcher:
         """
         for path in staging.values():
             try:
-                path.unlink()
+                # missing_ok: a claim the create never reached holds nothing.
+                path.unlink(missing_ok=True)
             except OSError as e:
                 self._logger.error(f"Could not remove swap staging copy: {e}")
                 warning(
@@ -1338,10 +1341,19 @@ class ClaudeAccountSwitcher:
                             f"accounts still work (`cswap list`), then delete "
                             f"the file and retry."
                         )
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    # Recorded before the write, so an interrupt in between
-                    # cannot strand a file the discard does not know about.
-                    staged[f"{kind}-{num}"] = path
+                    # Claimed BEFORE the create, which is the earliest
+                    # boundary the file can exist at: a signal arriving inside
+                    # `os.open` raises the instant it returns, so anything
+                    # recorded after the call can miss a file that exists.
+                    key = f"{kind}-{num}"
+                    staged[key] = path
+                    try:
+                        fd = os.open(
+                            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                        )
+                    except FileExistsError:
+                        del staged[key]  # lost the race; not ours to remove
+                        raise
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(content)
         except ConfigError:

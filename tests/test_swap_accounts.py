@@ -1,5 +1,6 @@
 """Tests for `cswap swap` (ClaudeAccountSwitcher.swap_accounts)."""
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -409,6 +410,102 @@ class TestSwapAccounts:
         # And the abort left both slots exactly as they were.
         assert switcher._read_account_credentials("1", email) == "creds-one"
         assert switcher._read_account_credentials("2", email) == "creds-two"
+
+    def test_swap_staging_interrupted_at_the_create_is_discarded_not_stranded(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+    ):
+        """The earliest boundary the file can exist at is ``os.open``'s return.
+
+        A signal arriving inside the create syscall raises at the next
+        bytecode, which is before anything recorded after the call. The file
+        exists, the discard does not know it, and the next same-email swap
+        refuses behind "may be the only surviving copy" -- pointing at a
+        copy this path abandoned.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-one")
+        switcher._write_account_credentials("2", email, "creds-two")
+
+        real_open = os.open
+        created: list[str] = []
+
+        def open_then_interrupt(path, *args, **kwargs):
+            fd = real_open(path, *args, **kwargs)
+            if ".swap-staging-" in str(path):
+                created.append(str(path))
+                os.close(fd)
+                raise KeyboardInterrupt
+            return fd
+
+        monkeypatch.setattr(os, "open", open_then_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            switcher.swap_accounts("1", "2")
+
+        strays = list(switcher.credentials_dir.glob(".swap-staging-*"))
+        assert created, "premise: no staging file was ever created"
+        assert strays == [], f"left behind {[s.name for s in strays]}"
+        assert switcher._read_account_credentials("1", email) == "creds-one"
+        assert switcher._read_account_credentials("2", email) == "creds-two"
+
+    def test_a_staging_name_claimed_but_never_created_raises_no_alarm(
+        self, temp_home: Path, caplog
+    ):
+        """A path the create never reached holds no credential to leak.
+
+        The discard warns the user to delete a survivor by hand; saying that
+        about a file that does not exist sends them after nothing.
+        """
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        absent = switcher.credentials_dir / ".swap-staging-creds-1.json"
+
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            switcher._discard_staging({"creds-1": absent})
+
+        assert not absent.exists(), "premise: the path must not exist"
+        assert caplog.records == [], (
+            f"alarmed about a file that was never created: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_a_staging_file_this_call_did_not_create_is_never_removed(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+    ):
+        """Losing the create race means the file belongs to someone else.
+
+        A leftover staging file may be the only surviving copy of that
+        slot's credential, which is why the swap refuses instead of writing
+        over it. Claiming the name before the create must not turn that
+        refusal into a deletion.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-one")
+        switcher._write_account_credentials("2", email, "creds-two")
+
+        real_open = os.open
+        theirs = "someone else's pre-swap credential"
+
+        def create_then_refuse(path, *args, **kwargs):
+            # Models the window between the existence check and the create:
+            # the file appears, so O_EXCL refuses it.
+            if ".swap-staging-" in str(path):
+                Path(path).write_text(theirs, encoding="utf-8")
+                raise FileExistsError("File exists")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", create_then_refuse)
+
+        with pytest.raises(ConfigError, match="nothing was changed"):
+            switcher.swap_accounts("1", "2")
+
+        survivors = list(switcher.credentials_dir.glob(".swap-staging-*"))
+        assert len(survivors) == 1, "premise: the race never produced a file"
+        assert survivors[0].read_text(encoding="utf-8") == theirs
 
     def test_swap_failed_required_clear_aborts_commit(
         self, temp_home: Path, sample_sequence_data_with_org: dict
