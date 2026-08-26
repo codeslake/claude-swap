@@ -1160,9 +1160,9 @@ class ClaudeAccountSwitcher:
                 {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
             )
 
-        # Move each session profile to its owner's new slot key. `moved` is a
-        # sink, not a return: a rollback must read it even when the move raised.
+        # Move each session profile to its owner's new slot key.
         moved: list[Path] = []
+        wrote_backups = False
         try:
             self._swap_session_dirs(num_a, email_a, num_b, email_b, moved)
 
@@ -1173,6 +1173,11 @@ class ClaudeAccountSwitcher:
             # separate old-key cleanup runs) or a stale file leaked by an
             # earlier crash. The old keys are cleared only after the commit
             # below, so the records never point at missing material.
+            #
+            # Armed one statement early on purpose: an abort in the gap costs
+            # one needless restore, while arming it after the first write
+            # would let an abort skip a restore that was owed.
+            wrote_backups = True
             if creds_a:
                 self._write_account_credentials(num_b, email_a, creds_a)
             else:
@@ -1212,7 +1217,7 @@ class ClaudeAccountSwitcher:
             self._rollback_swap(
                 num_a, email_a, creds_a, config_a,
                 num_b, email_b, creds_b, config_b,
-                staging, moved,
+                staging, moved, wrote_backups,
             )
             raise
 
@@ -1334,13 +1339,13 @@ class ClaudeAccountSwitcher:
         profile from the relocated backups, so a skipped move costs at most
         that slot's session history.
 
-        Appends to ``moved`` in a ``finally``, because an abort can arrive on
-        either side of a rename and the rename and its record are two
-        statements. ``exists()`` after an atomic rename is exactly "it
-        landed", and each guard above proved the destination free, so a
-        failed rename records nothing. Neither call can raise, so the
-        original exception is never masked. A same-email caller needs that
-        precision: for it, reversing a move that never ran IS a swap.
+        Appends to ``moved`` from a ``finally``: the rename and its record are
+        two statements and a signal lands between them. ``os.path.exists``
+        after an atomic rename is exactly "it landed", and the guards proved
+        each destination free, so a failed rename records nothing. It is
+        ``os.path`` and not ``Path.exists`` because the latter re-raises
+        EACCES/EIO/ESTALE before 3.14, and a raise here would replace the
+        exception being unwound with one this helper then swallows.
         """
         dir_a = self._session_dir(num_a, email_a)
         dir_b = self._session_dir(num_b, email_b)
@@ -1356,14 +1361,13 @@ class ClaudeAccountSwitcher:
                 try:
                     os.replace(dir_b, new_b)
                 finally:
-                    if new_b.exists():
+                    if os.path.exists(new_b):
                         moved.append(new_b)
             if staging is not None and not new_a.exists():
                 try:
                     os.replace(staging, new_a)
                 finally:
-                    if new_a.exists():
-                        staging = None
+                    if os.path.exists(new_a):
                         moved.append(new_a)
         except OSError as e:
             self._logger.warning(f"Session profile move skipped during swap: {e}")
@@ -1388,6 +1392,7 @@ class ClaudeAccountSwitcher:
         config_b: str,
         staging: dict[str, "Path"],
         moved: list[Path],
+        wrote_backups: bool,
     ) -> None:
         """Best-effort restore of both slots after a failed swap mutation.
 
@@ -1404,20 +1409,24 @@ class ClaudeAccountSwitcher:
             f"Swap {num_a} <-> {num_b} failed mid-write; restoring both slots"
         )
         failures = 0
-        # Undo the session-profile exchange (same staging trick, reversed).
         # Unlike the credential steps below, this is not a no-op when its
         # forward half never ran: with one email the two slots' keys are each
         # other's destinations, so it would exchange two untouched profiles.
         if moved:
-            self._logger.error(f"Reversing {len(moved)} session-profile move(s)")
+            self._logger.error("Reversing the session-profile exchange")
             self._swap_session_dirs(num_b, email_a, num_a, email_b, [])
         overlap = email_a == email_b
-        for kind, num, email, original in (
+        # Restoring a key that was never written is not a no-op: rewriting it
+        # with the value already under it still drops that slot's session
+        # credentials, so an abort that changed nothing would cost both
+        # profiles their credential material.
+        restores = (
             ("creds", num_a, email_a, creds_a),
             ("config", num_a, email_a, config_a),
             ("creds", num_b, email_b, creds_b),
             ("config", num_b, email_b, config_b),
-        ):
+        ) if wrote_backups else ()
+        for kind, num, email, original in restores:
             try:
                 if original:
                     if kind == "creds":
@@ -1439,7 +1448,7 @@ class ClaudeAccountSwitcher:
                 self._logger.error(
                     f"Rollback {kind} restore failed for slot {num}: {e}"
                 )
-        if email_a != email_b:
+        if wrote_backups and email_a != email_b:
             # Drop half-written copies under the new keys; the records still
             # point at the old slots. (When the emails match, the "new" keys
             # are the keys just restored — nothing stale exists.)
@@ -1450,7 +1459,7 @@ class ClaudeAccountSwitcher:
                 except Exception as e:
                     failures += 1
                     self._logger.error(f"Rollback cleanup failed for slot {num}: {e}")
-        if not failures:
+        if wrote_backups and not failures:
             # The restore writes above pushed the half-written material into
             # the keys' retained .prev generations; both keys now hold their
             # exact originals, so those generations are pure contamination.

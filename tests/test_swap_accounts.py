@@ -206,13 +206,13 @@ class TestSwapAccounts:
         assert data["accounts"]["1"]["organizationUuid"] == "org-uuid-5678"
         assert data["activeAccountNumber"] == 1
 
-    def _same_email_slots(self, switcher, data) -> str:
-        """Two slots sharing one email, each with a marked session profile."""
+    def _same_email_slots(self, switcher, data, profiles=("1", "2")) -> str:
+        """Two slots sharing one email; each named slot gets a marked profile."""
         self._write(switcher, data)
         email = "user@example.com"
         switcher._write_account_credentials("1", email, "creds-org")
         switcher._write_account_credentials("2", email, "creds-personal")
-        for num in ("1", "2"):
+        for num in profiles:
             profile = switcher._session_dir(num, email)
             profile.mkdir(parents=True, exist_ok=True)
             (profile / "marker").write_text(f"SLOT-{num}-HISTORY")
@@ -373,6 +373,8 @@ class TestSwapAccounts:
         """
         switcher = ClaudeAccountSwitcher()
         email = self._same_email_slots(switcher, sample_sequence_data_with_org)
+        for num in ("1", "2"):
+            (switcher._session_dir(num, email) / ".credentials.json").write_text("{}")
 
         real_replace = os.replace
         tripped: list[str] = []
@@ -391,6 +393,46 @@ class TestSwapAccounts:
         assert tripped, "the injected interrupt never fired"
         assert self._marker(switcher, "1", email) == "SLOT-1-HISTORY"
         assert self._marker(switcher, "2", email) == "SLOT-2-HISTORY"
+        alive = {
+            num: (switcher._session_dir(num, email) / ".credentials.json").exists()
+            for num in ("1", "2")
+        }
+        assert alive == {"1": True, "2": True}, f"session creds destroyed: {alive}"
+
+    def test_swap_records_the_move_when_only_one_slot_has_a_profile(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The last rename needs its own record, and only this shape shows it.
+
+        With a profile in both slots the earlier rename already fills the sink,
+        so losing the record of the last one is invisible. With one profile it
+        is the only rename there is.
+        """
+        switcher = ClaudeAccountSwitcher()
+        email = self._same_email_slots(
+            switcher, sample_sequence_data_with_org, profiles=("1",)
+        )
+
+        real_replace = os.replace
+        landed: list[str] = []
+
+        def interrupt_just_past_the_last_park(src, dst):
+            # One shot: the rollback's own reverse must run for real.
+            real_replace(src, dst)
+            if not landed and str(src).endswith(".swapping"):
+                landed.append(str(dst))
+                raise KeyboardInterrupt
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "replace", interrupt_just_past_the_last_park)
+            with pytest.raises(KeyboardInterrupt):
+                switcher.swap_accounts("1", "2")
+
+        assert landed, "the injected interrupt never fired"
+        slot_1 = switcher._session_dir("1", email) / "marker"
+        assert slot_1.exists(), "account 1's profile was left under slot 2's key"
+        assert slot_1.read_text() == "SLOT-1-HISTORY"
+        assert not (switcher._session_dir("2", email) / "marker").exists()
 
     def test_swap_of_two_emails_still_reverses_the_move_on_failure(
         self, temp_home: Path, sample_sequence_data: dict
