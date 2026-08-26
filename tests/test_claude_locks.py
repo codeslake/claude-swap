@@ -30,6 +30,28 @@ class TestProperLockfile:
             assert lock_dir.is_dir()
         assert not lock_dir.exists()
 
+    def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
+        """A stolen-and-recreated lock belongs to its new holder.
+
+        The exit path removed whatever sat at the path, so for the rest of the
+        new holder's critical section there was no lock on disk and any third
+        waiter could take it uncontested. The replacement here is stamped with
+        an mtime no live holder would ever set, so what disappears is
+        identifiably theirs rather than ours.
+
+        The control is test_acquire_creates_and_release_removes above: a
+        release that quietly stopped removing anything would fail it.
+        """
+        stolen_mtime = 1_000_000.0
+        with proper_lockfile(lock_dir):
+            # Deemed stale, removed, and re-created by somebody else.
+            os.rmdir(lock_dir)
+            os.mkdir(lock_dir)
+            os.utime(lock_dir, (stolen_mtime, stolen_mtime))
+
+        assert lock_dir.is_dir()
+        assert os.stat(lock_dir).st_mtime == stolen_mtime
+
     def test_reacquire_after_release(self, lock_dir):
         with proper_lockfile(lock_dir):
             pass
