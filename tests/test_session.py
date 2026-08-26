@@ -411,6 +411,10 @@ class TestBootstrap:
             # ERROR_NOTES has prose for this one, and the raw kind would
             # report a failure where nothing failed.
             ("consume-busy", "another cswap surface holds the slot"),
+            # The opposite direction: this one IS fatal, and the line ends
+            # "continuing with the stored credentials", so a bare kind reads
+            # as reassurance.
+            ("invalid_grant", "refresh lineage is dead"),
         ],
     )
     def test_the_refresh_failure_warning_outlives_the_terminal(

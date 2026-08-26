@@ -546,13 +546,12 @@ class SessionManager:
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
+            warning(msg)
             # run() sets this to a session profile, so a nested launch takes
             # this branch every time. Only a value we did not write says the
             # user's intent was overruled, and only that is worth keeping.
-            if Path(config_dir_preset).parent == self.sessions_dir:
-                warning(msg)
-            else:
-                self._warn(msg)
+            if Path(config_dir_preset).parent != self.sessions_dir:
+                self._logger.warning(msg)
         else:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —

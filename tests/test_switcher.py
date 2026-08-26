@@ -8650,6 +8650,30 @@ class TestDisableEnableAccount:
 
         assert "nothing to pick" not in capsys.readouterr().out
 
+    def test_the_empty_rotation_verdict_reads_each_slot_once(
+        self, temp_home, capsys
+    ):
+        """The gate and the advice need the same per-slot read.
+
+        Taking it twice doubles a keychain subprocess per miss, and every
+        failed read logs a warning — so the branch whose advice is "a store
+        may be locked" would write each such failure into the log twice.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        calls = []
+        real = s._account_is_switchable
+        with patch.object(
+            s, "_account_is_switchable",
+            side_effect=lambda n: (calls.append(n), real(n))[1],
+        ):
+            s.set_account_disabled("1", True)   # rotation still has slot 2
+            s.set_account_disabled("2", True)   # empties it: advice branch
+
+        assert len(calls) == 4, calls
+
     def test_disable_warns_about_credentials_when_no_slot_is_readable(
         self, temp_home, capsys
     ):

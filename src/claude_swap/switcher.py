@@ -1822,16 +1822,19 @@ class ClaudeAccountSwitcher:
             and not self._disabled_from_data(data, str(num))
         ]
 
-    def _empty_rotation_advice(self, data: dict) -> str:
+    def _empty_rotation_advice(self, any_readable: bool) -> str:
         """Why nothing is selectable, and the remedy that matches the cause.
 
-        `_account_is_switchable` cannot tell an absent backup from one it
-        failed to read, so that arm must not lead with a re-add — it would
-        overwrite a credential the user simply cannot see right now.
+        Takes the verdict rather than re-deriving it: the caller has already
+        read every slot to reach this branch, and on a locked store each of
+        those reads is a subprocess and a logged warning.
+
+        `_account_is_switchable` discards the absent-vs-unreadable verdict
+        that `_read_account_credentials_ex` carries, so the second arm must
+        not lead with a re-add — it would overwrite a credential the user
+        simply cannot see right now.
         """
-        if any(
-            self._account_is_switchable(str(n)) for n in data.get("sequence", [])
-        ):
+        if any_readable:
             return (
                 "No accounts remain in rotation — auto-switch and bare switch "
                 "have nothing to pick. Re-enable one with "
@@ -1912,8 +1915,14 @@ class ClaudeAccountSwitcher:
                     "  It is the active account — it stays live until you switch "
                     "away; it just won't be an automatic switch target."
                 ))
-            if not self.switchable_account_numbers():
-                warning("  " + self._empty_rotation_advice(data))
+            # One pass serves both: the gate is "every readable slot is
+            # disabled", which is vacuously true when none is readable.
+            readable = [
+                n for n in map(str, data.get("sequence", []))
+                if self._account_is_switchable(n)
+            ]
+            if all(self._disabled_from_data(data, n) for n in readable):
+                warning("  " + self._empty_rotation_advice(bool(readable)))
         else:
             print(dimmed("  It is back in the rotation."))
 
@@ -5742,7 +5751,10 @@ class ClaudeAccountSwitcher:
                     None,
                 )
                 if not fallback:
-                    raise ConfigError(self._empty_rotation_advice(data))
+                    raise ConfigError(self._empty_rotation_advice(
+                        any(self._account_is_switchable(str(num))
+                            for num in sequence)
+                    ))
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
             return (

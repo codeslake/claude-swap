@@ -75,6 +75,10 @@ ERROR_NOTES = {
         "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
         "normal shell"
     ),
+    "invalid_grant": (
+        "this slot's refresh lineage is dead — log in as this account "
+        "again, then re-add the slot"
+    ),
     "invalid_client": (
         "cswap's OAuth client was rejected — systemic, not this account"
     ),
