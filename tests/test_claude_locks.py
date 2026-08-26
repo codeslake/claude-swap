@@ -441,13 +441,20 @@ class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     def test_the_rmdir_branch_clamps_to_what_is_left(
         self, lock_dir, monkeypatch
     ):
-        """Same weakening, the other clamp, read off the sleep ARGUMENTS.
+        """Same weakening, the other clamp, measured per sleep.
 
-        A 0.05s flat sleep against a 0.175s budget overshoots by at most
-        0.05s, which wall-clock cannot separate from scheduling noise. What it
-        cannot hide is the shape: the correct clamp's LAST sleep is the
-        remainder and is therefore shorter than 0.05, while the weakened form
-        sleeps exactly 0.05 every time.
+        EACH SLEEP AGAINST THE BUDGET LEFT AT THAT MOMENT, never `min(slept)`.
+        The shape of the last sleep depends on when the loop happens to arrive:
+        with ~8-12ms of per-iteration latency the arrivals step straight over
+        the window where a remainder is drawn, every sleep is a full 0.05, and
+        the case fails on CORRECT code. Measured on pristine source with only
+        `time.sleep` returning late: 0ms passes, 10ms and 50ms both fail. This
+        box has 48 cores and never showed it; CI is `-n auto` on 2-4, where
+        that latency is ordinary.
+
+        The clamp's actual contract has no such dependency -- no sleep may
+        exceed what is left when it starts -- and `tests/test_locking.py`
+        already asserts its sibling that way.
         """
         lock_dir.mkdir()
         past = time.time() - claude_locks.CONFIG_STALENESS_S - 30
@@ -464,24 +471,34 @@ class TestTheClampsSurviveWeakeningNotOnlyDeletion:
 
         # Scoped to this thread: `claude_locks.time` IS the `time` module, so
         # an unscoped patch records every other thread's sleeps too.
-        slept: list[float] = []
+        budget = 0.175
+        over: list[tuple[float, float]] = []
+        n = 0
         real_sleep = claude_locks.time.sleep
         mine = threading.get_ident()
+        start = time.monotonic()
 
         def recording(seconds):
+            nonlocal n
             if threading.get_ident() != mine:
                 return real_sleep(seconds)
-            slept.append(seconds)
+            n += 1
+            left = budget - (time.monotonic() - start)
+            # A tick of slack: the clamp reads the clock a few instructions
+            # before we do, so an exactly-clamped sleep can measure marginally
+            # over. The defect it separates is a FLAT 0.05 against a remainder
+            # near zero, which is nowhere near this tolerance.
+            if seconds > max(left, 0.0) + 0.005:
+                over.append((seconds, left))
             return real_sleep(seconds)
 
         monkeypatch.setattr(claude_locks.time, "sleep", recording)
         with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.175):
+            with proper_lockfile(lock_dir, timeout=budget):
                 pass
-        assert len(slept) >= 2, (
-            f"only {len(slept)} sleep(s) happened — the instrument, not the code"
-        )
-        assert min(slept) < 0.05, (
-            f"every sleep was a full {max(slept):.3f}s — the last one must be "
-            "the remainder of the budget, not the flat interval"
+        assert n >= 2, f"only {n} sleep(s) happened — the instrument, not the code"
+        assert not over, (
+            f"{len(over)} sleep(s) ran past the deadline; worst slept "
+            f"{max(o for o, _ in over):.3f}s with {min(l for _, l in over):.3f}s "
+            "left — the clamp used `timeout`, not what remains of it"
         )

@@ -253,3 +253,65 @@ class TestFileLockConcurrency:
 
         assert result is True
         lock.release()
+
+
+class TestTheClampSurvivesWeakeningNotOnlyDeletion:
+    """`min(sleep, timeout)` is a no-op once most of the budget is spent.
+
+    The case above uses a budget SMALLER than the flat sleep (0.01 vs 0.1),
+    where `min(0.1, timeout)` and `min(0.1, remaining)` are the same number.
+    Measured: weakening this clamp to the whole timeout leaves the two lock
+    suites at 38 passed, while DELETING it is caught — so the file
+    discriminates against deletion and is blind to weakening. That is the
+    identical hole `test_claude_locks.py` grew a class to close, left open on
+    the other file the same change touched.
+
+    Per sleep against the budget left at that moment, never a wall-clock total
+    or the shape of the last draw: both depend on when the loop happens to
+    arrive, and on a saturated CI core they report a correct clamp as broken.
+    """
+
+    def test_no_retry_sleep_outlives_the_budget_it_was_given(self, tmp_path):
+        target = tmp_path / "held.json"
+        holder = FileLock(target, timeout=5)
+        assert holder.acquire(), "premise: the lock must be held to contend"
+        try:
+            # NOT A MULTIPLE OF THE FLAT SLEEP. With 0.5 the weakened form
+            # divides evenly, every sleep lands exactly on the remainder, and
+            # the mutant survives -- measured, it did. 0.45 leaves 0.05 when
+            # the last 0.1 starts, which is the overshoot.
+            budget = 0.45
+            over: list[tuple[float, float]] = []
+            n = 0
+            real_sleep = locking.time.sleep
+            mine = threading.get_ident()
+            start = time.monotonic()
+
+            def recording(seconds):
+                nonlocal n
+                if threading.get_ident() != mine:
+                    return real_sleep(seconds)
+                n += 1
+                left = budget - (time.monotonic() - start)
+                # A tick of slack: the clamp reads the clock a few
+                # instructions before we do. The defect this separates is a
+                # FLAT 0.1 against a remainder near zero.
+                if seconds > max(left, 0.0) + 0.005:
+                    over.append((seconds, left))
+                return real_sleep(seconds)
+
+            locking.time.sleep = recording
+            try:
+                waiter = FileLock(target, timeout=budget)
+                assert not waiter.acquire(), "the held lock was handed over"
+            finally:
+                locking.time.sleep = real_sleep
+            assert n >= 2, f"only {n} sleep(s) — the instrument, not the code"
+            assert not over, (
+                f"{len(over)} sleep(s) ran past the deadline; worst slept "
+                f"{max(o for o, _ in over):.3f}s with "
+                f"{min(l for _, l in over):.3f}s left — the clamp used "
+                "`timeout`, not what remains of it"
+            )
+        finally:
+            holder.release()
