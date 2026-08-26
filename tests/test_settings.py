@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap import settings as settings_mod
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -381,3 +382,44 @@ class TestTheWrittenFileIsAWellFormedTextFile:
         p = tmp_path / "settings.json"
         atomic_write_json(p, {"a": 1, "nested": {"b": [1, 2]}})
         assert json.loads(p.read_text()) == {"a": 1, "nested": {"b": [1, 2]}}
+
+
+class TestAPublishedFileIsNotUnlinkedByItsOwnCleanup:
+    """Every sibling writer in this change got this guard; the shared one
+    did not, and it is the writer with a statement AFTER the publish."""
+
+    def test_the_cleanup_does_not_take_a_name_the_publish_handed_over(
+        self, tmp_path, monkeypatch
+    ):
+        """``mkstemp`` can draw a freed name back the moment the rename frees
+        it, so whatever stands there after the publish belongs to whoever
+        created it next — and the ``chmod`` that follows can still fail."""
+        p = tmp_path / "settings.json"
+        drawn: list[str] = []
+        real_mkstemp = settings_mod.tempfile.mkstemp
+        real_chmod = settings_mod.os.chmod
+
+        def recording_mkstemp(*a, **kw):
+            fd, name = real_mkstemp(*a, **kw)
+            drawn.append(name)
+            return fd, name
+
+        def chmod_that_fails_on_the_published_file(path, mode, *a, **kw):
+            if str(path) == str(p):
+                # the freed temp name has already been drawn back by someone
+                Path(drawn[-1]).write_text("not ours", encoding="utf-8")
+                raise OSError("injected: chmod refused")
+            return real_chmod(path, mode, *a, **kw)
+
+        monkeypatch.setattr(settings_mod.tempfile, "mkstemp", recording_mkstemp)
+        monkeypatch.setattr(
+            settings_mod.os, "chmod", chmod_that_fails_on_the_published_file
+        )
+
+        with pytest.raises(OSError, match="chmod refused"):
+            atomic_write_json(p, {"a": 1})
+
+        # Instrument guard: no temp name drawn means the assertion below is
+        # about a file this test created and nothing ever reached.
+        assert drawn, "premise: no temp name was ever drawn"
+        assert Path(drawn[-1]).read_text(encoding="utf-8") == "not ours"
