@@ -1148,23 +1148,22 @@ class ClaudeAccountSwitcher:
         config_b = self._read_account_config(num_b, email_b)
 
         staging: dict[str, Path] = {}
-        swapped_dirs = False
-        try:
-            if email_a == email_b:
-                # Same email: the two slots' backup keys fully overlap, so
-                # every write below overwrites the other account's material.
-                # Park durable copies first — a failure mid-write can then
-                # never leave a credential existing only in this process's
-                # memory. (Staging fails -> abort before anything changed.)
-                staging = self._stage_overlap_material(
-                    {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
-                )
+        if email_a == email_b:
+            # Same email: the two slots' backup keys fully overlap, so every
+            # write below overwrites the other account's material. Park
+            # durable copies first — a failure mid-write can then never leave
+            # a credential existing only in this process's memory. Outside the
+            # try: it can fail with nothing mutated, and the rollback restores
+            # by rewriting both slots, invalidating two live session profiles.
+            staging = self._stage_overlap_material(
+                {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
+            )
 
-            # Move each session profile to its owner's new slot key. When both
-            # accounts share an email the two paths swap directly, so stage the
-            # first through a temporary name.
-            self._swap_session_dirs(num_a, email_a, num_b, email_b)
-            swapped_dirs = True
+        # Move each session profile to its owner's new slot key. `moved` is a
+        # sink, not a return: a rollback must read it even when the move raised.
+        moved: list[Path] = []
+        try:
+            self._swap_session_dirs(num_a, email_a, num_b, email_b, moved)
 
             # Set each destination key to its owner's exact state: write
             # material that exists, actively clear what doesn't. An empty
@@ -1212,7 +1211,7 @@ class ClaudeAccountSwitcher:
             self._rollback_swap(
                 num_a, email_a, creds_a, config_a,
                 num_b, email_b, creds_b, config_b,
-                staging, swapped_dirs,
+                staging, bool(moved),
             )
             raise
 
@@ -1324,7 +1323,7 @@ class ClaudeAccountSwitcher:
         return staged
 
     def _swap_session_dirs(
-        self, num_a: str, email_a: str, num_b: str, email_b: str
+        self, num_a: str, email_a: str, num_b: str, email_b: str, moved: list[Path]
     ) -> None:
         """Exchange two slots' session profile directories, best effort.
 
@@ -1333,6 +1332,11 @@ class ClaudeAccountSwitcher:
         session profiles too), and setup_session re-bootstraps a missing
         profile from the relocated backups, so a skipped move costs at most
         that slot's session history.
+
+        Appends each directory to ``moved`` as it lands under its new key —
+        as it lands, because an abort can arrive on either side of any rename
+        here. A same-email caller needs that: for it, reversing a move that
+        never ran IS the swap it was told did not happen.
         """
         dir_a = self._session_dir(num_a, email_a)
         dir_b = self._session_dir(num_b, email_b)
@@ -1346,9 +1350,11 @@ class ClaudeAccountSwitcher:
                 os.replace(dir_a, staging)
             if dir_b.exists() and not new_b.exists():
                 os.replace(dir_b, new_b)
+                moved.append(new_b)
             if staging is not None and not new_a.exists():
                 os.replace(staging, new_a)
                 staging = None
+                moved.append(new_a)
         except OSError as e:
             self._logger.warning(f"Session profile move skipped during swap: {e}")
         finally:
@@ -1388,14 +1394,11 @@ class ClaudeAccountSwitcher:
             f"Swap {num_a} <-> {num_b} failed mid-write; restoring both slots"
         )
         failures = 0
-        # Undo the session-profile exchange (same staging trick, reversed) —
-        # but ONLY if the forward move ran. Staging happens before it, so an
-        # abort there reaches here with nothing swapped, and an unconditional
-        # reverse would exchange two profiles nobody touched while the error
-        # says nothing was changed. The credential and roster steps below are
-        # already no-ops when their forward halves did not run; this one is not.
+        # Undo the session-profile exchange (same staging trick, reversed).
+        # Unlike the credential steps below, this one is not a no-op when its
+        # forward half never ran: it would exchange two untouched profiles.
         if swapped_dirs:
-            self._swap_session_dirs(num_b, email_a, num_a, email_b)
+            self._swap_session_dirs(num_b, email_a, num_a, email_b, [])
         overlap = email_a == email_b
         for kind, num, email, original in (
             ("creds", num_a, email_a, creds_a),
