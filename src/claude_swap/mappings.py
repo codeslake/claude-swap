@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 from claude_swap.fsutil import replace_with_retry
@@ -118,24 +117,32 @@ class MappingStore:
         return best
 
     def _write(self, mappings: dict[str, dict]) -> None:
-        """Atomically write the mappings file (tempfile + os.replace)."""
+        """Atomically write the mappings file (temp + os.replace)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if sys.platform != "win32":
             os.chmod(self.path.parent, 0o700)
         payload = json.dumps(
             {"schemaVersion": SCHEMA_VERSION, "mappings": mappings}, indent=2
         )
-        fd, tmp = tempfile.mkstemp(
-            dir=str(self.path.parent), prefix=".mappings-", suffix=".tmp"
-        )
+        # THE NAME BEFORE THE FILE, and the fd tracked across the handover to
+        # `fdopen`: `mkstemp` mints the name inside the syscall, so an
+        # interrupt there strands a temp nothing can name, and an interrupt
+        # between the create and `fdopen` leaks the descriptor -- on Windows
+        # that held handle is what makes the cleanup unlink fail.
+        tmp = str(self.path.parent / f".mappings-{os.getpid()}.tmp")
+        fd = -1
         try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             if sys.platform != "win32":
                 os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            owned, fd = fd, -1
+            with os.fdopen(owned, "w", encoding="utf-8") as f:
                 f.write(payload)
             replace_with_retry(tmp, self.path)
         except BaseException:
             # Not just OSError: a Ctrl-C anywhere here strands the temp.
+            if fd >= 0:
+                os.close(fd)
             try:
                 os.unlink(tmp)
             except OSError:

@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -470,8 +469,13 @@ def atomic_write_json(path: Path, data: dict) -> None:
     if sys.platform != "win32":
         # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+    # THE NAME BEFORE THE FILE. `mkstemp` picks the name internally and opens
+    # the file before it returns, so an interrupt in that window strands a temp
+    # nothing can name. `O_EXCL` keeps the collision safety mkstemp gave.
+    tmp_path = str(target.parent / f".{target.name}.{os.getpid()}.tmp")
+    fd = -1
     try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         if sys.platform != "win32":
             # On the fd, BEFORE the publish. Not for secrecy: `mkstemp`

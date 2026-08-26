@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import threading
 import sys
 import time
@@ -552,10 +553,28 @@ class ClaudeAccountSwitcher:
             finally:
                 os.close(fd)
             shutil.copyfile(path, salvage)
-        except OSError as e:
+        except BaseException as e:
+            # A PARTIAL COPY IS WORSE THAN NO COPY. The name is a promise the
+            # bytes survived, and a restore from a truncated one loses whatever
+            # the copy never reached -- silently, which is the loss this guard
+            # exists to prevent. `O_EXCL` above proved the name was ours, so
+            # nothing but our own partial write is removed here. BaseException
+            # because `except OSError` left the truncated file on every Ctrl-C.
+            left = ""
+            try:
+                salvage.unlink()
+            except OSError:
+                left = (f"; a PARTIAL copy is at {salvage.name} and is NOT a "
+                        f"usable backup")
+            if not isinstance(e, OSError):
+                if left:
+                    self._logger.warning(f"{path}{left}")
+                    if emit_output:
+                        warning(f"{path.name}{left}")
+                raise
             raise SwitchError(
                 f"{path} could not be parsed and the salvage copy failed "
-                f"({e}); aborting rather than destroying it"
+                f"({e}); aborting rather than destroying it{left}"
             )
         msg = (
             f"{path.name} could not be parsed — a copy was kept at "
@@ -620,7 +639,17 @@ class ClaudeAccountSwitcher:
                 # `copy`/`copy2` cannot carry the mode instead: `copystat`'s
                 # `utime` fires after the bytes land, and a mount that refuses
                 # the rename can refuse that too.
+                # CAPTURED, so the narrowing below can be undone. It is a
+                # committed side effect otherwise: a copy that fails leaves the
+                # destination at 0600 with nothing recording what it was, and
+                # on a bind-mounted config at 0644 the other uid that reads it
+                # gets EACCES for ever with only the copy error to go on.
+                prior_mode = None
                 if sys.platform != "win32":
+                    try:
+                        prior_mode = stat.S_IMODE(os.stat(path).st_mode)
+                    except OSError:
+                        prior_mode = None
                     try:
                         os.chmod(path, 0o600)
                     except OSError as mode_err:
@@ -638,11 +667,28 @@ class ClaudeAccountSwitcher:
                     f"{path.name} may now be truncated; the complete content "
                     f"was kept at {source.name}"
                 )
+                def _unnarrow():
+                    # `copyfile` opens 'wb', so by here the destination is
+                    # already truncated and holds no original content. Empty it
+                    # outright before widening: an empty file at the old mode
+                    # leaks nothing, and the complete content is at `source`,
+                    # which `kept` names.
+                    if prior_mode is None or prior_mode == 0o600:
+                        return
+                    try:
+                        with open(path, "wb"):
+                            pass
+                        os.chmod(path, prior_mode)
+                    except OSError:
+                        pass  # best effort; `kept` still names the survivor
+
                 try:
                     shutil.copyfile(source, path)
                 except OSError as copy_err:
+                    _unnarrow()
                     raise ConfigError(f"{kept} ({copy_err})") from copy_err
                 except BaseException:
+                    _unnarrow()
                     # An interrupt has to stay an interrupt, so the message
                     # cannot ride it out. stderr, never stdout: that is the
                     # `--json` envelope's channel.

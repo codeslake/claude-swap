@@ -324,17 +324,21 @@ class TestAtomicWriteThroughSymlink:
         """Beside the LINK, the rename hits EXDEV whenever the target is on
         another mount — the write fails outright. Assert the placement
         directly; staging two filesystems in a unit test is not portable."""
-        import tempfile
+        import os as os_mod
         from claude_swap import settings as S
         repo = tmp_path / "repo"; repo.mkdir()
         live = tmp_path / "live"; live.mkdir()
         tracked = repo / "settings.json"; tracked.write_text("{}")
         link = live / "settings.json"; link.symlink_to(tracked)
         seen = []
-        real_mkstemp = tempfile.mkstemp
+        real_open = os_mod.open
+        # The CREATE, not `mkstemp`: the writer computes the name itself and
+        # opens it inside its guard, so an interrupt in the create still leaves
+        # a name to unlink. `os.path.dirname` of that name is the placement.
         monkeypatch.setattr(
-            S.tempfile, "mkstemp",
-            lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
+            S.os, "open",
+            lambda path, *a, **kw: (seen.append(os_mod.path.dirname(str(path))),
+                                    real_open(path, *a, **kw))[1],
         )
 
         atomic_write_json(link, {"x": 1})

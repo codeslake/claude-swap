@@ -12661,3 +12661,127 @@ def test_a_ctrl_c_mid_write_through_still_names_the_copy_it_kept(
     out, err = capsys.readouterr()
     assert strays[0].name in err, f"the surviving copy was not named: {err!r}"
     assert out == "", f"a machine-readable channel was written to: {out!r}"
+
+
+@pytest.mark.parametrize("site", ["settings", "mappings", "session"])
+def test_no_writer_mints_its_temp_name_inside_the_syscall(
+    temp_home: Path, monkeypatch, tmp_path: Path, site: str
+):
+    """An interrupt inside the CREATE must still leave a name to unlink.
+
+    `tempfile.mkstemp` picks the name internally and opens the file before it
+    returns, so a `KeyboardInterrupt` in that window leaves a temp whose name
+    never reached the caller — no handler can remove what it cannot name. The
+    roster writer does not have this window: it computes the name first and
+    calls `os.open` inside its own guard.
+
+    Measured before the fix, same injection at each site:
+    `settings.atomic_write_json` -> `tmp*.tmp`, `mappings._write` ->
+    `.mappings-*.tmp`, `session._write_manifest` -> `.cswap-shared-*.tmp`;
+    the roster writer -> nothing.
+    """
+    import tempfile as tempfile_mod
+
+    def exploding(*_a, **_kw):
+        raise AssertionError(
+            "the temp name is minted inside mkstemp, so an interrupt there "
+            "strands a file nothing can name"
+        )
+
+    monkeypatch.setattr(tempfile_mod, "mkstemp", exploding)
+
+    d = tmp_path / "d"
+    d.mkdir()
+    if site == "settings":
+        from claude_swap.settings import atomic_write_json
+
+        atomic_write_json(d / "s.json", {"a": 1})
+    elif site == "mappings":
+        from claude_swap.mappings import MappingStore
+
+        MappingStore(d)._write({})
+    else:
+        from claude_swap.session import SessionManager
+
+        SessionManager(ClaudeAccountSwitcher())._write_manifest(d / "m.json", [])
+    assert list(d.glob(".*tmp")) == [] and list(d.glob("*tmp*")) == [], (
+        "a temp survived a completed write"
+    )
+
+
+def test_an_interrupted_salvage_leaves_no_partial_copy(
+    temp_home: Path, monkeypatch, capsys
+):
+    """The `.unreadable-` name promises the bytes survived. A partial breaks it.
+
+    `except OSError` does not catch `KeyboardInterrupt`, so a Ctrl-C inside
+    `copyfile` left a truncated copy of the credential under a name a later
+    restore trusts — and printed, logged, and returned nothing about it.
+    Measured before the fix: 29 of 55 bytes, mode 0600, `warnings_out == []`.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    def truncating_copy(src, dst, *_a, **_kw):
+        Path(dst).write_text('{"primaryApiKey": "sk-ant-RED')
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", truncating_copy)
+    warnings_out: list[str] = []
+    with pytest.raises(KeyboardInterrupt):
+        switcher._salvage_unreadable(path, True, warnings_out)
+
+    strays = list(path.parent.glob(f"{path.name}.unreadable-*"))
+    assert strays == [], (
+        f"a partial salvage survived as {[s.name for s in strays]} — the name "
+        "says the bytes are there and they are not"
+    )
+
+
+def test_a_failed_write_through_does_not_keep_the_narrowed_mode(
+    temp_home: Path, monkeypatch
+):
+    """The 0600 is a committed side effect when the copy after it fails.
+
+    The write-through path narrows the destination BEFORE the copy, because
+    `copyfile` truncates without touching the mode and a chmod after it would
+    publish the payload at whatever mode was there. When the copy then fails
+    the narrowing stands, the old mode was never captured, and nothing can put
+    it back — on the deployment this branch exists for (a bind-mounted
+    `~/.claude.json` at 0644 so another uid can read it) a full disk narrows
+    the host file permanently and reports only the copy error.
+
+    `copyfile` has already truncated by then, so the destination is emptied
+    before the mode goes back: an empty file at the old mode leaks nothing,
+    and the complete content is at the temp the message names.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"activeAccountNumber": 1}')
+    os.chmod(path, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def out_of_space(src, dst, *_a, **_kw):
+        Path(dst).write_text("")          # copyfile truncates first
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", out_of_space)
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"activeAccountNumber": 2})
+
+    import stat as stat_mod
+
+    mode = stat_mod.S_IMODE(path.stat().st_mode)
+    assert mode == 0o644, (
+        f"the destination was left at {oct(mode)} — the narrowing "
+        "outlived the write it was for, and nothing recorded what "
+        "to restore"
+    )
