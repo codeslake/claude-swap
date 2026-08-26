@@ -1375,7 +1375,10 @@ class TestRun:
         with pytest.raises(_ExecCalled) as exc:
             manager.run("2", [])
 
-        assert "CLAUDE_CONFIG_DIR" not in exc.value.env
+        # NAMES, not the mapping. A failing `not in` renders the whole dict,
+        # and this one is the process environment: pytest keeps its head and
+        # tail, so a token sitting at either end is printed with it.
+        assert "CLAUDE_CONFIG_DIR" not in sorted(exc.value.env)
         assert "already the active default login" in capsys.readouterr().out
 
     def test_preset_config_dir_disables_fast_path(
@@ -1422,8 +1425,10 @@ class TestRun:
         # `cswap run 2` means account 2, not whatever the API key resolves to.
         out = capsys.readouterr().out
         assert "Ignoring ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN" in out
-        assert "ANTHROPIC_API_KEY" not in exc.value.env
-        assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
+        # NAMES, for the reason above.
+        exec_env_names = sorted(exc.value.env)
+        assert "ANTHROPIC_API_KEY" not in exec_env_names
+        assert "ANTHROPIC_AUTH_TOKEN" not in exec_env_names
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
     @pytest.mark.parametrize(
