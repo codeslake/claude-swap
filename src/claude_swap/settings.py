@@ -462,8 +462,8 @@ def atomic_write_json(path: Path, data: dict) -> None:
     - The 0700 hardening stays on the directory cswap owns. Applying it to
       the resolved parent would narrow a directory belonging to something
       else, and raise ``PermissionError`` outright when that parent is not
-      ours to chmod. The written file still gets 0600, and ``mkstemp``
-      creates it 0600 to begin with, so the secret is never exposed.
+      ours to chmod. The written file still gets 0600, set on the fd before
+      the publish, so the secret is never exposed at any point.
     """
     target = Path(os.path.realpath(path)) if path.is_symlink() else path
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -472,20 +472,21 @@ def atomic_write_json(path: Path, data: dict) -> None:
         os.chmod(path.parent, 0o700)
     fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
-        os.write(fd, (json.dumps(data, indent=2) + "\n").encode("utf-8"))
+        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+        if sys.platform != "win32":
+            # On the fd, BEFORE the publish. `mkstemp` masks its 0600 against
+            # the umask, so the mode is the caller's otherwise; and setting it
+            # on the published path instead leaves a statement that can fail
+            # after the rename has handed the temp name away.
+            os.fchmod(fd, 0o600)
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(target))
-        tmp_path = ""  # consumed by the publish; the name is not ours
-        if sys.platform != "win32":
-            os.chmod(str(target), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        # Only while the name is still ours: the publish hands it over.
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         raise

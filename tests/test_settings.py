@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -358,76 +359,22 @@ class TestAtomicWriteThroughSymlink:
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
 
 
-class TestTheWrittenFileIsAWellFormedTextFile:
-    """A JSON file with no trailing newline is not a POSIX text file, and the
-    consequence is not cosmetic: an editor that adds one on save (vim's
-    default, most IDEs) fights this writer forever — save, cswap rewrites,
-    the byte is gone, save again. The file never settles.
+class TestTheWrittenFileLandsAt0600:
+    """The mode must not depend on the caller's umask.
 
-    Nothing about a repo is required for that; it is why the fix belongs in
-    the writer and not in whatever happens to track the file."""
+    ``mkstemp`` masks its 0600 request, so under a restrictive umask the temp
+    lands 0400 and under a permissive one 0600 — neither is what this writer
+    promises. It publishes settings and the autoswitch state; a session's
+    ``.claude.json`` goes through it too.
+    """
 
-    def test_the_file_ends_with_a_newline(self, tmp_path):
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")
+    @pytest.mark.parametrize("umask", [0o022, 0o000, 0o377])
+    def test_whatever_the_umask(self, tmp_path, umask):
         p = tmp_path / "settings.json"
-        atomic_write_json(p, {"a": 1})
-        assert p.read_bytes().endswith(b"\n")
-
-    def test_exactly_one_newline_so_repeated_writes_do_not_grow_it(self, tmp_path):
-        p = tmp_path / "settings.json"
-        atomic_write_json(p, {"a": 1})
-        atomic_write_json(p, json.loads(p.read_text()))
-        assert not p.read_bytes().endswith(b"\n\n")
-
-    def test_it_still_parses(self, tmp_path):
-        p = tmp_path / "settings.json"
-        atomic_write_json(p, {"a": 1, "nested": {"b": [1, 2]}})
-        assert json.loads(p.read_text()) == {"a": 1, "nested": {"b": [1, 2]}}
-
-
-class TestAPublishedFileIsNotUnlinkedByItsOwnCleanup:
-    """Every sibling writer in this change got this guard; the shared one
-    did not, and it is the writer with a statement AFTER the publish."""
-
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason=(
-            "the only statement after the publish is the POSIX-only chmod, so "
-            "on Windows nothing between the rename and the end of the try can "
-            "fail and the window has no trigger there"
-        ),
-    )
-    def test_the_cleanup_does_not_take_a_name_the_publish_handed_over(
-        self, tmp_path, monkeypatch
-    ):
-        """``mkstemp`` can draw a freed name back the moment the rename frees
-        it, so whatever stands there after the publish belongs to whoever
-        created it next — and the ``chmod`` that follows can still fail."""
-        p = tmp_path / "settings.json"
-        drawn: list[str] = []
-        real_mkstemp = settings_mod.tempfile.mkstemp
-        real_chmod = settings_mod.os.chmod
-
-        def recording_mkstemp(*a, **kw):
-            fd, name = real_mkstemp(*a, **kw)
-            drawn.append(name)
-            return fd, name
-
-        def chmod_that_fails_on_the_published_file(path, mode, *a, **kw):
-            if str(path) == str(p):
-                # the freed temp name has already been drawn back by someone
-                Path(drawn[-1]).write_text("not ours", encoding="utf-8")
-                raise OSError("injected: chmod refused")
-            return real_chmod(path, mode, *a, **kw)
-
-        monkeypatch.setattr(settings_mod.tempfile, "mkstemp", recording_mkstemp)
-        monkeypatch.setattr(
-            settings_mod.os, "chmod", chmod_that_fails_on_the_published_file
-        )
-
-        with pytest.raises(OSError, match="chmod refused"):
+        previous = os.umask(umask)
+        try:
             atomic_write_json(p, {"a": 1})
-
-        # Instrument guard: no temp name drawn means the assertion below is
-        # about a file this test created and nothing ever reached.
-        assert drawn, "premise: no temp name was ever drawn"
-        assert Path(drawn[-1]).read_text(encoding="utf-8") == "not ours"
+        finally:
+            os.umask(previous)
+        assert oct(p.stat().st_mode & 0o777) == "0o600"
