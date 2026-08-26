@@ -77,9 +77,8 @@ def ensure_notification_identity(
                 os.replace(tmp, path)
                 tmp = None
             finally:
-                # Only while the name is still ours: the publish consumes
-                # it. Errors swallowed so the cleanup cannot replace the real
-                # failure with its own.
+                # Only while the name is still ours; the publish consumes
+                # it. Swallowed so cleanup cannot mask the real failure.
                 if tmp is not None:
                     try:
                         tmp.unlink(missing_ok=True)

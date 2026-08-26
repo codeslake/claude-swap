@@ -482,9 +482,7 @@ def atomic_write_json(path: Path, data: dict) -> None:
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        # Only while the name is still ours. The three sibling writers keep
-        # this invariant; leaving it out here made the shared writer the one
-        # that could unlink a name the publish had already handed over.
+        # Only while the name is still ours: the publish hands it over.
         if tmp_path:
             try:
                 os.unlink(tmp_path)

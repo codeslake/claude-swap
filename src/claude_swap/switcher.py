@@ -564,12 +564,9 @@ class ClaudeAccountSwitcher:
         temp_path = path.with_suffix(f".{os.getpid()}.tmp")
 
         try:
-            # 0600 AT CREATION. `write_text` uses the umask default, so the
-            # temp held the whole payload world-readable for the length of the
-            # write and the read-back below — and this writer publishes
-            # `~/.claude.json`, which can carry `primaryApiKey` and inline MCP
-            # credentials. fchmod as well as the open mode, because O_CREAT
-            # leaves a leftover temp's existing mode alone.
+            # 0600 from creation: this writer publishes `~/.claude.json`,
+            # which can carry `primaryApiKey`. fchmod as well as the open
+            # mode, because O_CREAT leaves a leftover temp's mode alone.
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 if sys.platform != "win32":
@@ -582,22 +579,19 @@ class ClaudeAccountSwitcher:
             except json.JSONDecodeError:
                 raise ConfigError("Generated invalid JSON")
 
-            # Permissions go on the temp so a rename publish is the final,
-            # atomic commit. That needs a REAL rename: shutil.move falls back
-            # to a copy on ANY rename error, and that copy overwrites the
-            # roster in place. (The EBUSY branch below is the one publish that
-            # cannot be atomic, and it says so.)
+            # A REAL rename, so the publish is the final atomic commit:
+            # shutil.move falls back to a copy on ANY rename error, and that
+            # copy overwrites the roster in place.
             try:
                 replace_with_retry(temp_path, path)
                 temp_path = None  # consumed by the publish; the name is not ours
             except OSError as e:
                 if e.errno != errno.EBUSY:
                     raise
-                # A bind-mounted destination pins the inode, so rename is
-                # refused and writing through is the only way to update it
-                # (a container mounting ~/.claude.json). Not atomic, so the
-                # temp is disowned first and reclaimed only once the copy
-                # lands: a failure part-way must leave the complete content.
+                # A bind-mounted destination pins the inode (a container
+                # mounting ~/.claude.json), so writing through is the only
+                # way to update it. Disowned before and reclaimed after: a
+                # copy that dies part-way must leave the complete content.
                 # `copy`, not `copy2`: `copystat`'s unguarded `utime` is
                 # refused by the same mounts that refuse the rename.
                 source, temp_path = temp_path, None
@@ -1341,10 +1335,9 @@ class ClaudeAccountSwitcher:
                             f"accounts still work (`cswap list`), then delete "
                             f"the file and retry."
                         )
-                    # Claimed BEFORE the create, which is the earliest
-                    # boundary the file can exist at: a signal arriving inside
-                    # `os.open` raises the instant it returns, so anything
-                    # recorded after the call can miss a file that exists.
+                    # Claimed BEFORE the create: a signal arriving inside
+                    # `os.open` raises the instant it returns, so a record
+                    # made after the call can miss a file that exists.
                     key = f"{kind}-{num}"
                     staged[key] = path
                     try:
