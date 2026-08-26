@@ -664,8 +664,12 @@ class TestTheSwitchScreenBadgeIsResolvedOncePerSnapshot:
         fake = FakeSwitcher(accounts, tmp_path)
 
         calls = []
+        # THE COMPOSITE SEAM. The badge asks `pinned_identity` now: an email
+        # alone lights every slot sharing that address, so stubbing the old
+        # seam here would leave this case measuring nothing.
         monkeypatch.setattr(
-            _dash.pin, "pinned_email", lambda _sw: calls.append(1) or "two@e.com"
+            _dash.pin, "pinned_identity",
+            lambda _sw: calls.append(1) or ("two@e.com", ""),
         )
 
         app = make_app(fake)
@@ -719,11 +723,12 @@ class TestTheSwitchScreenBadgeIsResolvedOncePerSnapshot:
 
         calls = []
         monkeypatch.setattr(
-            _dash.pin, "pinned_email", lambda _sw: calls.append(1) or "one@e.com"
+            _dash.pin, "pinned_identity",
+            lambda _sw: calls.append(1) or ("one@e.com", ""),
         )
         monkeypatch.setattr(
-            "claude_swap.tui.widgets.pin.pinned_email",
-            lambda _sw: calls.append(1) or "one@e.com",
+            "claude_swap.tui.widgets.pin.pinned_identity",
+            lambda _sw: calls.append(1) or ("one@e.com", ""),
         )
 
         fake = FakeSwitcher([make_account(1, active=True, email="one@e.com")], tmp_path)
@@ -1010,3 +1015,86 @@ class TestAnOrphanedRecordDoesNotHideItsOwnRemoval:
                 f"the broken-package submenu dead-ends on the error string "
                 f"with a removable record still on disk: {actions}"
             )
+
+class TestTheCloudBadgeNeedsTheOrganizationToo:
+    """The badge answers "which account owns the claude.ai side", and an email
+    does not identify an account here.
+
+    Two managed slots may share one address across organizations -- the premise
+    `pinned_identity` was written for. Matching on the email alone badges BOTH
+    rows, and every health reading printed beside the badge (`pin_is_broken`,
+    `pin_is_applying`) is then taken against whichever row matched first. A
+    healthy pin renders as broken on the sibling, or a dead one renders clean.
+    """
+
+    def test_a_same_email_sibling_is_not_the_pinned_account(self):
+        from claude_swap import pin
+
+        pinned = ("shared@example.com", "org-PIN")
+        assert pin.account_is_pinned(pinned, "shared@example.com", "org-PIN") is True
+        assert pin.account_is_pinned(pinned, "shared@example.com", "org-OTHER") is False, (
+            "an email-only comparison badges the sibling slot too, and the pin "
+            "health beside it is then read from the wrong account"
+        )
+
+    def test_a_different_address_is_never_the_pinned_account(self):
+        """The control: without it a predicate that returned True whenever an
+        identity exists would pass the case above."""
+        from claude_swap import pin
+
+        assert pin.account_is_pinned(
+            ("a@example.com", "org-1"), "b@example.com", "org-1") is False
+
+    def test_no_pin_badges_nothing(self):
+        from claude_swap import pin
+
+        assert pin.account_is_pinned(None, "a@example.com", "org-1") is False
+
+    def test_a_missing_org_is_compared_as_empty_not_dropped(self):
+        """A roster row imported before the org fields existed carries "". It
+        must still match a pin whose org is also "" -- and must NOT match one
+        that has an org, which is what dropping the field would do."""
+        from claude_swap import pin
+
+        assert pin.account_is_pinned(("a@example.com", ""), "a@example.com", "") is True
+        assert pin.account_is_pinned(("a@example.com", "org-1"), "a@example.com", "") is False
+
+
+class TestEveryBadgeSiteAsksTheSameQuestion:
+    """The structural half. Three widgets each answered it by hand, and the
+    third was found only after the first two were fixed -- so assert that none
+    of them compares an address to a pin on its own again.
+    """
+
+    def test_no_tui_site_matches_a_pin_on_the_email_alone(self):
+        import ast
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "src" / "claude_swap" / "tui"
+        offenders = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Compare):
+                    continue
+                # BY WHAT THE SIDE SAYS, not by its node type. Keying on
+                # `ast.Name` let `acc.email == pinned_identity[0]` through --
+                # a Subscript -- which is exactly the shape a regression takes
+                # once the composite is in scope. Measured: that mutation
+                # survived this guard until it read the unparsed text.
+                sides = [node.left, *node.comparators]
+                if len(sides) != 2:
+                    continue
+                rendered = [ast.unparse(x) for x in sides]
+                has_email = any(
+                    isinstance(x, ast.Attribute) and x.attr == "email" for x in sides)
+                names_pin = any("pinned" in r for r in rendered)
+                if has_email and names_pin:
+                    offenders.append(f"{path.name}:{node.lineno}  {rendered[0]} == {rendered[1]}")
+        # THE CONTROL: an empty walk would pass vacuously.
+        assert len(list(root.rglob("*.py"))) > 2, "the walk found no TUI modules"
+        assert offenders == [], (
+            "a badge site compares an address to the pin directly, so two slots "
+            f"sharing one address both render as pinned: {offenders}"
+        )
+

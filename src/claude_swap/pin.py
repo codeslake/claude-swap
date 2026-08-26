@@ -732,6 +732,22 @@ def pinned_email(switcher) -> str | None:
     return pin[0] if pin else None
 
 
+def account_is_pinned(identity, email: str, org_uuid: str) -> bool:
+    """Is ``(email, org_uuid)`` the pinned account?
+
+    THE COMPOSITE, and it is the badge's whole correctness. Two managed slots
+    may share one address across organizations, so an email-only test lights
+    BOTH rows -- and `pin_is_broken`/`pin_is_applying` are then read against
+    whichever row matched first, rendering a healthy pin as broken on the
+    sibling or a dead one as clean.
+
+    ``org_uuid`` is normalised, never dropped: a roster row imported before the
+    org fields existed carries "", which must still match a pin whose org is
+    also "" and must not match one that has an org.
+    """
+    return identity is not None and (email, org_uuid or "") == identity
+
+
 def pinned_identity(switcher) -> "tuple[str, str] | None":
     """The pinned account as `(email, organizationUuid)`, or None.
 

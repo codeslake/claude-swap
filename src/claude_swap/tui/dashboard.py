@@ -582,10 +582,10 @@ class AccountListScreen(Screen):
         # used to ask `pin.pinned_email` itself, which is per-widget and off the
         # poll — see that class for the measurement. This is the only place that
         # knows a new snapshot has arrived, so it is where the question belongs.
-        pinned_email = pin.pinned_email(self.app.switcher)
+        pinned_identity = pin.pinned_identity(self.app.switcher)
 
         def _pinned(acc) -> bool:
-            return bool(pinned_email and acc.email == pinned_email)
+            return pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid)
 
         if numbers != self._numbers:
             first_build = not self._numbers

@@ -305,12 +305,12 @@ class AutoScreen(Screen):
         # The badge rides on that account's own row rather than the summary
         # line: naming the pin separately makes you match an email against the
         # list directly below it instead of just reading the list.
-        pinned_email = pin.pinned_email(self.app.switcher)
+        pinned_identity = pin.pinned_identity(self.app.switcher)
         # ONCE PER RENDER, not once per row: this reads the daemon's record off
         # disk, and the badge below is drawn inside the account loop. The same
-        # mistake was fixed for `pinned_email` itself — see the test that pins
+        # mistake was fixed for the pin lookup itself — see the test that pins
         # its call count.
-        pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_email else None
+        pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -332,10 +332,10 @@ class AutoScreen(Screen):
             # Outside the usage branches on purpose: an account whose usage is
             # unknown still owns the claude.ai side, so the badge must not hang
             # off whichever branch happened to run.
-            if pinned_email and acc.email == pinned_email:
+            if pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid):
                 entry.append("  · ", style=palette.muted)
                 # SET IS NOT APPLYING. This badge used to be lit by
-                # `pinned_email` alone, so it stayed green while the daemon
+                # the pin's presence alone, so it stayed green while the daemon
                 # could not mint the pinned token and every request went out
                 # unpinned, with the statusline and the coherence check
                 # agreeing with it. `False` is the

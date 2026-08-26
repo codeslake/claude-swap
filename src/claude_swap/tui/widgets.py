@@ -373,7 +373,7 @@ class AccountsPanel(Static):
     def __init__(self, *, show_minis: bool = True, id: str | None = None) -> None:
         super().__init__(id=id)
         self._show_minis = show_minis
-        self._pinned_email: str | None = None
+        self._pinned_identity: "tuple[str, str] | None" = None
 
     def on_mount(self) -> None:
         self.watch(self.app, "snapshot", lambda _snap: self._resolve_and_refresh())
@@ -391,7 +391,7 @@ class AccountsPanel(Static):
         widget already watched `snapshot`, so the answer had a place to live
         and simply was not put there.
         """
-        self._pinned_email = pin.pinned_email(self.app.switcher)
+        self._pinned_identity = pin.pinned_identity(self.app.switcher)
         self.refresh(layout=True)
 
     def render(self) -> Text:
@@ -410,9 +410,9 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         blocks: list[Text] = []
-        pinned_email = self._pinned_email
+        pinned_identity = self._pinned_identity
         for acc in snap.accounts:
-            pinned = bool(pinned_email and acc.email == pinned_email)
+            pinned = pin.account_is_pinned(pinned_identity, acc.email, acc.org_uuid)
             if acc.is_active:
                 blocks.append(
                     account_card_text(
@@ -442,7 +442,7 @@ class AccountCard(Static):
     """One account rendered full-size (used by the switch screen's list).
 
     ``cloud_pinned`` IS HANDED IN, not asked for. This used to call
-    ``pin.pinned_email`` from ``render()``, which is per-widget and not on the
+    ``pin.pinned_identity`` from ``render()``, which is per-widget and not on the
     poll: it fires on every repaint, resize and reflow, so N accounts cost N
     package resolutions per frame (measured 450us each with the extra absent,
     the majority case). Steady state that is 0.15% of a 3s tick and would not

@@ -2122,9 +2122,9 @@ class TestTheTuiSurfaceSurvivesTheSplit:
             raising=False,
         )
 
-        monkeypatch.setattr(autoview.pin, "pinned_email", lambda sw: pinned)
+        monkeypatch.setattr(autoview.pin, "pinned_identity", lambda sw: (pinned, ""))
         with_pin = screen._candidates_text(snap, accounts[0].number).plain
-        monkeypatch.setattr(autoview.pin, "pinned_email", lambda sw: None)
+        monkeypatch.setattr(autoview.pin, "pinned_identity", lambda sw: None)
         without = screen._candidates_text(snap, accounts[0].number).plain
 
         assert "○ cloud" in with_pin, "the auto-switch view lost the cloud badge"
