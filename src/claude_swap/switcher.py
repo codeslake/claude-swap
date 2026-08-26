@@ -308,13 +308,15 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
-#: How long the switch transaction may spend asking the policy question.
+#: How long a switch may spend asking the policy question.
 #:
-#: Both callers sit INSIDE `_perform_switch` -- after the credential write and
-#: before `activeAccountNumber` is persisted -- so it narrows the window in
-#: which the two disagree. NOT A WALL-CLOCK BOUND: urlopen applies this per
-#: blocking socket operation, so connect, handshake and each read get it
-#: separately. The fetch's own default is 10s.
+#: The one caller is `_perform_switch`, AFTER its body has released the locks,
+#: so this no longer narrows a credentials-vs-roster window -- that window
+#: closed when the call moved out. What it bounds is the tail of `cswap switch`
+#: itself, on the path the autoswitch engine drives right before a lockout.
+#: NOT A WALL-CLOCK BOUND: urlopen applies this per blocking socket operation,
+#: so connect, handshake and each read get it separately. The fetch's own
+#: default is 10s.
 _POLICY_FETCH_BUDGET_S = 2.0
 
 
@@ -583,6 +585,11 @@ class ClaudeAccountSwitcher:
         if not isinstance(doc, dict):
             return
         path = get_claude_config_home() / "policy-limits.json"
+        # THROUGH A SYMLINK, NEVER OVER IT -- the rule `_write_json` states
+        # above. `os.replace` swaps a directory entry and does not follow
+        # links, so a dotfiles-managed cache would be detached from its target.
+        if path.is_symlink():
+            path = Path(os.path.realpath(path))
         # THE PID IS IN THE NAME, like every other writer in this store. A
         # fixed temp name is shared by every process writing this file, so two
         # concurrent switches interleave their write and replace and the
@@ -600,7 +607,10 @@ class ClaudeAccountSwitcher:
             try:
                 os.chmod(tmp, path.stat().st_mode & 0o777)
             except OSError:
-                pass
+                # First creation: nothing to carry over. The umask-derived mode
+                # is a mint as well, just a looser one (0644 under 022), so
+                # pick the tighter default rather than inherit an accident.
+                os.chmod(tmp, 0o600)
             tmp.replace(path)          # atomic: no reader sees half a document
         except OSError as exc:
             self._logger.debug("could not write the policy cache: %r", exc)
@@ -6750,6 +6760,37 @@ class ClaudeAccountSwitcher:
         force_activate: bool = False,
         provenance: dict | None = None,
     ) -> dict:
+        """Switch, then re-ask the org-policy question. See the body below.
+
+        THE REFRESH IS NETWORK I/O AND THE BODY HOLDS THREE LOCKS -- two of
+        them Claude Code's own, which it blocks on during a credential
+        refresh -- so it cannot live inside. It cannot live at the end of the
+        body either: that body has TWO exits, and the direct-activation branch
+        (`force_activate`, a fresh machine, post-import, an unmanaged live
+        login) returns from inside the lock scope. A tail call reaches the
+        ordinary rotation only, and no test could see the difference because
+        every policy test drives a roster-matching live login.
+
+        Deliberately NOT `try`/`finally`: a switch that raised has rolled back,
+        and refreshing then writes a policy answer for an account the machine
+        is no longer on.
+        """
+        result = self._perform_switch_locked(
+            target_account,
+            emit_output=emit_output,
+            force_activate=force_activate,
+            provenance=provenance,
+        )
+        self._refresh_policy_cache()
+        return result
+
+    def _perform_switch_locked(
+        self,
+        target_account: str,
+        emit_output: bool = True,
+        force_activate: bool = False,
+        provenance: dict | None = None,
+    ) -> dict:
         """Perform the actual account switch with transaction support.
 
         Returns ``{"from": ref|None, "to": ref, "warnings": [...]}``, capturing the
@@ -7329,24 +7370,13 @@ class ClaudeAccountSwitcher:
                 raise
 
         # Lock released. Safe to do network I/O and let persist callbacks
-        # re-acquire the lock from inside list_accounts().
+        # re-acquire the lock from inside list_accounts(). All of this is
+        # display only — suppressed in JSON mode (the nested list_accounts()
+        # would otherwise leak human output onto the JSON stdout).
         #
-        # THE POLICY REFRESH IS NETWORK I/O, so it belongs on this side of the
-        # release. It ran inside the lock block above, whose own comment
-        # promises "no network while locks are held" -- and those are Claude
-        # Code's credential and config locks, which Claude Code itself blocks
-        # on during a token refresh. `_POLICY_FETCH_BUDGET_S` bounds each
-        # blocking socket operation, not the call, so connect plus handshake
-        # plus reads can hold them well past it.
-        #
-        # This does not widen the window it was placed to narrow: the network
-        # call IS that window and it is unchanged. What changes is who waits
-        # behind it. Once, not once per branch -- both switch paths reach here.
-        self._refresh_policy_cache()
-
-        # Display only below here — suppressed in JSON mode (the nested
-        # list_accounts() would otherwise leak human output onto the JSON
-        # stdout).
+        # The policy refresh is network I/O and does NOT belong here: this is
+        # one of two exits, and the other returns from inside the lock scope
+        # above. `_perform_switch` wraps this function and covers both.
         if emit_output:
             print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
             try:

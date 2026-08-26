@@ -1064,8 +1064,9 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 # THIS IS THE BUDGET REQUESTED, NOT THE CEILING OBSERVED, and the gap is not
 # ours to close from here. `proper_lockfile` checks its deadline and THEN
 # sleeps `0.25 + random() * 0.25` unclamped, so one acquisition can overrun by
-# a full jittered sleep; `_config_lock_is_free` spends this per config and
-# there are up to two. Worst case is therefore ~2.0s, not 0.5s.
+# a full jittered sleep. The two consumers then differ: `_config_lock_is_free`
+# spends this PER CONFIG (~2.0s across two), while `clear_wiring` treats it as
+# a TOTAL split into fair shares (~1.5s by the same overrun). Neither is 0.5s.
 #
 # Clamping that sleep to the remaining budget is a one-line fix in
 # `claude_locks.py`, which is CORE cswap and deliberately out of this branch's

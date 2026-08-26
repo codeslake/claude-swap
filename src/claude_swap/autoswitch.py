@@ -684,6 +684,11 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # The bridge-title repair's own state. Declared here rather
+        # than conjured by the method that reads it, so the engine's
+        # state is visible in one place.
+        self._bridge_titles_next_at: float = 0.0
+        self._bridge_titles_last: str | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -876,6 +881,10 @@ class AutoSwitchEngine:
 
     # -- tick -----------------------------------------------------------------
 
+    #: How often the bridge-title restore may ask the API. A repair cadence,
+    #: not a poll: ticks are frequent and a re-mint is rare.
+    BRIDGE_TITLE_INTERVAL_S = 300.0
+
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         # After the tick, not before it, and in a `finally` so an error path
@@ -894,10 +903,6 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         finally:
             self._restore_bridge_titles_if_due()
-
-    #: How often the restore may ask the API. A repair cadence, not a poll:
-    #: ticks are frequent and a re-mint is rare.
-    BRIDGE_TITLE_INTERVAL_S = 300.0
 
     def _restore_bridge_titles_if_due(self) -> None:
         """Put locally-named sessions' names back on their cloud bridges.
@@ -936,7 +941,7 @@ class AutoSwitchEngine:
         # under a handler that catches only ClaudeSwitchError.
         try:
             now = self.clock()
-            if now < getattr(self, "_bridge_titles_next_at", 0.0):
+            if now < self._bridge_titles_next_at:
                 return
             self._bridge_titles_next_at = now + self.BRIDGE_TITLE_INTERVAL_S
             # Every way out reports. Three bare `return`s used to sit here,
@@ -1022,7 +1027,7 @@ class AutoSwitchEngine:
         # numbers, so a persistently slow endpoint would make every pass a
         # different string and the transition rule would never fire.
         kind = "".join("N" if c.isdigit() else c for c in outcome)
-        if kind == getattr(self, "_bridge_titles_last", None):
+        if kind == self._bridge_titles_last:
             return
         self._bridge_titles_last = kind
         # Faults are "wrong and nobody asked for it": `list-failed`, a raise,

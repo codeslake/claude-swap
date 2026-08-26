@@ -7948,7 +7948,10 @@ class TestAFailedSwitchKeepsThePin:
 
         from claude_swap import switcher as _sw
 
-        src = inspect.getsource(_sw.ClaudeAccountSwitcher._perform_switch)
+        # THE BODY, not the wrapper: `_perform_switch` is now a thin
+        # shim that calls this and then refreshes the policy cache.
+        src = inspect.getsource(
+            _sw.ClaudeAccountSwitcher._perform_switch_locked)
 
         # Both statements exist; the ORDER is the behaviour.
         i_txn = src.find("transaction = SwitchTransaction(")

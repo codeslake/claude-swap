@@ -5198,6 +5198,51 @@ class TestSwitchSkipsBrokenSlots:
             "restrictions keep gating sessions under an account they no "
             "longer describe")
 
+    def test_the_activation_path_refreshes_the_policy_cache_too(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE OTHER SWITCH PATH, which had no witness and lost the refresh.
+
+        `_perform_switch` has two exits. The ordinary rotation falls out of the
+        lock block; the direct-activation branch -- `force_activate`, a fresh
+        machine with no live login, post-import, or a live login cswap does not
+        manage -- returns from INSIDE it. A refresh placed after the lock is
+        reached by the first and not the second, and every existing policy test
+        drives `s.switch()` with a roster-matching live login, so all of them
+        take the first.
+
+        That gap is not a corner: activation is what runs right after
+        `cswap --import` on a new machine, which is precisely when
+        `policy-limits.json` is absent -- and absent is DENIED, so Remote
+        Control is refused until something else happens to write it.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps(
+            {"restrictions": {"allow_remote_control": {"allowed": False}}}))
+
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        monkeypatch.setattr(
+            "claude_swap.switcher.fetch_policy_limits", lambda: fresh)
+
+        # NO `~/.claude.json` oauthAccount: that is what makes `switch()` take
+        # the fresh-machine path and `_perform_switch` take the activation
+        # branch. Credentials still exist, so the fetch has a token to carry.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+
+        s.switch()
+
+        assert json.loads(policy.read_text()) == fresh, (
+            "the activation path returned without refreshing the policy "
+            "cache, so the previous account's restrictions keep gating every "
+            "session on the machine")
+
     def test_a_failed_policy_fetch_leaves_the_old_answer_rather_than_none(
         self, temp_home: Path, monkeypatch
     ):
@@ -12228,13 +12273,16 @@ class TestSessionShellGuardCoversEveryMutator:
 
 
 class TestThePolicyFetchIsBudgeted:
-    """The switch transaction must not spend ten seconds asking about policy.
+    """A switch must not spend ten seconds asking about policy.
 
-    Both `_refresh_policy_cache` call sites sit INSIDE `_perform_switch` --
-    after the credential write and before `activeAccountNumber` is persisted --
-    so `urlopen`'s own 10s default widened the window in which the credentials
-    are the new account's and the roster still says the old one, on the path
-    the autoswitch engine drives right before a lockout.
+    The one call sits in `_perform_switch`, which wraps the locked body and
+    runs after it returns -- policy is network I/O and the body holds Claude
+    Code's own locks. So this budget no longer narrows a
+    credentials-vs-roster window; that window closed when the call moved out.
+    What it still bounds is the tail of `cswap switch` itself, on the path the
+    autoswitch engine drives right before a lockout, where `urlopen`'s 10s
+    default is the whole delay a user waits through for a cache refresh that
+    fails open anyway.
 
     THIS TEST EXISTS BECAUSE ITS ABSENCE WAS MEASURED. A reviewer reverted the
     budget with `fetch_policy_limits.__defaults__ = (10.0,)` and the suite came
