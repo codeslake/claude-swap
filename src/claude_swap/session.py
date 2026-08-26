@@ -576,7 +576,10 @@ class SessionManager:
             identifier, share, share_history
         )
 
-        print(
+        # RECORDED, not just printed. The blank erases this line too, and the
+        # only other log of which account launched fires on FIRST bootstrap --
+        # so every re-launch of an existing profile left no record at all.
+        self._note(
             f"{accent('Launching')} Account-{account_num} ({email}) "
             f"{muted('[session mode]')}"
         )

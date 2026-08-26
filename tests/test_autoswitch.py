@@ -6919,3 +6919,24 @@ class TestOneRemedyPerKindAcrossEverySurface:
             "the same failure kind reads differently depending on which "
             f"surface reports it: {sorted(drifted)}"
         )
+
+    def test_the_two_enumerations_of_a_systemic_kind_agree(self):
+        """The text can no longer drift; the SET still can, silently.
+
+        `_SYSTEMIC_MESSAGES` is derived from `ERROR_NOTES`, so comparing their
+        strings compares a value with itself — the case above cannot fail on
+        wording any more and is a PREMISE, not a guard. What remains free is
+        WHICH kinds each side knows: `oauth._DETERMINISTIC_REFRESH_ERRORS`
+        decides that a refresh failure is systemic, `_SYSTEMIC_KINDS` decides
+        what the tick then says about it, and they are two independent
+        literals. Measured: adding a fifth kind to one leaves the suite green
+        and the tick reports "(network?)" for a failure it has a remedy for.
+        """
+        from claude_swap.autoswitch import _SYSTEMIC_KINDS
+        from claude_swap.oauth import _DETERMINISTIC_REFRESH_ERRORS
+
+        assert set(_SYSTEMIC_KINDS) == set(_DETERMINISTIC_REFRESH_ERRORS), (
+            "a kind is systemic on one side and not the other: "
+            f"only oauth={sorted(set(_DETERMINISTIC_REFRESH_ERRORS) - set(_SYSTEMIC_KINDS))} "
+            f"only autoswitch={sorted(set(_SYSTEMIC_KINDS) - set(_DETERMINISTIC_REFRESH_ERRORS))}"
+        )

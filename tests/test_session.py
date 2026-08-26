@@ -2917,6 +2917,12 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         )
 
 
+#: Methods whose `print` IS the sanctioned one. A set, not a single name, so
+#: adding a second printer with the same print-and-log contract is a one-line
+#: change rather than a guard failure.
+_SANCTIONED_PRINTERS = {"_note", "_warn"}
+
+
 class TestEveryLaunchNoticeOutlivesTheBlank:
     """The screen blank erases stdout, so a print-only notice reaches nobody.
 
@@ -2937,24 +2943,41 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         import claude_swap.session as session_mod
 
         src = pathlib.Path(session_mod.__file__).read_text(encoding="utf-8")
-        offenders = []
-        for node in ast.walk(ast.parse(src)):
+        tree = ast.parse(src)
+        offenders_with_id: list[tuple[int, int]] = []
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             if getattr(node.func, "id", "") != "print":
                 continue
             if not node.args:
                 continue
-            inner = node.args[0]
-            if (isinstance(inner, ast.Call)
-                    and getattr(inner.func, "id", "") == "dimmed"):
-                offenders.append(node.lineno)
-        # `_note` IS the sanctioned print; exempting it by line keeps the rule
-        # "no bare print(dimmed(...))" rather than "no print at all".
-        note = next(n for n in ast.walk(ast.parse(src))
-                    if isinstance(n, ast.FunctionDef) and n.name == "_note")
-        offenders = [f"session.py:{n}" for n in offenders
-                     if not (note.lineno <= n <= note.end_lineno)]
+            # ANY `print` in this module, not one wearing a particular
+            # helper's name. Keying on `dimmed` made the guard blind to the
+            # launch line itself (`print(accent(...) ...)`), which is the
+            # PR's own failure mode, and a matcher typo left it green
+            # forever -- measured both.
+            offenders_with_id.append((node.lineno, id(node)))
+        # THE DENOMINATOR. Without it a matcher that matches nothing -- a
+        # typo, a renamed helper -- is green for ever. Measured: changing
+        # `dimmed` to `dimmedZZZ` left this passing.
+        assert offenders_with_id, (
+            "the walk found no `print` at all in session.py — the matcher is "
+            "broken, not the module clean"
+        )
+        # `_note` IS the sanctioned print. Excluded by NODE IDENTITY, not by
+        # line range: a rename raised StopIteration, a shadowing definition
+        # false-failed on `_note`'s own print, and a second printer with the
+        # same contract was rejected -- all measured.
+        sanctioned = {
+            id(c)
+            for fn in ast.walk(tree)
+            if isinstance(fn, ast.FunctionDef) and fn.name in _SANCTIONED_PRINTERS
+            for c in ast.walk(fn)
+            if isinstance(c, ast.Call)
+        }
+        offenders = [f"session.py:{n}" for n, node_id in offenders_with_id
+                     if node_id not in sanctioned]
         assert offenders == [], (
             "a launch notice is print-only, so the screen blank erases it and "
             f"nothing records why: {offenders}. Use `_note`."
