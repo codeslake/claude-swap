@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import logging
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sys
@@ -406,12 +406,9 @@ class TestBootstrap:
     def test_the_refresh_failure_warning_outlives_the_terminal(
         self, manager, auth_status_tracks_seed, monkeypatch, capsys, caplog
     ):
-        """setup_session prints, then run() execs — print() is this message's
-        whole life. The wrapper blanks the main screen before the child starts,
-        and nothing else carries it: the status line names the account, not the
-        refresh that failed, so the user launches on a possibly-stale token
-        with no record anywhere. The sibling above proves it is printed; this
-        proves it is kept."""
+        """The sibling above proves the warning is printed; this proves it is
+        kept. Nothing else carries it: the status line names the account, not
+        the refresh that failed."""
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
             lambda self, num, email, snap: oauth.RefreshOutcome(
@@ -424,6 +421,9 @@ class TestBootstrap:
         assert "Could not refresh" in capsys.readouterr().out
         logged = "\n".join(r.getMessage() for r in caplog.records)
         assert "Could not refresh the token for Account-2" in logged
+        # The cause picks the remedy, and it reaches no other record:
+        # oauth logs it at DEBUG, which setup_logging filters out.
+        assert "transient" in logged
 
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
@@ -1402,12 +1402,8 @@ class TestRun:
         refresh_rotates,
         caplog,
     ):
-        """The launch path prints and then execs, so print() is the whole life
-        of the message. The wrapper Claude Code launches through blanks the
-        terminal's main screen before starting the child, so anything printed
-        here is gone from view a moment later. The account itself is still
-        carried by the status line; "your env var was ignored" is carried by
-        nothing. Record it."""
+        """The account is still carried by the status line after the exec;
+        "your env var was ignored" is carried by nothing."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok")
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
@@ -1427,11 +1423,6 @@ class TestRun:
         caplog,
     ):
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/somewhere/else")
-        monkeypatch.setattr(
-            manager.switcher,
-            "_get_current_account",
-            lambda: (ACCOUNT_EMAIL, ORG_UUID),
-        )
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             with pytest.raises(_ExecCalled):
                 manager.run("2", [])

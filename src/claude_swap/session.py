@@ -499,6 +499,11 @@ class SessionManager:
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
 
+    def _warn(self, msg: str) -> None:
+        """Print and log: this path execs, so the printed line is not kept."""
+        warning(msg)
+        self._logger.warning(msg)
+
     # -- launch ----------------------------------------------------------
 
     def run(
@@ -531,16 +536,10 @@ class SessionManager:
             # With CLAUDE_CONFIG_DIR set, "current default account" is
             # meaningless (we may already be inside a session terminal), so
             # the same-account fast path below must not trigger.
-            # Logged as well as printed: this method ends in execvpe, and the
-            # wrapper Claude Code launches through blanks the main screen
-            # before the child starts, so a printed line does not survive it.
-            # The running account does, via the status line. This does not.
-            msg = (
+            self._warn(
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-            warning(msg)
-            self._logger.warning(msg)
         else:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
@@ -558,12 +557,10 @@ class SessionManager:
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
-            msg = (
+            self._warn(
                 f"Ignoring {', '.join(scrubbed)} for this session — it would "
                 f"override the selected account inside Claude Code."
             )
-            warning(msg)
-            self._logger.warning(msg)
 
         session_dir, account_num, email = self.setup_session(
             identifier, share, share_history
@@ -713,12 +710,12 @@ class SessionManager:
                     f"re-add it: cswap --add-account --slot {account_num}"
                 )
             if outcome.error is not None:
-                msg = (
-                    f"Could not refresh the token for Account-{account_num}; "
-                    "continuing with the stored credentials."
+                # `outcome.error` (transient vs invalid_grant) picks the
+                # remedy and reaches no other record — oauth logs it at DEBUG.
+                self._warn(
+                    f"Could not refresh the token for Account-{account_num} "
+                    f"({outcome.error}); continuing with the stored credentials."
                 )
-                warning(msg)
-                self._logger.warning(msg)
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:

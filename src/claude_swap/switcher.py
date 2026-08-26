@@ -1904,20 +1904,18 @@ class ClaudeAccountSwitcher:
                     "  It is the active account — it stays live until you switch "
                     "away; it just won't be an automatic switch target."
                 ))
-            # An empty rotation has two causes and only one is a disable.
-            # Advising `cswap enable` when no slot is readable points at a
-            # setting that is already right.
-            #
-            # ONE walk. `_account_is_switchable` reads the credential store per
-            # slot and nothing caches it, so deriving the cause after
-            # `switchable_account_numbers()` would read every slot twice on
-            # this branch's own hot case — where each read is a keychain miss.
+            # An empty rotation has two causes and only one is a disable, so
+            # the cause picks the remedy. Not switchable_account_numbers():
+            # it walks the same uncached per-slot credential reads, which on
+            # this branch's hot case are keychain misses.
             readable = [
-                n
-                for n in (str(x) for x in data.get("sequence", []))
+                n for n in map(str, data.get("sequence", []))
                 if self._account_is_switchable(n)
             ]
-            if not any(not self._disabled_from_data(data, n) for n in readable):
+            in_rotation = [
+                n for n in readable if not self._disabled_from_data(data, n)
+            ]
+            if not in_rotation:
                 if readable:
                     warning(
                         "  No accounts remain in rotation — auto-switch and bare "
@@ -1925,9 +1923,8 @@ class ClaudeAccountSwitcher:
                         "cswap enable <num|email>."
                     )
                 else:
-                    # The keychain is a macOS backend. Off macOS the stored
-                    # `.enc` is the only one, and telling the user to unlock a
-                    # keychain names something that does not exist there.
+                    # A keychain exists only on macOS; naming it elsewhere
+                    # points at something that is not there.
                     remedy = (
                         "unlock the keychain, or re-add a slot"
                         if self.platform == Platform.MACOS

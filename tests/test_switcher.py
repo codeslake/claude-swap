@@ -8646,10 +8646,9 @@ class TestDisableEnableAccount:
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
 
-        # NO slot is readable, INCLUDING the one being disabled — that is what
-        # this branch requires. Leaving slot 1 readable would make it a
-        # re-enable candidate and correctly select the other branch, because
-        # _account_is_switchable never consults the disabled flag.
+        # No slot readable, the disabled one included: _account_is_switchable
+        # never consults the disabled flag, so a readable slot 1 would still
+        # be a re-enable candidate and select the other branch.
         with patch.object(s, "_read_account_credentials", return_value=""):
             s.set_account_disabled("1", True)
 
@@ -8658,6 +8657,21 @@ class TestDisableEnableAccount:
         assert "readable credentials/config" in out
         # _setup runs as LINUX, where there is no keychain to unlock.
         assert "keychain" not in out.lower()
+
+    def test_unreadable_slots_name_the_keychain_only_on_macos(
+        self, temp_home, capsys
+    ):
+        """Same branch, macOS: there the keychain IS the credential backend,
+        so the remedy that the sibling must not print is the one to print."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+
+        s.platform = Platform.MACOS
+        with patch.object(s, "_read_account_credentials", return_value=""):
+            s.set_account_disabled("1", True)
+
+        out = capsys.readouterr().out
+        assert "unlock the keychain" in out
 
     # -- display -----------------------------------------------------------
 
