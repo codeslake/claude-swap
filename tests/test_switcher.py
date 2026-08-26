@@ -12269,7 +12269,7 @@ def test_a_non_ebusy_publish_failure_never_truncates_the_live_roster(
         raise AssertionError("a non-EBUSY failure must not write through")
 
     monkeypatch.setattr(switcher_mod, "replace_with_retry", refused)
-    monkeypatch.setattr(switcher_mod.shutil, "copy", recording_copy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", recording_copy)
 
     with pytest.raises(OSError):
         switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
@@ -12397,14 +12397,59 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     assert [oct(m) for m in seen] == ["0o600"] * len(seen)
 
 
-def test_a_failed_write_through_keeps_the_only_complete_copy(
+def test_a_refused_mode_carry_does_not_fail_a_publish_that_landed(
     temp_home: Path, monkeypatch
 ):
-    """Writing through cannot be atomic, so the temp is the safety net.
+    """Once the bytes are through the mount the write is committed.
 
-    If the copy dies half-way the destination is truncated, and removing the
-    temp too would destroy the last complete copy -- the exact loss that
-    `shutil.move` produced before this change.
+    `shutil.copy` is `copyfile` + `copymode`, and `copymode`'s chmod is
+    unguarded — the same shape as the `copystat`/`utime` failure this branch
+    rejected `copy2` for, and reachable on a mount that refuses chmod. Raising
+    there makes the caller roll credentials back around a roster that WAS
+    written, which is the outcome `_write_json`'s own design forbids. The mode
+    is still wanted, so a refusal warns instead.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    real_chmod = os.chmod
+
+    def refuse_the_destination(path, *a, **kw):
+        if str(path) == str(target):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        return real_chmod(path, *a, **kw)
+
+    warned: list[str] = []
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.os, "chmod", refuse_the_destination)
+    monkeypatch.setattr(switcher_mod, "warning", warned.append)
+
+    switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+    assert list(target.parent.glob("sequence.*.tmp")) == []
+    # The mode could not be set, so the user has to hear about it.
+    assert any("mode" in w or "permission" in w.lower() for w in warned), (
+        f"a refused mode carry went unreported: {warned}"
+    )
+
+
+def test_a_failed_write_through_names_the_copy_it_kept(temp_home: Path, monkeypatch):
+    """A truncated destination is recoverable only if the user is told where.
+
+    The write-through is the one publish that is not atomic, so a failure
+    part-way leaves the destination short and the temp holding the only
+    complete content. `_salvage_unreadable` in this same file sets the
+    standard: raise with the path, do not leave a bare errno.
     """
     from claude_swap import switcher as switcher_mod
 
@@ -12421,11 +12466,14 @@ def test_a_failed_write_through_keeps_the_only_complete_copy(
         raise OSError("injected: no space left on device")
 
     monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
-    monkeypatch.setattr(switcher_mod.shutil, "copy", truncating_copy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", truncating_copy)
 
-    with pytest.raises(OSError):
+    with pytest.raises(ConfigError) as exc:
         switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
 
     strays = list(target.parent.glob("sequence.*.tmp"))
     assert len(strays) == 1, "the only complete copy was removed"
     assert json.loads(strays[0].read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+    assert strays[0].name in str(exc.value), (
+        f"the surviving copy was not named: {exc.value}"
+    )

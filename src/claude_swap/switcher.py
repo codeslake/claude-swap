@@ -557,7 +557,11 @@ class ClaudeAccountSwitcher:
         return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
+        """Write JSON atomically: 0600 temp, read-back check, rename publish.
+
+        A destination that refuses the rename (EBUSY, a bind-mounted file) is
+        written through instead; that one path is not atomic and says so.
+        """
         content = json.dumps(data, indent=2)
 
         # Write to temp file first
@@ -591,12 +595,32 @@ class ClaudeAccountSwitcher:
                 # A bind-mounted destination pins the inode (a container
                 # mounting ~/.claude.json), so writing through is the only
                 # way to update it. Disowned before and reclaimed after: a
-                # copy that dies part-way must leave the complete content.
-                # `copy`, not `copy2`: `copystat`'s unguarded `utime` is
-                # refused by the same mounts that refuse the rename.
+                # copy that dies part-way must leave the complete content,
+                # and must say where, because nothing else names it.
                 source, temp_path = temp_path, None
-                shutil.copy(source, path)
+                try:
+                    shutil.copyfile(source, path)
+                except OSError as copy_err:
+                    raise ConfigError(
+                        f"{path.name} could not be updated in place "
+                        f"({copy_err}); it may now be truncated, and the "
+                        f"complete content was kept at {source.name}"
+                    ) from copy_err
                 temp_path = source
+                # `copyfile`, not `copy`/`copy2`: their mode and timestamp
+                # carries are unguarded, and a mount that refuses the rename
+                # refuses those too. Raising once the bytes are committed
+                # makes the caller roll back a write that worked, so the mode
+                # is set separately and a refusal is reported, not raised.
+                if sys.platform != "win32":
+                    try:
+                        os.chmod(path, 0o600)
+                    except OSError as mode_err:
+                        warning(
+                            f"{path.name} was updated in place but its mode "
+                            f"could not be set to 0600 ({mode_err}) — it may "
+                            f"be readable by other users."
+                        )
         finally:
             # Every path where the name is still ours, including the Ctrl-C
             # no except can name. The EBUSY branch disowns it deliberately.
