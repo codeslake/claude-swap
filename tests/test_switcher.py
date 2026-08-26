@@ -5299,8 +5299,21 @@ class TestSwitchSkipsBrokenSlots:
         # The blocking site gets the same advice as the informational one:
         # _account_is_switchable cannot tell an absent backup from one it
         # failed to read, so neither site may lead with a destructive re-add.
-        with pytest.raises(ConfigError, match="could not be read"):
+        #
+        # Matched on a phrase only THIS message carries. "could not be read"
+        # appears fifteen times across three modules, so it passed for an
+        # unrelated ConfigError raised anywhere in the call.
+        with pytest.raises(ConfigError, match="No managed account is usable"):
             s.switch()
+        # The ORDER is the finding, not just the wording: a locked store or an
+        # unmounted volume must be offered before a re-add that overwrites the
+        # credential the user simply cannot see right now.
+        with pytest.raises(ConfigError) as exc:
+            s.switch()
+        text = str(exc.value)
+        assert text.index("fix that first") < text.index("re-add a slot"), (
+            f"the destructive remedy is offered before the recoverable one: {text}"
+        )
 
     def test_fresh_machine_all_disabled_raises(self, temp_home: Path):
         s = self._setup(temp_home)
