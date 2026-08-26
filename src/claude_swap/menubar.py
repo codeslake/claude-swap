@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import plistlib
 import re
 import sys
@@ -71,7 +72,9 @@ def ensure_notification_identity(
             changed = True
         if changed or not path.exists():
             # atomic: an interrupted write must not leave a half-written plist
-            tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+            tmp = path.with_name(
+                f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+            )
             try:
                 tmp.write_bytes(plistlib.dumps(data))
                 os.replace(tmp, path)

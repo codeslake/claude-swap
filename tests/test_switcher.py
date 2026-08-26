@@ -12159,7 +12159,7 @@ def test_a_ctrl_c_during_the_roster_move_leaves_no_temp_file(temp_home: Path, mo
     with pytest.raises(KeyboardInterrupt):
         switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
 
-    strays = list(target.parent.glob("sequence.*.tmp"))
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
     assert strays == [], f"left behind {[s.name for s in strays]}"
 
 
@@ -12187,7 +12187,7 @@ def test_a_failed_roster_write_leaves_no_temp_file(temp_home: Path, monkeypatch)
     with pytest.raises(OSError):
         switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
 
-    strays = list(target.parent.glob("sequence.*.tmp"))
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
     assert strays == [], f"left behind {[s.name for s in strays]}"
 
 
@@ -12238,7 +12238,7 @@ def test_an_invalid_roster_readback_leaves_no_temp_file(temp_home: Path, monkeyp
         switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
 
     assert not target.exists(), "premise: nothing may be published"
-    strays = list(target.parent.glob("sequence.*.tmp"))
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
     assert strays == [], f"left behind {[s.name for s in strays]}"
 
 
@@ -12280,7 +12280,7 @@ def test_a_non_ebusy_publish_failure_never_truncates_the_live_roster(
     assert fired["publish"], "premise: the injected publish failure never fired"
     assert copies == [], f"a non-EBUSY error wrote through: {copies}"
     assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 1
-    assert list(target.parent.glob("sequence.*.tmp")) == []
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
 
 
 def test_a_destination_that_refuses_rename_is_written_through(
@@ -12321,7 +12321,7 @@ def test_a_destination_that_refuses_rename_is_written_through(
 
     assert fired["replace"], "premise: the injected EBUSY was never reached"
     assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
-    assert list(target.parent.glob("sequence.*.tmp")) == []
+    assert list(target.parent.glob(f".{target.name}.*.tmp")) == []
     if sys.platform != "win32":
         # The chmod-on-the-temp design exists because a 0644 ~/.claude.json
         # once published a key world-readable; the write-through must carry it.
@@ -12362,7 +12362,7 @@ def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
         switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
 
     assert fired["chmod"], "premise: the injected interrupt never fired"
-    strays = list(target.parent.glob("sequence.*.tmp"))
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
     assert strays == [], f"an interrupt at the mode call stranded {strays}"
 
 
@@ -12509,15 +12509,19 @@ def test_the_temp_is_created_narrow_on_a_name_that_does_not_exist(
     switcher = ClaudeAccountSwitcher()
     target = switcher.backup_dir / "sequence.json"
     target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(f".{os.getpid()}.tmp")
-    assert not temp.exists(), "premise: the temp name must be fresh for O_CREAT to apply its mode"
+    prefix = f".{target.name}.{os.getpid()}."
+    assert not list(target.parent.glob(prefix + "*.tmp")), (
+        "premise: the temp name must be fresh for O_CREAT to apply its mode"
+    )
 
     seen: list[int] = []
     real_open = os.open
 
     def sampling_open(path, flags, *a, **kw):
         fd = real_open(path, flags, *a, **kw)
-        if str(path) == str(temp):
+        # The writer draws a random suffix, so the name cannot be predicted.
+        name = os.path.basename(os.fspath(path))
+        if name.startswith(prefix) and name.endswith(".tmp"):
             seen.append(os.fstat(fd).st_mode & 0o777)
         return fd
 
@@ -12544,11 +12548,13 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     The mode is sampled during the read-back — the widest point of the window,
     where the payload is fully on disk and the publish has not happened.
 
-    The temp is PRE-CREATED at 0644, which is the only state `fchmod` covers
-    and the one a reused pid produces: the open carries no `O_EXCL`, so an
-    existing name is reopened and `O_CREAT`'s mode argument is ignored. On a
-    name that does not exist the open already yields 0600 under any umask this
-    would run with, and the case passes with the `fchmod` deleted.
+    The temp is WIDENED to 0644 the instant it is created, which is the only
+    state `fchmod` covers and the one a reused name produces: the open carries
+    no `O_EXCL`, so an existing name is reopened and `O_CREAT`'s mode argument
+    is ignored. On a name that does not exist the open already yields 0600
+    under any umask this would run with, and the case passes with the `fchmod`
+    deleted. It widens rather than pre-creating because the writer's name now
+    carries a random suffix and cannot be predicted.
     """
     if sys.platform == "win32":
         pytest.skip("POSIX modes only")
@@ -12557,19 +12563,29 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
     switcher = ClaudeAccountSwitcher()
     target = switcher.backup_dir / "sequence.json"
     target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(f".{os.getpid()}.tmp")
+    prefix = f".{target.name}.{os.getpid()}."
+    drawn: list[Path] = []
+    real_open = os.open
 
-    temp.write_text("", encoding="utf-8")
-    os.chmod(temp, 0o644)
+    def widening_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        name = os.path.basename(os.fspath(path))
+        if name.startswith(prefix) and name.endswith(".tmp"):
+            # 0644 the instant the file exists: the state a reused name leaves,
+            # reached without predicting a name that now carries randomness.
+            os.chmod(path, 0o644)
+            drawn.append(Path(path))
+        return fd
 
     seen: list[int] = []
     real_loads = json.loads
 
     def spy(s, *a, **kw):
-        if temp.exists():
-            seen.append(temp.stat().st_mode & 0o777)
+        if drawn and drawn[0].exists():
+            seen.append(drawn[0].stat().st_mode & 0o777)
         return real_loads(s, *a, **kw)
 
+    monkeypatch.setattr(switcher_mod.os, "open", widening_open)
     monkeypatch.setattr(switcher_mod.json, "loads", spy)
     switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
 
@@ -12614,7 +12630,7 @@ def test_a_failed_write_through_names_the_copy_it_kept(temp_home: Path, monkeypa
     with pytest.raises(ConfigError) as exc:
         switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
 
-    strays = list(target.parent.glob("sequence.*.tmp"))
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
     assert len(strays) == 1, "the only complete copy was removed"
     assert json.loads(strays[0].read_text(encoding="utf-8"))["activeAccountNumber"] == 2
     assert strays[0].name in str(exc.value), (
@@ -12654,7 +12670,7 @@ def test_a_ctrl_c_mid_write_through_still_names_the_copy_it_kept(
     with pytest.raises(KeyboardInterrupt):
         switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
 
-    strays = list(target.parent.glob("sequence.*.tmp"))
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
     assert len(strays) == 1, "the only complete copy was removed"
     assert json.loads(strays[0].read_text(encoding="utf-8"))["activeAccountNumber"] == 2
 
@@ -12663,7 +12679,80 @@ def test_a_ctrl_c_mid_write_through_still_names_the_copy_it_kept(
     assert out == "", f"a machine-readable channel was written to: {out!r}"
 
 
-@pytest.mark.parametrize("site", ["settings", "mappings", "session"])
+# EVERY atomic writer, not the three the first pass reached. A test named "no
+# writer" needs the whole population behind it; parametrised over three of
+# eight it was a true statement about a sample and a false one about its name.
+_ALL_ATOMIC_WRITERS = [
+    "settings", "mappings", "session",
+    "global_config", "active_creds", "backup_enc", "write_json", "plist",
+]
+
+
+def _writer_site(site: str, temp_home: Path, tmp_path: Path):
+    """-> (dir the temp is drawn in, a call that publishes, a stray temp name).
+
+    The stray is what a predecessor killed by a SIGKILL would have left: the
+    same pid-derived name, without whatever randomness the writer adds.
+    """
+    pid = os.getpid()
+    d = tmp_path / "d"
+    d.mkdir(exist_ok=True)
+    if site == "settings":
+        from claude_swap.settings import atomic_write_json
+
+        t = d / "s.json"
+        return d, (lambda: atomic_write_json(t, {"a": 1})), d / f".{t.name}.{pid}.tmp"
+    if site == "mappings":
+        from claude_swap.mappings import MappingStore
+
+        store = MappingStore(d)
+        return d, (lambda: store._write({})), d / f".mappings-{pid}.tmp"
+    if site == "session":
+        from claude_swap.session import SessionManager
+
+        mgr = SessionManager(ClaudeAccountSwitcher())
+        return (d, (lambda: mgr._write_manifest(d / "m.json", [])),
+                d / f".cswap-shared-{pid}.tmp")
+    if site == "plist":
+        from claude_swap import menubar
+
+        exe = d / "bin" / "python3"
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        return (exe.parent,
+                (lambda: menubar.ensure_notification_identity(
+                    exe, platform="darwin")),
+                exe.parent / f"Info.plist.{pid}.tmp")
+    if site == "write_json":
+        sw = ClaudeAccountSwitcher()
+        t = d / "seq.json"
+        return d, (lambda: sw._write_json(t, {"a": 1})), d / f".{t.name}.{pid}.tmp"
+
+    store = ClaudeAccountSwitcher()._store
+    if site == "global_config":
+        from claude_swap.credentials import get_global_config_path
+
+        cfg = get_global_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        return (cfg.parent,
+                (lambda: store._update_global_config(
+                    lambda c: c.__setitem__("primaryApiKey", "sk-ant-REDACTED"))),
+                cfg.parent / f".{cfg.name}.{pid}.tmp")
+    if site == "active_creds":
+        from claude_swap.credentials import get_claude_config_home
+
+        cd = get_claude_config_home()
+        cd.mkdir(parents=True, exist_ok=True)
+        return (cd,
+                (lambda: store._write_active_credentials_file("{}")),
+                cd / f".credentials.json.{pid}.tmp")
+    assert site == "backup_enc", site
+    cd = store._host.credentials_dir
+    cd.mkdir(parents=True, exist_ok=True)
+    t = cd / "1-probe.enc"
+    return cd, (lambda: store._atomic_b64_write(t, "{}")), cd / f".{t.name}.{pid}.tmp"
+
+
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
 def test_no_writer_mints_its_temp_name_inside_the_syscall(
     temp_home: Path, monkeypatch, tmp_path: Path, site: str
 ):
@@ -12690,20 +12779,8 @@ def test_no_writer_mints_its_temp_name_inside_the_syscall(
 
     monkeypatch.setattr(tempfile_mod, "mkstemp", exploding)
 
-    d = tmp_path / "d"
-    d.mkdir()
-    if site == "settings":
-        from claude_swap.settings import atomic_write_json
-
-        atomic_write_json(d / "s.json", {"a": 1})
-    elif site == "mappings":
-        from claude_swap.mappings import MappingStore
-
-        MappingStore(d)._write({})
-    else:
-        from claude_swap.session import SessionManager
-
-        SessionManager(ClaudeAccountSwitcher())._write_manifest(d / "m.json", [])
+    d, write, _stray = _writer_site(site, temp_home, tmp_path)
+    write()
     assert list(d.glob(".*tmp")) == [] and list(d.glob("*tmp*")) == [], (
         "a temp survived a completed write"
     )
@@ -12738,6 +12815,74 @@ def test_an_interrupted_salvage_leaves_no_partial_copy(
     assert strays == [], (
         f"a partial salvage survived as {[s.name for s in strays]} — the name "
         "says the bytes are there and they are not"
+    )
+
+
+def test_a_lost_salvage_race_does_not_delete_the_other_process_copy(
+    temp_home: Path, monkeypatch
+):
+    """`exists()` is a check, not a claim on the name.
+
+    Two switches hitting an unreadable config in the same second draw the same
+    `.unreadable-<epoch>` name. The `while salvage.exists()` loop settles who
+    goes first only until it returns; the winner creates the file in the gap,
+    our `O_EXCL` fails, and the cleanup then unlinks THEIR complete copy of the
+    credential — the one thing on disk that still had it.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    real_open = switcher_mod.os.open
+    theirs: list[Path] = []
+
+    def losing_open(target, *a, **kw):
+        # The other process wins the name between `exists()` and here.
+        p = Path(target)
+        p.write_text("their complete copy")
+        theirs.append(p)
+        raise FileExistsError(errno.EEXIST, "File exists")
+
+    monkeypatch.setattr(switcher_mod.os, "open", losing_open)
+    with pytest.raises(SwitchError):
+        switcher._salvage_unreadable(path, False, [])
+    monkeypatch.setattr(switcher_mod.os, "open", real_open)
+
+    assert theirs and theirs[0].exists(), (
+        f"the loser deleted the winner's salvage at {theirs[0].name}"
+    )
+    assert theirs[0].read_text() == "their complete copy"
+
+
+def test_a_salvage_that_was_never_created_is_not_announced_as_a_partial(
+    temp_home: Path, monkeypatch
+):
+    """A message naming a file that is not there sends the user after nothing.
+
+    When the create itself fails there is no copy at all, but `unlink` then
+    raises `FileNotFoundError` — an `OSError` — and the handler read that as
+    "the partial could not be removed" and named it in the error the user gets.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    def refusing_open(*_a, **_kw):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(switcher_mod.os, "open", refusing_open)
+    with pytest.raises(SwitchError) as excinfo:
+        switcher._salvage_unreadable(path, False, [])
+
+    assert list(path.parent.glob(f"{path.name}.unreadable-*")) == [], (
+        "premise: this case is about a salvage that does not exist"
+    )
+    assert "PARTIAL" not in str(excinfo.value), (
+        f"named a partial copy that was never created: {excinfo.value}"
     )
 
 
@@ -12836,7 +12981,7 @@ def test_a_copy_that_never_opened_the_destination_leaves_it_alone(
     )
 
 
-@pytest.mark.parametrize("site", ["settings", "mappings", "session"])
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
 def test_a_stranded_temp_from_a_recycled_pid_does_not_wedge_the_write(
     temp_home: Path, tmp_path: Path, site: str
 ):
@@ -12851,27 +12996,7 @@ def test_a_stranded_temp_from_a_recycled_pid_does_not_wedge_the_write(
     A random suffix keeps I1's property (the name is known before the file
     exists) AND mkstemp's collision profile.
     """
-    d = tmp_path / "d"
-    d.mkdir()
-    if site == "settings":
-        from claude_swap.settings import atomic_write_json
-
-        target = d / "s.json"
-        stray = d / f".{target.name}.{os.getpid()}.tmp"
-        write = lambda: atomic_write_json(target, {"a": 1})
-    elif site == "mappings":
-        from claude_swap.mappings import MappingStore
-
-        store = MappingStore(d)
-        stray = d / f".mappings-{os.getpid()}.tmp"
-        write = lambda: store._write({})
-    else:
-        from claude_swap.session import SessionManager
-
-        mgr = SessionManager(ClaudeAccountSwitcher())
-        stray = d / f".cswap-shared-{os.getpid()}.tmp"
-        write = lambda: mgr._write_manifest(d / "m.json", [])
-
+    _d, write, stray = _writer_site(site, temp_home, tmp_path)
     stray.write_text("a predecessor died holding this")
     write()
     assert stray.read_text() == "a predecessor died holding this", (
@@ -12879,7 +13004,7 @@ def test_a_stranded_temp_from_a_recycled_pid_does_not_wedge_the_write(
     )
 
 
-@pytest.mark.parametrize("site", ["settings", "mappings", "session"])
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
 def test_an_interrupt_at_the_create_strands_nothing(
     temp_home: Path, tmp_path: Path, monkeypatch, site: str
 ):
@@ -12926,3 +13051,46 @@ def test_an_interrupt_at_the_create_strands_nothing(
 
     strays = sorted(set(os.listdir(d)) - before)
     assert strays == [], f"an interrupt at the create left {strays}"
+
+
+def test_a_partial_larger_than_the_original_is_not_left_world_readable(
+    temp_home: Path, monkeypatch
+):
+    """The size proxy reads the ORDINARY direction as "never touched".
+
+    `_unnarrow` inferred "the copy truncated it" from `st_size < before_size`.
+    The mainline switch splices `oauthAccount` INTO an existing config, so the
+    new payload is larger — and a copy dying past the old size then reads as
+    untouched, leaving a partial `primaryApiKey` at the destination's old
+    world-readable mode. That is the exposure the narrowing exists to prevent,
+    re-opened by the guard added to stop it emptying an untouched file.
+
+    Measured before this fix: mode 0o644 -> 0o644 with the secret on disk.
+    """
+    import stat as stat_mod
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"a": 1}')            # 8 bytes
+    os.chmod(path, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def dies_past_the_old_size(_src, dst, *_a, **_kw):
+        # `copyfile` opens 'wb' (truncating) and then writes; it died after
+        # writing MORE than the original held.
+        Path(dst).write_text('{"primaryApiKey": "sk-ant-SECRET-PARTIAL')
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", dies_past_the_old_size)
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"activeAccountNumber": 2, "pad": "x" * 200})
+
+    left = path.read_text()
+    mode = stat_mod.S_IMODE(path.stat().st_mode)
+    assert "SECRET" not in left, (
+        f"a partial credential survived at mode {oct(mode)}: {left[:40]!r}"
+    )

@@ -7,6 +7,7 @@ import errno
 import json
 import logging
 import os
+import secrets
 import re
 import shutil
 import stat
@@ -533,6 +534,7 @@ class ClaudeAccountSwitcher:
         """
         stem = f"{path.name}.unreadable-{int(time.time())}"
         salvage = path.with_name(stem)
+        created = False
         n = 1
         while salvage.exists():
             salvage = path.with_name(f"{stem}.{n}")
@@ -547,6 +549,7 @@ class ClaudeAccountSwitcher:
             # cannot lose to us) and filled with `copyfile`, which truncates
             # without touching the mode.
             fd = os.open(salvage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
             try:
                 if sys.platform != "win32":
                     os.fchmod(fd, 0o600)
@@ -557,15 +560,22 @@ class ClaudeAccountSwitcher:
             # A PARTIAL COPY IS WORSE THAN NO COPY. The name is a promise the
             # bytes survived, and a restore from a truncated one loses whatever
             # the copy never reached -- silently, which is the loss this guard
-            # exists to prevent. `O_EXCL` above proved the name was ours, so
-            # nothing but our own partial write is removed here. BaseException
-            # because `except OSError` left the truncated file on every Ctrl-C.
+            # exists to prevent. BaseException because `except OSError` left the
+            # truncated file on every Ctrl-C.
+            #
+            # ONLY WHAT WE CREATED. `exists()` above is a check, not a claim on
+            # the name: a peer can take it in the gap, `O_EXCL` then fails, and
+            # unlinking here would delete THEIR complete copy. A create that
+            # never ran leaves nothing to remove and nothing to announce, so a
+            # missing file is silence, not a partial the user should go looking
+            # for.
             left = ""
-            try:
-                salvage.unlink()
-            except OSError:
-                left = (f"; a PARTIAL copy is at {salvage.name} and is NOT a "
-                        f"usable backup")
+            if created:
+                try:
+                    salvage.unlink()
+                except OSError:
+                    left = (f"; a PARTIAL copy is at {salvage.name} and is NOT "
+                            f"a usable backup")
             if not isinstance(e, OSError):
                 if left:
                     self._logger.warning(f"{path}{left}")
@@ -595,8 +605,14 @@ class ClaudeAccountSwitcher:
         """
         content = json.dumps(data, indent=2)
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
+        # A PID IS RECYCLED, and past the EBUSY branch below this temp becomes
+        # the only complete copy of the payload -- a predecessor killed by a
+        # SIGKILL leaves the same name, and the writer that draws it again
+        # either dies on it or eats a file it did not create. `with_suffix`
+        # also dropped the real extension, so `a.json` and `a.txt` collided.
+        temp_path = path.parent / (
+            f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        )
 
         try:
             # 0600 from creation: this writer publishes `~/.claude.json`,
@@ -667,9 +683,10 @@ class ClaudeAccountSwitcher:
                     f"{path.name} may now be truncated; the complete content "
                     f"was kept at {source.name}"
                 )
-                before_size = None
+                before = None
                 try:
-                    before_size = os.stat(path).st_size
+                    _st = os.stat(path)
+                    before = (_st.st_size, _st.st_mtime_ns)
                 except OSError:
                     pass
 
@@ -679,15 +696,24 @@ class ClaudeAccountSwitcher:
                     # SameFileError, SpecialFileError, any failure opening the
                     # SOURCE, and a signal in that prologue -- and there the
                     # destination still holds its original bytes. Emptying it
-                    # then destroys a live config the write never touched, so
-                    # the size is compared first: a truncation is visible as a
-                    # shrink, and only then is emptying safe (the complete
-                    # content is at `source`, which `kept` names).
+                    # then destroys a live config the write never touched.
+                    #
+                    # SIZE ALONE CANNOT ASK THAT. It reads a truncation as a
+                    # SHRINK, and the mainline direction is the opposite: the
+                    # switch splices `oauthAccount` into an existing config, so
+                    # the new payload is LARGER and a copy dying past the old
+                    # size looks untouched. mtime_ns settles it -- opening the
+                    # destination 'wb' truncates it, and a truncation that
+                    # changes the length marks mtime for update. A copy that
+                    # died on an already-empty file leaves no partial to
+                    # publish, which is the one case the pair cannot see and
+                    # the one where there is nothing to see.
                     if prior_mode is None or prior_mode == 0o600:
                         return
                     try:
-                        touched = (before_size is not None
-                                   and os.stat(path).st_size < before_size)
+                        st = os.stat(path)
+                        touched = (before is not None
+                                   and (st.st_size, st.st_mtime_ns) != before)
                         if touched:
                             with open(path, "wb"):
                                 pass
