@@ -12433,12 +12433,8 @@ def test_the_salvage_copy_is_never_wider_than_0600(temp_home: Path, monkeypatch)
         seen.append(os.stat(dst).st_mode & 0o777)
         return result
 
-    prev_umask = os.umask(0o022)
-    try:
-        monkeypatch.setattr(switcher_mod.shutil, "copyfile", sampling_copy)
-        switcher._salvage_unreadable(path, emit_output=False, warnings_out=[])
-    finally:
-        os.umask(prev_umask)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", sampling_copy)
+    switcher._salvage_unreadable(path, emit_output=False, warnings_out=[])
 
     assert seen, "premise: no salvage file was created"
     assert all(m == 0o600 for m in seen), (
@@ -12456,8 +12452,8 @@ def test_the_write_through_never_lands_the_secret_world_readable(
     0644. A copy that dies part-way never reaches a chmod placed after it, and
     a refused one leaves that mode permanently.
 
-    The umask is pinned to 022 because the assertion is otherwise vacuous: a
-    runner already at 077 gets 0600 from the unfixed order too.
+    What keeps this from being vacuous is the explicit 0644 below, not a
+    umask: measured, the case reads the same at 022, 077 and 000.
     """
     if sys.platform == "win32":
         pytest.skip("POSIX modes only")
@@ -12482,12 +12478,8 @@ def test_the_write_through_never_lands_the_secret_world_readable(
 
     monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
     monkeypatch.setattr(switcher_mod.shutil, "copyfile", dying_copy)
-    prev_umask = os.umask(0o022)
-    try:
-        with pytest.raises(ConfigError):
-            switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
-    finally:
-        os.umask(prev_umask)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
 
     assert seen, "premise: the write-through never ran"
     assert oct(seen[0]) == "0o600", (
@@ -12532,11 +12524,7 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
         return real_loads(s, *a, **kw)
 
     monkeypatch.setattr(switcher_mod.json, "loads", spy)
-    prev_umask = os.umask(0o022)
-    try:
-        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
-    finally:
-        os.umask(prev_umask)
+    switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
 
     assert seen, "premise: the read-back never sampled the temp"
     assert [oct(m) for m in seen] == ["0o600"] * len(seen)
