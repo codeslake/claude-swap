@@ -920,22 +920,26 @@ class ClaudeAccountSwitcher:
         return ""
 
     def _account_is_switchable(self, account_num: str) -> bool:
-        """Whether a slot has both stored credentials and config backups.
+        """Whether a slot has a stored credential to activate.
 
         Used by switch() and switch_to() to decide whether a target slot can
         be activated without re-adding the account. Tolerates stale sequence
         entries that reference a removed account record.
+
+        The CONFIG backup is deliberately not required (#41 required it, when
+        a missing one aborted the switch). ``_target_config`` rebuilds it from
+        the sequence record, and the record is what this method already
+        refuses without — so a config-less slot is recoverable, not broken.
+        Saying otherwise made ``switch_to N`` succeed on a slot that rotation,
+        ``best`` and auto-switch all skipped, and had the TUI advise a login
+        on a slot whose credential was fine.
         """
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num))
         if not record:
             return False
         email = record.get("email", "")
-        if not self._read_account_credentials(str(account_num), email):
-            return False
-        if not self._read_account_config(str(account_num), email):
-            return False
-        return True
+        return bool(self._read_account_credentials(str(account_num), email))
 
     def _write_account_config(
         self, account_num: str, email: str, config: str
@@ -3762,9 +3766,25 @@ class ClaudeAccountSwitcher:
             # The roster is the authority on WHICH slot is active; the live
             # store on what that slot currently holds. A fallback only, so a
             # live identity still wins whenever there is one.
+            #
+            # AND ONLY WHEN THE SLOT IS ITSELF EMPTY. `current_identity is
+            # None` is also every ordinary logged-out state (`/logout`, a
+            # deleted credentials file, a fresh machine with an imported
+            # roster). Marking the slot active there routes its read at the
+            # EMPTY live store instead of its own intact backup, so a slot
+            # that showed usage starts reading as having no login. After the
+            # landing the slot has no backup either, which is what separates
+            # the two.
             roster_active = data.get("activeAccountNumber")
             if roster_active is not None:
-                active_num = str(roster_active)
+                roster_email = (
+                    (data.get("accounts", {}).get(str(roster_active)) or {})
+                    .get("email", "")
+                )
+                if not self._read_account_credentials(
+                    str(roster_active), roster_email
+                ):
+                    active_num = str(roster_active)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # PER THREAD, not per switcher. The TUI's two refresh lanes and the
@@ -5651,9 +5671,9 @@ class ClaudeAccountSwitcher:
                 if target_disabled:
                     reason = console_reason = "(disabled)"
                 else:
-                    reason = "(no stored credentials/config)"
+                    reason = "(no stored credentials)"
                     console_reason = (
-                        "(no stored credentials/config, re-add with "
+                        "(no stored credentials, re-add with "
                         f"cswap --add-account --slot {target})"
                     )
                 if json_output:
@@ -5867,12 +5887,12 @@ class ClaudeAccountSwitcher:
             if not self._account_is_switchable(candidate):
                 if json_output:
                     warnings.append(
-                        f"Skipped Account-{candidate} (no stored credentials/config)"
+                        f"Skipped Account-{candidate} (no stored credentials)"
                     )
                 else:
                     print(
                         f"{accent('Skipping')} Account-{candidate} "
-                        f"(no stored credentials/config, re-add with "
+                        f"(no stored credentials, re-add with "
                         f"cswap --add-account --slot {candidate})"
                     )
                 continue
@@ -6386,15 +6406,29 @@ class ClaudeAccountSwitcher:
                 "credentialsMtime": creds_mtime,
             },
         )
-        self._logger.warning(
-            "Live credential does not belong to Account-%s (%s): stashed as %s "
-            "(credentials mtime %s). Something outside cswap rewrote the live "
-            "login after the last switch.",
-            current_account,
-            reason,
-            entry_id,
-            creds_mtime or "unknown",
-        )
+        if reason in ("foreign", "alien", "known-foreign"):
+            # Issue #117's corruption signature, and only these three earn it:
+            # they are ownership VERDICTS — the live bytes provably are not
+            # this slot's. A DISPLACEMENT (an ordinary --force rewrite, or a
+            # logged-out landing) preserves bytes that were never in doubt,
+            # and firing this text there trains readers to ignore the one
+            # case that means something.
+            self._logger.warning(
+                "Live credential does not belong to Account-%s (%s): stashed "
+                "as %s (credentials mtime %s). Something outside cswap "
+                "rewrote the live login after the last switch.",
+                current_account,
+                reason,
+                entry_id,
+                creds_mtime or "unknown",
+            )
+        else:
+            self._logger.info(
+                "Live credential preserved before it was replaced (%s): "
+                "stashed as %s",
+                reason,
+                entry_id,
+            )
         return entry_id
 
     def _switch_to_empty_slot(
@@ -6427,7 +6461,24 @@ class ClaudeAccountSwitcher:
         ``oauthAccount`` goes too. Left behind, sequence.json and
         ``~/.claude.json`` name different slots, and every later switch fails
         the "empty read must not overwrite the departing backup" guard.
+
+        Refuses a SELF-landing: clearing the live login to reach the slot it
+        is already on costs a working credential and reaches nothing.
         """
+        if from_ref == to_ref:
+            # `--force` skips the already-active short-circuit deliberately —
+            # its job is to rewrite the live login from the stored backup —
+            # so it arrives here when that backup is absent. Being on the slot
+            # is the whole state this landing exists to produce, so there is
+            # nothing left to do but log in. Refuse before the clear: `from ==
+            # to` also makes `switched` False, and `switch_to`'s forced
+            # self-activation block then relabels the payload "Activated
+            # Account-N from stored backup" over a backup that does not exist.
+            raise SwitchError(
+                f"Already on Account-{target_account} ({target_email}), and "
+                f"it has no stored login to restore from. Run /login in "
+                f"Claude Code, then: cswap add --slot {target_account}"
+            )
         active = self._store._read_active_credentials()
         live = active.value
         # PRESENT BUT UNREADABLE is not ABSENT, and both are falsy. `""` means
@@ -6522,7 +6573,8 @@ class ClaudeAccountSwitcher:
             print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
             warning(note)
         return {
-            "switched": True,
+            # No "switched": `_switch_result_from_op` derives it from
+            # `from != to` and ignores whatever an op says.
             "from": from_ref,
             "to": to_ref,
             "needsLogin": True,

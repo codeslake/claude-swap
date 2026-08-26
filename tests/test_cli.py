@@ -1024,6 +1024,63 @@ class TestAutoCommand:
         installed[signal_mod.SIGINT]()
         assert stopped == [True], "the SIGINT handler does not stop the engine"
 
+    def test_a_second_ctrl_c_aborts_rather_than_doing_nothing(
+        self, temp_home
+    ):
+        """One Ctrl-C asks; a second must be able to insist.
+
+        `stop()` is idempotent — the second call hits `if self._live_lock is
+        None: return` and does nothing. So with a tick wedged in a network
+        call the operator had no way out short of SIGKILL from another
+        terminal, while the banner still says "Ctrl-C to stop". The handler
+        restores the default, which is the standard escalation: the second
+        signal raises KeyboardInterrupt.
+        """
+        import signal as signal_mod
+
+        installed = {}
+
+        def record(sig, handler):
+            installed[sig] = handler
+
+        class _Engine:
+            dry_run = False
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch.object(signal_mod, "signal", record), \
+                patch("claude_swap.autoswitch.AutoSwitchEngine",
+                      return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+            # Delivered INSIDE the patch, so the handler's own re-install is
+            # recorded here instead of touching the test process's signals.
+            installed[signal_mod.SIGINT]()
+
+        assert installed[signal_mod.SIGINT] is signal_mod.default_int_handler, (
+            "after the first Ctrl-C the handler is still the engine's stop(), "
+            "which is a no-op the second time — a wedged tick cannot be "
+            "interrupted at all"
+        )
+
+    def test_auto_flag_is_refused_where_it_does_nothing(self, capsys):
+        """`--auto` is read only by the tui branch.
+
+        Everywhere else it parsed cleanly and was dropped, so `cswap watch
+        --auto` opened the watch page in silence — a flag that means "start
+        switching accounts" is the wrong one to ignore quietly.
+        """
+        with patch.object(sys, "argv", ["claude-swap", "watch", "--auto"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--auto can only be used with 'tui'" in capsys.readouterr().err
+
     def test_auto_help(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "auto", "--help"]):
             with pytest.raises(SystemExit) as excinfo:

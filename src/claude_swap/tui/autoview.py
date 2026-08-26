@@ -389,11 +389,10 @@ class AutoScreen(Screen):
                 # (data.window_chip_label) so one account cannot read two ways.
                 now = time.time()
                 chips = [
-                    (key, label, wpct)
+                    (key, label, data.window_pct(acc.usage.last_good, key))
                     for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
-                    if (wpct := data.window_pct(acc.usage.last_good, key))
-                    is not None
                 ]
+                chips = [c for c in chips if c[2] is not None]
                 for i, (key, label, wpct) in enumerate(chips):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     entry.append(

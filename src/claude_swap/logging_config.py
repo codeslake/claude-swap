@@ -1,6 +1,7 @@
 """Logging configuration for Claude Swap."""
 
 import logging
+from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -20,8 +21,15 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
         return super()._open()
 
 
+@lru_cache(maxsize=None)
 def decision_logger(log_dir: Path) -> logging.Logger:
-    """A per-engine logger for the auto-switch tick reasoning."""
+    """The auto-switch tick-reasoning logger for one backup dir.
+
+    Memoized because `logging.Handler.__init__` registers itself in the
+    module's shutdown list, so a per-engine handler is never collected: every
+    TUI dry-run/LIVE toggle built a new engine and leaked one open file, and
+    two `RotatingFileHandler`s on one path rotate it independently.
+    """
     # Constructed, not ``getLogger``: with no parent it cannot spill per-tick
     # records into the rotating claude-swap.log. No formatter: the default is
     # ``%(message)s`` and the caller supplies the UTC ``event.ts``

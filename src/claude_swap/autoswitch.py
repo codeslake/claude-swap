@@ -2179,9 +2179,18 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first:
+            elif consume_first and trigger != "at-limit":
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
+                #
+                # NOT for at-limit. `consume_first` is the configured
+                # STRATEGY, and this arm sitting ahead of the escape arm made
+                # the escape rank on the weekly reset for consume-first users
+                # — filtering on one axis while sorting on another, the same
+                # shape the recovery-hysteresis gate above already had to
+                # close. Consume-first is a preference about which account to
+                # burn NEXT; at-limit is a stopped session, and the window
+                # that stopped it is the only axis that can end that.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -2711,7 +2720,17 @@ class AutoSwitchEngine:
                     "lock anyway, so two engines may act once"
                 )
                 _logger.warning(message)
-                self._emit(ErrorEvent(message=message, transient=True))
+                # NOT through `_emit`: it brackets the call with
+                # `_emit_in_flight`, which is the WORKER's flag and has no
+                # refcount, so this thread's `finally` would clear it under a
+                # worker parked in `on_event` — and the next `stop()` then
+                # waits the full ceiling instead of taking the exemption.
+                try:
+                    self.on_event(ErrorEvent(message=message, transient=True))
+                except Exception as exc:  # noqa: BLE001 — see `_emit`
+                    _logger.warning(
+                        f"auto-switch event consumer raised: {exc}"
+                    )
             lock.release()
 
     def wake(self) -> None:

@@ -717,7 +717,17 @@ Defaults live in settings.json in the backup root; flags override them.
         # the LIVE lock stayed held. The next engine then saw no cooldown and
         # could switch again immediately.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
-        signal.signal(signal.SIGINT, lambda *_: engine.stop())
+
+        def _interrupt(*_):
+            # ESCALATE. `stop()` is idempotent, so a second Ctrl-C hits its
+            # early return and does nothing — leaving a tick wedged in a
+            # network call with no way out but SIGKILL from another terminal,
+            # under a banner that says Ctrl-C stops it. Restoring the default
+            # makes the second signal raise KeyboardInterrupt.
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            engine.stop()
+
+        signal.signal(signal.SIGINT, _interrupt)
         if not args.json:
             print(
                 dimmed(
@@ -998,7 +1008,7 @@ Commands:
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
-  %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
+  %(prog)s tui [--auto]               interactive dashboard (--auto: auto-switch view, LIVE)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s menubar                    macOS menu bar app
   %(prog)s upgrade                    self-upgrade to latest
@@ -1234,6 +1244,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with 'list'")
+
+    # Only the tui branch consults it, so anywhere else it parsed cleanly and
+    # did nothing — `cswap watch --auto` opened the watch page in silence.
+    if args.tui_auto and not args.tui:
+        parser.error("--auto can only be used with 'tui'")
 
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")

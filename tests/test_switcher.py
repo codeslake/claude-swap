@@ -5280,6 +5280,14 @@ class TestSwitchSkipsBrokenSlots:
         s._write_json(s.sequence_file, data)
 
     def test_account_is_switchable_helper(self, temp_home: Path):
+        """The CREDENTIAL is the axis; the config is rebuildable.
+
+        Slot 3 asserted False under #41, when a missing config aborted the
+        switch. `_target_config` now rebuilds it from the sequence record,
+        so the slot is recoverable and the predicate must say so — see
+        test_rotation_reaches_a_config_less_slot_now_that_it_rebuilds for
+        what disagreeing cost.
+        """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com", creds=False)
@@ -5287,9 +5295,53 @@ class TestSwitchSkipsBrokenSlots:
 
         assert s._account_is_switchable("1") is True
         assert s._account_is_switchable("2") is False
-        assert s._account_is_switchable("3") is False
+        assert s._account_is_switchable("3") is True
         # Stale sequence reference to a missing account record.
         assert s._account_is_switchable("99") is False
+
+    def test_rotation_reaches_a_config_less_slot_now_that_it_rebuilds(
+        self, temp_home: Path, capsys
+    ):
+        """#41 skipped a config-less slot because it could not be activated.
+
+        It can now: the config backup is only ``oauthAccount``, and
+        ``_target_config`` rebuilds it from the sequence record — which
+        ``_account_is_switchable`` already requires to exist. Leaving the
+        predicate at False made ``switch_to N`` succeed on a slot that bare
+        rotation, ``best``, ``next-available``, auto-switch and the TUI all
+        called unreachable.
+
+        The TUI half is the damaging one: an unswitchable row with no
+        sentinel renders ``USAGE_NO_CREDENTIALS`` — "no stored login, switch
+        here then log in" — on a slot whose credential is fine, and
+        following that advice overwrites it.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", config=False)
+
+        assert s._account_is_switchable("2") is True, (
+            "a slot whose config is rebuildable is not a broken slot"
+        )
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+            },
+        }))
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        assert "Skipping Account-2" not in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
 
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
@@ -5395,9 +5447,13 @@ class TestSwitchSkipsBrokenSlots:
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
     def test_fresh_machine_all_broken_raises(self, temp_home: Path):
+        """Both slots lack the CREDENTIAL, which is the only unrecoverable
+        half. Slot 2 used to carry `config=False` here, which no longer makes
+        a slot broken — `_target_config` rebuilds that from the roster.
+        """
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com", creds=False)
-        self._seed(s, 2, "b@example.com", config=False)
+        self._seed(s, 2, "b@example.com", creds=False)
 
         with pytest.raises(ConfigError, match="No managed accounts have valid"):
             s.switch()
@@ -6451,6 +6507,62 @@ class TestSwitchSkipsBrokenSlots:
         cfg = json.loads((temp_home / ".claude.json").read_text())
         assert cfg["oauthAccount"]["emailAddress"] == "b@example.com"
 
+    def test_a_plain_logout_still_reads_the_active_slot_from_its_backup(
+        self, temp_home: Path
+    ):
+        """The roster fallback is licensed by the empty-slot landing only.
+
+        Keyed on `current_identity is None`, it also catches every ordinary
+        logged-out state — `/logout`, a deleted `.credentials.json`, a fresh
+        machine carrying an imported roster. There the roster slot becomes
+        `is_active`, so `_build_accounts_info` reads it from the LIVE store
+        instead of its backup: a slot with a perfectly good stored credential
+        goes from showing usage to reading as having no login at all.
+
+        The landing case is distinguishable and it is the one that needs the
+        fallback: after it, the roster slot has no stored credential either.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        # A plain logout: the live store is empty, the backups are intact.
+        (temp_home / ".claude" / ".credentials.json").unlink(missing_ok=True)
+        (temp_home / ".claude.json").write_text(json.dumps({}))
+
+        info = s._build_accounts_info()
+        creds_for_1 = next(c for num, _e, _o, _u, _a, c, _al in info if num == 1)
+        assert creds_for_1, (
+            "the active slot was read from the empty live store, so its own "
+            "stored credential became invisible after an ordinary logout"
+        )
+
+    def test_a_landed_empty_slot_still_reads_as_active(self, temp_home: Path):
+        """The case the fallback exists for must keep working.
+
+        After a logged-out landing the live store is empty AND the slot has
+        no backup, so nothing else can name the active slot.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False, config=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        s._write_json(s.sequence_file, data)
+
+        (temp_home / ".claude" / ".credentials.json").unlink(missing_ok=True)
+        (temp_home / ".claude.json").write_text(json.dumps({}))
+
+        info = s._build_accounts_info()
+        active = [num for num, _e, _o, _u, a, _c, _al in info if a]
+        assert active == [2], (
+            "a landed empty slot lost its active mark, which is the whole "
+            "reason the roster fallback exists"
+        )
+
     def test_a_blind_keychain_refuses_rather_than_rebuilding_the_config(
         self, temp_home: Path, monkeypatch
     ):
@@ -6498,6 +6610,106 @@ class TestSwitchSkipsBrokenSlots:
         assert s._get_sequence_data()["activeAccountNumber"] == 1, (
             "landed on the slot on a config rebuilt from the roster while "
             "the real backup was merely unreadable"
+        )
+
+    def test_force_onto_the_active_slot_with_no_backup_keeps_the_login(
+        self, temp_home: Path
+    ):
+        """`--force` on the slot you are ALREADY on must not log you out.
+
+        `--force` skips the already-active short-circuit on purpose: its job
+        is to rewrite the live login FROM the stored backup. With no backup
+        there is nothing to rewrite from, and landing "logged out" reaches
+        nothing — the slot is already the active one, which is the whole
+        state the empty-slot landing exists to produce.
+
+        Measured before the guard: the live credential was cleared, and
+        because `from == to` makes `switched` False, `switch_to`'s forced
+        self-activation block overwrote the payload with
+        `reason="activated"` / "Activated Account-1 from stored backup" —
+        a restore reported over a backup that does not exist. The TUI then
+        read `switched=False` and notified "No switch: activated" after
+        clearing the login.
+        """
+        from claude_swap.exceptions import SwitchError
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com", creds=False)
+        self._seed(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-live-1",
+            },
+        })
+        (temp_home / ".claude" / ".credentials.json").write_text(live)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+            },
+        }))
+
+        with pytest.raises(SwitchError, match="Already on"):
+            s.switch_to("1", json_output=True, force=True)
+
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == live, (
+            "--force cleared the live login to land on the slot it was "
+            "already on, and there is no backup to restore it from"
+        )
+
+    def test_an_empty_slot_landing_does_not_cry_corruption(
+        self, temp_home: Path, caplog
+    ):
+        """Issue #117's signature belongs to ownership VERDICTS, not to a
+        displacement.
+
+        The landing stashes the live credential before clearing it, and the
+        stash logged "does not belong to Account-1 (displaced-by-empty-slot)
+        ... Something outside cswap rewrote the live login after the last
+        switch" — every clause of which is false here. Firing the corruption
+        signature on an ordinary switch is how it stops being read.
+        """
+        import logging
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", creds=False)
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        # The slot's OWN bytes, so Step 1 classifies this as an ordinary
+        # backup and the only stash left is the landing's.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "a@example.com",
+                "accountUuid": "uuid-1",
+            },
+        }))
+
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["needsLogin"] is True
+        assert not [
+            r for r in caplog.records
+            if "Something outside cswap" in r.getMessage()
+        ], "the landing raised issue #117's corruption signature on a clean switch"
+        preserved = [
+            r for r in caplog.records
+            if "preserved before it was replaced" in r.getMessage()
+        ]
+        assert preserved, "the stash stopped saying it happened at all"
+        assert preserved[0].levelno == logging.INFO, (
+            "a routine preservation must not carry a WARNING"
         )
 
     def test_an_unmanaged_live_login_survives_landing_on_an_empty_slot(

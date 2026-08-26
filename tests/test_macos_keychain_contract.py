@@ -1201,5 +1201,9 @@ class TestOurOwnFileModeIsNotAKeychainFailure:
 
         out = s._perform_switch("2", emit_output=False, force_activate=True)
 
-        assert out["switched"] is True, out
+        # `needsLogin`, not `switched`: the other two `_perform_switch`
+        # returns carry only from/to/warnings, and `_switch_result_from_op`
+        # derives `switched` from `from != to`. Asserting a key one of three
+        # paths happens to add tests the shape, not the landing.
+        assert out["needsLogin"] is True, out
         assert s._get_sequence_data()["activeAccountNumber"] == 2

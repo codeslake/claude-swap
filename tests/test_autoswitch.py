@@ -3617,6 +3617,39 @@ class TestEveryAccountAboveThreshold:
             "window (3: max(85,10)=85 -> headroom 15 beats 2's 10)"
         )
 
+    def test_the_escape_axis_is_not_cancelled_by_the_consume_first_strategy(
+        self, temp_home
+    ):
+        """Same case, `strategy=consume-first` — the answer must not change.
+
+        `consume_first` is the configured STRATEGY, not the trigger, and its
+        arm sat ahead of the escape arm. So an at-limit escape for a
+        consume-first user ranked on the soonest weekly reset and never
+        reached the window that had actually blocked it: the feature applied
+        to half the users. The same shape the recovery-hysteresis fix
+        already closed one branch above — filtering on one axis while
+        sorting on another.
+
+        The consume-first PREFERENCE is proactive (which account to burn
+        next); at-limit is not a preference, it is a session that is stopped.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com"); h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com"); h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 20.0}},
+            "2": {"five_hour": {"pct": 0.0},   "seven_day": {"pct": 90.0}},
+            "3": {"five_hour": {"pct": 85.0},  "seven_day": {"pct": 10.0}},
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.active_number() == 2, (
+            "consume-first ranked the escape on the weekly reset, so a 5h "
+            "limit sent the user to the account with 15 points of 5h room "
+            "instead of the one with 100"
+        )
+
     def test_control_a_7d_limit_still_ranks_on_the_weekly_axis(self, harness):
         """CONTROL for the case above, and it is what makes it a fix rather
         than a preference. Flip which window blocks the active account and the
@@ -7691,6 +7724,47 @@ class TestLiveLock:
             f"events {[type(e).__name__ for e in harness.events]} — a JSONL "
             "consumer gets no `error` record for the one condition where two "
             "engines can act at once"
+        )
+
+    def test_the_release_warning_does_not_touch_the_workers_emit_flag(
+        self, harness
+    ):
+        """`_emit_in_flight` belongs to the WORKER, and it has no refcount.
+
+        Routing `stop()`'s own ceiling warning through `_emit` set the flag
+        on this thread and cleared it in `finally` — so a worker that entered
+        `on_event` in the meantime came back to a cleared flag, and the next
+        `stop()` waited the whole ceiling instead of taking the exemption
+        that exists to stop the TUI deadlocking.
+        """
+        from claude_swap import autoswitch as autoswitch_mod
+
+        engine = harness.engine
+        seen: list[bool] = []
+        original = engine.on_event
+
+        def watch(event):
+            seen.append(engine._emit_in_flight.is_set())
+            original(event)
+
+        engine.on_event = watch
+
+        class _Lock:
+            def release(self):
+                pass
+
+        engine._live_lock = _Lock()
+        engine._tick_thread_id = -1
+        engine._tick_in_flight.clear()
+        harness.events.clear()
+
+        with patch.object(autoswitch_mod, "_STOP_SWITCH_WAIT_S", 0.05):
+            engine.stop()
+
+        assert seen, "premise: the ceiling expired and the warning was emitted"
+        assert not any(seen), (
+            "stop() marked the worker's emit flag while delivering its own "
+            "message, so its finally clears a flag it never owned"
         )
 
     def test_stop_on_the_ui_thread_does_not_block_on_the_worker(self, harness):
