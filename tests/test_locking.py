@@ -133,20 +133,17 @@ class TestFileLock:
                     f"a single retry sleep of {seconds:.3f}s exceeds the "
                     f"whole {budget}s timeout"
                 )
-            # THE SUM, NOT THE WALL CLOCK. The per-sleep invariant above
-            # cannot see many small sleeps that are each legal and together
-            # overrun; that is what this adds. Measuring it as a wall-clock
-            # ceiling made it an OS-jitter test instead: `begin` is anchored
-            # before `mkdir(parents=...)` + `open()`, which run before
-            # `acquire` starts its own deadline, and this file runs on a
-            # Windows CI shard with -n 4 where a cold CreateFile can eat the
-            # whole margin and fail correct code. The sum has no anchor and
-            # no first-open in it.
-            total = sum(seconds for _at, seconds in slept)
-            assert total <= budget + 1e-6, (
-                f"retry sleeps totalled {total:.3f}s against a {budget}s "
-                "timeout — legal individually, an overshoot together"
-            )
+            # NO SUM CEILING. It claimed to catch "many small sleeps, each
+            # legal, together overrunning", but the clamp caps every sleep at
+            # the budget the code itself has left, so a correct implementation
+            # reaches that shape only when `monotonic()` does not advance
+            # across a sleep -- it then legitimately sleeps the whole remaining
+            # budget again. Measured on a Windows shard, where the clock ticks
+            # in ~15.6ms steps: two 0.01s sleeps against a 0.01s budget, on
+            # code with no defect. The flat sleep this test exists for is
+            # caught by the per-sleep assert above (measured: same failure,
+            # same line, with and without a sum ceiling), so the ceiling cost
+            # a red CI and bought nothing.
         finally:
             waiter.release()
             holder.release()
