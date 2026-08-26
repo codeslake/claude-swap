@@ -501,20 +501,12 @@ class SessionManager:
         self._logger = switcher._logger
 
     def _warn(self, msg: str) -> None:
-        """Warn durably: print for this terminal, log to survive it.
-
-        For launch-path warnings only — the exec that follows takes the
-        printed line off the screen, and nothing else records it.
-        """
+        """Print for this terminal, log to survive the exec that clears it."""
         warning(msg)
         self._logger.warning(msg)
 
     def _note(self, msg: str) -> None:
-        """`_warn` for a notice: same terminal, same durability, INFO level.
-
-        For the launch-path lines that record where the user's own data was
-        moved — the destination is named there and nowhere else.
-        """
+        """`_warn` at INFO, for a line naming where the user's data went."""
         print(dimmed(msg))
         self._logger.info(msg)
 
@@ -732,10 +724,9 @@ class SessionManager:
                 )
             if outcome.error is not None:
                 # The kind picks the remedy and reaches no other record —
-                # oauth logs it at DEBUG. Render it the way the CLI usage
-                # line and the TUI do: several kinds here are not failures
-                # ("consume-busy" retries next pass), and the bare kind
-                # would report one.
+                # oauth logs it at DEBUG. Render it, never raw: several
+                # kinds here are not failures ("consume-busy" retries next
+                # pass) and the bare kind would report one.
                 self._warn(
                     f"Could not refresh the token for Account-{account_num} "
                     f"({ERROR_NOTES.get(outcome.error, outcome.error)}); "

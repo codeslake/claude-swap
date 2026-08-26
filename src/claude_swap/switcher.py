@@ -53,7 +53,6 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
 from claude_swap.fsutil import read_text_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
-from claude_swap.oauth import ERROR_NOTES
 from claude_swap.models import (
     AccountSnapshot,
     AccountsSnapshot,
@@ -75,6 +74,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
+from claude_swap.oauth import ERROR_NOTES
 from claude_swap.paths import (
     get_backup_root,
     get_credentials_path,
@@ -1825,9 +1825,8 @@ class ClaudeAccountSwitcher:
     def _empty_rotation_advice(self, data: dict) -> str:
         """Why nothing is selectable, and the remedy that matches the cause.
 
-        Re-enabling only helps when a slot's stored credentials/config can be
-        read. `_account_is_switchable` cannot tell an absent backup from one
-        it failed to read, so that arm must not lead with a re-add: it would
+        `_account_is_switchable` cannot tell an absent backup from one it
+        failed to read, so that arm must not lead with a re-add — it would
         overwrite a credential the user simply cannot see right now.
         """
         if any(
