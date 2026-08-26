@@ -683,3 +683,17 @@ class TestSaveGoesThroughTheSharedWriter:
         original = menubar.MenuBarSettings(auto_switch_enabled=True)
         original.save(p)
         assert menubar.MenuBarSettings.load(p) == original
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")
+    def test_the_file_is_not_left_at_the_umask_default(self, tmp_path):
+        """The round trip alone passes against a plain `write_text`, so it
+        cannot see the delegation. The mode can: the shared writer sets 0600
+        on the fd, a `write_text` takes whatever the umask allows. The umask
+        is pinned because a runner already at 0077 gets 0600 either way."""
+        p = tmp_path / "menubar_settings.json"
+        previous = os.umask(0o022)
+        try:
+            menubar.MenuBarSettings().save(p)
+        finally:
+            os.umask(previous)
+        assert oct(p.stat().st_mode & 0o777) == "0o600"

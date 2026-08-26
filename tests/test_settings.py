@@ -11,7 +11,6 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import settings as settings_mod
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
@@ -360,12 +359,13 @@ class TestAtomicWriteThroughSymlink:
 
 
 class TestTheWrittenFileLandsAt0600:
-    """The mode must not depend on the caller's umask.
+    """The published file is EXACTLY 0600, whatever the umask.
 
-    ``mkstemp`` masks its 0600 request, so under a restrictive umask the temp
-    lands 0400 and under a permissive one 0600 — neither is what this writer
-    promises. It publishes settings and the autoswitch state; a session's
-    ``.claude.json`` goes through it too.
+    This does not distinguish setting the mode before the publish from after
+    it -- both land 0600 -- and it is not claimed to. What it pins is that
+    the mode is set at all: ``mkstemp`` masks its request, so dropping the
+    call publishes 0400 under a restrictive umask and 0600 under a lax one,
+    and only one of those is a file its owner can still write.
     """
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes only")

@@ -569,8 +569,10 @@ class ClaudeAccountSwitcher:
 
         try:
             # 0600 from creation: this writer publishes `~/.claude.json`,
-            # which can carry `primaryApiKey`. fchmod as well as the open
-            # mode, because O_CREAT leaves a leftover temp's mode alone.
+            # which can carry `primaryApiKey`. `fchmod` is what enforces it —
+            # the open mode is masked by the umask and ignored outright on a
+            # leftover temp. The mode arg only carries Windows, where there
+            # is no `fchmod`.
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 if sys.platform != "win32":
@@ -579,7 +581,7 @@ class ClaudeAccountSwitcher:
 
             # Validate written content
             try:
-                json.loads(temp_path.read_text(encoding="utf-8"))
+                json.loads(read_text_with_retry(temp_path))
             except json.JSONDecodeError:
                 raise ConfigError("Generated invalid JSON")
 
@@ -606,20 +608,33 @@ class ClaudeAccountSwitcher:
                         f"({copy_err}); it may now be truncated, and the "
                         f"complete content was kept at {source.name}"
                     ) from copy_err
+                except BaseException:
+                    # The Ctrl-C the rest of this change is about, at the one
+                    # publish that is not atomic. It has to stay an interrupt,
+                    # so the message cannot ride the exception: stderr, which
+                    # the `--json` envelope on stdout does not share.
+                    error(
+                        f"{path.name} may now be truncated; the complete "
+                        f"content was kept at {source.name}"
+                    )
+                    raise
                 temp_path = source
                 # `copyfile`, not `copy`/`copy2`: their mode and timestamp
                 # carries are unguarded, and a mount that refuses the rename
                 # refuses those too. Raising once the bytes are committed
                 # makes the caller roll back a write that worked, so the mode
-                # is set separately and a refusal is reported, not raised.
+                # is set separately and a refusal is logged, not raised.
+                # LOGGED, not printed: `printer.warning` writes to stdout,
+                # which is where the `--json` envelope goes. Output policy
+                # belongs to `_perform_switch`, which owns `emit_output`.
                 if sys.platform != "win32":
                     try:
                         os.chmod(path, 0o600)
                     except OSError as mode_err:
-                        warning(
-                            f"{path.name} was updated in place but its mode "
-                            f"could not be set to 0600 ({mode_err}) — it may "
-                            f"be readable by other users."
+                        self._logger.warning(
+                            f"{path} was updated in place but its mode could "
+                            f"not be set to 0600 ({mode_err}); it may be "
+                            f"readable by other users."
                         )
         finally:
             # Every path where the name is still ours, including the Ctrl-C
@@ -1373,18 +1388,16 @@ class ClaudeAccountSwitcher:
                         raise
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         fh.write(content)
-        except ConfigError:
-            # Leftover found: remove only what THIS call created.
-            self._discard_staging(staged)
-            raise
         except OSError as e:
             self._discard_staging(staged)
             raise ConfigError(
                 f"Could not stage swap material, nothing was changed: {e}"
             )
         except BaseException:
-            # Ctrl-C reaches neither handler above, and the caller's rollback
-            # cannot help: it holds the empty dict this call never returned.
+            # The leftover ConfigError above and the Ctrl-C that reaches no
+            # named handler share one policy: remove only what THIS call
+            # created. The caller's rollback cannot help on the interrupt --
+            # it holds the empty dict this call never returned.
             self._discard_staging(staged)
             raise
         return staged

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import errno
 import json
+import logging
 import os
 import sys
 import time
@@ -12367,7 +12368,7 @@ def test_the_temp_is_never_world_readable_while_it_holds_the_payload(
 
 
 def test_a_refused_mode_carry_does_not_fail_a_publish_that_landed(
-    temp_home: Path, monkeypatch
+    temp_home: Path, monkeypatch, caplog, capsys
 ):
     """Once the bytes are through the mount the write is committed.
 
@@ -12397,19 +12398,20 @@ def test_a_refused_mode_carry_does_not_fail_a_publish_that_landed(
             raise PermissionError(errno.EPERM, "Operation not permitted")
         return real_chmod(path, *a, **kw)
 
-    warned: list[str] = []
     monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
     monkeypatch.setattr(switcher_mod.os, "chmod", refuse_the_destination)
-    monkeypatch.setattr(switcher_mod, "warning", warned.append)
 
-    switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
 
     assert json.loads(target.read_text(encoding="utf-8"))["activeAccountNumber"] == 2
     assert list(target.parent.glob("sequence.*.tmp")) == []
-    # The mode could not be set, so the user has to hear about it.
-    assert any("mode" in w or "permission" in w.lower() for w in warned), (
-        f"a refused mode carry went unreported: {warned}"
-    )
+    # The mode could not be set, so it must not pass in silence.
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "mode" in logged, f"a refused mode carry went unreported: {logged}"
+    # ...but on the LOG, not stdout: that is the `--json` envelope's channel,
+    # and a stray line there breaks every consumer's parse.
+    assert capsys.readouterr().out == "", "the mode warning reached stdout"
 
 
 def test_a_failed_write_through_names_the_copy_it_kept(temp_home: Path, monkeypatch):
@@ -12446,3 +12448,44 @@ def test_a_failed_write_through_names_the_copy_it_kept(temp_home: Path, monkeypa
     assert strays[0].name in str(exc.value), (
         f"the surviving copy was not named: {exc.value}"
     )
+
+
+def test_a_ctrl_c_mid_write_through_still_names_the_copy_it_kept(
+    temp_home: Path, monkeypatch, capsys
+):
+    """The interrupt this whole change is about, at the one non-atomic publish.
+
+    `except OSError` around the copy is the same too-narrow handler the rest
+    of this change exists to widen: a Ctrl-C leaves the destination short and
+    the temp holding the only complete content, and nothing names it. The
+    message cannot ride an exception here, because the interrupt has to stay
+    an interrupt -- so it goes to stderr, which the `--json` envelope on
+    stdout does not share.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    def interrupted_copy(src, dst, *a, **kw):
+        Path(dst).write_text('{"activeAcc', encoding="utf-8")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", interrupted_copy)
+
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"activeAccountNumber": 2, "accounts": {}})
+
+    strays = list(target.parent.glob("sequence.*.tmp"))
+    assert len(strays) == 1, "the only complete copy was removed"
+    assert json.loads(strays[0].read_text(encoding="utf-8"))["activeAccountNumber"] == 2
+
+    out, err = capsys.readouterr()
+    assert strays[0].name in err, f"the surviving copy was not named: {err!r}"
+    assert out == "", f"a machine-readable channel was written to: {out!r}"
