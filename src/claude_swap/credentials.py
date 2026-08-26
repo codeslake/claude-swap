@@ -818,7 +818,6 @@ class CredentialStore:
         to discard. Callers that must VERIFY a clear need this: a read cannot
         answer for them once file mode is pinned, because then nothing asks the
         Keychain at all. Off macOS there is no Keychain item, hence ``True``.
-        to discard. Off macOS there is no Keychain item, hence ``True``.
         """
         if self._host.platform != Platform.MACOS:
             return True
@@ -950,17 +949,8 @@ class CredentialStore:
         block on a transient read glitch), but the two must not report the
         same: a stale ``primaryApiKey`` surviving alongside a freshly
         activated OAuth credential is a live cross-account key that bills per
-        token while it lies.
-        I-2 (round 9): ``_read_global_config`` collapses ABSENT and UNREADABLE
-        into the same ``None`` — without the distinction below, an unreadable
-        config (permissions, mid-unmount) reads exactly like a genuinely
-        keyless profile, so the clear is silently skipped. Best-effort stays
-        best-effort here (never raises — the write path this feeds must not
-        block on a transient read glitch), but a distinguishing warning
-        matters: a stale ``primaryApiKey`` surviving alongside a freshly
-        activated OAuth credential is a live cross-account key that bills
-        per token while it lies, and a caller/log reader must be able to
-        tell "nothing to clear" from "could not check".
+        token while it lies, and a caller must be able to tell "nothing to
+        clear" from "could not check".
         """
         cleared = True
         if self._host.platform == Platform.MACOS:

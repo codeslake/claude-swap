@@ -15,9 +15,7 @@ from rich.text import Text
 from textual.widgets import ListItem, Static
 
 from claude_swap import pace
-from claude_swap.json_output import (
-    USAGE_API_KEY,
-)
+from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES
 from claude_swap.usage_store import STALE_OK_S
@@ -243,10 +241,7 @@ def account_card_text(
 
 
 def mini_account_text(
-    acc: AccountSnapshot,
-    now: float,
-    *,
-    palette: Palette = Palette.DARK,
+    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
 ) -> Text:
     """One minimized line for an inactive account.
 
@@ -378,9 +373,7 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                blocks.append(
-                    mini_account_text(acc, now, palette=palette)
-                )
+                blocks.append(mini_account_text(acc, now, palette=palette))
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()

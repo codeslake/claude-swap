@@ -164,7 +164,7 @@ def window_chip_label(last_good: dict | None, key: str, label: str, now: float) 
     reset = window_reset_text(last_good, key, now)
     if not reset:
         return f"{label}:"
-    return f"{label}({chr(0x27F3)}{reset.removeprefix('resets ').replace(' ', '')}):"
+    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
 
 
 def format_duration(seconds: float) -> str:
