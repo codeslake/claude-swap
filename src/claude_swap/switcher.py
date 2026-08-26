@@ -1211,7 +1211,7 @@ class ClaudeAccountSwitcher:
             self._rollback_swap(
                 num_a, email_a, creds_a, config_a,
                 num_b, email_b, creds_b, config_b,
-                staging, bool(moved),
+                staging, moved,
             )
             raise
 
@@ -1333,10 +1333,9 @@ class ClaudeAccountSwitcher:
         profile from the relocated backups, so a skipped move costs at most
         that slot's session history.
 
-        Appends each directory to ``moved`` as it lands under its new key —
-        as it lands, because an abort can arrive on either side of any rename
-        here. A same-email caller needs that: for it, reversing a move that
-        never ran IS the swap it was told did not happen.
+        Appends to ``moved`` as each directory lands, not at the end: an
+        abort can arrive on either side of any rename, and for a same-email
+        caller reversing a move that never ran IS a swap.
         """
         dir_a = self._session_dir(num_a, email_a)
         dir_b = self._session_dir(num_b, email_b)
@@ -1377,7 +1376,7 @@ class ClaudeAccountSwitcher:
         creds_b: str,
         config_b: str,
         staging: dict[str, "Path"],
-        swapped_dirs: bool,
+        moved: list[Path],
     ) -> None:
         """Best-effort restore of both slots after a failed swap mutation.
 
@@ -1397,7 +1396,7 @@ class ClaudeAccountSwitcher:
         # Undo the session-profile exchange (same staging trick, reversed).
         # Unlike the credential steps below, this one is not a no-op when its
         # forward half never ran: it would exchange two untouched profiles.
-        if swapped_dirs:
+        if moved:
             self._swap_session_dirs(num_b, email_a, num_a, email_b, [])
         overlap = email_a == email_b
         for kind, num, email, original in (
