@@ -33,14 +33,9 @@ class TestProperLockfile:
     def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
         """A stolen-and-recreated lock belongs to its new holder.
 
-        The exit path removed whatever sat at the path, so for the rest of the
-        new holder's critical section there was no lock on disk and any third
-        waiter could take it uncontested. The replacement here is stamped with
-        an mtime no live holder would ever set, so what disappears is
-        identifiably theirs rather than ours.
-
         The control is test_acquire_creates_and_release_removes above: a
-        release that quietly stopped removing anything would fail it.
+        release that quietly stopped removing anything passes here and
+        fails there.
         """
         stolen_mtime = 1_000_000.0
         with proper_lockfile(lock_dir):
@@ -51,6 +46,26 @@ class TestProperLockfile:
 
         assert lock_dir.is_dir()
         assert os.stat(lock_dir).st_mtime == stolen_mtime
+
+    def test_release_leaves_a_lock_a_running_toucher_saw(self, lock_dir, monkeypatch):
+        """A takeover is still a takeover after the toucher has run.
+
+        The toucher refreshed whatever sat at the path, so one tick later it
+        held the successor's mtime and the exit path removed their lock.
+        """
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
+        with proper_lockfile(lock_dir):
+            os.rmdir(lock_dir)
+            os.mkdir(lock_dir)
+            # A successor's toucher keeps it fresh. Stamp it: inode mtimes are
+            # ms-coarse, so a bare mkdir can land on our own acquire stamp. A
+            # whole second, one back, round-trips exactly and cannot collide.
+            fresh = float(int(time.time()) - 1)
+            os.utime(lock_dir, (fresh, fresh))
+            time.sleep(0.25)  # at least one toucher tick
+
+        assert lock_dir.is_dir()
+        assert lock_dir.stat().st_mtime == fresh  # nor did we refresh theirs
 
     def test_reacquire_after_release(self, lock_dir):
         with proper_lockfile(lock_dir):
@@ -86,10 +101,9 @@ class TestProperLockfile:
     def test_toucher_keeps_mtime_fresh(self, lock_dir, monkeypatch):
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.1)
         with proper_lockfile(lock_dir):
-            past = time.time() - 30
-            os.utime(lock_dir, (past, past))
+            acquired_ns = lock_dir.stat().st_mtime_ns
             time.sleep(0.4)
-            assert time.time() - lock_dir.stat().st_mtime < 10.0
+            assert lock_dir.stat().st_mtime_ns > acquired_ns
 
     def test_creates_missing_parent(self, tmp_path):
         nested = tmp_path / "a" / "b" / "target.lock"
