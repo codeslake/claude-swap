@@ -53,6 +53,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
 from claude_swap.fsutil import read_text_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
+from claude_swap.oauth import ERROR_NOTES
 from claude_swap.models import (
     AccountSnapshot,
     AccountsSnapshot,
@@ -178,22 +179,6 @@ _DEMOTING_STASH_REASONS = (
     "consume-gate-store-unreadable",
 )
 
-ERROR_NOTES = {
-    "store-unmirrored": (
-        "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
-        "normal shell"
-    ),
-    "invalid_client": (
-        "cswap's OAuth client was rejected — systemic, not this account"
-    ),
-    "consume-busy": (
-        "another cswap surface holds the slot — retries next pass"
-    ),
-    "stash-unreadable": (
-        "this slot's stashed successor is unreadable — unlock the keychain "
-        "or fix the file, then retry; `cswap unclaimed` inspects it"
-    ),
-}
 
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
@@ -1837,6 +1822,30 @@ class ClaudeAccountSwitcher:
             and not self._disabled_from_data(data, str(num))
         ]
 
+    def _empty_rotation_advice(self, data: dict) -> str:
+        """Why nothing is selectable, and the remedy that matches the cause.
+
+        Re-enabling only helps when a slot's stored credentials/config can be
+        read. `_account_is_switchable` cannot tell an absent backup from one
+        it failed to read, so that arm must not lead with a re-add: it would
+        overwrite a credential the user simply cannot see right now.
+        """
+        if any(
+            self._account_is_switchable(str(n)) for n in data.get("sequence", [])
+        ):
+            return (
+                "No accounts remain in rotation — auto-switch and bare switch "
+                "have nothing to pick. Re-enable one with "
+                "cswap enable <num|email>."
+            )
+        return (
+            "No managed account is usable — their stored credentials/config "
+            "could not be read, so auto-switch and bare switch have nothing "
+            "to pick. If a credential store is locked or a volume is "
+            "unmounted, fix that first; otherwise re-add a slot with "
+            "cswap --add-account --slot <number>."
+        )
+
     @staticmethod
     def _disabled_from_data(data: dict, account_num: str) -> bool:
         """Whether a slot is flagged out of rotation in already-loaded data."""
@@ -1904,31 +1913,8 @@ class ClaudeAccountSwitcher:
                     "  It is the active account — it stays live until you switch "
                     "away; it just won't be an automatic switch target."
                 ))
-            # An empty rotation has two causes and only one is a disable, so
-            # the cause picks the remedy. _account_is_switchable() never
-            # consults the disabled flag, so `readable` spans both.
-            readable = [
-                n for n in map(str, data.get("sequence", []))
-                if self._account_is_switchable(n)
-            ]
-            if all(self._disabled_from_data(data, n) for n in readable):
-                if readable:
-                    warning(
-                        "  No accounts remain in rotation — auto-switch and bare "
-                        "switch have nothing to pick. Re-enable one with "
-                        "cswap enable <num|email>."
-                    )
-                else:
-                    # A keychain exists only on macOS; naming it elsewhere
-                    # points at something that is not there.
-                    unlock = ("unlock the keychain, or "
-                              if self.platform == Platform.MACOS else "")
-                    warning(
-                        "  No managed accounts have readable credentials/config "
-                        "— auto-switch and bare switch have nothing to pick. "
-                        f"Re-enabling changes nothing: {unlock}re-add a slot "
-                        "with cswap --add-account --slot <number>."
-                    )
+            if not self.switchable_account_numbers():
+                warning("  " + self._empty_rotation_advice(data))
         else:
             print(dimmed("  It is back in the rotation."))
 
@@ -5757,17 +5743,7 @@ class ClaudeAccountSwitcher:
                     None,
                 )
                 if not fallback:
-                    if any(
-                        self._account_is_switchable(str(num)) for num in sequence
-                    ):
-                        raise ConfigError(
-                            "No accounts remain in rotation. Re-enable one with: "
-                            "cswap enable <num|email>"
-                        )
-                    raise ConfigError(
-                        "No managed accounts have valid stored credentials/config. "
-                        "Re-add a slot with: cswap --add-account --slot <number>"
-                    )
+                    raise ConfigError(self._empty_rotation_advice(data))
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
             return (

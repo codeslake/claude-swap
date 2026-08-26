@@ -403,17 +403,27 @@ class TestBootstrap:
         assert (session_dir / ".credentials.json").read_text() == CREDS
         assert "Could not refresh" in capsys.readouterr().out
 
+    @pytest.mark.parametrize(
+        "kind, expected",
+        [
+            # No note: the bare kind is the whole classification.
+            ("transient", "transient"),
+            # ERROR_NOTES has prose for this one, and the raw kind would
+            # report a failure where nothing failed.
+            ("consume-busy", "another cswap surface holds the slot"),
+        ],
+    )
     def test_the_refresh_failure_warning_outlives_the_terminal(
-        self, manager, auth_status_tracks_seed, monkeypatch, capsys, caplog
+        self, manager, auth_status_tracks_seed, monkeypatch, capsys, caplog,
+        kind, expected,
     ):
         """The sibling above proves the warning is printed; this proves it is
-        kept. Nothing else carries it: the status line names the account, not
-        the refresh that failed."""
+        kept, and that the cause is rendered the way every other surface
+        renders it. Nothing else carries either: the status line names the
+        account, not the refresh, and oauth logs the kind at DEBUG."""
         monkeypatch.setattr(
             ClaudeAccountSwitcher, "consume_backup_grant",
-            lambda self, num, email, snap: oauth.RefreshOutcome(
-                None, "transient"
-            ),
+            lambda self, num, email, snap: oauth.RefreshOutcome(None, kind),
         )
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             manager.setup_session("2", share=False)
@@ -421,9 +431,7 @@ class TestBootstrap:
         assert "Could not refresh" in capsys.readouterr().out
         logged = "\n".join(r.getMessage() for r in caplog.records)
         assert "Could not refresh the token for Account-2" in logged
-        # The cause picks the remedy, and it reaches no other record:
-        # oauth logs it at DEBUG, which setup_logging filters out.
-        assert "transient" in logged
+        assert expected in logged
 
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
@@ -1434,6 +1442,52 @@ class TestRun:
             assert expected in records
         for absent in not_logged:
             assert absent not in records
+
+    def test_our_own_config_dir_is_printed_but_not_logged(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth_status_tracks_seed,
+        refresh_rotates,
+        capsys,
+        caplog,
+    ):
+        """run() sets CLAUDE_CONFIG_DIR to a session profile, so a nested
+        `cswap run` takes this branch on every launch. Those records would
+        bury the one the log exists for: a value the USER set."""
+        monkeypatch.setenv(
+            "CLAUDE_CONFIG_DIR", str(manager.sessions_dir / "2-b_example.com")
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+
+        assert "overriding it for this launch" in capsys.readouterr().out
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "overriding it for this launch" not in logged
+
+    def test_the_two_data_moves_outlive_the_terminal(
+        self, manager, tmp_path, caplog
+    ):
+        """Both notices record where the user's own data WENT, and both are
+        printed on the launch path the exec clears. Every failure beside them
+        is already logged; only the successful moves were not."""
+        from claude_swap.session import MCP_DISPLACED_STASH
+
+        session_dir = tmp_path / "profile"
+        session_dir.mkdir()
+        src, dest = tmp_path / "shared", session_dir / "projects"
+        dest.mkdir()
+        (dest / "a.jsonl").write_text("{}")
+
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            assert manager._stash_displaced_mcp(session_dir, {"x": {}})
+            assert manager._prepare_history_share(src, dest, session_dir)
+
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert MCP_DISPLACED_STASH in logged
+        assert "projects" in logged
 
     def test_fast_path_keeps_env_untouched(
         self, manager, capture_exec, monkeypatch

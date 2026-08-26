@@ -58,6 +58,7 @@ from claude_swap.exceptions import (
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
+from claude_swap.oauth import ERROR_NOTES
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
@@ -500,9 +501,22 @@ class SessionManager:
         self._logger = switcher._logger
 
     def _warn(self, msg: str) -> None:
-        """Print and log: this path execs, so the printed line is not kept."""
+        """Warn durably: print for this terminal, log to survive it.
+
+        For launch-path warnings only — the exec that follows takes the
+        printed line off the screen, and nothing else records it.
+        """
         warning(msg)
         self._logger.warning(msg)
+
+    def _note(self, msg: str) -> None:
+        """`_warn` for a notice: same terminal, same durability, INFO level.
+
+        For the launch-path lines that record where the user's own data was
+        moved — the destination is named there and nowhere else.
+        """
+        print(dimmed(msg))
+        self._logger.info(msg)
 
     # -- launch ----------------------------------------------------------
 
@@ -536,10 +550,17 @@ class SessionManager:
             # With CLAUDE_CONFIG_DIR set, "current default account" is
             # meaningless (we may already be inside a session terminal), so
             # the same-account fast path below must not trigger.
-            self._warn(
+            msg = (
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
+            # run() sets this to a session profile, so a nested launch takes
+            # this branch every time. Only a value we did not write says the
+            # user's intent was overruled, and only that is worth keeping.
+            if Path(config_dir_preset).parent == self.sessions_dir:
+                warning(msg)
+            else:
+                self._warn(msg)
         else:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
@@ -710,11 +731,15 @@ class SessionManager:
                     f"re-add it: cswap --add-account --slot {account_num}"
                 )
             if outcome.error is not None:
-                # `outcome.error` (transient vs invalid_grant) picks the
-                # remedy and reaches no other record — oauth logs it at DEBUG.
+                # The kind picks the remedy and reaches no other record —
+                # oauth logs it at DEBUG. Render it the way the CLI usage
+                # line and the TUI do: several kinds here are not failures
+                # ("consume-busy" retries next pass), and the bare kind
+                # would report one.
                 self._warn(
                     f"Could not refresh the token for Account-{account_num} "
-                    f"({outcome.error}); continuing with the stored credentials."
+                    f"({ERROR_NOTES.get(outcome.error, outcome.error)}); "
+                    "continuing with the stored credentials."
                 )
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
@@ -1299,11 +1324,9 @@ class SessionManager:
                 "leaving them in place."
             )
             return False
-        print(
-            dimmed(
-                "Session MCP servers now mirror your default profile; the "
-                f"profile's previous definitions were saved to {stash.name}."
-            )
+        self._note(
+            "Session MCP servers now mirror your default profile; the "
+            f"profile's previous definitions were saved to {stash.name}."
         )
         return True
 
@@ -1352,11 +1375,9 @@ class SessionManager:
                     )
                 )
                 return False
-            print(
-                dimmed(
-                    f"Merged the profile's existing {dest.name} into "
-                    f"{src} — conversation history is now shared."
-                )
+            self._note(
+                f"Merged the profile's existing {dest.name} into "
+                f"{src} — conversation history is now shared."
             )
         if not src.exists():
             # Fresh ~/.claude (or first run): seed an empty share target so

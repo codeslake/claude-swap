@@ -5296,7 +5296,10 @@ class TestSwitchSkipsBrokenSlots:
         self._seed(s, 1, "a@example.com", creds=False)
         self._seed(s, 2, "b@example.com", config=False)
 
-        with pytest.raises(ConfigError, match="No managed accounts have valid"):
+        # The blocking site gets the same advice as the informational one:
+        # _account_is_switchable cannot tell an absent backup from one it
+        # failed to read, so neither site may lead with a destructive re-add.
+        with pytest.raises(ConfigError, match="could not be read"):
             s.switch()
 
     def test_fresh_machine_all_disabled_raises(self, temp_home: Path):
@@ -8668,24 +8671,30 @@ class TestDisableEnableAccount:
 
         out = capsys.readouterr().out
         assert "cswap enable" not in out
-        assert "readable credentials/config" in out
-        # _setup runs as LINUX, where there is no keychain to unlock.
-        assert "keychain" not in out.lower()
+        assert "could not be read" in out
+        assert "cswap --add-account" in out
 
-    def test_unreadable_slots_name_the_keychain_only_on_macos(
+    def test_the_unreadable_advice_does_not_vary_by_platform(
         self, temp_home, capsys
     ):
-        """Same branch, macOS: there the keychain IS the credential backend,
-        so the remedy that the sibling must not print is the one to print."""
-        s = self._setup(temp_home)
-        self._seed(s, 1, "a@example.com")
+        """The platform says which store exists, never whether it was READ.
 
-        s.platform = Platform.MACOS
-        with patch.object(s, "_read_account_credentials", return_value=""):
-            s.set_account_disabled("1", True)
+        An unreadable slot is a locked store on macOS and an unreadable file
+        elsewhere, and both take the same remedy, so branching on the platform
+        only lets one arm drift.
+        """
+        out = {}
+        for platform in (Platform.LINUX, Platform.MACOS):
+            s = self._setup(temp_home)
+            self._seed(s, 1, "a@example.com")
+            s.platform = platform
+            capsys.readouterr()
+            with patch.object(s, "_read_account_credentials", return_value=""):
+                s.set_account_disabled("1", True)
+            out[platform] = capsys.readouterr().out
 
-        out = capsys.readouterr().out
-        assert "unlock the keychain" in out
+        assert out[Platform.LINUX] == out[Platform.MACOS]
+        assert "could not be read" in out[Platform.LINUX]
 
     # -- display -----------------------------------------------------------
 

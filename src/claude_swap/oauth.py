@@ -68,6 +68,28 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
+# Error KINDS carrying a remedy, rendered wherever one is shown to a user:
+# the CLI usage detail line, the TUI account panel, and the launch-path
+# refresh warning. A kind with no note renders bare — the kind IS the
+# classification there.
+ERROR_NOTES = {
+    "store-unmirrored": (
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR set — unset it or run from a "
+        "normal shell"
+    ),
+    "invalid_client": (
+        "cswap's OAuth client was rejected — systemic, not this account"
+    ),
+    "consume-busy": (
+        "another cswap surface holds the slot — retries next pass"
+    ),
+    "stash-unreadable": (
+        "this slot's stashed successor is unreadable — unlock the keychain "
+        "or fix the file, then retry; `cswap unclaimed` inspects it"
+    ),
+}
+
+
 @dataclass(frozen=True)
 class RefreshOutcome:
     """Result of a refresh-token grant attempt.
