@@ -985,6 +985,226 @@ class TestSwapUnreadableSourceIsNotAbsent:
             f"the rollback purged .prev after a swap that wrote nothing: {alive}"
         )
 
+    def test_a_profile_only_rollback_does_not_say_it_restored_the_slots(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, caplog
+    ):
+        """The announcement had three states and only said two.
+
+        `bool(moved) or wrote_backups` reads as "restoring both slots" when a
+        rename landed and no credential write ever ran -- the fourth instance
+        of the class this change opens by naming. The existing case covers
+        only the `(False, [])` corner, where the text is already right.
+        """
+        import logging
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+
+        def half_moved(a, ea, b, eb, moved):
+            moved.append(temp_home / "one-profile-already-renamed")
+            raise OSError(errno.EIO, "interrupted just past a rename")
+
+        switcher._swap_session_dirs = half_moved
+        try:
+            with caplog.at_level(logging.ERROR, logger="claude-swap"):
+                with pytest.raises(OSError):
+                    switcher.swap_accounts("1", "2")
+        finally:
+            del switcher._swap_session_dirs
+
+        said = [r.message for r in caplog.records if "failed mid-write" in r.message]
+        assert said, "premise: the rollback never announced anything"
+        assert "restoring both slots" not in said[0], (
+            f"no credential write ran, and the line says otherwise: {said[0]!r}"
+        )
+
+    def test_a_swap_that_stored_nothing_keeps_both_session_profiles(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """A restore that changes no value still invalidated a live profile.
+
+        `wrote_backups` is armed one statement before the first write on
+        purpose -- arming it after would let an abort skip a restore that was
+        owed -- and the comment prices the gap at "one needless restore". It
+        is not one and it is not free: all four restores run, each credential
+        restore routes through `_post_backup_write`, and both slots lose their
+        session credential material for a swap where zero writes landed. That
+        is the same harm `..._touches_neither_slot` asserts against.
+
+        The restore is a no-op by construction here: the key still holds
+        exactly what the restore would write. A write that changes nothing
+        should not cost a re-bootstrap.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"gen1-{num}")
+
+        seeded = {}
+        for num in ("1", "2"):
+            d = switcher._session_dir(num, email)
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / ".credentials.json"
+            f.write_text('{"claudeAiOauth": {"accessToken": "session-tok"}}')
+            seeded[num] = f
+        assert all(f.exists() for f in seeded.values()), "premise: nothing seeded"
+
+        calls = {"n": 0}
+        real_write = switcher._write_account_credentials
+
+        def fail_first(num, mail, creds):
+            # ONLY THE FORWARD WRITE. Replacing the method outright would
+            # intercept the four RESTORE writes too, which is the behaviour
+            # under test.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(errno.EIO, "the first forward write failed")
+            return real_write(num, mail, creds)
+
+        switcher._write_account_credentials = fail_first
+        try:
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
+        finally:
+            del switcher._write_account_credentials
+
+        gone = [n for n, f in seeded.items() if not f.exists()]
+        assert gone == [], (
+            f"slots {gone} lost their session credentials to a swap that "
+            "stored nothing"
+        )
+
+    def test_one_reader_decides_whether_a_restore_displaced_anything(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """Two reads of one value can disagree, and the disagreement strands.
+
+        The purge used to probe the stored credential itself and then let
+        `_retain_previous_backup` read it again a moment later. Deny only the
+        probe -- an unreadable Keychain that clears between the two calls is
+        the ordinary way -- and `displaced` stays empty while a `.prev` IS
+        written. Nothing then purges a retained generation that holds the
+        other slot's half-written material, which is the state
+        `delete_previous_backup` exists to remove.
+
+        One email, so the restore keys and the forward keys coincide and the
+        retained generation really is contamination; failure at the COMMIT, so
+        all four forward writes landed. The store's retention verdict is the
+        only reader now, so there is no second answer to disagree with.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"gen1-{num}")
+            switcher._write_account_credentials(num, email, f"gen2-{num}")
+            switcher._store.delete_previous_backup(num, email)
+        prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
+        assert not any(p.exists() for p in prev.values()), (
+            "premise: a .prev already exists, so a survivor below proves nothing"
+        )
+
+        real_read = switcher._store._read_account_credentials_ex
+        rolling_back = {"yet": False}
+        seen: set[tuple[str, str]] = set()
+
+        def first_rollback_read_is_unreadable(num, mail, *a, **kw):
+            # ONLY DURING THE ROLLBACK. The forward pass reads the same keys to
+            # find the material it is moving; denying those aborts the swap
+            # before it reaches the state this case is about.
+            if rolling_back["yet"] and (num, mail) not in seen:
+                seen.add((num, mail))
+                return "", True
+            return real_read(num, mail, *a, **kw)
+
+        def refuse_commit(path, data):
+            rolling_back["yet"] = True
+            raise OSError(errno.EIO, "the commit failed")
+
+        switcher._store._read_account_credentials_ex = first_rollback_read_is_unreadable
+        switcher._write_json = refuse_commit
+        try:
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
+        finally:
+            del switcher._write_json
+            del switcher._store._read_account_credentials_ex
+        assert seen, "premise: no read was denied, so nothing could disagree"
+
+        survivors = {
+            n: switcher._store._read_previous_backup(n, email)
+            for n in ("1", "2") if prev[n].exists()
+        }
+        foreign = {n: v for n, v in survivors.items()
+                   if v and not v.endswith(f"-{n}")}
+        assert foreign == {}, (
+            "a recovery generation was left holding the other slot's "
+            f"half-written material: {sorted(foreign)}"
+        )
+
+    def test_the_purge_drops_only_the_keys_a_restore_displaced(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """`displaced` is built per key and then acted on for both.
+
+        Line 1481 only truth-tests the set; the loop below it had no
+        membership check, so any single displaced key purged every key. Same
+        email, failure on the SECOND forward credential write: one key was
+        written through and one was not. The written key's retained generation
+        really is the half-written forward material and may go; the untouched
+        key's is the user's genuine pre-swap copy and its restore, being a
+        value-for-value no-op, creates nothing to replace it.
+
+        The discriminator is which keys a FORWARD write reached, which the
+        injection below records rather than assumes.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"gen1-{num}")
+            switcher._write_account_credentials(num, email, f"gen2-{num}")
+
+        prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
+        assert all(p.exists() for p in prev.values()), (
+            "the fixture produced no .prev, so this would pass however the "
+            "purge behaves"
+        )
+
+        calls = {"n": 0}
+        forward: set[str] = set()
+        real_write = switcher._write_account_credentials
+        rolling_back = {"yet": False}
+
+        def fail_second(num, mail, creds):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                rolling_back["yet"] = True
+                raise OSError(errno.EIO, "the second forward write failed")
+            if not rolling_back["yet"]:
+                forward.add(num)
+            return real_write(num, mail, creds)
+
+        switcher._write_account_credentials = fail_second
+        try:
+            with pytest.raises(OSError):
+                switcher.swap_accounts("1", "2")
+        finally:
+            del switcher._write_account_credentials
+
+        untouched = sorted(set(prev) - forward)
+        assert untouched, (
+            "premise: every key took a forward write, so a blanket purge and "
+            "a per-key one cannot be told apart here"
+        )
+        lost = [n for n in untouched if not prev[n].exists()]
+        assert lost == [], (
+            f"the purge dropped .prev for {lost}, which no forward write "
+            "reached — that is the user's pre-swap generation, not "
+            "contamination this swap created"
+        )
+
     def test_a_rollback_drops_prev_it_really_did_contaminate(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):

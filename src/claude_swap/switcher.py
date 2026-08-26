@@ -811,8 +811,12 @@ class ClaudeAccountSwitcher:
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
-    ) -> None:
+    ) -> bool:
         """Write account credentials to backup, then invalidate the slot's session.
+
+        Returns whether the write displaced a value the store retained as
+        ``.prev`` — the store's own verdict, passed through, so the rollback
+        purge never has to re-derive it from a second read.
 
         The store performs the pure write and raises on failure *before* returning,
         so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
@@ -843,7 +847,8 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
-        self._store._write_account_credentials(account_num, email, credentials)
+        retained = self._store._write_account_credentials(
+            account_num, email, credentials)
         try:
             self._post_backup_write(account_num, email)
         except OSError:
@@ -866,6 +871,7 @@ class ClaudeAccountSwitcher:
                     "keep serving the superseded generation until its token "
                     "expires.", account_num, exc_info=True,
                 )
+        return retained
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
@@ -1409,12 +1415,17 @@ class ClaudeAccountSwitcher:
         # or `wrote_backups`, so an abort that mutated nothing skips all of
         # them -- and the line still said both slots were being restored,
         # which is the class of wrong text this change exists to remove.
-        will_restore = bool(moved) or wrote_backups
-        self._logger.error(
-            f"Swap {num_a} <-> {num_b} failed mid-write; "
-            + ("restoring both slots" if will_restore
-               else "nothing was written, so there is nothing to restore")
-        )
+        # THREE STATES, NOT TWO. `bool(moved) or wrote_backups` collapsed a
+        # profile-only reversal into "restoring both slots", which is the class
+        # of wrong text this change exists to remove -- an interrupt just past
+        # a rename runs no credential restore at all.
+        if wrote_backups:
+            what = "restoring both slots"
+        elif moved:
+            what = "reversing the session-profile exchange; no credential was written"
+        else:
+            what = "nothing was written, so there is nothing to restore"
+        self._logger.error(f"Swap {num_a} <-> {num_b} failed mid-write; {what}")
         failures = 0
         # Unlike the credential steps below, this is not a no-op when its
         # forward half never ran: with one email the two slots' keys are each
@@ -1433,26 +1444,42 @@ class ClaudeAccountSwitcher:
             ("creds", num_b, email_b, creds_b),
             ("config", num_b, email_b, config_b),
         ) if wrote_backups else ()
-        # WHAT A RESTORE ACTUALLY DISPLACED. The purge below may only drop a
-        # `.prev` its own restore created, and `_retain_previous_backup`
-        # creates one exactly when the value it would displace differs from
-        # the one going in. Reading that here subsumes the `overlap` gate: in
-        # the two-email case the stored value always equals `original`, and in
-        # the same-email case an abort before any forward write lands leaves
-        # it equal too -- which is the state `overlap` alone could not see.
+        # WHAT A RESTORE ACTUALLY DISPLACED, TAKEN FROM THE WRITE ITSELF.
+        # The purge below may only drop a `.prev` its own restore created, and
+        # the store already knows: `_retain_previous_backup` writes one exactly
+        # when the value it displaces differs from the one going in, and now
+        # says so. Asking a SECOND read of the same value instead let the two
+        # disagree -- a probe reading unreadable while retention read fine left
+        # the retained generation holding the OTHER account's credential, with
+        # nothing to purge it. One reader, one answer.
         displaced: set[tuple[str, str]] = set()
         for kind, num, email, original in restores:
             try:
                 if original:
                     if kind == "creds":
+                        # A NO-OP WRITE IS NOT FREE. Every credential write
+                        # routes through `_post_backup_write`, so restoring a
+                        # value the key already holds costs the slot its
+                        # session profile -- measured on a first-write failure
+                        # as both slots losing their session credentials for a
+                        # swap that stored nothing. `wrote_backups` is armed
+                        # before the first write deliberately (arming it after
+                        # would skip a restore that was owed); this is what
+                        # makes that cheap rather than what the comment there
+                        # priced it at.
+                        #
+                        # Used ONLY to skip. `displaced` still comes from the
+                        # store's own retention verdict, so a read that
+                        # disagrees costs at most a needless write and can
+                        # never widen the purge.
                         try:
                             now, unread = self._store._read_account_credentials_ex(
                                 num, email)
-                        except Exception:  # noqa: BLE001 - a failed read must
-                            now, unread = original, True  # not widen the purge
-                        if not unread and now != original:
-                            displaced.add((num, email))
-                        self._write_account_credentials(num, email, original)
+                        except Exception:  # noqa: BLE001 - a failed read writes
+                            now, unread = None, True  # rather than skips
+                        if unread or now != original:
+                            if self._write_account_credentials(num, email, original):
+                                displaced.add((num, email))
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:
@@ -1500,7 +1527,11 @@ class ClaudeAccountSwitcher:
                 (num_a, email_a, creds_a),
                 (num_b, email_b, creds_b),
             ):
-                if original:
+                # PER KEY. `displaced` was built per key and then acted on for
+                # both: one displaced key purged the other's genuine pre-swap
+                # generation, which is the loss this whole block exists to
+                # avoid.
+                if original and (num, email) in displaced:
                     self._store.delete_previous_backup(num, email)
         if staging:
             if failures:
