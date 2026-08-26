@@ -157,18 +157,18 @@ def proper_lockfile(
     finally:
         stop_touching.set()
         toucher.join(timeout=1.0)
-        # stop_touching bars a further refresh; this waits out one in flight.
-        with stamping:
-            mine_ns = stamped_ns
         try:
-            if os.stat(lock_dir).st_mtime_ns == mine_ns:
-                os.rmdir(lock_dir)
-            else:
-                # Removing a successor's lock would leave its critical section
-                # with nothing on disk, so a third waiter takes it uncontested.
-                _logger.warning(
-                    "Lock %s was taken over while held; leaving it", lock_dir
-                )
+            # Held across the decision, so no tick can move the stamp inside
+            # it; stop_touching bars any tick that has not started by now.
+            with stamping:
+                if os.stat(lock_dir).st_mtime_ns == stamped_ns:
+                    os.rmdir(lock_dir)
+                else:
+                    # A successor's critical section would be left with
+                    # nothing on disk, free for a third waiter to take.
+                    _logger.warning(
+                        "Lock %s was taken over while held; leaving it", lock_dir
+                    )
         except FileNotFoundError:
             _logger.warning(
                 "Lock %s vanished while held (taken over as stale?)", lock_dir

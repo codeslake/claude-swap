@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -66,11 +67,40 @@ class TestProperLockfile:
 
         def slow_utime(path, *args, **kwargs):
             real_utime(path, *args, **kwargs)
-            time.sleep(1.2)
+            if path == lock_dir:
+                time.sleep(1.2)
 
         monkeypatch.setattr(claude_locks.os, "utime", slow_utime)
         with proper_lockfile(lock_dir):
             time.sleep(0.15)  # a tick starts and stalls mid-refresh
+
+        assert not lock_dir.exists()
+
+    def test_release_removes_a_lock_a_late_tick_refreshes(self, lock_dir, monkeypatch):
+        # A tick past its deadline but not yet at the stamp is in flight too:
+        # read it and let go, and the stat sees a directory that tick refreshed.
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
+        main = threading.current_thread()
+        releasing = threading.Event()
+        real_wait, real_stat = threading.Event.wait, os.stat
+
+        def late_wait(self, timeout=None):
+            woke = real_wait(self, timeout)
+            if not woke and threading.current_thread() is not main:
+                time.sleep(1.2)  # past the release's join, still before the lock
+            return woke
+
+        def gap_before_stat(path, *args, **kwargs):
+            if releasing.is_set() and threading.current_thread() is main:
+                releasing.clear()
+                time.sleep(0.3)  # the late tick lands in here
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(threading.Event, "wait", late_wait)
+        monkeypatch.setattr(claude_locks.os, "stat", gap_before_stat)
+        with proper_lockfile(lock_dir):
+            time.sleep(0.1)
+            releasing.set()
 
         assert not lock_dir.exists()
 
