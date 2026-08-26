@@ -58,6 +58,22 @@ class TestProperLockfile:
         assert lock_dir.is_dir()
         assert lock_dir.stat().st_mtime == fresh  # nor did we refresh theirs
 
+    def test_release_removes_a_slowly_touched_lock(self, lock_dir, monkeypatch):
+        # Seen half-done, our own refresh reads to the release as a takeover.
+        # 1.2s outlives the join, so the release must wait rather than guess.
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
+        real_utime = os.utime
+
+        def slow_utime(path, *args, **kwargs):
+            real_utime(path, *args, **kwargs)
+            time.sleep(1.2)
+
+        monkeypatch.setattr(claude_locks.os, "utime", slow_utime)
+        with proper_lockfile(lock_dir):
+            time.sleep(0.15)  # a tick starts and stalls mid-refresh
+
+        assert not lock_dir.exists()
+
     def test_reacquire_after_release(self, lock_dir):
         with proper_lockfile(lock_dir):
             pass
@@ -95,6 +111,7 @@ class TestProperLockfile:
             acquired_ns = lock_dir.stat().st_mtime_ns
             time.sleep(0.4)
             assert lock_dir.stat().st_mtime_ns > acquired_ns
+        assert not lock_dir.exists()  # a refreshed lock is still ours to remove
 
     def test_creates_missing_parent(self, tmp_path):
         nested = tmp_path / "a" / "b" / "target.lock"

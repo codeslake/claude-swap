@@ -94,7 +94,8 @@ def proper_lockfile(
     Blocks up to ``timeout`` seconds (default ``DEFAULT_TIMEOUT_S``, resolved
     at call time so tests can shorten it), taking over locks whose mtime is
     older than ``staleness``, touches the directory mtime while held so other
-    holders don't deem us stale, and removes it on exit.
+    holders don't deem us stale, and removes it on exit — unless it was taken
+    over meanwhile, in which case the successor's lock is left in place.
 
     Raises:
         ClaudeCodeLockTimeout: The lock stayed held past ``timeout``.
@@ -133,17 +134,21 @@ def proper_lockfile(
     stamped_ns = os.stat(lock_dir).st_mtime_ns
 
     stop_touching = threading.Event()
+    # A refresh is a read-modify-write on stamped_ns that the release reads;
+    # half-done — utime landed, read-back has not — our own lock reads foreign.
+    stamping = threading.Lock()
 
     def _touch() -> None:
         nonlocal stamped_ns
         while not stop_touching.wait(TOUCH_INTERVAL_S):
-            try:
-                if os.stat(lock_dir).st_mtime_ns != stamped_ns:
-                    return  # taken over; refreshing it would adopt their stamp
-                os.utime(lock_dir)
-                stamped_ns = os.stat(lock_dir).st_mtime_ns
-            except OSError:
-                return  # lock stolen/removed; nothing left to keep alive
+            with stamping:
+                try:
+                    if os.stat(lock_dir).st_mtime_ns != stamped_ns:
+                        return  # taken over; refreshing it adopts their stamp
+                    os.utime(lock_dir)
+                    stamped_ns = os.stat(lock_dir).st_mtime_ns
+                except OSError:
+                    return  # lock stolen/removed; nothing left to keep alive
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
@@ -152,8 +157,11 @@ def proper_lockfile(
     finally:
         stop_touching.set()
         toucher.join(timeout=1.0)
+        # stop_touching bars a further refresh; this waits out one in flight.
+        with stamping:
+            mine_ns = stamped_ns
         try:
-            if os.stat(lock_dir).st_mtime_ns == stamped_ns:
+            if os.stat(lock_dir).st_mtime_ns == mine_ns:
                 os.rmdir(lock_dir)
             else:
                 # Removing a successor's lock would leave its critical section
