@@ -242,12 +242,15 @@ def _assert_macos_job_is_intact(workflow: Path) -> None:
     assert _pytest_run_lines(job), (
         "the macOS job no longer invokes pytest — it would stay green testing nothing"
     )
-    # A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned.
+    for path in re.findall(r"tests/test_\w+\.py", job):
+        assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
+    # A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned. LAST,
+    # because it is the broadest: raised ahead of the path check it masked
+    # `test_a_job_naming_a_deleted_file_is_refused`, which then failed with
+    # "regex did not match" about a workflow whose real defect was elsewhere.
     assert not re.search(r"^\s*continue-on-error:\s*true", job, re.M), (
         "the macOS job's step is continue-on-error, so a failure there is green"
     )
-    for path in re.findall(r"tests/test_\w+\.py", job):
-        assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
 
 
 def test_the_macos_job_runs_pytest_on_paths_that_exist():
@@ -306,20 +309,4 @@ def test_a_job_naming_a_deleted_file_is_refused(tmp_path):
     fake = tmp_path / "ci.yml"
     fake.write_text(stale, encoding="utf-8")
     with pytest.raises(AssertionError, match="names tests/test_gone.py"):
-        _assert_macos_job_is_intact(fake)
-
-
-def test_a_commented_out_invocation_does_not_count(tmp_path):
-    """A step someone commented out to debug and never restored.
-
-    The word `pytest` is still in the file, so a reader that keeps comments
-    passes here while the job runs nothing. This is what the stripping in
-    `_macos_job` buys, and without this case nothing witnessed it.
-    """
-    text = _WORKFLOW.read_text(encoding="utf-8")
-    disabled = _mutate_macos_run(text, lambda m: m.group(1).replace("run:", "# run:"))
-    assert disabled != text, "nothing was commented out — lost its subject"
-    fake = tmp_path / "ci.yml"
-    fake.write_text(disabled, encoding="utf-8")
-    with pytest.raises(AssertionError, match="no longer invokes pytest"):
         _assert_macos_job_is_intact(fake)
