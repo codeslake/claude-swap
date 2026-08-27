@@ -649,7 +649,11 @@ class ClaudeAccountSwitcher:
             # unlink fail, so the temp is stranded rather than removed.
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             owned, fd = fd, -1
-            with os.fdopen(owned, "w", encoding="utf-8") as fh:
+            # `newline=""` -- NO TRANSLATION, so the file's bytes ARE
+            # `content.encode("utf-8")` on every platform. Without it Windows
+            # writes CRLF, the two differ for every write, and the recovery
+            # below has to re-READ the temp to learn what it published.
+            with os.fdopen(owned, "w", encoding="utf-8", newline="") as fh:
                 if sys.platform != "win32":
                     os.fchmod(fh.fileno(), 0o600)
                 fh.write(content)
@@ -726,19 +730,16 @@ class ClaudeAccountSwitcher:
                     before = hashlib.sha256(_raw).hexdigest()
                 except OSError:
                     before = None
-                # THE SOURCE DIGEST, WHILE THE TEMP IS STILL KNOWN-GOOD and
-                # the outer cleanup still owns it. Read inside the recovery
-                # instead, it shares an `except OSError` with the
-                # destination's read -- and the temp is unreadable on exactly
-                # the population that reaches the recovery through a
-                # source-side error, so the whole recovery, the emptying AND
-                # the mode restore, became a no-op there. `None` degrades to
-                # "cannot tell whether it landed", never to "do nothing".
-                landed = None
-                try:
-                    landed = hashlib.sha256(temp_path.read_bytes()).hexdigest()
-                except OSError:
-                    pass
+                # WHAT THE COPY PUBLISHES, TAKEN FROM WHAT WE WROTE. The
+                # temp holds exactly `content` (see `newline=""` above), so
+                # this needs no read and therefore cannot fail -- which is
+                # what removes the arm this used to need. Reading the temp
+                # here made `landed` None on precisely the population that
+                # reaches the recovery through a source-side error, and a
+                # None there was indistinguishable from "the copy never
+                # opened the destination". It is the opposite: `copyfile`
+                # opens the destination `'wb'` before the first source byte.
+                landed = hashlib.sha256(content.encode("utf-8")).hexdigest()
                 kept = (
                     f"{path.name} may now be truncated; the complete content "
                     f"was kept at {temp_path.name}"
@@ -782,16 +783,11 @@ class ClaudeAccountSwitcher:
                         after = hashlib.sha256(path.read_bytes()).hexdigest()
                     except OSError:
                         return  # `kept` still names the survivor
-                    # `landed is None` MEANS THE TEMP WAS UNREADABLE, and
-                    # `after` is a hexdigest that is never None -- so without
-                    # this term `after != landed` is unconditionally true and
-                    # the predicate collapses to the destructive form this
-                    # guard exists to replace. An unreadable temp is the one
-                    # state where the copy almost certainly never opened the
-                    # destination, so the conservative answer is to leave the
-                    # content and still restore the mode: the two obligations
-                    # are separate, and only the mode one is POSIX-only.
-                    touched = (landed is not None and after != landed
+                    # `before is None` means the destination could not be
+                    # read BEFORE the copy, so nothing here can tell a partial
+                    # from the bytes that were already there, and emptying it
+                    # would destroy a config this write never reached.
+                    touched = (after != landed
                                and before is not None and after != before)
                     if touched:
                         try:

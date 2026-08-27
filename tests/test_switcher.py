@@ -12367,17 +12367,16 @@ def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
     assert strays == [], f"an interrupt at the mode call stranded {strays}"
 
 
-def test_an_unreadable_temp_does_not_empty_a_completed_copy(
+def test_a_completed_copy_is_not_emptied_by_the_recovery(
     temp_home: Path, monkeypatch
 ):
-    """`landed is None` is "cannot tell", and it must not mean "empty it".
+    """The ORDINARY interrupt on Linux, and the destructive one to get wrong.
 
-    `after` is a hexdigest and is never None, so `after != landed` is
-    unconditionally true once the temp read fails — and the predicate then
-    collapses to exactly the destructive form the completed-copy guard
-    replaced. The failing read and the completed copy are the same population
-    the hoist exists for: the destination is a bind mount, the temp is not,
-    so the temp's medium can fail while the copy still lands in full.
+    `copyfile` uses `sendfile`, so the last byte lands before the signal is
+    delivered: the destination differs from `before` and is COMPLETE. Deciding
+    on `before` alone empties a finished write. `landed` is what separates
+    them, and it is a digest of the bytes we wrote rather than of the file we
+    wrote them to, so nothing about the temp's medium can make it unavailable.
     """
     from claude_swap import switcher as switcher_mod
 
@@ -12392,14 +12391,7 @@ def test_an_unreadable_temp_does_not_empty_a_completed_copy(
     def busy(*_a, **_kw):
         raise OSError(errno.EBUSY, "Device or resource busy")
 
-    real_read = Path.read_bytes
-    fired = {"temp_read": False, "copied": False}
-
-    def refuse_the_temp_once(self):
-        if not fired["temp_read"] and self.name.endswith(".tmp"):
-            fired["temp_read"] = True
-            raise OSError(errno.EIO, "the temp's medium answered EIO")
-        return real_read(self)
+    fired = {"copied": False}
 
     real_copyfile = switcher_mod.shutil.copyfile
 
@@ -12410,17 +12402,15 @@ def test_an_unreadable_temp_does_not_empty_a_completed_copy(
 
     payload = {"activeAccountNumber": 2, "accounts": {"2": {"email": "x@y.z"}}}
     monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
-    monkeypatch.setattr(Path, "read_bytes", refuse_the_temp_once)
     monkeypatch.setattr(switcher_mod.shutil, "copyfile", copy_then_interrupt)
     with pytest.raises(KeyboardInterrupt):
         switcher._write_json(target, payload)
     monkeypatch.undo()
 
-    assert fired["temp_read"], "premise: the temp read never failed"
     assert fired["copied"], "premise: the copy never completed"
     assert target.read_bytes(), (
-        "an unreadable TEMP emptied a destination the copy had COMPLETED — "
-        "`cannot tell` was read as `empty it`, which is the destructive answer"
+        "the recovery emptied a destination the copy had COMPLETED — it "
+        "decided on `before` alone, which is the destructive answer"
     )
     if posix:
         assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
@@ -13499,4 +13489,143 @@ def test_a_partial_larger_than_the_original_is_not_left_world_readable(
     mode = stat_mod.S_IMODE(path.stat().st_mode)
     assert "SECRET" not in left, (
         f"a partial credential survived at mode {oct(mode)}: {left[:40]!r}"
+    )
+
+
+def test_a_partial_copy_is_emptied_not_left_at_the_prior_mode(
+    temp_home: Path, monkeypatch
+):
+    """The state the recovery exists for, and the one it skipped.
+
+    CPython's `copyfile` opens the destination `'wb'` -- truncating it --
+    before reading a single source byte, so a copy that dies mid-stream leaves
+    a PREFIX of the new payload behind. For `~/.claude.json` that prefix is a
+    truncated credential, and the mode restore then puts the permissive prior
+    mode back over it.
+
+    It was skipped whenever the digest of what we published was unavailable,
+    which the recovery used to obtain by re-READING the temp -- unreadable on
+    exactly the population that reaches the recovery through a source-side
+    error. Taking the digest from `content` removes that state entirely.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    import shutil as _shutil
+
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+    original = target.read_bytes()
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"copy": False}
+
+    def truncating_partial(src, dst, **_kw):
+        fired["copy"] = True
+        # EXACTLY CPython's order: the destination is opened 'wb' before the
+        # source is read, so the truncation has already happened.
+        with open(src, "rb") as s, open(dst, "wb") as d:
+            d.write(s.read(18))
+        raise OSError(errno.EIO, "injected mid-copy")
+
+    real_read_bytes = Path.read_bytes
+
+    def unreadable_temp(self):
+        if self.name.startswith(f".{target.name}.") and self.name.endswith(".tmp"):
+            raise OSError(errno.EIO, "the temp's medium answered EIO")
+        return real_read_bytes(self)
+
+    # THE MEDIUM THAT USED TO DISARM THIS, kept so the case still fails if the
+    # digest goes back to being read out of the temp. It is INERT on correct
+    # code -- nothing reads the temp any more -- so it cannot be asserted on
+    # as a premise; the instrument check below is what keeps it from going
+    # stale in silence.
+    probe = target.parent / f".{target.name}.probe.tmp"
+    with pytest.raises(OSError):
+        unreadable_temp(probe)
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(_shutil, "copyfile", truncating_partial)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_temp)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE-SECRET"})
+    monkeypatch.undo()
+
+    assert fired["copy"], "premise: the partial copy never ran"
+    now = target.read_bytes()
+    assert now != original, (
+        "premise: the copy did not truncate, so there is no partial to judge"
+    )
+    assert now == b"", (
+        f"a partial destination survived: {now[:40]!r} at mode "
+        f"{oct(os.stat(target).st_mode & 0o777)}"
+    )
+
+
+def test_an_unreadable_destination_before_the_copy_is_left_alone(
+    temp_home: Path, monkeypatch
+):
+    """THE `before is not None` TERM, which nothing else reaches.
+
+    A partial copy is normally emptied. When the destination could not be READ
+    before the copy, nothing here can tell that partial from bytes that were
+    already there, so the conservative answer is to leave it: the alternative
+    destroys a config this write never finished reaching.
+
+    Measured before this case existed: deleting the term left the file
+    byte-identical at 547 passed.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    import shutil as _shutil
+
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"copy": False, "before": False}
+    real_read_bytes = Path.read_bytes
+
+    def unreadable_before(self):
+        # ONLY the pre-copy read. The recovery reads the destination a second
+        # time afterwards, and that one must succeed or the case proves
+        # nothing about the term -- an early `return` would leave the file
+        # alone for a completely different reason.
+        if not fired["copy"] and os.fspath(self) == os.fspath(target):
+            fired["before"] = True
+            raise OSError(errno.EIO, "injected pre-copy read")
+        return real_read_bytes(self)
+
+    def truncating_partial(src, dst, **_kw):
+        fired["copy"] = True
+        with open(src, "rb") as s, open(dst, "wb") as d:
+            d.write(s.read(18))
+        raise OSError(errno.EIO, "injected mid-copy")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(_shutil, "copyfile", truncating_partial)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_before)
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE-SECRET"})
+    monkeypatch.undo()
+
+    assert fired["before"], "premise: the pre-copy read never failed"
+    assert fired["copy"], "premise: the partial copy never ran"
+    assert target.read_bytes() != b"", (
+        "the recovery emptied a destination it could not read beforehand — it "
+        "cannot tell a partial from what was already there, and emptying is "
+        "the destructive answer to that question"
     )
