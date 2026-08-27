@@ -1536,13 +1536,30 @@ class ClaudeAccountSwitcher:
                             # write above invalidates `_session_dir(num,
                             # email)` -- this key's HOME -- and a key is in
                             # `crossed_keys` precisely because its profile is
-                            # NOT there. With one email the two coincide and
-                            # the repair lands by accident; with two they are
-                            # disjoint, so the slot went on serving the other
-                            # account's token under the other slot's key.
+                            # NOT there. It is not a served key while the
+                            # roster still reads num_a->email_a, but
+                            # `move_account` resolves `_session_dir(target,
+                            # email)` and adopts the orphan as live, carrying
+                            # a superseded generation the reuse check accepts.
+                            #
+                            # THROUGH THE CHOKEPOINT, not around it. A direct
+                            # call opts out of the live-session policy on the
+                            # profile most likely to BE live, and an OSError
+                            # on a session directory would land in the
+                            # `except` below, which counts CREDENTIAL restore
+                            # failures. Contained the way the chokepoint
+                            # contains its own: a failure leaves the marker.
                             if (num, email) in crossed_keys:
-                                self._invalidate_session_credentials(
-                                    num_b if num == num_a else num_a, email)
+                                other = num_b if num == num_a else num_a
+                                try:
+                                    self._post_backup_write(other, email)
+                                except OSError:
+                                    from claude_swap.session import (
+                                        mark_session_stale,
+                                    )
+
+                                    mark_session_stale(
+                                        self._session_dir(other, email))
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:

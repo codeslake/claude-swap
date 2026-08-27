@@ -1823,6 +1823,110 @@ class TestTheRollbackDecidesPerKey:
             "under the OTHER slot's key, which is what put it in crossed_keys"
         )
 
+    def test_an_unwritable_crossed_profile_is_not_a_credential_failure(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The repair touches a SESSION directory from inside the `except`
+        that counts CREDENTIAL restore failures.
+
+        EACCES on the crossed profile -- the fault
+        `_write_account_credentials`'s own docstring names -- then reports a
+        failure for a restore that LANDED, naming a session path in a message
+        about credentials. `failures` also disables the `.prev` purge and
+        prints "Rollback incomplete ... kept for manual recovery", so one
+        unwritable directory turns a clean rollback into a recovery notice.
+
+        The chokepoint one function above already solved this: its own
+        docstring says the invalidation is contained and its failure LEAVES
+        THE MARKER instead.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        crossed.mkdir(parents=True, exist_ok=True)
+        (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
+        crossed.chmod(0o500)
+        try:
+            with caplog_at_error() as records:
+                switcher._rollback_swap(
+                    "1", mail_a, "creds-a", "{}",
+                    "2", mail_b, "creds-b", "{}",
+                    staging={}, moved=moved, wrote_backups=True,
+                )
+        finally:
+            crossed.chmod(0o700)
+
+        said = " ".join(records)
+        assert switcher._read_account_credentials("2", mail_b) == "creds-b", (
+            "premise: the credential restore did NOT land, so a reported "
+            "failure would be true and this asserts nothing"
+        )
+        assert "creds restore failed for slot 2" not in said, (
+            "an unwritable SESSION directory was reported as a failed "
+            f"CREDENTIAL restore, for a restore that landed: {said!r}"
+        )
+        assert "manual recovery" not in said, (
+            f"one unwritable profile turned a clean rollback into a "
+            f"manual-recovery notice: {said!r}"
+        )
+        from claude_swap.session import stale_marker_for
+
+        assert stale_marker_for(crossed).exists(), (
+            "the crossed profile was left with neither its credential "
+            "dropped nor a stale marker, so it keeps serving the superseded "
+            "generation with nothing to say so. The marker is a SIBLING of "
+            "the profile dir for exactly this fault -- the directory that "
+            "denied the unlink is not asked to accept a create"
+        )
+
+    def test_a_live_session_on_the_crossed_profile_is_spared_like_its_home(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The crossed profile is the one MOST likely to be live.
+
+        `_ensure_no_live_session` runs before the forward swap; a `cswap run`
+        starting in the window between it and the rollback has its pid files
+        renamed to the crossed path by the forward move. The forward write
+        then SPARES that profile through the chokepoint -- a running claude
+        manages its own copy, so it gets a marker, not a scrub. Reaching
+        `_invalidate_session_credentials` directly opts out of that policy on
+        exactly that profile.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        crossed.mkdir(parents=True, exist_ok=True)
+        (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
+        switcher._live_session_pids = lambda *a, **k: [4242]
+
+        with caplog_at_error():
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+
+        assert (crossed / ".credentials.json").exists(), (
+            "the rollback scrubbed credentials out from under a RUNNING "
+            "claude on the crossed profile, which the chokepoint spares"
+        )
+        from claude_swap.session import stale_marker_for
+
+        assert stale_marker_for(crossed).exists(), (
+            "spared but not marked: setup_session will reuse the superseded "
+            "generation once the live session exits"
+        )
+
     def test_only_a_crossed_key_reaches_into_the_other_slot(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
