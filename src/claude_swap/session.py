@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -492,6 +493,14 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
     return env
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _plain(msg: str) -> str:
+    """`msg` with SGR escapes removed, for a record a person reads later."""
+    return _ANSI_RE.sub("", msg)
+
+
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
@@ -503,12 +512,18 @@ class SessionManager:
     def _warn(self, msg: str) -> None:
         """Print for this terminal, log to survive the exec that clears it."""
         warning(msg)
-        self._logger.warning(msg)
+        self._logger.warning(_plain(msg))
 
     def _note(self, msg: str) -> None:
-        """`_warn` at INFO, for a line naming where the user's data went."""
+        """`_warn` at INFO, for a line naming where the user's data went.
+
+        STYLED FOR THE TERMINAL, PLAIN FOR THE LOG. A caller that pre-styles
+        its argument puts the escape sequences in the record too, and the
+        record is what the README points a user at. `dimmed` here rather than
+        at the call site, and `_plain` on the way to the logger.
+        """
         print(dimmed(msg))
-        self._logger.info(msg)
+        self._logger.info(_plain(msg))
 
     # -- launch ----------------------------------------------------------
 
@@ -546,12 +561,13 @@ class SessionManager:
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-            warning(msg)
             # run() sets this to a session profile, so a nested launch takes
             # this branch every time. Only a value we did not write says the
-            # user's intent was overruled, and only that is worth keeping.
+            # user's intent was overruled -- and only that is worth SAYING,
+            # not merely worth logging. Printing it either way left the
+            # nested-launch case print-only, which the screen blank erases.
             if Path(config_dir_preset).parent != self.sessions_dir:
-                self._logger.warning(msg)
+                self._warn(msg)
         else:
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —

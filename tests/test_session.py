@@ -1499,7 +1499,7 @@ class TestRun:
         for absent in not_logged:
             assert absent not in records
 
-    def test_our_own_config_dir_is_printed_but_not_logged(
+    def test_our_own_config_dir_is_neither_printed_nor_logged(
         self,
         manager,
         capture_exec,
@@ -1511,7 +1511,14 @@ class TestRun:
     ):
         """run() sets CLAUDE_CONFIG_DIR to a session profile, so a nested
         `cswap run` takes this branch on every launch. Those records would
-        bury the one the log exists for: a value the USER set."""
+        bury the one the log exists for: a value the USER set.
+
+        PRINTED-BUT-NOT-LOGGED WAS THE WRONG HALF TO KEEP. That is the
+        print-only shape this whole file guards against -- the exec clears
+        the screen, so the notice reached nobody either way. Saying nothing
+        about a nested launch we caused ourselves is the honest version, and
+        it leaves every notice that IS printed also recorded.
+        """
         monkeypatch.setenv(
             "CLAUDE_CONFIG_DIR", str(manager.sessions_dir / "2-b_example.com")
         )
@@ -1519,9 +1526,50 @@ class TestRun:
             with pytest.raises(_ExecCalled):
                 manager.run("2", [])
 
-        assert "overriding it for this launch" in capsys.readouterr().out
+        assert "overriding it for this launch" not in capsys.readouterr().out
         logged = "\n".join(r.getMessage() for r in caplog.records)
         assert "overriding it for this launch" not in logged
+
+    def test_every_note_and_warn_on_the_launch_path_reaches_the_log(
+        self, manager, capture_exec, monkeypatch, auth_status_tracks_seed,
+        refresh_rotates, caplog,
+    ):
+        """FIVE OF NINE had no behavioural case at all.
+
+        Swapping each `self._note` / `self._warn` for a print-only
+        `warning(...)`, one at a time, left the whole file green at
+        `session.py` 562, 582, 1113, 1347 and 1358 — including the
+        non-quiescent notice the structural guard's own docstring cites as
+        its motivating discovery, and the `Launching` line, whose text
+        appears nowhere else in this file.
+
+        Rather than nine injections, this asserts the invariant directly: on
+        a launch, everything PRINTED is also RECORDED. A notice that reaches
+        the terminal and not the log is the defect, whichever line it is on.
+        """
+        import re as _re
+
+        printed: list[str] = []
+        real_note, real_warn = manager._note, manager._warn
+        monkeypatch.setattr(
+            manager, "_note",
+            lambda m: (printed.append(m), real_note(m))[1], raising=False)
+        monkeypatch.setattr(
+            manager, "_warn",
+            lambda m: (printed.append(m), real_warn(m))[1], raising=False)
+
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+
+        assert printed, "premise: the launch printed no notice at all"
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        strip = lambda t: _re.sub(r"\x1b\[[0-9;]*m", "", t)
+        missing = [m for m in printed if strip(m) not in logged]
+        assert missing == [], (
+            "a launch notice reached the terminal and not the log, so the "
+            f"exec's screen blank erases it and nothing records why: {missing}"
+        )
 
     def test_the_two_data_moves_outlive_the_terminal(
         self, manager, tmp_path, caplog
@@ -2922,6 +2970,10 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 #: change rather than a guard failure.
 _SANCTIONED_PRINTERS = {"_note", "_warn"}
 
+#: Everything in `printer` that ends in a bare `print`. A notice routed
+#: through any of these dies in the screen blank exactly as `print` does.
+_PRINTERS = {"print", "warning", "error"}
+
 
 class TestEveryLaunchNoticeOutlivesTheBlank:
     """The screen blank erases stdout, so a print-only notice reaches nobody.
@@ -2948,7 +3000,13 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            if getattr(node.func, "id", "") != "print":
+            # EVERY PRINTER, not the builtin alone. `printer.warning` IS
+            # `print(_style(...))` and `printer.error` the same, so a bare
+            # `warning(msg)` is a print-only notice the screen blank erases --
+            # the exact defect class this file exists to guard, and the guard
+            # could not see it. Measured: reverting the whole durable-warning
+            # fix left this GREEN while the behavioural cases went red.
+            if getattr(node.func, "id", "") not in _PRINTERS:
                 continue
             if not node.args:
                 continue
@@ -2969,10 +3027,17 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         # line range: a rename raised StopIteration, a shadowing definition
         # false-failed on `_note`'s own print, and a second printer with the
         # same contract was rejected -- all measured.
+        # A METHOD OF THE CLASS, not any `def` anywhere. `ast.walk` reached
+        # a NESTED `def _note(m): print(...)` written inside the function
+        # under test, so the bypass was one line long. Scoped to class
+        # bodies: an `async def` or a rename fails loudly instead of blindly.
         sanctioned = {
             id(c)
-            for fn in ast.walk(tree)
-            if isinstance(fn, ast.FunctionDef) and fn.name in _SANCTIONED_PRINTERS
+            for cls in ast.walk(tree)
+            if isinstance(cls, ast.ClassDef)
+            for fn in cls.body
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and fn.name in _SANCTIONED_PRINTERS
             for c in ast.walk(fn)
             if isinstance(c, ast.Call)
         }
