@@ -256,7 +256,11 @@ class TestTheRetrySleepIsClampedToTheBudget:
             with claude_locks.proper_lockfile(held, timeout=0.6):
                 pass
         assert tries["n"] > 1, "premise: the loop must have retried at all"
-        assert tries["n"] < 40, (
+        # 6, NOT 40. The jittered arm sleeps 0.25-0.5s, so a 0.6s budget is a
+        # deterministic 3 attempts and 40 tolerated a 13x shrink in silence.
+        # Attempts are budget/sleep, so a slow or loaded machine yields FEWER
+        # -- the noise runs only downward and a tight bound cannot flake up.
+        assert tries["n"] <= 6, (
             f"{tries['n']} acquire attempts in a 0.6s budget — the retries are "
             f"not sleeping, which is a hot spin on a lock somebody holds"
         )
