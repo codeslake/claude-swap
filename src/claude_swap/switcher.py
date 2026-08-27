@@ -3905,7 +3905,12 @@ class ClaudeAccountSwitcher:
             # this process is one of those -- so the sentence below names the
             # pin for a machine whose pin is fine, and `pin --clear` leaves
             # the next attempt stopped at the same read with the pin gone too.
-            # This branch always raises, so the ask costs no second read.
+            # It DOES cost a second read: reaching here means the pin
+            # splice was found, which took `_live_credential_is` through
+            # `_read_active_credentials` already, and neither wrapper
+            # memoizes. Accepted because both arms of this branch raise,
+            # so the second read cannot disagree with a use-read that
+            # never happens.
             self._refuse_degraded_capture()
             raise ConfigError(
                 "The cloud pin is rewriting this machine's account identity, "

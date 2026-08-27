@@ -101,34 +101,53 @@ def _macos_pytest_run(text: str) -> str:
     what branch protection matches on, so it is the only key here that cannot
     move without somebody noticing.
     """
-    block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \w[\w-]*:\n|\Z)", text, re.S)
+    # THE NEXT JOB'S HEADER MAY CARRY MORE THAN A COLON. `  test-windows:  #
+    # four shards` is ordinary YAML, and requiring `:\n` exactly made this
+    # block swallow the following job -- so its commands counted as this
+    # job's and the macOS test failed naming the macOS job.
+    block = re.search(
+        r"\n  macos-keychain:\n(.*?)(?=\n  [A-Za-z_][\w-]*:[ \t]*(?:#[^\n]*)?\n|\Z)",
+        text, re.S,
+    )
     assert block, "the macos-keychain job is gone or was renamed"
     # ONLY `run:` VALUES, and INDENTATION is what says which lines are one.
-    # `run:` takes an inline string OR a block scalar, so the walk has to
-    # follow the scalar -- but stripping indentation to do that admits every
-    # line in the job, and then `- name: Run pytest` (the most ordinary step
-    # name in Actions), a `with:` value, and an install line all count as
-    # pytest commands. A line belongs to a scalar only while it is indented
+    # Stripping indentation to follow a scalar admits every line in the job,
+    # and then `- name: Run pytest`, a `with:` value and an install line all
+    # count as commands. A line belongs to a scalar only while it is indented
     # DEEPER than the `run:` that opened it.
-    lines = []
+    #
+    # AND A FOLDED SCALAR IS ONE COMMAND. `>` folds its newlines into spaces;
+    # only `|` keeps them. Treating both as line-per-command truncated a
+    # folded invocation at its first line, silently -- the same hole the
+    # backslash fold below exists to close.
+    lines: list[str] = []
     scalar_at = None
+    scalar_folds = False
     for raw in block.group(1).splitlines():
         if not raw.strip() or raw.strip().startswith("#"):
             continue
         indent = len(raw) - len(raw.lstrip())
         if scalar_at is not None:
             if indent > scalar_at:
-                lines.append(raw.strip())
+                if scalar_folds and lines:
+                    lines[-1] = (lines[-1] + " " + raw.strip()).strip()
+                else:
+                    lines.append(raw.strip())
                 continue
-            scalar_at = None  # dedented back out of the block
+            scalar_at = None
         run = re.match(r"\s*(?:- )?run:\s*(.*)$", raw)
         if not run:
             continue
         value = run.group(1).strip()
-        if value in ("|", "|-", "|+", ">", ">-", ">+"):
-            scalar_at = indent
+        # An indentation indicator (`|2`, `>-2`) is legal and carries no text.
+        head = re.fullmatch(r"([|>])([+-]?)(\d*)([+-]?)", value)
+        if head:
+            scalar_at, scalar_folds = indent, head.group(1) == ">"
+            if scalar_folds:
+                lines.append("")
         elif value:
             lines.append(value)
+    lines = [c for c in lines if c]
     # A CONTINUED COMMAND IS ONE COMMAND. `uv run pytest \` + an indented
     # path list is the ordinary way to write a long invocation, and reading
     # only the first physical line drops every path after it -- silently, so
@@ -140,7 +159,26 @@ def _macos_pytest_run(text: str) -> str:
         else:
             folded.append(line)
     lines = folded
-    pytest_runs = [c for c in lines if re.search(r"(^|\s)pytest(\s|$)", c)]
+    # INVOKED, NOT MENTIONED. A word-boundary match counts `uv pip install
+    # pytest` and `echo running pytest now` as commands -- two of the four
+    # shapes this reader was corrected for are installs, and adding
+    # `pytest-asyncio` to a deps step would red the build naming the macOS
+    # job's command count. pytest is invoked when it is in COMMAND position:
+    # skip the env assignments, wrappers and flags in front of it and see
+    # what is left.
+    _WRAPPERS = {"uv", "run", "python", "python3", "poetry", "pdm", "hatch",
+                 "nox", "tox", "env", "exec", "time", "xvfb-run"}
+
+    def _invokes_pytest(command: str) -> bool:
+        for token in command.split():
+            if "=" in token and not token.startswith("-"):
+                continue  # FOO=bar prefix
+            if token.startswith("-") or token in _WRAPPERS:
+                continue
+            return token == "pytest" or token.endswith("/pytest")
+        return False
+
+    pytest_runs = [c for c in lines if _invokes_pytest(c)]
     assert len(pytest_runs) == 1, (
         f"the macOS job has {len(pytest_runs)} pytest command(s), and this "
         f"reads one: {lines}"
@@ -202,14 +240,6 @@ def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
         + "          uv run pytest -o faulthandler_timeout=60\n"
         + tail
     )
-    # A COMMENT IS NOT A STEP. Without dropping them, the paragraph above the
-    # step — which names pytest — counts as a second command.
-    commented = (
-        head
-        + "      - name: X\n        # two pytest shards were tried here\n"
-        + "        run: uv run pytest -o faulthandler_timeout=60\n"
-        + tail
-    )
 
     # A STEP NAME IS NOT A COMMAND. `- name: Run pytest` is the most
     # idiomatic step name in Actions, and a walk that strips indentation
@@ -236,8 +266,9 @@ def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
     scalar_comment = (
         head
         + "      - name: X\n        run: |\n"
+        + "          uv run pytest \\\n"
         + "          # two pytest shards were tried here\n"
-        + "          uv run pytest -o faulthandler_timeout=60\n"
+        + "            tests/test_x.py\n"
         + tail
     )
     # A BACKSLASH CONTINUATION, which is how a long path list is written.
@@ -261,16 +292,85 @@ def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
         + tail
     )
 
+    # A FOLDED SCALAR IS ONE COMMAND. `>` folds newlines into spaces; reading
+    # it line-per-command truncates the invocation at its first line and the
+    # existence check below then sees no paths at all.
+    folded_scalar = (
+        head
+        + "      - name: X\n        run: >\n"
+        + "          uv run pytest\n"
+        + "          tests/test_x.py\n"
+        + tail
+    )
+    # AN INSTALL IS NOT AN INVOCATION, and this is the bare-name form: a
+    # word-boundary predicate counts it, and `pytest-xdist` slipped past only
+    # because of its trailing dash.
+    bare_install = (
+        head
+        + "      - name: Deps\n        run: uv pip install pytest\n"
+        + "      - name: X\n        run: uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # NOR AN ECHO.
+    mentioned = (
+        head
+        + "      - name: Say\n        run: echo running pytest now\n"
+        + "      - name: X\n        run: uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # A NAMELESS STEP puts `run:` straight on the list item.
+    dash_run = (
+        head
+        + "      - run: uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # A BLANK LINE INSIDE A SCALAR has indent 0 and would close it early.
+    blank_in_scalar = (
+        head
+        + "      - name: X\n        run: |\n"
+        + "          echo starting\n\n"
+        + "          uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # AN INDENTATION INDICATOR is legal and carries no command text.
+    indicator = (
+        head
+        + "      - name: X\n        run: |2\n"
+        + "          uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # THE NEXT JOB'S HEADER may carry a trailing comment; this file already
+    # has a comment block above that exact key.
+    next_job_comment = (
+        head
+        + "      - name: X\n        run: uv run pytest -o faulthandler_timeout=60\n"
+        + "\n  test-windows:  # four shards\n    runs-on: windows-latest\n"
+        + "    steps:\n      - run: uv run pytest -n 4\n"
+    )
+
     assert _macos_pytest_run(named) == "uv run pytest tests/test_x.py -v"
     assert _macos_pytest_run(whole) == "uv run pytest -o faulthandler_timeout=60"
     assert _macos_pytest_run(block) == "uv run pytest -o faulthandler_timeout=60"
-    assert _macos_pytest_run(commented) == "uv run pytest -o faulthandler_timeout=60"
     assert _macos_pytest_run(step_named) == "uv run pytest -o faulthandler_timeout=60"
     assert _macos_pytest_run(installs) == "uv run pytest -o faulthandler_timeout=60"
     assert _macos_pytest_run(with_value) == "uv run pytest -o faulthandler_timeout=60"
-    assert _macos_pytest_run(scalar_comment) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(scalar_comment) == "uv run pytest tests/test_x.py"
     assert _macos_pytest_run(continued) == (
         "uv run pytest tests/test_x.py tests/test_y.py")
+    assert _macos_pytest_run(folded_scalar) == (
+        "uv run pytest tests/test_x.py")
+    assert _macos_pytest_run(bare_install) == (
+        "uv run pytest -o faulthandler_timeout=60")
+    assert _macos_pytest_run(mentioned) == (
+        "uv run pytest -o faulthandler_timeout=60")
+    assert _macos_pytest_run(dash_run) == (
+        "uv run pytest -o faulthandler_timeout=60")
+    assert _macos_pytest_run(blank_in_scalar) == (
+        "uv run pytest -o faulthandler_timeout=60")
+    assert _macos_pytest_run(indicator) == (
+        "uv run pytest -o faulthandler_timeout=60")
+    assert _macos_pytest_run(next_job_comment) == (
+        "uv run pytest -o faulthandler_timeout=60")
     with pytest.raises(AssertionError, match="gone or was renamed"):
         _macos_pytest_run("\n  test:\n    runs-on: ubuntu-latest\n")
     with pytest.raises(AssertionError, match="pytest command"):
