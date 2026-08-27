@@ -6920,14 +6920,45 @@ class TestOneRemedyPerKindAcrossEverySurface:
         remedy -- with every test here still green, because each side is
         internally consistent.
         """
-        from claude_swap import oauth, switcher
-        from claude_swap.tui import widgets
+        import ast
+        import importlib
+        from pathlib import Path
 
-        for mod in (switcher, widgets):
+        from claude_swap import oauth
+
+        # DERIVED, because a literal pair is what failed here: it named
+        # `switcher` and `widgets` and omitted `session`, which binds the
+        # dict the same way and renders it at the `cswap run` refresh
+        # warning. A module that starts re-exporting it joins this set on
+        # its own.
+        root = Path(oauth.__file__).parent
+        bound = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:  # MODULE LEVEL ONLY -- a name bound
+                # inside a function is not a surface anyone renders from.
+                names = []
+                if isinstance(node, ast.ImportFrom):
+                    names = [a.asname or a.name for a in node.names]
+                elif isinstance(node, ast.Assign):
+                    names = [t.id for t in node.targets
+                             if isinstance(t, ast.Name)]
+                if "ERROR_NOTES" in names:
+                    rel = path.relative_to(root.parent).with_suffix("")
+                    bound.append(".".join(rel.parts))
+                    break
+
+        # THE DENOMINATOR. An empty scan passes every identity check below.
+        assert len(bound) >= 3, (
+            f"only {len(bound)} module(s) bind ERROR_NOTES ({bound}) -- the "
+            "scan found less than the definition plus two re-exports, so it "
+            "is measuring the wrong tree"
+        )
+        for name in bound:
+            mod = importlib.import_module(name)
             assert mod.ERROR_NOTES is oauth.ERROR_NOTES, (
-                f"{mod.__name__} exports its own copy of ERROR_NOTES, so a "
-                "remedy edited in oauth.py reaches some surfaces and not "
-                "others"
+                f"{name} exports its own copy of ERROR_NOTES, so a remedy "
+                "edited in oauth.py reaches some surfaces and not others"
             )
 
     def test_the_tick_renders_the_same_text_as_every_other_surface(self):
