@@ -586,6 +586,11 @@ class TestDecisionTable:
         event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
         assert event.earliest_reset_at == "2026-07-03T10:30:00Z"
         assert harness.engine._sleep_until_ts is not None
+        # The other arm of `deliberate_wait`. Every peer here is at its limit,
+        # so this IS the exhausted fleet -- and nothing else in the suite reads
+        # the flag as False, which would let a real exhaustion be relabelled.
+        assert event.deliberate_wait is False
+        assert "all accounts exhausted" in event.human()
 
     @pytest.mark.parametrize("offset", [-60.0, 0.0])
     def test_all_exhausted_ignores_non_future_reset(self, harness, offset):
