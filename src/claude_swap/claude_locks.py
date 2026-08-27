@@ -289,7 +289,15 @@ def proper_lockfile(
                     # still runs, because a stat that fails leaves the mtime
                     # where it was and a run of them is the frozen heartbeat
                     # a waiter takes over mid-swap. It is not proof, though.
-                    unproven = True
+                    #
+                    # ONLY WHERE A STAMP IS CONSULTED. Pinned, identity comes
+                    # from the held descriptor and no mtime is read at all, so
+                    # recording an unprovable stamp there forfeits the release
+                    # over a witness that platform never uses -- one transient
+                    # errno left the credentials lock on disk for the whole
+                    # staleness window, blocking Claude Code's own refresh.
+                    if not _CAN_PIN_A_DIRECTORY:
+                        unproven = True
                 # A STAMP WE CHOOSE, so the read-back can be CHECKED. With
                 # a bare `utime` the value is "now", nobody can predict it,
                 # and the read-back then takes whatever is at the name --
@@ -301,10 +309,8 @@ def proper_lockfile(
                     os.utime(lock_dir, ns=(stamp, stamp))
                 except FileNotFoundError:
                     return
-                except OSError as e:
-                    _warn_frozen(e)
-                    continue
-                last_ok = time.time()
+                except OSError:
+                    continue  # transient; the next tick refreshes it
                 if not _CAN_PIN_A_DIRECTORY:
                     try:
                         seen = os.stat(lock_dir).st_mtime_ns

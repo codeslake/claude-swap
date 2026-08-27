@@ -798,3 +798,78 @@ class TestIdentityNotAStamp:
             f"a held descriptor did not pin the inode ({reused_held}/50), so "
             "identity can be adopted the same way a stamp was"
         )
+
+
+class TestATransientErrnoIsNotFatalToTheHold:
+    """Two arms reached by an ordinary errno on a network `~/.claude`, and
+    neither is reachable from any case that asserts a return value.
+
+    The heartbeat runs on a daemon thread, so anything it raises is swallowed
+    by `threading.excepthook` and the suite stays green while the mtime stops
+    advancing -- which is the stale lock this module exists to prevent.
+    """
+
+    def _run(self, tmp_path, monkeypatch, *, syscall, errno_):
+        lock = tmp_path / "target.lock"
+        real = getattr(os, syscall)
+        left = {"n": 1}
+        raised: list[str] = []
+
+        def failing(path, *a, **k):
+            if (left["n"] and not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)):
+                left["n"] -= 1
+                raise OSError(errno_, "injected")
+            return real(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks.os, syscall, failing)
+        monkeypatch.setattr(
+            threading, "excepthook",
+            lambda a: raised.append(f"{a.exc_type.__name__}: {a.exc_value}"),
+        )
+        with proper_lockfile(lock, timeout=2.0):
+            time.sleep(0.2)
+        assert left["n"] == 0, "premise: the injected error never fired"
+        return lock, raised
+
+    def test_a_utime_error_that_is_not_absence_does_not_kill_the_toucher(
+        self, tmp_path, monkeypatch
+    ):
+        """The arm's own comment promises the heartbeat stays armed on EIO or
+        ESTALE. It called a name this module does not define, so the thread
+        died on the first one and the lock's mtime froze."""
+        _lock, raised = self._run(
+            tmp_path, monkeypatch, syscall="utime", errno_=errno.EIO
+        )
+        assert not raised, (
+            f"the heartbeat thread died on a transient errno: {raised} — the "
+            "mtime stops advancing and a waiter takes the lock as stale"
+        )
+
+    def test_a_stat_error_does_not_forfeit_a_pinned_release(
+        self, tmp_path, monkeypatch
+    ):
+        """`unproven` is a fact about the STAMP, and a pinned platform never
+        reads one -- identity comes from the held descriptor. Recording it
+        anyway made one transient errno leave the credentials lock on disk for
+        the whole staleness window, blocking Claude Code's own refresh."""
+        if not claude_locks._CAN_PIN_A_DIRECTORY:
+            pytest.skip("no held descriptor here, so the stamp really is the witness")
+        lock, raised = self._run(
+            tmp_path, monkeypatch, syscall="stat", errno_=errno.EIO
+        )
+        assert not raised, f"the heartbeat thread died: {raised}"
+        assert not lock.exists(), (
+            "the release left the lock behind over an unprovable STAMP on a "
+            "platform that decides identity by descriptor and never reads one"
+        )
+
+    def test_the_control_removes_it_when_nothing_fails(self, tmp_path, monkeypatch):
+        """Without this the case above passes on a release that always removes."""
+        lock = tmp_path / "target.lock"
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        with proper_lockfile(lock, timeout=2.0):
+            time.sleep(0.2)
+            assert lock.exists(), "premise: the lock was never taken"
+        assert not lock.exists()
