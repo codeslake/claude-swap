@@ -12686,6 +12686,54 @@ def test_a_real_midcopy_failure_names_the_SOURCE_and_must_not_widen(
     )
 
 
+def test_a_matching_destination_the_copy_never_opened_is_still_restored(
+    temp_home: Path, monkeypatch
+):
+    """The complete-copy short-circuit ranks ABOVE the predicate that separates
+    a copy that FINISHED from one that never opened the destination.
+
+    `after == landed` is read as "the destination already holds the whole new
+    payload". It is equally true when nothing was written and the payload
+    happens to equal what was already there -- a switch to the account that is
+    already active re-serialises byte-identical content. The mode restore is
+    then skipped for a file nothing touched, so a 0644 config comes back 0600
+    and whoever else reads it loses access over a write that never happened.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"activeAccountNumber": 1, "accounts": {}}
+    switcher._write_json(target, payload)
+    os.chmod(target, 0o644)
+
+    state = {"tried": False}
+
+    def source_open_failure(src, dst, **kw):
+        state["tried"] = True
+        # The destination is NEVER opened; filename names the SOURCE.
+        raise FileNotFoundError(errno.ENOENT, "No such file", os.fspath(src))
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", source_open_failure)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, payload)  # byte-identical to what is there
+
+    monkeypatch.undo()
+    assert state["tried"], "premise: the copy never ran"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+        "a write that never opened the destination narrowed it anyway, because "
+        "the payload happened to match what was already on disk"
+    )
+
+
 def test_an_unreadable_destination_IS_restored_when_the_copy_never_opened_it(
     temp_home: Path, monkeypatch
 ):
@@ -13047,7 +13095,7 @@ def test_the_temp_is_created_narrow_on_a_name_that_does_not_exist(
             seen.append(os.fstat(fd).st_mode & 0o777)
         return fd
 
-    prev_umask = os.umask(0o022)
+    prev_umask = os.umask(0o000)
     try:
         monkeypatch.setattr(switcher_mod.os, "open", sampling_open)
         switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
@@ -13625,7 +13673,7 @@ def test_the_temp_is_created_narrow_at_every_writer(
             seen.append(os.fstat(fd).st_mode & 0o777)
         return fd
 
-    prev_umask = os.umask(0o022)          # permissive: 0o644 if nothing narrows
+    prev_umask = os.umask(0o000)          # permissive: 0o644 if nothing narrows
     try:
         monkeypatch.setattr(mod.os, "open", sampling_open)
         write()

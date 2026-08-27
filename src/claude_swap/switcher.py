@@ -834,14 +834,20 @@ class ClaudeAccountSwitcher:
                     # recovery entirely and leaves 0600, so restoring the wider
                     # mode here would make an interrupt arriving one instant
                     # later END MORE EXPOSED than the run that finished.
-                    if after is not None and after == landed:
-                        return
                     comparable = after is not None and before is not None
                     untouched = (
                         isinstance(copy_err, OSError)
                         and getattr(copy_err, "filename2", None) is None
                         and copy_err.filename == os.fspath(source)
                     )
+                    # RANKED BELOW `untouched`, WHICH IS THE ONLY THING THAT
+                    # SEPARATES THE TWO. `after == landed` also holds when
+                    # nothing was written and the payload equals what was
+                    # already there -- a switch to the already-active account
+                    # re-serialises byte-identical content. Skipping the
+                    # restore there narrows a file the write never opened.
+                    if not untouched and after is not None and after == landed:
+                        return
                     if not (comparable or untouched):
                         return
                     try:
