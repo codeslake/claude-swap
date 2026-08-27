@@ -1686,7 +1686,96 @@ class TestTheRollbackDecidesPerKey:
             "every restore failed and the summary does not say so, so a "
             f"reader cannot tell it from a rollback with nothing to do: {said!r}"
         )
+        # THE NOUN, and it is the whole content of this arm. `failures` counts
+        # config restores and the overlap deletes as well as credential
+        # writes, while `wrote_any` is credential-only -- so "no RESTORE
+        # landed" is false in this very state, where both config restores
+        # landed and wrote files. "failed" alone is satisfied by either
+        # wording, which is how the correction shipped unwitnessed.
+        assert "no credential restore landed" in summary, (
+            "the arm denies restores that landed: `wrote_any` is set only by "
+            f"the credential branch, and two config restores wrote: {said!r}"
+        )
         assert "staged copies are kept" not in summary, (
             "these two slots have distinct emails, so nothing was staged — "
             f"the line names a recovery that does not exist: {said!r}"
+        )
+
+
+    def test_a_rollback_that_left_the_profiles_crossed_says_so(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The summary describes the CREDENTIAL axis and nothing else.
+
+        Its five arms cover restored / partly failed / none landed / reversed
+        / nothing owed. A reverse that could not put a profile back falls in
+        none of them: `elif undone` needs `wrote_any` False AND `failures`
+        zero, so "credentials were restored" is printed at ERROR level while a
+        slot's session profile is still living under the other slot's key.
+
+        No injected failure is needed. A leftover directory at the home is
+        enough -- the park step raises ENOTEMPTY, `_swap_session_dirs`
+        swallows it by design, and the state is exactly what
+        `crossed_keys` is computed from four lines above the summary.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+
+        said = " ".join(records)
+        assert "rollback:" in said, "premise: no summary was emitted at all"
+        summary = said.split("rollback:")[-1]
+        crossed = switcher._session_dir("1", mail_b)
+        assert crossed.exists(), (
+            "premise: the profile is not crossed, so there is nothing for the "
+            "summary to have left out"
+        )
+        assert "session profile" in summary, (
+            "a session profile is still under the other slot's key and the "
+            f"summary does not mention it: {said!r}"
+        )
+
+    def test_a_rollback_with_nothing_crossed_does_not_claim_otherwise(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """THE CONTROL for the clause above, and it was missing.
+
+        Measured: with the clause fired unconditionally the whole file stayed
+        at 48 passed. Every rollback would then report crossed profiles, which
+        is the same defect in the other direction -- a reader who acts on it
+        goes looking for two directories that are exactly where they belong.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=[], wrote_backups=True,
+            )
+
+        said = " ".join(records)
+        assert "rollback:" in said, "premise: no summary was emitted at all"
+        summary = said.split("rollback:")[-1]
+        # THE ARM DOES NOT MATTER; the clause is appended to whichever fired,
+        # which is the point of appending it once instead of per arm. What
+        # matters is that a summary was produced at all and that it does not
+        # name a crossing.
+        assert summary.strip(), f"premise: the summary is empty: {said!r}"
+        assert "session profile" not in summary, (
+            f"nothing moved, so nothing can be crossed: {said!r}"
         )

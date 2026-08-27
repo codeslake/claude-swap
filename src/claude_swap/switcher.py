@@ -1577,6 +1577,24 @@ class ClaudeAccountSwitcher:
             what = "the session-profile exchange was reversed; no credential was written"
         else:
             what = "no credential needed restoring"
+        # THE OTHER AXIS, and the five arms above do not have it. They all
+        # describe CREDENTIALS; a reverse that could not put a profile back
+        # falls in none of them, and `elif undone` cannot cover it either --
+        # it needs `wrote_any` False AND `failures` zero. So "credentials were
+        # restored" was printed at ERROR level while a slot's session profile
+        # was still living under the other slot's key, which needs no injected
+        # failure at all: a leftover directory at the home makes the park step
+        # raise ENOTEMPTY and `_swap_session_dirs` swallows it by design.
+        #
+        # One clause rather than five, because the fact is independent of
+        # which credential arm fired -- and appending it per arm is how the
+        # next arm added here would silently not carry it. `crossed_keys` is
+        # the set already computed for the forced writes, not a second reading.
+        if crossed_keys:
+            what += (
+                f"; {len(crossed_keys)} session profile(s) are still under "
+                "the other slot's key"
+            )
         self._logger.error(f"Swap {num_a} <-> {num_b} rollback: {what}")
         if wrote_backups and email_a != email_b:
             # Drop half-written copies under the new keys; the records still
