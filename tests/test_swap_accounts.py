@@ -1469,6 +1469,43 @@ class TestTheRollbackDecidesPerKey:
         switcher._session_dir("2", mail_b).mkdir(parents=True, exist_ok=True)
         return [crossed_b]
 
+    def test_a_landed_staging_move_is_not_re_attempted(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
+    ):
+        """`staging` names a path that stops existing once its move lands.
+
+        Left set, the outer `finally`'s recovery `os.replace` runs on every
+        SUCCESSFUL exchange and is carried by its own `except OSError` — so
+        the happy path leans on an error handler rather than on there being
+        no error, and a real ENOENT there is indistinguishable from that.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._session_dir("1", mail_a).mkdir(parents=True, exist_ok=True)
+        switcher._session_dir("2", mail_b).mkdir(parents=True, exist_ok=True)
+
+        real_replace = os.replace
+        from_staging: list[str] = []
+
+        def recording(src, dst, *a, **k):
+            if str(src).endswith(".swapping"):
+                from_staging.append(str(dst))
+            return real_replace(src, dst, *a, **k)
+
+        monkeypatch.setattr(switcher_mod.os, "replace", recording)
+        moved: list = []
+        switcher._swap_session_dirs("1", mail_a, "2", mail_b, moved)
+
+        assert moved, "premise: the forward exchange moved nothing"
+        assert len(from_staging) == 1, (
+            "the staging name was replaced twice on a successful exchange — "
+            "the strand recovery re-ran and only its `except OSError` hid "
+            f"it: {from_staging}"
+        )
+
     def test_only_the_slot_still_crossed_is_forced_through_a_write(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
@@ -1555,10 +1592,18 @@ class TestTheRollbackDecidesPerKey:
             "that could have failed"
         )
         assert "rollback:" in said, "premise: no summary was emitted at all"
-        assert "credentials were restored" not in said, (
+        summary = said.split("rollback:")[-1]
+        assert "credentials were restored" not in summary, (
             f"a restore that raised was reported as a restore: {said!r}"
         )
-        assert "nothing" not in said.split("rollback:")[-1], (
-            "every restore FAILED and the summary said nothing was written, "
-            f"which is the report that hides the kept staged copies: {said!r}"
+        # THE ARM'S OWN CONTENT, not the absence of a word from a superseded
+        # draft. Keying on "nothing" was satisfied by the arm AND by its
+        # deletion, because the fallback wording carries no "nothing" either.
+        assert "failed" in summary, (
+            "every restore failed and the summary does not say so, so a "
+            f"reader cannot tell it from a rollback with nothing to do: {said!r}"
+        )
+        assert "staged copies are kept" not in summary, (
+            "these two slots have distinct emails, so nothing was staged — "
+            f"the line names a recovery that does not exist: {said!r}"
         )

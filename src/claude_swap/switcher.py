@@ -1375,6 +1375,13 @@ class ClaudeAccountSwitcher:
                 finally:
                     if os.path.exists(new_a):
                         moved.append(new_a)
+                    if not os.path.exists(staging):
+                        # CLEARED ONCE THE MOVE LANDS. Left set, the strand
+                        # recovery below runs on every SUCCESSFUL swap and
+                        # relies on its own `except OSError` to swallow an
+                        # ENOENT -- so the happy path is carried by an error
+                        # handler rather than by not being an error.
+                        staging = None
         except OSError as e:
             self._logger.warning(f"Session profile move skipped during swap: {e}")
         finally:
@@ -1548,11 +1555,20 @@ class ClaudeAccountSwitcher:
         # restore RAISED, and one that restored configs only, both reported
         # that nothing had been written. A failure is the one a reader must
         # not miss: it is what keeps the staged copies on disk.
-        if wrote_any:
+        # EVERY CLAUSE TRUE IN EVERY STATE IT COVERS. `failures` counts config
+        # restores and the overlap deletes as well as credential writes, so it
+        # is "restores", not "credential restores". And staged copies exist
+        # only when the two slots share an email -- `staging` is empty for
+        # every distinct-email swap -- so the clause naming them is gated on
+        # having any, not on having failed. A partial failure is named beside
+        # the success rather than hidden behind it.
+        kept = "; the staged copies are kept" if staging else ""
+        if wrote_any and failures:
+            what = f"credentials were restored; {failures} restore(s) failed{kept}"
+        elif wrote_any:
             what = "credentials were restored"
         elif failures:
-            what = (f"no credential restore landed and {failures} failed; "
-                    "the staged copies are kept")
+            what = f"no restore landed and {failures} failed{kept}"
         elif undone:
             what = "the session-profile exchange was reversed; no credential was written"
         else:
