@@ -649,14 +649,18 @@ class ClaudeAccountSwitcher:
             # unlink fail, so the temp is stranded rather than removed.
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             owned, fd = fd, -1
-            # `newline=""` -- NO TRANSLATION, so the file's bytes ARE
-            # `content.encode("utf-8")` on every platform. Without it Windows
-            # writes CRLF, the two differ for every write, and the recovery
-            # below has to re-READ the temp to learn what it published.
-            with os.fdopen(owned, "w", encoding="utf-8", newline="") as fh:
+            # BINARY, so the file's bytes ARE `content.encode("utf-8")` by
+            # CONSTRUCTION rather than by a keyword argument. The recovery
+            # below compares the destination against a digest of `content`,
+            # and a text handle makes that comparison depend on newline
+            # translation: on Windows every completed copy would differ from
+            # the digest and the recovery would empty a destination the copy
+            # had written in full. `newline=""` also buys that, and nothing
+            # can pin a kwarg 80 lines above the comparison it protects.
+            with os.fdopen(owned, "wb") as fh:
                 if sys.platform != "win32":
                     os.fchmod(fh.fileno(), 0o600)
-                fh.write(content)
+                fh.write(content.encode("utf-8"))
 
             # Validate written content
             try:

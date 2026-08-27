@@ -13484,20 +13484,32 @@ def test_a_partial_copy_is_emptied_not_left_at_the_prior_mode(
 
     real_read_bytes = Path.read_bytes
 
+    def is_the_temp(name: str) -> bool:
+        return name.startswith(f".{target.name}.") and name.endswith(".tmp")
+
     def unreadable_temp(self):
-        if self.name.startswith(f".{target.name}.") and self.name.endswith(".tmp"):
+        if is_the_temp(self.name):
             raise OSError(errno.EIO, "the temp's medium answered EIO")
         return real_read_bytes(self)
 
     # THE MEDIUM THAT USED TO DISARM THIS, kept so the case still fails if the
     # digest goes back to being read out of the temp. It is INERT on correct
-    # code -- nothing reads the temp any more -- so it cannot be asserted on
-    # as a premise; the instrument check below is what keeps it from going
-    # stale in silence.
-    probe = target.parent / f".{target.name}.probe.tmp"
-    with pytest.raises(OSError):
-        unreadable_temp(probe)
+    # code -- nothing reads the temp any more -- so it cannot be a premise,
+    # and the check below is what keeps it from going stale in silence.
+    #
+    # DERIVED FROM PRODUCTION, not from the test's own spelling. Handing the
+    # predicate a name this file constructs asks whether it matches itself,
+    # which is true however the temp is really named -- so it would report a
+    # healthy instrument after the writer moved to `tmpXXXXXXXX.tmp`.
+    opened: list[str] = []
+    real_os_open = os.open
 
+    def recording_open(path, *a, **k):
+        if not isinstance(path, int):
+            opened.append(os.path.basename(os.fspath(path)))
+        return real_os_open(path, *a, **k)
+
+    monkeypatch.setattr(switcher_mod.os, "open", recording_open)
     monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
     monkeypatch.setattr(_shutil, "copyfile", truncating_partial)
     monkeypatch.setattr(Path, "read_bytes", unreadable_temp)
@@ -13506,6 +13518,11 @@ def test_a_partial_copy_is_emptied_not_left_at_the_prior_mode(
     monkeypatch.undo()
 
     assert fired["copy"], "premise: the partial copy never ran"
+    assert any(is_the_temp(n) for n in opened), (
+        f"the injection matches none of the names the writer actually opened "
+        f"({opened}) — it is inert for a reason that has nothing to do with "
+        "the fix, and this case has stopped guarding the revert"
+    )
     now = target.read_bytes()
     assert now != original, (
         "premise: the copy did not truncate, so there is no partial to judge"
