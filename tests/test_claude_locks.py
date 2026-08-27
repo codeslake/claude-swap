@@ -205,7 +205,8 @@ class TestProperLockfile:
 
     def test_release_removes_a_slowly_touched_lock(self, lock_dir, monkeypatch):
         # Seen half-done, our own refresh reads to the release as a takeover.
-        # 1.2s outlives the join, so the release must wait rather than guess.
+        # A 1.2s tick outlives `_RELEASE_WAIT_S`, so the release reaches its
+        # wait-or-refuse arm rather than deciding on a half-written stamp.
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
         real_utime = os.utime
 
@@ -532,7 +533,6 @@ class TestTheAcquireAndReleaseAreBounded:
             if (not swapped.is_set() and not isinstance(path, int)
                     and os.fspath(path) == os.fspath(lock)):
                 swapped.set()
-                st = real_utime  # keep the real one for the helper
                 successor["ino"] = self._successor_at(
                     lock, os.stat(lock).st_mtime_ns + offset_ns)
             return out
@@ -882,6 +882,64 @@ class TestATransientErrnoIsNotFatalToTheHold:
         assert not lock.exists(), (
             "the release left the lock behind over an unprovable STAMP on a "
             "platform that decides identity by descriptor and never reads one"
+        )
+
+    def test_an_unprovable_stamp_does_not_let_the_release_take_a_successor(
+        self, tmp_path, monkeypatch
+    ):
+        """The UNPINNED half of the arm above, and the half that had no case.
+
+        Pinned, `unproven` is a fact the release never consults. Unpinned it
+        is the only thing between a transient errno and rmdir-ing a stranger's
+        lock: the failed identity read leaves a window, a successor takes the
+        name inside it, and the refresh then writes OUR chosen stamp onto
+        THEIR directory. The read-back matches, because we wrote it. Without
+        this flag the release sees a reused inode carrying its own stamp,
+        calls the successor's lock its own, and removes it mid-hold.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        lock = tmp_path / "target.lock"
+        real_stat = os.stat
+        state: dict[str, object] = {"fired": False, "successor": None}
+
+        def failing_stat(path, *a, **k):
+            if (
+                not isinstance(path, int)
+                and os.fspath(path) == os.fspath(lock)
+                and not state["fired"]
+                # THE HEARTBEAT'S READ, not the acquire's. `proper_lockfile`
+                # stats the same name on the way in, and firing there raises
+                # out of the `with` instead of reaching the arm under test.
+                and threading.current_thread() is not threading.main_thread()
+            ):
+                state["fired"] = True
+                # THE TAKEOVER LANDS IN THE WINDOW the failed read opens.
+                os.rmdir(lock)
+                os.mkdir(lock)
+                state["successor"] = real_stat(lock).st_ino
+                raise OSError(errno.EIO, "injected")
+            return real_stat(path, *a, **k)
+
+        raised: list[str] = []
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks.os, "stat", failing_stat)
+        monkeypatch.setattr(
+            threading, "excepthook",
+            lambda a: raised.append(f"{a.exc_type.__name__}: {a.exc_value}"),
+        )
+        with proper_lockfile(lock, timeout=2.0):
+            time.sleep(0.2)
+
+        assert state["fired"], "premise: the injected error never fired"
+        assert not raised, f"the heartbeat thread died: {raised}"
+        assert lock.exists(), (
+            "the release removed a SUCCESSOR's lock — the tick could not "
+            "prove whose directory it stamped, and its own stamp read back "
+            "as proof of ownership"
+        )
+        assert real_stat(lock).st_ino == state["successor"], (
+            "premise: the directory at the name is not the successor's, so "
+            "this asserts nothing about a takeover"
         )
 
     def test_an_undisturbed_hold_is_removed_and_keeps_beating(
