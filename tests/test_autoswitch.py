@@ -10260,27 +10260,47 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
         }
         assert _binding_recovery_ts(usage, (), now) == pytest.approx(now + 40 * 60)
 
-    def test_a_tied_window_with_no_reset_makes_the_answer_unknown(self, harness):
-        """One blocker naming a moment does not make the account schedulable
-        when the other names none.
+    def test_the_two_readers_agree_on_a_partly_unknown_tie(self, harness):
+        """THE INVARIANT THIS CLASS IS NAMED FOR, and the shape that broke it
+        in the other direction.
 
-        Taking `max` over only the resets we HAVE would report the 5-hour one
-        and rank the account as back in forty minutes, while its weekly window
-        holds it for a length nothing here can state. `inf` sorts it last,
-        which is what `_binding_recovery_ts` already promises for an unknown.
+        A first fix made a tie where ANY member names no reset answer `inf`.
+        That is more conservative and it is wrong here, because
+        `limiting_reset_ts` -- what `_earliest_recovery` announces from --
+        SKIPS a window with no reset and answers with the latest of the ones it
+        has. So the pair disagreed again, now with the ranking calling `inf`
+        what the announcement called forty minutes: the same crossing this
+        class exists to prevent, pointing the other way.
+
+        Asserted as AGREEMENT rather than against a hand-written number, so it
+        cannot drift the way a copied expectation does. Scoped to a tie at 100,
+        which is where the two functions have the same subject at all.
         """
         from claude_swap.autoswitch import _binding_recovery_ts
+        from claude_swap.poll_policy import limiting_reset_ts
 
         now = harness.clock.now
         usage = {
             "five_hour": {"pct": 100.0, "resets_at": _iso_at(now + 40 * 60)},
             "seven_day": {"pct": 100.0},          # blocked, and will not say for how long
         }
-        assert _binding_recovery_ts(usage, (), now) == float("inf"), (
-            "one of two tied blockers named a reset and the other did not — "
-            "reporting the one we have schedules around a window that has not "
-            "said when it lets go"
+        assert _binding_recovery_ts(usage, (), now) == limiting_reset_ts(usage, ()), (
+            "the ranking and the announcement read one account differently: "
+            "the ranking sorts it last as unknowable while the announcement "
+            "names a moment, so the engine waits for a reset it never ranked"
         )
+
+    def test_a_tie_with_no_reset_at_all_is_unknown(self, harness):
+        """THE CONTROL. Skipping unknown members is not the same as ignoring
+        them: with NOT ONE tied window naming a reset there is nothing to take
+        the latest OF, and both readers say so."""
+        from claude_swap.autoswitch import _binding_recovery_ts
+        from claude_swap.poll_policy import limiting_reset_ts
+
+        now = harness.clock.now
+        usage = {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 100.0}}
+        assert _binding_recovery_ts(usage, (), now) == float("inf")
+        assert limiting_reset_ts(usage, ()) is None
 
     def test_the_wait_ranks_against_the_reset_it_announces(self, harness):
         """The consequence, through the engine: a peer with quota RIGHT NOW is

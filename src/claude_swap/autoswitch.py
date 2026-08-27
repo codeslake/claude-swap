@@ -614,15 +614,17 @@ def _binding_recovery_ts(
     # The ranking then refused every peer returning inside that gap and the
     # engine announced a reset it was not ranking against.
     binding = max(w[1] for w in windows)
-    resets = [w[2] for w in windows if w[1] == binding]
-    stamps = [ts for ts in map(_parse_reset_ts, resets) if ts is not None]
-    # ANY tied window with no usable reset makes the whole answer unknown: the
-    # account cannot be scheduled around a moment one of its blockers will not
-    # name. Same reading `_earliest_recovery` gives, one account down.
-    if len(stamps) != len(resets):
-        return float("inf")
-    ts = max(stamps) if stamps else None
-    return ts if ts is not None and ts > now else float("inf")
+    # A TIED WINDOW WITH NO RESET IS SKIPPED, NOT FATAL, because that is what
+    # `limiting_reset_ts` does -- and `_earliest_recovery` announces from it.
+    # Refusing the whole answer instead recreated the crossing this function
+    # was corrected for, pointing the other way: the ranking sorted an account
+    # last as unknowable while the announcement named a moment for it. With no
+    # tied window naming one there is nothing to take the latest of, and both
+    # readers say unknown.
+    stamps = [ts for ts in
+              (_parse_reset_ts(w[2]) for w in windows if w[1] == binding)
+              if ts is not None]
+    return max(stamps) if stamps and max(stamps) > now else float("inf")
 
 
 def _every_account_above_threshold(
