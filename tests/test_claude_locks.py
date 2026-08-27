@@ -1010,6 +1010,56 @@ class TestATransientErrnoIsNotFatalToTheHold:
             "platform that decides identity by descriptor and never reads one"
         )
 
+    def test_two_probes_on_one_directory_do_not_corrupt_each_other(
+        self, tmp_path, monkeypatch
+    ):
+        """A switch holds three locks and at least two share a parent.
+
+        With the probe on the heartbeat thread those two measure the SAME path
+        at the same time. Keyed on the pid alone they used one file: the writes
+        leapfrog, so a candidate that would have round-tripped is read carrying
+        the sibling's value and the answer comes back COARSER than the truth --
+        which widens the window in which a successor's mkdir mtime reads as
+        ours. Or one thread's cleanup makes the other's stat ENOENT and it
+        falls to the unmeasurable arm. Both end at a lock left on disk for the
+        whole staleness window, on the credentials lock Claude Code's own
+        refresh waits behind.
+        """
+        # A COARSE FILESYSTEM IS WHAT OPENS THE WINDOW. On a 1ns mount the
+        # first candidate round-trips immediately, so the loop is one syscall
+        # pair and two threads almost never overlap -- the instrument reads
+        # clean against the broken name. Simulating the granularity these
+        # locks actually live on makes the loop iterate, which is when the
+        # writes can leapfrog.
+        fs_quantum, real_utime = 1_000_000, os.utime
+
+        def at_granularity(path, *a, **k):
+            ns = k.get("ns")
+            if isinstance(ns, tuple) and len(ns) == 2:
+                k["ns"] = tuple(
+                    (int(v) // fs_quantum) * fs_quantum for v in ns)
+            return real_utime(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", at_granularity)
+        truth = claude_locks._mtime_quantum_ns(tmp_path)
+        answers, barrier = [], threading.Barrier(2)
+
+        def probe():
+            barrier.wait(5)
+            for _ in range(40):
+                answers.append(claude_locks._mtime_quantum_ns(tmp_path))
+
+        threads = [threading.Thread(target=probe) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        wrong = [a for a in answers if a != truth]
+        assert not wrong, (
+            f"{len(wrong)} of {len(answers)} concurrent probes disagreed with "
+            f"the solo measurement {truth}: {sorted(set(wrong))}"
+        )
+
     def test_the_quantum_probe_is_not_in_the_unprotected_gap(
         self, tmp_path, monkeypatch
     ):
@@ -1026,7 +1076,16 @@ class TestATransientErrnoIsNotFatalToTheHold:
         """
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
 
+        # SIGNALLED, so the assert does not race the thread it observes.
+        # `interrupted` returns in microseconds here, which is the only
+        # reason an unsynchronised read passed: give the probe any latency
+        # (a network `~/.claude` is tens of ms) and the `with` block exits,
+        # monkeypatch restores the real probe, and nothing ever raises --
+        # the witness reads clean while the bug is live.
+        reached = threading.Event()
+
         def interrupted(_directory):
+            reached.set()
             raise KeyboardInterrupt("injected inside the probe")
 
         monkeypatch.setattr(claude_locks, "_mtime_quantum_ns", interrupted)
@@ -1050,6 +1109,10 @@ class TestATransientErrnoIsNotFatalToTheHold:
         # it costs the heartbeat, so the mtime stops advancing and a waiter
         # takes the lock over as stale, which is the fault this module exists
         # to prevent traded for the one the move just fixed.
+        assert reached.wait(10), (
+            "the probe was never called, so the escape below is unobserved "
+            "rather than absent"
+        )
         assert not escaped, (
             "the quantum probe's failure escaped the heartbeat thread, which "
             f"ends it and freezes the lock's mtime: {escaped}"

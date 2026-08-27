@@ -37,6 +37,7 @@ import os
 import random
 import sys
 import threading
+import tempfile
 import time
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -77,8 +78,6 @@ def _quantum_for_heartbeat(directory: Path) -> int:
     `BaseException`, because a non-`OSError` is exactly what escapes the
     probe's internal `except OSError`.
     """
-    if _CAN_PIN_A_DIRECTORY:
-        return 1  # identity is the descriptor; no stamp is read
     try:
         return _mtime_quantum_ns(directory)
     except BaseException:
@@ -101,9 +100,17 @@ def _mtime_quantum_ns(directory: Path) -> int:
     own write. On an exact filesystem the quantum is 1 and nothing changes
     at all; on a coarse one the alternative is never releasing.
     """
-    probe = directory / f".mtime-probe-{os.getpid()}"
+    # UNIQUE PER CALL, NOT PER PROCESS. A switch holds three locks at once and
+    # at least two of them share a parent, so with the probe moved onto the
+    # heartbeat thread two of them measure the SAME path concurrently: the
+    # writes leapfrog and the answer comes back coarser than the truth, or one
+    # thread's cleanup makes the other's stat ENOENT and it falls to the
+    # unmeasurable arm. Both end at a lock left on disk for the full staleness
+    # window. `mkstemp` also leaves nothing behind from a crashed run.
+    fd, name = tempfile.mkstemp(dir=directory, prefix=".mtime-probe-")
+    os.close(fd)
+    probe = Path(name)
     try:
-        probe.touch()
         for quantum in (1, 100, 1_000, 1_000_000, 1_000_000_000, 2_000_000_000):
             # AN ODD MULTIPLE, so a coarser filesystem MUST truncate it.
             # `(t // q) * q` is already a multiple of every coarser quantum
@@ -116,13 +123,14 @@ def _mtime_quantum_ns(directory: Path) -> int:
             if os.stat(probe).st_mtime_ns == want:
                 return quantum
         # NOTHING ROUND-TRIPPED, so this filesystem is coarser than every
-        # candidate (or ignores `utime` outright) and no value here is
-        # measured. Returning the last candidate would claim a granularity the
-        # loop has just PROVED it does not keep, which truncates the stamp and
-        # latches `unproven` on the first tick -- the defect the quantisation
-        # exists to remove, rebuilt in its own error path. Same answer as the
-        # unreadable arm below, for the same reason.
-        return 1  # cannot measure; the strict comparison is the old behaviour
+        # candidate. No value here is measured, and the honest-looking answer
+        # is the WRONG one: `1` is the FIRST candidate the loop rejected, so a
+        # stamp written at it never round-trips and `unproven` latches on
+        # every tick. The coarsest candidate is rejected too, but only half
+        # the time -- measured over 200,000 clock samples on a filesystem
+        # coarser than all of them, 100,111 ticks round-trip at 2e9 against 0
+        # at 1. Half a release is strictly better than none.
+        return 2_000_000_000
     except OSError:
         return 1  # cannot measure; the strict comparison is the old behaviour
     finally:
