@@ -602,12 +602,11 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    The two cases that guard these clamps both use a timeout SMALLER than the
-    flat sleep (0.01 and 0.001), where `min(sleep, timeout)` and
-    `min(sleep, remaining)` are indistinguishable. Measured: weakening both
-    clamps to the whole timeout leaves the suite at 36/36 while the acquire
-    path overshoots by up to 0.5s, and at the production default the mutation
-    is a total no-op -- `proper_lockfile` is unbounded again.
+    THE FILE'S ONLY WALL CLOCK. Every other clamp case scripts `monotonic`, so
+    all of them share one instrument and a systematic error in it is invisible
+    to the lot. This one measures elapsed time and nothing else, which is the
+    whole reason to keep it: on the weakening below it is redundant, and that
+    is an argument about one mutation rather than about independence.
 
     The jitter is pinned, or the weakened form's overshoot is a random draw
     that can land inside any fixed margin.
@@ -623,8 +622,11 @@ class TestTheClampsSurviveWeakeningNotOnlyDeletion:
             with proper_lockfile(lock_dir, timeout=0.6):
                 pass
         elapsed = time.monotonic() - start
-        # Correct: 0.5 then 0.1 -> 0.6. Weakened: 0.5 twice -> 1.0.
-        assert elapsed < 0.8, (
+        # Correct: 0.5 then 0.1 -> 0.6. Weakened: 0.5 twice -> 1.0. Measured
+        # 0.60 idle over 5 runs and 0.70 under a heavily loaded box, so 0.8 sat
+        # 0.10 above the loaded value; 0.85 keeps the same distance from BOTH
+        # sides of the range this has to separate.
+        assert elapsed < 0.85, (
             f"a 0.6s budget took {elapsed:.2f}s — the retry sleep clamped to "
             "`timeout` rather than to what is left of it"
         )
