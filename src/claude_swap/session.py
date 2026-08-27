@@ -1430,7 +1430,15 @@ class SessionManager:
                   / f".cswap-shared-{os.getpid()}.{secrets.token_hex(4)}.tmp")
         fd = -1
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                fd = os.open(
+                    tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE, and this arm SWALLOWS -- so without the
+                # disown the `finally` below deletes the winner's file with
+                # no raise, no log, and nothing to notice.
+                tmp = ""
+                raise
             owned, fd = fd, -1
             with os.fdopen(owned, "w", encoding="utf-8") as f:
                 f.write(payload)

@@ -86,7 +86,15 @@ def ensure_notification_identity(
                 # descriptor, and on Windows the held handle makes the unlink
                 # below fail, stranding the temp it exists to remove.
                 fd = -1
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                try:
+                    fd = os.open(
+                        tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                except FileExistsError:
+                    # NOT OURS TO REMOVE. The outer handler swallows, so
+                    # without the disown the `finally` deletes the winner's
+                    # in-progress file behind a warning about our own write.
+                    tmp = None
+                    raise
                 owned, fd = fd, -1
                 with os.fdopen(owned, "wb") as fh:
                     fh.write(plistlib.dumps(data))

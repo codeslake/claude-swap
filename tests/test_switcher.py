@@ -13048,15 +13048,31 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
             if "O_EXCL" not in ast.unparse(node):
                 continue
             seen += 1
-            caught = {
-                name
-                for t in guarding.get(id(node), [])
-                for h in t.handlers if h.type is not None
-                for name in ast.unparse(h.type).replace(
-                    "(", " ").replace(")", " ").replace(",", " ").split()
-            }
-            if not ({"FileExistsError", "OSError"} & caught):
-                offenders.append(f"{mod.name}:{node.lineno}")
+            # NOT "IS THERE A HANDLER" -- that is true of every site here,
+            # so it discriminates nothing. What has to be true is that the
+            # handler for THIS call DISOWNS the name before the cleanup can
+            # reach it: it assigns something (the temp name, or the flag the
+            # cleanup consults) and re-raises. A bare `except OSError: raise`
+            # satisfies the weaker question and still deletes the winner's
+            # file -- measured, with the suite green.
+            name = (node.args[0].id if node.args
+                    and isinstance(node.args[0], ast.Name) else None)
+            ok = False
+            for t in guarding.get(id(node), []):
+                for h in t.handlers:
+                    if h.type is None:
+                        continue
+                    caught = ast.unparse(h.type)
+                    if not ("FileExistsError" in caught or "OSError" in caught):
+                        continue
+                    body = ast.dump(ast.Module(body=h.body, type_ignores=[]))
+                    disowns = ("Assign(" in body or "AnnAssign(" in body
+                               or "Delete(" in body)
+                    if disowns and "Raise(" in body:
+                        ok = True
+            if not ok:
+                offenders.append(f"{mod.name}:{node.lineno}"
+                                 + (f" ({name})" if name else ""))
 
     assert seen >= 8, (
         f"the instrument, not the code: only {seen} `O_EXCL` open(s) were "
@@ -13108,15 +13124,20 @@ def test_every_temp_writer_opens_with_O_EXCL():
             # count fell and nothing complained. Resolve a single binding --
             # `ast.AnnAssign` too, which the first cut of this missed.
             if flags.isidentifier():
+                # THE ISINSTANCE FIRST. `ast.walk` yields the Module before
+                # anything else and a Module has no `.value`, so leading with
+                # that test raises `AttributeError` the moment any site
+                # spells its flags as a name -- and a real weakening then
+                # reports as a crashed instrument instead of an offender.
                 bound = [
                     ast.unparse(a.value) for a in ast.walk(tree)
-                    if a.value is not None
-                    and ((isinstance(a, ast.Assign) and len(a.targets) == 1
-                          and isinstance(a.targets[0], ast.Name)
-                          and a.targets[0].id == flags)
-                         or (isinstance(a, ast.AnnAssign)
-                             and isinstance(a.target, ast.Name)
-                             and a.target.id == flags))
+                    if ((isinstance(a, ast.Assign) and len(a.targets) == 1
+                         and isinstance(a.targets[0], ast.Name)
+                         and a.targets[0].id == flags)
+                        or (isinstance(a, ast.AnnAssign)
+                            and isinstance(a.target, ast.Name)
+                            and a.target.id == flags))
+                    and a.value is not None
                 ]
                 flags = bound[0] if len(bound) == 1 else flags
             # UNREADABLE IS NOT SAFE, and this is where the previous cut let
