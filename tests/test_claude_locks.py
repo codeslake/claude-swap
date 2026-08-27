@@ -624,11 +624,34 @@ class TestTheAcquireAndReleaseAreBounded:
             return real_utime(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "utime", counting)
+
+        # THE REWIND LANDS IMMEDIATELY BEFORE A READ OF THE LOCK. Written as
+        # a bare `utime` from this thread it races the tick: one that lands
+        # after `_ours` has already read is overwritten by that same tick's
+        # own refresh, whose read-back then matches, and the rewind is never
+        # observed at all. Measured on APFS, 1 run in 3.
+        armed = threading.Event()
+        rewound = threading.Event()
+        real_stat = os.stat
+
+        def rewinding(path, *a, **k):
+            if (armed.is_set() and not rewound.is_set()
+                    and not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)):
+                rewound.set()
+                real_utime(lock, (time.time() - 30,) * 2)
+            return real_stat(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "stat", rewinding)
         with proper_lockfile(lock):
             time.sleep(0.1)
             before = touches["n"]
             assert before >= 1, "premise: the heartbeat never ran at all"
-            real_utime(lock, (time.time() - 30,) * 2)   # an external rewind
+            armed.set()
+            assert rewound.wait(2.0), (
+                "premise: no tick read the lock after arming, so no rewind "
+                "was ever placed for one to see"
+            )
             time.sleep(0.15)
             after = touches["n"]
 
@@ -761,10 +784,16 @@ class TestIdentityNotAStamp:
                 else:
                     reused_unheld += same
 
-        assert reused_unheld > 0, (
-            "premise: this filesystem never reuses an inode number even "
-            f"unheld ({reused_unheld}/50), so the held result proves nothing"
-        )
+        if reused_unheld == 0:
+            # NOT A FAILURE: APFS mints a new inode number every time
+            # (measured 0/50), so nothing here can distinguish a pin that
+            # works from one that does nothing, whatever `reused_held` says.
+            # ext4 recycles on every iteration (200/200), which is where this
+            # case has something to prove.
+            pytest.skip(
+                "this filesystem never reuses an inode number even unheld "
+                f"({reused_unheld}/50), so the held result proves nothing"
+            )
         assert reused_held == 0, (
             f"a held descriptor did not pin the inode ({reused_held}/50), so "
             "identity can be adopted the same way a stamp was"
