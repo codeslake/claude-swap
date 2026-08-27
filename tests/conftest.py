@@ -852,6 +852,16 @@ def _advancing_clock(clock, budget):
     # sleepless loop at ~100k reads (a fraction of a second) and leaves
     # every measured remainder unchanged.
     step = budget / 100000.0
+    # NOT THREAD-SCOPED, and it cannot be: the heartbeat under test runs on
+    # its own thread and must see the clock move. That leaves one asymmetry
+    # with the `fake_sleep` beside it -- a read from an UNRELATED thread would
+    # advance this clock too, and the remainder assert in
+    # `test_no_retry_sleep_outlives_the_budget_it_was_given` would then
+    # accuse pristine code with a negative `left`. Measured: zero foreign
+    # readers exist in this suite (no threaded timeout plugin), so it is a
+    # witness in one direction only, not a live failure. Scoping it to the
+    # installing thread was tried and fails 6 cases, because the subject IS
+    # a thread.
 
     def monotonic():
         clock[0] += step

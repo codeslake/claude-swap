@@ -315,6 +315,11 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
             # bound cannot flake upward: extra `time.monotonic()` reads from
             # any thread ADVANCE the scripted clock, which exhausts the
             # budget sooner and yields FEWER sleeps.
+            # THE MARGIN, so a reader knows how exact this is. Iteration 4
+            # records 0.104s left against a 0.1 clamp, so ~0.004s of extra
+            # clock advance -- about 980 foreign reads at the scripted step --
+            # would drop the count to 4. That direction passes this bound and
+            # fails the remainder assert below instead.
             assert len(slept) <= 5, (
                 f"{len(slept)} sleeps in a {budget}s budget — the retry "
                 "backed off less than it claims to"
