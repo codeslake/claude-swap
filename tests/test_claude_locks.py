@@ -140,8 +140,9 @@ class TestProperLockfile:
 
         assert touches["n"] > 2, "control: the toucher must have kept trying"
         assert age < 5.0, (
-            "premise: the mtime really did stop advancing, so the warning "
-            "would have been true"
+            "premise: the mtime kept advancing, so a theft warning here would "
+            "have been FALSE -- if it had frozen, the silence below is correct "
+            "for the wrong reason"
         )
         said = [r.getMessage() for r in caplog.records if "refresh" in r.getMessage()]
         assert said == [], (
@@ -174,8 +175,12 @@ class TestProperLockfile:
 
         monkeypatch.setattr(claude_locks.os, "utime", fail_the_tenth)
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            # staleness far below the hold, so the gate is genuinely reached
-            with proper_lockfile(lock_dir, staleness=0.05):
+            # Below the hold, so the gate is genuinely reached -- but not so
+            # close to TOUCH_INTERVAL_S that one scheduler stall reads as a
+            # frozen `last_ok`. At 0.05 a single 30ms hiccup between two ticks
+            # cries wolf on correct code; 0.15 leaves 130ms and still catches
+            # the `last_ok` deletion, because the hold is 0.4s either way.
+            with proper_lockfile(lock_dir, staleness=0.15):
                 time.sleep(0.4)
 
         assert state["n"] > 10, (
