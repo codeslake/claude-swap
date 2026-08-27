@@ -681,21 +681,18 @@ class ClaudeAccountSwitcher:
                 # mounting ~/.claude.json), so writing through is the only
                 # way to update it. Disowned before and reclaimed after, so
                 # a copy that dies part-way leaves the complete content.
-                # BEFORE THE COPY, and before the disown below. `copyfile`
-                # opens the destination `'wb'`: it truncates without touching
-                # the mode, so a chmod after it publishes the payload at
-                # whatever mode was already there. Above the disown for a
-                # second reason -- past that line the temp's name is held only
-                # by `source`, so anything raising in between strands it with
-                # nothing owning it and nothing printing where it went.
-                # `copy`/`copy2` cannot carry the mode instead: `copystat`'s
-                # `utime` fires after the bytes land, and a mount that refuses
-                # the rename can refuse that too.
-                # CAPTURED, so the narrowing below can be undone. It is a
-                # committed side effect otherwise: a copy that fails leaves the
-                # destination at 0600 with nothing recording what it was, and
-                # on a bind-mounted config at 0644 the other uid that reads it
-                # gets EACCES for ever with only the copy error to go on.
+                # BEFORE THE COPY, and before the disown. `copyfile` opens the
+                # destination `'wb'` -- truncating without touching the mode --
+                # so a chmod afterwards would publish the payload at whatever
+                # mode was already there. Past the disown the temp's name is
+                # held only by `source`, so a raise in between strands it
+                # unowned. `copy`/`copy2` cannot carry the mode instead:
+                # `copystat`'s `utime` fires after the bytes land, and a mount
+                # that refuses the rename can refuse that too.
+                #
+                # CAPTURED so the narrowing can be undone. Otherwise a failed
+                # copy leaves the destination at 0600 with nothing recording
+                # what it was.
                 prior_mode = None
                 if sys.platform != "win32":
                     try:
@@ -758,16 +755,11 @@ class ClaudeAccountSwitcher:
                     # destination still holds its original bytes. Emptying it
                     # then destroys a live config the write never touched.
                     #
-                    # SIZE ALONE CANNOT ASK THAT. It reads a truncation as a
-                    # SHRINK, and the mainline direction is the opposite: the
-                    # switch splices `oauthAccount` into an existing config, so
-                    # the new payload is LARGER and a copy dying past the old
-                    # size looks untouched. mtime_ns settles it -- opening the
-                    # destination 'wb' truncates it, and a truncation that
-                    # changes the length marks mtime for update. A copy that
-                    # died on an already-empty file leaves no partial to
-                    # publish, which is the one case the pair cannot see and
-                    # the one where there is nothing to see.
+                    # SIZE ALONE CANNOT ASK THAT: the mainline splices into an
+                    # existing config, so the new payload is LARGER and a copy
+                    # dying past the old size looks untouched. A copy that died
+                    # on an already-empty file is the one case the pair cannot
+                    # see, and the one with nothing to see.
                     #
                     # TWO OBLIGATIONS, NOT ONE. Emptying a partial is about the
                     # CONTENT and applies on every platform; restoring the mode
@@ -776,18 +768,16 @@ class ClaudeAccountSwitcher:
                     # credential -- measured in CI, `mode 0o666` with the
                     # secret still in the file.
                     #
-                    # A COMPLETE COPY ALSO DIFFERS FROM `before`, and on Linux
-                    # that is the ORDINARY interrupt here: `copyfile` uses
-                    # `sendfile`, so the last byte lands before the signal is
+                    # A COMPLETE COPY ALSO DIFFERS FROM `before` -- `copyfile`
+                    # uses `sendfile`, so the last byte lands before a signal is
                     # delivered. Deciding on `before` alone empties a finished
-                    # write, so compare against what the temp holds -- which
-                    # is `content` byte for byte, the handle being binary.
+                    # write; compare against what the temp holds, which is
+                    # `content` byte for byte because the handle is binary.
                     #
                     # NOT A `return`. An unreadable destination cannot judge a
-                    # partial, and that is all it cannot do: returning here
-                    # gated the mode restore below on this read, which is the
-                    # coupling the note above forbids one paragraph earlier.
-                    # The faults are the same ones that produced the EBUSY.
+                    # partial, and that is ALL it cannot do -- returning gated
+                    # the mode restore below on this read, the very coupling
+                    # the note above forbids.
                     try:
                         after = hashlib.sha256(path.read_bytes()).hexdigest()
                     except OSError:
