@@ -65,6 +65,26 @@ _RELEASE_WAIT_S = 5.0
 _CAN_PIN_A_DIRECTORY = sys.platform != "win32"
 
 
+def _quantum_for_heartbeat(directory: Path) -> int:
+    """`_mtime_quantum_ns` for a caller that must not be ended by it.
+
+    The heartbeat runs on a daemon thread, so anything the probe raises there
+    kills `_touch` -- and an mtime that stops advancing is the stale lock this
+    module exists to prevent, which is worse than any coarsening the quantum
+    was added to survive. Unmeasurable therefore means the strict comparison,
+    the same answer the probe's own unreadable arm gives.
+
+    `BaseException`, because a non-`OSError` is exactly what escapes the
+    probe's internal `except OSError`.
+    """
+    if _CAN_PIN_A_DIRECTORY:
+        return 1  # identity is the descriptor; no stamp is read
+    try:
+        return _mtime_quantum_ns(directory)
+    except BaseException:
+        return 1
+
+
 def _mtime_quantum_ns(directory: Path) -> int:
     """The finest granularity from a fixed candidate set that this filesystem
     round-trips, in nanoseconds -- never finer than the truth, possibly
@@ -330,19 +350,7 @@ def proper_lockfile(
     def _touch() -> None:
         nonlocal adopt_stamp, last_stamp, stamp_quantum, unproven
         if stamp_quantum is None:
-            try:
-                stamp_quantum = 1 if _CAN_PIN_A_DIRECTORY else \
-                    _mtime_quantum_ns(lock_dir.parent)
-            except BaseException:
-                # UNMEASURABLE IS THE STRICT COMPARISON, the answer the
-                # probe's own unreadable arm already gives. Raising here ends
-                # the heartbeat, and an mtime that stops advancing is the
-                # stale lock this module exists to prevent -- worse than any
-                # coarsening the quantum was added to survive. `BaseException`
-                # for the same reason the salvage path below states: a
-                # non-`OSError` is exactly what escapes an `except OSError`,
-                # and this runs on a daemon thread where nothing else catches.
-                stamp_quantum = 1
+            stamp_quantum = _quantum_for_heartbeat(lock_dir.parent)
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
         # OSError: return` over both syscalls meant a single EIO or ESTALE --
         # the ordinary errnos on a network `~/.claude` -- ended the heartbeat
