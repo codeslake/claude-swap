@@ -6907,6 +6907,29 @@ class TestOneRemedyPerKindAcrossEverySurface:
     does not.
     """
 
+    def test_every_module_that_exports_the_dict_exports_THE_dict(self):
+        """IDENTITY, not equality, and it is the one this file cannot get
+        from `_SYSTEMIC_MESSAGES`.
+
+        That comparison is derived FROM `oauth.ERROR_NOTES`, so it holds
+        however many copies of the dict exist. What splits the surfaces is a
+        second literal: `switcher` re-exports the dict by import, and
+        `tui/widgets` reads it FROM `switcher` while `session` reads it from
+        `oauth`. A merge that lands a literal below that import shadows it,
+        and the TUI then prints the bare kind where `cswap run` prints the
+        remedy -- with every test here still green, because each side is
+        internally consistent.
+        """
+        from claude_swap import oauth, switcher
+        from claude_swap.tui import widgets
+
+        for mod in (switcher, widgets):
+            assert mod.ERROR_NOTES is oauth.ERROR_NOTES, (
+                f"{mod.__name__} exports its own copy of ERROR_NOTES, so a "
+                "remedy edited in oauth.py reaches some surfaces and not "
+                "others"
+            )
+
     def test_the_tick_renders_the_same_text_as_every_other_surface(self):
         from claude_swap.autoswitch import _SYSTEMIC_MESSAGES
         from claude_swap.oauth import ERROR_NOTES
