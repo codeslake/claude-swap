@@ -22,6 +22,32 @@ from claude_swap.claude_locks import (
 from claude_swap.exceptions import ClaudeCodeLockTimeout
 
 
+def _advancing_clock(clock, budget):
+    """A scripted `monotonic` that MOVES ON READ.
+
+    A clock advanced only inside the fake sleep parks on one instant the moment
+    the code under test stops sleeping, so the retry loop never reaches its
+    deadline and the case HANGS instead of failing -- which is worse than the
+    bug, because a hung xdist worker holds the job with nothing to read.
+
+    The step is a thousandth of the budget, so a sleepless loop crosses the
+    deadline in about a thousand reads whatever the budget is. A FIXED hair
+    does not scale: at a 3s budget it needs three million iterations, and the
+    stale-takeover fires first, so the case reports the wrong failure.
+    """
+    # SMALL ENOUGH NOT TO PERTURB. A thousandth of the budget shifts the
+    # remainders these cases assert on; a hundred-thousandth bounds a
+    # sleepless loop at ~100k reads (a fraction of a second) and leaves
+    # every measured remainder unchanged.
+    step = budget / 100000.0
+
+    def monotonic():
+        clock[0] += step
+        return clock[0]
+
+    return monotonic
+
+
 @pytest.fixture
 def lock_dir(tmp_path: Path) -> Path:
     return tmp_path / "target.lock"
@@ -374,7 +400,7 @@ class TestProperLockfile:
             clock[0] += seconds
 
         monkeypatch.setattr(claude_locks.os, "rmdir", refuse)
-        monkeypatch.setattr(claude_locks.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
 
         with pytest.raises(ClaudeCodeLockTimeout):
@@ -430,7 +456,7 @@ class TestProperLockfile:
             # deadline check reading the same instant for ever.
             clock[0] += seconds + 0.001
 
-        monkeypatch.setattr(claude_locks.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
 
         with pytest.raises(ClaudeCodeLockTimeout):
@@ -672,6 +698,7 @@ class TestEveryArmOfTheLoopBacksOff:
         lock = tmp_path / "held.lock"
         lock.mkdir()  # FRESH, so the stale-takeover arm is never entered
 
+        budget = 3.0
         clock, slept = [0.0], []
         real_sleep = claude_locks.time.sleep
         mine = threading.get_ident()
@@ -691,13 +718,13 @@ class TestEveryArmOfTheLoopBacksOff:
             # loop then spins in real time until the holder ages past
             # CONFIG_STALENESS_S and is taken over, so the case reports "the
             # lock was acquired" after a ten-second real stall.
-            clock[0] += 1e-6
+            clock[0] += budget / 100000.0
             return clock[0]
 
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
         monkeypatch.setattr(claude_locks.time, "monotonic", fake_monotonic)
         with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock, timeout=3.0):
+            with proper_lockfile(lock, timeout=budget):
                 pass
 
         # UNCLAMPED DRAWS ONLY. The final sleep is `min(draw, what is left)`,
@@ -705,9 +732,17 @@ class TestEveryArmOfTheLoopBacksOff:
         # one value look like spread or hide its absence.
         draws = slept[:-1]
         assert len(draws) >= 5, f"too few draws to judge spread: {slept}"
-        assert len(set(draws)) > 1, (
-            f"all {len(draws)} back-offs were {draws[0]}s — the jitter is "
-            "gone, so every waiter released together retries in lockstep"
+        # THE SPREAD, NOT MERE DISTINCTNESS. `len(set(draws)) > 1` is satisfied
+        # by any band at all: a jitter narrowed to a microsecond is lockstep in
+        # every sense that matters and passed it. The band is 0.25 wide, and
+        # over 3000 runs of this body the observed range had a minimum of
+        # 0.044 and never fell below 0.02, so this threshold is ~2x below the
+        # floor and kills both the deletion and a 25x narrowing.
+        spread = max(draws) - min(draws)
+        assert spread > 0.02, (
+            f"the {len(draws)} back-offs span only {spread:.6f}s "
+            f"(min {min(draws):.6f}, max {max(draws):.6f}) — the jitter is "
+            "gone or narrowed, so waiters released together retry in lockstep"
         )
 
     def test_a_dangling_symlink_does_not_spin(self, tmp_path, monkeypatch):
@@ -780,7 +815,7 @@ class TestEveryArmOfTheLoopBacksOff:
             clock[0] += seconds
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
-        monkeypatch.setattr(claude_locks.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
 
         with pytest.raises(ClaudeCodeLockTimeout):
