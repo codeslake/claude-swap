@@ -90,7 +90,7 @@ jobs:
         #
         # `-o testpaths=` is a NO-OP for every shard as written, measured on
         # the pinned pytest: each named shard and the `rest` shard collect the
-        # same count with the flag and without (rest: 1336 either way), and
+        # same count with the flag and without on every shard, and
         # the control that the flag is honoured at all is `-o testpaths=docs`
         # collecting nothing. Positional paths already beat `testpaths`, and
         # `rest`'s `--ignore` list narrows it rather than replacing it. Kept

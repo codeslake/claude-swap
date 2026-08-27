@@ -133,7 +133,7 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
         f"shard matrix is dead data and every shard runs the same thing: {line!r}"
     )
     # KEPT, BUT NOT FOR THE REASON THIS ONCE GAVE. Measured: the `rest` shard
-    # collects 1337 tests with the flag and 1337 without, and every other
+    # collects the same number with the flag and without, and every other
     # shard matches too -- positional paths already beat `testpaths`, so the
     # consequence the old message named ("each shard runs it all") does not
     # occur. The control that the flag is honoured at all is `-o
