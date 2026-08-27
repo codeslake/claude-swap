@@ -810,16 +810,26 @@ class TestATransientErrnoIsNotFatalToTheHold:
     """
 
     def _run(self, tmp_path, monkeypatch, *, syscall, errno_):
+        """-> (lock, raised, after) where `after` counts calls to `syscall` on
+        the lock AFTER the injected one.
+
+        `after` is the half that matters. "The thread did not raise" is not
+        the arm's contract -- the arm promises the heartbeat STAYS ARMED, and
+        `except OSError: return` satisfies the first while breaking the
+        second. Measured: that one-token mutant, which is the original defect
+        the arm's comment describes, left the whole file at 36 passed.
+        """
         lock = tmp_path / "target.lock"
         real = getattr(os, syscall)
-        left = {"n": 1}
+        seen = {"before": 0, "after": 0}
         raised: list[str] = []
 
         def failing(path, *a, **k):
-            if (left["n"] and not isinstance(path, int)
-                    and os.fspath(path) == os.fspath(lock)):
-                left["n"] -= 1
-                raise OSError(errno_, "injected")
+            if not isinstance(path, int) and os.fspath(path) == os.fspath(lock):
+                if not seen["before"]:
+                    seen["before"] = 1
+                    raise OSError(errno_, "injected")
+                seen["after"] += 1
             return real(path, *a, **k)
 
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
@@ -830,8 +840,9 @@ class TestATransientErrnoIsNotFatalToTheHold:
         )
         with proper_lockfile(lock, timeout=2.0):
             time.sleep(0.2)
-        assert left["n"] == 0, "premise: the injected error never fired"
-        return lock, raised
+            in_body = seen["after"]
+        assert seen["before"], "premise: the injected error never fired"
+        return lock, raised, in_body
 
     def test_a_utime_error_that_is_not_absence_does_not_kill_the_toucher(
         self, tmp_path, monkeypatch
@@ -839,12 +850,19 @@ class TestATransientErrnoIsNotFatalToTheHold:
         """The arm's own comment promises the heartbeat stays armed on EIO or
         ESTALE. It called a name this module does not define, so the thread
         died on the first one and the lock's mtime froze."""
-        _lock, raised = self._run(
+        _lock, raised, after = self._run(
             tmp_path, monkeypatch, syscall="utime", errno_=errno.EIO
         )
         assert not raised, (
             f"the heartbeat thread died on a transient errno: {raised} — the "
             "mtime stops advancing and a waiter takes the lock as stale"
+        )
+        # AND IT KEPT BEATING. Not raising is only half of what the arm
+        # promises, and `return` here is the defect its own comment describes.
+        assert after > 0, (
+            "the heartbeat made no further refresh after ONE transient errno "
+            "— it did not raise, it stopped, and a mtime that stops advancing "
+            "is a lock a waiter takes over mid-swap"
         )
 
     def test_a_stat_error_does_not_forfeit_a_pinned_release(
@@ -856,20 +874,42 @@ class TestATransientErrnoIsNotFatalToTheHold:
         the whole staleness window, blocking Claude Code's own refresh."""
         if not claude_locks._CAN_PIN_A_DIRECTORY:
             pytest.skip("no held descriptor here, so the stamp really is the witness")
-        lock, raised = self._run(
+        lock, raised, after = self._run(
             tmp_path, monkeypatch, syscall="stat", errno_=errno.EIO
         )
         assert not raised, f"the heartbeat thread died: {raised}"
+        assert after > 0, "premise: the heartbeat stopped, so no stamp was owed"
         assert not lock.exists(), (
             "the release left the lock behind over an unprovable STAMP on a "
             "platform that decides identity by descriptor and never reads one"
         )
 
-    def test_the_control_removes_it_when_nothing_fails(self, tmp_path, monkeypatch):
-        """Without this the case above passes on a release that always removes."""
+    def test_an_undisturbed_hold_is_removed_and_keeps_beating(
+        self, tmp_path, monkeypatch
+    ):
+        """THE BASELINE for the two cases above: with nothing injected the
+        heartbeat ticks and the release removes.
+
+        It is NOT a control against an always-removing release -- six other
+        cases in this file fail that mutation and this one does not, so
+        claiming it here would name a power it has not got.
+        """
         lock = tmp_path / "target.lock"
+        ticks = {"n": 0}
+        real_utime = os.utime
+
+        def counting(path, *a, **k):
+            if not isinstance(path, int) and os.fspath(path) == os.fspath(lock):
+                ticks["n"] += 1
+            return real_utime(path, *a, **k)
+
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        monkeypatch.setattr(claude_locks.os, "utime", counting)
         with proper_lockfile(lock, timeout=2.0):
             time.sleep(0.2)
             assert lock.exists(), "premise: the lock was never taken"
+        assert ticks["n"] > 1, (
+            f"{ticks['n']} refresh(es) in 0.2s at a 0.02s interval — the "
+            "instrument, not the code"
+        )
         assert not lock.exists()
