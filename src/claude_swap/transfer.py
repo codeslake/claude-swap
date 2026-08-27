@@ -21,7 +21,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import replace_with_retry, write_all
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -123,7 +123,7 @@ def _atomic_write_file(path: Path, content: str) -> None:
     fd = -1
     try:
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.write(fd, content.encode("utf-8"))
+        write_all(fd, content.encode("utf-8"))
         if sys.platform != "win32":
             # On the fd: past `replace_with_retry` a chmod can only fail,
             # and the `except` below would report a landed write as failed.

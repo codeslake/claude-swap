@@ -12734,6 +12734,89 @@ def test_a_matching_destination_the_copy_never_opened_is_still_restored(
     )
 
 
+def test_write_all_finishes_a_short_write():
+    """The behaviour the structural guard above only points at.
+
+    `os.write` accepting fewer bytes is the whole reason the helper exists,
+    and nothing else in the suite makes it happen.
+    """
+    from claude_swap.fsutil import write_all
+
+    got = bytearray()
+    real_write = os.write
+
+    def one_byte_at_a_time(fd, data):
+        got.extend(bytes(data[:1]))
+        return 1
+
+    payload = b'{"refreshToken": "rt-EXAMPLE"}'
+    with patch.object(os, "write", one_byte_at_a_time):
+        write_all(-1, payload)
+    assert bytes(got) == payload, (
+        f"a short write lost bytes: wrote {bytes(got)!r} of {payload!r}"
+    )
+
+    with patch.object(os, "write", lambda fd, data: 0):
+        with pytest.raises(OSError):
+            write_all(-1, payload)
+
+
+def test_no_writer_calls_os_write_bare():
+    """`os.write` is write(2): it may write FEWER bytes than it was given.
+
+    These callers publish credentials, and the `replace_with_retry` that
+    follows succeeds either way -- so a short write does not surface as a
+    failed write, it surfaces as a corrupt account. The count is the only
+    thing that says which happened and every site discarded it.
+
+    Structural for the same reason as its two siblings above: the fix is one
+    line per call site, so a per-site assertion goes stale the moment a
+    seventh writer is added.
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders = []
+    for mod in sorted(src_dir.glob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        # THE LOOP THAT EXISTS TO DO THIS IS THE ONE PLACE ALLOWED TO. Named
+        # rather than exempting its module, so a second exemption has to be
+        # written down here to take effect.
+        exempt = {
+            id(n) for f in ast.walk(tree)
+            if isinstance(f, ast.FunctionDef) and f.name == "write_all"
+            for n in ast.walk(f)
+        }
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "write"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"
+                    and id(node) not in exempt):
+                offenders.append(f"{mod.name}:{node.lineno}")
+
+    # THE SUBJECT FIRST. A denominator that runs ahead of it reports a code
+    # regression as an instrument failure -- reverting one call site drops the
+    # helper's user count below the floor, and "the instrument, not the code"
+    # is then the wrong sentence about the right defect.
+    assert not offenders, (
+        "a writer discards `os.write`'s count, so a short write publishes a "
+        f"truncated file and the rename still succeeds: {offenders}"
+    )
+    # THE DENOMINATOR THAT SURVIVES THE FIX. Counting bare `os.write` cannot
+    # be one: it is zero once this passes, so a guard resting on it would
+    # report clean over a package that had stopped writing anything.
+    users = sum(
+        1 for mod in src_dir.glob("*.py")
+        if "write_all(fd, " in mod.read_text(encoding="utf-8")
+    )
+    assert users >= 4, (
+        f"the instrument, not the code: only {users} module(s) use the "
+        "checked helper, so this would pass over almost nothing"
+    )
+
+
 def test_no_writer_chmods_after_it_publishes():
     """The try block must end AT the publish, everywhere it was moved once.
 

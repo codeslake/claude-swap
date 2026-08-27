@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import replace_with_retry, write_all
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
@@ -478,7 +478,7 @@ def atomic_write_json(path: Path, data: dict) -> None:
     fd = -1
     try:
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+        write_all(fd, json.dumps(data, indent=2).encode("utf-8"))
         if sys.platform != "win32":
             # On the fd, BEFORE the publish. Not for secrecy: `mkstemp`
             # opens at 0600 and a umask only clears bits, so its temp is

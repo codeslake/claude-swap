@@ -33,7 +33,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     CredentialWriteError,
 )
-from claude_swap.fsutil import replace_with_retry
+from claude_swap.fsutil import replace_with_retry, write_all
 from claude_swap.models import Platform
 from claude_swap.paths import (
     get_claude_config_home,
@@ -742,7 +742,7 @@ class CredentialStore:
         fd = -1
         try:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+            write_all(fd, json.dumps(data, indent=2).encode("utf-8"))
             if sys.platform != "win32":
                 # On the fd: past `replace_with_retry` a chmod can only fail,
                 # and the `except` below would report a landed write as failed.
@@ -777,7 +777,7 @@ class CredentialStore:
         fd = -1
         try:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.write(fd, credentials.encode("utf-8"))
+            write_all(fd, credentials.encode("utf-8"))
             if sys.platform != "win32":
                 # On the fd: past `replace_with_retry` a chmod can only fail,
                 # and the `except` below would report a landed write as failed.
@@ -1156,7 +1156,7 @@ class CredentialStore:
         fd = -1
         try:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.write(fd, encoded.encode("utf-8"))
+            write_all(fd, encoded.encode("utf-8"))
             if sys.platform != "win32":
                 # On the fd: past `replace_with_retry` a chmod can only fail,
                 # and the `except` below would report a landed write as failed.
