@@ -12800,6 +12800,16 @@ def test_no_writer_calls_os_write_bare():
             and isinstance(f, ast.FunctionDef) and f.name == "write_all"
             for n in ast.walk(f)
         }
+        # EVERY NAME THAT REACHES THE MODULE, not the literal `os`. Matching
+        # `os.write` alone left `import os as _o; _o.write(...)` invisible --
+        # and in a module with other `write_all` sites it did not even move
+        # the denominator, so a live regression in the credential writer ran
+        # green.
+        os_names = {"os"} | {
+            (a.asname or a.name)
+            for imp in ast.walk(tree) if isinstance(imp, ast.Import)
+            for a in imp.names if a.name == "os"
+        }
         # `from os import write as _w` binds a bare NAME, which an attribute
         # match cannot see; resolve the aliases this module actually created.
         aliases = {
@@ -12808,14 +12818,45 @@ def test_no_writer_calls_os_write_bare():
             and imp.module == "os"
             for a in imp.names if a.name == "write"
         }
+        # A LOCAL BOUND TO THE FUNCTION IS THE FUNCTION. `w = os.write` then
+        # `w(fd, ...)` is the same call under a name the scans above cannot
+        # see, and it is the spelling a reader reaches for when the call is
+        # in a loop.
+        aliases |= {
+            t.id
+            for a in ast.walk(tree) if isinstance(a, ast.Assign)
+            for t in a.targets if isinstance(t, ast.Name)
+            if isinstance(a.value, ast.Attribute) and a.value.attr == "write"
+            and isinstance(a.value.value, ast.Name)
+            and a.value.value.id in os_names
+        }
+        # A STAR IMPORT MAKES THE QUESTION UNANSWERABLE, so it is the answer.
+        # Nothing in this package does it, and the first thing that does would
+        # otherwise silently turn every scan here into a pass.
+        if any(isinstance(imp, ast.ImportFrom) and imp.module == "os"
+               and any(a.name == "*" for a in imp.names)
+               for imp in ast.walk(tree)):
+            offenders.append(f"{mod.name}: `from os import *` hides every "
+                             "bare write from this scan")
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or id(node) in exempt:
                 continue
             f = node.func
             bare = isinstance(f, ast.Name) and f.id in aliases
             dotted = (isinstance(f, ast.Attribute) and f.attr == "write"
-                      and isinstance(f.value, ast.Name) and f.value.id == "os")
-            if bare or dotted:
+                      and isinstance(f.value, ast.Name)
+                      and f.value.id in os_names)
+            # `getattr(os, "write")(fd, ...)` -- the call's func is itself a
+            # `getattr` call, which neither branch above is shaped to see.
+            fetched = (
+                isinstance(f, ast.Call) and isinstance(f.func, ast.Name)
+                and f.func.id == "getattr" and len(f.args) == 2
+                and isinstance(f.args[0], ast.Name)
+                and f.args[0].id in os_names
+                and isinstance(f.args[1], ast.Constant)
+                and f.args[1].value == "write"
+            )
+            if bare or dotted or fetched:
                 offenders.append(f"{mod.name}:{node.lineno}")
 
     # THE SUBJECT FIRST. A denominator that runs ahead of it reports a code
@@ -12829,12 +12870,29 @@ def test_no_writer_calls_os_write_bare():
     # THE DENOMINATOR THAT SURVIVES THE FIX. Counting bare `os.write` cannot
     # be one: it is zero once this passes, so a guard resting on it would
     # report clean over a package that had stopped writing anything.
-    users = sum(
-        1 for mod in src_dir.glob("*.py")
-        if "write_all(fd, " in mod.read_text(encoding="utf-8")
-    )
+    # CALL SITES, STRUCTURALLY, AND WITH SLACK. The substring form counted
+    # MODULES -- three sites in one file counted once -- and broke on any
+    # other variable name, so `write_all(owned, ...)` would not have matched.
+    # It also sat exactly ON its floor, which makes the CORRECT refactor
+    # (hand the fd to `os.fdopen` and let the buffered writer loop) fail RED
+    # with "the instrument, not the code" -- the wrong sentence about a good
+    # change. That is the refactor `_write_json` itself already uses.
+    users = 0
+    for mod in src_dir.glob("*.py"):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        named = {
+            (a.asname or a.name)
+            for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
+            and (imp.module or "").endswith("fsutil")
+            for a in imp.names if a.name == "write_all"
+        }
+        users += sum(
+            1 for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in named
+        )
     assert users >= 4, (
-        f"the instrument, not the code: only {users} module(s) use the "
+        f"the instrument, not the code: only {users} call site(s) of the "
         "checked helper, so this would pass over almost nothing"
     )
 
@@ -12864,18 +12922,27 @@ def test_no_writer_chmods_after_it_publishes():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
                 continue
-            pub = chm = None
+            pub, chmods = None, []
             for i, stmt in enumerate(node.body):
                 text = ast.unparse(stmt)
                 if "replace_with_retry(" in text and pub is None:
                     pub = i
                     publishes += 1
-                # ANY RECEIVER. `path.chmod(0o600)` is the idiomatic spelling
-                # here and walked straight past a literal `os.chmod(`.
-                if re.search(r"(?<![\w.])(os\.chmod|\w+\.chmod)\(", text) and chm is None:
-                    chm = i
-            if pub is not None and chm is not None and chm > pub:
-                offenders.append(f"{mod.name}:{node.body[chm].lineno}")
+                # ANY RECEIVER, AND THE LOOKBEHIND WAS EXCLUDING THE ONES
+                # THAT OCCUR: `(?<![\w.])` rejected the dot in
+                # `self.path.chmod(`, the natural regression beside a
+                # `replace_with_retry(tmp, self.path)` publish. `os.fchmod`
+                # is deliberately NOT here -- it takes an fd, which is the
+                # cure this scan exists to push writers towards.
+                if re.search(r"\.(chmod|lchmod|copymode)\(|(?<!\w)chmod\(",
+                             text):
+                    chmods.append(i)
+            # EVERY chmod, not the first. Keeping only the first one recorded
+            # the `os.fchmod` CURE that runs before the publish and then
+            # compared THAT index, so a real chmod after the publish could
+            # not be reached -- the widening masked the offence it added.
+            after = [i for i in chmods if pub is not None and i > pub]
+            offenders += [f"{mod.name}:{node.body[i].lineno}" for i in after]
 
     assert publishes >= 5, (
         f"the instrument, not the code: only {publishes} publish(es) were "
