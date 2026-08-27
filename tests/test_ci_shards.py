@@ -95,6 +95,67 @@ def test_every_test_file_runs_in_exactly_one_windows_shard():
 
 
 
+def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
+    """The shards are data ONLY if the job actually consumes them.
+
+    Everything above reads the matrix and nothing read its consumer, so three
+    edits that collapse sharding entirely were invisible: dropping
+    `${{ matrix.paths }}` makes the matrix dead data and every `--ignore`
+    inert; dropping `-o testpaths=` lets pyproject's own `testpaths` override
+    the positional paths so each shard silently runs the whole suite; deleting
+    the run line stops the job testing anything. All three left the suite green.
+    """
+    text = workflow.read_text(encoding="utf-8")
+    block = re.search(r"\n  test-windows:\n(.*?)(?=\n  \S|\Z)", text, re.S)
+    assert block, "the test-windows job is gone or was renamed"
+    runs = _pytest_run_lines(block.group(1))
+    assert runs, "the Windows job no longer invokes pytest — the shards run nowhere"
+    line = " ".join(runs)
+    assert "${{ matrix.paths }}" in line, (
+        "the Windows pytest command does not consume `matrix.paths`, so the "
+        f"shard matrix is dead data and every shard runs the same thing: {line!r}"
+    )
+    assert "-o testpaths=" in line, (
+        "the Windows pytest command does not clear `testpaths`, so pyproject's "
+        f"own value overrides the shard paths and each shard runs it all: {line!r}"
+    )
+
+
+def test_the_windows_job_consumes_the_shard_matrix():
+    _assert_windows_job_consumes_the_matrix(_WORKFLOW)
+
+
+def _mutate_windows_run(text: str, repl: str) -> str:
+    block = re.search(r"\n  test-windows:\n(.*?)(?=\n  \S|\Z)", text, re.S)
+    assert block, "the test-windows job is gone or was renamed"
+    body, n = re.subn(
+        r"(\n +run: [^\n]*(?<![\w-])pytest(?![\w-])[^\n]*)", repl,
+        block.group(1), count=1,
+    )
+    assert n == 1, "the Windows job has no pytest invocation to mutate"
+    return text[: block.start(1)] + body + text[block.end(1) :]
+
+
+@pytest.mark.parametrize(
+    "repl, expected",
+    [
+        ("", "no longer invokes pytest"),
+        (lambda m: m.group(1).replace(" ${{ matrix.paths }}", ""), "dead data"),
+        (lambda m: m.group(1).replace(" -o testpaths=", ""), "overrides the shard paths"),
+    ],
+    ids=["invocation-deleted", "matrix-not-consumed", "testpaths-not-cleared"],
+)
+def test_each_way_the_windows_shards_collapse_is_refused(tmp_path, repl, expected):
+    """The three edits that were measured green before this existed."""
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    broken = _mutate_windows_run(text, repl)
+    assert broken != text, "nothing was mutated — this check lost its subject"
+    fake = tmp_path / "ci.yml"
+    fake.write_text(broken, encoding="utf-8")
+    with pytest.raises(AssertionError, match=expected):
+        _assert_windows_job_consumes_the_matrix(fake)
+
+
 def _macos_job(workflow: Path) -> str:
     """The `macos-keychain` job's block, with comments stripped.
 
@@ -107,18 +168,46 @@ def _macos_job(workflow: Path) -> str:
     return "\n".join(re.sub(r"(?<!\S)#.*", "", ln) for ln in block.group(1).splitlines())
 
 
+def _pytest_run_lines(job: str) -> list[str]:
+    """The job's `run:` lines that invoke pytest.
+
+    ON THE `run:` LINE, not anywhere in the block. Keyed loosely, the word in a
+    step's `name:` answers yes while the command does nothing -- and `name: Run
+    pytest on macOS` is the most ordinary step name there is, so the loose form
+    is both a false clean and a false alarm. This matches how the mutation
+    helper below selects its target; when the two disagree, the case tests its
+    own scaffolding rather than the workflow.
+    """
+    return [
+        ln for ln in job.splitlines()
+        if re.match(r"\s*run: ", ln) and re.search(r"(?<![\w-])pytest(?![\w-])", ln)
+    ]
+
+
 def _assert_macos_job_is_intact(workflow: Path) -> None:
     job = _macos_job(workflow)
-    assert re.search(r"(?<![\w-])pytest(?![\w-])", job), (
+    assert _pytest_run_lines(job), (
         "the macOS job no longer invokes pytest — it would stay green testing nothing"
+    )
+    # A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned.
+    assert not re.search(r"^\s*continue-on-error:\s*true", job, re.M), (
+        "the macOS job's step is continue-on-error, so a failure there is green"
     )
     for path in re.findall(r"tests/test_\w+\.py", job):
         assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
 
 
 def test_the_macos_job_runs_pytest_on_paths_that_exist():
-    """Two ways the macOS job goes green testing nothing: the invocation is
-    deleted, or a rename leaves it naming a file that no longer exists."""
+    """Ways the macOS job goes green testing nothing that THIS can see: the
+    invocation deleted, the word present only in a step name, the step made
+    continue-on-error, or a rename leaving it naming a file that is gone.
+
+    NOT AN EXHAUSTIVE LIST, and deliberately not. `echo "uv run pytest ..."`,
+    `|| true`, `--collect-only` and `-k nothing` all leave a real pytest
+    invocation on a real `run:` line while selecting or running nothing.
+    Judging that needs pytest's own parser; the reader that tried it was 250
+    lines and got 16 of 31 shapes wrong, which is why it was deleted.
+    """
     _assert_macos_job_is_intact(_WORKFLOW)
 
 
@@ -177,7 +266,6 @@ def test_a_commented_out_invocation_does_not_count(tmp_path):
     text = _WORKFLOW.read_text(encoding="utf-8")
     disabled = _mutate_macos_run(text, lambda m: m.group(1).replace("run:", "# run:"))
     assert disabled != text, "nothing was commented out — lost its subject"
-    assert "pytest" in disabled, "the decoy is gone; the case no longer discriminates"
     fake = tmp_path / "ci.yml"
     fake.write_text(disabled, encoding="utf-8")
     with pytest.raises(AssertionError, match="no longer invokes pytest"):
