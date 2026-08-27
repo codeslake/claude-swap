@@ -272,77 +272,57 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
     """
 
     def test_no_retry_sleep_outlives_the_budget_it_was_given(self, tmp_path):
+        """A SCRIPTED CLOCK: the remaining budget at each sleep is CHOSEN.
+
+        The earlier form raced for it -- anchor on the code's own `monotonic`,
+        then assert the run had ENTERED the region where a flat sleep shows.
+        `min(lefts)` is `budget mod flat`, so losing one loop iteration to
+        latency raises it by a whole `flat` and the assertion can never be
+        satisfied: measured on pristine source, FAIL at 10ms and 12ms and 40ms
+        of injected latency, PASS at 0 and 25 and 30. Under ordinary
+        fair-share contention, 2 of 60 runs red.
+
+        Nothing here touches the wall clock now, so there is no race to lose.
+        """
         target = tmp_path / "held.json"
         holder = FileLock(target, timeout=5)
         assert holder.acquire(), "premise: the lock must be held to contend"
         try:
-            # NOT A MULTIPLE OF THE FLAT SLEEP. With 0.5 the weakened form
-            # divides evenly, every sleep lands exactly on the remainder, and
-            # the mutant survives -- measured, it did. 0.45 leaves 0.05 when
-            # the last 0.1 starts, which is the overshoot.
-            budget = 0.45
-            over: list[tuple[float, float]] = []
-            lefts: list[float] = []
+            # CHOSEN SO THE TAIL REMAINDER IS TINY. The loop spends
+            # 0.1 + 0.001 per iteration, so `budget mod 0.101` is what is
+            # left when the last sleep is drawn, and a flat sleep is only
+            # visible when it exceeds that. 0.45 left 0.046 and a flat 0.005
+            # was invisible; 0.407 leaves 0.003.
+            budget, clock, slept = 0.407, [0.0], []
             real_sleep = locking.time.sleep
             real_monotonic = locking.time.monotonic
-            mine = threading.get_ident()
-            # THE CODE'S OWN ANCHOR. `start` taken out here sits before the
-            # `mkdir` AND the `open` inside `acquire`, and this window is the
-            # wider of the two: measured, 3ms of injected skew already failed
-            # this case on correct code. The first `monotonic()` inside the
-            # call is the deadline the clamp is read against.
-            anchor: list[float] = []
 
-            def anchoring():
-                t = real_monotonic()
-                if threading.get_ident() == mine and not anchor:
-                    anchor.append(t)
-                return t
+            def fake_sleep(seconds):
+                slept.append((round(budget - clock[0], 3), round(seconds, 3)))
+                # ONE ITERATION OF WORK on top of the sleep: nothing else
+                # advances a scripted clock, so a clamped 0.0 would leave the
+                # deadline check reading the same instant for ever.
+                clock[0] += seconds + 0.001
 
-            def recording(seconds):
-                if threading.get_ident() != mine:
-                    return real_sleep(seconds)
-                if not anchor:
-                    # Nothing has read the clock inside the call yet, so
-                    # there is no deadline to measure against.
-                    return real_sleep(seconds)
-                left = budget - (real_monotonic() - anchor[0])
-                lefts.append(left)
-                # A tick of slack for the instructions between the clamp
-                # reading the clock and us reading it.
-                if seconds > max(left, 0.0) + 0.005:
-                    over.append((seconds, left))
-                return real_sleep(seconds)
-
-            locking.time.monotonic = anchoring
-            locking.time.sleep = recording
+            locking.time.monotonic = lambda: clock[0]
+            locking.time.sleep = fake_sleep
             try:
                 waiter = FileLock(target, timeout=budget)
-                # CLEARED HERE, not at the patch: `locking.time` IS the `time`
-                # module, so anything reading the clock in between would
-                # otherwise become the anchor.
-                anchor.clear()
                 assert not waiter.acquire(), "the held lock was handed over"
             finally:
                 locking.time.sleep = real_sleep
                 locking.time.monotonic = real_monotonic
-            assert len(lefts) >= 2, (
-                f"only {len(lefts)} sleep(s) — the instrument, not the code"
-            )
-            # THE DISCRIMINATING REGION. A clamp is observable only once the
-            # remainder falls below the sleep the code would otherwise take;
-            # loop latency can step over that window and an unclamped flat
-            # 0.1 then passes with nothing saying the run had no power.
-            assert min(lefts) < 0.1, (
-                f"the smallest remaining budget at a sleep was "
-                f"{min(lefts):.3f}s, never below the flat 0.1 this separates "
-                "— the run never entered the region where the clamp shows"
-            )
-            assert not over, (
-                f"{len(over)} sleep(s) ran past the deadline; worst slept "
-                f"{max(o for o, _ in over):.3f}s with "
-                f"{min(l for _, l in over):.3f}s left — the clamp used "
-                "`timeout`, not what remains of it"
+
+            assert len(slept) >= 2, f"the instrument, not the code: {slept}"
+            for left, seconds in slept:
+                assert seconds <= max(left, 0.0), (
+                    f"slept {seconds}s with {left}s left — the clamp used "
+                    f"`timeout`, not what remains of it (all sleeps: {slept})"
+                )
+            assert min(l for l, _ in slept) < 0.005, (
+                f"the run must reach a remainder small enough for any flat "
+                f"sleep to overshoot it: {slept}"
             )
         finally:
             holder.release()
+
