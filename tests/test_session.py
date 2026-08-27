@@ -3021,6 +3021,55 @@ _SANCTIONED_PRINTERS = {"_note", "_warn"}
 _PRINTERS = {"print", "warning", "error"}
 
 
+def _print_only_offenders(src: str) -> tuple[list[int], int]:
+    """Lines carrying a print-only notice, and how many printer calls were seen.
+
+    The second number is the DENOMINATOR: a matcher that matches nothing --
+    a typo, a renamed helper -- is green for ever without it.
+
+    EVERY PRINTER, not the builtin alone. `printer.warning` IS
+    `print(_style(...))` and `printer.error` the same, so a bare `warning(msg)`
+    is a print-only notice the screen blank erases. `printer.warning(...)` as
+    well as `warning(...)`: an attribute call has no `.id`.
+
+    A PLAIN NAME BASE, though. `self._logger.warning(...)` is an attribute call
+    whose `attr` is also "warning", and it is the CURE this guards for, not the
+    defect -- taking any `attr` turns every one of them into an offender.
+    """
+    import ast
+
+    tree = ast.parse(src)
+    found: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Name):
+            called = f.id
+        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+            called = f.attr
+        else:
+            continue
+        if called not in _PRINTERS or not node.args:
+            continue
+        found.append((node.lineno, id(node)))
+    # `_note` IS the sanctioned print. Excluded by NODE IDENTITY, not by line
+    # range, and scoped to CLASS BODIES: `ast.walk` reaches a nested
+    # `def _note(m): print(...)` written inside the function under test, so
+    # the bypass would otherwise be one line long.
+    sanctioned = {
+        id(c)
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef)
+        for fn in cls.body
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and fn.name in _SANCTIONED_PRINTERS
+        for c in ast.walk(fn)
+        if isinstance(c, ast.Call)
+    }
+    return [n for n, node_id in found if node_id not in sanctioned], len(found)
+
+
 class TestEveryLaunchNoticeOutlivesTheBlank:
     """The screen blank erases stdout, so a print-only notice reaches nobody.
 
@@ -3034,78 +3083,88 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
     whose whole subject is notices that outlive the blank.
     """
 
+    def test_a_styled_line_reaches_the_log_plain(self, manager, caplog):
+        """`_plain` on BOTH routes.
+
+        The colour-on launch case reads records the launch path produced, and
+        no `_warn` fires there -- measured, dropping `_plain` from `_warn`
+        alone left the whole suite green. Every other case runs colour-off,
+        where `_plain` is the identity function, so nothing held the warning
+        route at all.
+
+        The escape is written literally rather than through `accent`, so the
+        premise does not depend on the printer's colour detection.
+        """
+        import logging
+
+        styled = "\x1b[38;5;173mLaunching\x1b[0m into \x1b[2ma slot\x1b[0m"
+        assert "\x1b[" in styled, (
+            "premise: the input carries no escape, so a logger that recorded "
+            "it verbatim would pass this too"
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            manager._warn(styled)
+            manager._note(styled)
+
+        got = [r.getMessage() for r in caplog.records]
+        assert len(got) == 2, f"premise: both routes did not record: {got}"
+        assert [m for m in got if "\x1b[" in m] == [], (
+            "a record carries SGR escapes, so the log the README points a "
+            f"user at fills with them: {got}"
+        )
+
     def test_no_launch_notice_is_print_only(self):
-        import ast
         import pathlib
 
         import claude_swap.session as session_mod
 
         src = pathlib.Path(session_mod.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        offenders_with_id: list[tuple[int, int]] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            # EVERY PRINTER, not the builtin alone. `printer.warning` IS
-            # `print(_style(...))` and `printer.error` the same, so a bare
-            # `warning(msg)` is a print-only notice the screen blank erases --
-            # the exact defect class this file exists to guard, and the guard
-            # could not see it. Measured: reverting the whole durable-warning
-            # fix left this GREEN while the behavioural cases went red.
-            # `printer.warning(...)` AS WELL AS `warning(...)`: an attribute
-            # call has no `.id`, so keying on that alone left the guard blind
-            # to the import style a future edit is most likely to reach for.
-            #
-            # A PLAIN NAME BASE, though. `self._logger.warning(...)` is an
-            # attribute call whose `attr` is also "warning", and it is the
-            # CURE this file guards for, not the defect -- taking any `attr`
-            # turns all 11 of them into offenders. A module alias is a Name;
-            # a logger reached through `self` is an attribute chain.
-            f = node.func
-            if isinstance(f, ast.Name):
-                called = f.id
-            elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
-                called = f.attr
-            else:
-                continue
-            if called not in _PRINTERS:
-                continue
-            if not node.args:
-                continue
-            # ANY `print` in this module, not one wearing a particular
-            # helper's name. Keying on `dimmed` made the guard blind to the
-            # launch line itself (`print(accent(...) ...)`), which is the
-            # PR's own failure mode, and a matcher typo left it green
-            # forever -- measured both.
-            offenders_with_id.append((node.lineno, id(node)))
-        # THE DENOMINATOR. Without it a matcher that matches nothing -- a
-        # typo, a renamed helper -- is green for ever. Measured: changing
-        # `dimmed` to `dimmedZZZ` left this passing.
-        assert offenders_with_id, (
+        offenders, seen = _print_only_offenders(src)
+        assert seen, (
             "the walk found no `print` at all in session.py — the matcher is "
             "broken, not the module clean"
         )
-        # `_note` IS the sanctioned print. Excluded by NODE IDENTITY, not by
-        # line range: a rename raised StopIteration, a shadowing definition
-        # false-failed on `_note`'s own print, and a second printer with the
-        # same contract was rejected -- all measured.
-        # A METHOD OF THE CLASS, not any `def` anywhere. `ast.walk` reached
-        # a NESTED `def _note(m): print(...)` written inside the function
-        # under test, so the bypass was one line long. Scoped to class
-        # bodies: an `async def` or a rename fails loudly instead of blindly.
-        sanctioned = {
-            id(c)
-            for cls in ast.walk(tree)
-            if isinstance(cls, ast.ClassDef)
-            for fn in cls.body
-            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and fn.name in _SANCTIONED_PRINTERS
-            for c in ast.walk(fn)
-            if isinstance(c, ast.Call)
-        }
-        offenders = [f"session.py:{n}" for n, node_id in offenders_with_id
-                     if node_id not in sanctioned]
         assert offenders == [], (
             "a launch notice is print-only, so the screen blank erases it and "
-            f"nothing records why: {offenders}. Use `_note`."
+            f"nothing records why: {[f'session.py:{n}' for n in offenders]}. "
+            "Use `_note`."
+        )
+
+    def test_the_matcher_sees_both_call_shapes_and_spares_the_cure(self):
+        """Source of its own, because session.py exercises ONE of the halves.
+
+        The module has no `printer.warning(...)` and eleven
+        `self._logger.warning(...)`, so the attribute branch never fires on
+        it: deleting that branch, or widening it to any `attr`, is invisible
+        from the real file. Handing the matcher each shape is what makes both
+        halves answerable.
+        """
+        cases = [
+            ("the builtin", "print('x')", True),
+            ("a bare printer name", "warning('x')", True),
+            ("a module alias", "printer.warning('x')", True),
+            ("printer.error too", "printer.error('x')", True),
+            ("the logger, which is the CURE", "self._logger.warning('x')", False),
+            ("a sanctioned printer", "self._warn('x')", False),
+        ]
+        for label, expr, flagged in cases:
+            src = f"class C:\n    def f(self):\n        {expr}\n"
+            offenders, seen = _print_only_offenders(src)
+            assert bool(offenders) is flagged, (
+                f"{label}: `{expr}` was "
+                f"{'missed' if flagged else 'flagged'} by the matcher "
+                f"(offenders={offenders}, printer calls seen={seen})"
+            )
+
+    def test_a_sanctioned_printers_own_print_is_not_an_offender(self):
+        """The exclusion is by node identity, and it must survive a rename."""
+        src = ("class C:\n"
+               "    def _note(self, m):\n"
+               "        print(m)\n"
+               "    def other(self, m):\n"
+               "        print(m)\n")
+        offenders, seen = _print_only_offenders(src)
+        assert seen == 2, f"premise: the matcher saw {seen} prints, not 2"
+        assert offenders == [5], (
+            f"only `other`'s print is an offender; got {offenders}"
         )
