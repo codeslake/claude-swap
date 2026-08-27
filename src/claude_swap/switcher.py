@@ -810,14 +810,22 @@ class ClaudeAccountSwitcher:
                     # published, and with neither the narrow mode stands:
                     #   - both digests read, so `touched` is a real verdict --
                     #     it either emptied a partial or found the original;
-                    #   - `copyfile` raised BEFORE opening the destination,
-                    #     which ONLY `filename2` distinguishes. Every fast-copy
-                    #     helper sets `filename = fsrc.name` AND `filename2 =
-                    #     fdst.name` before re-raising, so a mid-copy EFBIG or
-                    #     ENOSPC names the SOURCE too -- measured with real
-                    #     `shutil.copyfile`, with a credential fragment already
-                    #     on disk. `filename2` is set on exactly the paths that
-                    #     had opened the destination and None on the rest.
+                    #   - `copyfile` raised BEFORE opening the destination.
+                    #     BOTH conjuncts are load-bearing, for different paths;
+                    #     neither alone decides it. Measured against real
+                    #     `shutil.copyfile`, `(filename, filename2)` is:
+                    #       SameFileError / SpecialFileError  (None, None)
+                    #       source open failed                (SRC,  None)
+                    #       destination open failed           (DST,  None)
+                    #       fast-copy helper, mid-copy        (SRC,  DST)
+                    #       copyfileobj fallback, mid-copy    (None, None)
+                    #     So `filename2 is None` is NOT "the destination was
+                    #     never opened" -- the fallback carries it with the
+                    #     destination already truncated. What excludes that row
+                    #     is `filename == source`. And what excludes the
+                    #     fast-copy row, whose `filename` IS the source, is
+                    #     `filename2`. Only the source-open failure satisfies
+                    #     both, which is the one row where nothing was written.
                     # A COMPLETE COPY IS A SUCCESS THAT DID NOT GET TO RENAME.
                     # `after == landed` means the destination already holds the
                     # whole new payload, so it now carries a credential it need

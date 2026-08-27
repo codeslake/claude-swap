@@ -12631,7 +12631,10 @@ def test_a_real_midcopy_failure_names_the_SOURCE_and_must_not_widen(
     RLIMIT_FSIZE: errno EFBIG, `filename == src`, `filename2 == dst`, and the
     destination holding a fragment of the credential.
 
-    `filename2` is the exclusive discriminator: None on every path that raises
+    `filename2` alone is NOT the discriminator -- measured, the `copyfileobj`
+    fallback raises with BOTH names None and the destination truncated, so it
+    is `filename == source` that excludes that row. Neither conjunct decides
+    alone: None on every path that raises
     before the destination is opened, set on every one that raises after.
     """
     from claude_swap import switcher as switcher_mod
