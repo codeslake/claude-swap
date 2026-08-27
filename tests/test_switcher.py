@@ -14691,6 +14691,62 @@ class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
         assert len(out.get("warnings", [])) == 1, out
 
 
+def test_keychain_blind_probes_rather_than_reading_an_unset_cache(
+    temp_home: Path, monkeypatch
+):
+    """The probe IS the guard, and deleting it left the suite green.
+
+    `_keychain_blind` answers "macOS cannot read the Keychain right now",
+    which is what stops a logout from clearing a working login to reach a
+    slot that was never empty. Only a real `security` call fills the cache,
+    and the paths that matter never make one — `--force` skips the
+    live-identity prefetch and an `.enc`-satisfied read short-circuits before
+    the keychain — so without the probe a locked keychain is indistinguishable
+    from a probed one and the answer is False either way.
+
+    Measured before this: removing the two probe lines left 2300 passed.
+    """
+    switcher = ClaudeAccountSwitcher()
+    switcher.platform = Platform.MACOS
+    switcher._store._keychain_usable_cache = None
+
+    probed: list[int] = []
+
+    def locked_read():
+        probed.append(1)
+        # What a declined `security` leaves: the cache says unusable.
+        switcher._store._keychain_usable_cache = False
+        return ActiveCredentials("", True)
+
+    monkeypatch.setattr(switcher._store, "_read_active_credentials", locked_read)
+    switcher._keychain_blind()
+
+    assert probed == [1], (
+        "the cache was unset and nothing probed it, so the answer came from "
+        "'nobody has asked yet' rather than from the keychain — and a logout "
+        "here clears a working login to reach a slot that is not empty"
+    )
+
+
+def test_keychain_blind_does_not_reprobe_a_cache_already_filled(
+    temp_home: Path, monkeypatch
+):
+    """THE CONTROL. Probing unconditionally would pass the case above and put
+    a `security` call on every read, including the ones that short-circuited
+    precisely to avoid it."""
+    switcher = ClaudeAccountSwitcher()
+    switcher.platform = Platform.MACOS
+    switcher._store._keychain_usable_cache = True
+
+    probed: list[int] = []
+    monkeypatch.setattr(
+        switcher._store, "_read_active_credentials",
+        lambda: probed.append(1) or ActiveCredentials("", False))
+
+    switcher._keychain_blind()
+    assert probed == [], "a filled cache was probed again"
+
+
 def test_a_vetoed_landing_leaves_no_stash_entry_behind(
     temp_home: Path, monkeypatch
 ):

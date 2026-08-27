@@ -735,7 +735,12 @@ Defaults live in settings.json in the backup root; flags override them.
                 dimmed(
                     f"Auto-switch running: threshold {settings.threshold:.0f}%, "
                     f"every {settings.interval_seconds:.0f}s"
-                    f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
+                    # THE ENGINE, NOT THE REQUEST. A demoted engine has
+                    # `dry_run` True while `args.dry_run` is False, and this
+                    # line then announces switching to somebody watching a
+                    # process that will switch nothing. `tui/autoview.py`
+                    # already reads it this way.
+                    f"{' (dry-run)' if engine.dry_run else ''} — Ctrl-C to stop"
                 )
             )
         sys.exit(engine.run_loop())

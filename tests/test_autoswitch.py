@@ -6970,6 +6970,53 @@ class TestLiveLock:
             "the demotion is what the TUI renders, so it has to be set"
         )
 
+    def test_a_lock_that_cannot_be_CREATED_is_not_reported_as_contention(
+        self, harness
+    ):
+        """Demoting silently is worse than the raise it replaced.
+
+        The round-5 fix swallowed `OSError` from `acquire()` so a read-only
+        backup dir could not replace `cswap auto`'s documented 0/1/2/3 exit
+        with a traceback. It took the CONTENTION branch to do it, so a
+        writable dir with an unwritable `.auto-live.lock` — a root run, a
+        tight umask — now says another engine holds the lock. There is no
+        other engine, nothing is logged, `_retry_live_promotion` re-raises the
+        same errno every tick so it never recovers, and every tick decides to
+        switch and does not. Before the fix this raised loudly.
+
+        The demotion is still right; the SENTENCE has to be about what
+        happened.
+        """
+        from claude_swap import autoswitch as autoswitch_mod
+
+        def unwritable(self, *a, **kw):
+            raise OSError(13, "Permission denied")
+
+        events: list = []
+        with patch.object(autoswitch_mod.FileLock, "acquire", unwritable):
+            engine = harness._make_engine(dry_run=False)
+            engine.on_event = events.append
+            with patch.object(
+                harness.switcher, "usage_entries_by_account",
+                return_value={
+                    num: _entry_for(value, harness.clock.now)
+                    for num, value in {"1": _usage(95), "2": _usage(5)}.items()
+                },
+            ):
+                engine.tick()
+
+        assert engine.demoted_from_live is True, "premise: it did not demote"
+        said = [e.message for e in events
+                if isinstance(e, ConfigWarningEvent)]
+        assert said, "the demotion was silent — nothing said why it stopped"
+        assert not any("already running" in m for m in said), (
+            f"a lock that could not be created was reported as contention: {said}"
+        )
+        assert any("Permission denied" in m or "denied" in m.lower()
+                   for m in said), (
+            f"the cause the operator has to fix is not in the message: {said}"
+        )
+
     def test_a_user_requested_dry_run_still_reports_switched(self, harness):
         """The other arm, which the demoted assertion must not take with it.
 

@@ -7443,10 +7443,13 @@ def switch_off_at_limit_account(switcher: "ClaudeAccountSwitcher") -> dict:
     ``strategy="best"`` does anyway.
 
     THAT LOCK IS NOT PROTECTION FOR THIS CALL, and the paragraph above reads
-    as if it were. Nothing here takes it: ``switch()`` serializes the WRITE
-    through the state lock and no further, so a LIVE engine deciding in the
-    same window still decides independently — the same shape two LIVE engines
-    have, which is why only one of those is allowed. What makes it acceptable
+    as if it were. Nothing here takes it. ``switch()`` takes three others —
+    ``FileLock(self.lock_file)``, ``claude_credentials_lock()`` and
+    ``claude_config_lock()`` — and every one of them serializes the WRITE, not
+    the DECISION. (``.autoswitch_state.lock`` is the engine's own and this file
+    never opens it.) So a LIVE engine deciding in the same window still decides
+    independently — the same shape two LIVE engines have, which is why only one
+    of those is allowed. What makes it acceptable
     is that both would be reacting to the same at-limit account and choosing
     by the same ranking, and that the proxy calls this only on a 429 it just
     saw. It is a narrow race, not an excluded one.

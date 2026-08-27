@@ -693,11 +693,14 @@ class AutoSwitchEngine:
         # with no stale-pid sweep of ours.
         self._live_lock: FileLock | None = None
         self.demoted_from_live = False
+        # The errno that stopped us, when it was not contention. None means
+        # the ordinary case: somebody else holds it.
+        self._live_lock_error: OSError | None = None
         if not self.dry_run:
             lock = FileLock(switcher.backup_dir / LIVE_LOCK_FILENAME, timeout=0)
             try:
                 got = lock.acquire()
-            except OSError:
+            except OSError as exc:
                 # `acquire()` CREATES the lock's directory and file, so an
                 # unwritable backup_dir raises here -- the same reason
                 # `_retry_live_promotion` guards the identical call. This one
@@ -705,10 +708,14 @@ class AutoSwitchEngine:
                 # turn it into an exit code, so it replaced `cswap auto`'s
                 # documented 0/1/2/3 with a traceback.
                 #
-                # Demoting is the answer the loser already gets: a process
-                # that cannot take the lock cannot be the LIVE engine,
-                # whatever stopped it.
+                # Demoting is the answer the loser already gets. WHY is not:
+                # a lock nobody can create is not a lock somebody else holds,
+                # and saying "another engine is running" about a machine with
+                # no other engine sends the operator looking for a process
+                # that does not exist while every tick decides to switch and
+                # does not.
                 got = False
+                self._live_lock_error = exc
             if got:
                 self._live_lock = lock
             else:
@@ -778,6 +785,15 @@ class AutoSwitchEngine:
         if self._demotion_announced:
             return
         self._demotion_announced = True
+        if self._live_lock_error is not None:
+            self._emit(
+                ConfigWarningEvent(
+                    message=f"the LIVE auto-switch lock could not be taken "
+                            f"({self._live_lock_error}) — this one is watching "
+                            f"only (dry-run), and it will keep retrying"
+                )
+            )
+            return
         self._emit(
             ConfigWarningEvent(
                 message="another LIVE auto-switch engine is already running "
@@ -1001,11 +1017,19 @@ class AutoSwitchEngine:
         try:
             if not lock.acquire():
                 return
-        except OSError:
+        except OSError as exc:
             # `acquire()` creates the lock's directory and file, so an
             # unwritable backup_dir raises — and this runs BEFORE `tick()`'s
             # try, whose "never raises" is cli.py's 0/1/2/3 exit contract.
             # Staying demoted one more tick is the right answer here.
+            #
+            # Recorded, so a cause that CHANGES gets said once more rather
+            # than being reported forever as whatever stopped the first
+            # attempt.
+            if type(self._live_lock_error) is not type(exc) or \
+                    str(self._live_lock_error) != str(exc):
+                self._live_lock_error = exc
+                self._demotion_announced = False
             return
         # PUBLISH FIRST, THEN ASK, under `stop()`'s own lock. A re-check before
         # the assignment cannot close the window: a `stop()` landing between
