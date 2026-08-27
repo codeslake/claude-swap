@@ -6899,12 +6899,14 @@ class TestFreshenRoutesThroughGate:
 class TestOneRemedyPerKindAcrossEverySurface:
     """`ERROR_NOTES`'s own comment claims every surface renders through it.
 
-    A second dict in `autoswitch` covered four of the same kinds and the
-    wording had already drifted -- "run from a normal shell" against "run
-    cswap from a normal shell", "this slot's stashed successor" against "a
-    stashed successor" -- with nothing tying them. Someone editing the remedy
-    in one place ships a fix that `cswap run` and the TUI show and the tick
-    does not.
+    TWO OF THESE THREE HAVE POWER, and the drift this class is named for is
+    not what they check. `_SYSTEMIC_MESSAGES` is a comprehension over
+    `ERROR_NOTES`, so comparing their strings compares a value with itself --
+    the text can no longer drift and the method that compares it is a PREMISE.
+    What remains free is WHICH modules hold the dict
+    (`test_every_module_that_exports_the_dict_exports_THE_dict`) and WHICH
+    kinds each side knows
+    (`test_the_two_enumerations_of_a_systemic_kind_agree`).
     """
 
     def test_every_module_that_exports_the_dict_exports_THE_dict(self):
@@ -6920,45 +6922,42 @@ class TestOneRemedyPerKindAcrossEverySurface:
         remedy -- with every test here still green, because each side is
         internally consistent.
         """
-        import ast
         import importlib
-        from pathlib import Path
+        import pkgutil
 
+        import claude_swap
         from claude_swap import oauth
 
-        # DERIVED, because a literal pair is what failed here: it named
-        # `switcher` and `widgets` and omitted `session`, which binds the
-        # dict the same way and renders it at the `cswap run` refresh
-        # warning. A module that starts re-exporting it joins this set on
-        # its own.
-        root = Path(oauth.__file__).parent
+        # ASKED OF THE MODULE OBJECT, not of its source. A literal pair named
+        # half the modules; an AST scan for `Assign`/`ImportFrom` then named
+        # half the BINDING SHAPES -- `ERROR_NOTES: dict = {...}` walked
+        # straight through it, and so did a binding under `try`/`if`, a
+        # `globals()[...]`, and a tuple target. "Does this module expose the
+        # name" is a runtime question and `hasattr` answers it for every shape
+        # there is, including ones nobody has written yet.
         bound = []
-        for path in sorted(root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in tree.body:  # MODULE LEVEL ONLY -- a name bound
-                # inside a function is not a surface anyone renders from.
-                names = []
-                if isinstance(node, ast.ImportFrom):
-                    names = [a.asname or a.name for a in node.names]
-                elif isinstance(node, ast.Assign):
-                    names = [t.id for t in node.targets
-                             if isinstance(t, ast.Name)]
-                if "ERROR_NOTES" in names:
-                    rel = path.relative_to(root.parent).with_suffix("")
-                    bound.append(".".join(rel.parts))
-                    break
+        for info in pkgutil.walk_packages(
+            claude_swap.__path__, claude_swap.__name__ + "."
+        ):
+            mod = importlib.import_module(info.name)
+            if hasattr(mod, "ERROR_NOTES"):
+                bound.append(mod)
 
-        # THE DENOMINATOR. An empty scan passes every identity check below.
-        assert len(bound) >= 3, (
-            f"only {len(bound)} module(s) bind ERROR_NOTES ({bound}) -- the "
-            "scan found less than the definition plus two re-exports, so it "
-            "is measuring the wrong tree"
+        # THE DENOMINATOR NAMES THE DEFINITION, not a count. A count asserts
+        # an architecture: refactor the re-exports to read `oauth.ERROR_NOTES`
+        # through the module and a `>= 3` fires RED on a tree that is strictly
+        # healthier. Finding `oauth` is what proves the walk reached the right
+        # package, and it cannot go stale while the dict lives there.
+        assert oauth in bound, (
+            f"the walk did not find the module that DEFINES ERROR_NOTES "
+            f"({[m.__name__ for m in bound]}) -- it is measuring the wrong "
+            "tree, and every identity check below is vacuous"
         )
-        for name in bound:
-            mod = importlib.import_module(name)
+        for mod in bound:
             assert mod.ERROR_NOTES is oauth.ERROR_NOTES, (
-                f"{name} exports its own copy of ERROR_NOTES, so a remedy "
-                "edited in oauth.py reaches some surfaces and not others"
+                f"{mod.__name__} exports its own copy of ERROR_NOTES, so a "
+                "remedy edited in oauth.py reaches some surfaces and not "
+                "others"
             )
 
     def test_the_tick_renders_the_same_text_as_every_other_surface(self):
