@@ -12424,6 +12424,71 @@ def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
         )
 
 
+def test_an_unreadable_destination_still_undoes_the_narrowing(
+    temp_home: Path, monkeypatch
+):
+    """THE OTHER READER. Its sibling above covers an unreadable TEMP; this is
+    the destination, and it reaches the same two obligations by a different
+    door.
+
+    The digest read's `except OSError: return` sits ABOVE the mode restore, so
+    a destination that becomes unreadable between the `before` read and the
+    recovery -- EIO or ESTALE on the network mount that produced the EBUSY in
+    the first place -- keeps 0600 for ever. The production comment argues that
+    the two obligations must not be gated on one another; an early return
+    gates them just as surely as a shared `except` did.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False}
+    real_read = Path.read_bytes
+
+    def unreadable_after_the_copy(self):
+        if state["copied"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def partial_copy(src, dst, **kw):
+        Path(dst).write_bytes(Path(src).read_bytes()[:20])
+        state["copied"] = True
+        raise OSError(errno.EIO, "copy died mid-write")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", partial_copy)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_after_the_copy)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    # AND IT MUST NOT EMPTY WHAT IT COULD NOT READ. Dropping the `return`
+    # frees the mode restore; it must not also hand the emptying a digest of
+    # None, which differs from everything and so looks like a partial every
+    # time. This is the `before is None` reasoning on the other read: with no
+    # comparand, a complete write and a partial one are the same picture.
+    assert os.stat(target).st_size != 0, (
+        "the recovery emptied a destination it could not read, so it cannot "
+        "have known whether it was destroying a partial or a finished write"
+    )
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+        "the 0600 narrowing was never undone on a destination that was 0o644 "
+        "before the write, so another uid reading this config gets EACCES "
+        "for ever with only the copy error to go on"
+    )
+
+
 def test_a_completed_copy_is_not_emptied_by_the_recovery(
     temp_home: Path, monkeypatch
 ):
@@ -13285,9 +13350,10 @@ def test_the_temp_is_created_narrow_at_every_writer(
     `credentials.py` has no `os.fchmod` at all, so on those three the literal
     on `os.open` is the ONLY thing narrowing a temp that holds a live OAuth
     token for the whole write window -- and widening every create to 0o666
-    failed just two cases, one of them pre-existing. `O_EXCL` is what makes
-    the mode argument load-bearing: the name is always fresh, so nothing
-    else can have set it.
+    failed just two cases, one of them pre-existing. On NINE of the ten the
+    name is fresh (`O_EXCL`), so nothing else can have set the mode. The
+    tenth opens `O_TRUNC` and would reopen an existing name with the mode
+    argument ignored, which is why that one carries an `os.fchmod` as well.
     """
     if sys.platform == "win32":
         pytest.skip("POSIX modes only")
@@ -13492,10 +13558,12 @@ def test_a_partial_copy_is_emptied_not_left_at_the_prior_mode(
             raise OSError(errno.EIO, "the temp's medium answered EIO")
         return real_read_bytes(self)
 
-    # THE MEDIUM THAT USED TO DISARM THIS, kept so the case still fails if the
-    # digest goes back to being read out of the temp. It is INERT on correct
-    # code -- nothing reads the temp any more -- so it cannot be a premise,
-    # and the check below is what keeps it from going stale in silence.
+    # THE MEDIUM THAT USED TO DISARM THIS, kept so the case still fails on a
+    # WHOLE revert to reading the digest out of the temp. It does NOT catch
+    # the half of that revert which re-points the digest and leaves `touched`
+    # alone -- measured, 27 passed -- so it is INERT on correct code and
+    # partial against a wrong one. Not a premise either way; the check below
+    # is what keeps it from going stale in silence.
     #
     # DERIVED FROM PRODUCTION, not from the test's own spelling. Handing the
     # predicate a name this file constructs asks whether it matches itself,

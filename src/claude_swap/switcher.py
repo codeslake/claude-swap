@@ -735,7 +735,8 @@ class ClaudeAccountSwitcher:
                 except OSError:
                     before = None
                 # WHAT THE COPY PUBLISHES, TAKEN FROM WHAT WE WROTE. The
-                # temp holds exactly `content` (see `newline=""` above), so
+                # temp holds exactly `content` -- the handle is binary, so no
+                # newline translation stands between them -- so
                 # this needs no read and therefore cannot fail -- which is
                 # what removes the arm this used to need. Reading the temp
                 # here made `landed` None on precisely the population that
@@ -779,19 +780,23 @@ class ClaudeAccountSwitcher:
                     # that is the ORDINARY interrupt here: `copyfile` uses
                     # `sendfile`, so the last byte lands before the signal is
                     # delivered. Deciding on `before` alone empties a finished
-                    # write. Compare against the SOURCE rather than `content`:
-                    # the temp is what the copy copies, and a text-mode
-                    # newline translation would make `content`'s bytes and the
-                    # file's bytes differ on Windows for every write.
+                    # write, so compare against what the temp holds -- which
+                    # is `content` byte for byte, the handle being binary.
+                    #
+                    # NOT A `return`. An unreadable destination cannot judge a
+                    # partial, and that is all it cannot do: returning here
+                    # gated the mode restore below on this read, which is the
+                    # coupling the note above forbids one paragraph earlier.
+                    # The faults are the same ones that produced the EBUSY.
                     try:
                         after = hashlib.sha256(path.read_bytes()).hexdigest()
                     except OSError:
-                        return  # `kept` still names the survivor
+                        after = None
                     # `before is None` means the destination could not be
                     # read BEFORE the copy, so nothing here can tell a partial
                     # from the bytes that were already there, and emptying it
                     # would destroy a config this write never reached.
-                    touched = (after != landed
+                    touched = (after is not None and after != landed
                                and before is not None and after != before)
                     if touched:
                         try:
