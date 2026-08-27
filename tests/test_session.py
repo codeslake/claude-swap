@@ -3074,14 +3074,33 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
     # or another function does not, unless a module-level name of its own
     # spelling is bound to it. Over-reporting costs a loud false alarm in the
     # matcher; under-reporting is silent.
+    def _names(value):
+        """Function names this module-level value can be reaching."""
+        if isinstance(value, ast.Name):
+            return {value.id}
+        if isinstance(value, ast.Call):
+            out = _names(value.func)
+            for a in value.args:          # `partial(_emit, ...)`
+                out |= _names(a)
+            return out
+        return set()
+
     exported: set[str] = set()
+    bindings: dict[str, str] = {}
     for n in _own_scope(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             exported.add(n.name)
-        elif isinstance(n, ast.Assign):
-            exported |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+            continue
+        targets, value = [], None
+        if isinstance(n, ast.Assign):
+            targets = [t.id for t in n.targets if isinstance(t, ast.Name)]
+            value = n.value
         elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
-            exported.add(n.target.id)
+            targets, value = [n.target.id], n.value
+        exported |= set(targets)
+        for t in targets:
+            for name in _names(value):
+                bindings[t] = name
     funcs = [n for n in ast.walk(tree)
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
              and n.name in exported]
@@ -3116,6 +3135,22 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
         if grown <= found:
             break
         found |= grown
+    # THE NAME IT IS EXPORTED UNDER, which need not be the name of the def.
+    # `funcs` matches a `FunctionDef` by `.name`, so an alias whose target is
+    # spelled differently -- `banner = _emit`, `banner = _make_banner()`,
+    # `banner = partial(_emit, ...)` -- resolves to nothing and the printer is
+    # SILENT, which is the failure this guard exists to prevent. The previous
+    # cut passed its own case only because the inner def happened to share the
+    # exported spelling. Resolve the binding to whatever it names, and export
+    # the name a caller can actually reach.
+    while True:
+        more = {
+            t: v for t, v in bindings.items()
+            if t not in found and v in found
+        }
+        if not more:
+            break
+        found |= set(more)
     # NO FLOOR ON THE POPULATION. An empty answer is what a printer module
     # with no bare `print` gives, and that tree is strictly healthier. Asserted
     # here it fires at IMPORT: measured, rewriting the two printers to
@@ -3282,15 +3317,31 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         under-reporting is silent, and silent is the failure this guard exists
         to prevent.
         """
-        found = _bare_print_printers("""
+        for label, src in (
+            # THE INNER DEF IS RENAMED, so a match on `.name` cannot find it.
+            # Spelled `banner` this case passes by coincidence, which is how
+            # the first cut shipped resolving nothing.
+            ("factory", """
 def _make_banner():
-    def banner(msg): print(msg)
-    return banner
+    def _inner(msg): print(msg)
+    return _inner
 banner = _make_banner()
-""")
-        assert "banner" in found, (
-            f"the exported printer was not derived: {sorted(found)}"
-        )
+"""),
+            ("plain alias", """
+def _emit(m): print(m)
+banner = _emit
+"""),
+            ("partial", """
+import functools
+def _emit(p, m): print(m)
+banner = functools.partial(_emit, 'x')
+"""),
+        ):
+            found = _bare_print_printers(src)
+            assert "banner" in found, (
+                f"{label}: the exported printer was not derived: "
+                f"{sorted(found)}"
+            )
 
     @pytest.mark.parametrize("shape,body,expected", [
         (
