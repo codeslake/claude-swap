@@ -104,6 +104,9 @@ def proper_lockfile(
 
     Raises:
         ClaudeCodeLockTimeout: The lock stayed held past ``timeout``.
+        FileNotFoundError: The lock's PARENT is gone. Retrying cannot make a
+            directory under a directory nobody has, so that errno is the one
+            case this re-raises instead of waiting out the budget.
     """
     if timeout is None:
         timeout = DEFAULT_TIMEOUT_S
@@ -210,25 +213,25 @@ def proper_lockfile(
                 "the stale sweep", lock_dir, _RELEASE_WAIT_S,
             )
         else:
-          try:
-              # Held across the decision, so no tick can move the stamp inside
-              # it; stop_touching bars any tick that has not started by now.
-              if os.stat(lock_dir).st_mtime_ns == stamped_ns:
-                  os.rmdir(lock_dir)
-              else:
-                  # A successor's critical section would be left with
-                  # nothing on disk, free for a third waiter to take.
-                  _logger.warning(
-                      "Lock %s was taken over while held; leaving it", lock_dir
-                  )
-          except FileNotFoundError:
-              _logger.warning(
-                  "Lock %s vanished while held (taken over as stale?)", lock_dir
-              )
-          except OSError as e:
-              _logger.warning("Failed to release lock %s: %s", lock_dir, e)
-          finally:
-              stamping.release()
+            try:
+                # Held across the decision, so no tick can move the stamp inside
+                # it; stop_touching bars any tick that has not started by now.
+                if os.stat(lock_dir).st_mtime_ns == stamped_ns:
+                    os.rmdir(lock_dir)
+                else:
+                    # A successor's critical section would be left with
+                    # nothing on disk, free for a third waiter to take.
+                    _logger.warning(
+                        "Lock %s was taken over while held; leaving it", lock_dir
+                    )
+            except FileNotFoundError:
+                _logger.warning(
+                    "Lock %s vanished while held (taken over as stale?)", lock_dir
+                )
+            except OSError as e:
+                _logger.warning("Failed to release lock %s: %s", lock_dir, e)
+            finally:
+                stamping.release()
 
 
 @contextmanager

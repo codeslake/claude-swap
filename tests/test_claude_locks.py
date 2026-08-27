@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import errno
 import logging
 import os
 import shutil
-import threading
 import time
 from pathlib import Path
 
@@ -168,6 +166,44 @@ class TestProperLockfile:
         assert said, "the release gave up silently"
         assert lock_dir.exists(), (
             "a lock the release could not prove was ours was removed anyway"
+        )
+
+    def test_a_stalled_heartbeat_does_not_swallow_the_body_error(
+        self, lock_dir, monkeypatch
+    ):
+        """The give-up branch must fall through, never `return`.
+
+        It sits in the context manager's `finally`, so a `return` there
+        discards the exception the body raised: `_perform_switch` failing
+        under a stalled heartbeat would come back as a SUCCESSFUL switch over
+        a store that was never written.
+
+        Its sibling above cannot see that -- the warning is emitted either
+        way, and the lock is left either way. Nor can the interpreter:
+        `SyntaxWarning: 'return' in a 'finally' block` arrived in 3.14 and CI
+        runs 3.12, where the regression is completely silent.
+        """
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
+        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
+        real_utime = os.utime
+        real_sleep = time.sleep
+
+        def stalling(path, *a, **kw):
+            if os.fspath(path) == os.fspath(lock_dir):
+                real_sleep(2.0)          # far past the release's own wait
+            return real_utime(path, *a, **kw)
+
+        monkeypatch.setattr(claude_locks.os, "utime", stalling)
+
+        class BodyFailed(Exception):
+            pass
+
+        with pytest.raises(BodyFailed):
+            with proper_lockfile(lock_dir):
+                real_sleep(0.05)         # let one tick get into the stall
+                raise BodyFailed
+        assert lock_dir.exists(), (
+            "the give-up branch removed a lock it could not prove was ours"
         )
 
     def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
