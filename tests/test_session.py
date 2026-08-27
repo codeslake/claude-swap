@@ -3050,9 +3050,18 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
     # as p` binds the module under `p`, and a literal set misses it -- a miss
     # this guard did not have before the set was introduced.
     bases = set(_PRINTER_MODULES)
+    # THE FUNCTIONS TOO, by the same rule. `from claude_swap.printer import
+    # warning as print_warning` binds a printer under a name no literal set
+    # can hold -- and that is not a hypothetical spelling: `oauth.py` uses it.
+    # The module half of this took the source's own names and the function
+    # half kept a literal, so the guard read one alias and not the other.
+    printers = set(_PRINTERS)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "claude_swap":
             bases |= {a.asname or a.name for a in node.names if a.name == "printer"}
+        elif isinstance(node, ast.ImportFrom) and node.module == "claude_swap.printer":
+            printers |= {a.asname or a.name for a in node.names
+                         if a.name in _PRINTERS}
         elif isinstance(node, ast.Import):
             bases |= {a.asname for a in node.names
                       if a.name == "claude_swap.printer" and a.asname}
@@ -3071,7 +3080,7 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
         # ARGS OR KEYWORDS. `printer.warning(msg="...")` is a print-only
         # notice with an empty `node.args`, and the filter was inert in both
         # directions: deleting it changed nothing either.
-        if called not in _PRINTERS or not (node.args or node.keywords):
+        if called not in printers or not (node.args or node.keywords):
             continue
         found.append((node.lineno, id(node)))
     # `_note` IS the sanctioned print. Excluded by NODE IDENTITY, not by line
@@ -3170,6 +3179,15 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             ("an ALIASED printer module",
              "import x\nfrom claude_swap import printer as p\np.warning('x')",
              True),
+            # NOT A HYPOTHETICAL SPELLING: `oauth.py` imports the printer this
+            # way today, so a launch notice copied from it was invisible here.
+            ("an ALIASED printer FUNCTION",
+             "from claude_swap.printer import warning as print_warning\n"
+             "print_warning('x')",
+             True),
+            ("...and an alias of something that is not a printer",
+             "from claude_swap.printer import accent as a\na('x')",
+             False),
             ("the logger, which is the CURE", "self._logger.warning('x')", False),
             ("a MODULE-LEVEL logger, the sibling modules' idiom",
              "_logger.warning('x')", False),
