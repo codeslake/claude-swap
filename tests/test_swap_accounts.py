@@ -1469,6 +1469,74 @@ class TestTheRollbackDecidesPerKey:
         switcher._session_dir("2", mail_b).mkdir(parents=True, exist_ok=True)
         return [crossed_b]
 
+    def test_a_partial_failure_is_named_beside_the_success_it_hides_behind(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """Arm 1 and the `kept` clause, asserted POSITIVELY.
+
+        Every other assertion in this file about the summary is negative — it
+        checks a string is ABSENT — so both the partial-failure arm and the
+        staged-copies clause can be deleted in silence. Measured: collapsing
+        arm 1 back to a bare "credentials were restored", and separately
+        emptying `kept`, each left the suite byte-identical.
+
+        SAME EMAIL, so `staging` is real: the two slots' keys are each
+        other's destinations, which is the only shape where pre-swap copies
+        are staged and therefore the only one where "the staged copies are
+        kept" can be true.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail = "user@example.com"
+        # THE STORE HOLDS SOMETHING ELSE, so both restores are genuinely OWED
+        # and the value-equal skip cannot swallow them. This case is about
+        # the SUMMARY, not about which key is crossed, so it does not lean on
+        # `crossed_keys` — which is empty here anyway, since with one email
+        # neither key's crossed location is a move DESTINATION.
+        switcher._write_account_credentials("1", mail, "stale-1")
+        switcher._write_account_credentials("2", mail, "stale-2")
+
+        real = switcher._write_account_credentials
+        seen: list[str] = []
+
+        def one_lands_then_one_raises(num, email, creds):
+            seen.append(num)
+            if len(seen) > 1:
+                raise CredentialError("injected: every later restore fails")
+            return real(num, email, creds)
+
+        staged = {"creds-1": switcher.credentials_dir / ".swap-staging-creds-1.json"}
+        staged["creds-1"].parent.mkdir(parents=True, exist_ok=True)
+        staged["creds-1"].write_text("{}", encoding="utf-8")
+
+        switcher._write_account_credentials = one_lands_then_one_raises
+        try:
+            with caplog_at_error() as records:
+                switcher._rollback_swap(
+                    "1", mail, "creds-1", "{}",
+                    "2", mail, "creds-2", "{}",
+                    staging=staged, moved=[], wrote_backups=True,
+                )
+        finally:
+            switcher._write_account_credentials = real
+
+        summary = " ".join(records).split("rollback:")[-1]
+        assert len(seen) > 1, (
+            f"premise: only {len(seen)} restore was attempted, so there is "
+            "no partial failure for this case to be about"
+        )
+        assert "credentials were restored" in summary, (
+            f"premise: no restore landed, so arm 1 is not the arm under test: {summary!r}"
+        )
+        assert "failed" in summary, (
+            "a restore that RAISED is hidden behind the success line, so the "
+            f"reader is told the rollback went cleanly: {summary!r}"
+        )
+        assert "staged copies are kept" in summary, (
+            "these two slots share an email, so pre-swap copies really were "
+            f"staged and kept — and the summary is where that is said: {summary!r}"
+        )
+
     def test_a_landed_staging_move_is_not_re_attempted(
         self, temp_home: Path, sample_sequence_data_with_org: dict, monkeypatch
     ):

@@ -1568,7 +1568,11 @@ class ClaudeAccountSwitcher:
         elif wrote_any:
             what = "credentials were restored"
         elif failures:
-            what = f"no restore landed and {failures} failed{kept}"
+            # CREDENTIAL-ONLY ON THE SUCCESS SIDE, because `wrote_any` is:
+            # `_write_account_config` never sets it. Widening this noun to
+            # "restore" denies config restores that DID land and wrote files.
+            what = (f"no credential restore landed and {failures} "
+                    f"restore(s) failed{kept}")
         elif undone:
             what = "the session-profile exchange was reversed; no credential was written"
         else:
