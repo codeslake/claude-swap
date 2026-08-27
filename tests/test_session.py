@@ -3046,6 +3046,14 @@ def _own_scope(func):
 def _bare_print_printers(src: str | None = None) -> set[str]:
     """`printer`'s own functions that reach the builtin `print`.
 
+    PROSPECTIVE ON THIS TREE, and worth saying plainly: `printer.py` has
+    eight module-level assignments and every one is a `Dict` or a `Constant`,
+    so `bindings`, `_names` and the alias promotion contribute NOTHING to
+    today's answer. They fire the day it grows an alias, a `partial` or a
+    delegating printer. A re-export (`from ._impl import warning`) is the one
+    shape still missed on purpose -- proving that name is a printer needs the
+    other module, which this function does not read.
+
     DERIVED, not listed: a list is right until someone adds a function, and
     then it is silently short. Measured today this returns `{"error",
     "warning"}` -- the same answer a top-level scan gives, so nothing on this
@@ -3080,23 +3088,64 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
             return {value.id}
         if isinstance(value, ast.Call):
             out = _names(value.func)
-            f = value.func
-            # ARGUMENTS ONLY FOR `partial`, which is the one shape that
-            # returns its argument's printer. Following every call's
-            # arguments makes any constant built from a call that merely
-            # MENTIONS a printer a printer, and then anything built from
-            # that constant too -- unbounded, and the matcher then fails on
-            # lines that are not notices.
-            if ((isinstance(f, ast.Name) and f.id == "partial")
-                    or (isinstance(f, ast.Attribute) and f.attr == "partial")):
-                for a in value.args + [k.value for k in value.keywords]:
+            # ONLY THE CALLABLE `partial` IS GIVEN, not every argument. In
+            # `partial(f, *bound)` the rest are data, so following them
+            # promotes a target on a name that is merely bound to it.
+            if _is_partial(value.func):
+                for a in (value.args[:1]
+                          + [k.value for k in value.keywords
+                             if k.arg == "func"]):
                     out |= _names(a)
             return out
+        # A LAMBDA REACHES WHATEVER ITS BODY CALLS. `banner = lambda m:
+        # warning(m)` is a printer under a name a `Name`/`Call` match cannot
+        # see, and missing it is the silent direction.
+        if isinstance(value, ast.Lambda):
+            return {n.func.id for n in ast.walk(value.body)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)}
         return set()
+
+    # THE SOURCE'S OWN NAMES, not the literal `partial` -- the same rule
+    # `_print_only_offenders` states for the printer module a hundred lines
+    # below. A literal misses `from functools import partial as pt` and
+    # `p2 = partial` (silent), and fires on an unrelated `c.partial(...)`
+    # and on a local `def partial` that shadows the import (loud).
+    _partial_names = {"functools.partial"}
+    for _n in ast.walk(tree):
+        if isinstance(_n, ast.ImportFrom) and _n.module == "functools":
+            _partial_names |= {a.asname or a.name for a in _n.names
+                               if a.name == "partial"}
+        elif isinstance(_n, ast.Import):
+            _partial_names |= {f"{a.asname or a.name}.partial"
+                               for a in _n.names if a.name == "functools"}
+    _shadowed_partial = {
+        f.name for f in _own_scope(tree)
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+    } | {
+        t.id for n in _own_scope(tree) if isinstance(n, ast.Assign)
+        for t in n.targets if isinstance(t, ast.Name)
+    }
+
+    def _is_partial(f) -> bool:
+        if isinstance(f, ast.Name):
+            return f.id in _partial_names and f.id not in _shadowed_partial
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+            return f"{f.value.id}.{f.attr}" in _partial_names
+        return False
 
     exported: set[str] = set()
     bindings: dict[str, set[str]] = {}
     for n in _own_scope(tree):
+        # A RE-EXPORT IS A BINDING. `from ._impl import warning` makes it
+        # reachable as `printer.warning`, and `ImportFrom` was not a binder
+        # here at all -- the whole name derived nothing.
+        if isinstance(n, ast.ImportFrom):
+            exported |= {a.asname or a.name for a in n.names}
+            for a in n.names:
+                if a.asname:
+                    bindings.setdefault(a.asname, set()).add(a.name)
+            continue
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             exported.add(n.name)
             continue
@@ -3332,6 +3381,15 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
 
         src = pathlib.Path(session_mod.__file__).read_text(encoding="utf-8")
         offenders, seen = _print_only_offenders(src)
+        # THE DERIVED NAMES, NOT THE BUILTIN. `_PRINTERS` always holds
+        # `print`, and session.py always has one sanctioned `print`, so
+        # `seen` could not reach zero however badly the derivation failed:
+        # replacing it wholesale with `{"print"}` left this assert green.
+        derived = _bare_print_printers() - {"print"}
+        assert derived, (
+            "the derivation produced no printer name beyond the builtin, so "
+            "every call this matcher could newly catch is invisible to it"
+        )
         assert seen, (
             "the walk found no `print` at all in session.py — the matcher is "
             "broken, not the module clean"
@@ -3340,6 +3398,65 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             "a launch notice is print-only, so the screen blank erases it and "
             f"nothing records why: {[f'session.py:{n}' for n in offenders]}. "
             "Use `_note`."
+        )
+
+    def test_the_derivation_does_not_depend_on_the_hash_seed(self):
+        """The regression case for the seed defect was itself seed-dependent.
+
+        A two-candidate binding is 50/50 under a last-wins `bindings`, so the
+        case written to catch that defect passed on 4 runs in 10 -- and the
+        direction that ships is the silent one. Nothing about a source shape
+        can fix this: an n-candidate set is 1/n by construction. The seed has
+        to be forced, and forcing it needs a subprocess.
+
+        HOME and XDG_DATA_HOME are pointed at a scratch dir so that even an
+        import side effect cannot reach the real account store.
+        """
+        import json
+        import pathlib
+        import subprocess
+        import sys
+        import tempfile
+
+        src = (
+            "from functools import partial\n"
+            "def _emit(p, m): print(m)\n"
+            "banner = partial(_emit, 'x')\n"
+        )
+        here = pathlib.Path(__file__).resolve()
+        prog = (
+            "import importlib.util, json, sys\n"
+            f"spec = importlib.util.spec_from_file_location('t', {str(here)!r})\n"
+            "m = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(m)\n"
+            "print(json.dumps(sorted(m._bare_print_printers(sys.argv[1]))))\n"
+        )
+        answers = {}
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {
+                **os.environ, "HOME": scratch, "XDG_DATA_HOME": scratch,
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            for seed in ("0", "1", "2", "3", "4", "5"):
+                out = subprocess.run(
+                    [sys.executable, "-c", prog, src],
+                    env={**env, "PYTHONHASHSEED": seed},
+                    capture_output=True, text=True, timeout=120,
+                )
+                assert out.returncode == 0, (
+                    f"seed {seed}: the probe did not run, so this case "
+                    f"measured nothing: {out.stderr[-400:]}"
+                )
+                answers[seed] = json.loads(out.stdout.strip().splitlines()[-1])
+        distinct = {json.dumps(v) for v in answers.values()}
+        assert len(distinct) == 1, (
+            "the derived set changes with PYTHONHASHSEED, so the guard's "
+            f"answer is a coin flip: {answers}"
+        )
+        # AND THE RIGHT ANSWER, not merely a stable one. A derivation that
+        # returned nothing at all would be perfectly consistent.
+        assert "banner" in answers["0"], (
+            f"stable but wrong -- the exported printer is absent: {answers['0']}"
         )
 
     def test_a_printer_delegating_to_an_ALIASED_printer_is_derived(self):
@@ -3394,6 +3511,7 @@ LABEL = str(TABLE)
         under-reporting is silent, and silent is the failure this guard exists
         to prevent.
         """
+        missed = []
         for label, src in (
             # THE INNER DEF IS RENAMED, so a match on `.name` cannot find it.
             # Spelled `banner` this case passes by coincidence, which is how
@@ -3429,11 +3547,14 @@ def _emit(m): print(m)
 banner = partial(func=_emit)
 """),
         ):
-            found = _bare_print_printers(src)
-            assert "banner" in found, (
-                f"{label}: the exported printer was not derived: "
-                f"{sorted(found)}"
-            )
+            # COLLECTED, NOT ASSERTED PER ROW. Asserting inside the loop
+            # stops at the first failure, so a mutation that kills rows 2-5
+            # is reported as a row-1 failure and the other four never run.
+            if "banner" not in _bare_print_printers(src):
+                missed.append(label)
+        assert not missed, (
+            f"the exported printer was not derived for: {missed}"
+        )
 
     @pytest.mark.parametrize("shape,body,expected", [
         (
