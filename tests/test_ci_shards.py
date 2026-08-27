@@ -223,11 +223,6 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
         "the Windows pytest command does not clear `testpaths`, so a shard "
         f"cannot ignore the testpaths root itself: {line!r}"
     )
-    # LAST, because it is the broadest -- the reason its macOS caller already
-    # states. Raised first it masks every assert above it, and four of them
-    # then report "regex did not match" about a workflow whose real defect is
-    # elsewhere.
-    _assert_no_step_can_swallow_failure(block.group(1), "Windows")
 
 
 def test_a_backslash_continuation_keeps_the_tail_it_continues_into():
@@ -729,7 +724,11 @@ def _assert_macos_job_is_intact(workflow: Path) -> None:
     # because it is the broadest: raised ahead of the path check it masked
     # `test_a_job_naming_a_deleted_file_is_refused`, which then failed with
     # "regex did not match" about a workflow whose real defect was elsewhere.
-    _assert_no_step_can_swallow_failure(job, "macOS")
+    # NOT HERE. `test_no_job_in_the_workflow_can_swallow_its_own_failure`
+    # asks this of EVERY job, so a copy inside a per-job helper adds nothing
+    # and carries the masking hazard its own comment used to describe: it is
+    # the broadest assert in the function, and raised first it reports four
+    # unrelated cases as "regex did not match".
 
 
 def test_the_macos_job_runs_pytest_on_paths_that_exist():
