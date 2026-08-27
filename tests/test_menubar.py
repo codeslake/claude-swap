@@ -590,7 +590,8 @@ def test_a_deliberate_wait_is_not_titled_an_exhausted_fleet():
 
     `AllExhaustedEvent`'s own comment enumerates "the panel, the JSON and the
     log". This says the same sentence to the same user, and said "All accounts
-    exhausted" for a wait entered BECAUSE a candidate still holds quota.
+    exhausted" for a wait entered BECAUSE every candidate was READ and one
+    still holds quota.
     """
     from claude_swap.autoswitch import AllExhaustedEvent
 

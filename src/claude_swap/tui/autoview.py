@@ -56,8 +56,8 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     role = _EVENT_ROLES.get(event.kind)
     if role == "sev_crit" and getattr(event, "deliberate_wait", False):
         # The map keys on the KIND and this kind carries two states; the
-        # critical colour overstates a hold whose gate proves a candidate
-        # still holds quota.
+        # critical colour overstates a hold whose gate proves every candidate
+        # was READ and one still holds quota.
         role = "sev_warn"
     if role is not None:
         style = getattr(palette, role)

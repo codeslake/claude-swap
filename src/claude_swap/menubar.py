@@ -461,8 +461,9 @@ def switch_notification(payload: dict | None = None) -> tuple[str, str]:
 def exhausted_notification(event) -> tuple[str, str]:
     """``(title, body)`` for the notification an ``all-exhausted`` event posts.
 
-    One kind carries two states. A deliberate wait is entered BECAUSE a
-    candidate still holds quota, so "All accounts exhausted" is the one thing
+    One kind carries two states. A deliberate wait is entered BECAUSE every
+    candidate was READ and one still holds quota, so "All accounts exhausted"
+    is the one thing
     it is not -- and the notification is a surface `AllExhaustedEvent`'s own
     enumeration ("the panel, the JSON and the log") does not count.
     """
