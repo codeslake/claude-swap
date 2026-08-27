@@ -12917,6 +12917,71 @@ def test_a_temp_name_already_taken_is_not_deleted(temp_home: Path, monkeypatch):
     assert squatted.read_text(encoding="utf-8") == "A PEER'S IN-PROGRESS FILE"
 
 
+def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
+    """`O_EXCL` is what makes `FileExistsError` reachable, so the conversion is
+    what opened this. A writer that refuses the name and then unlinks it in a
+    `finally` deletes the file the OTHER process is in the middle of writing --
+    and two of them swallow the exception, so that happens with no error at all.
+
+    Derived, because the guard was added at ONE of the twelve converted sites.
+    A per-site test is right until the thirteenth writer, and the thirteenth is
+    the one nobody checks -- the same argument the sibling scans make.
+
+    THE OPEN'S OWN `try`, not the function's. Asking whether the FUNCTION
+    mentions `FileExistsError` anywhere would pass a handler wrapped round the
+    wrong statement, and it reported `_salvage_unreadable` -- which catches the
+    create's `OSError` and clears its `created` claim -- as an offender. What
+    has to exist is a branch on THIS call's failure, running before any
+    cleanup: either spelling of the catch does the job, and neither is
+    substitutable by a handler somewhere else in the function.
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders, seen = [], 0
+    for mod in sorted(src_dir.glob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        # Every `Try` that lexically contains each node, innermost last.
+        guarding: dict[int, list[ast.Try]] = {}
+        def descend(node, stack):
+            guarding[id(node)] = stack
+            for child in ast.iter_child_nodes(node):
+                deeper = stack
+                if isinstance(node, ast.Try) and any(
+                        child is st for st in node.body):
+                    deeper = stack + [node]
+                descend(child, deeper)
+        descend(tree, [])
+
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "open"):
+                continue
+            if "O_EXCL" not in ast.unparse(node):
+                continue
+            seen += 1
+            caught = {
+                name
+                for t in guarding.get(id(node), [])
+                for h in t.handlers if h.type is not None
+                for name in ast.unparse(h.type).replace(
+                    "(", " ").replace(")", " ").replace(",", " ").split()
+            }
+            if not ({"FileExistsError", "OSError"} & caught):
+                offenders.append(f"{mod.name}:{node.lineno}")
+
+    assert seen >= 8, (
+        f"the instrument, not the code: only {seen} `O_EXCL` open(s) were "
+        "found, so this would pass over almost nothing"
+    )
+    assert not offenders, (
+        "an `O_EXCL` open has no branch on its own failure, so the name it "
+        "was REFUSED is still in reach of the cleanup below -- it deletes "
+        f"whatever the holder is writing: {offenders}"
+    )
+
+
 def test_every_temp_writer_opens_with_O_EXCL():
     """The invariant `_write_json`'s own docstring states, checked structurally.
 
@@ -12932,6 +12997,7 @@ def test_every_temp_writer_opens_with_O_EXCL():
     to follow a symlink planted at the name.
     """
     import ast
+    import re
 
     src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders, seen = [], 0
@@ -12944,21 +13010,42 @@ def test_every_temp_writer_opens_with_O_EXCL():
                     and isinstance(node.func.value, ast.Name)
                     and node.func.value.id == "os"):
                 continue
-            if len(node.args) < 2:
+            kw = {k.arg: k.value for k in node.keywords}
+            arg = (node.args[1] if len(node.args) >= 2
+                   else kw.get("flags"))
+            if arg is None:
                 continue  # a read; no creation flags to judge
-            flags = ast.unparse(node.args[1])
+            flags = ast.unparse(arg)
             # A NAME IS NOT A VERDICT. Hoisting the flags into a local hid the
             # writer from the offender list AND from the denominator, so the
-            # count fell and nothing complained. Resolve a single assignment.
+            # count fell and nothing complained. Resolve a single binding --
+            # `ast.AnnAssign` too, which the first cut of this missed.
             if flags.isidentifier():
                 bound = [
                     ast.unparse(a.value) for a in ast.walk(tree)
-                    if isinstance(a, ast.Assign) and len(a.targets) == 1
-                    and isinstance(a.targets[0], ast.Name)
-                    and a.targets[0].id == flags
+                    if a.value is not None
+                    and ((isinstance(a, ast.Assign) and len(a.targets) == 1
+                          and isinstance(a.targets[0], ast.Name)
+                          and a.targets[0].id == flags)
+                         or (isinstance(a, ast.AnnAssign)
+                             and isinstance(a.target, ast.Name)
+                             and a.target.id == flags))
                 ]
-                if len(bound) == 1:
-                    flags = bound[0]
+                flags = bound[0] if len(bound) == 1 else flags
+            # UNREADABLE IS NOT SAFE, and this is where the previous cut let
+            # six spellings through. A numeric literal, a partial hoist
+            # (`_base | os.O_TRUNC`), a module alias, a tuple unpack -- each
+            # one failed the `O_CREAT` substring test and took the `continue`
+            # that means "not creating anything". "I could not read it" and
+            # "it is safe" must not share a branch, so anything that is not a
+            # plain `|` chain of `os.O_*` names is an offender.
+            terms = [t.strip() for t in flags.split("|")]
+            if not all(re.fullmatch(r"os\.O_[A-Z_]+", t) for t in terms):
+                offenders.append(
+                    f"{mod.name}:{node.lineno} flags `{flags}` are not a "
+                    "readable `os.O_*` chain, so O_EXCL cannot be proven"
+                )
+                continue
             if "O_CREAT" not in flags:
                 continue  # not creating anything
             seen += 1

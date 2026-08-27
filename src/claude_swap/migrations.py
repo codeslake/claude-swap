@@ -93,7 +93,13 @@ def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
     )
     fd = -1
     try:
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+            # the name, so the cleanup below must not unlink their file.
+            tmp_path = None
+            raise
         write_all(fd, content.encode("utf-8"))
         if sys.platform != "win32":
             # On the fd: past `replace_with_retry` a chmod can only fail,

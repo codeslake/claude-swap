@@ -477,7 +477,14 @@ def atomic_write_json(path: Path, data: dict) -> None:
                    / f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
     fd = -1
     try:
-        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            fd = os.open(
+                tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+            # the name, so the cleanup below must not unlink their file.
+            tmp_path = None
+            raise
         write_all(fd, json.dumps(data, indent=2).encode("utf-8"))
         if sys.platform != "win32":
             # On the fd, BEFORE the publish. Not for secrecy: `mkstemp`
@@ -492,8 +499,9 @@ def atomic_write_json(path: Path, data: dict) -> None:
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise

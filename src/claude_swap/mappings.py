@@ -134,7 +134,14 @@ class MappingStore:
                   / f".mappings-{os.getpid()}.{secrets.token_hex(4)}.tmp")
         fd = -1
         try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                fd = os.open(
+                    tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE. `O_EXCL` refused because somebody holds
+                # the name, so the cleanup below must not unlink their file.
+                tmp = None
+                raise
             if sys.platform != "win32":
                 os.fchmod(fd, 0o600)
             owned, fd = fd, -1
@@ -145,8 +152,9 @@ class MappingStore:
             # Not just OSError: a Ctrl-C anywhere here strands the temp.
             if fd >= 0:
                 os.close(fd)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
             raise
