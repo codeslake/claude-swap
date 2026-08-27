@@ -1551,6 +1551,16 @@ class ClaudeAccountSwitcher:
                                     # unmarked profile is reused.
                                     if not mark_session_stale(
                                             self._session_dir(other, email)):
+                                        # COUNTED, for the reason its
+                                        # `except Exception` sibling below
+                                        # states: without it the staged
+                                        # copies are discarded. This state is
+                                        # the worse of the two -- the profile
+                                        # keeps a superseded credential AND
+                                        # carries no marker -- so it is the
+                                        # last one that should drop the only
+                                        # remaining recovery copies.
+                                        failures += 1
                                         self._logger.error(
                                             "Rollback could NOT invalidate "
                                             "slot %s's crossed session "
@@ -1589,14 +1599,19 @@ class ClaudeAccountSwitcher:
                         self._delete_config_backup(num, email)
             except Exception as e:
                 failures += 1
+                # THE VERB THE BRANCH ACTUALLY TOOK. The overlap arm CLEARS a
+                # key -- `original` is falsy there and no restore is attempted
+                # -- so "restore failed" named a step that never ran, the same
+                # mis-naming the repair arm above was fixed for.
+                did = "restore" if original else "clear"
                 self._logger.error(
-                    f"Rollback {kind} restore failed for slot {num}: {e}"
+                    f"Rollback {kind} {did} failed for slot {num}: {e}"
                 )
         # THE SUMMARY, from what ran, and EVERY CLAUSE TRUE IN EVERY STATE IT
         # COVERS. "nothing was written" came from `wrote_any`, which only the
         # credential arm sets, so an all-raising rollback and a configs-only
-        # one both reported it. `failures` counts config restores and overlap
-        # deletes too, hence "restores". Staged copies exist only when the two
+        # one both reported it. `failures` counts config restores, overlap
+        # deletes and refused repairs too, hence "steps". Staged copies exist only when the two
         # slots share an email, so their clause is gated on having any, not on
         # having failed.
         kept = "; the staged copies are kept" if staging else ""

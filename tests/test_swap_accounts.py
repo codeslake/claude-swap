@@ -2091,6 +2091,76 @@ class TestTheRollbackDecidesPerKey:
             f"marker, and nothing said so: {said!r}"
         )
 
+    def test_a_crossed_profile_neither_lever_reached_keeps_the_staged_copies(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The worse of the two repair failures was the uncounted one.
+
+        Its `except Exception` sibling four lines below counts, and says why:
+        without the count the staged copies are discarded. The `OSError` arm
+        did not, so in the one state where a profile keeps serving a
+        superseded credential with NO marker, the rollback threw away every
+        remaining recovery copy and reported success -- the summary reads
+        `credentials were restored` with no failure clause, `_discard_staging`
+        deletes the staged pre-swap copies, and the purge gate
+        `wrote_backups and displaced and not failures` then drops both slots'
+        `.prev` generations.
+
+        Its sibling case passes `staging={}`, so the branch is inert there and
+        the accounting has never been observed.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        crossed.mkdir(parents=True, exist_ok=True)
+        (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
+
+        real_post = switcher._post_backup_write
+        refused = {"n": 0}
+
+        def denying(num, email, *a, **k):
+            if (num, email) == ("1", mail_b):
+                refused["n"] += 1
+                raise PermissionError(errno.EACCES, "injected")
+            return real_post(num, email, *a, **k)
+
+        switcher._post_backup_write = denying
+        staged = switcher.backup_dir / ".swap-staging-probe"
+        staged.write_text("pre-swap-copy", encoding="utf-8")
+        import claude_swap.session as _session
+        real_mark = _session.mark_session_stale
+        _session.mark_session_stale = lambda _d: False
+        try:
+            with caplog_at_error() as records:
+                switcher._rollback_swap(
+                    "1", mail_a, "creds-a", "{}",
+                    "2", mail_b, "creds-b", "{}",
+                    staging={"creds-1": staged}, moved=moved,
+                    wrote_backups=True,
+                )
+        finally:
+            _session.mark_session_stale = real_mark
+
+        assert refused["n"] >= 1, (
+            "premise: the repair never reached the denied call, so this says "
+            "nothing about what it accounts for"
+        )
+        said = " ".join(records)
+        assert "crossed session profile" in said, (
+            "premise: the arm under test did not fire, so the staged copies "
+            f"below survive for an unrelated reason: {said!r}"
+        )
+        assert staged.exists(), (
+            "the staged pre-swap copy was discarded although neither the "
+            "invalidation nor the marker landed — the rollback threw away the "
+            "last recovery copy in the state it can least afford to"
+        )
+
     def test_a_refused_repair_is_contained_but_counted_not_silent(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
