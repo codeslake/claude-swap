@@ -470,12 +470,15 @@ class TestSwapUnreadableSourceIsNotAbsent:
         reason="needs POSIX permission semantics (non-root)",
     )
     # THE MACOS ARM MAKES THE SHAPE REACHABLE ON THE UBUNTU JOB, which is
-    # where it adds anything. `_use_keychain` is False off macOS
-    # unconditionally, so the class fixture that forces the file store has
-    # effect on exactly one of the three CI jobs -- the shape it exists for
-    # was reachable only where nobody runs it. Windows skips this case
-    # entirely (the `skipif` above), and on macOS `Platform.detect()` already
-    # answers MACOS, so the arm duplicates `[None]` there.
+    # where it adds anything -- and the class fixture that forces the file
+    # store is what makes it so. `_use_keychain` keys on the SWITCHER's
+    # platform, not on the real OS, so this arm turns it True on Ubuntu too;
+    # the `[None]` arm is already file-mode there and the fixture is inert,
+    # but on this arm -- and on the whole macOS job -- the fixture is what
+    # keeps the store on file so there is an `.enc` to chmod. Windows skips
+    # this case entirely (the `skipif` above), and on macOS
+    # `Platform.detect()` already answers MACOS, so the arm duplicates
+    # `[None]` there.
     @pytest.mark.parametrize("as_platform", [None, Platform.MACOS])
     def test_unreadable_enc_aborts_the_swap_before_anything_changes(
         self, temp_home: Path, sample_sequence_data: dict, as_platform
