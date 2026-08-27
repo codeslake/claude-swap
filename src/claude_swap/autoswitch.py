@@ -1443,7 +1443,7 @@ class AutoSwitchEngine:
             return ranked
 
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
+        ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
@@ -1476,7 +1476,7 @@ class AutoSwitchEngine:
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
-            ordered, any_known, active_reset_ts = _rank(
+            ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,
                 consume_first=consume_first,
                 oauth_candidates=oauth_candidates,
@@ -1545,7 +1545,7 @@ class AutoSwitchEngine:
             truly_exhausted = all(
                 h is not None and h <= 0 for h in candidate_headrooms
             )
-            if not truly_exhausted:
+            if not truly_exhausted and not waiting_for_recovery:
                 self._emit(
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
@@ -1557,6 +1557,13 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
+            # A DELIBERATE WAIT IS NOT A FAILURE TO FIND A LANDING, and it
+            # ends where an exhausted fleet's does: the earliest reset. The
+            # escape reaches it when every peer holds a sliver that returns
+            # LATER than the account we are on -- which `truly_exhausted`
+            # cannot see, because those slivers are above zero. Reported as
+            # the block above, it kept the ordinary cadence for the whole
+            # window and never named the reset it had just measured.
             self._blocked_wait_long = True
             earliest = self._earliest_recovery(usage)
             if earliest is not None:
@@ -2059,13 +2066,23 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
-    ) -> tuple[list[str], bool, float | None]:
+    ) -> tuple[list[str], bool, float | None, bool]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
-        Returns ``(ordered, any_known, active_reset_ts)``. Pure — no emits,
-        no state writes — so the consume-first two-phase commit can run it
-        twice per tick: on the stored snapshot to decide provisionally, then
-        on the escalated refetch to re-verify before switching.
+        Returns ``(ordered, any_known, active_reset_ts, waiting_for_recovery)``.
+        Pure — no emits, no state writes — so the consume-first two-phase
+        commit can run it twice per tick: on the stored snapshot to decide
+        provisionally, then on the escalated refetch to re-verify before
+        switching.
+
+        ``waiting_for_recovery`` is the one thing the caller cannot re-derive
+        without restating four conditions this method already evaluated: an
+        EMPTY ``ordered`` from the at-limit escape means two different things.
+        Either nothing was viable, or the escape ranked on recovery and every
+        peer comes back later than the account we are on — a decision to WAIT,
+        with an end the engine can name. Reported as the same generic block,
+        the second kept the ordinary cadence through a window it had already
+        measured.
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
@@ -2153,6 +2170,14 @@ class AutoSwitchEngine:
             trigger in ("proactive", "consume-first")
             or (
                 trigger == "at-limit"
+                # A KNOWABLE RETURN FOR THE ACCOUNT WE ARE LEAVING, or there
+                # is nothing to rank against. `_binding_recovery_ts` answers
+                # `inf` for unknown AND for already past, so a fleet whose
+                # rows have gone stale makes every recovery `inf` --
+                # `inf >= inf - RECOVERY_HYSTERESIS_S` then refuses every
+                # candidate, and no state this branch can reach clears it.
+                # Waiting is only a choice when something can say what for.
+                and active_recovery_ts != float("inf")
                 and (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
                 and best_candidate_headroom <= SPENT_HEADROOM_PCT
             )
@@ -2306,7 +2331,15 @@ class AutoSwitchEngine:
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
-        return [num for _, num in qualifying], any_known, active_reset_ts
+        ordered = [num for _, num in qualifying]
+        # ONLY when the escape had somewhere it COULD have gone. With no
+        # readable candidate at all this is the ordinary unreadable-usage
+        # block, and naming a reset there would announce a wait nobody chose.
+        waiting = bool(
+            trigger == "at-limit" and by_recovery_axis and not ordered
+            and any(h is not None and h > 0 for h in map(headroom.get, oauth_candidates))
+        )
+        return ordered, any_known, active_reset_ts, waiting
 
     # -- adaptive usage scheduling ---------------------------------------------
 

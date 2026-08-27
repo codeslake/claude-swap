@@ -4798,8 +4798,8 @@ class TestHorizonAxisDoesNotFlap:
             settings=AutoSwitchSettings(),
             now=harness.clock.now,
         )
-        unbarred, _, _ = harness.engine._rank_candidates(no_return=None, **args)
-        barred, _, _ = harness.engine._rank_candidates(no_return="1", **args)
+        unbarred, _, _, _ = harness.engine._rank_candidates(no_return=None, **args)
+        barred, _, _, _ = harness.engine._rank_candidates(no_return="1", **args)
 
         assert list(unbarred) == ["1"], (
             f"premise: account 1 holds 60 points against an active on 4 and "
@@ -10045,7 +10045,7 @@ class TestTheAtLimitEscapeDoesNotLandOnASliver:
         return args
 
     def test_the_sliver_does_not_win_when_it_comes_back_last(self, harness):
-        ordered, any_known, _ = harness.engine._rank_candidates(
+        ordered, any_known, _, _ = harness.engine._rank_candidates(
             **self._args(harness)
         )
         assert any_known, "premise: the rows were unreadable, so nothing ranked"
@@ -10067,10 +10067,34 @@ class TestTheAtLimitEscapeDoesNotLandOnASliver:
         now = harness.clock.now
         args = self._args(harness)
         args["usage"]["3"] = _usage7(1.0, 98.0, _iso_at(now + 5 * 60))
-        ordered, _, _ = harness.engine._rank_candidates(**args)
+        ordered, _, _, _ = harness.engine._rank_candidates(**args)
         assert list(ordered) == ["3"], (
             f"got {list(ordered)} — account 3 is back in five minutes against "
             "the active's forty, which is the move the escape exists to make"
+        )
+
+    def test_no_knowable_reset_anywhere_still_lets_the_escape_escape(
+        self, harness
+    ):
+        """`_binding_recovery_ts` answers `inf` for unknown AND for already
+        past, so a fleet whose rows have gone stale makes every recovery
+        `inf`. `inf >= inf - RECOVERY_HYSTERESIS_S` is True for every
+        candidate, and the escape then refuses every landing FOREVER -- there
+        is no state change that can clear it.
+
+        The recovery axis needs a knowable return time for the account we are
+        LEAVING. Without one there is nothing to rank against, and headroom is
+        the only question left, which is what the escape did before.
+        """
+        args = self._args(harness)
+        for u in args["usage"].values():
+            for w in u.values():
+                w.pop("resets_at", None)
+        ordered, _, _, _ = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["3"], (
+            f"the escape chose {list(ordered)} — no window in the fleet says "
+            "when anything comes back, so waiting for the active is waiting "
+            "for a moment nothing can name"
         )
 
     def test_a_healthy_peer_is_still_taken_the_ordinary_way(self, harness):
@@ -10081,8 +10105,80 @@ class TestTheAtLimitEscapeDoesNotLandOnASliver:
         args = self._args(harness)
         args["usage"]["3"] = _usage7(1.0, 20.0, _iso_at(now + 4 * 86400))
         args["headroom"]["3"] = 80.0
-        ordered, _, _ = harness.engine._rank_candidates(**args)
+        ordered, _, _, _ = harness.engine._rank_candidates(**args)
         assert list(ordered) == ["3"], (
             f"got {list(ordered)} — 80 points is a healthy landing and the "
             "escape must still take it"
         )
+
+
+class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
+    """The state the at-limit recovery ranking newly creates, and the outcome
+    it did not have.
+
+    An empty ranking from the escape means two different things now. Either
+    nothing was viable -- keep the ordinary cadence, a candidate can turn
+    viable at any moment -- or every peer holds a sliver that comes back LATER
+    than the account we are on, and the engine has DECIDED to wait. Only the
+    second has an end anybody can name.
+
+    `truly_exhausted` cannot separate them: it asks whether every candidate is
+    at zero, and the slivers are above zero by construction. So the wait was
+    reported as `no-qualifying-candidate`, the reset-aware sleep never armed,
+    and the engine polled its way through a window it had already measured.
+    """
+
+    def _tick(self, harness):
+        now = harness.clock.now
+        soon = _iso_at(now + 40 * 60)
+        far = _iso_at(now + 4 * 86400)
+        active = _usage7(100.0, 40.0)
+        active["five_hour"]["resets_at"] = soon
+        return harness.tick_with_usage({
+            "1": active,                       # at its limit, back in 40 min
+            "2": _usage7(1.0, 98.0, far),      # 2 points, weekly, 4 days out
+            "3": _usage7(100.0, 100.0, far),   # nothing left at all
+        })
+
+    def test_the_wait_announces_the_reset_and_arms_the_sleep(self, harness):
+        outcome = self._tick(harness)
+        assert outcome is TickOutcome.BLOCKED
+        assert harness.active_number() == 1, "premise: it moved, so it did not wait"
+        exhausted = [e for e in harness.events if isinstance(e, AllExhaustedEvent)]
+        assert exhausted, (
+            "the engine held the machine for a reset it had measured and "
+            "reported `no-qualifying-candidate` — the reason it waited is "
+            f"nowhere in {[type(e).__name__ for e in harness.events]}"
+        )
+        assert exhausted[-1].earliest_reset_at is not None, (
+            "the wait was announced without the moment it ends"
+        )
+        assert harness.engine._sleep_until_ts is not None, (
+            "the reset-aware sleep never armed, so this polls the ordinary "
+            "cadence for the whole window"
+        )
+
+    def test_an_ordinary_hysteresis_block_keeps_the_ordinary_cadence(
+        self, harness
+    ):
+        """THE CONTROL, and it has to reach the SAME arm.
+
+        A proactive tick whose candidates are all READABLE and healthy but
+        none clears the hysteresis margin: `ordered` is empty for a reason
+        that can change on the next poll, so no reset may be announced and no
+        sleep armed. An unreadable fleet does NOT test this -- `any_known` is
+        False there and the tick returns at `no-comparison`, several arms
+        earlier, so the widening this control exists to catch sails past it.
+        Measured: with the wait widened to every empty ranking, the
+        unreadable-fleet version passed and this one fails.
+        """
+        outcome = harness.tick_with_usage({
+            "1": _usage(92),   # active, over the threshold -> proactive
+            "2": _usage(88),   # healthy, but only 4 points better than active
+            "3": _usage(88),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert not [e for e in harness.events if isinstance(e, AllExhaustedEvent)], (
+            "an ordinary hysteresis block was announced as a wait with an end"
+        )
+        assert harness.engine._sleep_until_ts is None
