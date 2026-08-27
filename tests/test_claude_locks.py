@@ -1063,11 +1063,34 @@ class TestATransientErrnoIsNotFatalToTheHold:
                     (int(v) // fs_quantum) * fs_quantum for v in ns)
             return real_utime(path, *a, **k)
 
+        # THE FAKE IS A FLOOR, NOT A SETTING. It can only coarsen, so on a
+        # host that already keeps less than `fs_quantum` the honest answer is
+        # the host's own -- asserting `fs_quantum` there demands a precision
+        # the filesystem does not have. Measured on the Windows runner: NTFS
+        # keeps 100ns and the case for 1ns failed on the real granularity.
+        #
+        # MEASURED WITHOUT THE SUBJECT. Taking this baseline from
+        # `_mtime_quantum_ns` itself makes the expectation move with the
+        # answer: a body replaced by `return 2_000_000_000` sets both sides to
+        # 2e9 and the case passes -- the control satisfied by the mutation it
+        # exists to catch. The duplicated round-trip below is the price of a
+        # baseline the subject cannot influence.
+        def host_keeps(q):
+            probe = tmp_path / ".host-probe"
+            probe.touch()
+            v = ((time.time_ns() // (2 * q)) * 2 + 1) * q
+            os.utime(probe, ns=(v, v))
+            return os.stat(probe).st_mtime_ns == v
+
+        host = next(q for q in (1, 100, 1_000, 1_000_000,
+                                1_000_000_000, 2_000_000_000)
+                    if host_keeps(q))
         monkeypatch.setattr(claude_locks.os, "utime", at_granularity)
         got = claude_locks._mtime_quantum_ns(tmp_path)
-        assert got == fs_quantum, (
-            f"the probe measured {got}ns on a filesystem that keeps "
-            f"{fs_quantum}ns"
+        want = max(fs_quantum, host)
+        assert got == want, (
+            f"the probe measured {got}ns on a filesystem that keeps {want}ns "
+            f"(fake floor {fs_quantum}ns over a host that keeps {host}ns)"
         )
 
     @pytest.mark.parametrize("offset_ns", [0, 1_000_000_000])
