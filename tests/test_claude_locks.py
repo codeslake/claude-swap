@@ -461,6 +461,10 @@ class TestAPermanentENOENTIsNotARetry:
 class TestIdentityNotAStamp:
     """A stamp is a value we write; a successor's directory can carry it."""
 
+    @pytest.mark.skipif(
+        not claude_locks._CAN_PIN_A_DIRECTORY,
+        reason="no way to hold a directory open, so the hole cannot be closed",
+    )
     def test_the_release_does_not_remove_a_successors_lock(self, tmp_path):
         """The window is between the heartbeat's utime and anything after it.
 
@@ -502,6 +506,10 @@ class TestIdentityNotAStamp:
             "so this asserts nothing about whose lock survived"
         )
 
+    @pytest.mark.skipif(
+        not claude_locks._CAN_PIN_A_DIRECTORY,
+        reason="asserts the POSIX pin this platform does not have",
+    )
     def test_an_unheld_inode_number_comes_straight_back(self, tmp_path):
         """Why identity is taken from a HELD descriptor and not a plain stat.
 

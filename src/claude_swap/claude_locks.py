@@ -35,9 +35,10 @@ from __future__ import annotations
 import logging
 import os
 import random
+import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeCodeLockTimeout
@@ -53,6 +54,11 @@ CREDENTIALS_STALENESS_S = 60.0
 CONFIG_STALENESS_S = 10.0
 # We touch a little faster than CC's 5s for margin.
 TOUCH_INTERVAL_S = 3.0
+# WINDOWS CANNOT HOLD A DIRECTORY OPEN: `os.open` on one raises EACCES, and
+# the stdlib offers no other way. Identity there is the file index from a
+# plain stat -- still not a value we write, so still not adoptable the way an
+# mtime stamp was, but not pinned, so an index a takeover frees can come back.
+_CAN_PIN_A_DIRECTORY = sys.platform != "win32"
 # Claude Code holds the credentials lock for one token-endpoint round trip
 # (sub-second to a few seconds); its config lock for a local RMW. 9s of
 # bounded waiting comfortably outlasts both without stalling the CLI forever.
@@ -106,6 +112,7 @@ def proper_lockfile(
     if timeout is None:
         timeout = DEFAULT_TIMEOUT_S
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    held_fd = -1
     start = time.monotonic()
     while True:
         try:
@@ -123,7 +130,13 @@ def proper_lockfile(
             # directory we just made. Outside the loop that raises
             # FileNotFoundError out of a call documented to raise only
             # ClaudeCodeLockTimeout.
-            held_fd = os.open(lock_dir, os.O_RDONLY)
+            if _CAN_PIN_A_DIRECTORY:
+                held_fd = os.open(lock_dir, os.O_RDONLY)
+                st = os.fstat(held_fd)
+            else:
+                st = os.stat(lock_dir)
+            ident = (st.st_dev, st.st_ino)
+            last_stamp = st.st_mtime_ns
             break
         except FileExistsError:
             pass
@@ -176,38 +189,66 @@ def proper_lockfile(
             continue
         time.sleep(0.25 + random.random() * 0.25)
 
-    ident = (lambda st: (st.st_dev, st.st_ino))(os.fstat(held_fd))
     stop_touching = threading.Event()
+    # UNPINNED ONLY. Where the inode can be handed back, `last_stamp` is a
+    # read-modify-write the release also reads, and half-done -- utime landed,
+    # read-back has not -- our own lock reads foreign. Pinned, identity is
+    # immutable and there is nothing to serialise, so this costs nothing.
+    stamping = threading.Lock() if not _CAN_PIN_A_DIRECTORY else nullcontext()
 
     def _ours() -> bool:
         """Is the directory at this path still the one we created?
 
         Raises whatever the stat raises; each caller decides what an errno
         means for it.
+
+        The mtime is a SECOND witness, and only where the first one is not
+        decisive. Unpinned, a takeover's `mkdir` can be handed the inode
+        number back, and then the index alone says ours about a successor's
+        directory. Both readers treat a mismatch as "not ours", whose cost is
+        a lock left for the stale sweep -- so a stamp read mid-refresh is
+        safe, and there is nothing here for a mutex to protect.
         """
         st = os.stat(lock_dir)
-        return (st.st_dev, st.st_ino) == ident
+        if (st.st_dev, st.st_ino) != ident:
+            return False
+        return _CAN_PIN_A_DIRECTORY or st.st_mtime_ns == last_stamp
+
+    # WINDOWS HAS NO FIX HERE, and this says so rather than implying one. The
+    # stamp above narrows the window; it cannot close it, because the tick's
+    # own read-back adopts whatever the path now carries.
 
     def _touch() -> None:
+        nonlocal last_stamp
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
         # OSError: return` over both syscalls meant a single EIO or ESTALE --
         # the ordinary errnos on a network `~/.claude` -- ended the heartbeat
         # for the rest of the hold, and a mtime that stops advancing is a lock
         # a waiter may take over as stale, mid-swap.
         while not stop_touching.wait(TOUCH_INTERVAL_S):
-            try:
-                if not _ours():
-                    return  # taken over; refreshing it keeps THEIR lock alive
-            except FileNotFoundError:
-                return  # gone; nothing left to keep alive
-            except OSError:
-                continue  # unreadable this tick, not stolen
-            try:
-                os.utime(lock_dir)
-            except FileNotFoundError:
-                return
-            except OSError:
-                continue
+            with stamping:
+                try:
+                    if not _ours():
+                        return  # taken over; refreshing it keeps THEIR lock alive
+                except FileNotFoundError:
+                    return  # gone; nothing left to keep alive
+                except OSError:
+                    continue  # unreadable this tick, not stolen
+                try:
+                    os.utime(lock_dir)
+                except FileNotFoundError:
+                    return
+                except OSError:
+                    continue
+                if not _CAN_PIN_A_DIRECTORY:
+                    # A read-back that fails leaves the stamp stale, so the next
+                    # tick and the release both read "not ours" and leave the
+                    # lock. That is the safe direction, which is why no errno
+                    # here needs its own arm.
+                    try:
+                        last_stamp = os.stat(lock_dir).st_mtime_ns
+                    except OSError:
+                        pass
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
@@ -215,24 +256,26 @@ def proper_lockfile(
         yield
     finally:
         stop_touching.set()
-        # NO WAIT AND NO LOCK HERE. Identity is immutable, so the release
-        # needs nothing from the heartbeat -- neither a `join` nor a mutex
-        # over a stamp the toucher rewrites. A tick landing inside this block
-        # can at worst refresh a successor's lock once; it can never make one
-        # look like ours, which is what a stamp could and did.
+        # NO WAIT HERE. Pinned, identity is immutable, so the release needs
+        # nothing from the heartbeat: `stamping` is a nullcontext and a tick
+        # landing inside this block can at worst refresh a successor's lock
+        # once. It can never make one look like ours, which is what a stamp
+        # could and did. Unpinned, the mutex is what keeps the release from
+        # reading `last_stamp` half-written -- one wait, and only there.
         #
         # NOT `return` ON ANY ARM: this whole block is the context manager's
         # `finally`, and a `return` there discards an exception the body
         # raised.
         try:
-            if _ours():
-                os.rmdir(lock_dir)
-            else:
-                # A successor's critical section would be left with nothing on
-                # disk, free for a third waiter to take.
-                _logger.warning(
-                    "Lock %s was taken over while held; leaving it", lock_dir
-                )
+            with stamping:
+                if _ours():
+                    os.rmdir(lock_dir)
+                else:
+                    # A successor's critical section would be left with nothing on
+                    # disk, free for a third waiter to take.
+                    _logger.warning(
+                        "Lock %s was taken over while held; leaving it", lock_dir
+                    )
         except FileNotFoundError:
             _logger.warning(
                 "Lock %s vanished while held (taken over as stale?)", lock_dir
@@ -243,7 +286,8 @@ def proper_lockfile(
             # LAST, so the inode stays pinned across the decision above. Close
             # it first and a takeover between the stat and the rmdir could
             # reuse the number, which is the whole hole this replaced.
-            os.close(held_fd)
+            if held_fd >= 0:
+                os.close(held_fd)
 
 @contextmanager
 def claude_credentials_lock(*, timeout: float | None = None):
