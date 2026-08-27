@@ -12766,9 +12766,29 @@ def test_write_all_finishes_a_short_write():
         f"a short write lost bytes: wrote {bytes(got)!r} of {payload!r}"
     )
 
-    with patch.object(os, "write", lambda fd, data: 0):
-        with pytest.raises(OSError):
+    # CAPPED, so a DELETED guard fails instead of hanging. With the guard gone
+    # a stub that always returns 0 never advances the view and the loop spins
+    # for ever -- measured, the run had to be SIGKILLed at 45s, which reads as
+    # a stuck CI rather than as this assertion. After the cap the same
+    # deletion completes the write and `pytest.raises` fails, naming the guard.
+    stalls = {"n": 0}
+
+    def stalls_then_completes(fd, data):
+        stalls["n"] += 1
+        if stalls["n"] <= 3:
+            return 0
+        return len(data)
+
+    # THE ERRNO, NOT MERELY AN OSError. `write_all(-1, ...)` raises EBADF on
+    # its own, so a patch that silently stopped taking effect would satisfy a
+    # bare `raises(OSError)` with the guard never reached.
+    with patch.object(os, "write", stalls_then_completes):
+        with pytest.raises(OSError) as excinfo:
             write_all(-1, payload)
+    assert excinfo.value.errno == errno.EIO, (
+        "the raise came from somewhere other than the zero-progress guard: "
+        f"errno {excinfo.value.errno}"
+    )
 
 
 def test_no_writer_calls_os_write_bare():
