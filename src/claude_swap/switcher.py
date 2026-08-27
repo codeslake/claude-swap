@@ -807,13 +807,24 @@ class ClaudeAccountSwitcher:
         possibly-stale plaintext fallback anyway.
         """
         active = self._read_active_credentials()
-        if active.degraded:
+        # A MANAGED API KEY IS NOT OURS TO REFUSE. It has no generation to
+        # supersede, and its real door is `--add-token`, which
+        # `_reject_live_api_key_capture` names a few lines on. Raising here
+        # reaches the user with a remedy for a different cause AND hides the
+        # one that would work: on a session with no GUI the Keychain does not
+        # become readable inside this process, so the correct message is
+        # never printed at all.
+        if active.degraded and not looks_like_api_key(active.value or ""):
+            # SAYS WHAT IS KNOWN IN EVERY ARM. Two of the reachable ones have
+            # nothing readable at all, so "whatever is readable here" was
+            # vacuous there; what holds throughout is that a capture taken
+            # from a degraded read is either empty or already superseded.
             raise CredentialReadError(
-                "The OAuth Keychain read failed, so whatever is readable "
-                "here may be a superseded generation and capturing it would "
-                "file that against this slot. A locked Keychain or a session "
-                "with no GUI is the usual cause, and retrying from a GUI "
-                "terminal is what clears that one."
+                "The OAuth Keychain read failed, so a capture now would "
+                "either store nothing or store a superseded generation "
+                "against this slot. A locked Keychain or a session with no "
+                "GUI is the usual cause, and retrying from a GUI terminal is "
+                "what clears that one."
             )
         return active.value
 
