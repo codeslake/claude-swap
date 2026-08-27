@@ -846,13 +846,16 @@ class ClaudeAccountSwitcher:
                         and getattr(copy_err, "filename2", None) is None
                         and copy_err.filename == os.fspath(source)
                     )
-                    # RANKED BELOW `untouched`, WHICH IS THE ONLY THING THAT
-                    # SEPARATES THE TWO. `after == landed` also holds when
-                    # nothing was written and the payload equals what was
-                    # already there -- a switch to the already-active account
-                    # re-serialises byte-identical content. Skipping the
-                    # restore there narrows a file the write never opened.
-                    if not untouched and after is not None and after == landed:
+                    # ONLY WHEN THE DESTINATION ACTUALLY CHANGED. `after ==
+                    # landed` also holds when nothing was written and the
+                    # payload equals what was already there -- a switch to the
+                    # already-active account re-serialises byte-identical
+                    # content. `untouched` recognises only the source-open row;
+                    # the destination-open and SameFile rows leave the file
+                    # untouched too and it says nothing about them, so this
+                    # keys on the CONTENT instead of on the error shape.
+                    if (not untouched and after is not None
+                            and after == landed and after != before):
                         return
                     if not (comparable or untouched):
                         return

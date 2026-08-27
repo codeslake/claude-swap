@@ -12686,8 +12686,9 @@ def test_a_real_midcopy_failure_names_the_SOURCE_and_must_not_widen(
     )
 
 
+@pytest.mark.parametrize("shape", ["source-open", "destination-open", "same-file"])
 def test_a_matching_destination_the_copy_never_opened_is_still_restored(
-    temp_home: Path, monkeypatch
+    temp_home: Path, monkeypatch, shape
 ):
     """The complete-copy short-circuit ranks ABOVE the predicate that separates
     a copy that FINISHED from one that never opened the destination.
@@ -12699,6 +12700,8 @@ def test_a_matching_destination_the_copy_never_opened_is_still_restored(
     then skipped for a file nothing touched, so a 0644 config comes back 0600
     and whoever else reads it loses access over a write that never happened.
     """
+    import shutil as shutil_mod
+
     from claude_swap import switcher as switcher_mod
 
     if sys.platform == "win32":
@@ -12715,8 +12718,15 @@ def test_a_matching_destination_the_copy_never_opened_is_still_restored(
 
     def source_open_failure(src, dst, **kw):
         state["tried"] = True
-        # The destination is NEVER opened; filename names the SOURCE.
-        raise FileNotFoundError(errno.ENOENT, "No such file", os.fspath(src))
+        # THREE ROWS OF THE (filename, filename2) TABLE LEAVE THE DESTINATION
+        # UNTOUCHED, and `untouched` recognises only the first. The other two
+        # reach the short-circuit below with `after == landed` true for the
+        # ordinary reason -- the payload equals what was already there.
+        if shape == "source-open":
+            raise FileNotFoundError(errno.ENOENT, "No such file", os.fspath(src))
+        if shape == "destination-open":
+            raise PermissionError(errno.EACCES, "cannot open", os.fspath(dst))
+        raise shutil_mod.SameFileError("source and destination are the same")
 
     monkeypatch.setattr(switcher_mod, "replace_with_retry",
                         lambda *a, **k: (_ for _ in ()).throw(
