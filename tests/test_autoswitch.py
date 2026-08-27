@@ -10158,6 +10158,38 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
             "cadence for the whole window"
         )
 
+    def test_an_unreadable_candidate_is_not_announced_as_an_exhausted_fleet(
+        self, harness
+    ):
+        """The state the `best_candidate_headroom > 0` narrowing separates,
+        and it had no witness at all.
+
+        Every readable candidate is at zero, so there is nothing to land on --
+        but one row could not be read, and an unreadable row is not a measured
+        account. Announcing a reset here says the fleet is exhausted when one
+        of its accounts may be perfectly healthy, and arms a sleep toward a
+        moment nobody chose.
+
+        `truly_exhausted` cannot cover it: it requires every candidate
+        readable, and this one is not.
+        """
+        now = harness.clock.now
+        active = _usage7(100.0, 40.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 40 * 60)
+        outcome = harness.tick_with_usage({
+            "1": active,
+            "2": _usage7(100.0, 100.0, _iso_at(now + 11 * 86400)),
+            "3": "usage-unavailable",
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert not [e for e in harness.events if isinstance(e, AllExhaustedEvent)], (
+            "a fleet with an unreadable row was announced as exhausted — that "
+            "row may be a healthy account, and nothing here has measured it"
+        )
+        assert harness.engine._sleep_until_ts is None, (
+            "the sleep armed toward a reset chosen over an account nobody read"
+        )
+
     def test_an_ordinary_hysteresis_block_keeps_the_ordinary_cadence(
         self, harness
     ):
@@ -10182,3 +10214,94 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
             "an ordinary hysteresis block was announced as a wait with an end"
         )
         assert harness.engine._sleep_until_ts is None
+
+
+class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
+    """`_binding_recovery_ts` and `_earliest_recovery` must not disagree about
+    the SAME account, and on the ordinary exhausted shape they did.
+
+    `_earliest_recovery` takes the LATEST reset among an account's >=100%
+    windows, and says why: "an account blocked on both 5h and a scoped weekly
+    limit isn't usable when the 5h rolls over". `_binding_recovery_ts` takes
+    `max(windows, key=pct)`, and on a tie `max` returns the FIRST -- which is
+    `5h`, because that is the order `relevant_windows` emits.
+
+    So an account at 100/100 reports "back in 40 minutes" to the ranking and
+    "back in four days" to the announcement, from one snapshot. The ranking
+    then refuses every peer that returns inside those four days, and the
+    engine says it is waiting for a reset it is not ranking against.
+    """
+
+    def test_a_tie_at_the_limit_reports_the_later_reset(self, harness):
+        from claude_swap.autoswitch import _binding_recovery_ts
+
+        now = harness.clock.now
+        soon, far = _iso_at(now + 40 * 60), _iso_at(now + 4 * 86400)
+        usage = {
+            "five_hour": {"pct": 100.0, "resets_at": soon},
+            "seven_day": {"pct": 100.0, "resets_at": far},
+        }
+        got = _binding_recovery_ts(usage, (), now)
+        assert got == pytest.approx(now + 4 * 86400), (
+            f"reported back in {(got - now) / 3600:.1f}h — both windows are at "
+            "the limit, so the account is not usable until the LATER one "
+            "resets, which is what _earliest_recovery already says"
+        )
+
+    def test_a_single_binding_window_is_unchanged(self, harness):
+        """THE CONTROL. Only the tie moves; one clear binding window must
+        still report its own reset, not the latest in the account."""
+        from claude_swap.autoswitch import _binding_recovery_ts
+
+        now = harness.clock.now
+        usage = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_at(now + 40 * 60)},
+            "seven_day": {"pct": 40.0, "resets_at": _iso_at(now + 4 * 86400)},
+        }
+        assert _binding_recovery_ts(usage, (), now) == pytest.approx(now + 40 * 60)
+
+    def test_a_tied_window_with_no_reset_makes_the_answer_unknown(self, harness):
+        """One blocker naming a moment does not make the account schedulable
+        when the other names none.
+
+        Taking `max` over only the resets we HAVE would report the 5-hour one
+        and rank the account as back in forty minutes, while its weekly window
+        holds it for a length nothing here can state. `inf` sorts it last,
+        which is what `_binding_recovery_ts` already promises for an unknown.
+        """
+        from claude_swap.autoswitch import _binding_recovery_ts
+
+        now = harness.clock.now
+        usage = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_at(now + 40 * 60)},
+            "seven_day": {"pct": 100.0},          # blocked, and will not say for how long
+        }
+        assert _binding_recovery_ts(usage, (), now) == float("inf"), (
+            "one of two tied blockers named a reset and the other did not — "
+            "reporting the one we have schedules around a window that has not "
+            "said when it lets go"
+        )
+
+    def test_the_wait_ranks_against_the_reset_it_announces(self, harness):
+        """The consequence, through the engine: a peer with quota RIGHT NOW is
+        refused, and the reset announced is one the ranking never used."""
+        now = harness.clock.now
+        active = _usage7(100.0, 100.0, _iso_at(now + 4 * 86400))
+        active["five_hour"]["resets_at"] = _iso_at(now + 40 * 60)
+        # PEER 2'S OWN BINDING WINDOW CARRIES A RESET. Its 5h is what binds it
+        # (98 against 50), and a binding window with no `resets_at` is `inf` by
+        # construction -- which would refuse it for a reason that has nothing
+        # to do with the tie under test.
+        peer = _usage7(98.0, 50.0, _iso_at(now + 4 * 86400))
+        peer["five_hour"]["resets_at"] = _iso_at(now + 2 * 3600)
+        outcome = harness.tick_with_usage({
+            "1": active,
+            "2": peer,                                            # 2 points, usable
+            "3": _usage7(100.0, 100.0, _iso_at(now + 4 * 86400)),
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            "the active is blocked for four days and account 2 has quota now — "
+            "the escape held the machine on the dead account because the "
+            "ranking read the 5-hour reset the account is not waiting for"
+        )
+        assert harness.active_number() == 2

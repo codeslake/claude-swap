@@ -606,8 +606,22 @@ def _binding_recovery_ts(
     windows = list(oauth.relevant_windows(usage, models))
     if not windows:
         return float("inf")
-    _label, _pct, resets_at = max(windows, key=lambda w: w[1])
-    ts = _parse_reset_ts(resets_at)
+    # TIED WINDOWS ALL BIND, and the account is usable only when the LAST of
+    # them resets. `max` returns the FIRST of a tie, and `relevant_windows`
+    # emits 5h before 7d, so an account at 100/100 -- the ordinary shape of a
+    # genuinely exhausted one -- reported the five-hour reset while
+    # `_earliest_recovery` reported the weekly one from the same snapshot.
+    # The ranking then refused every peer returning inside that gap and the
+    # engine announced a reset it was not ranking against.
+    binding = max(w[1] for w in windows)
+    resets = [w[2] for w in windows if w[1] == binding]
+    stamps = [ts for ts in map(_parse_reset_ts, resets) if ts is not None]
+    # ANY tied window with no usable reset makes the whole answer unknown: the
+    # account cannot be scheduled around a moment one of its blockers will not
+    # name. Same reading `_earliest_recovery` gives, one account down.
+    if len(stamps) != len(resets):
+        return float("inf")
+    ts = max(stamps) if stamps else None
     return ts if ts is not None and ts > now else float("inf")
 
 
@@ -2178,7 +2192,11 @@ class AutoSwitchEngine:
                 # candidate, and no state this branch can reach clears it.
                 # Waiting is only a choice when something can say what for.
                 and active_recovery_ts != float("inf")
-                and (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
+                # ONLY THE CANDIDATE SIDE IS ASKED. The active's own headroom
+                # was tested too, and it cannot be False here: `at-limit` is
+                # set only when the active is at zero, so the clause was true
+                # for the whole population it guarded and rode on its live
+                # neighbour through every mutation check.
                 and best_candidate_headroom <= SPENT_HEADROOM_PCT
             )
         )
@@ -2332,12 +2350,15 @@ class AutoSwitchEngine:
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
-        # ONLY when the escape had somewhere it COULD have gone. With no
-        # readable candidate at all this is the ordinary unreadable-usage
-        # block, and naming a reset there would announce a wait nobody chose.
+        # ONLY when the escape had somewhere it COULD have gone. An
+        # UNREADABLE candidate is the state this separates, not "no readable
+        # candidate at all" -- that one returns at `no-comparison` several
+        # arms earlier, so naming it here described something this line
+        # cannot see. A row we could not read may be a healthy account, and
+        # announcing a reset over it claims a fleet nobody measured.
         waiting = bool(
             trigger == "at-limit" and by_recovery_axis and not ordered
-            and any(h is not None and h > 0 for h in map(headroom.get, oauth_candidates))
+            and best_candidate_headroom > 0
         )
         return ordered, any_known, active_reset_ts, waiting
 
