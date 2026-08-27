@@ -699,24 +699,28 @@ class ClaudeAccountSwitcher:
                             f"({mode_err}); refusing to write a credential "
                             f"there. Fix the mode or the mount, then retry"
                         ) from mode_err
-                source, temp_path = temp_path, None
-                kept = (
-                    f"{path.name} may now be truncated; the complete content "
-                    f"was kept at {source.name}"
-                )
-                # THE BYTES, not a proxy for them. `(size, mtime_ns)` is
-                # still an inference: a partial written at exactly the prior
-                # length, inside the filesystem's mtime granule (1 ms here),
-                # moves neither -- and the destination keeps a truncated
-                # credential. Measured at 249 of 300 with no gap between the
-                # writes. A digest answers exactly, and it is affordable
-                # because only the EBUSY write-through reaches this.
+                # THE BYTES, not a proxy for them. `(size, mtime_ns)` is an
+                # inference: a partial written at exactly the prior length,
+                # inside the filesystem's mtime granule, moves neither -- and
+                # the destination keeps a truncated credential. A digest is
+                # affordable because only the EBUSY write-through reaches it.
+                #
+                # ABOVE THE DISOWN, for the same reason as the chmod. Past
+                # that line `temp_path` is None and the outer cleanup no
+                # longer owns the name, so anything raising here strands the
+                # temp holding the complete new payload, unnamed and
+                # unmentioned. `except OSError` does not cover a signal.
                 before = None
                 try:
                     _raw = path.read_bytes()
                     before = hashlib.sha256(_raw).hexdigest()
                 except OSError:
                     before = None
+                source, temp_path = temp_path, None
+                kept = (
+                    f"{path.name} may now be truncated; the complete content "
+                    f"was kept at {source.name}"
+                )
 
                 def _unnarrow():
                     # ONLY WHAT THE COPY ACTUALLY TRUNCATED. `copyfile` raises

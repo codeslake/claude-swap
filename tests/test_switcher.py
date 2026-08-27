@@ -12366,6 +12366,47 @@ def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
     assert strays == [], f"an interrupt at the mode call stranded {strays}"
 
 
+def test_an_interrupt_at_the_digest_does_not_strand_the_temp(
+    temp_home: Path, monkeypatch
+):
+    """The `before` digest has to sit above the disown too.
+
+    Its own `except OSError` does not cover a signal or a MemoryError, and
+    past `source, temp_path = temp_path, None` the outer cleanup no longer
+    owns the name -- so the stray holds the COMPLETE new payload, which for
+    `~/.claude.json` is a credential-bearing file, with nothing naming it.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"digest": False}
+    real_sha256 = switcher_mod.hashlib.sha256
+
+    def interrupt_at_digest(*a, **kw):
+        if not fired["digest"]:
+            fired["digest"] = True
+            raise KeyboardInterrupt
+        return real_sha256(*a, **kw)
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.hashlib, "sha256", interrupt_at_digest)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert fired["digest"], "premise: the injected interrupt never fired"
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], f"an interrupt at the digest stranded {strays}"
+
+
 def test_a_refused_mode_refuses_the_write_through(temp_home: Path, monkeypatch):
     """A destination that cannot be narrowed must not receive the payload.
 
