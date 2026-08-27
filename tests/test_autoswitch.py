@@ -6923,7 +6923,7 @@ class TestOneRemedyPerKindAcrossEverySurface:
         internally consistent.
         """
         import importlib
-        import pkgutil
+        from pathlib import Path
 
         import claude_swap
         from claude_swap import oauth
@@ -6935,13 +6935,23 @@ class TestOneRemedyPerKindAcrossEverySurface:
         # `globals()[...]`, and a tuple target. "Does this module expose the
         # name" is a runtime question and `hasattr` answers it for every shape
         # there is, including ones nobody has written yet.
-        bound = []
-        for info in pkgutil.walk_packages(
-            claude_swap.__path__, claude_swap.__name__ + "."
-        ):
-            mod = importlib.import_module(info.name)
-            if hasattr(mod, "ERROR_NOTES"):
-                bound.append(mod)
+        # FROM THE FILESYSTEM, not `pkgutil.walk_packages`, which recurses
+        # only through packages that carry an `__init__.py`. A subpackage
+        # added as a PEP 420 namespace is skipped in silence, and this test
+        # gets quietly weaker with nothing to show for it.
+        root = Path(claude_swap.__file__).parent
+        names = {
+            "claude_swap." + ".".join(p.relative_to(root).with_suffix("").parts)
+            for p in root.rglob("*.py")
+        }
+        bound = [
+            mod
+            for mod in (
+                importlib.import_module(n.removesuffix(".__init__"))
+                for n in sorted(names)
+            )
+            if hasattr(mod, "ERROR_NOTES")
+        ]
 
         # THE DENOMINATOR NAMES THE DEFINITION, not a count. A count asserts
         # an architecture: refactor the re-exports to read `oauth.ERROR_NOTES`
@@ -6952,6 +6962,16 @@ class TestOneRemedyPerKindAcrossEverySurface:
             f"the walk did not find the module that DEFINES ERROR_NOTES "
             f"({[m.__name__ for m in bound]}) -- it is measuring the wrong "
             "tree, and every identity check below is vacuous"
+        )
+        # AND THE LOOP MUST HAVE A SUBJECT. Finding only the definer satisfies
+        # the line above while leaving the identity check below iterating over
+        # nothing -- a re-export deleted and a walk that stopped early are the
+        # same green. This asserts the loop has something to compare, not how
+        # many things or which, so a refactor that changes the surfaces is free.
+        assert [m for m in bound if m is not oauth], (
+            "no module besides oauth exposes ERROR_NOTES, so the identity "
+            "comparison below has no subject -- either every re-export is "
+            "gone or the walk is not reaching them"
         )
         for mod in bound:
             assert mod.ERROR_NOTES is oauth.ERROR_NOTES, (
