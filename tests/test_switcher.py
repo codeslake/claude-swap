@@ -12799,11 +12799,118 @@ def _os_names(tree) -> set[str]:
     """
     import ast
 
-    return {"os"} | {
+    names = {"os"} | {
         (a.asname or a.name)
         for imp in ast.walk(tree) if isinstance(imp, ast.Import)
         for a in imp.names if a.name == "os"
     }
+    # AND A PLAIN REBINDING. `import os as _o` is not the only way to get a
+    # second name for the module -- `_o = os` does it too, and an
+    # `_o.open(..., O_TRUNC)` writer was invisible to every scan keying on
+    # this. A fixpoint, because `_p = _o` chains.
+    while True:
+        grown = names | {
+            t.id
+            for n in ast.walk(tree) if isinstance(n, ast.Assign)
+            for t in n.targets if isinstance(t, ast.Name)
+            if isinstance(n.value, ast.Name) and n.value.id in names
+        }
+        if grown == names:
+            return names
+        names = grown
+
+
+def _flat(body):
+    """Statements in this block's OWN scope -- a nested `def` is not it.
+
+    Recursive rather than `ast.walk`, which cannot PRUNE: filtering its
+    output drops the `def` node and still yields the body underneath it, so
+    an assignment inside a function that never runs counted as a disown.
+    """
+    import ast
+
+    for st in body:
+        yield st
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef,
+                           ast.ClassDef)):
+            continue
+        for child in ast.iter_child_nodes(st):
+            if isinstance(child, ast.stmt):
+                yield from _flat([child])
+            else:
+                for sub in ast.iter_child_nodes(child):
+                    if isinstance(sub, ast.stmt):
+                        yield from _flat([sub])
+
+
+def _bound_names(st) -> set[str]:
+    """Names this statement binds or unbinds."""
+    import ast
+
+    targets = []
+    if isinstance(st, ast.Assign):
+        targets = st.targets
+    elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+        targets = [st.target]
+    elif isinstance(st, ast.Delete):
+        targets = st.targets
+    return {sub.id for t in targets for sub in ast.walk(t)
+            if isinstance(sub, ast.Name)}
+
+
+def _cleanup_reads(tries, this_handler) -> set[str]:
+    """Names the cleanup around this call READS.
+
+    That is the whole invariant: a handler disowns by changing something the
+    cleanup consults -- the temp name, the flag guarding the unlink, the
+    registry the discard walks. Its own `except` clause is excluded, or the
+    handler would answer about itself.
+    """
+    import ast
+
+    out: set[str] = set()
+    for t in tries:
+        blocks = list(t.finalbody) + [
+            st for h in t.handlers if h is not this_handler for st in h.body]
+        for st in blocks:
+            for n in ast.walk(st):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    out.add(n.id)
+    return out
+
+
+def _os_call_aliases(tree, func: str) -> set[str]:
+    """Bare names this module can call `os.<func>` through.
+
+    `from os import open as _open` and `_open = os.open` both bind a NAME,
+    which an attribute match cannot see at all.
+    """
+    import ast
+
+    return {
+        (a.asname or a.name)
+        for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
+        and imp.module == "os"
+        for a in imp.names if a.name == func
+    } | {
+        t.id
+        for n in ast.walk(tree) if isinstance(n, ast.Assign)
+        for t in n.targets if isinstance(t, ast.Name)
+        if isinstance(n.value, ast.Attribute) and n.value.attr == func
+    }
+
+
+def _is_os_call(node, func: str, os_names: set[str], aliases: set[str]) -> bool:
+    """Does this `Call` reach `os.<func>` under ANY of its spellings."""
+    import ast
+
+    if not isinstance(node, ast.Call):
+        return False
+    f = node.func
+    if isinstance(f, ast.Attribute):
+        return (f.attr == func and isinstance(f.value, ast.Name)
+                and f.value.id in os_names)
+    return isinstance(f, ast.Name) and f.id in aliases
 
 
 def test_no_writer_calls_os_write_bare():
@@ -12843,12 +12950,7 @@ def test_no_writer_calls_os_write_bare():
         os_names = _os_names(tree)
         # `from os import write as _w` binds a bare NAME, which an attribute
         # match cannot see; resolve the aliases this module actually created.
-        aliases = {
-            (a.asname or a.name)
-            for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
-            and imp.module == "os"
-            for a in imp.names if a.name == "write"
-        }
+        aliases = _os_call_aliases(tree, "write")
         # A LOCAL BOUND TO THE FUNCTION IS THE FUNCTION. `w = os.write` then
         # `w(fd, ...)` is the same call under a name the scans above cannot
         # see, and it is the spelling a reader reaches for when the call is
@@ -12975,13 +13077,17 @@ def test_no_writer_chmods_after_it_publishes():
             after = [i for i in chmods if pub is not None and i > pub]
             offenders += [f"{mod.name}:{node.body[i].lineno}" for i in after]
 
-    assert publishes >= 5, (
-        f"the instrument, not the code: only {publishes} publish(es) were "
-        "found inside a try block, so this would pass over almost nothing"
-    )
+    # THE SUBJECT FIRST, like its two siblings. A refactor that consolidates
+    # publishes takes the count under the floor, and a real post-publish
+    # chmod then reports as "the instrument, not the code" with the offender
+    # list never printed -- measured, 10 live against a floor of 5.
     assert not offenders, (
         "a chmod runs AFTER the publish, so its failure reports a landed "
         f"write as a failed one: {offenders}"
+    )
+    assert publishes >= 5, (
+        f"the instrument, not the code: only {publishes} publish(es) were "
+        "found inside a try block, so this would pass over almost nothing"
     )
 
 
@@ -13051,10 +13157,10 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
                 descend(child, deeper)
         descend(tree, [])
 
+        os_names = _os_names(tree)
+        open_aliases = _os_call_aliases(tree, "open")
         for node in ast.walk(tree):
-            if not (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "open"):
+            if not _is_os_call(node, "open", os_names, open_aliases):
                 continue
             if "O_EXCL" not in ast.unparse(node):
                 continue
@@ -13069,16 +13175,28 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
             name = (node.args[0].id if node.args
                     and isinstance(node.args[0], ast.Name) else None)
             ok = False
-            for t in guarding.get(id(node), []):
+            t_stack = guarding.get(id(node), [])
+            for t in t_stack:
                 for h in t.handlers:
                     if h.type is None:
                         continue
                     caught = ast.unparse(h.type)
                     if not ("FileExistsError" in caught or "OSError" in caught):
                         continue
+                    # IT MUST CHANGE SOMETHING THE CLEANUP READS. "is
+                    # there an Assign" is satisfied by `_msg = str(e)`, by
+                    # `del payload`, and by an assignment inside a nested
+                    # `def` that never runs -- each leaves the name in reach
+                    # of the cleanup, measured with the suite green. The real
+                    # disowns are not all rebindings of the temp name either:
+                    # one clears the flag the cleanup guards its unlink with,
+                    # another drops the entry the discard walks.
                     body = ast.dump(ast.Module(body=h.body, type_ignores=[]))
-                    disowns = ("Assign(" in body or "AnnAssign(" in body
-                               or "Delete(" in body)
+                    reads = _cleanup_reads(t_stack, h)
+                    if name is not None:
+                        reads.add(name)
+                    disowns = any(_bound_names(st) & reads
+                                  for st in _flat(h.body))
                     if disowns and "Raise(" in body:
                         ok = True
             if not ok:
@@ -13121,16 +13239,16 @@ def test_every_temp_writer_opens_with_O_EXCL():
     offenders, unreadable, seen = [], [], 0
     for mod in sorted(src_dir.rglob("*.py")):
         tree = ast.parse(mod.read_text(encoding="utf-8"))
+        # EVERY NAME THAT REACHES THE MODULE. Its sibling scan resolves
+        # `import os as _o` and this one did not, so that one alias hid an
+        # `O_TRUNC` regression from BOTH -- the disown scan filters on the
+        # literal `O_EXCL`, which the aliased call no longer carries.
+        # PER MODULE, not per node: both resolvers walk the whole tree, so
+        # calling them inside the loop is quadratic on the larger modules.
+        os_names = _os_names(tree)
+        open_aliases = _os_call_aliases(tree, "open")
         for node in ast.walk(tree):
-            # EVERY NAME THAT REACHES THE MODULE. Its sibling scan resolves
-            # `import os as _o` and this one did not, so that one alias hid
-            # an `O_TRUNC` regression from BOTH -- the disown scan filters on
-            # the literal `O_EXCL`, which the aliased call no longer carries.
-            if not (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "open"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id in _os_names(tree)):
+            if not _is_os_call(node, "open", os_names, open_aliases):
                 continue
             kw = {k.arg: k.value for k in node.keywords}
             arg = (node.args[1] if len(node.args) >= 2
@@ -13173,8 +13291,14 @@ def test_every_temp_writer_opens_with_O_EXCL():
             # does. A `getattr` with a literal name IS readable, so it is not
             # unreadable either.
             terms = [t.strip() for t in flags.split("|")]
+            # THE SAME NAMES THE MATCHER RESOLVED. Hardcoding `os` here
+            # made an aliased chain unreadable, so safe code (`O_EXCL`
+            # intact under `import os as _o`) failed under the "can be
+            # neither proven nor refuted" sentence, and a real aliased
+            # `O_TRUNC` was filed there too instead of as an offender.
             readable = re.compile(
-                r'os\.O_[A-Z_]+'
+                r'(?:' + '|'.join(re.escape(n) for n in sorted(os_names))
+                + r')\.O_[A-Z_]+'
                 r'|getattr\(\s*\w+\s*,\s*[\'"]O_[A-Z_]+[\'"]\s*(?:,[^)]*)?\)')
             if not all(readable.fullmatch(t) for t in terms):
                 unreadable.append(f"{mod.name}:{node.lineno} `{flags}`")
