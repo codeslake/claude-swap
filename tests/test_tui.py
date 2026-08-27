@@ -1590,6 +1590,42 @@ class TestAutoScreen:
 
             assert len(app.screen.query_one("#event-log", RichLog).lines) > 0
 
+    async def test_a_promoted_engine_updates_the_badge(
+        self, tmp_path, contended_fake_engine
+    ):
+        """The engine PROMOTES itself mid-run, with no human action.
+
+        Nothing else re-reads `dry_run` after mount, so without the refresh in
+        `_on_engine_event` the badge keeps reading DRY-RUN over an engine that
+        is now switching accounts -- worse than the stuck-dry-run it fixes,
+        because the display then contradicts what is happening. Deleting that
+        one call left the suite green: `contended_fake_engine` was built for
+        exactly this and no case used it.
+        """
+        from textual.widgets import Static
+
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            engine = contended_fake_engine.instances[0]
+            badge = app.screen.query_one("#mode-badge", Static)
+            assert badge.has_class("dry"), (
+                "premise: the screen did not open demoted, so a later LIVE "
+                "badge would prove nothing"
+            )
+
+            engine.promote()
+            assert engine.wait_promoted(), "premise: the engine never promoted"
+            await settle(pilot)
+
+            assert badge.has_class("live"), (
+                "the badge still reads DRY-RUN over an engine that is now "
+                "LIVE and switching accounts"
+            )
+
     async def test_go_live_requires_confirmation(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [make_account(1, active=True), make_account(2)], tmp_path

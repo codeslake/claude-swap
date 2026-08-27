@@ -213,6 +213,39 @@ class TestActiveReadStaysOnOneProfile:
         ]
 
 
+class TestTheManagedReadVerdictIsPerThread:
+    def test_a_sibling_read_does_not_reset_this_thread_s_verdict(self, tmp_path):
+        """One store, several readers, and this verdict spans statements.
+
+        The TUI's two refresh lanes, the auto engine's worker and the fetch
+        pool share a `CredentialStore`. As a plain attribute, a sibling
+        entering `_read_active_credentials` cleared it mid-flight and the
+        first reader then returned `("", False, False)` -- a live, billing
+        managed key reported as a genuinely empty slot.
+
+        Swapping `threading.local()` for a shared attribute left the whole
+        suite green, so nothing but this stands between that race and a
+        future simplification.
+        """
+        import threading as _threading
+
+        store = CredentialStore(_Host(tmp_path / "backups"))
+        store._managed_read_tls.failed = True
+
+        def sibling():
+            # what the top of every active read does
+            store._managed_read_tls.failed = False
+
+        t = _threading.Thread(target=sibling)
+        t.start()
+        t.join()
+
+        assert store._managed_read_tls.failed is True, (
+            "a sibling read's reset reached this thread's verdict, so a "
+            "keychain failure observed here is erased by an unrelated reader"
+        )
+
+
 class TestSecureStorageOverride:
     """``CLAUDE_SECURESTORAGE_CONFIG_DIR`` takes precedence when *defined*.
 

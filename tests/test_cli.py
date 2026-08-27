@@ -1068,6 +1068,40 @@ class TestAutoCommand:
             "interrupted at all"
         )
 
+    def test_the_banner_says_dry_run_for_a_demoted_engine(
+        self, temp_home, capsys
+    ):
+        """THE ENGINE, NOT THE REQUEST.
+
+        A second `cswap auto` loses the LIVE lock and demotes itself in
+        `__init__`, so `engine.dry_run` is True while `args.dry_run` is False.
+        Every other banner case drives a stub whose `dry_run` AGREES with the
+        flag, so both readings print the same line and none of them can say
+        which one it came from -- reverting this to `args.dry_run` left the
+        whole suite green.
+        """
+        class _Engine:
+            dry_run = True          # demoted; no --dry-run was asked for
+
+            def stop(self):
+                pass
+
+            def run_loop(self):
+                return 0
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine",
+                   return_value=_Engine()), \
+                patch.object(sys, "argv", ["claude-swap", "auto"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+
+        out = capsys.readouterr().out
+        assert "Auto-switch running" in out, "premise: the banner never printed"
+        assert "(dry-run)" in out, (
+            "the banner read the REQUEST, so a demoted engine announces "
+            f"switching over a process that will switch nothing: {out!r}"
+        )
+
     def test_once_is_interruptible_too(self, temp_home):
         """`--once` exits before the handlers are installed, so it has none.
 

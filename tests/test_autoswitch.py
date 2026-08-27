@@ -7132,12 +7132,21 @@ class TestLiveLock:
         and it is observable without touching the runtime.
         """
         import inspect
+        import re as _re
 
         src = inspect.getsource(harness.engine._perform)
         arm = src.index("self._switch_in_flight = True")
-        gate = src.index("if self._stop.is_set():", arm - 400)
-        assert arm < gate, (
-            "`_switch_in_flight` is armed after the `_stop` gate; a signal "
+        # EVERY GATE, NOT ONE FOUND THROUGH A BYTE WINDOW. `index(gate,
+        # arm - 400)` skipped the function's entry gate by distance alone: a
+        # new `_stop` checkpoint within 400 bytes before the arm makes it
+        # match THAT one and fail correct code, and once the anchor moves it
+        # raises `ValueError: substring not found` instead of the sentence
+        # below.
+        gates = [m.start() for m in
+                 _re.finditer(r"if self\._stop\.is_set\(\):", src)]
+        assert gates, "premise: `_perform` has no `_stop` gate at all"
+        assert [g for g in gates if g > arm], (
+            "`_switch_in_flight` is armed after every `_stop` gate; a signal "
             "between them takes stop()'s immediate-release path"
         )
 
@@ -7233,6 +7242,55 @@ class TestLiveLock:
             )
         finally:
             successor.stop()
+
+    def test_a_lock_error_that_changes_is_said_once_more(self, harness):
+        """A cause that CHANGES has to be announced again.
+
+        The first attempt loses on contention, so the operator is told another
+        LIVE engine is running. The holder then exits while `backup_dir` goes
+        read-only, and every attempt after that raises EROFS -- without the
+        re-arm the operator hunts a process that no longer exists for the life
+        of the run. Deleting the four lines that record it left the whole
+        suite green.
+        """
+        import errno as _errno
+
+        from claude_swap.locking import FileLock
+
+        demoted = harness._make_engine(dry_run=False)
+        try:
+            assert demoted.demoted_from_live, "premise: the harness holds LIVE"
+            real_acquire = FileLock.acquire
+            box = [OSError(_errno.EACCES, "first")]
+
+            def raising(self, *a, **kw):
+                raise box[0]
+
+            FileLock.acquire = raising
+            try:
+                demoted._demotion_announced = True
+                demoted._retry_live_promotion()
+                assert demoted._demotion_announced is False, (
+                    "the first error was not recorded, so nothing re-announces"
+                )
+
+                demoted._demotion_announced = True
+                demoted._retry_live_promotion()          # the SAME cause
+                assert demoted._demotion_announced is True, (
+                    "an unchanged cause was re-announced, so the operator gets "
+                    "the same sentence every tick"
+                )
+
+                box[0] = OSError(_errno.EROFS, "second")  # the cause CHANGES
+                demoted._retry_live_promotion()
+                assert demoted._demotion_announced is False, (
+                    "a changed cause was not re-armed, so whatever stopped the "
+                    "FIRST attempt is reported for the life of the run"
+                )
+            finally:
+                FileLock.acquire = real_acquire
+        finally:
+            demoted.stop()
 
     def test_a_stop_one_statement_later_does_not_strand_the_lock(
         self, harness
