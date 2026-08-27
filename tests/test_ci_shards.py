@@ -346,6 +346,40 @@ def _macos_job(workflow: Path) -> str:
     return block.group(1)
 
 
+def _uncomment(text: str) -> str:
+    """`text` up to the `#` that starts a comment, by the SHELL's rule.
+
+    A `#` inside a quoted string starts no comment -- `pytest -k "smoke #
+    fast"` carries one -- and cutting there truncates a LIVE command to
+    something with no markers, which is a false refusal, the opposite failure
+    to the one this exists for. A backslash escapes the next character inside
+    a double quote, so it does not close it.
+
+    AN UNBALANCED QUOTE IS NOT A LICENCE TO KEEP EVERYTHING. Returning the
+    whole line there lets a real comment survive and answer the invocation
+    question -- a job running `echo` reads as running the shard command, which
+    is the original false CLEAN. Unparseable falls back to the unquoted rule,
+    which is what the regex this replaced always did.
+    """
+    quote, i, n = None, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or text[i - 1] in " \t"):
+            return text[:i]
+        i += 1
+    if quote:
+        return re.sub(r"(?<!\S)#.*", "", text)
+    return text
+
+
 def _pytest_run_lines(job: str) -> list[str]:
     """The job's `run:` lines that invoke pytest.
 
@@ -366,49 +400,58 @@ def _pytest_run_lines(job: str) -> list[str]:
     What actually separates the two is the comment stripping above, which is
     why it lives in this reader and not in one caller.
     """
-    def uncomment(text: str) -> str:
-        # QUOTE-AWARE, because the shell is. `pytest -k "smoke # fast"` carries
-        # a `#` that starts no comment, and cutting there truncated a LIVE
-        # command to something with no markers -- a false refusal on a correct
-        # workflow, which is the opposite failure to the one this exists for.
-        quote = None
-        for i, ch in enumerate(text):
-            if quote:
-                if ch == quote:
-                    quote = None
-            elif ch in "'\"":
-                quote = ch
-            elif ch == "#" and (i == 0 or text[i - 1] in " \t"):
-                return text[:i]
-        return text
-
     lines, folded, i = job.splitlines(), [], 0
     while i < len(lines):
         # `|2` / `>2-` carry an explicit indentation indicator and are legal.
-        head = re.match(r"(\s*)run: *([|>])[-+]?\d*[-+]?\s*$", lines[i])
+        # A TRAILING COMMENT ON THE HEADER IS LEGAL YAML. Unmatched, the
+        # block never folds and a CORRECT job reads as invoking nothing.
+        head = re.match(
+            r"(\s*)run: *([|>])[-+]?\d*[-+]?\s*(?:#.*)?$", lines[i])
         if not head:
-            folded.append(uncomment(lines[i]))
+            folded.append(_uncomment(lines[i]))
             i += 1
             continue
         # A BLOCK SCALAR IS THE SAME COMMAND. `run: |` puts the invocation on
         # the following, deeper-indented lines; read literally the header has
         # no `pytest` in it and the job reads as running nothing.
-        pad, scalar, indent, body = head.group(1), head.group(2), None, []
+        pad, scalar = head.group(1), head.group(2)
         indent = len(pad)
-        i += 1
+        i, raw_body = i + 1, []
         while i < len(lines) and (
             not lines[i].strip()
             or len(lines[i]) - len(lines[i].lstrip()) > indent
         ):
-            body.append(lines[i].strip())
+            raw_body.append(lines[i])
             i += 1
-        body = [x for x in body if x]
+        # THE BLOCK'S OWN INDENT, from its first non-empty line: anything
+        # deeper is a YAML newline, not a continuation of the same line.
+        body_indent = next(
+            (len(r) - len(r.lstrip()) for r in raw_body if r.strip()),
+            indent + 1)
+        body = [x.strip() for x in raw_body if x.strip()]
         if scalar == ">":
-            # FOLDED INTO ONE SHELL LINE, so a `#` anywhere before the command
-            # comments out everything after it. Stripping per SOURCE line
-            # first drops the `#` line and reassembles a live-looking
-            # invocation -- the same false CLEAN, one spelling over.
-            folded.append(pad + "run: " + uncomment(" ".join(body)))
+            # FOLDED ONLY BETWEEN SAME-INDENT NON-EMPTY LINES. A blank line
+            # and a MORE-indented line both stay newlines in YAML, so they
+            # separate commands exactly as `|` does -- joining across them
+            # hides a second invocation, which is the collapse the `|` arm
+            # was just fixed for. Within a group the fold is real, and a `#`
+            # anywhere before the command comments out the rest of it.
+            group, groups = [], []
+            for raw in raw_body:
+                if not raw.strip() or (
+                        len(raw) - len(raw.lstrip()) > body_indent):
+                    if group:
+                        groups.append(group)
+                    group = [] if not raw.strip() else [raw.strip()]
+                    if group:
+                        groups.append(group)
+                        group = []
+                    continue
+                group.append(raw.strip())
+            if group:
+                groups.append(group)
+            folded += [pad + "run: " + _uncomment(" ".join(g))
+                       for g in groups if g]
             continue
         # `|` KEEPS ITS LINES SEPARATE, so each is its own command and joining
         # them hides a second invocation inside one block. A trailing
@@ -421,7 +464,7 @@ def _pytest_run_lines(job: str) -> list[str]:
                 buf = ""
         if buf:
             logical.append(buf)
-        folded += [pad + "run: " + uncomment(x) for x in logical]
+        folded += [pad + "run: " + _uncomment(x) for x in logical]
     return [
         ln for ln in folded
         if re.match(r"\s*run: ", ln) and re.search(r"(?<![\w-])pytest(?![\w-])", ln)
@@ -439,7 +482,7 @@ def _assert_macos_job_is_intact(workflow: Path) -> None:
     # comment naming a since-deleted test file reddens the suite here AND
     # masks `test_a_job_naming_a_deleted_file_is_refused`. Only what the job
     # RUNS can name a file it needs.
-    live = "\n".join(re.sub(r"(?<!\S)#.*", "", ln) for ln in job.splitlines())
+    live = "\n".join(_uncomment(ln) for ln in job.splitlines())
     for path in re.findall(r"tests/test_\w+\.py", live):
         assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
     # A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned. LAST,
