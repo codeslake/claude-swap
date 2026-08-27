@@ -792,13 +792,15 @@ class ClaudeAccountSwitcher:
         manages it; pulling credentials out from under a running process would be
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
+
+        Returns whether the profile was invalidated or marked stale.
         """
         # ANSWERED, NOT ONLY LOGGED. The live branch cannot invalidate a
         # profile in use, so a refused marker leaves it serving a superseded
-        # generation with nothing recording that -- and a caller that must
-        # decide whether recovery material is still needed cannot read a log
-        # line. The forward path at `_write_account_credentials` ignores this;
-        # the rollback's repair counts it.
+        # generation -- logged below, but a caller that must decide whether
+        # recovery material is still needed cannot act on a log line. The
+        # forward path at `_write_account_credentials` ignores this; the
+        # rollback's repair counts it.
         if self._live_session_pids(account_num, email):
             from claude_swap.session import mark_session_stale
 
@@ -1435,6 +1437,14 @@ class ClaudeAccountSwitcher:
         # and "wrote something" are different claims.
         self._logger.error(f"Swap {num_a} <-> {num_b} failed; rolling back")
         failures = 0
+        # ITS OWN COUNTER. The crossed-profile repair below fails on a
+        # SESSION MARKER, which lives in a sibling tree of the credential
+        # store -- so its refusal says nothing about whether the restores
+        # landed. Counted as a credential failure it retained the other
+        # account's material in this key's `.prev` (the block below calls
+        # that pure contamination) and kept a plaintext staged copy that
+        # cannot repair an unmarked profile anyway. Reported, not gating.
+        repairs = 0
         wrote_any = False
         # NOT A NO-OP when its forward half never ran: with one email the two
         # slots' keys are each other's destinations, so it would exchange two
@@ -1550,11 +1560,19 @@ class ClaudeAccountSwitcher:
                                         # its marker branch and the marker was
                                         # refused, so the profile keeps a
                                         # superseded credential unmarked. It
-                                        # is counted for the reason the arms
-                                        # below are: otherwise the staged
-                                        # copies are discarded and this is
-                                        # reported as a success.
-                                        failures += 1
+                                        # is counted so the summary says
+                                        # so; `failures` would also throw away
+                                        # this key's `.prev`, which a marker
+                                        # refusal gives no reason to doubt.
+                                        repairs += 1
+                                        self._logger.error(
+                                            "Rollback restored slot %s but "
+                                            "its crossed session profile is "
+                                            "LIVE and could not be marked "
+                                            "stale; it may keep serving the "
+                                            "superseded generation until it "
+                                            "exits.", other,
+                                        )
                                 except OSError:
                                     from claude_swap.session import (
                                         mark_session_stale,
@@ -1572,14 +1590,11 @@ class ClaudeAccountSwitcher:
                                             self._session_dir(other, email)):
                                         # COUNTED, for the reason its
                                         # `except Exception` sibling below
-                                        # states: without it the staged
-                                        # copies are discarded. This state is
-                                        # the worse of the two -- the profile
-                                        # keeps a superseded credential AND
-                                        # carries no marker -- so it is the
-                                        # last one that should drop the only
-                                        # remaining recovery copies.
-                                        failures += 1
+                                        # states: the summary owes this. This
+                                        # state is the worse of the two -- the
+                                        # profile keeps a superseded
+                                        # credential AND carries no marker.
+                                        repairs += 1
                                         self._logger.error(
                                             "Rollback could NOT invalidate "
                                             "slot %s's crossed session "
@@ -1596,9 +1611,9 @@ class ClaudeAccountSwitcher:
                                     # credential restore that in fact landed,
                                     # in the same report whose summary says
                                     # credentials were restored. The count
-                                    # still has to happen here: without it
-                                    # the staged copies are discarded.
-                                    failures += 1
+                                    # still has to happen here: the
+                                    # summary owes this one too.
+                                    repairs += 1
                                     self._logger.error(
                                         "Rollback could not invalidate slot "
                                         "%s's crossed session profile: %s",
@@ -1661,6 +1676,13 @@ class ClaudeAccountSwitcher:
                 f"; {len(crossed_keys)} session profile(s) are still under "
                 "the other slot's key"
             )
+            # AND WHICH OF THEM THE REPAIR COULD NOT REACH. A repair failure
+            # gates nothing now, so this clause is the whole of its report.
+            if repairs:
+                what += (
+                    f", {repairs} of which could not be invalidated or "
+                    "marked stale"
+                )
         self._logger.error(f"Swap {num_a} <-> {num_b} rollback: {what}")
         if wrote_backups and email_a != email_b:
             # Drop half-written copies under the new keys; the records still

@@ -2127,7 +2127,52 @@ class TestTheRollbackDecidesPerKey:
             f"a delete was reported as a failed restore: {said!r}"
         )
 
-    def test_a_LIVE_crossed_profile_neither_lever_reached_keeps_them_too(
+    def test_a_refused_credential_restore_IS_called_a_restore(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The other direction of the same verb, which nothing witnessed.
+
+        Its sibling pins the falsy-`original` branch. With only that one,
+        pinning the verb to the constant "clear" passes the whole file -- so
+        the mirror defect (every genuine credential-restore failure named a
+        clear) had no witness at all, and the sibling's own negative assert
+        `"creds restore failed" not in said` goes vacuous under that pinning.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        # DIFFERENT FROM WHAT THE ROLLBACK RESTORES, or the value-equal skip
+        # above means no write is attempted and the verb is never chosen.
+        switcher._write_account_credentials("1", mail_a, "creds-a-HALFWRITTEN")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+
+        real_write = switcher._write_account_credentials
+        refused = {"n": 0}
+
+        def refusing(num, mail, value, *a, **k):
+            if (num, mail) == ("1", mail_a):
+                refused["n"] += 1
+                raise PermissionError(errno.EACCES, "injected: restore")
+            return real_write(num, mail, value, *a, **k)
+
+        switcher._write_account_credentials = refusing
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=[], wrote_backups=True,
+            )
+        assert refused["n"] >= 1, (
+            "premise: the restore was never attempted, so the verb below was "
+            "chosen for some other branch"
+        )
+        said = " ".join(records)
+        assert "creds restore failed" in said, (
+            "a credential restore was attempted with material to restore and "
+            f"its failure was not named a restore: {said!r}"
+        )
+
+    def test_a_LIVE_crossed_profile_neither_lever_reached_is_reported_too(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
         """The same end state through the door the sibling case cannot see.
@@ -2175,13 +2220,16 @@ class TestTheRollbackDecidesPerKey:
             "premise: the live marker branch did not fire, so the staged "
             f"copies below survive or vanish for another reason: {said!r}"
         )
-        assert staged.exists(), (
-            "the staged pre-swap copy was discarded although the live crossed "
-            "profile keeps a superseded credential with no marker — the "
-            "chokepoint swallowed the refusal and the rollback reported success"
+        # AND NOT BY KEEPING CREDENTIAL MATERIAL. The refusal is on a session
+        # marker, a sibling tree of the credential store, so it is no reason
+        # to doubt the restores -- and a staged plaintext copy cannot repair
+        # an unmarked profile.
+        assert not staged.exists(), (
+            "a refused session marker kept the staged pre-swap credential, "
+            "which cannot repair a profile and blocks the next same-email swap"
         )
 
-    def test_a_crossed_profile_neither_lever_reached_keeps_the_staged_copies(
+    def test_a_crossed_profile_neither_lever_reached_is_reported(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
         """The worse of the two repair failures was the uncounted one.
@@ -2244,15 +2292,24 @@ class TestTheRollbackDecidesPerKey:
         # THE FRAGMENT ONLY THIS ARM SAYS. Its `except Exception` sibling
         # emits "crossed session profile" too AND counts, so that phrase is
         # satisfied when the injected error falls through to the sibling --
-        # measured: retyping this arm's `except` leaves this case green.
-        assert "OR mark it stale" in said, (
+        # measured: retyping this arm's `except` leaves this case green. Nor
+        # is "OR mark it stale" enough: `_write_account_credentials` says it
+        # too, and the sibling arm reaches that emitter.
+        assert "crossed session profile OR mark it stale" in said, (
             "premise: the arm under test did not fire, so the staged copies "
             f"below survive for an unrelated reason: {said!r}"
         )
-        assert staged.exists(), (
-            "the staged pre-swap copy was discarded although neither the "
-            "invalidation nor the marker landed — the rollback threw away the "
-            "last recovery copy in the state it can least afford to"
+        assert "could not be invalidated or marked stale" in said, (
+            "the refused repair was contained and never reported — the "
+            f"summary claims a clean restore: {said!r}"
+        )
+        # AND NOT BY KEEPING CREDENTIAL MATERIAL. The marker lives in a
+        # sibling tree of the credential store, so its refusal is no reason to
+        # doubt the restores -- and the staged copy cannot repair an unmarked
+        # profile, it only leaves a second plaintext credential on disk.
+        assert not staged.exists(), (
+            "a refused session marker kept the staged pre-swap credential, "
+            "which cannot repair a profile and blocks the next same-email swap"
         )
 
     def test_a_refused_repair_is_contained_but_counted_not_silent(
@@ -2317,10 +2374,6 @@ class TestTheRollbackDecidesPerKey:
         # rationale does NOT transfer here. What must hold instead is that the
         # key is COUNTED, so the staged copy survives and the operator is told,
         # and that the failure is named for what actually failed.
-        assert staged.exists(), (
-            "the staged pre-swap copy was discarded although a key's repair "
-            "was refused — the rollback treated a contained failure as success"
-        )
         said = " ".join(records)
         # THE ARM'S OWN SENTENCE. Deleting the whole `except Exception` that
         # names the repair leaves every count, the summary and the staged copy
@@ -2336,9 +2389,13 @@ class TestTheRollbackDecidesPerKey:
         # THE ACCOUNTING LINE, not merely SOME error. A bare `assert said` is
         # satisfied by any record the rollback happens to emit, so it stays
         # green when the contained failure itself goes quiet.
-        assert "preserved in" in said or "kept for manual recovery" in said, (
-            "the refused repair was contained and never accounted for — the "
-            f"staged copies survive with nobody told where: {said!r}"
+        assert "could not be invalidated or marked stale" in said, (
+            "the refused repair was contained and never carried into the "
+            f"summary, which claims a clean restore: {said!r}"
+        )
+        assert not staged.exists(), (
+            "a refused repair kept the staged pre-swap credential; the "
+            "restores landed, so it is a redundant plaintext copy"
         )
 
     def test_a_crossed_profile_the_marker_DID_reach_is_not_reported(
