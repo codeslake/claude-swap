@@ -36,6 +36,12 @@ from claude_swap.models import Platform
 from tests import conftest
 
 
+#: Captured at import, BEFORE the autouse `_isolate_real_home` patches it.
+#: `monkeypatch.undo()` is the only other way back and it is far too wide --
+#: it also uninstalls `block_real_keychain`, the fake that keeps the suite off
+#: the real Keychain.
+_REAL_PATH_HOME = Path.home
+
 def test_control_a_tmp_path_write_is_allowed(tmp_path: Path):
     """CONTROL A: the guard must not block everything — a legitimate write
     to pytest's own isolated tmp_path must still succeed."""
@@ -691,7 +697,12 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
     # fallback the third snapshot depends on. Restore the real
     # `Path.home` for this test -- $HOME stays scratch, which is the
     # condition under test.
-    monkeypatch.undo()
+    from claude_swap import macos_keychain
+
+    monkeypatch.setattr(Path, "home", _REAL_PATH_HOME)
+    assert (
+        macos_keychain.get_password.__qualname__ != "get_password"
+    ), "premise: the Keychain fake was uninstalled, so this test can reach the real one"
     scratch = tmp_path / "scratch-home"
     scratch.mkdir()
     monkeypatch.setenv("HOME", str(scratch))

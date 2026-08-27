@@ -521,10 +521,17 @@ class TestMoveUnreadableSourceIsNotAbsent:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
+    # THE MACOS ARM RUNS ON EVERY JOB. `_use_keychain` is False off macOS
+    # unconditionally, so the class fixture that forces the file store has
+    # effect on exactly one of the three CI jobs -- the shape it exists for
+    # was reachable only where nobody runs it.
+    @pytest.mark.parametrize("as_platform", [None, Platform.MACOS])
     def test_unreadable_enc_aborts_the_move_before_anything_changes(
-        self, temp_home: Path, sample_sequence_data: dict
+        self, temp_home: Path, sample_sequence_data: dict, as_platform
     ):
         switcher = ClaudeAccountSwitcher()
+        if as_platform is not None:
+            switcher.platform = as_platform
         self._write(switcher, sample_sequence_data)
         switcher._write_account_credentials("2", "account2@example.com", "live-rt")
         switcher._write_account_credentials("1", "account1@example.com", "rt-1")
