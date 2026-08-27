@@ -551,6 +551,36 @@ class TestCcRefreshLockProtocol:
         assert not cfg.exists()
 
 
+class TestTheClampsSurviveWeakeningNotOnlyDeletion:
+    """`min(sleep, timeout)` is a no-op once most of the budget is spent.
+
+    The two cases that guard these clamps both use a timeout SMALLER than the
+    flat sleep (0.01 and 0.001), where `min(sleep, timeout)` and
+    `min(sleep, remaining)` are indistinguishable. Measured: weakening both
+    clamps to the whole timeout leaves the suite at 36/36 while the acquire
+    path overshoots by up to 0.5s, and at the production default the mutation
+    is a total no-op -- `proper_lockfile` is unbounded again.
+
+    The jitter is pinned, or the weakened form's overshoot is a random draw
+    that can land inside any fixed margin.
+    """
+
+    def test_a_timeout_above_the_sleep_still_bounds_the_call(
+        self, lock_dir, monkeypatch
+    ):
+        lock_dir.mkdir()  # fresh mtime -> contended, not stale
+        monkeypatch.setattr(claude_locks.random, "random", lambda: 1.0)
+        start = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock_dir, timeout=0.6):
+                pass
+        elapsed = time.monotonic() - start
+        # Correct: 0.5 then 0.1 -> 0.6. Weakened: 0.5 twice -> 1.0.
+        assert elapsed < 0.8, (
+            f"a 0.6s budget took {elapsed:.2f}s — the retry sleep clamped to "
+            "`timeout` rather than to what is left of it"
+        )
+
 class TestEveryArmOfTheLoopBacksOff:
     """The bounding pass clamped the two sleeping arms and skipped one.
 
@@ -583,35 +613,4 @@ class TestEveryArmOfTheLoopBacksOff:
         assert tries["n"] < 40, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the arm that "
             "retries a vanished name never sleeps, so it pins a core"
-        )
-
-
-class TestTheClampsSurviveWeakeningNotOnlyDeletion:
-    """`min(sleep, timeout)` is a no-op once most of the budget is spent.
-
-    The two cases that guard these clamps both use a timeout SMALLER than the
-    flat sleep (0.01 and 0.001), where `min(sleep, timeout)` and
-    `min(sleep, remaining)` are indistinguishable. Measured: weakening both
-    clamps to the whole timeout leaves the suite at 36/36 while the acquire
-    path overshoots by up to 0.5s, and at the production default the mutation
-    is a total no-op -- `proper_lockfile` is unbounded again.
-
-    The jitter is pinned, or the weakened form's overshoot is a random draw
-    that can land inside any fixed margin.
-    """
-
-    def test_a_timeout_above_the_sleep_still_bounds_the_call(
-        self, lock_dir, monkeypatch
-    ):
-        lock_dir.mkdir()  # fresh mtime -> contended, not stale
-        monkeypatch.setattr(claude_locks.random, "random", lambda: 1.0)
-        start = time.monotonic()
-        with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.6):
-                pass
-        elapsed = time.monotonic() - start
-        # Correct: 0.5 then 0.1 -> 0.6. Weakened: 0.5 twice -> 1.0.
-        assert elapsed < 0.8, (
-            f"a 0.6s budget took {elapsed:.2f}s — the retry sleep clamped to "
-            "`timeout` rather than to what is left of it"
         )
