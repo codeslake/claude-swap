@@ -9991,3 +9991,98 @@ class TestAClosedPipeDoesNotOutlastItsOwnSleep:
             f"the loop slept {max(slept):.1f}s after the consumer was gone, "
             "holding the LIVE lock for a window a rival engine is demoted in"
         )
+
+
+class TestTheAtLimitEscapeDoesNotLandOnASliver:
+    """Upstream issue: the escape landed on 2 points and stranded the fleet.
+
+    At-limit skips the healthy-landing gate deliberately -- a blocked account
+    is worth leaving for a working one -- so the only test a candidate faces
+    is `h > 0` and the key falls through to `-h`. When NOTHING is working that
+    picks whoever holds the largest sliver, which is routinely an account
+    bound by its WEEKLY window with days to run, while the account being left
+    was bound only by a five-hour window minutes from resetting.
+
+    Reported tick: four accounts, threshold 95, active on 4 at its 5-hour
+    limit with 40 minutes to go; peers at 0, 0 and 2 points, the 2-point one
+    at 98% weekly with four days to run. The engine moved there, reported
+    `all-exhausted` two minutes later, and named the active's own 40-minute
+    reset as `earliestResetAt` -- it had the answer in hand and had already
+    moved off it.
+
+    `all_above` is the state where the recovery ranking exists, and it was
+    scoped to the proactive triggers only. Failover stays out: there the
+    active is dead or unreadable, and its reset is not a quota fact anyone can
+    wait for.
+    """
+
+    def _args(self, harness, **over):
+        from claude_swap.settings import AutoSwitchSettings
+
+        now = harness.clock.now
+        args = dict(
+            trigger="at-limit",
+            consume_first=False,
+            no_return=None,
+            oauth_candidates=["1", "2", "3"],
+            usage={
+                # The active: 5-hour window at its limit, back in 40 minutes.
+                "4": _usage7(100.0, 40.0),
+                "1": _usage7(100.0, 95.0),
+                "2": _usage7(100.0, 100.0),
+                # The sliver: 2 points, and they are on a WEEKLY window that
+                # does not return for four days.
+                "3": _usage7(1.0, 98.0, _iso_at(now + 4 * 86400)),
+            },
+            headroom={"1": 0.0, "2": 0.0, "3": 2.0, "4": 0.0},
+            current="4",
+            active_headroom=0.0,
+            settings=AutoSwitchSettings(threshold=95.0),
+            now=now,
+        )
+        args["usage"]["4"]["five_hour"]["resets_at"] = _iso_at(now + 40 * 60)
+        args.update(over)
+        return args
+
+    def test_the_sliver_does_not_win_when_it_comes_back_last(self, harness):
+        ordered, any_known, _ = harness.engine._rank_candidates(
+            **self._args(harness)
+        )
+        assert any_known, "premise: the rows were unreadable, so nothing ranked"
+        assert list(ordered) == [], (
+            f"the escape chose {list(ordered)} — account 3 holds 2 points on a "
+            "weekly window four days out, and the account being left is back "
+            "in forty minutes. Landing there costs the fleet those four days"
+        )
+
+    def test_a_peer_back_sooner_than_the_active_still_wins(self, harness):
+        """THE OVER-CORRECTION GUARD. Same shape, with the sliver's binding
+        window resetting BEFORE the active's, so the move is the right one.
+
+        It does NOT discriminate the fix: `-h` picks account 3 here too,
+        because it is the only candidate with any headroom at all. What it
+        catches is a gate that refuses every candidate once `all_above` holds
+        -- which is what a fix one clause wider than this one produces, and
+        the case above cannot see it."""
+        now = harness.clock.now
+        args = self._args(harness)
+        args["usage"]["3"] = _usage7(1.0, 98.0, _iso_at(now + 5 * 60))
+        ordered, _, _ = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["3"], (
+            f"got {list(ordered)} — account 3 is back in five minutes against "
+            "the active's forty, which is the move the escape exists to make"
+        )
+
+    def test_a_healthy_peer_is_still_taken_the_ordinary_way(self, harness):
+        """The second control: this must change nothing when the fleet is not
+        all above the threshold. A peer with real headroom wins on headroom,
+        whatever its reset says."""
+        now = harness.clock.now
+        args = self._args(harness)
+        args["usage"]["3"] = _usage7(1.0, 20.0, _iso_at(now + 4 * 86400))
+        args["headroom"]["3"] = 80.0
+        ordered, _, _ = harness.engine._rank_candidates(**args)
+        assert list(ordered) == ["3"], (
+            f"got {list(ordered)} — 80 points is a healthy landing and the "
+            "escape must still take it"
+        )

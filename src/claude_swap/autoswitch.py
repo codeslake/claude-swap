@@ -2126,6 +2126,37 @@ class AutoSwitchEngine:
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
+        # AT-LIMIT TAKES THE RECOVERY AXIS WHEN NOTHING IS WORTH HAVING, and
+        # only then. The escape skips the landing gate on purpose -- a blocked
+        # account is worth leaving for a WORKING one -- so `-h` is all that is
+        # left choosing, and once no account is working that picks whoever
+        # holds the largest sliver. Reported upstream: a 2-point account at
+        # 98% weekly won over an active bound only by a five-hour window forty
+        # minutes from resetting, and `all-exhausted` two minutes later named
+        # that same forty-minute reset.
+        #
+        # `SPENT_HEADROOM_PCT` is the discriminator, and it is the one
+        # `_recovery_is_useful` already applies: below it a headroom edge is
+        # under two poll intervals, so the escape's own premise is false and
+        # the only question left is who returns first. Above it the premise
+        # holds and headroom keeps deciding -- a 9-point peer really is
+        # somewhere to work while the active waits out its window.
+        #
+        # NOT failover: there the active is dead or unreadable, so its
+        # recovery time is not a quota fact anyone can wait for.
+        #
+        # ONE NAME FOR BOTH THE GATE AND THE KEY. They were two copies of the
+        # same trigger tuple, and this file has already had to close two
+        # defects where a filter ran on one axis while the sort ran on
+        # another.
+        by_recovery_axis = all_above and (
+            trigger in ("proactive", "consume-first")
+            or (
+                trigger == "at-limit"
+                and (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
+                and best_candidate_headroom <= SPENT_HEADROOM_PCT
+            )
+        )
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
@@ -2147,7 +2178,7 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if by_recovery_axis or trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
@@ -2217,7 +2248,7 @@ class AutoSwitchEngine:
                     # qualifies; near-line pairs can't flap back).
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
-            if all_above and trigger in ("proactive", "consume-first"):
+            if by_recovery_axis:
                 # Ranked on the axis its own gate decided, and TIERED so the two
                 # stay comparable: a candidate returning inside the horizon
                 # beats one that does not, whatever its headroom. Untiered, the
