@@ -589,9 +589,12 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Four of the file's eight clamp
-    cases run the real clock, so being one of them is not what makes this one
-    worth keeping. The others assert a syscall count or a per-sleep remainder,
+    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Some of this file's clamp cases
+    run the real clock, so being one of them is not what makes this one worth
+    keeping. NO COUNT HERE, deliberately: the ratio has been restated three
+    times in three commits and went stale inside the very commit that
+    corrected it, because the next clamp case moves it again. The claim the
+    sentence carries survives without a number. The others assert a syscall count or a per-sleep remainder,
     and a clamp WEAKENED rather than deleted moves neither. On the weakening
     below this case is redundant with the jitter arm's; on the quantity it
     measures it is alone.
