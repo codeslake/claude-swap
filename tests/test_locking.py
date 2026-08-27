@@ -301,20 +301,27 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
                     f"slept {seconds}s with {left}s left — the clamp used "
                     f"`timeout`, not what remains of it (all sleeps: {slept})"
                 )
+            # AN ATTEMPT COUNT, which is what the remainder assert cannot
+            # see, and FIRST, because it is the one that names the defect.
+            # Detection below is a RESONANCE -- it fires only when the budget
+            # happens to leave a remainder smaller than the sleep -- so for
+            # every shrink the resonance DOES catch, the reader was told the
+            # instrument could not reach a small enough remainder and invited
+            # to retune the budget rather than revert the shrink.
+            #
+            # THE MEASURED COUNT EXACTLY. A bound with a spare sleep in it
+            # leaves exactly one shrink alive -- 0.1 -> 0.08, 25% more flock
+            # attempts on every contended acquire, whole suite green. The
+            # bound cannot flake upward: extra `time.monotonic()` reads from
+            # any thread ADVANCE the scripted clock, which exhausts the
+            # budget sooner and yields FEWER sleeps.
+            assert len(slept) <= 5, (
+                f"{len(slept)} sleeps in a {budget}s budget — the retry "
+                "backed off less than it claims to"
+            )
             assert min(l for l, _ in slept) < 0.005, (
                 f"the run must reach a remainder small enough for any flat "
                 f"sleep to overshoot it: {slept}"
-            )
-            # AN ATTEMPT COUNT, which is what the remainder assert cannot see.
-            # Detection above is a RESONANCE -- it fires only when the budget
-            # happens to leave a remainder smaller than the sleep -- so a
-            # back-off shrunk 3.3x or 8x lands between the resonances and the
-            # whole suite stays green, at 333 and 800 flock attempts over a
-            # 10s wait. Its three siblings in `test_claude_locks.py` each
-            # carry one for exactly this; this arm was the one without.
-            assert len(slept) <= 6, (
-                f"{len(slept)} sleeps in a {budget}s budget — the retry "
-                "backed off less than it claims to"
             )
         finally:
             holder.release()

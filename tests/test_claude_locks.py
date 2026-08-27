@@ -778,12 +778,12 @@ class TestEveryArmOfTheLoopBacksOff:
 
         real_rmdir = os.rmdir
 
-        # SCOPED TO THIS PATH, like every sibling patch in this file. The
-        # module does `import os`, so this patches the GLOBAL `os.rmdir`:
-        # unscoped it feeds an injected EACCES to any other caller in the
-        # process and counts THEIR removals into a bound with four of slack.
-        # `_count_touches` states the same rule for `os.utime` a few hundred
-        # lines up; this was the one patch obeying neither path nor thread.
+        # SCOPED TO THIS PATH. The module does `import os`, so this patches
+        # the GLOBAL `os.rmdir`: unscoped it feeds an injected EACCES to any
+        # other caller in the process and counts THEIR removals into a bound
+        # with four of slack. `_count_touches` states the same rule for
+        # `os.utime` a few hundred lines up. Six other patches in this file
+        # obey neither path nor thread, so this is the rule, not the habit.
         def refusing(path, *a, **k):
             if os.fspath(path) != os.fspath(target):
                 return real_rmdir(path, *a, **k)
