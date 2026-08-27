@@ -170,10 +170,14 @@ def proper_lockfile(
             # AND WAIT ON THE WAY. The fall-through reaches the deadline, then
             # stats a name that is gone and `continue`s, so it never reaches
             # the jittered sleep at the bottom -- ending at the budget while
-            # pinning a core for all of it. The ordinary "holder released
-            # between mkdir and stat" retry stays instant; only a name being
-            # swept out from under us backs off -- and never past what is left
-            # of the caller's budget, which is the whole loop's contract.
+            # pinning a core for all of it. Never past what is left of the
+            # caller's budget, which is the whole loop's contract.
+            #
+            # WHICH OTHER ARMS BACK OFF IS NOT CLAIMED HERE. A sibling branch
+            # puts a back-off on the stat-FNF arm below (a dangling symlink
+            # answers EEXIST to mkdir and ENOENT to stat for the whole
+            # budget), so any sentence contrasting this arm with that one goes
+            # false on the merged tree.
             time.sleep(max(0.0, min(0.05, timeout - (time.monotonic() - start))))
         except OSError:
             # `mkdir` made the directory and the open could not read it back,
