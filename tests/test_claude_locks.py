@@ -1171,6 +1171,60 @@ class TestATransientErrnoIsNotFatalToTheHold:
             f"(fake floor {fs_quantum}ns over a host that keeps {host}ns)"
         )
 
+    def test_a_probe_that_raises_answers_1_too(self):
+        """The third `return 1` had no value coverage.
+
+        `_quantum_for_heartbeat` catches `BaseException` so the heartbeat
+        thread survives, and nothing asserted WHAT it returns. Setting that
+        arm to the coarsest candidate reproduces the successor-lock
+        destruction this branch removed from the fallthrough, with the whole
+        suite green.
+        """
+        boom = []
+
+        def raising(_d):
+            boom.append(1)
+            raise RuntimeError("not an OSError")
+
+        with patch.object(claude_locks, "_mtime_quantum_ns", raising):
+            got = claude_locks._quantum_for_heartbeat(tmp := Path("."))
+        assert boom, (
+            "premise: the probe was never called, so this says nothing about "
+            "what the guard returns"
+        )
+        assert got == 1, (
+            f"a probe that raised answered {got}ns; the release then acts on "
+            "a stamp it never proved"
+        )
+
+    def test_the_coarse_case_really_exhausts_the_candidates(self):
+        """Its sibling asserts `1`, which is also the unfaked answer here.
+
+        So the assertion alone cannot tell "the fallthrough ran" from
+        "candidate #1 matched immediately". The loop tries six candidates
+        before falling through and exactly one when it matches, so the call
+        count is what separates them.
+        """
+        calls = []
+        real_utime = os.utime
+        coarser = 4_000_000_000
+
+        def counting(path, *a, **k):
+            calls.append(1)
+            ns = k.get("ns")
+            if isinstance(ns, tuple) and len(ns) == 2:
+                k["ns"] = tuple((int(v) // coarser) * coarser for v in ns)
+            return real_utime(path, *a, **k)
+
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(claude_locks.os, "utime", counting):
+                got = claude_locks._mtime_quantum_ns(Path(d))
+        assert got == 1, got
+        assert len(calls) == 6, (
+            f"the probe wrote {len(calls)} time(s), so it did not reject "
+            "every candidate -- this case would pass without its own fake"
+        )
+
     def test_a_directory_we_cannot_write_answers_1_rather_than_raising(
         self, tmp_path
     ):

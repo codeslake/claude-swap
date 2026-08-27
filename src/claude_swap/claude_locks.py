@@ -86,8 +86,17 @@ def _quantum_for_heartbeat(directory: Path) -> int:
 
 def _mtime_quantum_ns(directory: Path) -> int:
     """The finest granularity from a fixed candidate set that this filesystem
-    round-trips, in nanoseconds -- never finer than the truth, possibly
-    coarser.
+    round-trips, in nanoseconds -- or `1`, meaning DO NOT QUANTISE, when
+    nothing round-trips or the probe cannot run.
+
+    That `1` is deliberately finer than the truth. On a filesystem coarser
+    than every candidate it makes every read-back differ, so `unproven`
+    latches and the release leaves the lock for the stale sweep. The
+    alternative -- answering with the coarsest candidate -- lets a stamp
+    round-trip on the ticks that land on a multiple, and the strict
+    comparison then runs against an mtime a successor's `mkdir` truncates to
+    that same value. Measured, that removed a live successor's lock in about
+    half of the trials.
 
     Unpinned, the heartbeat proves a hold by writing a stamp and reading it
     back unchanged. A filesystem coarser than the stamp truncates it, so the
@@ -98,7 +107,10 @@ def _mtime_quantum_ns(directory: Path) -> int:
 
     ponytail: a takeover landing inside a single quantum then reads as our
     own write. On an exact filesystem the quantum is 1 and nothing changes
-    at all; on a coarse one the alternative is never releasing.
+    at all; on a coarse one this IS the never-releasing branch, and that is
+    the trade: short holds lose their release (the stale sweep recovers
+    them, with a warning already logged) so that no hold can remove a
+    stranger's lock.
     """
     # UNIQUE PER CALL, NOT PER PROCESS. A switch holds three locks at once and
     # at least two of them share a parent, so with the probe moved onto the
@@ -136,10 +148,12 @@ def _mtime_quantum_ns(directory: Path) -> int:
         # Answering 1 makes every read-back differ, so `unproven` latches and
         # the lock is left for the stale sweep.
         #
-        # Nor is it a trade. The stamp advances one touch interval at a time,
-        # so three consecutive ticks can never all be multiples of the
-        # coarsest candidate -- past two ticks the release is refused either
-        # way, and only the collision is left.
+        # AT THE NOMINAL INTERVAL, three consecutive ticks cannot all be
+        # multiples of the coarsest candidate, so past two ticks the release
+        # is refused either way. Off-nominal they can -- and then the coarse
+        # answer never latches at all, which is worse. Either way what the
+        # coarse answer buys is bounded to the first two ticks, against a
+        # collision that is not.
         return 1
     except OSError:
         return 1  # cannot measure; the strict comparison is the old behaviour
