@@ -7132,22 +7132,21 @@ class TestLiveLock:
         and it is observable without touching the runtime.
         """
         import inspect
-        import re as _re
 
         src = inspect.getsource(harness.engine._perform)
         arm = src.index("self._switch_in_flight = True")
-        # EVERY GATE, NOT ONE FOUND THROUGH A BYTE WINDOW. `index(gate,
-        # arm - 400)` skipped the function's entry gate by distance alone: a
-        # new `_stop` checkpoint within 400 bytes before the arm makes it
-        # match THAT one and fail correct code, and once the anchor moves it
-        # raises `ValueError: substring not found` instead of the sentence
-        # below.
-        gates = [m.start() for m in
-                 _re.finditer(r"if self\._stop\.is_set\(\):", src)]
-        assert gates, "premise: `_perform` has no `_stop` gate at all"
-        assert [g for g in gates if g > arm], (
-            "`_switch_in_flight` is armed after every `_stop` gate; a signal "
-            "between them takes stop()'s immediate-release path"
+        # THE GATE THAT GUARDS THE SWITCH, not any gate after the arm. Asking
+        # "is there a gate below the arm" is `arm < max(gates)`, which a new
+        # checkpoint anywhere below `switch_to` satisfies while the SIGTERM
+        # window this exists for is fully reopened. The subject is the last
+        # gate BEFORE the switch; the byte window this replaced picked its
+        # gate by distance and raised `ValueError` once the anchor moved.
+        gate = src.rfind("if self._stop.is_set():", 0, src.index("switch_to("))
+        assert gate != -1, "premise: no `_stop` gate precedes the switch call"
+        assert arm < gate, (
+            "`_switch_in_flight` is armed after the `_stop` gate that guards "
+            "the switch; a signal between them takes stop()'s "
+            "immediate-release path"
         )
 
     def test_a_stopped_engine_does_not_fetch_usage(self, harness):
@@ -7286,6 +7285,52 @@ class TestLiveLock:
                 assert demoted._demotion_announced is False, (
                     "a changed cause was not re-armed, so whatever stopped the "
                     "FIRST attempt is reported for the life of the run"
+                )
+            finally:
+                FileLock.acquire = real_acquire
+        finally:
+            demoted.stop()
+
+    def test_contention_clears_an_errno_it_no_longer_explains(self, harness):
+        """A cause that goes ERRNO -> CONTENTION must stop being reported.
+
+        The errno arm re-arms when the cause changes; the contention arm was a
+        bare `return`, so a run that started on an unwritable `backup_dir` and
+        later lost only to another engine kept naming the filesystem fault for
+        the life of the run -- the same harm the errno arm exists to prevent,
+        in the direction it did not cover.
+        """
+        import errno as _errno
+
+        from claude_swap.locking import FileLock
+
+        demoted = harness._make_engine(dry_run=False)
+        try:
+            assert demoted.demoted_from_live, "premise: the harness holds LIVE"
+            real_acquire = FileLock.acquire
+            mode = {"raise": True}
+
+            def flaky(self, *a, **kw):
+                if mode["raise"]:
+                    raise OSError(_errno.EROFS, "read-only file system")
+                return False        # plain contention: somebody holds it
+
+            FileLock.acquire = flaky
+            try:
+                demoted._retry_live_promotion()
+                assert demoted._live_lock_error is not None, (
+                    "premise: the errno was never recorded"
+                )
+                demoted._demotion_announced = True
+
+                mode["raise"] = False          # the mount is fixed; a peer wins
+                demoted._retry_live_promotion()
+                assert demoted._live_lock_error is None, (
+                    "contention left a filesystem errno recorded, so the "
+                    "operator keeps being told to fix a mount that is fine"
+                )
+                assert demoted._demotion_announced is False, (
+                    "the cause changed and nothing re-armed the announcement"
                 )
             finally:
                 FileLock.acquire = real_acquire

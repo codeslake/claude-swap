@@ -1016,6 +1016,14 @@ class AutoSwitchEngine:
         lock = FileLock(self.switcher.backup_dir / LIVE_LOCK_FILENAME, timeout=0)
         try:
             if not lock.acquire():
+                # CONTENTION CLEARS A RECORDED ERRNO. The errno arm below
+                # re-arms when the cause CHANGES; without the same here, a
+                # run that started on an unwritable backup_dir and later lost
+                # only to another engine kept reporting the filesystem fault
+                # that no longer exists, for the life of the run.
+                if self._live_lock_error is not None:
+                    self._live_lock_error = None
+                    self._demotion_announced = False
                 return
         except OSError as exc:
             # `acquire()` creates the lock's directory and file, so an
@@ -1026,8 +1034,9 @@ class AutoSwitchEngine:
             # Recorded, so a cause that CHANGES gets said once more rather
             # than being reported forever as whatever stopped the first
             # attempt.
-            if type(self._live_lock_error) is not type(exc) or \
-                    str(self._live_lock_error) != str(exc):
+            # `repr` carries the type AND the args, so it is the whole of the
+            # two-part compare this replaced.
+            if repr(self._live_lock_error) != repr(exc):
                 self._live_lock_error = exc
                 self._demotion_announced = False
             return
@@ -1049,6 +1058,12 @@ class AutoSwitchEngine:
                 return
             self.dry_run = False
             self.demoted_from_live = False
+            # PROMOTED, so nothing is owed an explanation. Left set, a
+            # re-armed errno announces "could not be taken ... it will keep
+            # retrying" on the very tick whose retry then succeeds --
+            # `tick()` announces before it retries.
+            self._live_lock_error = None
+            self._demotion_announced = True
         self._emit(
             ConfigWarningEvent(
                 message="the LIVE holder released the lock — this engine is "
@@ -2878,8 +2893,9 @@ class AutoSwitchEngine:
             # and used to be swallowed -- the engine kept ticking, kept
             # switching accounts and kept holding `.auto-live.lock`, which also
             # demotes any TUI opened afterwards, with nothing reaching a
-            # terminal. Releasing the lock is `stop`'s job and the caller's
-            # `finally` already does it.
+            # terminal. Releasing the lock is `stop`'s job; no consumer
+            # wraps `run_loop` in a `finally`, so what actually drops the
+            # flock here is the process exiting.
             if self._consumer_gone:
                 return 0
             try:

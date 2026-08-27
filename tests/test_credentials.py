@@ -230,19 +230,41 @@ class TestTheManagedReadVerdictIsPerThread:
         import threading as _threading
 
         store = CredentialStore(_Host(tmp_path / "backups"))
-        store._managed_read_tls.failed = True
 
-        def sibling():
-            # what the top of every active read does
-            store._managed_read_tls.failed = False
+        # THROUGH `_read_active_credentials`, not by poking the attribute.
+        # Reading the flag directly only pins its TYPE: leaving
+        # `threading.local()` in place and pointing the three real uses at a
+        # plain attribute restores the race and a type check stays green.
+        inside = _threading.Event()
+        release = _threading.Event()
+        real_managed = store._read_managed_key
 
-        t = _threading.Thread(target=sibling)
-        t.start()
-        t.join()
+        def blocking_managed():
+            store._managed_read_tls.failed = True   # what a failed read records
+            inside.set()
+            release.wait(5)
+            return ""
 
-        assert store._managed_read_tls.failed is True, (
-            "a sibling read's reset reached this thread's verdict, so a "
-            "keychain failure observed here is erased by an unrelated reader"
+        store._read_managed_key = blocking_managed
+        out = {}
+
+        def reader_a():
+            out["a"] = store._read_active_credentials()
+
+        a = _threading.Thread(target=reader_a)
+        a.start()
+        assert inside.wait(5), "premise: thread A never reached the managed read"
+
+        store._read_managed_key = real_managed
+        store._read_active_credentials()            # a complete sibling read
+        release.set()
+        a.join(5)
+
+        assert "a" in out, "premise: thread A never finished"
+        assert out["a"].keychain_unavailable is True, (
+            "a sibling read entering `_read_active_credentials` cleared this "
+            "thread's verdict mid-flight, so a live keychain failure came "
+            "back as a genuinely empty slot"
         )
 
 
