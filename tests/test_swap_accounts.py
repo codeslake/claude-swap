@@ -1223,6 +1223,37 @@ class TestSwapUnreadableSourceIsNotAbsent:
             "contamination this swap created"
         )
 
+    @pytest.mark.parametrize("backend", ["file", "keychain"])
+    def test_the_write_reports_what_it_retained_on_both_backends(
+        self, temp_home: Path, monkeypatch, backend
+    ):
+        """The verdict the rollback purge keys on, at its source.
+
+        `_write_account_credentials`'s own docstring calls the type
+        load-bearing and says `uv run pytest` cannot see it. Measured: with
+        the Keychain arm's `return retained` replaced by `return False` the
+        whole suite stayed green, while raising there instead failed 26 cases
+        and errored 121 -- so the branch is entered constantly and nothing
+        read what it answered. With the verdict lost the purge never runs and
+        the contaminated `.prev` survives.
+        """
+        store = ClaudeAccountSwitcher()._store
+        monkeypatch.setattr(store, "_retain_previous_backup", lambda *a, **k: True)
+        monkeypatch.setattr(store, "_use_keychain", lambda: backend == "keychain")
+        monkeypatch.setattr(store, "_kc_write_backup", lambda *a, **k: None)
+        monkeypatch.setattr(
+            store, "_reconcile_enc_after_keychain_write", lambda *a, **k: None
+        )
+        monkeypatch.setattr(store, "_write_backup_enc", lambda *a, **k: None)
+        monkeypatch.setattr(
+            store, "_delete_backup_keychain_quiet", lambda *a, **k: None
+        )
+
+        assert store._write_account_credentials("1", "u@example.com", "c") is True, (
+            f"the {backend} arm dropped the retained verdict; the rollback "
+            "purge keys on it and would leave the contaminated .prev in place"
+        )
+
     def test_a_rollback_drops_prev_it_really_did_contaminate(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
