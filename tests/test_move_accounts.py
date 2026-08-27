@@ -500,16 +500,10 @@ class TestMoveUnreadableSourceIsNotAbsent:
 
     @pytest.fixture(autouse=True)
     def _file_mode(self, monkeypatch):
-        """Force the FILE store, because these cases read the FILE reader.
-
-        They need the material on disk: on macOS a usable Keychain takes the
-        write instead, so there is no file to `chmod` (FileNotFoundError) and
-        a retained generation lands where `_prev_backup_path` cannot see it.
-
-        CLASS-WIDE and autouse, so membership alone grants it in both
-        directions -- a case moved out loses the routing, a case appended
-        here silently gains it. The routing is therefore not evidence that a
-        case needs it, and macOS is where either direction shows.
+        """Force the FILE store: these cases read the file backend, and on
+        macOS a usable Keychain takes the write instead -- no file to `chmod`,
+        and the retained generation lands where `_prev_backup_path` cannot
+        see it. Class-wide and autouse, so membership alone grants it.
         """
         monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
 
