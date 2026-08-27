@@ -862,8 +862,12 @@ class ClaudeAccountSwitcher:
                     # content. `untouched` recognises only the source-open row;
                     # the destination-open and SameFile rows leave the file
                     # untouched too and it says nothing about them, so this
-                    # keys on the CONTENT instead of on the error shape.
-                    if (not untouched and after is not None
+                    # keys on the CONTENT instead of on the error shape --
+                    # and `not untouched` sat here beside it saying otherwise.
+                    # It is implied: the source-open row never opened the
+                    # destination, so `after == before` and `after != before`
+                    # already excludes it. `untouched` stays live below.
+                    if (after is not None
                             and after == landed and after != before):
                         return
                     if not (comparable or untouched):
