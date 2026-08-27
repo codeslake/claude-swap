@@ -104,6 +104,19 @@ def test_every_test_file_runs_in_exactly_one_windows_shard():
 
 
 
+def _assert_no_step_can_swallow_failure(job: str, which: str) -> None:
+    """A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned.
+
+    One line makes every shard of a job green regardless of failures, which
+    is the loudest form of "this file silently stopped running in CI". It
+    was guarded on one job and not on the other, so it lives here.
+    """
+    assert not re.search(r"^\s*continue-on-error:\s*true", job, re.M), (
+        f"the {which} job's step is continue-on-error, so a failure there "
+        "is green"
+    )
+
+
 def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
     """The shards are data ONLY if the job actually consumes them.
 
@@ -117,6 +130,7 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
     text = workflow.read_text(encoding="utf-8")
     block = re.search(r"\n  test-windows:\n(.*?)(?=\n  \S|\Z)", text, re.S)
     assert block, "the test-windows job is gone or was renamed"
+    _assert_no_step_can_swallow_failure(block.group(1), "Windows")
     runs = _pytest_run_lines(block.group(1))
     assert runs, "the Windows job no longer invokes pytest — the shards run nowhere"
     # ONE INVOCATION, NOT THEIR CONCATENATION. Joined, a second pytest step
@@ -208,6 +222,46 @@ def test_a_hash_the_shell_does_not_treat_as_a_comment_is_not_cut(command):
     assert "# shard it" not in runs[0], (
         f"a real trailing comment survived the strip: {runs[0]!r}"
     )
+
+
+@pytest.mark.parametrize("scalar", ["plain", "|", ">"])
+@pytest.mark.parametrize("sep", [";", "&&", "||", "|", "&"])
+def test_a_second_command_on_one_line_is_not_read_as_one(scalar, sep):
+    """The collapse this file exists to forbid, spelled on ONE line.
+
+    Chained, the shard command loses `-o testpaths=` while a harmless second
+    `pytest` carries it -- and every marker below is then satisfied across
+    the two. The splitter shipped knowing `;`, `&&` and `||`; `|` and `&`
+    are the remaining POSIX list operators and run a second command exactly
+    the same way, so both read CLEAN on the real workflow.
+
+    Every emit path, because the split is applied at three call sites.
+    """
+    cmd = ("uv run pytest -n 4 ${{ matrix.paths }} " + sep
+           + " uv run pytest -o testpaths= --version")
+    if scalar == "plain":
+        job = "    - name: t\n      run: " + cmd
+    else:
+        job = f"    - name: t\n      run: {scalar}\n        " + cmd
+    runs = _pytest_run_lines(job)
+    assert len(runs) == 2, (
+        f"`{sep}` runs a second command and the reader saw one: {runs!r}"
+    )
+
+
+@pytest.mark.parametrize("expr,commands", [
+    # GitHub's own expression syntax uses `&&` and `||`; cutting inside one
+    # halves a CORRECT command -- the false refusal.
+    ("uv run pytest ${{ a && b }} -o testpaths=", 1),
+    ("uv run pytest ${{ a || b }} -o testpaths=", 1),
+    # A redirect is not a separator.
+    ("uv run pytest -o testpaths= 2>&1", 1),
+    # An UNTERMINATED `${{` must not swallow the rest of the line, or every
+    # separator after it is invisible.
+    ("uv run pytest ${{ a } ; uv run pytest --version", 2),
+])
+def test_the_splitter_cuts_shell_operators_and_nothing_else(expr, commands):
+    assert len(_shell_commands(expr)) == commands, _shell_commands(expr)
 
 
 @pytest.mark.parametrize("scalar,body,expected", [
@@ -429,10 +483,12 @@ def _uncomment(text: str) -> str:
 def _shell_commands(line: str) -> list[str]:
     """One shell line split into the commands it actually runs.
 
-    A `;`, `&&` or `||` chain is several commands on one line, and reading
-    them as one hides a second invocation exactly as joining a block scalar's
-    lines did -- the shard command loses `-o testpaths=` while a harmless
-    second `pytest` on the same line carries it.
+    A `;`, `&&`, `||`, `|` or `&` chain is several commands on one line, and
+    reading them as one hides a second invocation exactly as joining a block
+    scalar's lines did -- the shard command loses `-o testpaths=` while a
+    harmless second `pytest` on the same line carries it. The two-character
+    operators are consumed first, so a bare `|`/`&` is what falls through;
+    a redirect (`&>`, `>&`, `2>&1`) is not a separator.
 
     QUOTES AND `${{ }}` ARE SKIPPED. GitHub's own expression syntax uses `&&`
     and `||`, so splitting inside `${{ ... }}` would cut a CORRECT command in
@@ -452,15 +508,28 @@ def _shell_commands(line: str) -> list[str]:
             quote = line[i]
         elif line.startswith("${{", i):
             end = line.find("}}", i)
-            end = n if end < 0 else end + 2
-            buf += line[i:end]
-            i = end
+            if end < 0:
+                # UNTERMINATED IS NOT "TO END OF LINE". Copying the rest
+                # verbatim hides every separator after it, so a chain reads
+                # as one command. Treat the marker as ordinary text and keep
+                # scanning; Actions rejects the file anyway, but only AFTER
+                # this suite has said CLEAN.
+                buf += "${{"
+                i += 3
+                continue
+            buf += line[i:end + 2]
+            i = end + 2
             continue
         elif two in ("&&", "||"):
             out.append(buf)
             buf, i = "", i + 2
             continue
         elif line[i] == ";":
+            out.append(buf)
+            buf, i = "", i + 1
+            continue
+        elif line[i] in "|&" and not (
+                two in ("&>", ">&") or (buf and buf[-1] == ">")):
             out.append(buf)
             buf, i = "", i + 1
             continue
@@ -589,9 +658,7 @@ def _assert_macos_job_is_intact(workflow: Path) -> None:
     # because it is the broadest: raised ahead of the path check it masked
     # `test_a_job_naming_a_deleted_file_is_refused`, which then failed with
     # "regex did not match" about a workflow whose real defect was elsewhere.
-    assert not re.search(r"^\s*continue-on-error:\s*true", job, re.M), (
-        "the macOS job's step is continue-on-error, so a failure there is green"
-    )
+    _assert_no_step_can_swallow_failure(job, "macOS")
 
 
 def test_the_macos_job_runs_pytest_on_paths_that_exist():
