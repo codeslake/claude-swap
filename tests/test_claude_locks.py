@@ -614,3 +614,34 @@ class TestEveryArmOfTheLoopBacksOff:
             f"{tries['n']} mkdir attempts in a 0.3s budget — the arm that "
             "retries a vanished name never sleeps, so it pins a core"
         )
+
+    def test_a_dangling_symlink_still_ends_at_the_BUDGET(self, tmp_path):
+        """The attempt count cannot see the clamp, and this arm is the one
+        clamp on the branch with no other witness.
+
+        A flat `time.sleep(0.05)` makes exactly the same TWO mkdir attempts
+        the case above counts, while a 0.01s budget takes 0.05s. Measured on
+        the unclamped form: 0.0502s against 0.0101s clamped, 5x over. So the
+        count proves the sleep exists and nothing about the bound the branch
+        is named for.
+        """
+        target = tmp_path / "target.lock"
+        target.symlink_to(tmp_path / "nothing-here")
+        assert not target.exists(), "premise: the symlink must dangle"
+
+        budget = 0.01
+        start = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(target, timeout=budget):
+                pass
+        elapsed = time.monotonic() - start
+
+        assert elapsed >= budget, (
+            f"the acquire returned in {elapsed:.4f}s, under its own {budget}s "
+            "budget, so it cannot have waited the budget out at all"
+        )
+        assert elapsed < 0.03, (
+            f"{elapsed:.4f}s against a {budget}s budget — the vanished-name "
+            "arm sleeps a flat constant instead of what is LEFT, so a caller "
+            "asking for a short wait gets the constant"
+        )
