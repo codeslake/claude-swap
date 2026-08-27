@@ -415,6 +415,12 @@ class TestBootstrap:
             # "continuing with the stored credentials", so a bare kind reads
             # as reassurance.
             ("invalid_grant", "refresh lineage is dead"),
+            # NO PRODUCER ON THIS BRANCH -- `_classify_usage_error` answers
+            # `http-<code>`/`timeout`/`network`/`bad-response`, and the kind
+            # is added for the merged tree. Witnessed here anyway: without a
+            # reader, a sibling branch renaming it is a silent un-wiring, and
+            # this file has already had one.
+            ("tls-cert", "certificate chain was not trusted"),
         ],
     )
     def test_the_refresh_failure_warning_outlives_the_terminal(
@@ -1544,9 +1550,11 @@ class TestRun:
         its motivating discovery, and the `Launching` line, whose text
         appears nowhere else in this file.
 
-        Rather than nine injections, this asserts the invariant directly: on
-        a launch, everything PRINTED is also RECORDED. A notice that reaches
-        the terminal and not the log is the defect, whichever line it is on.
+        Rather than nine injections, this asserts the invariant over the
+        routed writers: on a launch everything printed THROUGH `_note`/`_warn`
+        is also recorded, whichever line it is on. A bare `print` on the same
+        path bypasses this collection entirely and is
+        `test_no_launch_notice_is_print_only`'s subject, not this one's.
         """
         import re as _re
 
@@ -3019,11 +3027,15 @@ _SANCTIONED_PRINTERS = {"_note", "_warn"}
 def _bare_print_printers() -> set[str]:
     """`printer`'s own functions that reach the builtin `print`.
 
-    DERIVED, not listed. The two other enumerations in this module were moved
-    off literals for the same reason: a list is right until someone adds a
-    function, and then it is silently short. Measured today this returns
-    `{"error", "warning"}`; a new `printer.notice()` that bare-prints joins it
-    with no edit here, where the literal would have missed it in silence.
+    DERIVED, not listed: a list is right until someone adds a function, and
+    then it is silently short. Measured today this returns `{"error",
+    "warning"}` -- the same answer a top-level scan gives, so nothing on this
+    tree changes. What the walk and the fixpoint add is the two shapes that
+    scan misses and that a future printer is most likely to take: one defined
+    inside an `if`/`try`/class, and one that DELEGATES to a printer instead of
+    calling `print` itself. Measured, appending either to `printer.py`: the
+    top-level scan still answers `{"error", "warning"}`, this answers with the
+    new name.
     """
     import ast
 
@@ -3031,15 +3043,24 @@ def _bare_print_printers() -> set[str]:
         (Path(__file__).resolve().parent.parent
          / "src" / "claude_swap" / "printer.py").read_text(encoding="utf-8")
     )
-    found = set()
-    for node in tree.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for sub in ast.walk(node):
-            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
-                    and sub.func.id == "print"):
-                found.add(node.name)
-                break
+    funcs = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    # `ast.walk`, not `tree.body`: a printer defined inside an `if`, a `try`
+    # or a class is still a printer. And a FIXPOINT, because a printer that
+    # DELEGATES to one reaches `print` just as surely -- a new `notice()`
+    # that calls `warning()` dies in the same screen blank, and the top-level
+    # scan alone reports it as safe.
+    found: set[str] = set()
+    while True:
+        grown = {
+            f.name for f in funcs
+            if any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                   and (sub.func.id == "print" or sub.func.id in found)
+                   for sub in ast.walk(f))
+        }
+        if grown <= found:
+            break
+        found |= grown
     assert found, "no bare-print printer found — the parse or the layout moved"
     return found
 

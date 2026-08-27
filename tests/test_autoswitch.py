@@ -6907,10 +6907,11 @@ class TestOneRemedyPerKindAcrossEverySurface:
     the sole catcher of `autoswitch` holding its own partly-stale literal
     again, which is the regression the shared dict exists to prevent.
 
-    Today `_SYSTEMIC_MESSAGES` is derived from `ERROR_NOTES`, so that method
-    cannot detect text drift. It is a guard against the BINDING going back to
-    a literal, not against the text, and calling it a premise is how it gets
-    deleted.
+    What that method actually catches is TEXT, measured both ways: re-binding
+    `_SYSTEMIC_MESSAGES` as a byte-identical literal leaves the file green, and
+    the same literal with one string shortened fails that method alone. So it
+    is dormant while the derivation holds and is the only witness the moment
+    the text drifts -- not a guard on the binding, and not a premise either.
     """
 
     def test_every_module_that_exports_the_dict_exports_THE_dict(self):
@@ -6999,10 +7000,7 @@ class TestOneRemedyPerKindAcrossEverySurface:
     def test_the_two_enumerations_of_a_systemic_kind_agree(self):
         """The text can no longer drift; the SET still can, silently.
 
-        `_SYSTEMIC_MESSAGES` is derived from `ERROR_NOTES`, so comparing their
-        strings compares a value with itself — the case above cannot fail on
-        wording any more and is a PREMISE, not a guard. What remains free is
-        WHICH kinds each side knows: `oauth._DETERMINISTIC_REFRESH_ERRORS`
+        What remains free is WHICH kinds each side knows: `oauth._DETERMINISTIC_REFRESH_ERRORS`
         decides that a refresh failure is systemic, `_SYSTEMIC_KINDS` decides
         what the tick then says about it, and they are two independent
         literals. Measured: adding a fifth kind to one leaves the suite green
