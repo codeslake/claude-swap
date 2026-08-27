@@ -1823,7 +1823,10 @@ class TestEventText:
         """`_EVENT_ROLES` keys on the KIND, and one kind carries two states.
 
         `sev_crit` is the fifth surface saying "exhausted" about a hold whose
-        own gate proves a candidate holds quota.
+        own gate proves every candidate was READ and one still holds quota.
+        The readability half is what carries that gate: dropping the
+        `headroom.get(n) is not None` conjunct fails a case by name, while
+        dropping the `best_candidate_headroom > 0` one detects nothing.
         """
         from claude_swap.autoswitch import AllExhaustedEvent
         from claude_swap.tui.autoview import event_text

@@ -463,9 +463,9 @@ def exhausted_notification(event) -> tuple[str, str]:
 
     One kind carries two states. A deliberate wait is entered BECAUSE every
     candidate was READ and one still holds quota, so "All accounts exhausted"
-    is the one thing
-    it is not -- and the notification is a surface `AllExhaustedEvent`'s own
-    enumeration ("the panel, the JSON and the log") does not count.
+    is the one thing it is not -- and the notification is a surface
+    `AllExhaustedEvent`'s own enumeration ("the panel, the JSON and the log")
+    does not count.
     """
     if getattr(event, "deliberate_wait", False):
         return "Waiting for a reset", event.human()
