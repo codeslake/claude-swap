@@ -793,7 +793,13 @@ class ClaudeAccountSwitcher:
                             with open(path, "wb"):
                                 pass
                         except OSError:
-                            pass
+                            # THE ORDER WAS GIVEN BECAUSE THE FILE HOLDS A
+                            # PARTIAL. If the emptying is refused -- the same
+                            # fault that killed the copy also blocks this
+                            # write -- the partial is still there, so the mode
+                            # must stay narrow. `comparable` below only says
+                            # both digests were READ, never that it landed.
+                            return
                     if prior_mode is None or prior_mode == 0o600:
                         return
                     # AND NEVER WIDER THAN WHAT THIS CAN VOUCH FOR. Restoring

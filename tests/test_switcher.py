@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import base64
 import errno
 import json
@@ -12542,6 +12543,79 @@ def test_an_unreadable_destination_is_not_WIDENED_over_a_late_failure(
         "the recovery widened a destination it could NOT read, after a copy "
         "that had already written to it — so a truncated credential is now "
         "readable by every other uid on the box"
+    )
+
+
+def test_an_emptying_that_FAILED_must_not_be_followed_by_a_widen(
+    temp_home: Path, monkeypatch
+):
+    """`touched` orders the emptying; a swallowed failure keeps the verdict.
+
+    `touched` being True IS the finding that the destination holds neither the
+    original nor the complete payload -- a partial, with half a token in it.
+    The recovery then empties the file. If that write is REFUSED, the file
+    still holds the partial, and restoring the mode publishes it to every
+    other uid.
+
+    Reachable because the emptying is a write to the destination whose write
+    just failed, so one fault produces both: a mount that went read-only
+    mid-write, EIO on a failing disk, an overlay refusing truncate.
+    `comparable` says only "I read both digests", never "the emptying landed".
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False, "emptying_refused": 0}
+    real_open = builtins.open
+
+    def refusing_open(file, mode="r", *a, **kw):
+        if "w" in mode and os.fspath(file) == os.fspath(target):
+            state["emptying_refused"] += 1
+            raise OSError(errno.EROFS, "read-only file system")
+        return real_open(file, mode, *a, **kw)
+
+    def midcopy(src, dst, **kw):
+        # shutil's real field shape on a mid-copy failure: the destination was
+        # opened and truncated, and BOTH names are set.
+        whole = Path(src).read_bytes()
+        # A GENUINE PARTIAL. A slice longer than the payload copies all of it,
+        # `after == landed`, and `touched` never fires -- the premise assert
+        # below is what catches that, and did.
+        assert len(whole) > 20, "payload too small to truncate meaningfully"
+        Path(dst).write_bytes(whole[:20])
+        state["copied"] = True
+        err = OSError(errno.ENOSPC, "No space left on device")
+        err.filename, err.filename2 = os.fspath(src), os.fspath(dst)
+        raise err
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", midcopy)
+    monkeypatch.setattr(builtins, "open", refusing_open)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    assert state["emptying_refused"] >= 1, (
+        "premise: the emptying was never attempted, so this says nothing "
+        "about what happens when it fails"
+    )
+    body = os.stat(target)
+    assert stat.S_IMODE(body.st_mode) == 0o600, (
+        "the emptying was REFUSED and the recovery widened anyway, so the "
+        f"partial payload ({body.st_size} bytes) is now readable by every "
+        "other uid on the box"
     )
 
 
