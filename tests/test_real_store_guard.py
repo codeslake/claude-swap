@@ -721,11 +721,7 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
         "disarmed for exactly the population running mutation batteries"
     )
     # WHAT THIS CASE OWNS is the HOME axis: the OS account home and the
-    # scratch HOME must BOTH be protected, which no other case asks. It is
-    # NOT a per-entry guard -- the ambient-override pass has its own witness
-    # in `test_frozen_specs_include_the_ambient_xdg_override_backup_root`, and
-    # the legacy backup root has one in
-    # `test_the_legacy_backup_root_is_protected_on_every_platform`.
+    # scratch HOME must BOTH be protected, which no other case asks.
     assert scratch_root in roots, (
         "the scratch HOME's own root must stay protected too"
     )
