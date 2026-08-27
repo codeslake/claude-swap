@@ -1024,19 +1024,27 @@ class TestATransientErrnoIsNotFatalToTheHold:
         """
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
         lock = tmp_path / "target.lock"
-        # NANOSECOND MTIME, ASSERTED. The caplog check below is exclusive only
-        # because the stat-error tick is the ONLY writer of that record on a
-        # filesystem whose mtime round-trips exactly. On a coarse mount (ext3,
-        # HFS+, FAT, some network TMPDIR) the read-back mismatch writes it on
-        # every tick instead, and the case goes green with its subject deleted.
-        # A premise nobody can see is one nobody re-checks after a move.
+        # MTIME GRANULARITY, ASSERTED. The caplog check below is exclusive
+        # only because the stat-error tick is the ONLY writer of that record.
+        # On a coarse mount (ext3, HFS+, FAT, some network TMPDIR) the
+        # read-back mismatch writes it on EVERY tick instead, and the case
+        # goes green with its subject deleted.
+        #
+        # The bound is sub-millisecond, not exact equality, and the stamp is
+        # shaped like a real one. NTFS keeps 100ns and truncates anything
+        # finer; `time.time_ns()` there derives from a FILETIME and is already
+        # a multiple of 100, so the code round-trips even though an arbitrary
+        # value does not. Demanding exact equality of an invented number
+        # failed Windows CI for a filesystem that is perfectly fine.
         _probe = tmp_path / ".mtime-granularity-probe"
         _probe.touch()
-        os.utime(_probe, ns=(1_000_000_123, 1_000_000_123))
-        assert os.stat(_probe).st_mtime_ns == 1_000_000_123, (
-            "this filesystem does not round-trip nanosecond mtimes, so the "
-            "record asserted below can be written by a different tick and "
-            "this case cannot say which refusal happened"
+        _want = (time.time_ns() // 100) * 100
+        os.utime(_probe, ns=(_want, _want))
+        _drift = abs(os.stat(_probe).st_mtime_ns - _want)
+        assert _drift < 1_000_000, (
+            f"this filesystem rounds mtime by {_drift}ns, so two ticks a "
+            "moment apart share a stamp and the record asserted below can be "
+            "written by a different tick than the one under test"
         )
         real_stat = os.stat
         state = {"fired": False}
