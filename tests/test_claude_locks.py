@@ -589,7 +589,7 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Three of the file's seven clamp
+    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Four of the file's eight clamp
     cases run the real clock, so being one of them is not what makes this one
     worth keeping. The others assert a syscall count or a per-sleep remainder,
     and a clamp WEAKENED rather than deleted moves neither. On the weakening
@@ -783,9 +783,12 @@ class TestEveryArmOfTheLoopBacksOff:
                 pass
 
         assert tries["n"] > 1, "premise: the loop must have retried at all"
-        # 10, on the same arithmetic as the sibling above: a flat 0.05s over a
-        # 0.3s budget is 7 attempts, so 10 leaves headroom without tolerating
-        # the 5x shrink the sleep-total bound cannot see.
+        # 10, on the sibling's arithmetic MINUS ONE. A flat 0.05s over a 0.3s
+        # budget is 6 attempts HERE: the sibling counts `mkdir`, which runs
+        # before the deadline check and so gets one extra call on the final
+        # iteration, while this counts `rmdir`, which runs after it. 10 leaves
+        # headroom without tolerating the 5x shrink the sleep-total bound
+        # cannot see.
         assert tries["n"] <= 10, (
             f"{tries['n']} rmdir attempts in a 0.3s budget — the arm that "
             "cannot remove a stale lock backed off less than it claims to"
