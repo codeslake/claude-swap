@@ -65,25 +65,17 @@ jobs:
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
-        # assert a Linux store layout — the XDG backup root, and an `.enc`
-        # the Keychain path never writes — and failed on macOS while every
-        # job here stayed green, because this job never ran them.
+        # assert a Linux store layout and failed on macOS while every job
+        # stayed green, because this job never ran them. A merge that
+        # restores a two-file selection here re-opens that hole invisibly:
+        # those cases pass now, they would simply stop running.
         #
-        # faulthandler dumps every thread's stack past the budget, which is
-        # the only clue when a `security` call blocks on an invisible
-        # SecurityAgent dialog.
-        #
-        # AS OF THIS BRANCH THIS `-o` IS THE ONLY THING SETTING IT. The base
-        # has no faulthandler keys at all; PR 287 adds them repo-wide, and
-        # only once THAT lands does this override become a no-op and the dump
-        # also abort the worker. Both orderings are possible, so nothing here
-        # claims which backstop fires first -- that sentence has been written
-        # both ways in successive rounds, and `timeout-minutes` below is the
-        # one that does not go stale.
-        #
-        # 600 matches the value PR 287 sets, so the two cannot drift. It is
-        # NOT a per-test contention margin: the whole suite runs in well under
-        # a minute on this runner, so the 60 it replaces already exceeded the
-        # suite total.
+        # faulthandler dumps every thread's stack past the budget, the only
+        # clue when a `security` call blocks on an invisible SecurityAgent
+        # dialog. While pyproject sets no faulthandler keys this `-o` is the
+        # only thing setting the budget and the dump does not abort; PR 287
+        # adds them repo-wide at the same 600, after which this is a no-op
+        # and the dump aborts the worker. `timeout-minutes` is the backstop
+        # that holds under either ordering.
         timeout-minutes: 15
         run: uv run pytest -o faulthandler_timeout=600

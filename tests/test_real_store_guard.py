@@ -637,25 +637,28 @@ def test_mkdir_exist_ok_true_does_not_swallow_the_refusal(
         (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
 
 
-def test_the_legacy_backup_root_is_protected_on_every_platform(monkeypatch):
-    """`~/.claude-swap-backup` is a SEPARATE live path on Linux, and nothing
-    was asserting it.
+def test_the_legacy_backup_root_is_protected_recursively():
+    """`~/.claude-swap-backup` is a SEPARATE live path on Linux -- `switcher`
+    migrates data out of it and purges it -- and nothing was asserting it.
 
-    On macOS and Windows `get_backup_root()` returns it, so dropping either
-    entry from `_resolve()` leaves the deduped set identical and the mutation
-    is a genuine no-op. On Linux they are two different directories and the
-    legacy one is live -- `switcher` migrates data out of it and purges it --
-    so the same mutation is a 25% cut of the protected set. Measured: it left
-    the whole suite green.
+    RECURSIVELY, because the flag is what the hook branches on: a
+    non-recursive root protects only its direct children, and the file the
+    original incident overwrote was nested (`credentials/*.enc`). Asserting
+    membership alone passes on a spec downgraded to non-recursive.
+
+    On macOS and Windows `get_backup_root()` returns this same path, so the
+    entry is a duplicate there and dropping it is a no-op. The assert is
+    Linux-only in effect and needs no marker: if those platforms ever stop
+    aliasing the two, it starts firing there too.
     """
-    import tests.conftest as conftest  # noqa: PLC0415
-
-    roots = [root for root, _recursive in conftest._freeze_real_store_specs()]
+    recursive_roots = {
+        root for root, recursive in conftest._freeze_real_store_specs() if recursive
+    }
     legacy = paths.get_legacy_backup_root()
-    assert legacy in roots, (
-        f"the legacy backup root {legacy} is not frozen as protected, so a "
-        "test whose isolation has unwound can write into the account's real "
-        f"pre-XDG store: {roots}"
+    assert legacy in recursive_roots, (
+        f"the legacy backup root {legacy} is not frozen as recursively "
+        "protected, so a test whose isolation has unwound can write into the "
+        f"account's real pre-XDG store: {sorted(map(str, recursive_roots))}"
     )
 
 

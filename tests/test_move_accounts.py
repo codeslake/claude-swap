@@ -502,19 +502,14 @@ class TestMoveUnreadableSourceIsNotAbsent:
     def _file_mode(self, monkeypatch):
         """Force the FILE store, because these cases read the FILE reader.
 
-        One makes an `.enc` unreadable; the others count retained `.prev`
-        generations. Both need the material on disk: on macOS a usable
-        Keychain takes the write instead, so there is no file to `chmod`
-        (FileNotFoundError) and the retained generation lands where
-        `_prev_backup_path` cannot see it.
+        They need the material on disk: on macOS a usable Keychain takes the
+        write instead, so there is no file to `chmod` (FileNotFoundError) and
+        a retained generation lands where `_prev_backup_path` cannot see it.
 
-        CLASS-WIDE, AND THE CLASS GROWS. Membership is the only thing
-        granting this, in both directions -- a case moved out loses the
-        routing, and a case appended here SILENTLY GAINS it. The second is
-        what has actually happened: this class holds 2 cases on the branch
-        and 11 merged, the extra 9 appended by a sibling. So the routing is
-        not evidence that a case needs it, and macOS is where either
-        direction shows.
+        CLASS-WIDE and autouse, so membership alone grants it in both
+        directions -- a case moved out loses the routing, a case appended
+        here silently gains it. The routing is therefore not evidence that a
+        case needs it, and macOS is where either direction shows.
         """
         monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
 
