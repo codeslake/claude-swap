@@ -237,15 +237,10 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
                 slept.append(seconds)
                 clock[0] += seconds + 0.001
 
-            def fake_monotonic():
-                # A HAIR PER READ, so a sleepless loop still reaches the
-                # deadline. With the clock advancing only inside `fake_sleep`,
-                # deleting the sleep call freezes it and the retry loop never
-                # ends -- the run hangs instead of going red, and `assert
-                # slept` below is never reached in the one direction it is
-                # written for.
-                clock[0] += budget / 100000.0
-                return clock[0]
+            # THE SHARED CLOCK, not a copy of its arithmetic. Advancing only
+            # inside `fake_sleep` freezes it the moment a sleep is deleted, so
+            # the run hangs instead of going red.
+            fake_monotonic = _advancing_clock(clock, budget)
 
             locking.time.monotonic = fake_monotonic
             locking.time.sleep = fake_sleep

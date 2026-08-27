@@ -721,15 +721,10 @@ class TestEveryArmOfTheLoopBacksOff:
             slept.append(seconds)
             clock[0] += seconds
 
-        def fake_monotonic():
-            # A HAIR PER READ. The last sleep is clamped to what is left, so
-            # it is exactly 0.0 and a clock that only moves inside `sleep`
-            # parks ON the deadline forever -- `> timeout` is strict. The
-            # loop then spins in real time until the holder ages past
-            # CONFIG_STALENESS_S and is taken over, so the case reports "the
-            # lock was acquired" after a ten-second real stall.
-            clock[0] += budget / 100000.0
-            return clock[0]
+        # THE SHARED CLOCK, not a copy of its arithmetic. The last sleep is
+        # clamped to what is left, so it is exactly 0.0 and a clock that moves
+        # only inside `sleep` parks ON the deadline forever.
+        fake_monotonic = _advancing_clock(clock, budget)
 
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
         monkeypatch.setattr(claude_locks.time, "monotonic", fake_monotonic)
