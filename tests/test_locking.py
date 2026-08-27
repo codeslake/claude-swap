@@ -103,32 +103,19 @@ class TestFileLock:
             budget = 0.01
             begin = time.monotonic()
             got = waiter.acquire(timeout=budget)
-            elapsed = time.monotonic() - begin
 
             assert not got, "the lock was held; acquire must not succeed"
             assert slept, "no retry sleep happened — the instrument, not the code"
-            # `begin` is anchored here, but `acquire` starts its own deadline
-            # AFTER `mkdir(parents=...)` + `open()`, so a correct clamp can
-            # sleep slightly past THIS deadline. Measured worst case for that
-            # skew: 0.9ms, which left only 12% headroom under a 1ms tolerance
-            # -- real flakiness on a slow first `open()`. Widened to `budget`,
-            # which is the most a correct clamp can produce: its own cap is
-            # the remaining internal budget, never more than `timeout`.
-            #
-            # NOT wider. At 0.05 a flat 0.02 and a flat 0.04 both PASS
-            # (measured), so a regression reintroducing a small flat sleep
-            # would ship green. A ceiling you can tune a flat sleep under is
-            # not an invariant, which is the whole point of the docstring
-            # above.
-            deadline = begin + budget
-            for at, seconds in slept:
-                left = deadline - at
-                assert seconds <= max(0.0, left) + budget, (
-                    f"slept {seconds:.3f}s with {left:.3f}s of budget left — "
-                    "the retry sleep ignored the deadline"
-                )
-                # Anchor-free, so no skew to absorb: the clamp is capped by
-                # the remaining budget, which never exceeds the whole timeout.
+            # ONE BOUND, ANCHOR-FREE. A per-iteration form -- `seconds <=
+            # max(0.0, deadline - at) + budget` -- was carried here as well,
+            # and `max` floors its first term at zero on the terminal
+            # iteration, so it reduces to `seconds <= budget`: the same bound
+            # as the one below, tighter by exactly the 1e-6 tolerance. It
+            # detected nothing extra and failed on that epsilon
+            # (0.010000000000218279 against 0.01) where the timer is coarse.
+            for _at, seconds in slept:
+                # The clamp is capped by the remaining budget, which never
+                # exceeds the whole timeout, so no anchor skew to absorb.
                 assert seconds <= budget + 1e-6, (
                     f"a single retry sleep of {seconds:.3f}s exceeds the "
                     f"whole {budget}s timeout"
