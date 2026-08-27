@@ -103,14 +103,19 @@ def _mtime_quantum_ns(directory: Path) -> int:
     # UNIQUE PER CALL, NOT PER PROCESS. A switch holds three locks at once and
     # at least two of them share a parent, so with the probe moved onto the
     # heartbeat thread two of them measure the SAME path concurrently: the
-    # writes leapfrog and the answer comes back coarser than the truth, or one
-    # thread's cleanup makes the other's stat ENOENT and it falls to the
-    # unmeasurable arm. Both end at a lock left on disk for the full staleness
-    # window. `mkstemp` also leaves nothing behind from a crashed run.
-    fd, name = tempfile.mkstemp(dir=directory, prefix=".mtime-probe-")
-    os.close(fd)
-    probe = Path(name)
+    # writes leapfrog and the answer comes back FINER than the truth -- the
+    # common direction, and the one that latches `unproven` -- or coarser, or
+    # one thread's cleanup makes the other's stat ENOENT. Every outcome ends
+    # at a lock left on disk for the full staleness window.
+    probe = None
     try:
+        # INSIDE THE `try`, so the documented `return 1` covers a directory
+        # we cannot write. Outside it, a refused create raises out of a
+        # function whose only production caller catches `BaseException` by
+        # luck and whose test callers do not.
+        fd, name = tempfile.mkstemp(dir=directory, prefix=".mtime-probe-")
+        os.close(fd)
+        probe = Path(name)
         for quantum in (1, 100, 1_000, 1_000_000, 1_000_000_000, 2_000_000_000):
             # AN ODD MULTIPLE, so a coarser filesystem MUST truncate it.
             # `(t // q) * q` is already a multiple of every coarser quantum
@@ -122,20 +127,26 @@ def _mtime_quantum_ns(directory: Path) -> int:
             os.utime(probe, ns=(want, want))
             if os.stat(probe).st_mtime_ns == want:
                 return quantum
-        # NOTHING ROUND-TRIPPED, so this filesystem is coarser than every
-        # candidate. No value here is measured, and the honest-looking answer
-        # is the WRONG one: `1` is the FIRST candidate the loop rejected, so a
-        # stamp written at it never round-trips and `unproven` latches on
-        # every tick. The coarsest candidate is rejected too, but only half
-        # the time -- measured over 200,000 clock samples on a filesystem
-        # coarser than all of them, 100,111 ticks round-trip at 2e9 against 0
-        # at 1. Half a release is strictly better than none.
-        return 2_000_000_000
+        # NOTHING ROUND-TRIPPED, so the quantum is UNMEASURED -- and the arm
+        # that refuses is the safe one. `unproven` is all that stands between
+        # a coarse filesystem and `os.rmdir(lock_dir)`: answer with the
+        # coarsest candidate and a stamp round-trips on the ticks that land on
+        # a multiple, leaving `unproven` clear so the strict comparison runs
+        # against an mtime a successor's `mkdir` truncates to that same value.
+        # Answering 1 makes every read-back differ, so `unproven` latches and
+        # the lock is left for the stale sweep.
+        #
+        # Nor is it a trade. The stamp advances one touch interval at a time,
+        # so three consecutive ticks can never all be multiples of the
+        # coarsest candidate -- past two ticks the release is refused either
+        # way, and only the collision is left.
+        return 1
     except OSError:
         return 1  # cannot measure; the strict comparison is the old behaviour
     finally:
         try:
-            probe.unlink()
+            if probe is not None:
+                probe.unlink()
         except OSError:
             pass
 # Claude Code holds the credentials lock for one token-endpoint round trip

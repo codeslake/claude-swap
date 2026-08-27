@@ -1123,13 +1123,13 @@ class TestATransientErrnoIsNotFatalToTheHold:
     def test_the_probe_answers_the_fine_end_too(
         self, tmp_path, monkeypatch, fs_quantum
     ):
-        """Its coarse sibling is satisfied by `return 2_000_000_000`.
+        """Its coarse sibling is satisfied by a constant return.
 
-        That constant passes the 2s case, so the candidate list, the loop and
-        the ordering have no witness at all -- and this function runs on the
-        only platform that cannot pin a directory, where coarsening every
-        stamp widens the window in which a successor's mkdir mtime collides
-        with ours and the release removes THEIR lock.
+        Answering 2e9 unconditionally passes the 2s case, so the candidate
+        list, the loop and the ordering have no witness at all -- and this
+        function runs on the only platform that cannot pin a directory, where
+        coarsening every stamp widens the window in which a successor's mkdir
+        mtime collides with ours and the release removes THEIR lock.
         """
         real_utime = os.utime
 
@@ -1168,6 +1168,40 @@ class TestATransientErrnoIsNotFatalToTheHold:
         assert got == want, (
             f"the probe measured {got}ns on a filesystem that keeps {want}ns "
             f"(fake floor {fs_quantum}ns over a host that keeps {host}ns)"
+        )
+
+    def test_a_filesystem_coarser_than_every_candidate_answers_1(
+        self, tmp_path, monkeypatch
+    ):
+        """The fallthrough must be the arm that REFUSES, not the one that acts.
+
+        `unproven` is the only thing between a coarse filesystem and
+        `os.rmdir(lock_dir)`. Answering with the coarsest candidate lets a
+        stamp round-trip on the ticks that happen to land on a multiple, so
+        `unproven` stays clear and the strict comparison runs -- against an
+        mtime a successor's `mkdir` truncates to the same value. Answering 1
+        makes every read-back differ, `unproven` latches, and the release
+        leaves the lock for the stale sweep.
+
+        The trade is not even a trade: the stamp advances one touch interval
+        at a time, so three consecutive ticks can never all land on a multiple
+        of the coarsest candidate. Past two ticks the release is refused
+        either way, and only the collision is left.
+        """
+        coarser = 4_000_000_000
+        real_utime = os.utime
+
+        def coarser_than_all(path, *a, **k):
+            ns = k.get("ns")
+            if isinstance(ns, tuple) and len(ns) == 2:
+                k["ns"] = tuple((int(v) // coarser) * coarser for v in ns)
+            return real_utime(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", coarser_than_all)
+        got = claude_locks._mtime_quantum_ns(tmp_path)
+        assert got == 1, (
+            f"nothing round-tripped, so the quantum is unmeasured -- answering "
+            f"{got}ns lets the release act on a stamp it never proved"
         )
 
     @pytest.mark.parametrize("offset_ns", [0, 1_000_000_000])
