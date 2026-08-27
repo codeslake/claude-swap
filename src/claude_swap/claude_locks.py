@@ -66,7 +66,9 @@ _CAN_PIN_A_DIRECTORY = sys.platform != "win32"
 
 
 def _mtime_quantum_ns(directory: Path) -> int:
-    """The finest mtime this filesystem keeps, in nanoseconds.
+    """The finest granularity from a fixed candidate set that this filesystem
+    round-trips, in nanoseconds -- never finer than the truth, possibly
+    coarser.
 
     Unpinned, the heartbeat proves a hold by writing a stamp and reading it
     back unchanged. A filesystem coarser than the stamp truncates it, so the
@@ -93,7 +95,14 @@ def _mtime_quantum_ns(directory: Path) -> int:
             os.utime(probe, ns=(want, want))
             if os.stat(probe).st_mtime_ns == want:
                 return quantum
-        return 2_000_000_000
+        # NOTHING ROUND-TRIPPED, so this filesystem is coarser than every
+        # candidate (or ignores `utime` outright) and no value here is
+        # measured. Returning the last candidate would claim a granularity the
+        # loop has just PROVED it does not keep, which truncates the stamp and
+        # latches `unproven` on the first tick -- the defect the quantisation
+        # exists to remove, rebuilt in its own error path. Same answer as the
+        # unreadable arm below, for the same reason.
+        return 1  # cannot measure; the strict comparison is the old behaviour
     except OSError:
         return 1  # cannot measure; the strict comparison is the old behaviour
     finally:
@@ -260,7 +269,13 @@ def proper_lockfile(
     # both readings share the value. Only never having accepted an inexact
     # one can, so the release requires this to still be False.
     unproven = False
-    stamp_quantum = 1 if _CAN_PIN_A_DIRECTORY else _mtime_quantum_ns(lock_dir.parent)
+    # MEASURED IN THE HEARTBEAT, NOT HERE. The probe does filesystem I/O --
+    # up to fourteen syscalls -- and this line sits between the acquire's
+    # `break` and the `try` whose `finally` removes the lock, the same
+    # unprotected gap the thread start below was moved out of. Anything it
+    # raises that is not an `OSError` strands the directory with nobody
+    # holding it. Its only reader is `_touch`, which runs inside that `try`.
+    stamp_quantum: int | None = 1 if _CAN_PIN_A_DIRECTORY else None
     stamping = None if _CAN_PIN_A_DIRECTORY else threading.Lock()
     _tick_guard = nullcontext() if stamping is None else stamping
 
@@ -313,7 +328,9 @@ def proper_lockfile(
         return False
 
     def _touch() -> None:
-        nonlocal adopt_stamp, last_stamp, unproven
+        nonlocal adopt_stamp, last_stamp, stamp_quantum, unproven
+        if stamp_quantum is None:
+            stamp_quantum = _mtime_quantum_ns(lock_dir.parent)
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
         # OSError: return` over both syscalls meant a single EIO or ESTALE --
         # the ordinary errnos on a network `~/.claude` -- ended the heartbeat

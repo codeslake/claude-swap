@@ -1010,6 +1010,66 @@ class TestATransientErrnoIsNotFatalToTheHold:
             "platform that decides identity by descriptor and never reads one"
         )
 
+    def test_the_quantum_probe_is_not_in_the_unprotected_gap(
+        self, tmp_path, monkeypatch
+    ):
+        """Nothing removes the lock between the acquire's `break` and the
+        `try` whose `finally` does.
+
+        One hunk lower this file already argues it: "a `RuntimeError: can't
+        start new thread` here left the descriptor open AND the lock directory
+        on disk, with nobody holding it". The quantum probe then put up to
+        fourteen syscalls back into that same gap. A `KeyboardInterrupt` there
+        -- not an `OSError`, so the probe's own handler does not see it -- is
+        the realistic trigger, and on a credentials lock the directory blocks
+        Claude Code's own refresh for the full staleness window.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+
+        def interrupted(_directory):
+            raise KeyboardInterrupt("injected inside the probe")
+
+        monkeypatch.setattr(claude_locks, "_mtime_quantum_ns", interrupted)
+        lock = tmp_path / "target.lock"
+        try:
+            with claude_locks.proper_lockfile(lock, timeout=2):
+                pass
+        except KeyboardInterrupt:
+            pass
+        assert not lock.exists(), (
+            "the acquire raised out of the quantum probe and left the lock "
+            "directory on disk with nobody holding it"
+        )
+
+    @pytest.mark.parametrize(
+        "fs_quantum", [1, 100, 1_000_000, 1_000_000_000])
+    def test_the_probe_answers_the_fine_end_too(
+        self, tmp_path, monkeypatch, fs_quantum
+    ):
+        """Its coarse sibling is satisfied by `return 2_000_000_000`.
+
+        That constant passes the 2s case, so the candidate list, the loop and
+        the ordering have no witness at all -- and this function runs on the
+        only platform that cannot pin a directory, where coarsening every
+        stamp widens the window in which a successor's mkdir mtime collides
+        with ours and the release removes THEIR lock.
+        """
+        real_utime = os.utime
+
+        def at_granularity(path, *a, **k):
+            ns = k.get("ns")
+            if isinstance(ns, tuple) and len(ns) == 2:
+                k["ns"] = tuple(
+                    (int(v) // fs_quantum) * fs_quantum for v in ns)
+            return real_utime(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", at_granularity)
+        got = claude_locks._mtime_quantum_ns(tmp_path)
+        assert got == fs_quantum, (
+            f"the probe measured {got}ns on a filesystem that keeps "
+            f"{fs_quantum}ns"
+        )
+
     @pytest.mark.parametrize("offset_ns", [0, 1_000_000_000])
     def test_the_quantum_probe_is_not_fooled_by_an_aligned_candidate(
         self, tmp_path, monkeypatch, offset_ns
