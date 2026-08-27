@@ -171,13 +171,9 @@ def proper_lockfile(
             # stats a name that is gone and `continue`s, so it never reaches
             # the jittered sleep at the bottom -- ending at the budget while
             # pinning a core for all of it. Never past what is left of the
-            # caller's budget, which is the whole loop's contract.
-            #
-            # WHICH OTHER ARMS BACK OFF IS NOT CLAIMED HERE. A sibling branch
-            # puts a back-off on the stat-FNF arm below (a dangling symlink
-            # answers EEXIST to mkdir and ENOENT to stat for the whole
-            # budget), so any sentence contrasting this arm with that one goes
-            # false on the merged tree.
+            # caller's budget, which is the whole loop's contract -- and no
+            # claim here about which OTHER arm sleeps, because that sentence
+            # has been true and false in successive merges.
             time.sleep(max(0.0, min(0.05, timeout - (time.monotonic() - start))))
         except OSError:
             # `mkdir` made the directory and the open could not read it back,
@@ -197,7 +193,7 @@ def proper_lockfile(
         try:
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
-            continue  # holder released between mkdir and stat; retry now
+            continue  # holder released between mkdir and stat
         if time.time() - held_mtime > staleness:
             # Dead holder per the protocol: remove and retake. Losing the
             # rmdir/mkdir race to another waiter just means looping again.

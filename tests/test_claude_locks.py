@@ -885,7 +885,7 @@ class TestATransientErrnoIsNotFatalToTheHold:
         )
 
     def test_an_unprovable_stamp_does_not_let_the_release_take_a_successor(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, caplog
     ):
         """The UNPINNED half of the arm above, and the half that had no case.
 
@@ -921,6 +921,7 @@ class TestATransientErrnoIsNotFatalToTheHold:
             return real_stat(path, *a, **k)
 
         raised: list[str] = []
+        caplog.set_level(logging.WARNING, logger="claude-swap")
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
         monkeypatch.setattr(claude_locks.os, "stat", failing_stat)
         monkeypatch.setattr(
@@ -937,9 +938,17 @@ class TestATransientErrnoIsNotFatalToTheHold:
             "prove whose directory it stamped, and its own stamp read back "
             "as proof of ownership"
         )
-        assert real_stat(lock).st_ino == state["successor"], (
-            "premise: the directory at the name is not the successor's, so "
-            "this asserts nothing about a takeover"
+        # WHICH REFUSAL, not merely that it survived. The strict check
+        # refuses on IDENTITY too, so on a filesystem that mints a fresh inode
+        # -- APFS every time, ext4 whenever the number has been consumed --
+        # the lock survives for a reason that has nothing to do with the flag
+        # under test, and the mutation ships green. Measured: with the inode
+        # forced fresh, the gated `unproven = True` can be deleted and this
+        # case passed 3/3 on the surviving asserts alone.
+        assert any("unproven stamp" in r.getMessage() for r in caplog.records), (
+            "the lock survived, but by the strict identity comparison rather "
+            "than because the tick recorded it could not prove ownership: "
+            f"{[r.getMessage() for r in caplog.records]}"
         )
 
     def test_an_undisturbed_hold_is_removed_and_keeps_beating(
