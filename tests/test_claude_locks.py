@@ -669,6 +669,67 @@ class TestTheAcquireAndReleaseAreBounded:
             "the release removed a lock a rewind had made unprovable"
         )
 
+    def test_a_failed_read_back_is_ADOPTED_so_the_heartbeat_survives(
+        self, tmp_path, monkeypatch
+    ):
+        """The unpinned path's whole reason for `adopt_stamp`, and nothing ran it.
+
+        The tick writes a stamp it chose, then reads it back. If THAT read
+        fails, `last_stamp` never advances, and the next tick's `_ours` sees a
+        mtime it cannot match. Refusing there returns out of the heartbeat, the
+        mtime stops advancing, and a waiter takes the lock over as stale --
+        mid-hold, on a lock nobody actually took. Adopting the observed stamp
+        keeps the beat alive, and `unproven` stops the release acting on it.
+
+        Measured before this case existed: `if adopt_stamp:` -> `if False:`
+        left the whole suite green.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+
+        lock = tmp_path / "target.lock"
+        real_stat, real_utime = os.stat, os.utime
+        state = {"ticks": 0, "injected": False, "after": 0, "tid": None}
+
+        def counting_utime(path, *a, **k):
+            if not isinstance(path, int) and os.fspath(path) == os.fspath(lock):
+                state["tid"] = threading.get_ident()
+                state["ticks"] += 1
+                if state["injected"]:
+                    state["after"] += 1
+            return real_utime(path, *a, **k)
+
+        def failing_stat(path, *a, **k):
+            # THE READ-BACK ONLY: the toucher's own thread, this lock, once.
+            if (not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)
+                    and threading.get_ident() == state["tid"]
+                    and state["ticks"] >= 1
+                    and not state["injected"]):
+                state["injected"] = True
+                raise OSError(errno.EIO, "injected read-back failure")
+            return real_stat(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", counting_utime)
+        monkeypatch.setattr(claude_locks.os, "stat", failing_stat)
+        with proper_lockfile(lock, timeout=2.0):
+            time.sleep(0.4)
+        monkeypatch.undo()
+
+        assert state["injected"], (
+            f"premise: the read-back never failed ({state['ticks']} tick(s)), "
+            "so this says nothing about what happens when it does"
+        )
+        assert state["after"] >= 2, (
+            f"the heartbeat stopped after the failed read-back "
+            f"({state['after']} tick(s) followed it) — the lock's mtime now "
+            "freezes and a waiter may take it over as stale, mid-hold"
+        )
+        assert lock.exists(), (
+            "the release removed a lock whose stamp it could not prove, "
+            "which is the other direction of the same fault"
+        )
+
     def test_the_release_does_not_wait_out_a_stalled_tick(
         self, tmp_path, monkeypatch
     ):
