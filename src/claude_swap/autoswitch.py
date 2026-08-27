@@ -1058,11 +1058,11 @@ class AutoSwitchEngine:
                 return
             self.dry_run = False
             self.demoted_from_live = False
-            # PROMOTED, so nothing is owed an explanation. Left set, a
-            # re-armed errno announces "could not be taken ... it will keep
-            # retrying" on the very tick whose retry then succeeds --
-            # `tick()` announces before it retries.
-            self._live_lock_error = None
+            # THE FLAG, NOT THE ERRNO. `tick()` retries BEFORE it announces,
+            # so leaving this False lets `_announce_demotion` run on the very
+            # tick that promoted and emit the CONTENTION sentence right after
+            # "now LIVE". Clearing `_live_lock_error` too was dead: both its
+            # readers are unreachable once the two assignments above land.
             self._demotion_announced = True
         self._emit(
             ConfigWarningEvent(

@@ -7141,7 +7141,7 @@ class TestLiveLock:
         # window this exists for is fully reopened. The subject is the last
         # gate BEFORE the switch; the byte window this replaced picked its
         # gate by distance and raised `ValueError` once the anchor moved.
-        gate = src.rfind("if self._stop.is_set():", 0, src.index("switch_to("))
+        gate = src.rfind("if self._stop.is_set():", 0, src.index("self.switcher.switch_to("))
         assert gate != -1, "premise: no `_stop` gate precedes the switch call"
         assert arm < gate, (
             "`_switch_in_flight` is armed after the `_stop` gate that guards "
@@ -7292,14 +7292,11 @@ class TestLiveLock:
             demoted.stop()
 
     def test_a_promotion_before_any_announcement_stays_silent(self, harness):
-        """The clearing's own witness — its sibling above cannot be one.
+        """An errno recorded while nothing has been announced yet.
 
-        There the first tick ANNOUNCES before it retries, so
-        `_demotion_announced` is already True and the announce short-circuits
-        whether or not the promotion cleared anything. The discriminating
-        state is an errno recorded while nothing has been announced yet: the
-        cause is armed, the promotion then succeeds, and without the clearing
-        the reordered announce emits the stale cause AFTER "now LIVE".
+        That is the only state that discriminates the clearing: the cause is
+        armed, the promotion then succeeds, and without the flag the
+        reordered announce emits a stale cause AFTER "now LIVE".
         """
         import errno as _errno
 
@@ -7334,16 +7331,16 @@ class TestLiveLock:
             assert any("now LIVE" in m for m in said), (
                 f"premise: the engine never promoted: {said}"
             )
-            # BOTH SENTENCES. The cleared cause is the ERRNO, but
-            # `_announce_demotion` then falls through to the CONTENTION
-            # branch, so that is the stale line this actually lets through.
-            # Keying on the errno alone passed the mutation it was written
-            # for: 339 passed with the clearing gone.
-            assert not [m for m in said
-                        if "could not be taken" in m
-                        or "already running" in m], (
-                "the promotion did not clear the cause it resolved, so the "
-                f"stale fault is announced after the engine went LIVE: {said}"
+                # COUNTED, NOT MATCHED. Keying on prose ties this to two
+            # sentences forever, and a rewording of either one disarms it
+            # silently. A promoting tick owes exactly one event, the
+            # promotion's own.
+            warned = [e for e in harness.events[before:]
+                      if isinstance(e, ConfigWarningEvent)]
+            assert len(warned) == 1, (
+                "the promotion did not clear the cause it resolved, so a "
+                "stale fault is announced after the engine went LIVE: "
+                f"{[e.message for e in warned]}"
             )
         finally:
             demoted.stop()
