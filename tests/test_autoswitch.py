@@ -10180,38 +10180,71 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
             f"the human line still calls this an exhausted fleet: {ev.human()!r}"
         )
 
-    def test_a_wait_keeps_the_reset_a_peer_cannot_prove(self, harness):
-        """A peer's missing `resets_at` must not throw away the active's own.
+    def test_the_wait_announces_the_soonest_reset_it_can_prove(self, harness):
+        """A peer that CAN prove a sooner return must not lose to the active's.
 
-        `_earliest_recovery` answers None the moment ANY blocked account has an
-        unprovable reset. That is right for an exhausted fleet, where there is
-        no better answer, and wrong here: the gate that created this wait
-        required the ACTIVE's recovery to be finite, so the moment the wait
-        ends is already in hand. Discarding it drops to the ordinary cadence.
+        The fallback substitutes the ACTIVE account's own recovery, which is
+        the one value the gate guarantees is finite -- and is not the earliest.
+        Any blocked peer with a provable reset before it is discarded, while
+        `human()` renders the result as "earliest reset".
+        """
+        harness.seed(4, "d@example.com")
+        now = harness.clock.now
+        active = _usage7(100.0, 40.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 100 * 60)
+        unprovable = _usage7(100.0, 100.0)
+        unprovable["five_hour"]["resets_at"] = None
+        unprovable["seven_day"]["resets_at"] = None
+        sooner = _usage7(100.0, 40.0)
+        sooner["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        outcome = harness.tick_with_usage({
+            "1": active,
+            "2": _usage7(1.0, 98.0, _iso_at(now + 4 * 86400)),
+            "3": unprovable,
+            "4": sooner,
+        })
+        assert outcome is TickOutcome.BLOCKED
+        exhausted = [e for e in harness.events if isinstance(e, AllExhaustedEvent)]
+        assert exhausted, "premise: no wait was announced, so there is nothing to judge"
+        announced = exhausted[-1].earliest_reset_at
+        assert announced == _iso_at(now + 10 * 60), (
+            f"announced {announced!r}, but account 4 proves it returns at "
+            f"{_iso_at(now + 10 * 60)!r} -- the wait named the active's own "
+            "reset over one it could prove was ninety minutes sooner"
+        )
+
+    def test_an_unprovable_peer_keeps_the_bounded_recheck(self, harness):
+        """Announcing a reset is not the same as sleeping toward it.
+
+        `_earliest_recovery`'s own contract: a blocked account whose exhausted
+        windows carry no reset "could recover at any moment, so ... let the
+        bounded blocked-cadence fallback re-check, rather than sleeping toward
+        another account's later known reset." `_blocked_wait_long` is already
+        set five lines above, so the un-armed path is NO_RESET_FALLBACK_S --
+        never the ordinary cadence, which is what arming it was justified by.
         """
         now = harness.clock.now
         active = _usage7(100.0, 40.0)
         active["five_hour"]["resets_at"] = _iso_at(now + 41 * 60)
-        blocked_peer = _usage7(100.0, 100.0)
-        # the peer is at a limit and cannot say when it comes back
-        blocked_peer["five_hour"]["resets_at"] = None
-        blocked_peer["seven_day"]["resets_at"] = None
+        unprovable = _usage7(100.0, 100.0)
+        unprovable["five_hour"]["resets_at"] = None
+        unprovable["seven_day"]["resets_at"] = None
         outcome = harness.tick_with_usage({
             "1": active,
-            "2": _usage7(98.0, 60.0, _iso_at(now + 4 * 86400)),
-            "3": blocked_peer,
+            "2": _usage7(1.0, 98.0, _iso_at(now + 4 * 86400)),
+            "3": unprovable,
         })
         assert outcome is TickOutcome.BLOCKED
         exhausted = [e for e in harness.events if isinstance(e, AllExhaustedEvent)]
         assert exhausted, "premise: no wait was announced, so there is nothing to judge"
         assert exhausted[-1].earliest_reset_at is not None, (
-            "the wait announced no reset although the active's own was finite "
-            "— a peer that cannot prove its recovery erased an answer already "
-            "measured"
+            "premise: nothing was announced, so announcing and sleeping cannot "
+            "be told apart here"
         )
-        assert harness.engine._sleep_until_ts is not None, (
-            "the reset-aware sleep never armed, so this polls the ordinary "
-            "cadence instead of sleeping to a moment it had measured"
+        assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S, (
+            "the wait slept toward a reset while a peer could return at any "
+            "moment -- `_earliest_recovery` refused to answer for exactly that "
+            "reason, and the fallback overrode it"
         )
 
     def test_an_unreadable_candidate_is_not_announced_as_an_exhausted_fleet(

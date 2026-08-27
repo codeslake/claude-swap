@@ -625,30 +625,17 @@ def _binding_recovery_ts(
     windows = list(oauth.relevant_windows(usage, models))
     if not windows:
         return float("inf")
-    # TIED WINDOWS ALL BIND, and the account is usable only when the LAST of
-    # them resets. `max` returns the FIRST of a tie, and `relevant_windows`
-    # emits 5h before 7d, so an account at 100/100 -- the ordinary shape of a
-    # genuinely exhausted one -- reported the five-hour reset while
-    # `_earliest_recovery` reported the weekly one from the same snapshot.
-    # The ranking then refused every peer returning inside that gap and the
-    # engine announced a reset it was not ranking against.
+    # Tied windows all bind, so the account is back only when the LAST of them
+    # resets. Take the binding PCT: `max(windows)` returns the FIRST of a tie
+    # and `relevant_windows` emits 5h before 7d.
     binding = max(w[1] for w in windows)
-    # A TIED WINDOW WITH NO RESET IS SKIPPED, NOT FATAL, because that is what
-    # `limiting_reset_ts` does -- and `_earliest_recovery` announces from it.
-    # Refusing the whole answer instead recreated the crossing this function
-    # was corrected for, pointing the other way: the ranking sorted an account
-    # last as unknowable while the announcement named a moment for it. With no
-    # tied window naming one there is nothing to take the latest of, and both
-    # readers say unknown.
-    # THE BLOCKERS, NOT THE TIE. Once anything is at the limit the account is
-    # back when the LAST blocker resets, and every window at or above 100 is
-    # one -- which is exactly the set `limiting_reset_ts` reads. Narrowing to
-    # the max-pct tie made the two agree only when the blockers carried an
-    # IDENTICAL pct; one ulp apart and the ranking said unknowable while the
-    # announcement named a moment. Nothing holds them equal: `utilization` is
-    # copied through unclamped, and `account_headroom` documents <= 0 as "at
-    # OR OVER a limit". Below 100 nothing is blocking and the binding window
-    # is the max-pct tie as before.
+    # At or above the limit every blocker counts -- exactly the set
+    # `limiting_reset_ts` reads, which is what announces from here. Below it
+    # the max-pct tie binds. Narrowing the at-limit case to the tie makes the
+    # two readers agree only when the blockers are bit-identical, and
+    # `utilization` is copied through unclamped, so one ulp apart the ranking
+    # says unknowable while the announcement names a moment. A tied window
+    # with no reset is skipped rather than fatal for the same reason.
     blocking = (
         (lambda pct: pct >= 100.0) if binding >= 100.0
         else (lambda pct: pct == binding)
@@ -1613,21 +1600,19 @@ class AutoSwitchEngine:
             # the block above, it kept the ordinary cadence for the whole
             # window and never named the reset it had just measured.
             self._blocked_wait_long = True
-            earliest = self._earliest_recovery(usage)
+            earliest, all_provable = self._earliest_recovery(usage)
             earliest_ts = earliest.timestamp() if earliest is not None else None
-            if earliest_ts is None and not truly_exhausted:
-                # THE WAIT ALREADY KNOWS WHEN IT ENDS. `_earliest_recovery`
-                # answers None the moment ANY blocked account has an unprovable
-                # reset -- right for an exhausted fleet, where there is no
-                # better answer, wrong here: the gate that created this wait
-                # required the active's own recovery to be finite, so a peer's
-                # missing `resets_at` must not throw it away and drop back to
-                # the ordinary cadence.
-                own = _binding_recovery_ts(usage.get(current), self._models,
-                                           decided_now)
-                if own != float("inf"):
-                    earliest_ts = own
-            if earliest_ts is not None:
+            if not all_provable:
+                # A blocked account that cannot prove its return may beat any
+                # reset we DID measure, so never sleep toward one -- and
+                # `_blocked_wait_long` above already holds the un-armed path
+                # at NO_RESET_FALLBACK_S, not the ordinary cadence.
+                # An exhausted fleet then has no end to name. A deliberate
+                # wait does: the earliest moment a blocked account PROVED,
+                # which is what it is holding out for.
+                if truly_exhausted:
+                    earliest_ts = None
+            elif earliest_ts is not None:
                 self._sleep_until_ts = earliest_ts + RESET_SLACK_S
             self._emit(
                 AllExhaustedEvent(
@@ -2768,20 +2753,22 @@ class AutoSwitchEngine:
 
     def _earliest_recovery(
         self, usage: dict[str, dict | str | None]
-    ) -> datetime | None:
-        """Earliest moment any account becomes usable again (UTC), or None
-        when that moment can't be proven.
+    ) -> tuple[datetime | None, bool]:
+        """Earliest moment any account becomes usable again (UTC), and whether
+        every blocked account could prove one.
 
         Per account that's the *latest* reset among its ≥100% relevant
         windows — an account blocked on both 5h and a scoped weekly limit
         isn't usable when the 5h rolls over — then the minimum across
         accounts, the active one included (its recovery also ends the
         blocked state). A blocked account whose exhausted windows carry no
-        reset time at all could recover at any moment, so it makes the whole
-        answer unprovable: return None and let the bounded blocked-cadence
-        fallback re-check, rather than sleeping toward another account's
-        later known reset."""
+        reset time at all could recover at any moment. That does not erase
+        what the others proved, so it is reported as the second element
+        rather than by discarding the first: the caller ANNOUNCES the
+        earliest provable moment and keeps the bounded blocked-cadence
+        re-check, rather than sleeping toward a reset that peer may beat."""
         earliest: float | None = None
+        all_provable = True
         now = self.clock()
         for value in usage.values():
             if not isinstance(value, dict):
@@ -2795,12 +2782,13 @@ class AutoSwitchEngine:
                 continue  # not exhausted — doesn't gate the blocked state
             usable_at = _limiting_reset_ts(value, self._models)
             if usable_at is None or usable_at <= now:
-                return None  # blocked with unprovable recovery — don't oversleep
+                all_provable = False  # could return at any moment — don't oversleep
+                continue
             if earliest is None or usable_at < earliest:
                 earliest = usable_at
         if earliest is None:
-            return None
-        return datetime.fromtimestamp(earliest, tz=timezone.utc)
+            return None, all_provable
+        return datetime.fromtimestamp(earliest, tz=timezone.utc), all_provable
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         # `human()` is what the TUI panel renders, so log and screen cannot

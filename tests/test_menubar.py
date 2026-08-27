@@ -583,3 +583,27 @@ def test_a_logged_out_landing_is_not_reported_as_a_working_switch():
         f"{title!r} {body!r}"
     )
     assert "/login" in body, f"the recovery step was dropped: {body!r}"
+
+
+def test_a_deliberate_wait_is_not_titled_an_exhausted_fleet():
+    """The notification is the fourth surface, and it was not counted.
+
+    `AllExhaustedEvent`'s own comment enumerates "the panel, the JSON and the
+    log". This says the same sentence to the same user, and said "All accounts
+    exhausted" for a wait entered BECAUSE a candidate still holds quota.
+    """
+    from claude_swap.autoswitch import AllExhaustedEvent
+
+    wait = AllExhaustedEvent(
+        earliest_reset_at="2026-07-05T20:00:00Z", deliberate_wait=True
+    )
+    title, body = menubar.exhausted_notification(wait)
+    assert "exhausted" not in title.lower(), (
+        f"a deliberate wait was announced as an exhausted fleet: {title!r}"
+    )
+    assert body == wait.human(), "the body drifted from the shared renderer"
+
+    real = AllExhaustedEvent(earliest_reset_at=None, deliberate_wait=False)
+    assert menubar.exhausted_notification(real)[0] == "All accounts exhausted", (
+        "a genuinely exhausted fleet lost its own title"
+    )

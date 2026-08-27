@@ -1819,6 +1819,23 @@ class TestEventText:
 
         assert event.human() in event_text(event).plain
 
+    def test_a_deliberate_wait_is_not_painted_as_an_exhausted_fleet(self):
+        """`_EVENT_ROLES` keys on the KIND, and one kind carries two states.
+
+        `sev_crit` is the fifth surface saying "exhausted" about a hold whose
+        own gate proves a candidate holds quota.
+        """
+        from claude_swap.autoswitch import AllExhaustedEvent
+        from claude_swap.tui.autoview import event_text
+
+        wait = AllExhaustedEvent(earliest_reset_at=None, deliberate_wait=True)
+        real = AllExhaustedEvent(earliest_reset_at=None, deliberate_wait=False)
+        styles = lambda e: {str(s.style) for s in event_text(e).spans}
+        assert styles(wait) != styles(real), (
+            "a deliberate hold is painted exactly like an exhausted fleet: "
+            f"{styles(wait)}"
+        )
+
     def test_event_text_uses_light_accent_for_switch(self):
         from claude_swap.tui.autoview import event_text
         from claude_swap.tui.theme import ACCENT_LIGHT, CSWAP_LIGHT, Palette

@@ -54,6 +54,11 @@ _QUIET_KINDS = {"poll", "no-switch", "sleep", "account-unquarantined"}
 def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Text:
     """Log line for one engine event, styled like the CLI's human renderer."""
     role = _EVENT_ROLES.get(event.kind)
+    if role == "sev_crit" and getattr(event, "deliberate_wait", False):
+        # The map keys on the KIND and this kind carries two states; the
+        # critical colour overstates a hold whose gate proves a candidate
+        # still holds quota.
+        role = "sev_warn"
     if role is not None:
         style = getattr(palette, role)
     else:

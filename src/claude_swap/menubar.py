@@ -458,6 +458,19 @@ def switch_notification(payload: dict | None = None) -> tuple[str, str]:
     )
 
 
+def exhausted_notification(event) -> tuple[str, str]:
+    """``(title, body)`` for the notification an ``all-exhausted`` event posts.
+
+    One kind carries two states. A deliberate wait is entered BECAUSE a
+    candidate still holds quota, so "All accounts exhausted" is the one thing
+    it is not -- and the notification is a surface `AllExhaustedEvent`'s own
+    enumeration ("the panel, the JSON and the log") does not count.
+    """
+    if getattr(event, "deliberate_wait", False):
+        return "Waiting for a reset", event.human()
+    return "All accounts exhausted", event.human()
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -652,7 +665,7 @@ def run(switcher) -> int:
                 elif ev.kind == "account-quarantined":
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
-                    rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                    rumps.notification("claude-swap", *exhausted_notification(ev))
                 elif ev.kind == "config-warning":
                     # e.g. an autoswitch.model name no account reports — the
                     # engine emits it once per run; dropping it would leave a
