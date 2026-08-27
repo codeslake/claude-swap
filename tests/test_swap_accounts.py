@@ -1488,6 +1488,89 @@ class TestTheRollbackDecidesPerKey:
         switcher._session_dir("2", mail_b).mkdir(parents=True, exist_ok=True)
         return [crossed_b]
 
+    def test_a_reverse_that_moved_nothing_does_not_announce_one(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, caplog
+    ):
+        """`if undone:` had no witness — announcing a reversal that never ran.
+
+        The guard exists because the line fired before a reverse that then put
+        nothing back. Mutating it to `if True:` was measured green on this
+        branch and on the integrated tree; the existing case cannot see it
+        because it runs with `moved == []`, so the outer `if moved:` short
+        circuits and its negative assert can never fail from this guard.
+        """
+        import logging
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+        assert moved, "premise: nothing moved, so the outer `if moved:` skips"
+
+        # THE REVERSE RUNS AND PUTS NOTHING BACK — `undone` stays empty.
+        switcher._swap_session_dirs = lambda *a, **k: None
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+        said = "\n".join(r.getMessage() for r in caplog.records)
+        assert said, "premise: the rollback said nothing at all"
+        assert "Reversed the session-profile exchange" not in said, (
+            "the rollback announced a reversal although the reverse put "
+            f"nothing back — both profiles are still crossed:\n{said}"
+        )
+
+    def test_a_reverse_that_DID_move_is_named_in_the_summary(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, caplog
+    ):
+        """The `elif undone:` arm, which had no witness on either tree.
+
+        Every arm above it describes CREDENTIALS, so a run whose only work was
+        putting profiles back falls into none of them. Deleting the arm was
+        measured green; it then reports "no credential needed restoring",
+        which is the opposite report — it says nothing happened.
+        """
+        import logging
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        # A REVERSE THAT SUCCEEDS. `_one_crossed_one_home` deliberately blocks
+        # it by occupying the home, which leaves `undone` empty and takes the
+        # `else` arm correctly. Here B's profile is crossed and its home is
+        # FREE, so the reverse puts it back and `undone` is non-empty.
+        crossed_b = switcher._session_dir("1", mail_b)
+        crossed_b.mkdir(parents=True, exist_ok=True)
+        (crossed_b / ".credentials.json").write_text("B")
+        home_b = switcher._session_dir("2", mail_b)
+        assert not home_b.exists(), (
+            "premise: B's home is occupied, so the reverse refuses and this "
+            "case takes the `else` arm rather than the one under test"
+        )
+        moved = [crossed_b]
+
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            switcher._rollback_swap(
+                "1", mail_a, None, None,
+                "2", mail_b, None, None,
+                staging={}, moved=moved, wrote_backups=False,
+            )
+        said = "\n".join(r.getMessage() for r in caplog.records)
+        assert "rollback:" in said, "premise: no summary was emitted"
+        assert "no credential needed restoring" not in said, (
+            "a run that reversed a profile exchange was summarised as one "
+            f"where nothing needed doing:\n{said}"
+        )
+        assert "session-profile exchange was reversed" in said, (
+            f"the reversal is absent from the summary:\n{said}"
+        )
+
     def test_a_partial_failure_is_named_beside_the_success_it_hides_behind(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
