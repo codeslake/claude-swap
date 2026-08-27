@@ -582,11 +582,17 @@ def _binding_recovery_ts(
 ) -> float:
     """When this account's *binding* window comes back, as a sort key.
 
-    The binding window is the one holding the account back — the highest
-    utilization among the windows that gate it (the same set
-    ``account_headroom`` measures, so ranking and headroom can never disagree
-    about which window matters). Its reset is the moment the account becomes
-    useful again.
+    TWO RULES, and which one applies depends on whether anything is AT a
+    limit. Below 100 the binding window is the highest-utilization one and its
+    own reset is the answer. Once any window is at or over 100 the account is
+    back only when the LAST of those blockers resets, which is a different
+    window whenever a weekly limit is spent alongside a five-hour one.
+
+    So this and ``account_headroom`` DO name different windows, by design.
+    Headroom is ``100 - max(pct)`` and answers "how blocked"; this answers
+    "when usable". Measured on 5h at 100.5 resetting in 40 minutes with 7d at
+    100.0 four days out: headroom is set by the 5h, and this returns the 7d,
+    because the account is not usable when the five-hour window rolls over.
 
     Not the weekly window: with every account in the 90s the thing that
     decides where to go is which 5-hour window rolls over first, and that is

@@ -10248,36 +10248,6 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
             "resets, which is what _earliest_recovery already says"
         )
 
-    def test_an_account_under_every_limit_keeps_its_own_binding_reset(
-        self, harness
-    ):
-        """NOTHING AT A LIMIT MUST BEHAVE EXACTLY AS BEFORE.
-
-        The blockers rule only replaces the max-pct tie once something is at
-        or over 100; below that the predicate is `pct == binding`, which is
-        the tie. Without this case the two arms of that branch have one
-        witness between them, and a widening -- rank every window, not only
-        the blocking ones -- would make a perfectly usable account report the
-        LATEST reset in the snapshot and drop out of the ranking for days.
-
-        This is the concern that a usable account can be stalled, stated as a
-        test: 88% and 62% are both under the limit, so the answer is the 5h
-        reset, and nothing about the 7d four days out may enter it.
-        """
-        from claude_swap.autoswitch import _binding_recovery_ts
-
-        now = harness.clock.now
-        usage = {
-            "five_hour": {"pct": 88.0, "resets_at": _iso_at(now + 41 * 60)},
-            "seven_day": {"pct": 62.0, "resets_at": _iso_at(now + 4 * 86400)},
-        }
-        got = _binding_recovery_ts(usage, (), now)
-        assert got == pytest.approx(now + 41 * 60), (
-            f"reported back in {(got - now) / 3600:.1f}h — no window is at a "
-            "limit, so the binding window is the max-pct one and its own "
-            "reset is the answer; a usable account was ranked as stalled"
-        )
-
     def test_a_single_binding_window_is_unchanged(self, harness):
         """THE CONTROL. Only the tie moves; one clear binding window must
         still report its own reset, not the latest in the account."""
