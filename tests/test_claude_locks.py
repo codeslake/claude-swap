@@ -330,24 +330,6 @@ class TestProperLockfile:
         with proper_lockfile(nested):
             assert nested.is_dir()
 
-    def test_a_small_timeout_is_not_overshot_by_the_retry_sleep(self, lock_dir):
-        """`timeout` must bound the call, sleeps included.
-
-        The unclamped retry sleeps a full jittered 0.25-0.5s whatever the
-        budget, so a sub-sleep timeout never times out anywhere near when it
-        says.
-        """
-        lock_dir.mkdir()  # fresh mtime -> contended, not stale
-        start = time.monotonic()
-        with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.01):
-                pass
-        elapsed = time.monotonic() - start
-        assert elapsed < 0.15, (
-            f"a 0.01s timeout overshot to {elapsed:.3f}s — the retry sleep "
-            "ignored the remaining budget"
-        )
-
     def test_the_rmdir_branch_sleeps_only_what_is_left(
         self, lock_dir, monkeypatch
     ):

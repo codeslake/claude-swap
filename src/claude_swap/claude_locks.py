@@ -118,12 +118,10 @@ def proper_lockfile(
         try:
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
-            # BACK OFF HERE TOO. A holder releasing between our mkdir and our
-            # stat is one iteration; a lock PATH that is a dangling symlink
-            # answers FileExistsError to mkdir and FileNotFoundError to stat
-            # for the whole budget, and this was the one arm of the loop with
-            # no sleep in it -- measured 109,000 mkdir/s, four times the spin
-            # this branch exists to bound.
+            # BACK OFF HERE TOO. A dangling symlink at the lock path answers
+            # FileExistsError to mkdir and FileNotFoundError to stat, so this
+            # arm can repeat for the whole budget -- and it was the only one
+            # with no sleep in it.
             time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
         if time.time() - held_mtime > staleness:
@@ -160,22 +158,14 @@ def proper_lockfile(
             except FileNotFoundError:
                 return  # gone; nothing left to keep alive
             except OSError as e:
-                # Transient, so stay armed. Returning on ANY OSError disarmed
-                # the heartbeat on a lock still held, and CONFIG_STALENESS_S
-                # later a waiter could steal it. The errno already in hand is
-                # what separates the two; re-checking the path is both a
-                # second syscall that can fail the same way and, from 3.14,
-                # an answer that reads absence out of a permission error.
+                # Transient, so stay armed: absence is terminal and every
+                # other errno is not. Re-checking the path to tell them apart
+                # is a second syscall that can fail the same way, and from
+                # 3.14 one that reads absence out of a permission error.
                 #
-                # ONLY ONCE THE SENTENCE IS TRUE. "its mtime stops advancing,
-                # so a waiter may take it over as stale" describes a failure
-                # that outlives the staleness window; the arm fired on the
-                # FIRST one, so a hiccup that cleared on the next tick printed
-                # imminent theft over a lock that stayed fresh throughout.
-                #
-                # Once, not per attempt: a failure that never clears really
-                # does stop the mtime, and the takeover that follows would
-                # otherwise arrive with nothing recording its cause.
+                # WARN ONLY ONCE THE SENTENCE IS TRUE. It describes a freeze
+                # that outlives `staleness`; firing on the first failure
+                # announced imminent theft over a lock that stayed fresh.
                 if not warned and time.time() - last_ok > staleness:
                     warned = True
                     _logger.warning(
