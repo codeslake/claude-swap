@@ -634,7 +634,9 @@ def test_a_cleanup_failure_does_not_hide_why_the_plist_write_failed(
     def refused_unlink(*_a, **_kw):
         raise PermissionError("injected: cleanup refused")
 
-    monkeypatch.setattr(Path, "write_bytes", no_space)
+    # THE CREATE, which is what the writer calls now: it opens the temp with
+    # `os.open`+O_EXCL like every sibling rather than `Path.write_bytes`.
+    monkeypatch.setattr(menubar.os, "open", no_space)
     monkeypatch.setattr(Path, "unlink", refused_unlink)
 
     with caplog.at_level(logging.WARNING, logger="claude-swap"):

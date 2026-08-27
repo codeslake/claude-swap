@@ -76,7 +76,14 @@ def ensure_notification_identity(
                 f"{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
             )
             try:
-                tmp.write_bytes(plistlib.dumps(data))
+                # `os.open` with O_EXCL, like every sibling writer: a
+                # `write_bytes` creates the file inside a call nothing can
+                # interrupt-and-name, and it accepts a name that already
+                # exists. No credential rides here, so the mode is the
+                # ordinary one -- the create is what had to match.
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(plistlib.dumps(data))
                 os.replace(tmp, path)
                 tmp = None
             finally:

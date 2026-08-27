@@ -548,8 +548,26 @@ class ClaudeAccountSwitcher:
             # empty at 0600 (the name is fresh by the loop above, so O_EXCL
             # cannot lose to us) and filled with `copyfile`, which truncates
             # without touching the mode.
-            fd = os.open(salvage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # CLAIMED BEFORE THE SYSCALL, cancelled only by the one errno
+            # that says the name is somebody else's. A record made AFTER the
+            # call misses a file that exists: a signal delivered between the
+            # create and the assignment leaves a 0-byte file under a name the
+            # docstring above calls a promise that the bytes survived, with
+            # nothing to remove it and nothing to announce it. This is the
+            # same ordering `_stage_overlap_material` already argues for.
             created = True
+            try:
+                fd = os.open(
+                    salvage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except OSError:
+                # `O_CREAT|O_EXCL` either creates the file or fails, so any
+                # errno means nothing of ours is on disk -- EEXIST because the
+                # name is somebody else's, anything else because the create
+                # did not happen. A SIGNAL is the case this ordering exists
+                # for and it is not an `OSError`, so `created` stays True
+                # there and the 0-byte file gets removed.
+                created = False
+                raise
             try:
                 if sys.platform != "win32":
                     os.fchmod(fd, 0o600)
@@ -573,6 +591,8 @@ class ClaudeAccountSwitcher:
             if created:
                 try:
                     salvage.unlink()
+                except FileNotFoundError:
+                    pass  # the signal beat the kernel to it; nothing exists
                 except OSError:
                     left = (f"; a PARTIAL copy is at {salvage.name} and is NOT "
                             f"a usable backup")

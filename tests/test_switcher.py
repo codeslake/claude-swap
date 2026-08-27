@@ -12685,11 +12685,17 @@ def test_a_ctrl_c_mid_write_through_still_names_the_copy_it_kept(
 _ALL_ATOMIC_WRITERS = [
     "settings", "mappings", "session",
     "global_config", "active_creds", "backup_enc", "write_json", "plist",
+    # ENUMERATED BY STRUCTURE, not by memory: every site that publishes a
+    # temp through `replace_with_retry`/`os.replace`. These two were missed by
+    # the first sweep, and `transfer` writes the export payload -- live OAuth
+    # refresh tokens, into a directory the user chose.
+    "migrations", "transfer",
 ]
 
 
 def _writer_site(site: str, temp_home: Path, tmp_path: Path):
-    """-> (dir the temp is drawn in, a call that publishes, a stray temp name).
+    """-> (dir the temp is drawn in, a call that publishes, a stray temp name,
+    the module whose `os` the writer uses).
 
     The stray is what a predecessor killed by a SIGKILL would have left: the
     same pid-derived name, without whatever randomness the writer adds.
@@ -12698,21 +12704,26 @@ def _writer_site(site: str, temp_home: Path, tmp_path: Path):
     d = tmp_path / "d"
     d.mkdir(exist_ok=True)
     if site == "settings":
+        from claude_swap import settings as mod
         from claude_swap.settings import atomic_write_json
 
         t = d / "s.json"
-        return d, (lambda: atomic_write_json(t, {"a": 1})), d / f".{t.name}.{pid}.tmp"
+        return (d, (lambda: atomic_write_json(t, {"a": 1})),
+                d / f".{t.name}.{pid}.tmp", mod)
     if site == "mappings":
+        from claude_swap import mappings as mod
         from claude_swap.mappings import MappingStore
 
         store = MappingStore(d)
-        return d, (lambda: store._write({})), d / f".mappings-{pid}.tmp"
+        return (d, (lambda: store._write({})),
+                d / f".mappings-{pid}.tmp", mod)
     if site == "session":
+        from claude_swap import session as mod
         from claude_swap.session import SessionManager
 
         mgr = SessionManager(ClaudeAccountSwitcher())
         return (d, (lambda: mgr._write_manifest(d / "m.json", [])),
-                d / f".cswap-shared-{pid}.tmp")
+                d / f".cswap-shared-{pid}.tmp", mod)
     if site == "plist":
         from claude_swap import menubar
 
@@ -12721,12 +12732,32 @@ def _writer_site(site: str, temp_home: Path, tmp_path: Path):
         return (exe.parent,
                 (lambda: menubar.ensure_notification_identity(
                     exe, platform="darwin")),
-                exe.parent / f"Info.plist.{pid}.tmp")
+                exe.parent / f"Info.plist.{pid}.tmp", menubar)
     if site == "write_json":
+        from claude_swap import switcher as mod
+
         sw = ClaudeAccountSwitcher()
         t = d / "seq.json"
-        return d, (lambda: sw._write_json(t, {"a": 1})), d / f".{t.name}.{pid}.tmp"
+        return (d, (lambda: sw._write_json(t, {"a": 1})),
+                d / f".{t.name}.{pid}.tmp", mod)
 
+    if site == "migrations":
+        from claude_swap import migrations as mod
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        t = mod._state_path(sw)
+        t.parent.mkdir(parents=True, exist_ok=True)
+        return (t.parent, (lambda: mod._mark_applied(sw, "probe")),
+                t.parent / f".{t.name}.{pid}.tmp", mod)
+    if site == "transfer":
+        from claude_swap import transfer as mod
+
+        t = d / "out.cswap"
+        return (d, (lambda: mod._atomic_write_file(t, "{}")),
+                d / f".{t.name}.{pid}.tmp", mod)
+
+    from claude_swap import credentials as _cred_mod
     store = ClaudeAccountSwitcher()._store
     if site == "global_config":
         from claude_swap.credentials import get_global_config_path
@@ -12736,7 +12767,7 @@ def _writer_site(site: str, temp_home: Path, tmp_path: Path):
         return (cfg.parent,
                 (lambda: store._update_global_config(
                     lambda c: c.__setitem__("primaryApiKey", "sk-ant-REDACTED"))),
-                cfg.parent / f".{cfg.name}.{pid}.tmp")
+                cfg.parent / f".{cfg.name}.{pid}.tmp", _cred_mod)
     if site == "active_creds":
         from claude_swap.credentials import get_claude_config_home
 
@@ -12744,12 +12775,13 @@ def _writer_site(site: str, temp_home: Path, tmp_path: Path):
         cd.mkdir(parents=True, exist_ok=True)
         return (cd,
                 (lambda: store._write_active_credentials_file("{}")),
-                cd / f".credentials.json.{pid}.tmp")
+                cd / f".credentials.json.{pid}.tmp", _cred_mod)
     assert site == "backup_enc", site
     cd = store._host.credentials_dir
     cd.mkdir(parents=True, exist_ok=True)
     t = cd / "1-probe.enc"
-    return cd, (lambda: store._atomic_b64_write(t, "{}")), cd / f".{t.name}.{pid}.tmp"
+    return (cd, (lambda: store._atomic_b64_write(t, "{}")),
+            cd / f".{t.name}.{pid}.tmp", _cred_mod)
 
 
 @pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
@@ -12779,7 +12811,7 @@ def test_no_writer_mints_its_temp_name_inside_the_syscall(
 
     monkeypatch.setattr(tempfile_mod, "mkstemp", exploding)
 
-    d, write, _stray = _writer_site(site, temp_home, tmp_path)
+    d, write, _stray, _mod = _writer_site(site, temp_home, tmp_path)
     write()
     assert list(d.glob(".*tmp")) == [] and list(d.glob("*tmp*")) == [], (
         "a temp survived a completed write"
@@ -12815,6 +12847,41 @@ def test_an_interrupted_salvage_leaves_no_partial_copy(
     assert strays == [], (
         f"a partial salvage survived as {[s.name for s in strays]} — the name "
         "says the bytes are there and they are not"
+    )
+
+
+def test_a_signal_between_the_create_and_the_record_strands_nothing(
+    temp_home: Path, monkeypatch
+):
+    """A record made AFTER the call misses a file that exists.
+
+    `created = True` sat below `os.open`, so a signal delivered in that gap
+    left a 0-byte file under the `.unreadable-` name -- which the docstring
+    calls a promise that the bytes survived -- with `created` False, nothing
+    to remove it and nothing to announce it. `_stage_overlap_material` two
+    thousand lines down already argues this ordering for its own create.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    path.write_text('{"primaryApiKey": "sk-ant-REDACTED", "projects": {}}')
+
+    real_open = switcher_mod.os.open
+
+    def interrupted_open(target, *a, **kw):
+        fd = real_open(target, *a, **kw)   # the file now exists
+        os.close(fd)
+        raise KeyboardInterrupt("between the create and the record")
+
+    monkeypatch.setattr(switcher_mod.os, "open", interrupted_open)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._salvage_unreadable(path, False, [])
+
+    strays = list(path.parent.glob(f"{path.name}.unreadable-*"))
+    assert strays == [], (
+        f"a 0-byte salvage survived as {[s.name for s in strays]} — the name "
+        "says the bytes are there and the file is empty"
     )
 
 
@@ -12996,7 +13063,7 @@ def test_a_stranded_temp_from_a_recycled_pid_does_not_wedge_the_write(
     A random suffix keeps I1's property (the name is known before the file
     exists) AND mkstemp's collision profile.
     """
-    _d, write, stray = _writer_site(site, temp_home, tmp_path)
+    _d, write, stray, _mod = _writer_site(site, temp_home, tmp_path)
     stray.write_text("a predecessor died holding this")
     write()
     assert stray.read_text() == "a predecessor died holding this", (
@@ -13017,8 +13084,7 @@ def test_an_interrupt_at_the_create_strands_nothing(
     first, so that premise holds) it stays green on a tree that strands the
     temp. This one interrupts at the create and looks at the directory.
     """
-    d = tmp_path / "d"
-    d.mkdir()
+    d, write, _stray, mod = _writer_site(site, temp_home, tmp_path)
     before = set(os.listdir(d))
 
     real_open = os.open
@@ -13027,23 +13093,6 @@ def test_an_interrupt_at_the_create_strands_nothing(
         fd = real_open(path, *a, **k)   # the file now exists
         os.close(fd)
         raise KeyboardInterrupt("inside the create")
-
-    if site == "settings":
-        from claude_swap import settings as mod
-        from claude_swap.settings import atomic_write_json
-
-        write = lambda: atomic_write_json(d / "s.json", {"a": 1})
-    elif site == "mappings":
-        from claude_swap import mappings as mod
-        from claude_swap.mappings import MappingStore
-
-        write = lambda: MappingStore(d)._write({})
-    else:
-        from claude_swap import session as mod
-        from claude_swap.session import SessionManager
-
-        write = lambda: SessionManager(
-            ClaudeAccountSwitcher())._write_manifest(d / "m.json", [])
 
     monkeypatch.setattr(mod.os, "open", exploding)
     with pytest.raises(KeyboardInterrupt):

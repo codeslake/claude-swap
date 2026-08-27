@@ -25,8 +25,8 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
-import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -83,21 +83,32 @@ def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
     applied[migration_id] = get_timestamp()
     content = json.dumps({"version": STATE_VERSION, "applied": applied}, indent=2)
 
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    # NAME FIRST, THEN THE FILE. `mkstemp` mints the name INSIDE the syscall,
+    # so a signal between the create and the return strands a file no handler
+    # can name. The random suffix keeps what mkstemp gave in exchange: a pid
+    # alone is recycled, and `O_EXCL` on a recycled name can only fail -- or
+    # unlink a predecessor's file on the way out.
+    tmp_path = str(
+        path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    )
+    fd = -1
     try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.write(fd, content.encode("utf-8"))
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(path))
+        tmp_path = None  # consumed by the publish; the name is not ours
         if sys.platform != "win32":
             os.chmod(str(path), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise
 
 
