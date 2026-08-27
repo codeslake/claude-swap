@@ -818,6 +818,16 @@ class ClaudeAccountSwitcher:
                     #     `shutil.copyfile`, with a credential fragment already
                     #     on disk. `filename2` is set on exactly the paths that
                     #     had opened the destination and None on the rest.
+                    # A COMPLETE COPY IS A SUCCESS THAT DID NOT GET TO RENAME.
+                    # `after == landed` means the destination already holds the
+                    # whole new payload, so it now carries a credential it need
+                    # not have held before -- exactly what the narrowing refusal
+                    # above ranks as unacceptable. The clean path skips this
+                    # recovery entirely and leaves 0600, so restoring the wider
+                    # mode here would make an interrupt arriving one instant
+                    # later END MORE EXPOSED than the run that finished.
+                    if after is not None and after == landed:
+                        return
                     comparable = after is not None and before is not None
                     untouched = (
                         isinstance(copy_err, OSError)

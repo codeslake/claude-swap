@@ -12781,9 +12781,16 @@ def test_a_completed_copy_is_not_emptied_by_the_recovery(
     assert json.loads(target.read_text()) == payload, (
         "the destination survived but does not hold the new payload"
     )
-    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
-        "the copy completed, so the narrowing still has to be undone -- "
-        "skipping the whole recovery leaves the destination at 0600"
+    # THE SAME AS A SUCCESS, and for the same reason. A completed copy leaves
+    # the destination holding the new payload, so it now carries a credential
+    # it need not have held before -- which is the state the narrowing refusal
+    # above ranks as unacceptable. The clean success path skips the recovery
+    # entirely and leaves 0600; an interrupt arriving one instant later must
+    # not end MORE exposed than the run that finished.
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600, (
+        "an interrupt after a COMPLETED copy left the destination wider than "
+        "the identical successful run, publishing the new credential to every "
+        "other uid"
     )
 
 
