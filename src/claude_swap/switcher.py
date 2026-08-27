@@ -780,7 +780,7 @@ class ClaudeAccountSwitcher:
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
         self._store._delete_backup_keychain_quiet(account_num, email)
 
-    def _post_backup_write(self, account_num: str, email: str) -> None:
+    def _post_backup_write(self, account_num: str, email: str) -> bool:
         """Invalidate the slot's session profile after backup credentials change.
 
         Backup credentials changed (re-login via --add-account, --add-token,
@@ -793,6 +793,12 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
+        # ANSWERED, NOT ONLY LOGGED. The live branch cannot invalidate a
+        # profile in use, so a refused marker leaves it serving a superseded
+        # generation with nothing recording that -- and a caller that must
+        # decide whether recovery material is still needed cannot read a log
+        # line. The forward path at `_write_account_credentials` ignores this;
+        # the rollback's repair counts it.
         if self._live_session_pids(account_num, email):
             from claude_swap.session import mark_session_stale
 
@@ -803,8 +809,10 @@ class ClaudeAccountSwitcher:
                     "serving the superseded generation once it exits.",
                     account_num,
                 )
+                return False
         else:
             self._invalidate_session_credentials(account_num, email)
+        return True
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         return self._store._read_account_credentials(account_num, email)
@@ -1535,7 +1543,18 @@ class ClaudeAccountSwitcher:
                             if (num, email) in crossed_keys:
                                 other = num_b if num == num_a else num_a
                                 try:
-                                    self._post_backup_write(other, email)
+                                    if not self._post_backup_write(
+                                            other, email):
+                                        # THE LIVE DOOR TO THE SAME STATE. No
+                                        # raise here -- the chokepoint took
+                                        # its marker branch and the marker was
+                                        # refused, so the profile keeps a
+                                        # superseded credential unmarked. It
+                                        # is counted for the reason the arms
+                                        # below are: otherwise the staged
+                                        # copies are discarded and this is
+                                        # reported as a success.
+                                        failures += 1
                                 except OSError:
                                     from claude_swap.session import (
                                         mark_session_stale,

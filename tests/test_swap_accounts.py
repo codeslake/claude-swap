@@ -2091,12 +2091,102 @@ class TestTheRollbackDecidesPerKey:
             f"marker, and nothing said so: {said!r}"
         )
 
+    def test_a_refused_overlap_clear_is_not_called_a_restore(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The overlap arm CLEARS a key; nothing was restored there.
+
+        `original` is falsy in that branch, so no write is attempted -- and
+        the per-key handler said `restore failed` about a step that never
+        ran. The verb is chosen from `original` now, and this is what makes
+        the choice observable: without it, pinning the word back to "restore"
+        changes nothing the suite can see.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-org")
+        switcher._write_account_credentials("2", email, "creds-personal")
+
+        def refusing(num, mail, *a, **k):
+            raise PermissionError(errno.EACCES, "injected: strict delete")
+
+        switcher._delete_account_credentials_strict = refusing
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", email, "", "",
+                "2", email, "", "",
+                staging={}, moved=[], wrote_backups=True,
+            )
+        said = " ".join(records)
+        assert "clear failed" in said, (
+            "the overlap arm CLEARS a key and no restore was attempted, so "
+            f"naming it a restore describes a step that never ran: {said!r}"
+        )
+        assert "restore failed" not in said, (
+            f"a delete was reported as a failed restore: {said!r}"
+        )
+
+    def test_a_LIVE_crossed_profile_neither_lever_reached_keeps_them_too(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The same end state through the door the sibling case cannot see.
+
+        Its sibling makes the chokepoint RAISE. When the crossed profile is
+        LIVE the chokepoint does not raise at all: it takes its marker branch,
+        logs a denied marker and returns normally -- so the rollback learns
+        nothing, `failures` stays 0, the staged pre-swap copies are discarded
+        and the summary reports success. Identical state, and this is the
+        likelier door: the crossed profile is the one MOST likely to be live.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        crossed.mkdir(parents=True, exist_ok=True)
+        (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
+
+        switcher._live_session_pids = (
+            lambda num, email, *a, **k:
+            [4242] if (num, email) == ("1", mail_b) else []
+        )
+        staged = switcher.backup_dir / ".swap-staging-probe"
+        staged.write_text("pre-swap-copy", encoding="utf-8")
+        import claude_swap.session as _session
+        real_mark = _session.mark_session_stale
+        _session.mark_session_stale = lambda _d: False
+        try:
+            with caplog_at_error() as records:
+                switcher._rollback_swap(
+                    "1", mail_a, "creds-a", "{}",
+                    "2", mail_b, "creds-b", "{}",
+                    staging={"creds-1": staged}, moved=moved,
+                    wrote_backups=True,
+                )
+        finally:
+            _session.mark_session_stale = real_mark
+
+        said = " ".join(records)
+        assert "could not be marked stale" in said, (
+            "premise: the live marker branch did not fire, so the staged "
+            f"copies below survive or vanish for another reason: {said!r}"
+        )
+        assert staged.exists(), (
+            "the staged pre-swap copy was discarded although the live crossed "
+            "profile keeps a superseded credential with no marker — the "
+            "chokepoint swallowed the refusal and the rollback reported success"
+        )
+
     def test_a_crossed_profile_neither_lever_reached_keeps_the_staged_copies(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
         """The worse of the two repair failures was the uncounted one.
 
-        Its `except Exception` sibling four lines below counts, and says why:
+        Its `except Exception` sibling further down counts, and says why:
         without the count the staged copies are discarded. The `OSError` arm
         did not, so in the one state where a profile keeps serving a
         superseded credential with NO marker, the rollback threw away every
@@ -2151,7 +2241,11 @@ class TestTheRollbackDecidesPerKey:
             "nothing about what it accounts for"
         )
         said = " ".join(records)
-        assert "crossed session profile" in said, (
+        # THE FRAGMENT ONLY THIS ARM SAYS. Its `except Exception` sibling
+        # emits "crossed session profile" too AND counts, so that phrase is
+        # satisfied when the injected error falls through to the sibling --
+        # measured: retyping this arm's `except` leaves this case green.
+        assert "OR mark it stale" in said, (
             "premise: the arm under test did not fire, so the staged copies "
             f"below survive for an unrelated reason: {said!r}"
         )
