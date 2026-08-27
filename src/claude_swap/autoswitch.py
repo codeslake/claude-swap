@@ -621,8 +621,21 @@ def _binding_recovery_ts(
     # last as unknowable while the announcement named a moment for it. With no
     # tied window naming one there is nothing to take the latest of, and both
     # readers say unknown.
+    # THE BLOCKERS, NOT THE TIE. Once anything is at the limit the account is
+    # back when the LAST blocker resets, and every window at or above 100 is
+    # one -- which is exactly the set `limiting_reset_ts` reads. Narrowing to
+    # the max-pct tie made the two agree only when the blockers carried an
+    # IDENTICAL pct; one ulp apart and the ranking said unknowable while the
+    # announcement named a moment. Nothing holds them equal: `utilization` is
+    # copied through unclamped, and `account_headroom` documents <= 0 as "at
+    # OR OVER a limit". Below 100 nothing is blocking and the binding window
+    # is the max-pct tie as before.
+    blocking = (
+        (lambda pct: pct >= 100.0) if binding >= 100.0
+        else (lambda pct: pct == binding)
+    )
     stamps = [ts for ts in
-              (_parse_reset_ts(w[2]) for w in windows if w[1] == binding)
+              (_parse_reset_ts(w[2]) for w in windows if blocking(w[1]))
               if ts is not None]
     return max(stamps) if stamps and max(stamps) > now else float("inf")
 

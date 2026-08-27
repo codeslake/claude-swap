@@ -5910,10 +5910,10 @@ class TestHorizonAxisDoesNotFlap:
     def test_the_recovery_leg_requires_the_actives_reset_to_be_known_not_merely_absent(
         self, temp_home
     ):
-        """`_binding_recovery_ts` returns `inf` for FIVE states, only two
-        of which mean "never" (unreadable, token-expired
-        sentinel) -- unknown resets_at and a stale/past resets_at both also
-        return `inf` but mean "we do not know", not "never". The old
+        """`_binding_recovery_ts` returns `inf` in THREE states, and NONE of
+        them means "never": no relevant window at all, no blocking window
+        naming a parseable `resets_at`, and every blocking reset already
+        elapsed. All three mean "we do not know". The old
         predicate `peer < active - HYST` treats all of them alike, so an
         active whose `resets_at` is simply unreported reads as WORSE than a
         peer that is finite but arbitrarily far out (400h), and the bar
@@ -5978,7 +5978,7 @@ class TestHorizonAxisDoesNotFlap:
     def test_the_isfinite_guard_must_not_hold_when_a_near_peer_is_available(
         self, temp_home
     ):
-        """`math.isfinite(active_recovery_ts)` reads ALL FIVE `inf` states
+        """`math.isfinite(active_recovery_ts)` reads ALL THREE `inf` states
         as "unknown, hold" -- but two of them are
         ordinary API shapes for an active that is plainly alive and burning:
         no `resets_at` reported, or a `resets_at` already elapsed. On those
@@ -10259,6 +10259,41 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
             "seven_day": {"pct": 40.0, "resets_at": _iso_at(now + 4 * 86400)},
         }
         assert _binding_recovery_ts(usage, (), now) == pytest.approx(now + 40 * 60)
+
+    def test_the_two_readers_agree_when_the_blockers_are_NOT_tied(
+        self, harness
+    ):
+        """A TIE AT 100 IS SUFFICIENT FOR AGREEMENT, NOT THE BOUNDARY OF IT.
+
+        `_binding_recovery_ts` narrowed to the max-pct tie; the announcement
+        takes EVERY window at or above 100. Those are the same subject only
+        when the blockers carry an identical pct -- one ulp apart and the
+        ranking says unknowable while the announcement names a moment, which
+        is the crossing this function has now been corrected for twice.
+
+        Nothing is at 100 by contract: `build_usage_result` copies
+        `utilization` through with no clamp, and `account_headroom` documents
+        <= 0 as "at OR OVER a limit".
+        """
+        now = 1_000_000.0
+
+        def iso(dt):
+            import time as _t
+            return _t.strftime("%Y-%m-%dT%H:%M:%SZ", _t.gmtime(now + dt))
+
+        from claude_swap.autoswitch import _binding_recovery_ts
+        from claude_swap.poll_policy import limiting_reset_ts
+
+        usage = {"five_hour": {"pct": 100.0, "resets_at": iso(2400)},
+                 "seven_day": {"pct": 100.5}}
+        ranked = _binding_recovery_ts(usage, (), now)
+        announced = limiting_reset_ts(usage, ())
+        assert ranked == announced, (
+            "two windows are blocking at unequal pct: the ranking reads "
+            f"{ranked!r} and the announcement {announced!r}, so the engine "
+            "sorts an account as unknowable while telling the user when it "
+            "comes back"
+        )
 
     def test_the_two_readers_agree_on_a_partly_unknown_tie(self, harness):
         """THE INVARIANT THIS CLASS IS NAMED FOR, and the shape that broke it
