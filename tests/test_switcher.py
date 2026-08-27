@@ -12485,10 +12485,19 @@ class TestTheLiveCredentialIsReadThroughTheStore:
             seen.append({"args": a, "kwargs": kw})
             return None
 
+        real_fetch = switcher_mod.fetch_policy_limits
         monkeypatch.setattr(switcher_mod, "fetch_policy_limits", _spy)
         s._refresh_policy_cache()
         assert seen, "premise: the refresh never called the seam at all"
-        got = seen[0]["kwargs"] if not seen[0]["args"] else {}
+        # BOUND TO THE SIGNATURE, not read off `kwargs`. Collapsing to `{}`
+        # whenever a positional was passed made the budget assertion below
+        # report clean about a call it had not looked at: `timeout_s` handed
+        # over positionally is not in an empty dict either.
+        import inspect
+
+        got = inspect.signature(real_fetch).bind_partial(
+            *seen[0]["args"], **seen[0]["kwargs"]
+        ).arguments
         assert got.get("switcher") is s, (
             "the refresh called the seam without its switcher, so on a "
             f"keychain-only host the fetch has no token to ask with: {seen}"
