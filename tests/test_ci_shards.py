@@ -46,7 +46,7 @@ def _windows_shards() -> list[dict[str, str]]:
             shards.append(current)
         elif line.startswith("paths:"):
             rest = line.split(":", 1)[1].strip()
-            current["paths"] = "" if rest == ">-" else rest
+            current["paths"] = "" if rest in (">-", ">", "|", "|-", ">+", "|+") else rest
         elif current is not None:
             current["paths"] += " " + line
     assert shards, "no shards parsed out of the matrix"
@@ -110,7 +110,15 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
     assert block, "the test-windows job is gone or was renamed"
     runs = _pytest_run_lines(block.group(1))
     assert runs, "the Windows job no longer invokes pytest — the shards run nowhere"
-    line = " ".join(runs)
+    # ONE INVOCATION, NOT THEIR CONCATENATION. Joined, a second pytest step
+    # anywhere in the job satisfies both markers below for the real shard
+    # command -- the exact collapse this case exists to forbid. It also pins
+    # the count `_mutate_windows_run` already assumes.
+    assert len(runs) == 1, (
+        f"the Windows job invokes pytest {len(runs)} times; the shard markers "
+        f"below would be satisfied across them rather than by one line: {runs!r}"
+    )
+    line = runs[0]
     assert "${{ matrix.paths }}" in line, (
         "the Windows pytest command does not consume `matrix.paths`, so the "
         f"shard matrix is dead data and every shard runs the same thing: {line!r}"
@@ -123,6 +131,24 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
 
 def test_the_windows_job_consumes_the_shard_matrix():
     _assert_windows_job_consumes_the_matrix(_WORKFLOW)
+
+
+def test_a_step_named_for_pytest_that_runs_nothing_is_refused(tmp_path):
+    """The scoping fix had no witness: every case passed with it reverted.
+
+    Keying anywhere in the job rather than on the `run:` line accepts a step
+    whose NAME says pytest while its command does something else -- and
+    "Run pytest on macOS" is the most ordinary step name there is. Measured:
+    with the reader loosened back to a bare search over the block, this is the
+    only case that fails.
+    """
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    renamed = _mutate_macos_run(text, "\n        name: Run pytest on macOS")
+    assert renamed != text, "nothing was mutated — this check lost its subject"
+    fake = tmp_path / "ci.yml"
+    fake.write_text(renamed, encoding="utf-8")
+    with pytest.raises(AssertionError, match="no longer invokes pytest"):
+        _assert_macos_job_is_intact(fake)
 
 
 def _mutate_windows_run(text: str, repl: str) -> str:
@@ -174,12 +200,39 @@ def _pytest_run_lines(job: str) -> list[str]:
     ON THE `run:` LINE, not anywhere in the block. Keyed loosely, the word in a
     step's `name:` answers yes while the command does nothing -- and `name: Run
     pytest on macOS` is the most ordinary step name there is, so the loose form
-    is both a false clean and a false alarm. This matches how the mutation
-    helper below selects its target; when the two disagree, the case tests its
-    own scaffolding rather than the workflow.
+    is both a false clean and a false alarm.
+
+    Block scalars are folded first, because `run: |` is a legal spelling of the
+    same command and the header alone carries no `pytest`: read literally it
+    reports a job that tests everything as testing nothing.
+
+    WHAT THIS STILL CANNOT DO, stated rather than discovered: the two mutation
+    helpers below select their target with a line regex and do NOT fold. On a
+    workflow written with block scalars they raise "no pytest invocation to
+    mutate" -- a loud refusal, which is the safe direction, but the cases then
+    test their own scaffolding rather than the workflow.
     """
+    lines, folded, i = job.splitlines(), [], 0
+    while i < len(lines):
+        head = re.match(r"(\s*)run: *[|>][-+]?\s*$", lines[i])
+        if not head:
+            folded.append(lines[i])
+            i += 1
+            continue
+        # A BLOCK SCALAR IS THE SAME COMMAND. `run: |` puts the invocation on
+        # the following, deeper-indented lines; read literally the header has
+        # no `pytest` in it and the job reads as running nothing.
+        indent, body = len(head.group(1)), []
+        i += 1
+        while i < len(lines) and (
+            not lines[i].strip()
+            or len(lines[i]) - len(lines[i].lstrip()) > indent
+        ):
+            body.append(lines[i].strip())
+            i += 1
+        folded.append(head.group(1) + "run: " + " ".join(x for x in body if x))
     return [
-        ln for ln in job.splitlines()
+        ln for ln in folded
         if re.match(r"\s*run: ", ln) and re.search(r"(?<![\w-])pytest(?![\w-])", ln)
     ]
 
