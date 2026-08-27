@@ -380,6 +380,50 @@ def _uncomment(text: str) -> str:
     return text
 
 
+def _shell_commands(line: str) -> list[str]:
+    """One shell line split into the commands it actually runs.
+
+    A `;`, `&&` or `||` chain is several commands on one line, and reading
+    them as one hides a second invocation exactly as joining a block scalar's
+    lines did -- the shard command loses `-o testpaths=` while a harmless
+    second `pytest` on the same line carries it.
+
+    QUOTES AND `${{ }}` ARE SKIPPED. GitHub's own expression syntax uses `&&`
+    and `||`, so splitting inside `${{ ... }}` would cut a CORRECT command in
+    half -- the false refusal, again.
+    """
+    out, buf, quote, i, n = [], "", None, 0, len(line)
+    while i < n:
+        two = line[i:i + 2]
+        if quote:
+            if line[i] == "\\" and quote == '"':
+                buf += line[i:i + 2]
+                i += 2
+                continue
+            if line[i] == quote:
+                quote = None
+        elif line[i] in "'\"":
+            quote = line[i]
+        elif line.startswith("${{", i):
+            end = line.find("}}", i)
+            end = n if end < 0 else end + 2
+            buf += line[i:end]
+            i = end
+            continue
+        elif two in ("&&", "||"):
+            out.append(buf)
+            buf, i = "", i + 2
+            continue
+        elif line[i] == ";":
+            out.append(buf)
+            buf, i = "", i + 1
+            continue
+        buf += line[i]
+        i += 1
+    out.append(buf)
+    return [c.strip() for c in out if c.strip()]
+
+
 def _pytest_run_lines(job: str) -> list[str]:
     """The job's `run:` lines that invoke pytest.
 
@@ -408,7 +452,15 @@ def _pytest_run_lines(job: str) -> list[str]:
         head = re.match(
             r"(\s*)run: *([|>])[-+]?\d*[-+]?\s*(?:#.*)?$", lines[i])
         if not head:
-            folded.append(_uncomment(lines[i]))
+            # A PLAIN `run:` LINE IS A SHELL LINE TOO, so a chain on it
+            # hides a second invocation the same way.
+            head_run = re.match(r"(\s*)run: +(\S.*)$", lines[i])
+            if head_run:
+                folded += [head_run.group(1) + "run: " + c
+                           for c in _shell_commands(
+                               _uncomment(head_run.group(2)))]
+            else:
+                folded.append(_uncomment(lines[i]))
             i += 1
             continue
         # A BLOCK SCALAR IS THE SAME COMMAND. `run: |` puts the invocation on
@@ -450,8 +502,9 @@ def _pytest_run_lines(job: str) -> list[str]:
                 group.append(raw.strip())
             if group:
                 groups.append(group)
-            folded += [pad + "run: " + _uncomment(" ".join(g))
-                       for g in groups if g]
+            folded += [pad + "run: " + c
+                       for g in groups if g
+                       for c in _shell_commands(_uncomment(" ".join(g)))]
             continue
         # `|` KEEPS ITS LINES SEPARATE, so each is its own command and joining
         # them hides a second invocation inside one block. A trailing
@@ -464,7 +517,8 @@ def _pytest_run_lines(job: str) -> list[str]:
                 buf = ""
         if buf:
             logical.append(buf)
-        folded += [pad + "run: " + _uncomment(x) for x in logical]
+        folded += [pad + "run: " + c for x in logical
+                   for c in _shell_commands(_uncomment(x))]
     return [
         ln for ln in folded
         if re.match(r"\s*run: ", ln) and re.search(r"(?<![\w-])pytest(?![\w-])", ln)
