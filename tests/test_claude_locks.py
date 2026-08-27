@@ -6,6 +6,7 @@ import errno
 import logging
 import os
 import shutil
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1169,6 +1170,34 @@ class TestATransientErrnoIsNotFatalToTheHold:
             f"the probe measured {got}ns on a filesystem that keeps {want}ns "
             f"(fake floor {fs_quantum}ns over a host that keeps {host}ns)"
         )
+
+    def test_a_directory_we_cannot_write_answers_1_rather_than_raising(
+        self, tmp_path
+    ):
+        """The docstring promises an `int`; the probe's create must be caught.
+
+        Its one production caller catches `BaseException`, which hides this
+        from everything except a direct call -- and three cases in this file
+        are direct calls.
+        """
+        d = tmp_path / "ro"
+        d.mkdir()
+        os.chmod(d, 0o500)
+        try:
+            # THE CONTROL. Root ignores the mode, and then the probe measures
+            # the real quantum -- which is 1 on this filesystem, i.e. the same
+            # answer for the opposite reason.
+            try:
+                fd, name = tempfile.mkstemp(dir=d)
+            except OSError:
+                pass
+            else:
+                os.close(fd)
+                os.unlink(name)
+                pytest.skip("this user can write the mode-0500 directory")
+            assert claude_locks._mtime_quantum_ns(d) == 1
+        finally:
+            os.chmod(d, 0o700)
 
     def test_a_filesystem_coarser_than_every_candidate_answers_1(
         self, tmp_path, monkeypatch
