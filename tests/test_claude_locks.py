@@ -494,6 +494,111 @@ class TestTheAcquireAndReleaseAreBounded:
             "identity read, pinned to an inode it then unlinked"
         )
 
+    def _successor_at(self, lock, mtime_ns):
+        """Replace the lock with a fresh directory carrying `mtime_ns`."""
+        os.rmdir(lock)
+        os.mkdir(lock)
+        os.utime(lock, ns=(mtime_ns, mtime_ns))
+        return os.stat(lock).st_ino
+
+    @pytest.mark.parametrize(
+        "offset_ns,label",
+        [(-2_000_000_000, "stamped BEFORE our last write"),
+         (2_000_000_000, "stamped AFTER it, adopted through a failed read-back")],
+    )
+    def test_an_unproven_tick_forbids_the_release_from_removing(
+        self, tmp_path, monkeypatch, caplog, offset_ns, label
+    ):
+        """UNPINNED. A separate READING cannot make the release independent.
+
+        `os.utime` writes to the NAME and the read-back reads from the NAME,
+        so one tick that proceeds without exact equality makes `last_stamp`
+        equal whatever is at that path -- and a strict comparison then matches
+        a SUCCESSOR's directory. Both readings share the value, so the only
+        thing that can gate the removal is never having accepted an inexact
+        one.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+
+        lock = tmp_path / "target.lock"
+        swapped = threading.Event()
+        successor = {}
+
+        real_utime = os.utime
+
+        def take_over_once(path, *a, **k):
+            out = real_utime(path, *a, **k)
+            if (not swapped.is_set() and not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)):
+                swapped.set()
+                st = real_utime  # keep the real one for the helper
+                successor["ino"] = self._successor_at(
+                    lock, os.stat(lock).st_mtime_ns + offset_ns)
+            return out
+
+        monkeypatch.setattr(claude_locks.os, "utime", take_over_once)
+        caplog.set_level(logging.WARNING, logger="claude-swap")
+        with proper_lockfile(lock, timeout=2.0, staleness=60.0):
+            for _ in range(150):
+                if swapped.is_set():
+                    break
+                time.sleep(0.02)
+            time.sleep(0.15)   # ticks that could adopt the successor
+
+        assert swapped.is_set(), "premise: the takeover never fired"
+        assert lock.is_dir(), (
+            f"the release removed a SUCCESSOR's lock ({label}) — its holder "
+            "is now running unprotected and the name is free for a third "
+            "waiter"
+        )
+        assert os.stat(lock).st_ino == successor["ino"], (
+            "premise: the directory on disk is no longer the successor's, so "
+            "this asserts nothing about whose lock survived"
+        )
+        # WHICH REFUSAL, not merely that one happened. A strict mismatch
+        # leaves the lock too, so "it survived" passes even when the tick
+        # never noticed it had adopted a stranger's stamp — the read-back's
+        # own check is what this distinguishes.
+        assert any("unproven stamp" in r.getMessage() for r in caplog.records), (
+            "the lock survived, but by the strict comparison rather than "
+            "because the tick recorded that it could not prove ownership: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_a_toucher_that_cannot_start_leaves_nothing_behind(
+        self, tmp_path, monkeypatch
+    ):
+        """The window between the acquire's `break` and the body's `try`.
+
+        `RuntimeError: can't start new thread` there left the descriptor open
+        AND the directory on disk with nobody holding it. On a credentials
+        lock that blocks Claude Code's own refresh for the whole staleness
+        window, and the next switch then blames Claude Code for a lock this
+        process abandoned.
+        """
+        lock = tmp_path / "target.lock"
+        have_proc = os.path.isdir("/proc/self/fd")
+        before = len(os.listdir("/proc/self/fd")) if have_proc else None
+
+        def refuse(self):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(threading.Thread, "start", refuse)
+        with pytest.raises(RuntimeError):
+            with proper_lockfile(lock, timeout=0.5):
+                pass
+        monkeypatch.undo()
+
+        assert not lock.exists(), (
+            "the lock directory was left on disk with no heartbeat and no "
+            "holder, so every waiter is blocked for the staleness window"
+        )
+        if have_proc:
+            assert len(os.listdir("/proc/self/fd")) <= before, (
+                "the descriptor was stranded on an inode nothing will unlink"
+            )
+
     def test_an_external_rewind_is_not_read_as_a_takeover(
         self, tmp_path, monkeypatch
     ):
@@ -531,9 +636,14 @@ class TestTheAcquireAndReleaseAreBounded:
             f"the heartbeat stopped after an external REWIND ({before} -> "
             f"{after}) — an mtime that moved backwards was read as a takeover"
         )
-        assert not lock.exists(), (
-            "the release left the lock behind on a rewind it should have "
-            "recognised as its own"
+        # THE LOCK IS LEFT, AND THAT IS THE TRADE. A rewind is one of the
+        # states no reading can tell from a successor stamped in the past, so
+        # the heartbeat keeps beating (this case's subject) and the release
+        # refuses to remove what it cannot prove. The stale sweep recovers a
+        # lock left behind; nothing recovers a successor's lock removed
+        # inside its critical section.
+        assert lock.exists(), (
+            "the release removed a lock a rewind had made unprovable"
         )
 
     def test_the_release_does_not_wait_out_a_stalled_tick(

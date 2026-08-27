@@ -211,6 +211,14 @@ def proper_lockfile(
     # a stalled `utime` would otherwise hold a `finally` that a single switch
     # reaches three times.
     adopt_stamp = False
+    # SET BY ANY TICK THAT PROCEEDED WITHOUT EXACT EQUALITY, and never
+    # cleared. `os.utime` writes to the NAME and the read-back reads from the
+    # NAME, so one lenient tick makes `last_stamp` equal whatever is at that
+    # path -- and the release's strict comparison then matches a SUCCESSOR's
+    # directory and removes it. A separate reading cannot fix that, because
+    # both readings share the value. Only never having accepted an inexact
+    # one can, so the release requires this to still be False.
+    unproven = False
     stamping = None if _CAN_PIN_A_DIRECTORY else threading.Lock()
     _tick_guard = nullcontext() if stamping is None else stamping
 
@@ -238,28 +246,32 @@ def proper_lockfile(
           costs a lock left for the stale sweep; the other direction removes a
           successor's lock inside its critical section.
         """
-        nonlocal adopt_stamp, last_stamp
+        nonlocal adopt_stamp, last_stamp, unproven
         st = os.stat(lock_dir)
         if (st.st_dev, st.st_ino) != ident:
             return False
         if _CAN_PIN_A_DIRECTORY:
             return True
-        if adopt_stamp and not strict:
-            # OUR OWN `utime` landed and its read-back did not, so this stamp
-            # is ours rather than a successor's. Condemning it would end the
-            # heartbeat over a transient read.
-            last_stamp, adopt_stamp = st.st_mtime_ns, False
+        if st.st_mtime_ns == last_stamp:
             return True
         if strict:
-            return st.st_mtime_ns == last_stamp
-        return st.st_mtime_ns <= last_stamp
-
-    # WINDOWS HAS NO FIX HERE, and this says so rather than implying one. The
-    # stamp above narrows the window; it cannot close it, because the tick's
-    # own read-back adopts whatever the path now carries.
+            return False
+        # EVERYTHING BELOW KEEPS THE HEARTBEAT ALIVE WITHOUT PROVING THE
+        # DIRECTORY IS OURS, so the release may no longer remove it. A
+        # rewind, and a stamp adopted after a failed read-back, are both
+        # states where refusing would end the heartbeat on a lock nobody
+        # took -- which is how it goes stale and really is taken.
+        if adopt_stamp:
+            last_stamp, adopt_stamp = st.st_mtime_ns, False
+            unproven = True
+            return True
+        if st.st_mtime_ns < last_stamp:
+            unproven = True
+            return True
+        return False
 
     def _touch() -> None:
-        nonlocal adopt_stamp, last_stamp
+        nonlocal adopt_stamp, last_stamp, unproven
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
         # OSError: return` over both syscalls meant a single EIO or ESTALE --
         # the ordinary errnos on a network `~/.claude` -- ended the heartbeat
@@ -273,25 +285,53 @@ def proper_lockfile(
                 except FileNotFoundError:
                     return  # gone; nothing left to keep alive
                 except OSError:
-                    continue  # unreadable this tick, not stolen
+                    # UNREADABLE THIS TICK, NOT STOLEN. The refresh below
+                    # still runs, because a stat that fails leaves the mtime
+                    # where it was and a run of them is the frozen heartbeat
+                    # a waiter takes over mid-swap. It is not proof, though.
+                    unproven = True
+                # A STAMP WE CHOOSE, so the read-back can be CHECKED. With
+                # a bare `utime` the value is "now", nobody can predict it,
+                # and the read-back then takes whatever is at the name --
+                # which is a SUCCESSOR's mtime when a takeover lands between
+                # the identity check and here. That is the one write that
+                # made the release's own comparison agree with a stranger.
+                stamp = time.time_ns()
                 try:
-                    os.utime(lock_dir)
+                    os.utime(lock_dir, ns=(stamp, stamp))
                 except FileNotFoundError:
                     return
-                except OSError:
+                except OSError as e:
+                    _warn_frozen(e)
                     continue
+                last_ok = time.time()
                 if not _CAN_PIN_A_DIRECTORY:
                     try:
-                        last_stamp = os.stat(lock_dir).st_mtime_ns
+                        seen = os.stat(lock_dir).st_mtime_ns
                     except OSError:
                         # Our own write landed and we could not read what it
-                        # wrote, so the stamp is behind the disk. Adopt the
-                        # next tick's rather than condemn it.
+                        # wrote. Adopt the next tick's rather than condemn it
+                        # -- but never let the release act on it.
                         adopt_stamp = True
+                        unproven = True
+                    else:
+                        if seen == stamp:
+                            last_stamp = stamp
+                        else:
+                            # Either somebody replaced the directory under us
+                            # or this filesystem coarsened the value. Neither
+                            # is proof, and the safe reading of both is the
+                            # same: keep beating, remove nothing.
+                            last_stamp = seen
+                            unproven = True
 
     toucher = threading.Thread(target=_touch, daemon=True)
-    toucher.start()
     try:
+        # STARTED INSIDE THE `try`. A `RuntimeError: can't start new thread`
+        # here left the descriptor open AND the lock directory on disk, with
+        # nobody holding it -- on a credentials lock that blocks Claude
+        # Code's own refresh for the full staleness window.
+        toucher.start()
         yield
     finally:
         stop_touching.set()
@@ -314,6 +354,15 @@ def proper_lockfile(
                     "Lock %s: its heartbeat did not return within %.1fs, so "
                     "the release cannot prove the lock is still ours; leaving "
                     "it for the stale sweep", lock_dir, _RELEASE_WAIT_S,
+                )
+            elif unproven:
+                # A tick kept the lock alive without ever proving it ours, so
+                # the strict comparison below would be reading a stamp that
+                # tick may have taken off a successor's directory.
+                _logger.warning(
+                    "Lock %s: the heartbeat proceeded on an unproven stamp, "
+                    "so the release cannot prove the lock is ours; leaving it "
+                    "for the stale sweep", lock_dir,
                 )
             elif _ours(strict=True):
                 os.rmdir(lock_dir)
