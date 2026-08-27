@@ -3020,10 +3020,11 @@ _SANCTIONED_PRINTERS = {"_note", "_warn"}
 #: through any of these dies in the screen blank exactly as `print` does.
 _PRINTERS = {"print", "warning", "error"}
 
-#: Module names whose `.warning`/`.error` IS the printer's. A LOGGER also
-#: answers to those two, and seven modules here hold a module-level
-#: `_logger = logging.getLogger(...)`, so matching any Name base turns the
-#: CURE into an offender the moment this module adopts that idiom.
+#: Fallback when the source binds the printer module under no name we can
+#: see. A LOGGER answers to `.warning`/`.error` too, and five modules here
+#: hold a module-level `_logger = logging.getLogger(...)`, so matching any
+#: Name base turns the CURE into an offender the moment this module adopts
+#: that idiom.
 _PRINTER_MODULES = {"printer"}
 
 
@@ -3045,6 +3046,16 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
     import ast
 
     tree = ast.parse(src)
+    # THE SOURCE'S OWN NAMES, not a literal. `from claude_swap import printer
+    # as p` binds the module under `p`, and a literal set misses it -- a miss
+    # this guard did not have before the set was introduced.
+    bases = set(_PRINTER_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "claude_swap":
+            bases |= {a.asname or a.name for a in node.names if a.name == "printer"}
+        elif isinstance(node, ast.Import):
+            bases |= {a.asname for a in node.names
+                      if a.name == "claude_swap.printer" and a.asname}
     found: list[tuple[int, int]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -3053,7 +3064,7 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
         if isinstance(f, ast.Name):
             called = f.id
         elif (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
-                and f.value.id in _PRINTER_MODULES):
+                and f.value.id in bases):
             called = f.attr
         else:
             continue
@@ -3155,6 +3166,10 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             ("a module alias", "printer.warning('x')", True),
             ("printer.error too", "printer.error('x')", True),
             ("a keyword-only notice", "printer.warning(msg='x')", True),
+            ("a blank-line separator", "print()", False),
+            ("an ALIASED printer module",
+             "import x\nfrom claude_swap import printer as p\np.warning('x')",
+             True),
             ("the logger, which is the CURE", "self._logger.warning('x')", False),
             ("a MODULE-LEVEL logger, the sibling modules' idiom",
              "_logger.warning('x')", False),
