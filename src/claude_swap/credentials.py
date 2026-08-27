@@ -1303,8 +1303,14 @@ class CredentialStore:
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
-    ) -> None:
+    ) -> bool:
         """Write account credentials to backup (pure I/O — no session invalidation).
+
+        Returns whether the write RETAINED a previous generation, i.e. whether
+        it displaced a value that differed from the one going in. The rollback
+        purge keys on that answer, so the type is load-bearing: the switcher
+        wrapper and `_retain_previous_backup` were both updated and this one
+        was missed, which `uv run pytest` cannot see.
 
         macOS writes the Keychain when usable, then reconciles the ``.enc`` away
         (see ``_reconcile_enc_after_keychain_write``). When the Keychain is unusable

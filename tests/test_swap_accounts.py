@@ -1242,3 +1242,148 @@ class TestSwapUnreadableSourceIsNotAbsent:
         )
         assert switcher._read_account_credentials("1", email) == "gen2-1"
         assert switcher._read_account_credentials("2", email) == "gen2-2"
+
+
+def _session_token_of(num: str) -> str:
+    return '{"claudeAiOauth": {"accessToken": "SESSION-TOKEN-OF-SLOT-%s"}}' % num
+
+
+class TestTheReverseCanFailAndTheSkipMustSeeIt:
+    """`_swap_session_dirs` swallows `OSError` by design, so the rollback's
+    reverse can put back FEWER profiles than the forward move took.
+
+    The value-equal skip then finds both backups already holding their
+    originals, writes nothing, and `_post_backup_write` never invalidates the
+    profiles that are still crossed -- so both slots keep serving each other's
+    session token, live, with no warning that says so. Base was clean here
+    only because its unconditional restore write masked it; this branch
+    removed the masking without replacing it.
+    """
+
+    def _seed(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def test_a_leftover_swapping_dir_leaves_both_profiles_crossed(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """NO INJECTED FAILURE. The only seeded state is a leftover
+        `.swapping` directory -- which nothing in the codebase removes and an
+        interrupt on any earlier swap leaves behind. It makes the park step
+        raise a real ENOTEMPTY from a real `os.replace`.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"creds-{num}")
+            d = switcher._session_dir(num, email)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "marker").write_text(f"SLOT-{num}-HISTORY")
+            (d / ".credentials.json").write_text(_session_token_of(num))
+
+        strand = switcher._session_dir("2", email)
+        strand = strand.with_name(strand.name + ".swapping")
+        strand.mkdir(parents=True)
+        (strand / "leftover").write_text("from an earlier interrupt")
+
+        calls = {"n": 0}
+        real_write = switcher._write_account_credentials
+
+        def fail_the_first(num, mail, creds):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise CredentialError("injected: the swap dies on its first write")
+            return real_write(num, mail, creds)
+
+        switcher._write_account_credentials = fail_the_first
+        with pytest.raises((CredentialError, ConfigError)):
+            switcher.swap_accounts("1", "2")
+        switcher._write_account_credentials = real_write
+
+        serving = {}
+        for num in ("1", "2"):
+            f = switcher._session_dir(num, email) / ".credentials.json"
+            if f.exists():
+                serving[num] = f.read_text()
+        wrong = {
+            num: text for num, text in serving.items()
+            if text and f"SLOT-{num}" not in text
+        }
+        assert not wrong, (
+            "a session profile was left serving another slot's token with no "
+            f"invalidation: {wrong}"
+        )
+
+
+class TestTheRetentionVerdictIsTheOneReader:
+    """The purge that deletes the user's only recovery generation keys on this
+    single boolean, and flipping its unchanged-value arm to `True` left the
+    whole suite green -- the three guards above it (`wrote_backups`, the
+    value-equal skip, `displaced`) are mutually redundant, so any one of them
+    can be deleted invisibly.
+    """
+
+    def test_an_unchanged_write_displaces_nothing(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        email = "user@example.com"
+        assert switcher._write_account_credentials("1", email, "gen-1") is False, (
+            "premise: the FIRST write has nothing to displace"
+        )
+        assert switcher._write_account_credentials("1", email, "gen-2") is True, (
+            "positive control: replacing a different value must retain a .prev"
+        )
+        assert switcher._write_account_credentials("1", email, "gen-2") is False, (
+            "a write of the value already stored claimed it displaced "
+            "something, so the rollback purge would delete a .prev this "
+            "write never created -- the user's only recovery generation"
+        )
+
+
+class TestTheRollbackSummaryReportsWhatRan:
+    """`wrote_backups` is armed one statement BEFORE the first write, so
+    "armed" and "wrote something" are different claims.
+
+    The old opening line made the second claim from the first fact: with both
+    credential restores skipped it still said "restoring both slots", and the
+    reversal line fired before a reverse that then moved nothing. Both are
+    reachable, and the existing cases only assert a string is ABSENT -- which
+    a rewording satisfies without making the text true.
+    """
+
+    def test_a_rollback_that_restored_nothing_says_so(
+        self, temp_home: Path, sample_sequence_data_with_org: dict, caplog
+    ):
+        import logging
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"creds-{num}")
+
+        real_write = switcher._write_account_credentials
+
+        def die_on_the_first(num, mail, creds):
+            raise CredentialError("injected: the swap dies on its first write")
+
+        switcher._write_account_credentials = die_on_the_first
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises((CredentialError, ConfigError)):
+                switcher.swap_accounts("1", "2")
+        switcher._write_account_credentials = real_write
+
+        said = "\n".join(r.getMessage() for r in caplog.records)
+        assert "rollback:" in said, (
+            "premise: no summary was emitted at all, so this proves nothing"
+        )
+        assert "credentials were restored" not in said, (
+            "the rollback reported restoring credentials while every restore "
+            f"was skipped or refused:\n{said}"
+        )
+        assert "Reversed the session-profile exchange" not in said, (
+            "a reversal that moved nothing was announced as having happened:"
+            f"\n{said}"
+        )

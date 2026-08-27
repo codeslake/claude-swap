@@ -1419,20 +1419,32 @@ class ClaudeAccountSwitcher:
         # profile-only reversal into "restoring both slots", which is the class
         # of wrong text this change exists to remove -- an interrupt just past
         # a rename runs no credential restore at all.
-        if wrote_backups:
-            what = "restoring both slots"
-        elif moved:
-            what = "reversing the session-profile exchange; no credential was written"
-        else:
-            what = "nothing was written, so there is nothing to restore"
-        self._logger.error(f"Swap {num_a} <-> {num_b} failed mid-write; {what}")
+        # ANNOUNCED IN TWO PARTS, because the facts do not exist yet. This
+        # line carries only what is certain here, and survives a rollback that
+        # dies partway; the summary after the loop is built from what actually
+        # ran. `wrote_backups` is armed one statement BEFORE the first write on
+        # purpose, so "armed" and "wrote something" are different claims and
+        # only the second one is a report.
+        self._logger.error(f"Swap {num_a} <-> {num_b} failed mid-write; rolling back")
         failures = 0
+        wrote_any = False
         # Unlike the credential steps below, this is not a no-op when its
         # forward half never ran: with one email the two slots' keys are each
         # other's destinations, so it would exchange two untouched profiles.
+        #
+        # ITS OWN SINK, not a throwaway list. `_swap_session_dirs` swallows
+        # `OSError` by design, so a reverse can put back FEWER profiles than
+        # the forward move took and leave one under the other slot's key. The
+        # value-equal skip below must not then leave it serving that account's
+        # token: reached with nothing injected, a leftover `.swapping`
+        # directory makes the park step raise ENOTEMPTY and both profiles stay
+        # crossed and live.
+        undone: list[Path] = []
         if moved:
-            self._logger.error("Reversing the session-profile exchange")
-            self._swap_session_dirs(num_b, email_a, num_a, email_b, [])
+            self._swap_session_dirs(num_b, email_a, num_a, email_b, undone)
+            if undone:
+                self._logger.error("Reversed the session-profile exchange")
+        crossed = len(undone) < len(moved)
         overlap = email_a == email_b
         # Restoring a key that was never written is not a no-op: rewriting it
         # with the value already under it still drops that slot's session
@@ -1477,7 +1489,8 @@ class ClaudeAccountSwitcher:
                                 num, email)
                         except Exception:  # noqa: BLE001 - a failed read writes
                             now, unread = None, True  # rather than skips
-                        if unread or now != original:
+                        if unread or crossed or now != original:
+                            wrote_any = True
                             if self._write_account_credentials(num, email, original):
                                 displaced.add((num, email))
                     else:
@@ -1497,6 +1510,14 @@ class ClaudeAccountSwitcher:
                 self._logger.error(
                     f"Rollback {kind} restore failed for slot {num}: {e}"
                 )
+        # THE SUMMARY, from what ran — see the two-part note above.
+        if wrote_any:
+            what = "credentials were restored"
+        elif undone:
+            what = "the session-profile exchange was reversed; no credential was written"
+        else:
+            what = "nothing was written, so there was nothing to restore"
+        self._logger.error(f"Swap {num_a} <-> {num_b} rollback: {what}")
         if wrote_backups and email_a != email_b:
             # Drop half-written copies under the new keys; the records still
             # point at the old slots. (When the emails match, the "new" keys
