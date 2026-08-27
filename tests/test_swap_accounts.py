@@ -2092,8 +2092,9 @@ class TestTheRollbackDecidesPerKey:
         — propagates and can never be hidden. The repair sits inside the
         per-key loop, whose `except Exception` counts a failure and carries on
         so one key cannot abort the rest of the rollback. Measured: the block
-        does NOT propagate. Widening the repair's own arm therefore changes
-        nothing, which is why that mutation was undetectable.
+        does NOT propagate. Widening this arm to `Exception` is detectable and
+        must not be done: measured, `failures` then stays 0, the staged copies
+        are discarded and this case fails on `staged.exists()`.
 
         So the property to hold here is not propagation but ACCOUNTING: a
         contained failure must keep the staged copies and say so, or a refused
@@ -2214,6 +2215,16 @@ class TestTheRollbackDecidesPerKey:
             "the marker landed, so the crossed profile IS recorded as "
             f"superseded, and the rollback reported it as unrecorded: {said!r}"
         )
+        # THE CLEAN ARM'S OWN SENTENCE. Every other case here asserts a
+        # NEGATIVE of it, and the one positive sits in the arm above, whose
+        # string is a superset -- so replacing this arm's text with the
+        # opposite arm's left the whole suite green.
+        assert "credentials were restored" in said, (
+            f"a clean rollback did not say what it did: {said!r}"
+        )
+        assert "restore(s) failed" not in said, (
+            f"a clean rollback reported a restore failure: {said!r}"
+        )
 
     def test_staged_copies_are_kept_on_a_partial_rollback(
         self, temp_home: Path, sample_sequence_data_with_org: dict
@@ -2303,6 +2314,66 @@ class TestTheRollbackDecidesPerKey:
             "spared but not marked: setup_session will reuse the superseded "
             "generation once the live session exits"
         )
+
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    def test_a_cleanup_failure_keeps_the_retained_generation(
+        self, temp_home: Path, sample_sequence_data_with_org: dict,
+        cleanup_fails,
+    ):
+        """`not failures` in the purge gate, and the counter that feeds it.
+
+        The cleanup block is the ONLY writer of `failures` after the summary
+        is logged, so the purge gate is its only reader. Neither had a
+        witness: dropping `not failures` from the gate left the suite green,
+        and so did deleting the cleanup's `failures += 1`.
+
+        A partial rollback must preserve the maximum material -- the retained
+        generation is the user's recovery copy when anything about the
+        rollback went wrong, and only a rollback that ran clean may call it
+        contamination.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("1", mail_a, "creds-a-DRIFTED")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        prev = switcher._store._prev_backup_path("1", mail_a)
+        assert prev.exists(), "premise: no retained generation to preserve"
+
+        if cleanup_fails:
+            real_del = switcher._store._delete_account_credentials
+
+            def refusing(num, email, *a, **k):
+                if (num, email) == ("2", mail_a):
+                    raise OSError(errno.EIO, "injected: cleanup refused")
+                return real_del(num, email, *a, **k)
+
+            switcher._store._delete_account_credentials = refusing
+
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+
+        if cleanup_fails:
+            assert "cleanup failed" in " ".join(records), (
+                "premise: the injected cleanup failure never fired, so the "
+                "counter under test was never incremented"
+            )
+            assert prev.exists(), (
+                "a rollback whose cleanup failed purged the retained "
+                "generation anyway — the only recovery copy after a partial "
+                "rollback"
+            )
+        else:
+            assert not prev.exists(), (
+                "CONTROL: a clean rollback must purge the generation it "
+                "contaminated, or the arm above passes for the wrong reason"
+            )
 
     def test_only_a_crossed_key_reaches_into_the_other_slot(
         self, temp_home: Path, sample_sequence_data_with_org: dict

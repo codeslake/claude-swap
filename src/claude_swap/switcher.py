@@ -1559,6 +1559,22 @@ class ClaudeAccountSwitcher:
                                             "generation until its token "
                                             "expires.", other, exc_info=True,
                                         )
+                                except Exception as e:
+                                    # NAMED FOR WHAT FAILED. Anything not an
+                                    # OSError fell through to the per-key
+                                    # handler below, which says "Rollback
+                                    # creds restore failed" -- about a
+                                    # credential restore that in fact landed,
+                                    # in the same report whose summary says
+                                    # credentials were restored. The count
+                                    # still has to happen here: without it
+                                    # the staged copies are discarded.
+                                    failures += 1
+                                    self._logger.error(
+                                        "Rollback could not invalidate slot "
+                                        "%s's crossed session profile: %s",
+                                        other, e,
+                                    )
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:
