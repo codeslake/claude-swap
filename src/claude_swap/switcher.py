@@ -320,15 +320,33 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 _POLICY_FETCH_BUDGET_S = 2.0
 
 
-def fetch_policy_limits(timeout_s: float = _POLICY_FETCH_BUDGET_S) -> "dict | None":
+def fetch_policy_limits(
+    timeout_s: float = _POLICY_FETCH_BUDGET_S, switcher: "object | None" = None
+) -> "dict | None":
     """The active credential's org-policy document, or None if unaskable.
 
     A module-level seam so the switch path has ONE thing to stub, and so the
     credential read lives beside the call that needs it rather than inside a
     method that also writes files.
+
+    THROUGH THE STORE WHEN THERE IS ONE. `get_credentials_path().read_text`
+    alone sees the plaintext file and nothing else, and on macOS the active
+    credential may live in the Keychain with no such file at all -- measured,
+    one of this fleet's two Macs has it and the other does not. There this
+    returned None on every call and the policy refresh went quiet for good.
+    The plaintext read stays as the fallback for callers with no switcher.
     """
+    raw = None
+    if switcher is not None:
+        try:
+            live = switcher._read_active_credentials()
+            if live.value:
+                raw = json.loads(live.value)
+        except Exception:  # noqa: BLE001 — fall through to the file
+            raw = None
     try:
-        raw = json.loads(get_credentials_path().read_text(encoding="utf-8"))
+        if raw is None:
+            raw = json.loads(get_credentials_path().read_text(encoding="utf-8"))
         token = (raw.get("claudeAiOauth") or {}).get("accessToken")
     except Exception:  # noqa: BLE001 — no credential, nothing to ask with
         return None
@@ -567,11 +585,15 @@ class ClaudeAccountSwitcher:
                 return
         except Exception:  # noqa: BLE001 — a switch must not fail on this
             pass
-        # NO-ARG ON PURPOSE: the budget is the seam's own default (see
-        # `_POLICY_FETCH_BUDGET_S`), and the suite replaces this seam with a
-        # no-arg stub -- passing it from here breaks every one of those.
+        # THE BUDGET STAYS THE SEAM'S OWN DEFAULT (see
+        # `_POLICY_FETCH_BUDGET_S`). `switcher` is passed because the seam
+        # cannot reach a keychain-aware read without it, and on a Mac whose
+        # live credential is Keychain-only the plaintext fallback finds
+        # nothing and the refresh returns before it asks. The suite's stubs
+        # take `**kwargs` for that reason -- they used to be no-arg, and the
+        # comment here used to say passing anything would break them.
         try:
-            doc = fetch_policy_limits()
+            doc = fetch_policy_limits(switcher=self)
         except Exception as exc:  # noqa: BLE001 — see the docstring
             self._logger.debug("policy refresh failed, keeping the old answer:"
                                " %r", exc)
@@ -3215,9 +3237,29 @@ class ClaudeAccountSwitcher:
                 blob = json.loads(blob)
             return ((blob or {}).get("claudeAiOauth") or {})
 
+        # THE STORE FIRST, the plaintext file second. On macOS the live
+        # credential may be in the Keychain with no file at all, and the file
+        # read then raises -- so this answered None on every call, and the
+        # tri-state's two consumers went quiet in OPPOSITE directions
+        # (`is True` never fires, `is False` never fires). The store is
+        # keychain-aware and reports `degraded` for the declined case this
+        # docstring argues about, which is the None that must survive.
+        #
+        # The file stays as the fallback because not every caller holds a
+        # fully built switcher: the seam is reached from `pin.py` with an
+        # instance that has a config reader and no credential store.
+        raw = None
         try:
-            live = _oauth(json.loads(
-                get_credentials_path().read_text(encoding="utf-8")))
+            active = self._read_active_credentials()
+            if active.keychain_unavailable:
+                return None
+            raw = active.value or None
+        except Exception:  # noqa: BLE001 — no store here; try the file
+            raw = None
+        try:
+            if raw is None:
+                raw = get_credentials_path().read_text(encoding="utf-8")
+            live = _oauth(json.loads(raw))
         except Exception:  # noqa: BLE001 — unreadable is not a mismatch
             return None
         try:

@@ -5278,7 +5278,8 @@ class TestSwitchSkipsBrokenSlots:
 
         fresh = {"restrictions": {}, "compliance_taints": []}
         monkeypatch.setattr(
-            "claude_swap.switcher.fetch_policy_limits", lambda: fresh)
+            "claude_swap.switcher.fetch_policy_limits",
+            lambda **_kw: fresh)
 
         (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
             {"claudeAiOauth": {"accessToken": "sk-live-1",
@@ -5326,7 +5327,8 @@ class TestSwitchSkipsBrokenSlots:
 
         fresh = {"restrictions": {}, "compliance_taints": []}
         monkeypatch.setattr(
-            "claude_swap.switcher.fetch_policy_limits", lambda: fresh)
+            "claude_swap.switcher.fetch_policy_limits",
+            lambda **_kw: fresh)
 
         # NO `~/.claude.json` oauthAccount: that is what makes `switch()` take
         # the fresh-machine path and `_perform_switch` take the activation
@@ -5357,7 +5359,7 @@ class TestSwitchSkipsBrokenSlots:
         stale = {"restrictions": {"allow_remote_control": {"allowed": True}}}
         policy.write_text(json.dumps(stale))
 
-        def _boom():
+        def _boom(**_kw):
             raise OSError("no network")
 
         monkeypatch.setattr("claude_swap.switcher.fetch_policy_limits", _boom)
@@ -12369,6 +12371,77 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestTheLiveCredentialIsReadThroughTheStore:
+    """Both readers went to the plaintext file and nowhere else.
+
+    On macOS the active credential may live in the Keychain with NO
+    `~/.claude/.credentials.json` at all -- measured across this fleet's two
+    Macs, one has the file and the other does not. There `read_text` raises,
+    both readers answer "unaskable", and three things downstream go quiet in
+    opposite directions because they split the tri-state differently:
+    `pin.py`'s `... is True` never fires, `switcher.py`'s `... is False` never
+    fires, and the policy refresh returns before it asks.
+
+    The class already owns a keychain-aware reader that reports `degraded` for
+    the declined case these docstrings argue about. Use it.
+    """
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def test_a_keychain_only_live_store_is_still_compared(
+        self, temp_home: Path, monkeypatch
+    ):
+        s = self._switcher(temp_home)
+        blob = json.dumps({"claudeAiOauth": {"refreshToken": "rt-1",
+                                             "accessToken": "at-1"}})
+        assert not get_credentials_path().exists(), (
+            "premise: the plaintext file exists, so this proves nothing"
+        )
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(blob, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: blob)
+
+        assert s._live_credential_is("1", "a@example.com") is True, (
+            "a keychain-only live store read as unaskable, so the un-splice "
+            "discriminator is off on exactly the machine it was written for"
+        )
+
+    def test_an_unreadable_store_still_answers_None(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL. `None` has to survive: it is what stops a keychain that
+        declines this process from reading as a different account."""
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(None, True))
+        assert s._live_credential_is("1", "a@example.com") is None
+
+    def test_the_policy_fetch_asks_the_store_too(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import switcher as switcher_mod
+
+        s = self._switcher(temp_home)
+        blob = json.dumps({"claudeAiOauth": {"accessToken": "at-policy"}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(blob, False))
+        seen: list[str] = []
+        monkeypatch.setattr(switcher_mod.oauth, "fetch_policy_limits",
+                            lambda tok, timeout_s=None: seen.append(tok) or {})
+
+        switcher_mod.fetch_policy_limits(switcher=s)
+        assert seen == ["at-policy"], (
+            "the policy fetch found no token, so the refresh returns before it "
+            f"asks on a machine with no plaintext file: {seen}"
+        )
 
 
 class TestThePolicyFetchIsBudgeted:

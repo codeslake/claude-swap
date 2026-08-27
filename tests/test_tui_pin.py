@@ -1060,6 +1060,87 @@ class TestTheCloudBadgeNeedsTheOrganizationToo:
         assert pin.account_is_pinned(("a@example.com", "org-1"), "a@example.com", "") is False
 
 
+class TestTwoSlotsAtOneAddressLightOneBadge:
+    """The behavioural half, and it is the durable one.
+
+    The structural tripwire beside this class matches source SHAPES, and a
+    matcher can be laundered: rename `AccountsPanel._pinned_identity` to
+    something that does not spell a reader, then alias the address, and an
+    email-only badge walks past it with the whole suite green.
+
+    This renders instead. Two accounts at ONE address in DIFFERENT
+    organizations is the entire subject of `account_is_pinned`; an email-only
+    test lights both cards, and no source rewrite hides that from a reader
+    counting badges. The repaint case above uses two DIFFERENT addresses, so
+    it cannot see this.
+    """
+
+    @pytest.mark.asyncio
+    async def test_only_the_pinned_organization_gets_the_badge(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap.tui import dashboard as _dash
+        from claude_swap.tui.widgets import AccountCard, AccountItem
+
+        accounts = [
+            make_account(1, active=True, email="shared@e.com", org_uuid="org-A"),
+            make_account(2, email="shared@e.com", org_uuid="org-B"),
+        ]
+        fake = FakeSwitcher(accounts, tmp_path)
+        monkeypatch.setattr(
+            _dash.pin, "pinned_identity", lambda _sw: ("shared@e.com", "org-B"))
+
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "switch")
+            await settle(pilot)
+
+            cards = [(item.number, item.query_one(AccountCard))
+                     for item in app.screen.query(AccountItem)]
+            assert len(cards) == 2, f"premise: expected two cards, got {cards}"
+            badged = sorted(n for n, c in cards
+                            if "○ cloud" in c.render().plain)
+            assert badged == ["2"], (
+                f"two slots share one address across organizations and the "
+                f"badge landed on {badged} — an email-only answer lights both"
+            )
+
+
+    @pytest.mark.asyncio
+    async def test_the_accounts_panel_badges_one_card_too(
+        self, tmp_path, monkeypatch
+    ):
+        """THE OTHER RENDER SITE. `AccountItem` is fed `cloud_pinned` by
+        `dashboard.py`; `AccountsPanel.render` decides for itself. The case
+        above cannot see this one, and a laundered email-only badge here —
+        the reader attribute renamed, the address aliased — passed the whole
+        suite with the structural tripwire green.
+        """
+        from claude_swap.tui import widgets as _w
+
+        accounts = [
+            make_account(1, active=True, email="shared@e.com", org_uuid="org-A"),
+            make_account(2, email="shared@e.com", org_uuid="org-B"),
+        ]
+        fake = FakeSwitcher(accounts, tmp_path)
+        monkeypatch.setattr(
+            _w.pin, "pinned_identity", lambda _sw: ("shared@e.com", "org-B"))
+
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            panel = app.screen.query_one(_w.AccountsPanel)
+            panel._resolve_and_refresh()
+            text = panel.render().plain
+
+        assert text.count("○ cloud") == 1, (
+            "two slots share one address across organizations and the panel "
+            f"drew {text.count('○ cloud')} badges — an email-only answer "
+            "lights both"
+        )
+
+
 class TestEveryBadgeSiteAsksTheSameQuestion:
     """The structural half. Three widgets each answered it by hand, and the
     third was found only after the first two were fixed -- so assert that none

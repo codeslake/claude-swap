@@ -81,12 +81,16 @@ def make_account(
     email: str | None = None,
     alias: str = "",
     disabled: bool = False,
+    # THE ORG AXIS. Without it no snapshot could express two slots sharing one
+    # address across organizations -- the entire subject of
+    # `pin.account_is_pinned` -- so nothing rendered that pair.
+    org_uuid: str = "",
 ) -> AccountSnapshot:
     return AccountSnapshot(
         number=str(number),
         email=email or f"user{number}@example.com",
         org_name="",
-        org_uuid="",
+        org_uuid=org_uuid,
         is_active=active,
         kind=kind,
         switchable=switchable,
