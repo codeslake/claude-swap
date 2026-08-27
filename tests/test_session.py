@@ -3123,10 +3123,45 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
             # this function -- so an unrelated `_Fmt.print` suppressed a real
             # `print(...)` and the printer went unexported. Only a def in
             # this function's OWN scope shadows the module one.
-            shadowed = {
-                n.name for n in _own_scope(f)
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-            }
+            # EVERY BINDER, not only `def`. A walrus, a `for` target, a
+            # `with ... as`, an `except ... as`, an `import ... as` and a
+            # plain assignment all rebind the name just as a nested `def`
+            # does, and the comment here used to say only a `def` could --
+            # a false statement about Python, and seven shapes reported as
+            # printers for a call to a name they had rebound.
+            shadowed = set()
+            for n in _own_scope(f):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    shadowed.add(n.name)
+                elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                    shadowed |= {(a.asname or a.name).split(".")[0]
+                                 for a in n.names}
+                elif isinstance(n, ast.ExceptHandler) and n.name:
+                    shadowed.add(n.name)
+                else:
+                    tgts = []
+                    if isinstance(n, ast.Assign):
+                        tgts = n.targets
+                    elif isinstance(n, (ast.AnnAssign, ast.AugAssign)):
+                        tgts = [n.target]
+                    elif isinstance(n, ast.NamedExpr):
+                        tgts = [n.target]
+                    elif isinstance(n, ast.For):
+                        tgts = [n.target]
+                    elif isinstance(n, ast.withitem) and n.optional_vars:
+                        tgts = [n.optional_vars]
+                    for t in tgts:
+                        if isinstance(t, ast.Name):
+                            shadowed.add(t.id)
+                        elif isinstance(t, (ast.Tuple, ast.List)):
+                            shadowed |= {e.id for e in t.elts
+                                         if isinstance(e, ast.Name)}
+            # THE CALL SCAN STAYS `ast.walk`, DELIBERATELY. Scoping it the
+            # way the shadow set is scoped would stop seeing a print inside
+            # a nested helper this function calls, and that miss is SILENT.
+            # Left wide it over-reports a function whose nested helper prints
+            # but is never called -- a loud false alarm in the matcher, which
+            # is the direction this guard is allowed to be wrong in.
             if any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
                    and sub.func.id not in shadowed
                    and (sub.func.id == "print" or sub.func.id in found)
@@ -3372,6 +3407,43 @@ def banner(msg):
     print(msg)
 """,
             set(),
+        ),
+        (
+            "a walrus rebinding the name",
+            """
+def banner(msg):
+    (print := (lambda x: x))
+    print(msg)
+""",
+            set(),
+        ),
+        (
+            "an `except ... as` rebinding it",
+            """
+def banner(msg):
+    try: pass
+    except Exception as print: pass
+    print(msg)
+""",
+            set(),
+        ),
+        (
+            "a plain assignment rebinding it",
+            """
+def banner(msg):
+    print = str
+    print(msg)
+""",
+            set(),
+        ),
+        (
+            "a comprehension, which has its OWN scope and shadows nothing",
+            """
+def banner(msg):
+    [print for print in []]
+    print(msg)
+""",
+            {"banner"},
         ),
     ])
     def test_a_shadow_only_counts_in_the_scope_that_binds_it(
