@@ -2172,6 +2172,65 @@ class TestTheRollbackDecidesPerKey:
             f"its failure was not named a restore: {said!r}"
         )
 
+    def test_a_refused_marker_still_purges_the_contaminated_prev(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The point of splitting the counter, and nothing pinned it.
+
+        Counting a refused session marker into `failures` gates the `.prev`
+        purge, and the retained generation is the OTHER account's material
+        under this key -- what the purge block's own comment calls pure
+        contamination. The staging half of that split IS witnessed; this
+        half was not, so re-adding `and not repairs` to the purge gate left
+        the whole file green.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        # A SECOND WRITE, so a `.prev` generation exists for the restore to
+        # displace. Without it `displaced` stays empty and the purge is inert
+        # whatever the counter says.
+        switcher._write_account_credentials("2", mail_b, "creds-b-HALFWRITTEN")
+        prev = switcher._store._prev_backup_path("2", mail_b)
+        assert prev.exists(), (
+            "premise: no retained generation exists, so the purge below has "
+            "nothing to remove and this case cannot see its subject"
+        )
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        crossed.mkdir(parents=True, exist_ok=True)
+        (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
+        switcher._live_session_pids = (
+            lambda num, email, *a, **k:
+            [4242] if (num, email) == ("1", mail_b) else []
+        )
+        import claude_swap.session as _session
+        real_mark = _session.mark_session_stale
+        _session.mark_session_stale = lambda _d: False
+        try:
+            with caplog_at_error() as records:
+                switcher._rollback_swap(
+                    "1", mail_a, "creds-a", "{}",
+                    "2", mail_b, "creds-b", "{}",
+                    staging={}, moved=moved, wrote_backups=True,
+                )
+        finally:
+            _session.mark_session_stale = real_mark
+
+        said = " ".join(records)
+        assert "could not be invalidated or marked stale" in said, (
+            f"premise: the repair did not fail, so nothing was counted: {said!r}"
+        )
+        assert not prev.exists(), (
+            "a refused SESSION MARKER kept this key's retained generation, "
+            "which holds the other account's material -- the marker lives in "
+            "a sibling tree of the credential store and says nothing about "
+            "whether the restores landed"
+        )
+
     def test_a_LIVE_crossed_profile_neither_lever_reached_is_reported_too(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
