@@ -83,7 +83,13 @@ def _mtime_quantum_ns(directory: Path) -> int:
     try:
         probe.touch()
         for quantum in (1, 100, 1_000, 1_000_000, 1_000_000_000, 2_000_000_000):
-            want = (time.time_ns() // quantum) * quantum
+            # AN ODD MULTIPLE, so a coarser filesystem MUST truncate it.
+            # `(t // q) * q` is already a multiple of every coarser quantum
+            # whenever the clock sits on one, so on a two-second mount the
+            # one-second candidate round-tripped for every even second and the
+            # answer came back half what it is -- the stamp is then finer than
+            # the filesystem keeps and every tick latches `unproven`.
+            want = ((time.time_ns() // (2 * quantum)) * 2 + 1) * quantum
             os.utime(probe, ns=(want, want))
             if os.stat(probe).st_mtime_ns == want:
                 return quantum

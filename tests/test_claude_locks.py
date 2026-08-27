@@ -1010,6 +1010,44 @@ class TestATransientErrnoIsNotFatalToTheHold:
             "platform that decides identity by descriptor and never reads one"
         )
 
+    @pytest.mark.parametrize("offset_ns", [0, 1_000_000_000])
+    def test_the_quantum_probe_is_not_fooled_by_an_aligned_candidate(
+        self, tmp_path, monkeypatch, offset_ns
+    ):
+        """A candidate must be REJECTED by a filesystem coarser than itself.
+
+        The probe writes a value derived from the clock and keeps the first
+        candidate that round-trips. Derived as `(t // q) * q`, that value is
+        ALREADY a multiple of any coarser quantum whenever the clock happens to
+        sit on one -- so on a two-second mount the one-second candidate
+        round-trips for every even second and the quantum comes back half what
+        it is. The stamp is then written finer than the filesystem keeps, the
+        read-back differs, `unproven` latches, and the release leaves the lock:
+        exactly the defect the quantisation exists to remove, on half of holds.
+
+        Both parities are exercised, because the wrong answer is the one that
+        only appears on one of them.
+        """
+        quantum = 2_000_000_000
+        real_utime = os.utime
+
+        def coarse_utime(path, *a, **k):
+            ns = k.get("ns")
+            if isinstance(ns, tuple) and len(ns) == 2:
+                k["ns"] = tuple((int(v) // quantum) * quantum for v in ns)
+            return real_utime(path, *a, **k)
+
+        base = (time.time_ns() // (2 * quantum)) * 2 * quantum + offset_ns
+        monkeypatch.setattr(claude_locks.os, "utime", coarse_utime)
+        monkeypatch.setattr(claude_locks.time, "time_ns", lambda: base)
+
+        got = claude_locks._mtime_quantum_ns(tmp_path)
+        assert got == quantum, (
+            f"the probe measured {got}ns on a filesystem that keeps {quantum}ns "
+            "— a stamp written at that granularity cannot round-trip, so every "
+            "tick latches `unproven` and the release removes nothing"
+        )
+
     def test_a_coarse_mtime_still_lets_the_release_remove_its_own_lock(
         self, tmp_path, monkeypatch
     ):
