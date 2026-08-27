@@ -305,6 +305,17 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
                 f"the run must reach a remainder small enough for any flat "
                 f"sleep to overshoot it: {slept}"
             )
+            # AN ATTEMPT COUNT, which is what the remainder assert cannot see.
+            # Detection above is a RESONANCE -- it fires only when the budget
+            # happens to leave a remainder smaller than the sleep -- so a
+            # back-off shrunk 3.3x or 8x lands between the resonances and the
+            # whole suite stays green, at 333 and 800 flock attempts over a
+            # 10s wait. Its three siblings in `test_claude_locks.py` each
+            # carry one for exactly this; this arm was the one without.
+            assert len(slept) <= 6, (
+                f"{len(slept)} sleeps in a {budget}s budget — the retry "
+                "backed off less than it claims to"
+            )
         finally:
             holder.release()
 
