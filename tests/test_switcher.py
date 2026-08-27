@@ -12424,6 +12424,61 @@ class TestTheLiveCredentialIsReadThroughTheStore:
                             lambda: ActiveCredentials(None, True))
         assert s._live_credential_is("1", "a@example.com") is None
 
+    def test_a_degraded_store_read_is_not_a_mismatch(
+        self, temp_home: Path, monkeypatch
+    ):
+        """`degraded` carries the declined keychain, not `keychain_unavailable`.
+
+        `_read_active_credentials` returns `(text, False, keychain_failed)` on
+        the arm where the plaintext file COVERED a failed Keychain read -- so
+        `keychain_unavailable` is hard-coded False exactly when there IS a
+        value to compare, and those bytes are a stale generation, because
+        Claude Code rotates keychain-only on macOS and the file lags.
+        Comparing them answers `False`: a mismatch, about the account that is
+        in fact logged in.
+        """
+        s = self._switcher(temp_home)
+        stale = json.dumps({"claudeAiOauth": {"refreshToken": "rt-previous"}})
+        current = json.dumps({"claudeAiOauth": {"refreshToken": "rt-current"}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(stale, False, True))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: current)
+
+        assert s._live_credential_is("1", "a@example.com") is None, (
+            "a degraded read was compared and called a mismatch -- the guard "
+            "reads keychain_unavailable, which is False on that very arm"
+        )
+
+    def test_the_policy_refresh_hands_the_seam_its_switcher(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CALL SITE, which `..._asks_the_store_too` cannot see.
+
+        That case calls `fetch_policy_limits(switcher=s)` itself, so it stays
+        green when the argument is dropped here -- and every stub in this file
+        takes `**kwargs`, so a no-arg call is accepted everywhere. Dropping it
+        is the revert the comment at that line used to invite, and it silently
+        restores the keychain-only outage the seam was widened to fix.
+        """
+        from claude_swap import pin as pin_mod
+        from claude_swap import switcher as switcher_mod
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(pin_mod, "is_available", lambda: False)
+        seen: list[object] = []
+
+        def _spy(*a, **kw):
+            seen.append(kw.get("switcher", ...) if not a else a[0])
+            return None
+
+        monkeypatch.setattr(switcher_mod, "fetch_policy_limits", _spy)
+        s._refresh_policy_cache()
+        assert seen and seen[0] is s, (
+            "the refresh called the seam without its switcher, so on a "
+            f"keychain-only host the fetch has no token to ask with: {seen}"
+        )
+
     def test_the_policy_fetch_asks_the_store_too(
         self, temp_home: Path, monkeypatch
     ):

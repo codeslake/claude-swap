@@ -585,13 +585,10 @@ class ClaudeAccountSwitcher:
                 return
         except Exception:  # noqa: BLE001 — a switch must not fail on this
             pass
-        # THE BUDGET STAYS THE SEAM'S OWN DEFAULT (see
-        # `_POLICY_FETCH_BUDGET_S`). `switcher` is passed because the seam
-        # cannot reach a keychain-aware read without it, and on a Mac whose
-        # live credential is Keychain-only the plaintext fallback finds
-        # nothing and the refresh returns before it asks. The suite's stubs
-        # take `**kwargs` for that reason -- they used to be no-arg, and the
-        # comment here used to say passing anything would break them.
+        # `switcher` is passed because the seam cannot reach a keychain-aware
+        # read without it: where the live credential is Keychain-only the
+        # plaintext fallback finds nothing and the refresh returns before it
+        # asks. The budget stays the seam's own `_POLICY_FETCH_BUDGET_S`.
         try:
             doc = fetch_policy_limits(switcher=self)
         except Exception as exc:  # noqa: BLE001 — see the docstring
@@ -3241,9 +3238,15 @@ class ClaudeAccountSwitcher:
         # credential may be in the Keychain with no file at all, and the file
         # read then raises -- so this answered None on every call, and the
         # tri-state's two consumers went quiet in OPPOSITE directions
-        # (`is True` never fires, `is False` never fires). The store is
-        # keychain-aware and reports `degraded` for the declined case this
-        # docstring argues about, which is the None that must survive.
+        # (`is True` never fires, `is False` never fires).
+        #
+        # `degraded`, NOT `keychain_unavailable`. The latter is hard-coded
+        # False on the one arm that matters here -- a failed Keychain read
+        # COVERED by the plaintext file -- so it is absent exactly when there
+        # is a value to compare, and those bytes are a stale generation
+        # because Claude Code rotates keychain-only. Comparing them answers
+        # `False`, a mismatch, about the account that IS logged in. `degraded`
+        # is set on every arm the other flag is, so nothing is lost by it.
         #
         # The file stays as the fallback because not every caller holds a
         # fully built switcher: the seam is reached from `pin.py` with an
@@ -3251,7 +3254,7 @@ class ClaudeAccountSwitcher:
         raw = None
         try:
             active = self._read_active_credentials()
-            if active.keychain_unavailable:
+            if active.degraded:
                 return None
             raw = active.value or None
         except Exception:  # noqa: BLE001 — no store here; try the file
