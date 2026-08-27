@@ -3020,6 +3020,12 @@ _SANCTIONED_PRINTERS = {"_note", "_warn"}
 #: through any of these dies in the screen blank exactly as `print` does.
 _PRINTERS = {"print", "warning", "error"}
 
+#: Module names whose `.warning`/`.error` IS the printer's. A LOGGER also
+#: answers to those two, and seven modules here hold a module-level
+#: `_logger = logging.getLogger(...)`, so matching any Name base turns the
+#: CURE into an offender the moment this module adopts that idiom.
+_PRINTER_MODULES = {"printer"}
+
 
 def _print_only_offenders(src: str) -> tuple[list[int], int]:
     """Lines carrying a print-only notice, and how many printer calls were seen.
@@ -3032,9 +3038,9 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
     is a print-only notice the screen blank erases. `printer.warning(...)` as
     well as `warning(...)`: an attribute call has no `.id`.
 
-    A PLAIN NAME BASE, though. `self._logger.warning(...)` is an attribute call
-    whose `attr` is also "warning", and it is the CURE this guards for, not the
-    defect -- taking any `attr` turns every one of them into an offender.
+    A NAMED PRINTER MODULE, though. `self._logger.warning(...)` and a
+    module-level `_logger.warning(...)` are attribute calls whose `attr` is
+    also "warning", and they are the CURE this guards for, not the defect.
     """
     import ast
 
@@ -3046,11 +3052,15 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
         f = node.func
         if isinstance(f, ast.Name):
             called = f.id
-        elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+        elif (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id in _PRINTER_MODULES):
             called = f.attr
         else:
             continue
-        if called not in _PRINTERS or not node.args:
+        # ARGS OR KEYWORDS. `printer.warning(msg="...")` is a print-only
+        # notice with an empty `node.args`, and the filter was inert in both
+        # directions: deleting it changed nothing either.
+        if called not in _PRINTERS or not (node.args or node.keywords):
             continue
         found.append((node.lineno, id(node)))
     # `_note` IS the sanctioned print. Excluded by NODE IDENTITY, not by line
@@ -3144,7 +3154,10 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             ("a bare printer name", "warning('x')", True),
             ("a module alias", "printer.warning('x')", True),
             ("printer.error too", "printer.error('x')", True),
+            ("a keyword-only notice", "printer.warning(msg='x')", True),
             ("the logger, which is the CURE", "self._logger.warning('x')", False),
+            ("a MODULE-LEVEL logger, the sibling modules' idiom",
+             "_logger.warning('x')", False),
             ("a sanctioned printer", "self._warn('x')", False),
         ]
         for label, expr, flagged in cases:
@@ -3167,4 +3180,24 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         assert seen == 2, f"premise: the matcher saw {seen} prints, not 2"
         assert offenders == [5], (
             f"only `other`'s print is an offender; got {offenders}"
+        )
+
+    def test_a_nested_sanctioned_name_does_not_sanction_its_own_print(self):
+        """The exclusion is scoped to CLASS BODIES, and that is load-bearing.
+
+        `ast.walk` reaches a `def _note(...)` written INSIDE the function
+        under test, so an unscoped walk lets one line sanction itself. Nothing
+        held that: replacing the class-body walk with a bare one over the tree
+        left every case green.
+        """
+        src = ("class C:\n"
+               "    def run(self, m):\n"
+               "        def _note(x):\n"
+               "            print(x)\n"
+               "        _note(m)\n")
+        offenders, seen = _print_only_offenders(src)
+        assert seen == 1, f"premise: the matcher saw {seen} prints, not 1"
+        assert offenders == [4], (
+            "a `_note` nested inside a method sanctioned its own print, so "
+            f"the bypass is one line long: {offenders}"
         )
