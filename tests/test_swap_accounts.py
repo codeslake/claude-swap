@@ -453,12 +453,21 @@ class TestSwapUnreadableSourceIsNotAbsent:
 
     @pytest.fixture(autouse=True)
     def _file_mode(self, monkeypatch):
-        """Force the FILE store. These cases make an `.enc`/`.prev`
-        unreadable to reach the file reader; on macOS a usable Keychain takes
-        the write instead, so there is no file to `chmod` (FileNotFoundError)
-        and the retained generation lands where `_prev_backup_path` cannot
-        see it. Scoped by CLASS MEMBERSHIP -- a case moved out of this class
-        loses the routing, and the macOS job is where that shows.
+        """Force the FILE store, because these cases read the FILE reader.
+
+        One makes an `.enc` unreadable; the others count retained `.prev`
+        generations. Both need the material on disk: on macOS a usable
+        Keychain takes the write instead, so there is no file to `chmod`
+        (FileNotFoundError) and the retained generation lands where
+        `_prev_backup_path` cannot see it.
+
+        CLASS-WIDE, AND THE CLASS GROWS. Membership is the only thing
+        granting this, in both directions -- a case moved out loses the
+        routing, and a case appended here SILENTLY GAINS it. The second is
+        what has actually happened: this class holds 2 cases on the branch
+        and 11 merged, the extra 9 appended by a sibling. So the routing is
+        not evidence that a case needs it, and macOS is where either
+        direction shows.
         """
         monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
 
