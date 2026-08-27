@@ -462,6 +462,57 @@ class TestAPermanentENOENTIsNotARetry:
 class TestTheAcquireAndReleaseAreBounded:
     """Two things the identity rewrite took out and had to put back."""
 
+    def test_the_release_closes_the_descriptor_AFTER_its_identity_stat(
+        self, tmp_path, monkeypatch
+    ):
+        """Ordering, and it is the only thing pinning the inode.
+
+        The release stats the lock to prove it is still ours, then removes it
+        by NAME. While the descriptor is open the inode cannot be recycled, so
+        the stat is answering about the directory we actually hold. Close
+        first and the inode is free the instant the last reference goes: this
+        file's own sibling case measures ext4 handing the same number back
+        200/200 times unheld, so the stat can then describe a stranger's
+        directory and the rmdir removes it.
+
+        The comment calls the ordering load-bearing; moving the close above
+        the stat was measured green across the whole suite.
+        """
+        if not claude_locks._CAN_PIN_A_DIRECTORY:
+            pytest.skip("no descriptor is held on this platform")
+
+        lock = tmp_path / "target.lock"
+        order = []
+        real_stat, real_close = os.stat, os.close
+
+        def tracking_stat(path, *a, **k):
+            if not isinstance(path, int) and os.fspath(path) == os.fspath(lock):
+                order.append("stat")
+            return real_stat(path, *a, **k)
+
+        def tracking_close(fd, *a, **k):
+            order.append("close")
+            return real_close(fd, *a, **k)
+
+        with proper_lockfile(lock, timeout=1.0):
+            order.clear()          # only the RELEASE's calls are the subject
+            monkeypatch.setattr(claude_locks.os, "stat", tracking_stat)
+            monkeypatch.setattr(claude_locks.os, "close", tracking_close)
+        monkeypatch.undo()
+
+        assert "close" in order, (
+            f"premise: the release never closed a descriptor: {order}"
+        )
+        assert "stat" in order, (
+            f"premise: the release never stat'd the lock, so there is no "
+            f"ordering to judge: {order}"
+        )
+        assert order.index("stat") < order.index("close"), (
+            "the release closed the descriptor BEFORE its identity stat, so "
+            "the inode was free to be recycled and the stat may describe a "
+            f"stranger's directory: {order}"
+        )
+
     def test_a_failed_identity_read_does_not_leak_the_descriptor(
         self, tmp_path, monkeypatch
     ):
@@ -973,6 +1024,20 @@ class TestATransientErrnoIsNotFatalToTheHold:
         """
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
         lock = tmp_path / "target.lock"
+        # NANOSECOND MTIME, ASSERTED. The caplog check below is exclusive only
+        # because the stat-error tick is the ONLY writer of that record on a
+        # filesystem whose mtime round-trips exactly. On a coarse mount (ext3,
+        # HFS+, FAT, some network TMPDIR) the read-back mismatch writes it on
+        # every tick instead, and the case goes green with its subject deleted.
+        # A premise nobody can see is one nobody re-checks after a move.
+        _probe = tmp_path / ".mtime-granularity-probe"
+        _probe.touch()
+        os.utime(_probe, ns=(1_000_000_123, 1_000_000_123))
+        assert os.stat(_probe).st_mtime_ns == 1_000_000_123, (
+            "this filesystem does not round-trip nanosecond mtimes, so the "
+            "record asserted below can be written by a different tick and "
+            "this case cannot say which refusal happened"
+        )
         real_stat = os.stat
         state = {"fired": False}
 
