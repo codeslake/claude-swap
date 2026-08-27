@@ -53,11 +53,6 @@ CREDENTIALS_STALENESS_S = 60.0
 CONFIG_STALENESS_S = 10.0
 # We touch a little faster than CC's 5s for margin.
 TOUCH_INTERVAL_S = 3.0
-# How long a release waits for the heartbeat before giving the lock up to
-# the stale sweep. `Thread.join(timeout=...)` is not this bound: the
-# release then re-blocks on `stamping`, so a tick stalled inside
-# `os.utime` holds it for as long as it stalls.
-_RELEASE_WAIT_S = 5.0
 # Claude Code holds the credentials lock for one token-endpoint round trip
 # (sub-second to a few seconds); its config lock for a local RMW. 9s of
 # bounded waiting comfortably outlasts both without stalling the CLI forever.
@@ -115,13 +110,20 @@ def proper_lockfile(
     while True:
         try:
             os.mkdir(lock_dir)
-            # Read back HERE, not after the loop. A waiter that judged this
-            # lock stale does stat-then-rmdir, and the holder can release and
-            # we can take the name in that gap -- its rmdir then removes the
+            # HOLD A DESCRIPTOR ON THE DIRECTORY WE MADE, and take identity
+            # from it. An mtime is a value we WRITE, so a successor's
+            # directory can come to carry ours; (st_dev, st_ino) is the object
+            # itself. The open is what makes it decisive -- an unheld inode
+            # number is reused by the next mkdir, while an open fd pins it in
+            # the orphan list so mkdir cannot get it back.
+            #
+            # Open HERE, not after the loop. A waiter that judged this lock
+            # stale does stat-then-rmdir, and the holder can release and we
+            # can take the name in that gap -- its rmdir then removes the
             # directory we just made. Outside the loop that raises
             # FileNotFoundError out of a call documented to raise only
             # ClaudeCodeLockTimeout.
-            stamped_ns = os.stat(lock_dir).st_mtime_ns
+            held_fd = os.open(lock_dir, os.O_RDONLY)
             break
         except FileExistsError:
             pass
@@ -145,6 +147,16 @@ def proper_lockfile(
             # between mkdir and stat" retry stays instant; only a name being
             # swept out from under us backs off.
             time.sleep(0.05)
+        except OSError:
+            # `mkdir` made the directory and the open could not read it back,
+            # so nobody holds it and every waiter is blocked for the full
+            # staleness window. Retrying cannot clear this errno; releasing
+            # the name can.
+            try:
+                os.rmdir(lock_dir)
+            except OSError:
+                pass
+            raise
         if time.monotonic() - start > timeout:
             raise ClaudeCodeLockTimeout(
                 f"Could not acquire {lock_dir.name} — Claude Code appears "
@@ -164,51 +176,38 @@ def proper_lockfile(
             continue
         time.sleep(0.25 + random.random() * 0.25)
 
-    # A takeover makes a NEW directory, so any mtime but the one we stamped is
-    # somebody else's lock, and a coarsened stamp never matches itself -- which
-    # is why the value above is read back rather than assumed.
-
+    ident = (lambda st: (st.st_dev, st.st_ino))(os.fstat(held_fd))
     stop_touching = threading.Event()
-    # A refresh is a read-modify-write on stamped_ns that the release reads;
-    # half-done — utime landed, read-back has not — our own lock reads foreign.
-    stamping = threading.Lock()
+
+    def _ours() -> bool:
+        """Is the directory at this path still the one we created?
+
+        Raises whatever the stat raises; each caller decides what an errno
+        means for it.
+        """
+        st = os.stat(lock_dir)
+        return (st.st_dev, st.st_ino) == ident
 
     def _touch() -> None:
-        nonlocal stamped_ns
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
-        # OSError: return` over all three syscalls meant a single EIO or
-        # ESTALE -- the ordinary errnos on a network `~/.claude` -- ended the
-        # heartbeat for the rest of the hold, and a mtime that stops advancing
-        # is a lock a waiter may take over as stale, mid-swap.
-        adopt_next = False
+        # OSError: return` over both syscalls meant a single EIO or ESTALE --
+        # the ordinary errnos on a network `~/.claude` -- ended the heartbeat
+        # for the rest of the hold, and a mtime that stops advancing is a lock
+        # a waiter may take over as stale, mid-swap.
         while not stop_touching.wait(TOUCH_INTERVAL_S):
-            with stamping:
-                try:
-                    seen = os.stat(lock_dir).st_mtime_ns
-                except FileNotFoundError:
-                    return  # gone; nothing left to keep alive
-                except OSError:
-                    continue  # unreadable this tick, not stolen
-                if adopt_next:
-                    # OUR OWN `utime` landed last tick and its read-back did
-                    # not, so this stamp is ours rather than a successor's.
-                    # Reading the mismatch as a takeover would end the
-                    # heartbeat over a transient read.
-                    stamped_ns, adopt_next = seen, False
-                elif seen != stamped_ns:
-                    return  # taken over; refreshing it adopts their stamp
-                try:
-                    os.utime(lock_dir)
-                except FileNotFoundError:
-                    return
-                except OSError:
-                    continue
-                try:
-                    stamped_ns = os.stat(lock_dir).st_mtime_ns
-                except FileNotFoundError:
-                    return
-                except OSError:
-                    adopt_next = True
+            try:
+                if not _ours():
+                    return  # taken over; refreshing it keeps THEIR lock alive
+            except FileNotFoundError:
+                return  # gone; nothing left to keep alive
+            except OSError:
+                continue  # unreadable this tick, not stolen
+            try:
+                os.utime(lock_dir)
+            except FileNotFoundError:
+                return
+            except OSError:
+                continue
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
@@ -216,48 +215,35 @@ def proper_lockfile(
         yield
     finally:
         stop_touching.set()
-        # ONE BOUND, and it is this acquire. A `join` here was a SECOND full
-        # wait on the same stalled tick -- measured 2.06s against a 1.0s
-        # constant -- and it bought nothing: a tick holding `stamping` is
-        # already what this waits for, and a tick not holding it either has
-        # not started (so the acquire is instant) or finds the directory gone
-        # and returns.
+        # NO WAIT AND NO LOCK HERE. Identity is immutable, so the release
+        # needs nothing from the heartbeat -- neither a `join` nor a mutex
+        # over a stamp the toucher rewrites. A tick landing inside this block
+        # can at worst refresh a successor's lock once; it can never make one
+        # look like ours, which is what a stamp could and did.
         #
-        # On expiry we LEAVE the lock rather than removing one we can no
-        # longer prove is ours. That self-heals through the stale sweep; the
-        # other direction removes a successor's lock inside its critical
-        # section.
-        #
-        # NOT `return` ON THE MISS: this whole block is the context manager's
+        # NOT `return` ON ANY ARM: this whole block is the context manager's
         # `finally`, and a `return` there discards an exception the body
         # raised.
-        if not stamping.acquire(timeout=_RELEASE_WAIT_S):
-            _logger.warning(
-                "Lock %s: its heartbeat did not return within %.1fs, so the "
-                "release cannot prove the lock is still ours; leaving it for "
-                "the stale sweep", lock_dir, _RELEASE_WAIT_S,
-            )
-        else:
-            try:
-                # Held across the decision, so no tick can move the stamp inside
-                # it; stop_touching bars any tick that has not started by now.
-                if os.stat(lock_dir).st_mtime_ns == stamped_ns:
-                    os.rmdir(lock_dir)
-                else:
-                    # A successor's critical section would be left with
-                    # nothing on disk, free for a third waiter to take.
-                    _logger.warning(
-                        "Lock %s was taken over while held; leaving it", lock_dir
-                    )
-            except FileNotFoundError:
+        try:
+            if _ours():
+                os.rmdir(lock_dir)
+            else:
+                # A successor's critical section would be left with nothing on
+                # disk, free for a third waiter to take.
                 _logger.warning(
-                    "Lock %s vanished while held (taken over as stale?)", lock_dir
+                    "Lock %s was taken over while held; leaving it", lock_dir
                 )
-            except OSError as e:
-                _logger.warning("Failed to release lock %s: %s", lock_dir, e)
-            finally:
-                stamping.release()
-
+        except FileNotFoundError:
+            _logger.warning(
+                "Lock %s vanished while held (taken over as stale?)", lock_dir
+            )
+        except OSError as e:
+            _logger.warning("Failed to release lock %s: %s", lock_dir, e)
+        finally:
+            # LAST, so the inode stays pinned across the decision above. Close
+            # it first and a takeover between the stat and the rmdir could
+            # reuse the number, which is the whole hole this replaced.
+            os.close(held_fd)
 
 @contextmanager
 def claude_credentials_lock(*, timeout: float | None = None):

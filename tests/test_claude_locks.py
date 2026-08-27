@@ -6,10 +6,12 @@ import errno
 import logging
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
 import pytest
+from unittest.mock import patch
 
 from claude_swap import claude_locks
 from claude_swap.claude_locks import (
@@ -124,51 +126,6 @@ class TestProperLockfile:
             "spinning, not waiting"
         )
 
-    def test_a_stalled_heartbeat_does_not_hold_the_release_open(
-        self, lock_dir, monkeypatch, caplog
-    ):
-        """`join(timeout=1.0)` looks like a bound and is not.
-
-        The release re-blocks on `stamping` right after it, so a tick stalled
-        inside `os.utime` holds the release for as long as it stalls -- on a
-        `finally` reached from `_perform_switch`. Measured before this: a 6.0s
-        stall blocked the release 5.9s, and at base the release was a bare
-        `rmdir` with no cross-thread wait at all.
-
-        On expiry the lock is LEFT, not removed: past the wait we can no
-        longer prove it is ours, and the stale sweep recovers it. Removing one
-        we cannot prove would take a successor's lock inside its critical
-        section.
-        """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
-        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
-        real_utime = os.utime
-
-        def stalling(path, *a, **kw):
-            if os.fspath(path) == os.fspath(lock_dir):
-                real_sleep(2.0)          # far past the release's own wait
-            return real_utime(path, *a, **kw)
-
-        real_sleep = time.sleep
-        monkeypatch.setattr(claude_locks.os, "utime", stalling)
-
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
-            started = time.monotonic()
-            with proper_lockfile(lock_dir):
-                real_sleep(0.05)         # let one tick get into the stall
-            elapsed = time.monotonic() - started
-
-        assert elapsed < 1.5, (
-            f"the release waited {elapsed:.2f}s on a stalled heartbeat — "
-            "`join(timeout=...)` is not the bound, `stamping` is"
-        )
-        said = [r.getMessage() for r in caplog.records
-                if "heartbeat did not return" in r.getMessage()]
-        assert said, "the release gave up silently"
-        assert lock_dir.exists(), (
-            "a lock the release could not prove was ours was removed anyway"
-        )
-
     def test_one_transient_stat_error_does_not_end_the_heartbeat(
         self, lock_dir, monkeypatch
     ):
@@ -208,78 +165,6 @@ class TestProperLockfile:
         assert len(seen) > 1, (
             "the mtime never advanced after one transient stat error, so the "
             "heartbeat is dead and the lock is stealable while still held"
-        )
-
-    def test_the_release_bound_is_the_one_the_constant_names(
-        self, lock_dir, monkeypatch
-    ):
-        """ONE bound, not two sequential ones on the same stall.
-
-        A `join(timeout=_RELEASE_WAIT_S)` ahead of the `stamping` acquire looks
-        like the bound and is a SECOND full-length wait on the same stalled
-        tick -- measured 2.06s against a 1.0s constant, i.e. 10s per lock at
-        the shipped value, and `cswap switch` exits three of them. Its sibling
-        above cannot see it: both waits end in the same give-up branch, with
-        the same warning and the same lock left behind.
-        """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
-        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
-        real_utime = os.utime
-        real_sleep = time.sleep
-
-        def stalling(path, *a, **kw):
-            if os.fspath(path) == os.fspath(lock_dir):
-                real_sleep(2.0)          # far past the release's own wait
-            return real_utime(path, *a, **kw)
-
-        monkeypatch.setattr(claude_locks.os, "utime", stalling)
-        started = time.monotonic()
-        with proper_lockfile(lock_dir):
-            real_sleep(0.05)             # let one tick get into the stall
-        elapsed = time.monotonic() - started
-
-        assert elapsed < 0.35, (
-            f"the release took {elapsed:.2f}s against _RELEASE_WAIT_S=0.2 — "
-            "two sequential waits on one stalled tick, so the constant names "
-            "half the real ceiling"
-        )
-
-    def test_a_stalled_heartbeat_does_not_swallow_the_body_error(
-        self, lock_dir, monkeypatch
-    ):
-        """The give-up branch must fall through, never `return`.
-
-        It sits in the context manager's `finally`, so a `return` there
-        discards the exception the body raised: `_perform_switch` failing
-        under a stalled heartbeat would come back as a SUCCESSFUL switch over
-        a store that was never written.
-
-        Its sibling above cannot see that -- the warning is emitted either
-        way, and the lock is left either way. Nor can the interpreter:
-        `SyntaxWarning: 'return' in a 'finally' block` arrived in 3.14 and CI
-        runs 3.12, where the regression is completely silent.
-        """
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
-        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
-        real_utime = os.utime
-        real_sleep = time.sleep
-
-        def stalling(path, *a, **kw):
-            if os.fspath(path) == os.fspath(lock_dir):
-                real_sleep(2.0)          # far past the release's own wait
-            return real_utime(path, *a, **kw)
-
-        monkeypatch.setattr(claude_locks.os, "utime", stalling)
-
-        class BodyFailed(Exception):
-            pass
-
-        with pytest.raises(BodyFailed):
-            with proper_lockfile(lock_dir):
-                real_sleep(0.05)         # let one tick get into the stall
-                raise BodyFailed
-        assert lock_dir.exists(), (
-            "the give-up branch removed a lock it could not prove was ours"
         )
 
     def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
@@ -570,4 +455,84 @@ class TestAPermanentENOENTIsNotARetry:
         assert attempts["n"] <= 2, (
             f"{attempts['n']} mkdir attempts for a parent that cannot come "
             "back: that is a pinned core, not a retry"
+        )
+
+
+class TestIdentityNotAStamp:
+    """A stamp is a value we write; a successor's directory can carry it."""
+
+    def test_the_release_does_not_remove_a_successors_lock(self, tmp_path):
+        """The window is between the heartbeat's utime and anything after it.
+
+        A stalled holder is judged stale, and the takeover lands while our
+        own refresh is in flight. Under an mtime stamp the holder read the
+        successor's directory back as its own and removed it on exit --
+        inside the successor's critical section, freeing the name for a
+        third waiter. Identity cannot be adopted that way.
+        """
+        lock = tmp_path / "the.lock"
+        real_utime = os.utime
+        took_over = threading.Event()
+        successor = {}
+
+        def utime_then_takeover(path, *a, **kw):
+            real_utime(path, *a, **kw)
+            if not took_over.is_set() and str(path) == str(lock):
+                took_over.set()
+                os.rmdir(lock)
+                os.mkdir(lock)
+                successor["ino"] = os.stat(lock).st_ino
+
+        with patch.object(claude_locks, "TOUCH_INTERVAL_S", 0.02), \
+                patch.object(os, "utime", utime_then_takeover):
+            with claude_locks.proper_lockfile(lock, timeout=2.0, staleness=60.0):
+                for _ in range(200):
+                    if took_over.is_set():
+                        break
+                    time.sleep(0.02)
+                time.sleep(0.15)  # ticks that would adopt the successor
+
+        assert took_over.is_set(), "premise: the takeover never fired"
+        assert lock.is_dir(), (
+            "our release removed the SUCCESSOR's lock, so its holder is "
+            "running unprotected and the name is free for a third waiter"
+        )
+        assert os.stat(lock).st_ino == successor["ino"], (
+            "premise: the directory on disk is no longer the successor's, "
+            "so this asserts nothing about whose lock survived"
+        )
+
+    def test_an_unheld_inode_number_comes_straight_back(self, tmp_path):
+        """Why identity is taken from a HELD descriptor and not a plain stat.
+
+        Without the open, `(st_dev, st_ino)` is no better than the mtime it
+        replaced: the next `mkdir` gets the same number. The open pins the
+        inode in the orphan list, which is what makes the comparison mean
+        "the same directory" rather than "the same slot".
+        """
+        lock = tmp_path / "L"
+        reused_unheld = reused_held = 0
+        for hold in (False, True):
+            for _ in range(50):
+                os.mkdir(lock)
+                fd = os.open(lock, os.O_RDONLY) if hold else None
+                first = os.stat(lock).st_ino
+                os.rmdir(lock)
+                os.mkdir(lock)
+                same = os.stat(lock).st_ino == first
+                os.rmdir(lock)
+                if fd is not None:
+                    os.close(fd)
+                if hold:
+                    reused_held += same
+                else:
+                    reused_unheld += same
+
+        assert reused_unheld > 0, (
+            "premise: this filesystem never reuses an inode number even "
+            f"unheld ({reused_unheld}/50), so the held result proves nothing"
+        )
+        assert reused_held == 0, (
+            f"a held descriptor did not pin the inode ({reused_held}/50), so "
+            "identity can be adopted the same way a stamp was"
         )
