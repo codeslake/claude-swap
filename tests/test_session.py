@@ -3016,9 +3016,38 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 #: change rather than a guard failure.
 _SANCTIONED_PRINTERS = {"_note", "_warn"}
 
-#: Everything in `printer` that ends in a bare `print`. A notice routed
-#: through any of these dies in the screen blank exactly as `print` does.
-_PRINTERS = {"print", "warning", "error"}
+def _bare_print_printers() -> set[str]:
+    """`printer`'s own functions that reach the builtin `print`.
+
+    DERIVED, not listed. The two other enumerations in this module were moved
+    off literals for the same reason: a list is right until someone adds a
+    function, and then it is silently short. Measured today this returns
+    `{"error", "warning"}`; a new `printer.notice()` that bare-prints joins it
+    with no edit here, where the literal would have missed it in silence.
+    """
+    import ast
+
+    tree = ast.parse(
+        (Path(__file__).resolve().parent.parent
+         / "src" / "claude_swap" / "printer.py").read_text(encoding="utf-8")
+    )
+    found = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                    and sub.func.id == "print"):
+                found.add(node.name)
+                break
+    assert found, "no bare-print printer found — the parse or the layout moved"
+    return found
+
+
+#: Everything in `printer` that ends in a bare `print`, plus the builtin
+#: itself. A notice routed through any of these dies in the screen blank
+#: exactly as `print` does.
+_PRINTERS = {"print"} | _bare_print_printers()
 
 #: Fallback when the source binds the printer module under no name we can
 #: see. A LOGGER answers to `.warning`/`.error` too, and five modules here
