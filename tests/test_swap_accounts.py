@@ -469,10 +469,13 @@ class TestSwapUnreadableSourceIsNotAbsent:
         sys.platform == "win32" or os.geteuid() == 0,
         reason="needs POSIX permission semantics (non-root)",
     )
-    # THE MACOS ARM RUNS ON EVERY JOB. `_use_keychain` is False off macOS
+    # THE MACOS ARM MAKES THE SHAPE REACHABLE ON THE UBUNTU JOB, which is
+    # where it adds anything. `_use_keychain` is False off macOS
     # unconditionally, so the class fixture that forces the file store has
     # effect on exactly one of the three CI jobs -- the shape it exists for
-    # was reachable only where nobody runs it.
+    # was reachable only where nobody runs it. Windows skips this case
+    # entirely (the `skipif` above), and on macOS `Platform.detect()` already
+    # answers MACOS, so the arm duplicates `[None]` there.
     @pytest.mark.parametrize("as_platform", [None, Platform.MACOS])
     def test_unreadable_enc_aborts_the_swap_before_anything_changes(
         self, temp_home: Path, sample_sequence_data: dict, as_platform
