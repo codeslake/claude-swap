@@ -10477,11 +10477,20 @@ class TestAddAccountRefusesASplicedIdentity:
 
     def _sw(self, triple, live):
         from claude_swap import switcher as _sw
+        from claude_swap.credentials import ActiveCredentials
 
         sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
         # Everything add_account touches BEFORE the guard, and nothing after --
         # a stub reaching further would let the case pass on a build where the
         # guard was deleted and something downstream happened to raise.
+        #
+        # The guard itself asks whether the live credential is READABLE before
+        # it names the pin, because an unreadable one has a different remedy.
+        # Answering readable is what puts these two cases on the pin's arm;
+        # the degraded arm has its own class.
+        sw._read_active_credentials = lambda: ActiveCredentials(
+            '{"claudeAiOauth": {"refreshToken": "rt-live"}}', False, False
+        )
         sw._refuse_session_shell = lambda: None
         sw._setup_directories = lambda: None
         sw._init_sequence_file = lambda: None
@@ -10865,3 +10874,77 @@ class TestRemovingThePinnedAccountClearsThePin:
             "the pinned account was removed and the record was left behind "
             "because the optional package is not installed"
         )
+
+
+class TestTheDegradedCauseOutranksThePinOne:
+    """`add_account`'s pin refusal prescribes `cswap pin --clear`.
+
+    `_live_login_identity` hands back the roster's slot whenever it cannot
+    PROVE the live credential is that slot's -- and its own docstring records
+    why a locked Keychain must read as "cannot tell" rather than "different
+    account": on a Mac the daemon above this process reads the same slot fine.
+    So the un-splice fires on an unreadable read, the identities differ, and
+    the user is told to clear the pin. Clearing it does not unblock: the next
+    attempt meets the same Keychain and stops for the same reason, with the
+    pin now gone as well.
+
+    `_refuse_degraded_capture` already owns the sentence that names the real
+    cause. This branch always raises, so asking it first costs no second read
+    of anything.
+    """
+
+    def _sw(self, temp_home, *, degraded):
+        import json as _json
+
+        from claude_swap.credentials import ActiveCredentials
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        (temp_home / ".claude.json").write_text(_json.dumps({
+            "oauthAccount": {
+                "emailAddress": "pinned@example.com",
+                "accountUuid": "uuid-pin",
+                "organizationUuid": "org-PIN",
+            }
+        }))
+        sw = ClaudeAccountSwitcher()
+        # THE STATE THE REFUSAL IS ABOUT: the config names one account and the
+        # un-splice answers with another. How it got there is the subject of
+        # `_live_login_identity`'s own tests; what is under test here is which
+        # of the two refusals a caller in this state is given.
+        sw._live_login_identity = lambda: ("roster@example.com", "org-ROSTER")
+        # `keychain_unavailable` FALSE and `degraded` TRUE: the arm where a
+        # failed Keychain read was COVERED by the plaintext file, so bytes are
+        # served and they may be a stale generation. That is the shape the
+        # un-splice cannot tell from a different account, and the one flag
+        # that is set on it.
+        sw._read_active_credentials = lambda: ActiveCredentials(
+            _json.dumps({"claudeAiOauth": {"refreshToken": "rt-live"}}),
+            False,
+            degraded,
+        )
+        return sw
+
+    def test_an_unreadable_credential_names_the_keychain_not_the_pin(
+        self, temp_home
+    ):
+        from claude_swap.exceptions import CredentialReadError
+
+        sw = self._sw(temp_home, degraded=True)
+        with pytest.raises(CredentialReadError) as exc:
+            sw.add_account()
+        assert "Keychain" in str(exc.value), (
+            f"the user was given {exc.value!r}; `cswap pin --clear` does not "
+            "make a locked Keychain readable, so that remedy sends them one "
+            "command further from the fix"
+        )
+
+    def test_a_readable_credential_still_refuses_over_the_pin(self, temp_home):
+        """THE CONTROL, or the case above passes on a refusal that fires for
+        everybody. With the live credential readable the un-splice really is
+        evidence, and clearing the pin really is the remedy."""
+        from claude_swap.exceptions import ConfigError
+
+        sw = self._sw(temp_home, degraded=False)
+        with pytest.raises(ConfigError) as exc:
+            sw.add_account()
+        assert "pin --clear" in str(exc.value), exc.value

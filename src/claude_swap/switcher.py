@@ -3898,6 +3898,15 @@ class ClaudeAccountSwitcher:
         # command that stops and says why.
         live_login = self._live_login_identity()
         if live_login is not None and live_login != (current_email, current_org_uuid):
+            # THE UNREADABLE CAUSE OUTRANKS THE PIN ONE, because only one of
+            # them has a remedy the user can act on. `_live_login_identity`
+            # answers with the roster's slot whenever it could not PROVE the
+            # live credential is that slot's, and a Keychain that declines
+            # this process is one of those -- so the sentence below names the
+            # pin for a machine whose pin is fine, and `pin --clear` leaves
+            # the next attempt stopped at the same read with the pin gone too.
+            # This branch always raises, so the ask costs no second read.
+            self._refuse_degraded_capture()
             raise ConfigError(
                 "The cloud pin is rewriting this machine's account identity, "
                 "so the account you are adding cannot be read correctly "
