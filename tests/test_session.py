@@ -3066,21 +3066,25 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
         src = (Path(__file__).resolve().parent.parent
                / "src" / "claude_swap" / "printer.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
-    # REACHABLE AS `printer.<name>(...)`, which is what the matcher looks for.
-    # A def inside an `if`/`try` at module level is; one inside a class or
-    # another function is not, and counting it exports a name that then marks
-    # an unrelated local of the same name in another module as a printer.
-    nested = {
-        id(inner)
-        for outer in ast.walk(tree)
-        if isinstance(outer, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-        for inner in ast.walk(outer)
-        if inner is not outer
-        and isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
+    # REACHABLE AS `printer.<name>(...)` IS A MODULE-LEVEL BINDING, not a
+    # nesting depth. Keyed on nesting this exported `_make_banner`, which
+    # prints nothing, and missed the `banner` that factory returns, which
+    # does -- the filter inverted on the one shape it was reasoning about.
+    # A def inside a module-level `if`/`try` binds here; one inside a class
+    # or another function does not, unless a module-level name of its own
+    # spelling is bound to it. Over-reporting costs a loud false alarm in the
+    # matcher; under-reporting is silent.
+    exported: set[str] = set()
+    for n in _own_scope(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            exported.add(n.name)
+        elif isinstance(n, ast.Assign):
+            exported |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+        elif isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name):
+            exported.add(n.target.id)
     funcs = [n for n in ast.walk(tree)
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-             and id(n) not in nested]
+             and n.name in exported]
     # `ast.walk`, not `tree.body`: a printer defined inside an `if` or a
     # `try` is still a printer -- one inside a class is NOT, and the filter
     # above drops it, because it is not reachable as `printer.<name>(...)`. And a FIXPOINT, because a printer that
@@ -3264,6 +3268,28 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             "a launch notice is print-only, so the screen blank erases it and "
             f"nothing records why: {[f'session.py:{n}' for n in offenders]}. "
             "Use `_note`."
+        )
+
+    def test_a_factory_exported_printer_is_not_filtered_out(self):
+        """The nesting filter dropped the reachable name and kept the unreachable
+        one.
+
+        Its question is "is this reachable as `printer.<name>(...)`", and it
+        answered it by NESTING -- so `banner = _make_banner()` exported
+        `_make_banner`, which prints nothing, and missed `banner`, which does.
+        Reachability is a module-level BINDING, which is what it keys on now.
+        Over-reporting a name only costs a loud false alarm in the matcher;
+        under-reporting is silent, and silent is the failure this guard exists
+        to prevent.
+        """
+        found = _bare_print_printers("""
+def _make_banner():
+    def banner(msg): print(msg)
+    return banner
+banner = _make_banner()
+""")
+        assert "banner" in found, (
+            f"the exported printer was not derived: {sorted(found)}"
         )
 
     @pytest.mark.parametrize("shape,body,expected", [
