@@ -3024,7 +3024,26 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 #: change rather than a guard failure.
 _SANCTIONED_PRINTERS = {"_note", "_warn"}
 
-def _bare_print_printers() -> set[str]:
+def _own_scope(func):
+    """Statements `func` binds names in -- its body, minus every nested scope.
+
+    A `def` inside an `if` inside `func` binds in `func`; one inside a nested
+    `def`, or in a `class` body, does not. `ast.walk` cannot tell those apart.
+    """
+    import ast
+
+    out = []
+    stack = list(func.body)
+    while stack:
+        node = stack.pop()
+        out.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue          # its body binds in ITS scope, not in `func`'s
+        stack.extend(ast.iter_child_nodes(node))
+    return out
+
+
+def _bare_print_printers(src: str | None = None) -> set[str]:
     """`printer`'s own functions that reach the builtin `print`.
 
     DERIVED, not listed: a list is right until someone adds a function, and
@@ -3032,17 +3051,21 @@ def _bare_print_printers() -> set[str]:
     "warning"}` -- the same answer a top-level scan gives, so nothing on this
     tree changes. What the walk and the fixpoint add is the two shapes that
     scan misses and that a future printer is most likely to take: one defined
-    inside an `if`/`try`/class, and one that DELEGATES to a printer instead of
+    inside an `if`/`try`, and one that DELEGATES to a printer instead of
     calling `print` itself. Measured, appending either to `printer.py`: the
     top-level scan still answers `{"error", "warning"}`, this answers with the
     new name.
     """
     import ast
 
-    tree = ast.parse(
-        (Path(__file__).resolve().parent.parent
-         / "src" / "claude_swap" / "printer.py").read_text(encoding="utf-8")
-    )
+    # `src` SO THE FILTERS BELOW HAVE A POPULATION. Against `printer.py` alone
+    # both of them remove nothing -- measured, 0 nodes and 0 names -- so each
+    # could be deleted with the suite green, and one of them shipped inverted
+    # for exactly that reason. The default is still the real module.
+    if src is None:
+        src = (Path(__file__).resolve().parent.parent
+               / "src" / "claude_swap" / "printer.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
     # REACHABLE AS `printer.<name>(...)`, which is what the matcher looks for.
     # A def inside an `if`/`try` at module level is; one inside a class or
     # another function is not, and counting it exports a name that then marks
@@ -3058,8 +3081,9 @@ def _bare_print_printers() -> set[str]:
     funcs = [n for n in ast.walk(tree)
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
              and id(n) not in nested]
-    # `ast.walk`, not `tree.body`: a printer defined inside an `if`, a `try`
-    # or a class is still a printer. And a FIXPOINT, because a printer that
+    # `ast.walk`, not `tree.body`: a printer defined inside an `if` or a
+    # `try` is still a printer -- one inside a class is NOT, and the filter
+    # above drops it, because it is not reachable as `printer.<name>(...)`. And a FIXPOINT, because a printer that
     # DELEGATES to one reaches `print` just as surely -- a new `notice()`
     # that calls `warning()` dies in the same screen blank, and the top-level
     # scan alone reports it as safe.
@@ -3071,10 +3095,14 @@ def _bare_print_printers() -> set[str]:
             # `def warning(x): return x` shadows the module one, prints
             # nothing, and would otherwise promote its enclosing function --
             # which then marks every unrelated call of that name elsewhere.
+            # `ast.walk` HERE WAS THE BUG. It descends into nested CLASS
+            # bodies and doubly-nested defs, and neither binds anything in
+            # this function -- so an unrelated `_Fmt.print` suppressed a real
+            # `print(...)` and the printer went unexported. Only a def in
+            # this function's OWN scope shadows the module one.
             shadowed = {
-                n.name for n in ast.walk(f)
+                n.name for n in _own_scope(f)
                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and n is not f
             }
             if any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
                    and sub.func.id not in shadowed
@@ -3237,6 +3265,54 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             f"nothing records why: {[f'session.py:{n}' for n in offenders]}. "
             "Use `_note`."
         )
+
+    @pytest.mark.parametrize("shape,body,expected", [
+        (
+            "a nested class method of the same name",
+            """
+def print_helper():
+    class _Fmt:
+        def print(self): pass
+    print("x")
+""",
+            {"print_helper"},
+        ),
+        (
+            "a doubly-nested def of the same name",
+            """
+def banner(msg):
+    def outer():
+        def print(x): return x
+    print(msg)
+""",
+            {"banner"},
+        ),
+        (
+            "a genuine same-scope shadow",
+            """
+def banner(msg):
+    def print(x): return x
+    print(msg)
+""",
+            set(),
+        ),
+    ])
+    def test_a_shadow_only_counts_in_the_scope_that_binds_it(
+        self, shape, body, expected
+    ):
+        """Source of its own, because `printer.py` gives the filters NOTHING.
+
+        Measured on the real module: the nested-def filter removes 0 nodes and
+        the shadow filter removes 0 names, so either could be deleted with the
+        suite green -- and one of them shipped over-broad for exactly that
+        reason. `shadowed` was collected with `ast.walk`, which descends into
+        nested CLASS bodies and doubly-nested defs. Neither binds anything in
+        the enclosing function, so an unrelated `_Fmt.print` suppressed a real
+        `print(...)` and the printer went unexported -- the launch notice it
+        carries then reads as safe. Only the third case is a shadow Python
+        agrees with.
+        """
+        assert _bare_print_printers(body) == expected, shape
 
     def test_the_matcher_sees_both_call_shapes_and_spares_the_cure(self):
         """Source of its own, because session.py exercises ONE of the halves.
