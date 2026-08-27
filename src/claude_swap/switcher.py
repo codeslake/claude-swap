@@ -809,12 +809,11 @@ class ClaudeAccountSwitcher:
         active = self._read_active_credentials()
         if active.degraded:
             raise CredentialReadError(
-                "The OAuth Keychain read failed, so the only readable "
-                "credential is a plaintext fallback that may be a superseded "
-                "generation — capturing it would file a spent refresh token "
-                "against this slot. A locked Keychain or a session with no "
-                "GUI is the usual cause, and retrying from a GUI terminal is "
-                "what clears that one."
+                "The OAuth Keychain read failed, so whatever is readable "
+                "here may be a superseded generation and capturing it would "
+                "file that against this slot. A locked Keychain or a session "
+                "with no GUI is the usual cause, and retrying from a GUI "
+                "terminal is what clears that one."
             )
         return active.value
 
