@@ -63,6 +63,38 @@ _RELEASE_WAIT_S = 5.0
 # plain stat -- still not a value we write, so still not adoptable the way an
 # mtime stamp was, but not pinned, so an index a takeover frees can come back.
 _CAN_PIN_A_DIRECTORY = sys.platform != "win32"
+
+
+def _mtime_quantum_ns(directory: Path) -> int:
+    """The finest mtime this filesystem keeps, in nanoseconds.
+
+    Unpinned, the heartbeat proves a hold by writing a stamp and reading it
+    back unchanged. A filesystem coarser than the stamp truncates it, so the
+    read-back NEVER matches, `unproven` latches on the first tick and the
+    release removes nothing -- on an undisturbed hold nobody is contending
+    for. Quantising the stamp to what the filesystem keeps makes a mismatch
+    mean the one thing it claims to mean: somebody else wrote.
+
+    ponytail: a takeover landing inside a single quantum then reads as our
+    own write. On an exact filesystem the quantum is 1 and nothing changes
+    at all; on a coarse one the alternative is never releasing.
+    """
+    probe = directory / f".mtime-probe-{os.getpid()}"
+    try:
+        probe.touch()
+        for quantum in (1, 100, 1_000, 1_000_000, 1_000_000_000, 2_000_000_000):
+            want = (time.time_ns() // quantum) * quantum
+            os.utime(probe, ns=(want, want))
+            if os.stat(probe).st_mtime_ns == want:
+                return quantum
+        return 2_000_000_000
+    except OSError:
+        return 1  # cannot measure; the strict comparison is the old behaviour
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
 # Claude Code holds the credentials lock for one token-endpoint round trip
 # (sub-second to a few seconds); its config lock for a local RMW. 9s of
 # bounded waiting comfortably outlasts both without stalling the CLI forever.
@@ -112,6 +144,9 @@ def proper_lockfile(
         FileNotFoundError: The lock's PARENT is gone. Retrying cannot make a
             directory under a directory nobody has, so that errno is the one
             case this re-raises instead of waiting out the budget.
+        OSError: The identity read of a directory we did create failed. A
+            waiter cannot tell whose lock it is holding open, so the acquire
+            refuses rather than proceed blind.
     """
     if timeout is None:
         timeout = DEFAULT_TIMEOUT_S
@@ -219,6 +254,7 @@ def proper_lockfile(
     # both readings share the value. Only never having accepted an inexact
     # one can, so the release requires this to still be False.
     unproven = False
+    stamp_quantum = 1 if _CAN_PIN_A_DIRECTORY else _mtime_quantum_ns(lock_dir.parent)
     stamping = None if _CAN_PIN_A_DIRECTORY else threading.Lock()
     _tick_guard = nullcontext() if stamping is None else stamping
 
@@ -304,7 +340,7 @@ def proper_lockfile(
                 # which is a SUCCESSOR's mtime when a takeover lands between
                 # the identity check and here. That is the one write that
                 # made the release's own comparison agree with a stranger.
-                stamp = time.time_ns()
+                stamp = (time.time_ns() // stamp_quantum) * stamp_quantum
                 try:
                     os.utime(lock_dir, ns=(stamp, stamp))
                 except FileNotFoundError:
@@ -324,10 +360,10 @@ def proper_lockfile(
                         if seen == stamp:
                             last_stamp = stamp
                         else:
-                            # Either somebody replaced the directory under us
-                            # or this filesystem coarsened the value. Neither
-                            # is proof, and the safe reading of both is the
-                            # same: keep beating, remove nothing.
+                            # Somebody replaced the directory under us. The
+                            # stamp is quantised to what this filesystem
+                            # keeps, so coarsening can no longer produce this
+                            # -- keep beating, remove nothing.
                             last_stamp = seen
                             unproven = True
 

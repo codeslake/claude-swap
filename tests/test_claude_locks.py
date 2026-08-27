@@ -495,7 +495,8 @@ class TestTheAcquireAndReleaseAreBounded:
             return real_close(fd, *a, **k)
 
         with proper_lockfile(lock, timeout=1.0):
-            order.clear()          # only the RELEASE's calls are the subject
+            # Installed HERE so only the RELEASE's calls are the subject;
+            # nothing has been appended yet, so there is nothing to clear.
             monkeypatch.setattr(claude_locks.os, "stat", tracking_stat)
             monkeypatch.setattr(claude_locks.os, "close", tracking_close)
         monkeypatch.undo()
@@ -1009,6 +1010,41 @@ class TestATransientErrnoIsNotFatalToTheHold:
             "platform that decides identity by descriptor and never reads one"
         )
 
+    def test_a_coarse_mtime_still_lets_the_release_remove_its_own_lock(
+        self, tmp_path, monkeypatch
+    ):
+        """UNPINNED, undisturbed, nobody stealing -- and the lock survived.
+
+        The heartbeat proves a hold by reading back the stamp it wrote. A
+        filesystem that keeps a coarser mtime truncates it, so EVERY read-back
+        differs, `unproven` latches on the first tick, and the release then
+        removes nothing. The next acquire on that name waits out the whole
+        staleness window blaming Claude Code for a lock this process
+        abandoned, and a fresh orphan appears for every hold.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        lock = tmp_path / "target.lock"
+        real_utime = os.utime
+        quantum = 1_000_000_000  # a one-second mount
+
+        def coarse_utime(path, *a, **k):
+            ns = k.get("ns")
+            if isinstance(ns, tuple) and len(ns) == 2:
+                k["ns"] = tuple((int(v) // quantum) * quantum for v in ns)
+            return real_utime(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", coarse_utime)
+
+        with proper_lockfile(lock, timeout=2.0):
+            time.sleep(0.2)  # several ticks at the interval above
+
+        assert not lock.exists(), (
+            "the release left an undisturbed lock behind: the read-back never "
+            "matched because the filesystem coarsened it, not because anybody "
+            "else wrote"
+        )
+
     def test_an_unprovable_stamp_does_not_let_the_release_take_a_successor(
         self, tmp_path, monkeypatch, caplog
     ):
@@ -1024,28 +1060,6 @@ class TestATransientErrnoIsNotFatalToTheHold:
         """
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
         lock = tmp_path / "target.lock"
-        # MTIME GRANULARITY, ASSERTED. The caplog check below is exclusive
-        # only because the stat-error tick is the ONLY writer of that record.
-        # On a coarse mount (ext3, HFS+, FAT, some network TMPDIR) the
-        # read-back mismatch writes it on EVERY tick instead, and the case
-        # goes green with its subject deleted.
-        #
-        # The bound is sub-millisecond, not exact equality, and the stamp is
-        # shaped like a real one. NTFS keeps 100ns and truncates anything
-        # finer; `time.time_ns()` there derives from a FILETIME and is already
-        # a multiple of 100, so the code round-trips even though an arbitrary
-        # value does not. Demanding exact equality of an invented number
-        # failed Windows CI for a filesystem that is perfectly fine.
-        _probe = tmp_path / ".mtime-granularity-probe"
-        _probe.touch()
-        _want = (time.time_ns() // 100) * 100
-        os.utime(_probe, ns=(_want, _want))
-        _drift = abs(os.stat(_probe).st_mtime_ns - _want)
-        assert _drift < 1_000_000, (
-            f"this filesystem rounds mtime by {_drift}ns, so two ticks a "
-            "moment apart share a stamp and the record asserted below can be "
-            "written by a different tick than the one under test"
-        )
         real_stat = os.stat
         state = {"fired": False}
 
