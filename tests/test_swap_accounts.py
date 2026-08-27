@@ -1588,8 +1588,8 @@ class TestTheRollbackDecidesPerKey:
 
         with caplog.at_level(logging.ERROR, logger="claude-swap"):
             switcher._rollback_swap(
-                "1", mail_a, None, None,
-                "2", mail_b, None, None,
+                "1", mail_a, "", "",
+                "2", mail_b, "", "",
                 staging={}, moved=moved, wrote_backups=False,
             )
         said = "\n".join(r.getMessage() for r in caplog.records)
@@ -2125,8 +2125,8 @@ class TestTheRollbackDecidesPerKey:
             return real_post(num, email, *a, **k)
 
         switcher._post_backup_write = blocking
-        staged = tmp = switcher.backup_dir / ".swap-staging-probe"
-        tmp.write_text("pre-swap-copy", encoding="utf-8")
+        staged = switcher.backup_dir / ".swap-staging-probe"
+        staged.write_text("pre-swap-copy", encoding="utf-8")
         with caplog_at_error() as records:
             switcher._rollback_swap(
                 "1", mail_a, "creds-a", "{}",
