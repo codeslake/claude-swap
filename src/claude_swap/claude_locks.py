@@ -330,7 +330,19 @@ def proper_lockfile(
     def _touch() -> None:
         nonlocal adopt_stamp, last_stamp, stamp_quantum, unproven
         if stamp_quantum is None:
-            stamp_quantum = _mtime_quantum_ns(lock_dir.parent)
+            try:
+                stamp_quantum = 1 if _CAN_PIN_A_DIRECTORY else \
+                    _mtime_quantum_ns(lock_dir.parent)
+            except BaseException:
+                # UNMEASURABLE IS THE STRICT COMPARISON, the answer the
+                # probe's own unreadable arm already gives. Raising here ends
+                # the heartbeat, and an mtime that stops advancing is the
+                # stale lock this module exists to prevent -- worse than any
+                # coarsening the quantum was added to survive. `BaseException`
+                # for the same reason the salvage path below states: a
+                # non-`OSError` is exactly what escapes an `except OSError`,
+                # and this runs on a daemon thread where nothing else catches.
+                stamp_quantum = 1
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
         # OSError: return` over both syscalls meant a single EIO or ESTALE --
         # the ordinary errnos on a network `~/.claude` -- ended the heartbeat

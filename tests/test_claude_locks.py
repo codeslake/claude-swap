@@ -1030,6 +1030,9 @@ class TestATransientErrnoIsNotFatalToTheHold:
             raise KeyboardInterrupt("injected inside the probe")
 
         monkeypatch.setattr(claude_locks, "_mtime_quantum_ns", interrupted)
+        escaped: list = []
+        monkeypatch.setattr(
+            threading, "excepthook", lambda a: escaped.append(a.exc_type))
         lock = tmp_path / "target.lock"
         try:
             with claude_locks.proper_lockfile(lock, timeout=2):
@@ -1039,6 +1042,17 @@ class TestATransientErrnoIsNotFatalToTheHold:
         assert not lock.exists(), (
             "the acquire raised out of the quantum probe and left the lock "
             "directory on disk with nobody holding it"
+        )
+        # AND NOTHING ESCAPED THE HEARTBEAT THREAD. A LIVE thread is the
+        # wrong witness: the failure kills the thread, so counting survivors
+        # reads clean in exactly the broken case. What has to be observed is
+        # the ESCAPE, which only `threading.excepthook` sees -- and unobserved
+        # it costs the heartbeat, so the mtime stops advancing and a waiter
+        # takes the lock over as stale, which is the fault this module exists
+        # to prevent traded for the one the move just fixed.
+        assert not escaped, (
+            "the quantum probe's failure escaped the heartbeat thread, which "
+            f"ends it and freezes the lock's mtime: {escaped}"
         )
 
     @pytest.mark.parametrize(
