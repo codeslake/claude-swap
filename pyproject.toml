@@ -90,11 +90,10 @@ minversion = "9.0"
 addopts = "-n auto --dist loadgroup --max-worker-restart=0 --strict-config"
 # A HANG BECOMES AN ABORT WITH STACKS, with no new dependency: pytest ships
 # both of these, and `exit_on_timeout` is what turns the dump into a failure
-# instead of a note in a job that keeps running. GitHub's default step budget
-# is 360 minutes, so any job that does NOT set `timeout-minutes` pays six
-# hours for a spinning worker and prints no test name. Which jobs set it is
-# deliberately not enumerated here: the lock tests are collected by every job
-# that does not `--ignore` them, and that set changes with each shard edit.
+# instead of a note in a job that keeps running. GitHub's default JOB budget
+# is 360 minutes -- a step has no documented default and simply runs until
+# that budget cancels it -- so a job without `timeout-minutes` pays six hours
+# for a spinning worker and prints no test name.
 # PER TEST, not per suite -- pytest arms it in a `pytest_runtest_protocol`
 # hookwrapper, so 600s is compared against the slowest SINGLE case (~10s
 # here), not against the run. Collection is not covered at all.
