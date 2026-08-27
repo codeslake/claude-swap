@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import sys
@@ -14589,14 +14590,52 @@ class TestSwitchOffAtLimitAccount:
         need to, since it already skips cooldown, the no-return bar and
         hysteresis. Measured on the live host: the TUI held the lock, so an
         engine-tick version of this would have relayed every 429 untouched
-        while passing every test that did not hold the lock first."""
-        import inspect
-        import claude_swap.switcher as mod
+        while passing every test that did not hold the lock first.
 
-        src = inspect.getsource(switch_off_at_limit_account)
-        assert "AutoSwitchEngine" not in src
-        assert "AutoSwitchEngine" not in inspect.getsource(mod.__dict__[
-            "ClaudeAccountSwitcher"].switch)
+        AT RUNTIME, not by reading the source for a name. The text form was
+        defeated by anything that moved the construction one call away --
+        a helper, or `getattr(mod, "Auto" + "SwitchEngine")` -- and `switch()`
+        is 391 lines delegating to 14 private helpers a substring never
+        follows into.
+        """
+        from claude_swap import autoswitch as autoswitch_mod
+
+        built: list[int] = []
+        real_init = autoswitch_mod.AutoSwitchEngine.__init__
+
+        def spy(self, *a, **kw):
+            built.append(1)
+            return real_init(self, *a, **kw)
+
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "a@example.com")
+        seed(s, 2, "b@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"}
+        }))
+        usage = {"1": {"five_hour": {"pct": 100.0}, "seven_day": {"pct": 0.0}},
+                 "2": {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0}}}
+
+        with patch.object(autoswitch_mod.AutoSwitchEngine, "__init__", spy):
+            # THE CONTROL, first: an instrument that cannot see a construction
+            # reports the same empty list as a seam that makes none.
+            with contextlib.suppress(Exception):
+                autoswitch_mod.AutoSwitchEngine(s, None, None)
+            assert built, "the spy never fired — it cannot answer this"
+            built.clear()
+
+            with patch.object(s, "_usage_by_account", return_value=usage):
+                switch_off_at_limit_account(s)
+            assert built == [], "at-limit routed through an engine"
+
+            with contextlib.suppress(Exception):
+                s.switch()
+            assert built == [], "switch() routed through an engine"
 
 
 class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
@@ -14650,6 +14689,51 @@ class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:
         s = self._setup(temp_home)
         out = self._land(s, [])
         assert len(out.get("warnings", [])) == 1, out
+
+
+def test_a_vetoed_landing_leaves_no_stash_entry_behind(
+    temp_home: Path, monkeypatch
+):
+    """"Nothing was changed" is said one statement after something was.
+
+    The veto sits BELOW `_stash_live_credential`, so every refusal writes a
+    consume-gate entry and its manifest first and then reports that nothing
+    happened. Retrying accumulates them — one `.enc` per attempt, each holding
+    the live credential, none of them claimed by anything.
+
+    The veto reads `~/.claude.json` and nothing else; the stash cannot make
+    that readable, so there is no ordering reason for it to run first.
+    """
+    switcher = ClaudeAccountSwitcher()
+    cred = temp_home / ".claude" / ".credentials.json"
+    cred.parent.mkdir(parents=True, exist_ok=True)
+    cred.write_text('{"claudeAiOauth": {"accessToken": "live"}}')
+    (temp_home / ".claude.json").write_text("{ this is not json")
+
+    data = {"activeAccountNumber": 1,
+            "accounts": {"1": {"email": "a@example.com"},
+                         "2": {"email": "b@example.com"}}}
+
+    def land():
+        with pytest.raises(SwitchError):
+            switcher._switch_to_empty_slot(
+                "2", "b@example.com", None, {"num": "2"}, data,
+                emit_output=False, warnings_out=[])
+
+    cred_dir = switcher._store._host.credentials_dir
+    land()
+    after_one = sorted(p.name for p in cred_dir.glob(".unclaimed-*"))
+    land()
+    after_two = sorted(p.name for p in cred_dir.glob(".unclaimed-*"))
+
+    assert after_one == [], (
+        f"a refusal that says 'Nothing was changed' stashed {after_one}"
+    )
+    # THE ACCUMULATION, which is what makes it more than a wording problem:
+    # a per-attempt copy of a live credential nothing will ever claim.
+    assert after_two == after_one, (
+        f"a second refusal added {sorted(set(after_two) - set(after_one))}"
+    )
 
 
 def test_a_torn_config_vetoes_the_landing_before_anything_is_destroyed(

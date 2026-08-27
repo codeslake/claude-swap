@@ -6940,6 +6940,36 @@ class TestLiveLock:
 
         assert isinstance(outcome, TickOutcome)
 
+    def test_constructing_a_live_engine_on_an_unwritable_dir_does_not_raise(
+        self, harness
+    ):
+        """The same call, one frame earlier, with no guard on it.
+
+        `_retry_live_promotion` catches `OSError` from `acquire()` because the
+        acquire CREATES the lock's directory and file, so an unwritable
+        `backup_dir` raises. `__init__` makes the identical call and did not,
+        and it is on the ordinary CLI path: `cswap auto` builds the engine
+        before `_auto_command`'s `except ClaudeSwitchError/KeyboardInterrupt`
+        can mean anything, so a read-only backup dir replaced the documented
+        0/1/2/3 exit with a traceback.
+
+        Demoting is the answer the loser already gets. A machine that cannot
+        take the lock cannot be the LIVE engine, whoever holds it and for
+        whatever reason.
+        """
+        from claude_swap import autoswitch as autoswitch_mod
+
+        def unwritable(self, *a, **kw):
+            raise OSError(30, "Read-only file system")
+
+        with patch.object(autoswitch_mod.FileLock, "acquire", unwritable):
+            engine = harness._make_engine(dry_run=False)
+
+        assert engine.dry_run is True, "it must not act without the lock"
+        assert engine.demoted_from_live is True, (
+            "the demotion is what the TUI renders, so it has to be set"
+        )
+
     def test_a_user_requested_dry_run_still_reports_switched(self, harness):
         """The other arm, which the demoted assertion must not take with it.
 

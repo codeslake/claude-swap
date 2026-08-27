@@ -6485,6 +6485,25 @@ class ClaudeAccountSwitcher:
                 f"the read (a locked Keychain, permissions on "
                 f"{get_credentials_path()}) and retry."
             )
+        # VETO BEFORE ANYTHING, not merely before the unlink. `_clear_managed_key` refuses on a config
+        # that is present-and-unreadable, and that is a pure READ -- nothing
+        # about it becomes knowable by destroying the credential first. Left
+        # below the clears it fired with `.credentials.json` already gone: the
+        # command reported failure AND logged the user out, and this call site
+        # returns before the first `record_step`, so no rollback runs.
+        #
+        # Above the STASH for the same reason one step further back: the
+        # message says "Nothing was changed" and the stash writes a
+        # consume-gate entry plus its manifest, one per attempt, each
+        # holding the live credential and none of them claimed by anything.
+        cfg_path = get_global_config_path()
+        if cfg_path.exists() and self._store._read_global_config() is None:
+            raise SwitchError(
+                f"{cfg_path.name} is unreadable, so landing on an empty slot "
+                "cannot confirm the previous account's managed key was "
+                "cleared — and a survivor keeps authenticating under this "
+                "slot's name. Nothing was changed. Repair the file and retry."
+            )
         if live:
             self._stash_live_credential(
                 live,
@@ -6497,20 +6516,6 @@ class ClaudeAccountSwitcher:
         # only the OAuth one leaves a `primaryApiKey` live, and Claude Code
         # keeps authenticating (and billing) as the account it belongs to,
         # right after this announced "logged out".
-        # VETO BEFORE THE UNLINK. `_clear_managed_key` refuses on a config
-        # that is present-and-unreadable, and that is a pure READ -- nothing
-        # about it becomes knowable by destroying the credential first. Left
-        # below the clears it fired with `.credentials.json` already gone: the
-        # command reported failure AND logged the user out, and this call site
-        # returns before the first `record_step`, so no rollback runs.
-        cfg_path = get_global_config_path()
-        if cfg_path.exists() and self._store._read_global_config() is None:
-            raise SwitchError(
-                f"{cfg_path.name} is unreadable, so landing on an empty slot "
-                "cannot confirm the previous account's managed key was "
-                "cleared — and a survivor keeps authenticating under this "
-                "slot's name. Nothing was changed. Repair the file and retry."
-            )
         residual_gone = self._store._clear_oauth_credential()
         # BOTH axes report. The managed item shadows `primaryApiKey` the way
         # the OAuth item shadows the file, and Claude Code reads it first.
@@ -7436,6 +7441,15 @@ def switch_off_at_limit_account(switcher: "ClaudeAccountSwitcher") -> dict:
     itself to dry-run and switches nothing. Nor does it need one — ``at-limit``
     already skips the cooldown, the no-return bar and hysteresis, which is what
     ``strategy="best"`` does anyway.
+
+    THAT LOCK IS NOT PROTECTION FOR THIS CALL, and the paragraph above reads
+    as if it were. Nothing here takes it: ``switch()`` serializes the WRITE
+    through the state lock and no further, so a LIVE engine deciding in the
+    same window still decides independently — the same shape two LIVE engines
+    have, which is why only one of those is allowed. What makes it acceptable
+    is that both would be reacting to the same at-limit account and choosing
+    by the same ranking, and that the proxy calls this only on a 429 it just
+    saw. It is a narrow race, not an excluded one.
 
     Returns the ordinary ``--json`` switch payload. ``switched: false`` with
     ``reason: "candidates-exhausted"`` means nothing has headroom, and the

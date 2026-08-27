@@ -695,7 +695,21 @@ class AutoSwitchEngine:
         self.demoted_from_live = False
         if not self.dry_run:
             lock = FileLock(switcher.backup_dir / LIVE_LOCK_FILENAME, timeout=0)
-            if lock.acquire():
+            try:
+                got = lock.acquire()
+            except OSError:
+                # `acquire()` CREATES the lock's directory and file, so an
+                # unwritable backup_dir raises here -- the same reason
+                # `_retry_live_promotion` guards the identical call. This one
+                # is on the ordinary CLI path, ahead of anything that could
+                # turn it into an exit code, so it replaced `cswap auto`'s
+                # documented 0/1/2/3 with a traceback.
+                #
+                # Demoting is the answer the loser already gets: a process
+                # that cannot take the lock cannot be the LIVE engine,
+                # whatever stopped it.
+                got = False
+            if got:
                 self._live_lock = lock
             else:
                 self.dry_run = True

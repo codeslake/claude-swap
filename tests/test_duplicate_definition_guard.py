@@ -100,6 +100,19 @@ class TestNoModuleDefinesTheSameNameTwice:
 
         roots = [pathlib.Path(claude_swap.__file__).parent,
                  pathlib.Path(__file__).parent]
+        # THE DENOMINATOR, PER ROOT. A clean sweep over an empty set reads
+        # exactly like a clean sweep: `roots = []` passes this case with
+        # nothing examined, and so does one root that has moved while the
+        # other still fills the total. Counted per root for that reason, and
+        # never by naming a file -- `pin.py` exists on some branches and not
+        # others, so a name list turns a branch difference into a failure.
+        # The matcher itself has its own controls in the class below.
+        per_root = {root: sorted(root.rglob("*.py")) for root in roots}
+        thin = [str(root) for root, files in per_root.items() if len(files) < 5]
+        assert roots and not thin, (
+            f"these roots contributed almost nothing: {thin} — this guard "
+            "proves nothing about a tree it never read"
+        )
         offenders = [
             o
             for root in roots
