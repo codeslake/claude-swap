@@ -122,14 +122,28 @@ def test_the_macos_job_runs_pytest_on_paths_that_exist():
     _assert_macos_job_is_intact(_WORKFLOW)
 
 
-def test_a_job_that_stopped_running_pytest_is_refused(tmp_path):
-    """The deletion above, on a real copy of the real workflow.
+def _mutate_macos_run(text: str, repl: str) -> str:
+    """`text` with the macOS job's pytest `run:` line rewritten by `repl`.
 
-    The premise assert is the point: a substitution that matched nothing would
-    leave this passing against an unmutated file, which proves nothing.
+    SCOPED TO THAT JOB, and keyed on the invocation rather than on any path it
+    names: a sibling PR replaces the two named files with a bare `pytest`, so a
+    substitution keyed on a filename matches nothing once merged and the case
+    that used it silently stops testing.
     """
+    block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \S|\Z)", text, re.S)
+    assert block, "the macos-keychain job is gone or was renamed"
+    body, n = re.subn(
+        r"(\n +run: [^\n]*(?<![\w-])pytest(?![\w-])[^\n]*)", repl,
+        block.group(1), count=1,
+    )
+    assert n == 1, "the macOS job has no pytest invocation to mutate"
+    return text[: block.start(1)] + body + text[block.end(1) :]
+
+
+def test_a_job_that_stopped_running_pytest_is_refused(tmp_path):
+    """The deletion above, on a real copy of the real workflow."""
     text = _WORKFLOW.read_text(encoding="utf-8")
-    gutted = re.sub(r"\n +run: [^\n]*(?<![\w-])pytest(?![\w-])[^\n]*", "", text)
+    gutted = _mutate_macos_run(text, "")
     assert gutted != text, "nothing was mutated — this check lost its subject"
     fake = tmp_path / "ci.yml"
     fake.write_text(gutted, encoding="utf-8")
@@ -138,11 +152,15 @@ def test_a_job_that_stopped_running_pytest_is_refused(tmp_path):
 
 
 def test_a_job_naming_a_deleted_file_is_refused(tmp_path):
-    """The other half: the invocation survives, the path it names does not."""
+    """The other half: the invocation survives, a path it names does not.
+
+    The decoy is APPENDED, so this holds whether the job names two files or
+    none -- which is exactly what a sibling PR changes about this step.
+    """
     text = _WORKFLOW.read_text(encoding="utf-8")
-    stale = re.sub(r"tests/test_macos_keychain\.py", "tests/test_gone.py", text)
-    assert stale != text, "nothing was mutated — this check lost its subject"
     assert not (_ROOT / "tests/test_gone.py").exists(), "the decoy path exists"
+    stale = _mutate_macos_run(text, r"\1 tests/test_gone.py")
+    assert stale != text, "nothing was mutated — this check lost its subject"
     fake = tmp_path / "ci.yml"
     fake.write_text(stale, encoding="utf-8")
     with pytest.raises(AssertionError, match="names tests/test_gone.py"):
@@ -157,10 +175,8 @@ def test_a_commented_out_invocation_does_not_count(tmp_path):
     `_macos_job` buys, and without this case nothing witnessed it.
     """
     text = _WORKFLOW.read_text(encoding="utf-8")
-    disabled = re.sub(
-        r"\n( +)(run: [^\n]*(?<![\w-])pytest(?![\w-])[^\n]*)", r"\n\1# \2", text
-    )
-    assert disabled != text, "nothing was commented out — this check lost its subject"
+    disabled = _mutate_macos_run(text, lambda m: m.group(1).replace("run:", "# run:"))
+    assert disabled != text, "nothing was commented out — lost its subject"
     assert "pytest" in disabled, "the decoy is gone; the case no longer discriminates"
     fake = tmp_path / "ci.yml"
     fake.write_text(disabled, encoding="utf-8")
