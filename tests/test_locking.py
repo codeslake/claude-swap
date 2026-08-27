@@ -22,10 +22,9 @@ def _advancing_clock(clock, budget):
     deadline and the case HANGS instead of failing -- which is worse than the
     bug, because a hung xdist worker holds the job with nothing to read.
 
-    The step is a thousandth of the budget, so a sleepless loop crosses the
-    deadline in about a thousand reads whatever the budget is. A FIXED hair
-    does not scale: at a 3s budget it needs three million iterations, and the
-    stale-takeover fires first, so the case reports the wrong failure.
+    A FIXED hair does not scale: at a 3s budget it needs three million
+    iterations, and the stale-takeover fires first, so the case reports the
+    wrong failure. The step itself is set below, with why.
     """
     # SMALL ENOUGH NOT TO PERTURB. A thousandth of the budget shifts the
     # remainders these cases assert on; a hundred-thousandth bounds a

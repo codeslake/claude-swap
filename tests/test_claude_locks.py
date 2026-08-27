@@ -30,10 +30,9 @@ def _advancing_clock(clock, budget):
     deadline and the case HANGS instead of failing -- which is worse than the
     bug, because a hung xdist worker holds the job with nothing to read.
 
-    The step is a thousandth of the budget, so a sleepless loop crosses the
-    deadline in about a thousand reads whatever the budget is. A FIXED hair
-    does not scale: at a 3s budget it needs three million iterations, and the
-    stale-takeover fires first, so the case reports the wrong failure.
+    A FIXED hair does not scale: at a 3s budget it needs three million
+    iterations, and the stale-takeover fires first, so the case reports the
+    wrong failure. The step itself is set below, with why.
     """
     # SMALL ENOUGH NOT TO PERTURB. A thousandth of the budget shifts the
     # remainders these cases assert on; a hundred-thousandth bounds a
@@ -46,6 +45,30 @@ def _advancing_clock(clock, budget):
         return clock[0]
 
     return monotonic
+
+
+def _assert_backed_off(slept, budget, *, least=3, remainder=0.05, what="clamp"):
+    """Every arm of the retry loop must CLAMP to what is left AND back off.
+
+    The clamp half is one-sided on its own: a list of zeros satisfies it, and
+    a list of zeros is the hot spin these cases exist to forbid. Copying the
+    clamp assertions per arm is how two of the three arms here went without
+    the lower bound `test_locking` has carried for its own clamp since the
+    same pass -- so the assertions live in one place instead.
+    """
+    assert len(slept) >= least, f"the instrument, not the code: {slept}"
+    for left, seconds in slept:
+        assert seconds <= max(left, 0.0), (
+            f"slept {seconds}s with {left}s left — the {what} used `timeout`, "
+            f"not what remains of it (all sleeps: {slept})"
+        )
+    assert min(l for l, _ in slept) < remainder, (
+        f"the run must reach a remainder under {remainder}: {slept}"
+    )
+    assert sum(s for _, s in slept) >= budget * 0.9, (
+        f"slept {sum(s for _, s in slept)}s of a {budget}s budget — the arm "
+        f"spun instead of backing off: {slept}"
+    )
 
 
 @pytest.fixture
@@ -407,15 +430,7 @@ class TestProperLockfile:
             with proper_lockfile(lock_dir, timeout=budget):
                 pass
 
-        assert len(slept) >= 3, f"the instrument, not the code: {slept}"
-        for left, seconds in slept:
-            assert seconds <= max(left, 0.0), (
-                f"slept {seconds}s with {left}s left — the clamp used "
-                f"`timeout`, not what remains of it (all sleeps: {slept})"
-            )
-        assert min(l for l, _ in slept) < 0.05, (
-            f"the run must reach a remainder under the flat 0.05: {slept}"
-        )
+        _assert_backed_off(slept, budget)
 
     def test_the_jitter_branch_sleeps_only_what_is_left(
         self, lock_dir, monkeypatch
@@ -463,16 +478,8 @@ class TestProperLockfile:
             with proper_lockfile(lock_dir, timeout=budget):
                 pass
 
-        assert len(slept) >= 2, f"the instrument, not the code: {slept}"
-        for left, seconds in slept:
-            assert seconds <= max(left, 0.0), (
-                f"slept {seconds}s with {left}s left — the jitter clamp used "
-                f"`timeout`, not what remains of it (all sleeps: {slept})"
-            )
-        assert min(l for l, _ in slept) < 0.005, (
-            f"the run must reach a remainder small enough for any flat sleep "
-            f"to overshoot it: {slept}"
-        )
+        _assert_backed_off(slept, budget, least=2, remainder=0.005,
+                           what="jitter clamp")
 
 
 class TestLockPaths:
@@ -602,11 +609,12 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    THE FILE'S ONLY WALL CLOCK. Every other clamp case scripts `monotonic`, so
-    all of them share one instrument and a systematic error in it is invisible
-    to the lot. This one measures elapsed time and nothing else, which is the
-    whole reason to keep it: on the weakening below it is redundant, and that
-    is an argument about one mutation rather than about independence.
+    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Five of the file's seven clamp
+    cases run the real clock, so being one of them is not what makes this one
+    worth keeping. The others assert a syscall count or a per-sleep remainder,
+    and a clamp WEAKENED rather than deleted moves neither. On the weakening
+    below this case is redundant with the jitter arm's; on the quantity it
+    measures it is alone.
 
     The jitter is pinned, or the weakened form's overshoot is a random draw
     that can land inside any fixed margin.
@@ -824,15 +832,7 @@ class TestEveryArmOfTheLoopBacksOff:
             with proper_lockfile(target, timeout=budget):
                 pass
 
-        assert len(slept) >= 3, f"the instrument, not the code: {slept}"
-        for left, seconds in slept:
-            assert seconds <= max(left, 0.0), (
-                f"slept {seconds}s with {left}s left — the clamp used "
-                f"`timeout`, not what remains of it (all sleeps: {slept})"
-            )
-        assert min(l for l, _ in slept) < 0.05, (
-            f"the run must reach a remainder under the flat 0.05: {slept}"
-        )
+        _assert_backed_off(slept, budget)
 
 
 def test_a_second_freeze_after_a_recovery_is_reported_again(
