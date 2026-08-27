@@ -683,6 +683,14 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
         "otherwise the guard is armed only for a bare-pytest developer and "
         "disarmed for exactly the population running mutation batteries"
     )
+    # NOT A PER-ENTRY GUARD, and deliberately so. `_freeze_real_store_specs`
+    # dedupes by root, and on macOS/Windows `get_backup_root()` IS
+    # `get_legacy_backup_root()` (`~/.claude-swap-backup`), so dropping either
+    # one there leaves the merged set identical -- a no-op, not a hole. The
+    # ambient-override pass has its own witness in
+    # `test_frozen_specs_include_the_ambient_xdg_override_backup_root`. What
+    # this case owns is the HOME axis: the OS account home and the scratch
+    # HOME must BOTH be protected, which no other case asks.
     assert scratch_root in roots, (
         "the scratch HOME's own root must stay protected too"
     )

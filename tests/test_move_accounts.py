@@ -500,15 +500,12 @@ class TestMoveUnreadableSourceIsNotAbsent:
 
     @pytest.fixture(autouse=True)
     def _file_mode(self, monkeypatch):
-        """THE `.enc`/`.prev` FILES ARE THIS CLASS'S SUBJECT, so the store
-        must route to them on every platform.
-
-        On macOS a usable Keychain takes the write and reconciles the `.enc`
-        away, so the backup these cases make unreadable was never written as
-        a file at all: `chmod` raises FileNotFoundError, and the retained
-        generation lands in the Keychain where `_prev_backup_path` cannot
-        see it. The conflation under test belongs to the FILE reader, and
-        this is the routing that reaches it.
+        """Force the FILE store. These cases make an `.enc`/`.prev`
+        unreadable to reach the file reader; on macOS a usable Keychain takes
+        the write instead, so there is no file to `chmod` (FileNotFoundError)
+        and the retained generation lands where `_prev_backup_path` cannot
+        see it. Scoped by CLASS MEMBERSHIP -- a case moved out of this class
+        loses the routing, and the macOS job is where that shows.
         """
         monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
 

@@ -69,17 +69,18 @@ jobs:
         # the Keychain path never writes — and failed on macOS while every
         # job here stayed green, because this job never ran them.
         #
-        # faulthandler dumps every thread's stack if a test exceeds the
-        # budget — a `security` call blocking on an invisible SecurityAgent
-        # dialog would otherwise hang the job with no clue where. The step
-        # timeout is the backstop that actually kills it.
+        # faulthandler dumps every thread's stack past the budget, which is
+        # the only clue when a `security` call blocks on an invisible
+        # SecurityAgent dialog. Merged, a sibling sets
+        # `faulthandler_exit_on_timeout` repo-wide and this step overrides
+        # only the budget, so the dump also ABORTS the worker. Which backstop
+        # fires first is deliberately not claimed here: that sentence has been
+        # written both ways in successive rounds, and `timeout-minutes` below
+        # is the one that does not go stale.
         #
-        # 600s, NOT 60. Sixty was chosen when this job ran two files; pointed
-        # at the whole suite on the slowest, fewest-core runner it is a budget
-        # per test that ordinary contention can reach. A dump is cheap and a
-        # false one is noise, but the cost is not symmetric once a sibling
-        # sets `faulthandler_exit_on_timeout` with `--max-worker-restart=0`:
-        # there the budget stops being a dump and becomes a worker kill with
-        # no replacement, and the queued tests on that worker never run.
+        # 600 is that sibling's ini value, so this override is a no-op once
+        # merged rather than a second number to keep in step. It is NOT a
+        # per-test contention margin -- the whole suite runs in ~40s on this
+        # runner, so the 60 it replaces already exceeded the suite total.
         timeout-minutes: 15
         run: uv run pytest -o faulthandler_timeout=600
