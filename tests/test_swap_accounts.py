@@ -1850,17 +1850,31 @@ class TestTheRollbackDecidesPerKey:
         crossed = switcher._session_dir("1", mail_b)
         crossed.mkdir(parents=True, exist_ok=True)
         (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
-        crossed.chmod(0o500)
-        try:
-            with caplog_at_error() as records:
-                switcher._rollback_swap(
-                    "1", mail_a, "creds-a", "{}",
-                    "2", mail_b, "creds-b", "{}",
-                    staging={}, moved=moved, wrote_backups=True,
-                )
-        finally:
-            crossed.chmod(0o700)
 
+        # INJECTED, NOT chmod'd. A mode bit denies nothing on Windows, so the
+        # fault never fired there and the three negative asserts below passed
+        # because NOTHING had happened -- the shape they exist to catch.
+        real_inval = switcher._invalidate_session_credentials
+        denied = {"n": 0}
+
+        def denying(num, email, *a, **k):
+            if (num, email) == ("1", mail_b):
+                denied["n"] += 1
+                raise PermissionError(errno.EACCES, "injected")
+            return real_inval(num, email, *a, **k)
+
+        switcher._invalidate_session_credentials = denying
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+
+        assert denied["n"] == 1, (
+            "premise: the crossed profile was never reached, so nothing was "
+            f"denied and the asserts below judge an empty run ({denied['n']})"
+        )
         said = " ".join(records)
         assert switcher._read_account_credentials("2", mail_b) == "creds-b", (
             "premise: the credential restore did NOT land, so a reported "
