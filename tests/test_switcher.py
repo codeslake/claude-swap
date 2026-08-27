@@ -12792,18 +12792,30 @@ def test_no_writer_calls_os_write_bare():
         # THE LOOP THAT EXISTS TO DO THIS IS THE ONE PLACE ALLOWED TO. Named
         # rather than exempting its module, so a second exemption has to be
         # written down here to take effect.
+        # THE HELPER'S OWN MODULE, not any function of that name. A second
+        # `def write_all` elsewhere in src/ would otherwise exempt itself.
         exempt = {
             id(n) for f in ast.walk(tree)
-            if isinstance(f, ast.FunctionDef) and f.name == "write_all"
+            if mod.name == "fsutil.py"
+            and isinstance(f, ast.FunctionDef) and f.name == "write_all"
             for n in ast.walk(f)
         }
+        # `from os import write as _w` binds a bare NAME, which an attribute
+        # match cannot see; resolve the aliases this module actually created.
+        aliases = {
+            (a.asname or a.name)
+            for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
+            and imp.module == "os"
+            for a in imp.names if a.name == "write"
+        }
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "write"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "os"
-                    and id(node) not in exempt):
+            if not isinstance(node, ast.Call) or id(node) in exempt:
+                continue
+            f = node.func
+            bare = isinstance(f, ast.Name) and f.id in aliases
+            dotted = (isinstance(f, ast.Attribute) and f.attr == "write"
+                      and isinstance(f.value, ast.Name) and f.value.id == "os")
+            if bare or dotted:
                 offenders.append(f"{mod.name}:{node.lineno}")
 
     # THE SUBJECT FIRST. A denominator that runs ahead of it reports a code
@@ -12842,6 +12854,7 @@ def test_no_writer_chmods_after_it_publishes():
     asserted one site at a time: the round that moved the first of six left
     five behind and the suite stayed green.
     """
+    import re
     import ast
 
     src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
@@ -12857,7 +12870,9 @@ def test_no_writer_chmods_after_it_publishes():
                 if "replace_with_retry(" in text and pub is None:
                     pub = i
                     publishes += 1
-                if "os.chmod(" in text and chm is None:
+                # ANY RECEIVER. `path.chmod(0o600)` is the idiomatic spelling
+                # here and walked straight past a literal `os.chmod(`.
+                if re.search(r"(?<![\w.])(os\.chmod|\w+\.chmod)\(", text) and chm is None:
                     chm = i
             if pub is not None and chm is not None and chm > pub:
                 offenders.append(f"{mod.name}:{node.body[chm].lineno}")
@@ -12870,6 +12885,36 @@ def test_no_writer_chmods_after_it_publishes():
         "a chmod runs AFTER the publish, so its failure reports a landed "
         f"write as a failed one: {offenders}"
     )
+
+
+def test_a_temp_name_already_taken_is_not_deleted(temp_home: Path, monkeypatch):
+    """O_EXCL refuses the name; the cleanup must not then remove their file.
+
+    The refusal means somebody else holds it. `temp_path` is still set when
+    `os.open` raises, so the `finally` unlinks a file this writer never
+    created -- and under O_TRUNC that case could not arise, so the conversion
+    is what opened it. Both sibling writers in this file already guard it:
+    `_salvage` tracks `created`, and `_stage_overlap_material` drops the key
+    on EEXIST because it "lost the race; not ours to remove".
+    """
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(switcher_mod.secrets, "token_hex", lambda n: "deadbeef")
+    squatted = target.parent / f".{target.name}.{os.getpid()}.deadbeef.tmp"
+    squatted.write_text("A PEER'S IN-PROGRESS FILE", encoding="utf-8")
+
+    with pytest.raises(Exception):
+        switcher._write_json(target, {"activeAccountNumber": 1})
+
+    assert squatted.exists(), (
+        "the cleanup removed a temp this writer refused to create; O_EXCL "
+        "raised because somebody else holds that name"
+    )
+    assert squatted.read_text(encoding="utf-8") == "A PEER'S IN-PROGRESS FILE"
 
 
 def test_every_temp_writer_opens_with_O_EXCL():
@@ -12902,6 +12947,18 @@ def test_every_temp_writer_opens_with_O_EXCL():
             if len(node.args) < 2:
                 continue  # a read; no creation flags to judge
             flags = ast.unparse(node.args[1])
+            # A NAME IS NOT A VERDICT. Hoisting the flags into a local hid the
+            # writer from the offender list AND from the denominator, so the
+            # count fell and nothing complained. Resolve a single assignment.
+            if flags.isidentifier():
+                bound = [
+                    ast.unparse(a.value) for a in ast.walk(tree)
+                    if isinstance(a, ast.Assign) and len(a.targets) == 1
+                    and isinstance(a.targets[0], ast.Name)
+                    and a.targets[0].id == flags
+                ]
+                if len(bound) == 1:
+                    flags = bound[0]
             if "O_CREAT" not in flags:
                 continue  # not creating anything
             seen += 1

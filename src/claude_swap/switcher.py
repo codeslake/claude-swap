@@ -653,7 +653,16 @@ class ClaudeAccountSwitcher:
             # returning and `fdopen` taking the fd leaks the descriptor;
             # on Windows that held handle is what makes the cleanup
             # unlink fail, so the temp is stranded rather than removed.
-            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                fd = os.open(temp_path,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                # NOT OURS TO REMOVE. O_EXCL refused because somebody holds
+                # the name, so the `finally` must not unlink their file. Both
+                # sibling writers here already do this -- `_salvage` tracks
+                # `created`, `_stage_overlap_material` drops the key on EEXIST.
+                temp_path = None
+                raise
             owned, fd = fd, -1
             # BINARY, so the file's bytes ARE `content.encode("utf-8")` by
             # CONSTRUCTION rather than by a keyword argument. The recovery
