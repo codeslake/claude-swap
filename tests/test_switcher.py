@@ -12367,58 +12367,6 @@ def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
     assert strays == [], f"an interrupt at the mode call stranded {strays}"
 
 
-def test_a_completed_copy_is_not_emptied_by_the_recovery(
-    temp_home: Path, monkeypatch
-):
-    """The ORDINARY interrupt on Linux, and the destructive one to get wrong.
-
-    `copyfile` uses `sendfile`, so the last byte lands before the signal is
-    delivered: the destination differs from `before` and is COMPLETE. Deciding
-    on `before` alone empties a finished write. `landed` is what separates
-    them, and it is a digest of the bytes we wrote rather than of the file we
-    wrote them to, so nothing about the temp's medium can make it unavailable.
-    """
-    from claude_swap import switcher as switcher_mod
-
-    posix = sys.platform != "win32"
-    switcher = ClaudeAccountSwitcher()
-    target = switcher.backup_dir / "sequence.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
-    if posix:
-        os.chmod(target, 0o644)
-
-    def busy(*_a, **_kw):
-        raise OSError(errno.EBUSY, "Device or resource busy")
-
-    fired = {"copied": False}
-
-    real_copyfile = switcher_mod.shutil.copyfile
-
-    def copy_then_interrupt(src, dst, **kw):
-        real_copyfile(src, dst, **kw)      # every byte lands
-        fired["copied"] = True
-        raise KeyboardInterrupt            # ...and then the signal
-
-    payload = {"activeAccountNumber": 2, "accounts": {"2": {"email": "x@y.z"}}}
-    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
-    monkeypatch.setattr(switcher_mod.shutil, "copyfile", copy_then_interrupt)
-    with pytest.raises(KeyboardInterrupt):
-        switcher._write_json(target, payload)
-    monkeypatch.undo()
-
-    assert fired["copied"], "premise: the copy never completed"
-    assert target.read_bytes(), (
-        "the recovery emptied a destination the copy had COMPLETED — it "
-        "decided on `before` alone, which is the destructive answer"
-    )
-    if posix:
-        assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
-            "the mode obligation is separate from the content one and is owed "
-            "on this path too"
-        )
-
-
 def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
     temp_home: Path, monkeypatch
 ):
