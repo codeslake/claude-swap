@@ -720,6 +720,16 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
     # platform whose store lives somewhere else.
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", str(pwd_home))
+    # THE PREMISE FOR THE THING THAT CAN SILENTLY BREAK. `_REAL_PATH_HOME` is
+    # captured at import; if that capture ever lands on a PATCHED `Path.home`,
+    # both roots below collapse to the isolated home and every assert passes
+    # whatever the specs contain. The Keychain fake asserted above cannot fail
+    # that way -- this one can.
+    assert Path.home() == pwd_home, (
+        "premise: `Path.home` still answers the isolation fixture's constant, "
+        "so both roots below are the same isolated path and this case cannot "
+        "fail whatever the frozen specs hold"
+    )
     pwd_root = paths.get_backup_root()
     monkeypatch.setenv("HOME", str(scratch))
     scratch_root = paths.get_backup_root()
