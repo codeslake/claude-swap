@@ -286,19 +286,43 @@ class TestProperLockfile:
         that never stops at all.
         """
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
-        touches, _ = self._count_touches(monkeypatch, lock_dir)
+        # COUNTED ON THE TICK, not on `os.utime`. WHERE a tick notices absence
+        # is an implementation choice -- the leading stat is one syscall
+        # earlier than the refresh -- and a utime counter reads zero for a
+        # toucher that ran and correctly stopped, failing its own premise
+        # about code that is right. What this case is about is that the LOOP
+        # ends, so count the loop.
+        # BOTH SYSCALLS, because either one can be the tick's first. A
+        # heartbeat that verifies identity before refreshing notices absence
+        # at the STAT and never reaches `utime`; one that refreshes straight
+        # away notices it at the utime. Counting only the second reads zero
+        # for a toucher that ran and stopped correctly.
+        real = {"stat": os.stat, "utime": os.utime}
+        ticks = {"n": 0}
+
+        def counting(name):
+            def call(path, *a, **k):
+                if (not isinstance(path, int)
+                        and os.fspath(path) == os.fspath(lock_dir)):
+                    ticks["n"] += 1
+                return real[name](path, *a, **k)
+            return call
+
         with proper_lockfile(lock_dir):
+            # Armed INSIDE the hold, so the acquire's own calls are not ticks.
+            monkeypatch.setattr(claude_locks.os, "stat", counting("stat"))
+            monkeypatch.setattr(claude_locks.os, "utime", counting("utime"))
             os.rmdir(lock_dir)
             time.sleep(0.15)
-            settled = touches["n"]
+            settled = ticks["n"]
             assert settled >= 1, (
                 "the toucher never ran in the window — the instrument, not "
                 "the code (raise the sleep or lower TOUCH_INTERVAL_S)"
             )
             time.sleep(0.3)
-            assert touches["n"] == settled, (
+            assert ticks["n"] == settled, (
                 f"the toucher kept going on a dead lock "
-                f"({touches['n'] - settled} more attempts)"
+                f"({ticks['n'] - settled} more attempts)"
             )
 
     def test_creates_missing_parent(self, tmp_path):
