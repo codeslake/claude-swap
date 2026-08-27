@@ -95,12 +95,14 @@ def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
     try:
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.write(fd, content.encode("utf-8"))
+        if sys.platform != "win32":
+            # On the fd: past `replace_with_retry` a chmod can only fail,
+            # and the `except` below would report a landed write as failed.
+            os.fchmod(fd, 0o600)
         os.close(fd)
         fd = -1
         replace_with_retry(tmp_path, str(path))
         tmp_path = None  # consumed by the publish; the name is not ours
-        if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)

@@ -12734,6 +12734,97 @@ def test_a_matching_destination_the_copy_never_opened_is_still_restored(
     )
 
 
+def test_no_writer_chmods_after_it_publishes():
+    """The try block must end AT the publish, everywhere it was moved once.
+
+    `replace_with_retry` is the commit point. A `chmod` on the TARGET after it
+    can only fail, and the `except BaseException` around these writers then
+    reports a write that LANDED as a failure — the caller rolls back or
+    retries a file that is already correct. The mode is not what is at stake:
+    `O_EXCL` opens at 0600 and a umask only clears bits, so these temps are
+    never wider, which is why one site moved the call onto the fd and the
+    others can too.
+
+    Structural because it is an ORDERING, and orderings do not survive being
+    asserted one site at a time: the round that moved the first of six left
+    five behind and the suite stayed green.
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders, publishes = [], 0
+    for mod in sorted(src_dir.glob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            pub = chm = None
+            for i, stmt in enumerate(node.body):
+                text = ast.unparse(stmt)
+                if "replace_with_retry(" in text and pub is None:
+                    pub = i
+                    publishes += 1
+                if "os.chmod(" in text and chm is None:
+                    chm = i
+            if pub is not None and chm is not None and chm > pub:
+                offenders.append(f"{mod.name}:{node.body[chm].lineno}")
+
+    assert publishes >= 5, (
+        f"the instrument, not the code: only {publishes} publish(es) were "
+        "found inside a try block, so this would pass over almost nothing"
+    )
+    assert not offenders, (
+        "a chmod runs AFTER the publish, so its failure reports a landed "
+        f"write as a failed one: {offenders}"
+    )
+
+
+def test_every_temp_writer_opens_with_O_EXCL():
+    """The invariant `_write_json`'s own docstring states, checked structurally.
+
+    "Temps ... are created with ``O_EXCL`` and never overwrite an existing
+    file" -- and one writer of the dozen opened `O_TRUNC`, which does exactly
+    what that sentence forbids. Derived from the source rather than listed:
+    a per-site literal is right until the next writer is added, and the
+    thirteenth is the one nobody checks.
+
+    `O_EXCL` is not decoration here. The temp names carry a random token, so
+    a collision means somebody else holds the name -- and the safe answer to
+    that is to fail, not to truncate what they are writing. It also refuses
+    to follow a symlink planted at the name.
+    """
+    import ast
+
+    src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
+    offenders, seen = [], 0
+    for mod in sorted(src_dir.glob("*.py")):
+        tree = ast.parse(mod.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "open"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"):
+                continue
+            if len(node.args) < 2:
+                continue  # a read; no creation flags to judge
+            flags = ast.unparse(node.args[1])
+            if "O_CREAT" not in flags:
+                continue  # not creating anything
+            seen += 1
+            if "O_EXCL" not in flags:
+                offenders.append(f"{mod.name}:{node.lineno} {flags}")
+
+    assert seen >= 10, (
+        f"the instrument, not the code: only {seen} creating `os.open` call(s) "
+        "were found, so this would pass over almost nothing"
+    )
+    assert not offenders, (
+        "a temp writer can overwrite an existing file, which is what the "
+        f"`_write_json` docstring says none of them does: {offenders}"
+    )
+
+
 def test_an_unreadable_destination_IS_restored_when_the_copy_never_opened_it(
     temp_home: Path, monkeypatch
 ):

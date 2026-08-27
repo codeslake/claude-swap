@@ -743,12 +743,14 @@ class CredentialStore:
         try:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
+            if sys.platform != "win32":
+                # On the fd: past `replace_with_retry` a chmod can only fail,
+                # and the `except` below would report a landed write as failed.
+                os.fchmod(fd, 0o600)
             os.close(fd)
             fd = -1
             replace_with_retry(tmp_path, str(path))
             tmp_path = None  # consumed by the publish; the name is not ours
-            if sys.platform != "win32":
-                os.chmod(str(path), 0o600)
         except BaseException:
             if fd >= 0:
                 os.close(fd)
@@ -776,12 +778,14 @@ class CredentialStore:
         try:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.write(fd, credentials.encode("utf-8"))
+            if sys.platform != "win32":
+                # On the fd: past `replace_with_retry` a chmod can only fail,
+                # and the `except` below would report a landed write as failed.
+                os.fchmod(fd, 0o600)
             os.close(fd)
             fd = -1
             replace_with_retry(tmp_path, str(cred_file))
             tmp_path = None  # consumed by the publish; the name is not ours
-            if sys.platform != "win32":
-                os.chmod(str(cred_file), 0o600)
         except BaseException:
             if fd >= 0:
                 os.close(fd)
@@ -1153,12 +1157,14 @@ class CredentialStore:
         try:
             fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.write(fd, encoded.encode("utf-8"))
+            if sys.platform != "win32":
+                # On the fd: past `replace_with_retry` a chmod can only fail,
+                # and the `except` below would report a landed write as failed.
+                os.fchmod(fd, 0o600)
             os.close(fd)
             fd = -1
             replace_with_retry(tmp_path, str(enc_file))
             tmp_path = None  # consumed by the publish; the name is not ours
-            if sys.platform != "win32":
-                os.chmod(str(enc_file), 0o600)
         except BaseException:
             if fd >= 0:
                 os.close(fd)

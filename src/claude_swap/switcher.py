@@ -639,15 +639,21 @@ class ClaudeAccountSwitcher:
         try:
             # 0600 from creation: this writer publishes `~/.claude.json`,
             # which can carry `primaryApiKey`. `fchmod` is what enforces it —
-            # the open mode is masked by the umask and ignored outright on a
-            # leftover temp. The mode arg only carries Windows, where there
-            # is no `fchmod`.
+            # the open mode is masked by the umask. The mode arg only carries
+            # Windows, where there is no `fchmod`.
+            #
+            # O_EXCL, LIKE EVERY SIBLING WRITER. The comment above this
+            # function's temp name says a redrawn name leaves the writer to
+            # "either die on it or eat a file it did not create"; O_TRUNC
+            # chose to eat it. The name already carries a random token, so a
+            # collision means somebody else holds it and failing is the whole
+            # answer. It also refuses to follow a symlink planted at the name.
             #
             # TRACKED ACROSS THE HANDOVER. An interrupt between `os.open`
             # returning and `fdopen` taking the fd leaks the descriptor;
             # on Windows that held handle is what makes the cleanup
             # unlink fail, so the temp is stranded rather than removed.
-            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             owned, fd = fd, -1
             # BINARY, so the file's bytes ARE `content.encode("utf-8")` by
             # CONSTRUCTION rather than by a keyword argument. The recovery
