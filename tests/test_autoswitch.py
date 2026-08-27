@@ -592,6 +592,41 @@ class TestDecisionTable:
         assert event.deliberate_wait is False
         assert "all accounts exhausted" in event.human()
 
+    def test_a_reset_already_past_is_not_provable_either(self, harness):
+        """The `usable_at <= now` half, which nothing reads the flag for.
+
+        Its sibling below puts the SAME past reset on all three accounts, so
+        `earliest` is None whatever the flag says and the value is never
+        consulted. Mixed -- one account already past, the others hours out --
+        the two halves separate: a past reset means that account could return
+        at any moment, so the fleet is no more provable than one with no reset
+        at all, and announcing the next account's is a claim over it.
+        """
+        from datetime import datetime, timezone
+
+        def _at(offset):
+            return (
+                datetime.fromtimestamp(harness.clock.now + offset, tz=timezone.utc)
+                .isoformat().replace("+00:00", "Z")
+            )
+
+        outcome = harness.tick_with_usage({
+            "1": _usage(100, _at(-60)),
+            "2": _usage(100, _at(2 * 3600)),
+            "3": _usage(100, _at(3 * 3600)),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
+        assert event.earliest_reset_at is None, (
+            f"announced {event.earliest_reset_at!r} while account 1's reset has "
+            "already passed — it can return at any moment and nothing measured it"
+        )
+        assert harness.engine._sleep_until_ts is None, (
+            "the sleep armed toward a later account's reset over one that is "
+            "already due"
+        )
+        assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+
     @pytest.mark.parametrize("offset", [-60.0, 0.0])
     def test_all_exhausted_ignores_non_future_reset(self, harness, offset):
         from datetime import datetime, timezone
