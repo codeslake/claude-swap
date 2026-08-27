@@ -710,14 +710,18 @@ def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch,
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
     pwd_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-    # POINTED AWAY, so the AMBIENT pass cannot supply the scratch root and the
-    # assert below rests on the pass this case names. Without it the two
-    # passes resolve to the same directory -- the isolation fixture clears
-    # `XDG_DATA_HOME` for every test -- and dropping `default_specs` entirely
-    # left the whole suite green. That pass is load-bearing in exactly the
-    # scenario this case exists for: the mandated recipe exports HOME AND
-    # `XDG_DATA_HOME` before the interpreter starts, and only `default_specs`
-    # then protects the scratch HOME's own store.
+    # POINTED AWAY -- ON LINUX AND WSL ONLY. There the ambient pass then
+    # cannot supply the scratch root, so the assert below rests on the pass
+    # this case names, and dropping `default_specs` fails it. On macOS and
+    # Windows `get_backup_root()` ignores `XDG_DATA_HOME` entirely and
+    # answers `~/.claude-swap-backup`, so both passes resolve to the same
+    # directory and this case cannot tell them apart -- the mutation it
+    # claims to kill SURVIVES on those jobs. Measured on both.
+    #
+    # The pass is still load-bearing in the scenario this case exists for:
+    # the mandated recipe exports HOME AND `XDG_DATA_HOME` before the
+    # interpreter starts, and only `default_specs` then protects the scratch
+    # HOME's own store.
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-outside"))
     specs = conftest._freeze_real_store_specs()
     roots = [root for root, _recursive in specs]
