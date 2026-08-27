@@ -514,15 +514,18 @@ class SessionManager:
         warning(msg)
         self._logger.warning(_plain(msg))
 
-    def _note(self, msg: str) -> None:
+    def _note(self, msg: str, *, dim: bool = True) -> None:
         """`_warn` at INFO, for a line naming where the user's data went.
 
-        STYLED FOR THE TERMINAL, PLAIN FOR THE LOG. A caller that pre-styles
-        its argument puts the escape sequences in the record too, and the
-        record is what the README points a user at. `dimmed` here rather than
-        at the call site, and `_plain` on the way to the logger.
+        STYLED FOR THE TERMINAL, PLAIN FOR THE LOG. `dimmed` here rather than
+        at the call site, and `_plain` on the way to the logger, so the record
+        the README points a user at carries no escape sequences.
+
+        `dim=False` for a caller that carries its own styling: wrapping an
+        `accent(...)` span in `dimmed` dims it up to that span's own reset,
+        which is a visible change to a line this method only meant to record.
         """
-        print(dimmed(msg))
+        print(msg if not dim else dimmed(msg))
         self._logger.info(_plain(msg))
 
     # -- launch ----------------------------------------------------------
@@ -597,7 +600,8 @@ class SessionManager:
         # so every re-launch of an existing profile left no record at all.
         self._note(
             f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
+            f"{muted('[session mode]')}",
+            dim=False,
         )
         env = {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS

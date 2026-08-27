@@ -1303,17 +1303,18 @@ class TestMcpMirror:
 # ---------------------------------------------------------------------------
 
 
-def test_no_test_runs_with_an_outbound_hop_in_the_environment():
-    """An authenticated proxy in the operator's environment must not be visible.
+def test_the_isolating_fixture_really_cleared_every_outbound_hop():
+    """The subject is `_isolate_real_home`, not this process's environment.
 
     Every double here forwards `os.environ` into the thing it fakes, and pytest
     prints whatever a failing assertion touched -- so one unrelated red case
-    publishes `https://user:secret@host` into the log. cswap reads none of
-    these names, so removing them costs the suite nothing.
+    would publish `https://user:secret@host` into the log. The autouse fixture
+    deletes those names before any body runs; this asserts it did.
 
-    Vacuous on a runner that sets none of them, which is most CI. It is sharp
-    exactly where the exposure lives: a developer machine wired to a local
-    forward proxy.
+    So it fails when the fixture STOPS deleting, and only on a machine that
+    has a hop set -- vacuous elsewhere, which is most CI. It is not a check on
+    the operator's shell, and reading it as one credits it with reach it does
+    not have.
     """
     from tests.conftest import outbound_hop_names
 
@@ -1553,7 +1554,10 @@ class TestRun:
         real_note, real_warn = manager._note, manager._warn
         monkeypatch.setattr(
             manager, "_note",
-            lambda m: (printed.append(m), real_note(m))[1], raising=False)
+            # FORWARDED, not swallowed. A `**kw` that drops what it received
+            # would accept a call shape the real method does not.
+            lambda m, **kw: (printed.append(m), real_note(m, **kw))[1],
+            raising=False)
         monkeypatch.setattr(
             manager, "_warn",
             lambda m: (printed.append(m), real_warn(m))[1], raising=False)
@@ -1569,6 +1573,35 @@ class TestRun:
         assert missing == [], (
             "a launch notice reached the terminal and not the log, so the "
             f"exec's screen blank erases it and nothing records why: {missing}"
+        )
+
+    def test_the_launch_banner_is_not_dimmed_over_its_own_accent(
+        self, manager, capture_exec, monkeypatch, auth_status_tracks_seed,
+        refresh_rotates, capsys,
+    ):
+        """`_note` wraps in `dimmed` by design; this one line carries its own.
+
+        `accent('Launching')` closes with its own reset, so a `dimmed` wrap
+        around the whole string dims exactly that word and nothing after it --
+        a visible change to a line the durable-warning fix only meant to
+        RECORD. `dim=False` at the call site is what prevents it, and dropping
+        it is invisible to every other case here: they read the LOG, which
+        `_plain` strips either way.
+        """
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+
+        line = next((l for l in capsys.readouterr().out.splitlines()
+                     if "Launching" in l), None)
+        assert line is not None, "premise: the launch banner was never printed"
+        assert "\x1b[" in line, (
+            "premise: colour is off on this line, so the wrap is invisible "
+            "and this case proves nothing"
+        )
+        assert not line.startswith("\x1b[2m"), (
+            f"the banner is wrapped in dimmed(), so its accent renders dim: "
+            f"{line!r}"
         )
 
     def test_the_two_data_moves_outlive_the_terminal(
@@ -3006,7 +3039,23 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             # the exact defect class this file exists to guard, and the guard
             # could not see it. Measured: reverting the whole durable-warning
             # fix left this GREEN while the behavioural cases went red.
-            if getattr(node.func, "id", "") not in _PRINTERS:
+            # `printer.warning(...)` AS WELL AS `warning(...)`: an attribute
+            # call has no `.id`, so keying on that alone left the guard blind
+            # to the import style a future edit is most likely to reach for.
+            #
+            # A PLAIN NAME BASE, though. `self._logger.warning(...)` is an
+            # attribute call whose `attr` is also "warning", and it is the
+            # CURE this file guards for, not the defect -- taking any `attr`
+            # turns all 11 of them into offenders. A module alias is a Name;
+            # a logger reached through `self` is an attribute chain.
+            f = node.func
+            if isinstance(f, ast.Name):
+                called = f.id
+            elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+                called = f.attr
+            else:
+                continue
+            if called not in _PRINTERS:
                 continue
             if not node.args:
                 continue
