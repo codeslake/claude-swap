@@ -103,11 +103,24 @@ def _macos_pytest_run(text: str) -> str:
     """
     block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \w[\w-]*:\n|\Z)", text, re.S)
     assert block, "the macos-keychain job is gone or was renamed"
-    runs = [m.group(1) for m in re.finditer(r"\n\s+run: (.*)", block.group(1))]
-    pytest_runs = [r for r in runs if "pytest" in r]
+    # FOUND BY WHAT IT IS, not by the key it hangs off. `run:` takes an inline
+    # string OR a `|` block scalar, and reading only `run: (.*)` captures the
+    # bare `|` for the second -- so a step spelled the ordinary way for two
+    # commands reported "0 pytest step(s)", which is loud but names the wrong
+    # cause. Comments are dropped: one mentioning pytest is not a step.
+    lines = []
+    for raw in block.group(1).splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            continue
+        if line.startswith("run: "):
+            line = line[len("run: "):].strip()
+        if line and line != "|":
+            lines.append(line)
+    pytest_runs = [c for c in lines if re.search(r"(^|\s)pytest(\s|$)", c)]
     assert len(pytest_runs) == 1, (
-        f"the macOS job has {len(pytest_runs)} pytest step(s), and this reads "
-        f"one: {runs}"
+        f"the macOS job has {len(pytest_runs)} pytest command(s), and this "
+        f"reads one: {lines}"
     )
     return pytest_runs[0]
 
@@ -123,13 +136,15 @@ def test_the_macos_job_runs_something_that_exists():
     gained coverage.
     """
     run = _macos_pytest_run(_WORKFLOW.read_text(encoding="utf-8"))
-    for path in re.findall(r"(tests/test_\w+\.py)", run):
+    named = re.findall(r"(tests/test_\w+\.py)", run)
+    for path in named:
         assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
-    if not re.search(r"tests/test_\w+\.py", run):
-        assert not re.search(r"(^| )-[km]( |=)", run), (
-            f"the macOS job names no file and filters with {run!r} — that can "
-            "select nothing, which is the silent hole this guards"
-        )
+    # NO SECOND ARM. One tried to judge a no-path command by whether it
+    # carried `-k`/`-m`, and it was wrong in both directions: `python -m
+    # pytest` runs the whole suite and was refused, while `-kfoo`,
+    # `--deselect` and `--collect-only` select nothing and passed. Judging a
+    # pytest command line from a regex needs pytest's own parser; the
+    # invariant with real power is the one above.
 
 
 def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
@@ -149,9 +164,30 @@ def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
     named = head + "      - name: X\n        run: uv run pytest tests/test_x.py -v\n" + tail
     whole = head + "      - name: X\n        run: uv run pytest -o faulthandler_timeout=60\n" + tail
 
+    # A `|` BLOCK SCALAR IS THE ORDINARY WAY TO ADD A SECOND COMMAND, and
+    # reading only `run: (.*)` captures the bare `|` — measured, that reported
+    # "0 pytest step(s)" for a step spelled the normal way.
+    block = (
+        head
+        + "      - name: X\n        run: |\n"
+        + "          echo starting\n"
+        + "          uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # A COMMENT IS NOT A STEP. Without dropping them, the paragraph above the
+    # step — which names pytest — counts as a second command.
+    commented = (
+        head
+        + "      - name: X\n        # two pytest shards were tried here\n"
+        + "        run: uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+
     assert _macos_pytest_run(named) == "uv run pytest tests/test_x.py -v"
     assert _macos_pytest_run(whole) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(block) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(commented) == "uv run pytest -o faulthandler_timeout=60"
     with pytest.raises(AssertionError, match="gone or was renamed"):
         _macos_pytest_run("\n  test:\n    runs-on: ubuntu-latest\n")
-    with pytest.raises(AssertionError, match="pytest step"):
+    with pytest.raises(AssertionError, match="pytest command"):
         _macos_pytest_run(head + tail)
