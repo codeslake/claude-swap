@@ -129,6 +129,34 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
     )
 
 
+def test_a_commented_out_macos_command_is_refused(tmp_path):
+    """The comment stripping's own witness, which nothing had.
+
+    Removing the strip left the file green, and the case deleted for claiming
+    to witness it fired only when the run anchor went too. Folded, the shape
+    is the one that matters: a `run: |` whose command is commented out joins
+    into a value carrying `pytest`, and only the stripping tells that from a
+    job that still invokes it.
+    """
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \S|\Z)", text, re.S)
+    assert block, "the macos-keychain job is gone or was renamed"
+    real = re.search(r"\n( +)run: ([^\n]*(?<![\w-])pytest(?![\w-])[^\n]*)",
+                     block.group(1))
+    assert real, "premise: no inline pytest run line to comment out"
+    indent, cmd = real.group(1), real.group(2)
+    disabled = text.replace(
+        f"\n{indent}run: {cmd}",
+        f"\n{indent}run: |\n{indent}  # {cmd}\n{indent}  echo \"disabled\"",
+        1,
+    )
+    assert disabled != text, "nothing was mutated — this check lost its subject"
+    fake = tmp_path / "ci.yml"
+    fake.write_text(disabled, encoding="utf-8")
+    with pytest.raises(AssertionError, match="no longer invokes pytest"):
+        _assert_macos_job_is_intact(fake)
+
+
 def test_a_commented_out_windows_command_is_refused(tmp_path):
     """The Windows reader is handed the RAW job; the macOS one is stripped.
 
@@ -211,15 +239,20 @@ def test_each_way_the_windows_shards_collapse_is_refused(tmp_path, repl, expecte
 
 
 def _macos_job(workflow: Path) -> str:
-    """The `macos-keychain` job's block, with comments stripped.
+    """The `macos-keychain` job's block, raw.
 
-    Comments go because the question below is whether the job INVOKES pytest,
-    and a `#` line that merely mentions it answers yes for the wrong reason.
+    Comments are stripped by `_pytest_run_lines`, for both jobs, because a `#`
+    line that merely mentions pytest answers the invocation question for the
+    wrong reason -- and because folding a block scalar puts a commented-out
+    command INSIDE the value. Doing it here as well changed nothing and hid
+    which pass was load-bearing.
     """
     text = workflow.read_text(encoding="utf-8")
     block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \S|\Z)", text, re.S)
     assert block, "the macos-keychain job is gone or was renamed"
-    return "\n".join(re.sub(r"(?<!\S)#.*", "", ln) for ln in block.group(1).splitlines())
+    # NOT STRIPPED HERE. `_pytest_run_lines` strips, once, for both jobs --
+    # a second pass changes nothing and hid which one was load-bearing.
+    return block.group(1)
 
 
 def _pytest_run_lines(job: str) -> list[str]:
@@ -234,11 +267,13 @@ def _pytest_run_lines(job: str) -> list[str]:
     same command and the header alone carries no `pytest`: read literally it
     reports a job that tests everything as testing nothing.
 
-    WHAT THIS STILL CANNOT DO, stated rather than discovered: the two mutation
-    helpers below select their target with a line regex and do NOT fold. On a
-    workflow written with block scalars they raise "no pytest invocation to
-    mutate" -- a loud refusal, which is the safe direction, but the cases then
-    test their own scaffolding rather than the workflow.
+    WHAT THIS STILL CANNOT DO: the two mutation helpers below select their
+    target with a line regex and do NOT fold. On a workflow written with block
+    scalars they raise "no pytest invocation to mutate" -- and they raise it
+    whether that workflow is CORRECT or runs nothing, so that refusal has no
+    discriminating power and calling it "the safe direction" overstates it.
+    What actually separates the two is the comment stripping above, which is
+    why it lives in this reader and not in one caller.
     """
     # STRIPPED HERE, NOT PER CALLER. Folding joins a block scalar's lines, so
     # a `#` that comments the real command out lands INSIDE the folded value

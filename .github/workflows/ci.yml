@@ -88,13 +88,15 @@ jobs:
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
         # runs on stock Windows, and this job is the proof.
         #
-        # `-o testpaths=` makes the selection explicit. It does NOT rescue a
-        # shard from pyproject's `testpaths`: positional paths already win
-        # over it, measured on the pinned pytest -- a named shard collects the
-        # same 18/421/1335 with the flag and without. It matters only for the
-        # `rest` shard, which passes no positional path at all, and there it
-        # is what stops the ignore list being applied to `testpaths` instead
-        # of to the shard.
+        # `-o testpaths=` is a NO-OP for every shard as written, measured on
+        # the pinned pytest: each named shard and the `rest` shard collect the
+        # same count with the flag and without (rest: 1336 either way), and
+        # the control that the flag is honoured at all is `-o testpaths=docs`
+        # collecting nothing. Positional paths already beat `testpaths`, and
+        # `rest`'s `--ignore` list narrows it rather than replacing it. Kept
+        # because it is what would matter if a shard ever ignored the
+        # testpaths root itself; a first reading of it, and a second, each
+        # claimed a different reason that measurement did not support.
         #
         # -n 4, not the 8 the unsharded job used: each worker re-imports the
         # test modules and booting 8 cost 16.7s on Windows against 4's 8.8s.
