@@ -782,7 +782,16 @@ class ClaudeAccountSwitcher:
                         after = hashlib.sha256(path.read_bytes()).hexdigest()
                     except OSError:
                         return  # `kept` still names the survivor
-                    touched = (after != landed
+                    # `landed is None` MEANS THE TEMP WAS UNREADABLE, and
+                    # `after` is a hexdigest that is never None -- so without
+                    # this term `after != landed` is unconditionally true and
+                    # the predicate collapses to the destructive form this
+                    # guard exists to replace. An unreadable temp is the one
+                    # state where the copy almost certainly never opened the
+                    # destination, so the conservative answer is to leave the
+                    # content and still restore the mode: the two obligations
+                    # are separate, and only the mode one is POSIX-only.
+                    touched = (landed is not None and after != landed
                                and before is not None and after != before)
                     if touched:
                         try:

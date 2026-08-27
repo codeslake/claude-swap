@@ -12367,6 +12367,68 @@ def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
     assert strays == [], f"an interrupt at the mode call stranded {strays}"
 
 
+def test_an_unreadable_temp_does_not_empty_a_completed_copy(
+    temp_home: Path, monkeypatch
+):
+    """`landed is None` is "cannot tell", and it must not mean "empty it".
+
+    `after` is a hexdigest and is never None, so `after != landed` is
+    unconditionally true once the temp read fails — and the predicate then
+    collapses to exactly the destructive form the completed-copy guard
+    replaced. The failing read and the completed copy are the same population
+    the hoist exists for: the destination is a bind mount, the temp is not,
+    so the temp's medium can fail while the copy still lands in full.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    posix = sys.platform != "win32"
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    if posix:
+        os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    real_read = Path.read_bytes
+    fired = {"temp_read": False, "copied": False}
+
+    def refuse_the_temp_once(self):
+        if not fired["temp_read"] and self.name.endswith(".tmp"):
+            fired["temp_read"] = True
+            raise OSError(errno.EIO, "the temp's medium answered EIO")
+        return real_read(self)
+
+    real_copyfile = switcher_mod.shutil.copyfile
+
+    def copy_then_interrupt(src, dst, **kw):
+        real_copyfile(src, dst, **kw)      # every byte lands
+        fired["copied"] = True
+        raise KeyboardInterrupt            # ...and then the signal
+
+    payload = {"activeAccountNumber": 2, "accounts": {"2": {"email": "x@y.z"}}}
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(Path, "read_bytes", refuse_the_temp_once)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", copy_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, payload)
+    monkeypatch.undo()
+
+    assert fired["temp_read"], "premise: the temp read never failed"
+    assert fired["copied"], "premise: the copy never completed"
+    assert target.read_bytes(), (
+        "an unreadable TEMP emptied a destination the copy had COMPLETED — "
+        "`cannot tell` was read as `empty it`, which is the destructive answer"
+    )
+    if posix:
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+            "the mode obligation is separate from the content one and is owed "
+            "on this path too"
+        )
+
+
 def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
     temp_home: Path, monkeypatch
 ):
@@ -12379,15 +12441,15 @@ def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
     failures that need them: a partial destination stays partial, and the
     narrowing to 0600 is never undone.
     """
-    if sys.platform == "win32":
-        pytest.skip("POSIX modes only")
     from claude_swap import switcher as switcher_mod
 
+    posix = sys.platform != "win32"
     switcher = ClaudeAccountSwitcher()
     target = switcher.backup_dir / "sequence.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
-    os.chmod(target, 0o644)
+    if posix:
+        os.chmod(target, 0o644)
 
     def busy(*_a, **_kw):
         raise OSError(errno.EBUSY, "Device or resource busy")
@@ -12413,10 +12475,15 @@ def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
         "the recovery left a PARTIAL destination on disk because it could no "
         f"longer read the temp: {target.read_bytes()[:40]!r}"
     )
-    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
-        "the narrowing to 0600 was never undone, so another uid reading this "
-        "config gets EACCES for ever with only the copy error to go on"
-    )
+    # ONLY THE MODE HALF IS POSIX. Emptying a partial is a CONTENT obligation
+    # and applies on every platform -- gating both on one skip is the mistake
+    # the production comment records, where Windows kept a truncated
+    # credential at 0o666.
+    if posix:
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+            "the narrowing to 0600 was never undone, so another uid reading "
+            "this config gets EACCES for ever with only the copy error to go on"
+        )
 
 
 def test_a_completed_copy_is_not_emptied_by_the_recovery(
