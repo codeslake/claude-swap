@@ -494,6 +494,48 @@ class TestTheAcquireAndReleaseAreBounded:
             "identity read, pinned to an inode it then unlinked"
         )
 
+    def test_an_external_rewind_is_not_read_as_a_takeover(
+        self, tmp_path, monkeypatch
+    ):
+        """UNPINNED ONLY, where the mtime is a second witness at all.
+
+        A takeover stamps NOW, so only a LATER mtime can be a successor's.
+        One that moved BACKWARDS -- `rsync --times`, a restore, a clock step
+        on a shared home -- is an external writer touching a lock we still
+        hold, and equality reads it as theft: the heartbeat ends, the lock
+        then really does go stale, and a waiter takes it mid-swap.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+
+        lock = tmp_path / "target.lock"
+        real_utime = os.utime
+        touches = {"n": 0}
+
+        def counting(path, *a, **k):
+            if (not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)):
+                touches["n"] += 1
+            return real_utime(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", counting)
+        with proper_lockfile(lock):
+            time.sleep(0.1)
+            before = touches["n"]
+            assert before >= 1, "premise: the heartbeat never ran at all"
+            real_utime(lock, (time.time() - 30,) * 2)   # an external rewind
+            time.sleep(0.15)
+            after = touches["n"]
+
+        assert after > before, (
+            f"the heartbeat stopped after an external REWIND ({before} -> "
+            f"{after}) — an mtime that moved backwards was read as a takeover"
+        )
+        assert not lock.exists(), (
+            "the release left the lock behind on a rewind it should have "
+            "recognised as its own"
+        )
+
     def test_the_release_does_not_wait_out_a_stalled_tick(
         self, tmp_path, monkeypatch
     ):

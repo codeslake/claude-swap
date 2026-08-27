@@ -205,42 +205,61 @@ def proper_lockfile(
         time.sleep(0.25 + random.random() * 0.25)
 
     stop_touching = threading.Event()
-    # UNPINNED ONLY. Where the inode can be handed back, `last_stamp` is a
-    # read-modify-write the release also reads, and half-done -- utime landed,
-    # read-back has not -- our own lock reads foreign. Pinned, identity is
-    # immutable and there is nothing to serialise, so this costs nothing.
     # PINNED PLATFORMS HAVE NO MUTEX AT ALL: identity is immutable, so the
     # release needs nothing from the heartbeat. Unpinned, `_touch` holds this
     # across three syscalls, so the release's wait for it MUST be bounded --
     # a stalled `utime` would otherwise hold a `finally` that a single switch
     # reaches three times.
+    adopt_stamp = False
     stamping = None if _CAN_PIN_A_DIRECTORY else threading.Lock()
     _tick_guard = nullcontext() if stamping is None else stamping
 
-    def _ours() -> bool:
+    def _ours(*, strict: bool) -> bool:
         """Is the directory at this path still the one we created?
 
         Raises whatever the stat raises; each caller decides what an errno
         means for it.
 
-        The mtime is a SECOND witness, and only where the first one is not
-        decisive. Unpinned, a takeover's `mkdir` can be handed the inode
-        number back, and then the index alone says ours about a successor's
-        directory. Both readers treat a mismatch as "not ours", whose cost is
-        a lock left for the stale sweep -- so a stamp read mid-refresh is
-        safe, and there is nothing here for a mutex to protect.
+        Pinned, the descriptor settles it and `strict` changes nothing.
+
+        UNPINNED, THE TWO CALLERS WANT OPPOSITE THINGS OF THE MTIME, and
+        cannot both be served: an mtime that moved BACKWARDS is either our own
+        lock rewound by an external writer (`rsync --times`, a restore, a
+        clock step) or a successor stamped in the past, and neither the stamp
+        nor a reusable inode number separates them. So each caller gets the
+        reading whose mistake is the cheaper one:
+
+        - the heartbeat is LENIENT: only a stamp LATER than our last write can
+          be a real takeover, since a takeover's `mkdir` stamps NOW. Reading a
+          rewind as theft ends the heartbeat on a lock nobody took, and THAT
+          is what lets it go stale and really be taken.
+        - the release is STRICT: any stamp but the one we wrote means we
+          cannot prove the directory is ours, so we leave it. Its mistake
+          costs a lock left for the stale sweep; the other direction removes a
+          successor's lock inside its critical section.
         """
+        nonlocal adopt_stamp, last_stamp
         st = os.stat(lock_dir)
         if (st.st_dev, st.st_ino) != ident:
             return False
-        return _CAN_PIN_A_DIRECTORY or st.st_mtime_ns == last_stamp
+        if _CAN_PIN_A_DIRECTORY:
+            return True
+        if adopt_stamp and not strict:
+            # OUR OWN `utime` landed and its read-back did not, so this stamp
+            # is ours rather than a successor's. Condemning it would end the
+            # heartbeat over a transient read.
+            last_stamp, adopt_stamp = st.st_mtime_ns, False
+            return True
+        if strict:
+            return st.st_mtime_ns == last_stamp
+        return st.st_mtime_ns <= last_stamp
 
     # WINDOWS HAS NO FIX HERE, and this says so rather than implying one. The
     # stamp above narrows the window; it cannot close it, because the tick's
     # own read-back adopts whatever the path now carries.
 
     def _touch() -> None:
-        nonlocal last_stamp
+        nonlocal adopt_stamp, last_stamp
         # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
         # OSError: return` over both syscalls meant a single EIO or ESTALE --
         # the ordinary errnos on a network `~/.claude` -- ended the heartbeat
@@ -249,7 +268,7 @@ def proper_lockfile(
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             with _tick_guard:
                 try:
-                    if not _ours():
+                    if not _ours(strict=False):
                         return  # taken over; refreshing it keeps THEIR lock alive
                 except FileNotFoundError:
                     return  # gone; nothing left to keep alive
@@ -262,14 +281,13 @@ def proper_lockfile(
                 except OSError:
                     continue
                 if not _CAN_PIN_A_DIRECTORY:
-                    # A read-back that fails leaves the stamp stale, so the next
-                    # tick and the release both read "not ours" and leave the
-                    # lock. That is the safe direction, which is why no errno
-                    # here needs its own arm.
                     try:
                         last_stamp = os.stat(lock_dir).st_mtime_ns
                     except OSError:
-                        pass
+                        # Our own write landed and we could not read what it
+                        # wrote, so the stamp is behind the disk. Adopt the
+                        # next tick's rather than condemn it.
+                        adopt_stamp = True
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
@@ -297,7 +315,7 @@ def proper_lockfile(
                     "the release cannot prove the lock is still ours; leaving "
                     "it for the stale sweep", lock_dir, _RELEASE_WAIT_S,
                 )
-            elif _ours():
+            elif _ours(strict=True):
                 os.rmdir(lock_dir)
             else:
                 # A successor's critical section would be left with nothing on
