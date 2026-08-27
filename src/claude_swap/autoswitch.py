@@ -462,11 +462,9 @@ class AllExhaustedEvent(AutoSwitchEvent):
     # TWO STATES REACH THIS ARM AND ONLY ONE IS EXHAUSTION. A deliberate wait
     # is entered BECAUSE every candidate was READ and one still holds quota,
     # so reporting it as an exhausted fleet contradicts its own precondition,
-    # in the panel, the JSON and the log. The readability half is what carries
-    # the gate; `best_candidate_headroom > 0` beside it is equivalent to
-    # `not truly_exhausted` once every row is readable, and that is separately
-    # required by the arm's own consumer. Do not read it as THE gate and drop
-    # the other half.
+    # in the panel, the JSON and the log. Readability is what carries the
+    # gate: every candidate was read, and the consumer separately requires
+    # that one of them still holds room.
     deliberate_wait: bool = False
 
     def _fields(self) -> dict:
@@ -2041,10 +2039,9 @@ class AutoSwitchEngine:
             # But two of those three are ordinary shapes for an active that is
             # plainly alive and burning -- a `pct` with no `resets_at`, or one
             # already elapsed -- not unknowns. Reading all three as "unknown,
-            # hold" pins the engine
-            # on a near-spent active for up to a full window even when the
-            # peer is back within `RECOVERY_HORIZON_S`, the
-            # same constant this PR already uses for "near enough to
+            # hold" pins the engine on a near-spent active for up to a full
+            # window even when the peer is back within `RECOVERY_HORIZON_S`,
+            # the same constant this PR already uses for "near enough to
             # matter" (`_recovery_is_useful`). Requiring EITHER a known
             # active reset OR a peer inside that horizon keeps `isfinite`'s
             # intended release (a known active vs. an arbitrarily-far peer
@@ -2389,20 +2386,18 @@ class AutoSwitchEngine:
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
-        # ONLY when the escape had somewhere it COULD have gone. An
-        # UNREADABLE candidate is the state this separates, not "no readable
-        # candidate at all" -- that one returns at `no-comparison` several
-        # arms earlier, so naming it here described something this line
-        # cannot see. A row we could not read may be a healthy account, and
-        # announcing a reset over it claims a fleet nobody measured.
-        # EVERY CANDIDATE READABLE, not merely one of them holding room.
-        # `best_candidate_headroom` is a max that SKIPS unreadable rows, so a
-        # single peer with a sliver satisfies it while another candidate's
-        # usage was never read -- and the wait then announces a fleet nobody
-        # measured and sleeps toward a reset chosen over it.
+        # EVERY CANDIDATE READABLE, not merely one of them holding room. A
+        # row we could not read may be a healthy account, and announcing a
+        # reset over it claims a fleet nobody measured.
+        #
+        # A `best_candidate_headroom > 0` conjunct stood here and could not
+        # change any outcome. Under the readability requirement no row is
+        # skipped, so it says `max(headroom) > 0`, which is exactly
+        # `not truly_exhausted` -- and the sole consumer already requires
+        # that before it reads this value, so the one state the conjunct
+        # decided differently is one the consumer skips either way.
         waiting = bool(
             trigger == "at-limit" and by_recovery_axis and not ordered
-            and best_candidate_headroom > 0
             and all(headroom.get(n) is not None for n in oauth_candidates)
         )
         return ordered, any_known, active_reset_ts, waiting

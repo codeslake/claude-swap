@@ -1824,9 +1824,10 @@ class TestEventText:
 
         `sev_crit` is the fifth surface saying "exhausted" about a hold whose
         own gate proves every candidate was READ and one still holds quota.
-        The readability half is what carries that gate: dropping the
-        `headroom.get(n) is not None` conjunct fails a case by name, while
-        dropping the `best_candidate_headroom > 0` one detects nothing.
+
+        This case builds the event directly, so it cannot witness that gate;
+        `test_a_readable_peer_with_room_does_not_excuse_an_unread_one` is the
+        one that does.
         """
         from claude_swap.autoswitch import AllExhaustedEvent
         from claude_swap.tui.autoview import event_text
