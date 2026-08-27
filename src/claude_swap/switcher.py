@@ -1532,6 +1532,17 @@ class ClaudeAccountSwitcher:
                             if self._write_account_credentials(num, email, original):
                                 displaced.add((num, email))
                             wrote_any = True
+                            # AND THE PROFILE THAT IS ACTUALLY CROSSED. The
+                            # write above invalidates `_session_dir(num,
+                            # email)` -- this key's HOME -- and a key is in
+                            # `crossed_keys` precisely because its profile is
+                            # NOT there. With one email the two coincide and
+                            # the repair lands by accident; with two they are
+                            # disjoint, so the slot went on serving the other
+                            # account's token under the other slot's key.
+                            if (num, email) in crossed_keys:
+                                self._invalidate_session_credentials(
+                                    num_b if num == num_a else num_a, email)
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:

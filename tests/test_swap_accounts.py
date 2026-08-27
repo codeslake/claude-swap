@@ -1779,3 +1779,97 @@ class TestTheRollbackDecidesPerKey:
         assert "session profile" not in summary, (
             f"nothing moved, so nothing can be crossed: {said!r}"
         )
+
+    def test_the_forced_write_reaches_the_profile_that_is_actually_crossed(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """`crossed_keys` forces a write so the value-equal skip cannot leave a
+        slot serving the other account's token. The write invalidates
+        `_session_dir(num, email)` -- the key's HOME -- and a key is in
+        `crossed_keys` PRECISELY because its profile is not there.
+
+        With one email the two coincide (`home(A) == crossed(B)`) and the
+        repair lands by accident. With two they are disjoint, which is the
+        half of the population the guard was written for and the half it
+        cannot reach.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        home = switcher._session_dir("2", mail_b)
+        for d, token in ((crossed, "B-REAL-TOKEN"), (home, "BLOCKER-JUNK")):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / ".credentials.json").write_text(token)
+
+        with caplog_at_error():
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+
+        assert crossed.exists(), (
+            "premise: the crossed profile is gone, so there is nothing left "
+            "for the repair to have missed"
+        )
+        assert not (crossed / ".credentials.json").exists(), (
+            "the crossed profile still holds its credential material — the "
+            "forced write invalidated the key's HOME, and the profile is "
+            "under the OTHER slot's key, which is what put it in crossed_keys"
+        )
+
+    def test_only_a_crossed_key_reaches_into_the_other_slot(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """THE CONTROL for the repair above: WHICH keys it reaches for.
+
+        Every one of the four (slot, email) directories is either a home or a
+        crossed location for one of the two keys, and the reverse legitimately
+        relocates some of them -- so "a file survived" cannot separate the arm
+        firing from the reverse moving it. What can is the set of keys the arm
+        selects, recorded from the real calls.
+
+        Firing for a key that is not crossed costs a correctly-restored slot
+        its session credentials, which is the price the value-equal skip
+        exists to avoid.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        # STORED != ORIGINAL for slot A, so its key is forced through the
+        # write without ever being crossed; the value-equal skip would
+        # otherwise keep it away from the arm entirely.
+        switcher._write_account_credentials("1", mail_a, "creds-a-DRIFTED")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        reached: list[tuple[str, str]] = []
+        real = switcher._invalidate_session_credentials
+
+        def recording(num, email):
+            reached.append((num, email))
+            return real(num, email)
+
+        switcher._invalidate_session_credentials = recording
+        with caplog_at_error():
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+
+        assert switcher._read_account_credentials("1", mail_a) == "creds-a", (
+            "premise: slot A was not restored, so its key never reached the "
+            "forced write and this control tests nothing"
+        )
+        # A's crossed location is slot 2. It is not in `crossed_keys`, so the
+        # arm must never name it.
+        assert ("2", mail_a) not in reached, (
+            f"the arm reached into the other slot for a key that was never "
+            f"crossed: {reached}"
+        )
