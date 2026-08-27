@@ -65,8 +65,9 @@ jobs:
 
       - name: Run the whole suite (not only the Keychain files)
         # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
-        # assert a Linux store layout and failed on macOS while every job
-        # stayed green, because this job never ran them. A merge that
+        # failed on macOS -- one asserting the Linux XDG layout, two because a
+        # usable Keychain takes the write and leaves no `.enc` to chmod --
+        # while every job stayed green, because this job never ran them. A merge that
         # restores a two-file selection here re-opens that hole invisibly:
         # those cases pass now, they would simply stop running.
         #
