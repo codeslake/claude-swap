@@ -900,7 +900,7 @@ class TestATransientErrnoIsNotFatalToTheHold:
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
         lock = tmp_path / "target.lock"
         real_stat = os.stat
-        state: dict[str, object] = {"fired": False, "successor": None}
+        state = {"fired": False}
 
         def failing_stat(path, *a, **k):
             if (
@@ -916,7 +916,6 @@ class TestATransientErrnoIsNotFatalToTheHold:
                 # THE TAKEOVER LANDS IN THE WINDOW the failed read opens.
                 os.rmdir(lock)
                 os.mkdir(lock)
-                state["successor"] = real_stat(lock).st_ino
                 raise OSError(errno.EIO, "injected")
             return real_stat(path, *a, **k)
 
@@ -940,11 +939,8 @@ class TestATransientErrnoIsNotFatalToTheHold:
         )
         # WHICH REFUSAL, not merely that it survived. The strict check
         # refuses on IDENTITY too, so on a filesystem that mints a fresh inode
-        # -- APFS every time, ext4 whenever the number has been consumed --
-        # the lock survives for a reason that has nothing to do with the flag
-        # under test, and the mutation ships green. Measured: with the inode
-        # forced fresh, the gated `unproven = True` can be deleted and this
-        # case passed 3/3 on the surviving asserts alone.
+        # (APFS always, ext4 once the number is consumed) the lock survives for
+        # a reason unrelated to the flag under test and the mutation ships green.
         assert any("unproven stamp" in r.getMessage() for r in caplog.records), (
             "the lock survived, but by the strict identity comparison rather "
             "than because the tick recorded it could not prove ownership: "
