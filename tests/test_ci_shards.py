@@ -39,7 +39,14 @@ def _windows_shards() -> list[dict[str, str]]:
     shards, current = [], None
     for raw in block.group(1).splitlines():
         line = raw.strip()
-        if line.startswith("#") or not line:
+        # A TRAILING COMMENT IS NOT A PATH, and neither is another key. This
+        # took every non-`- name:`/`paths:` line as more paths, so
+        # `paths: tests/x.py  # the cheap one` made the shard "name" three
+        # files that do not exist and the workflow was REFUSED for a comment
+        # -- a false refusal on a correct edit, which is the direction this
+        # file keeps having to close.
+        line = _uncomment(line).strip()
+        if not line:
             continue
         if line.startswith("- name:"):
             current = {"name": line.split(":", 1)[1].strip(), "paths": ""}
@@ -47,6 +54,8 @@ def _windows_shards() -> list[dict[str, str]]:
         elif line.startswith("paths:"):
             rest = line.split(":", 1)[1].strip()
             current["paths"] = "" if rest in (">-", ">", "|", "|-", ">+", "|+") else rest
+        elif re.match(r"-?\s*[A-Za-z_][\w-]*:(\s|$)", line):
+            continue  # another key of this shard, not a path
         elif current is not None:
             current["paths"] += " " + line
     assert shards, "no shards parsed out of the matrix"
@@ -134,6 +143,43 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
         "the Windows pytest command does not clear `testpaths`, so a shard "
         f"cannot ignore the testpaths root itself: {line!r}"
     )
+
+
+def test_a_backslash_continuation_keeps_the_tail_it_continues_into():
+    """COUNTING CANNOT SEE THIS EITHER. Only the FIRST body line carries the
+    word `pytest`, so joined-into-one and split-into-two both return exactly
+    one `run:` line -- the join had no witness. What is lost when it goes is
+    the TAIL, which is where the markers the caller asserts live.
+    """
+    job = ("    - name: t\n      run: |\n"
+           "        uv run pytest -n 4 \\\n"
+           "          -o testpaths= ${{ matrix.paths }}")
+    runs = _pytest_run_lines(job)
+    assert len(runs) == 1, runs
+    assert "-o testpaths=" in runs[0], (
+        f"the continuation was dropped, so the markers went with it: {runs!r}"
+    )
+    assert "${{ matrix.paths }}" in runs[0], runs[0]
+
+
+def test_a_comment_naming_a_deleted_test_file_is_not_a_missing_path(tmp_path):
+    """Only what the job RUNS can name a file it needs.
+
+    `_assert_macos_job_is_intact` scans the job text for test paths, so
+    without the strip an ordinary comment mentioning a since-deleted file
+    reddens the suite AND masks the case that checks a real one. Measured
+    when the duplicate strip was removed and the removal was reported as a
+    no-op; this is the witness that was missing then.
+    """
+    wf = tmp_path / "ci.yml"
+    wf.write_text(
+        _WORKFLOW.read_text(encoding="utf-8").replace(
+            "    runs-on: macos-latest",
+            "    runs-on: macos-latest\n"
+            "    # tests/test_gone_forever.py was folded into another file",
+            1),
+        encoding="utf-8")
+    _assert_macos_job_is_intact(wf)
 
 
 @pytest.mark.parametrize("command", [
