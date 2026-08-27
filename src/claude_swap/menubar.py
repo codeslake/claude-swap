@@ -81,12 +81,20 @@ def ensure_notification_identity(
                 # interrupt-and-name, and it accepts a name that already
                 # exists. No credential rides here, so the mode is the
                 # ordinary one -- the create is what had to match.
+                # TRACKED ACROSS THE HANDOVER: an interrupt between
+                # `os.open` returning and `fdopen` taking the fd leaks the
+                # descriptor, and on Windows the held handle makes the unlink
+                # below fail, stranding the temp it exists to remove.
+                fd = -1
                 fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                with os.fdopen(fd, "wb") as fh:
+                owned, fd = fd, -1
+                with os.fdopen(owned, "wb") as fh:
                     fh.write(plistlib.dumps(data))
                 os.replace(tmp, path)
                 tmp = None
             finally:
+                if fd >= 0:
+                    os.close(fd)
                 # Only while the name is still ours; the publish consumes
                 # it. Swallowed so cleanup cannot mask the real failure.
                 if tmp is not None:

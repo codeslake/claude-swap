@@ -635,14 +635,21 @@ class ClaudeAccountSwitcher:
             f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
         )
 
+        fd = -1
         try:
             # 0600 from creation: this writer publishes `~/.claude.json`,
             # which can carry `primaryApiKey`. `fchmod` is what enforces it —
             # the open mode is masked by the umask and ignored outright on a
             # leftover temp. The mode arg only carries Windows, where there
             # is no `fchmod`.
+            #
+            # TRACKED ACROSS THE HANDOVER. An interrupt between `os.open`
+            # returning and `fdopen` taking the fd leaks the descriptor;
+            # on Windows that held handle is what makes the cleanup
+            # unlink fail, so the temp is stranded rather than removed.
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            owned, fd = fd, -1
+            with os.fdopen(owned, "w", encoding="utf-8") as fh:
                 if sys.platform != "win32":
                     os.fchmod(fh.fileno(), 0o600)
                 fh.write(content)
@@ -780,6 +787,8 @@ class ClaudeAccountSwitcher:
                     raise
                 temp_path = source
         finally:
+            if fd >= 0:
+                os.close(fd)
             # Every path where the name is still ours, including the Ctrl-C
             # no except can name. The EBUSY branch disowns it deliberately.
             if temp_path is not None:
@@ -1522,15 +1531,26 @@ class ClaudeAccountSwitcher:
                     # made after the call can miss a file that exists.
                     key = f"{kind}-{num}"
                     staged[key] = path
+                    # TRACKED ACROSS THE HANDOVER: an interrupt between
+                    # `os.open` returning and `fdopen` taking the fd leaks the
+                    # descriptor, and on Windows the held handle makes
+                    # `_discard_staging`'s unlink fail -- which then reports a
+                    # 0-byte file as holding pre-swap credentials.
+                    fd = -1
                     try:
                         fd = os.open(
                             path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
                         )
+                        owned, fd = fd, -1
+                        with os.fdopen(owned, "w", encoding="utf-8") as fh:
+                            fh.write(content)
                     except FileExistsError:
                         del staged[key]  # lost the race; not ours to remove
                         raise
-                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                        fh.write(content)
+                    except BaseException:
+                        if fd >= 0:
+                            os.close(fd)
+                        raise
         except OSError as e:
             self._discard_staging(staged)
             raise ConfigError(
