@@ -1425,7 +1425,7 @@ class ClaudeAccountSwitcher:
         # ran. `wrote_backups` is armed one statement BEFORE the first write on
         # purpose, so "armed" and "wrote something" are different claims and
         # only the second one is a report.
-        self._logger.error(f"Swap {num_a} <-> {num_b} failed mid-write; rolling back")
+        self._logger.error(f"Swap {num_a} <-> {num_b} failed; rolling back")
         failures = 0
         wrote_any = False
         # Unlike the credential steps below, this is not a no-op when its
@@ -1444,7 +1444,19 @@ class ClaudeAccountSwitcher:
             self._swap_session_dirs(num_b, email_a, num_a, email_b, undone)
             if undone:
                 self._logger.error("Reversed the session-profile exchange")
-        crossed = len(undone) < len(moved)
+        # PER KEY, not a whole-swap count. A reverse that put back one of two
+        # leaves the OTHER slot's profile stranded, not crossed -- forcing a
+        # write there costs a correctly-restored slot its session credentials,
+        # which is the exact price the value-equal skip exists to avoid.
+        back = set(undone)
+        crossed_keys = {
+            (num, email)
+            for num, email, home in (
+                (num_a, email_a, self._session_dir(num_a, email_a)),
+                (num_b, email_b, self._session_dir(num_b, email_b)),
+            )
+            if moved and home not in back
+        }
         overlap = email_a == email_b
         # Restoring a key that was never written is not a no-op: rewriting it
         # with the value already under it still drops that slot's session
@@ -1455,7 +1467,11 @@ class ClaudeAccountSwitcher:
             ("config", num_a, email_a, config_a),
             ("creds", num_b, email_b, creds_b),
             ("config", num_b, email_b, config_b),
-        ) if wrote_backups else ()
+        # `wrote_backups` ALONE IS NOT THE GATE. `moved` is appended from a
+        # `finally`, so a signal past a rename records it while `wrote_backups`
+        # is still False -- and then every restore was skipped, the repair
+        # below never ran, and both profiles stayed crossed and live.
+        ) if (wrote_backups or crossed_keys) else ()
         # WHAT A RESTORE ACTUALLY DISPLACED, TAKEN FROM THE WRITE ITSELF.
         # The purge below may only drop a `.prev` its own restore created, and
         # the store already knows: `_retain_previous_backup` writes one exactly
@@ -1489,10 +1505,14 @@ class ClaudeAccountSwitcher:
                                 num, email)
                         except Exception:  # noqa: BLE001 - a failed read writes
                             now, unread = None, True  # rather than skips
-                        if unread or crossed or now != original:
-                            wrote_any = True
+                        if unread or (num, email) in crossed_keys \
+                                or now != original:
+                            # AFTER THE CALL. A raising write lands in the
+                            # `except` below, and setting this first made the
+                            # summary report restores that every slot refused.
                             if self._write_account_credentials(num, email, original):
                                 displaced.add((num, email))
+                            wrote_any = True
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:

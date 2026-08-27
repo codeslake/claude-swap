@@ -1012,7 +1012,10 @@ class TestSwapUnreadableSourceIsNotAbsent:
         finally:
             del switcher._swap_session_dirs
 
-        said = [r.message for r in caplog.records if "failed mid-write" in r.message]
+        # "failed; rolling back", not "failed mid-write": the `try` this unwinds
+        # from BEGINS with the profile move, so a signal there wrote nothing
+        # and "mid-write" was itself the class of wrong text this case guards.
+        said = [r.message for r in caplog.records if "rolling back" in r.message]
         assert said, "premise: the rollback never announced anything"
         assert "restoring both slots" not in said[0], (
             f"no credential write ran, and the line says otherwise: {said[0]!r}"
@@ -1313,6 +1316,64 @@ class TestTheReverseCanFailAndTheSkipMustSeeIt:
         assert not wrong, (
             "a session profile was left serving another slot's token with no "
             f"invalidation: {wrong}"
+        )
+
+
+    def test_an_interrupt_before_the_first_write_still_uncrosses(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """`wrote_backups` alone cannot gate the repair.
+
+        `moved` is appended from a `finally` precisely so a signal past a
+        rename is recorded, and `KeyboardInterrupt` is not `OSError` -- so it
+        leaves `_swap_session_dirs` with `moved` full while `wrote_backups` is
+        still False. Gating `restores` on `wrote_backups` alone then skipped
+        every restore, the repair never ran, and both profiles stayed crossed
+        and live. Base was clean here because its restore was unconditional.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        switcher = ClaudeAccountSwitcher()
+        self._seed(switcher, sample_sequence_data_with_org)
+        email = "user@example.com"
+        for num in ("1", "2"):
+            switcher._write_account_credentials(num, email, f"creds-{num}")
+            d = switcher._session_dir(num, email)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / ".credentials.json").write_text(_session_token_of(num))
+
+        strand = switcher._session_dir("2", email)
+        strand = strand.with_name(strand.name + ".swapping")
+        strand.mkdir(parents=True)
+        (strand / "leftover").write_text("from an earlier interrupt")
+
+        real_replace = switcher_mod.os.replace
+        calls = {"n": 0}
+
+        def interrupt_after_the_last_forward_move(src, dst, *a, **kw):
+            out = real_replace(src, dst, *a, **kw)
+            calls["n"] += 1
+            if calls["n"] == 3:      # both profiles now under each other's keys
+                raise KeyboardInterrupt
+            return out
+
+        switcher_mod.os.replace = interrupt_after_the_last_forward_move
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                switcher.swap_accounts("1", "2")
+        finally:
+            switcher_mod.os.replace = real_replace
+
+        serving = {}
+        for num in ("1", "2"):
+            f = switcher._session_dir(num, email) / ".credentials.json"
+            if f.exists():
+                serving[num] = f.read_text()
+        wrong = {num: v for num, v in serving.items()
+                 if v and f"SLOT-{num}" not in v}
+        assert not wrong, (
+            "an abort before the first credential write left a profile serving "
+            f"another slot's token with no invalidation: {wrong}"
         )
 
 
