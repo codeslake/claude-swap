@@ -169,6 +169,81 @@ class TestProperLockfile:
             "a lock the release could not prove was ours was removed anyway"
         )
 
+    def test_one_transient_stat_error_does_not_end_the_heartbeat(
+        self, lock_dir, monkeypatch
+    ):
+        """Absence is terminal; every other errno is transient.
+
+        One `except OSError: return` over the tick's three syscalls meant a
+        single EIO or ESTALE -- the ordinary errnos on a network `~/.claude` --
+        froze the mtime for the rest of the hold, and a lock whose mtime stops
+        advancing is one a waiter may take over as stale, mid-swap.
+        """
+        import errno as _errno
+
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        real_stat = os.stat
+        # ARMED ONLY ONCE THE LOCK IS HELD. `os.stat` is patched on the module,
+        # and the ACQUIRE path stats too (its staleness check) -- an injection
+        # armed from the start fires there, where no handler covers a bare
+        # OSError, and the case then measures the acquire instead of the tick.
+        state = {"armed": False, "fired": 0}
+
+        def one_bad_stat(path, *a, **kw):
+            if (state["armed"] and not state["fired"]
+                    and os.fspath(path) == os.fspath(lock_dir)):
+                state["fired"] = 1
+                raise OSError(_errno.EIO, "injected: one transient read")
+            return real_stat(path, *a, **kw)
+
+        monkeypatch.setattr(claude_locks.os, "stat", one_bad_stat)
+        seen = set()
+        with proper_lockfile(lock_dir):
+            state["armed"] = True
+            for _ in range(12):
+                time.sleep(0.02)
+                seen.add(real_stat(lock_dir).st_mtime_ns)
+
+        assert state["fired"] == 1, "premise: the injected error never fired"
+        assert len(seen) > 1, (
+            "the mtime never advanced after one transient stat error, so the "
+            "heartbeat is dead and the lock is stealable while still held"
+        )
+
+    def test_the_release_bound_is_the_one_the_constant_names(
+        self, lock_dir, monkeypatch
+    ):
+        """ONE bound, not two sequential ones on the same stall.
+
+        A `join(timeout=_RELEASE_WAIT_S)` ahead of the `stamping` acquire looks
+        like the bound and is a SECOND full-length wait on the same stalled
+        tick -- measured 2.06s against a 1.0s constant, i.e. 10s per lock at
+        the shipped value, and `cswap switch` exits three of them. Its sibling
+        above cannot see it: both waits end in the same give-up branch, with
+        the same warning and the same lock left behind.
+        """
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
+        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
+        real_utime = os.utime
+        real_sleep = time.sleep
+
+        def stalling(path, *a, **kw):
+            if os.fspath(path) == os.fspath(lock_dir):
+                real_sleep(2.0)          # far past the release's own wait
+            return real_utime(path, *a, **kw)
+
+        monkeypatch.setattr(claude_locks.os, "utime", stalling)
+        started = time.monotonic()
+        with proper_lockfile(lock_dir):
+            real_sleep(0.05)             # let one tick get into the stall
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.35, (
+            f"the release took {elapsed:.2f}s against _RELEASE_WAIT_S=0.2 — "
+            "two sequential waits on one stalled tick, so the constant names "
+            "half the real ceiling"
+        )
+
     def test_a_stalled_heartbeat_does_not_swallow_the_body_error(
         self, lock_dir, monkeypatch
     ):

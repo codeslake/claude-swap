@@ -175,15 +175,40 @@ def proper_lockfile(
 
     def _touch() -> None:
         nonlocal stamped_ns
+        # ABSENCE IS TERMINAL; EVERY OTHER ERRNO IS TRANSIENT. One `except
+        # OSError: return` over all three syscalls meant a single EIO or
+        # ESTALE -- the ordinary errnos on a network `~/.claude` -- ended the
+        # heartbeat for the rest of the hold, and a mtime that stops advancing
+        # is a lock a waiter may take over as stale, mid-swap.
+        adopt_next = False
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             with stamping:
                 try:
-                    if os.stat(lock_dir).st_mtime_ns != stamped_ns:
-                        return  # taken over; refreshing it adopts their stamp
-                    os.utime(lock_dir)
-                    stamped_ns = os.stat(lock_dir).st_mtime_ns
+                    seen = os.stat(lock_dir).st_mtime_ns
+                except FileNotFoundError:
+                    return  # gone; nothing left to keep alive
                 except OSError:
-                    return  # lock stolen/removed; nothing left to keep alive
+                    continue  # unreadable this tick, not stolen
+                if adopt_next:
+                    # OUR OWN `utime` landed last tick and its read-back did
+                    # not, so this stamp is ours rather than a successor's.
+                    # Reading the mismatch as a takeover would end the
+                    # heartbeat over a transient read.
+                    stamped_ns, adopt_next = seen, False
+                elif seen != stamped_ns:
+                    return  # taken over; refreshing it adopts their stamp
+                try:
+                    os.utime(lock_dir)
+                except FileNotFoundError:
+                    return
+                except OSError:
+                    continue
+                try:
+                    stamped_ns = os.stat(lock_dir).st_mtime_ns
+                except FileNotFoundError:
+                    return
+                except OSError:
+                    adopt_next = True
 
     toucher = threading.Thread(target=_touch, daemon=True)
     toucher.start()
@@ -191,18 +216,18 @@ def proper_lockfile(
         yield
     finally:
         stop_touching.set()
-        # BOUNDED, and the `join` is not the bound. `join(timeout=1.0)` looks
-        # like one and is not: the `with stamping` below re-blocks on the same
-        # thread, so a tick stalled inside `os.utime` holds the release for as
-        # long as it stalls. Measured: a 6.0s stall blocked the release 5.9s,
-        # on a `finally` reached from `_perform_switch`. At base the release
-        # was a bare `rmdir` with no cross-thread wait at all.
+        # ONE BOUND, and it is this acquire. A `join` here was a SECOND full
+        # wait on the same stalled tick -- measured 2.06s against a 1.0s
+        # constant -- and it bought nothing: a tick holding `stamping` is
+        # already what this waits for, and a tick not holding it either has
+        # not started (so the acquire is instant) or finds the directory gone
+        # and returns.
         #
         # On expiry we LEAVE the lock rather than removing one we can no
         # longer prove is ours. That self-heals through the stale sweep; the
         # other direction removes a successor's lock inside its critical
         # section.
-        toucher.join(timeout=_RELEASE_WAIT_S)
+        #
         # NOT `return` ON THE MISS: this whole block is the context manager's
         # `finally`, and a `return` there discards an exception the body
         # raised.
