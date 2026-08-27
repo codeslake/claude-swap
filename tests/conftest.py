@@ -833,3 +833,28 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.get_closest_marker("no_keychain_fake"):
             item.add_marker(pytest.mark.xdist_group("real-keychain"))
+
+
+def _advancing_clock(clock, budget):
+    """A scripted `monotonic` that MOVES ON READ.
+
+    A clock advanced only inside the fake sleep parks on one instant the moment
+    the code under test stops sleeping, so the retry loop never reaches its
+    deadline and the case HANGS instead of failing -- which is worse than the
+    bug, because a hung xdist worker holds the job with nothing to read.
+
+    A FIXED hair does not scale: at a 3s budget it needs three million
+    iterations, and the stale-takeover fires first, so the case reports the
+    wrong failure. The step itself is set below, with why.
+    """
+    # SMALL ENOUGH NOT TO PERTURB. A thousandth of the budget shifts the
+    # remainders these cases assert on; a hundred-thousandth bounds a
+    # sleepless loop at ~100k reads (a fraction of a second) and leaves
+    # every measured remainder unchanged.
+    step = budget / 100000.0
+
+    def monotonic():
+        clock[0] += step
+        return clock[0]
+
+    return monotonic

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import _advancing_clock
+
 from claude_swap import claude_locks
 from claude_swap.claude_locks import (
     claude_config_lock,
@@ -22,39 +24,17 @@ from claude_swap.claude_locks import (
 from claude_swap.exceptions import ClaudeCodeLockTimeout
 
 
-def _advancing_clock(clock, budget):
-    """A scripted `monotonic` that MOVES ON READ.
-
-    A clock advanced only inside the fake sleep parks on one instant the moment
-    the code under test stops sleeping, so the retry loop never reaches its
-    deadline and the case HANGS instead of failing -- which is worse than the
-    bug, because a hung xdist worker holds the job with nothing to read.
-
-    A FIXED hair does not scale: at a 3s budget it needs three million
-    iterations, and the stale-takeover fires first, so the case reports the
-    wrong failure. The step itself is set below, with why.
-    """
-    # SMALL ENOUGH NOT TO PERTURB. A thousandth of the budget shifts the
-    # remainders these cases assert on; a hundred-thousandth bounds a
-    # sleepless loop at ~100k reads (a fraction of a second) and leaves
-    # every measured remainder unchanged.
-    step = budget / 100000.0
-
-    def monotonic():
-        clock[0] += step
-        return clock[0]
-
-    return monotonic
-
-
 def _assert_backed_off(slept, budget, *, least=3, remainder=0.05, what="clamp"):
     """Every arm of the retry loop must CLAMP to what is left AND back off.
 
     The clamp half is one-sided on its own: a list of zeros satisfies it, and
     a list of zeros is the hot spin these cases exist to forbid. Copying the
-    clamp assertions per arm is how two of the three arms here went without
+    clamp assertions per arm is how all three arms here went without
     the lower bound `test_locking` has carried for its own clamp since the
-    same pass -- so the assertions live in one place instead.
+    same pass -- so the assertions live in one place instead. It is a bound on
+    ITERATIONS in disguise: elapsed is `sum(sleeps) + n * 0.001`, so it is
+    satisfied by ~0.0095s per attempt whatever the arm's constant is. Each arm
+    keeps an attempt COUNT of its own for the shrink this cannot see.
     """
     assert len(slept) >= least, f"the instrument, not the code: {slept}"
     for left, seconds in slept:
@@ -609,7 +589,7 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Five of the file's seven clamp
+    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Three of the file's seven clamp
     cases run the real clock, so being one of them is not what makes this one
     worth keeping. The others assert a syscall count or a per-sleep remainder,
     and a clamp WEAKENED rather than deleted moves neither. On the weakening
@@ -774,6 +754,41 @@ class TestEveryArmOfTheLoopBacksOff:
         assert tries["n"] <= 10, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the arm that "
             "retries a vanished name never sleeps, so it pins a core"
+        )
+
+    def test_the_rmdir_refusal_does_not_spin(self, tmp_path, monkeypatch):
+        """The third arm's ATTEMPT COUNT, which its two siblings both have.
+
+        The sleep-total bound is a bound on ITERATIONS in disguise: total
+        elapsed on the scripted clock is `sum(sleeps) + n * 0.001`, so
+        `sum >= 0.9 * budget` is satisfied by roughly 0.0095s per attempt
+        whatever the arm's own constant is. A five-fold shrink of this arm's
+        flat 0.05s therefore passes it. A count is what the other two arms use
+        against exactly that, and this arm was the only one without one.
+        """
+        target = tmp_path / "target.lock"
+        target.mkdir()
+        stale = time.time() - 60
+        os.utime(target, (stale, stale))
+
+        tries = {"n": 0}
+
+        def refusing(path, *a, **k):
+            tries["n"] += 1
+            raise PermissionError(errno.EACCES, "cannot remove it either")
+
+        monkeypatch.setattr(claude_locks.os, "rmdir", refusing)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(target, timeout=0.3, staleness=1.0):
+                pass
+
+        assert tries["n"] > 1, "premise: the loop must have retried at all"
+        # 10, on the same arithmetic as the sibling above: a flat 0.05s over a
+        # 0.3s budget is 7 attempts, so 10 leaves headroom without tolerating
+        # the 5x shrink the sleep-total bound cannot see.
+        assert tries["n"] <= 10, (
+            f"{tries['n']} rmdir attempts in a 0.3s budget — the arm that "
+            "cannot remove a stale lock backed off less than it claims to"
         )
 
     def test_the_dangling_symlink_arm_sleeps_only_what_is_left(
