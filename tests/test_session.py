@@ -1577,7 +1577,7 @@ class TestRun:
 
     def test_the_launch_banner_is_not_dimmed_over_its_own_accent(
         self, manager, capture_exec, monkeypatch, auth_status_tracks_seed,
-        refresh_rotates, capsys,
+        refresh_rotates, capsys, caplog,
     ):
         """`_note` wraps in `dimmed` by design; this one line carries its own.
 
@@ -1588,9 +1588,22 @@ class TestRun:
         it is invisible to every other case here: they read the LOG, which
         `_plain` strips either way.
         """
+        import logging
+
         monkeypatch.setenv("FORCE_COLOR", "1")
-        with pytest.raises(_ExecCalled):
-            manager.run("2", [])
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            with pytest.raises(_ExecCalled):
+                manager.run("2", [])
+
+        # THE RECORD, TOO. `_plain` is the identity function when colour is
+        # off, and every case that reads `caplog` runs colour-off -- so
+        # dropping it from `_note`/`_warn` left the whole suite green while
+        # the log the README points a user at filled with escape sequences.
+        # This is the one case that turns colour ON.
+        styled = [r.getMessage() for r in caplog.records if "\x1b[" in r.getMessage()]
+        assert not styled, (
+            f"the log record carries SGR escapes: {styled[:1]}"
+        )
 
         line = next((l for l in capsys.readouterr().out.splitlines()
                      if "Launching" in l), None)
