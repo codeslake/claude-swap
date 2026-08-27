@@ -12830,6 +12830,13 @@ def _flat(body):
     import ast
 
     for st in body:
+        # A LITERAL-FALSE BRANCH DOES NOT RUN, so a `raise` inside one is not
+        # a re-raise. Only a constant is folded here -- anything needing real
+        # analysis is left to count, which is the loud direction.
+        if isinstance(st, ast.If) and isinstance(st.test, ast.Constant) \
+                and not st.test.value:
+            yield from _flat(st.orelse)
+            continue
         yield st
         if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef,
                            ast.ClassDef)):
