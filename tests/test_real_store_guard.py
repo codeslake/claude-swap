@@ -651,6 +651,18 @@ def test_the_legacy_backup_root_is_protected_recursively():
     Linux-only in effect and needs no marker: if those platforms ever stop
     aliasing the two, it starts firing there too.
     """
+    # THE ARTIFACT THE HOOK READS, not the factory that built it. The hook
+    # branches on the module global frozen at import; asserting on a fresh
+    # `_freeze_real_store_specs()` call leaves the two unconnected, and
+    # flattening every flag in that global was measured green across the whole
+    # suite while a nested `credentials/*.enc` write went REFUSED -> ALLOWED.
+    frozen = dict(conftest._REAL_STORE_SPECS)
+    frozen_legacy = conftest._HOME_AT_FREEZE_TIME / paths.LEGACY_BACKUP_DIRNAME
+    assert frozen.get(frozen_legacy) is True, (
+        f"the legacy backup root {frozen_legacy} is not frozen as RECURSIVELY "
+        "protected in the specs the audit hook actually reads, so a nested "
+        f"write under it is allowed: {sorted((str(r), f) for r, f in frozen.items())}"
+    )
     recursive_roots = {
         root for root, recursive in conftest._freeze_real_store_specs() if recursive
     }
