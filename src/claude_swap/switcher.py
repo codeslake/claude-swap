@@ -712,21 +712,23 @@ class ClaudeAccountSwitcher:
                 # the destination keeps a truncated credential. A digest is
                 # affordable because only the EBUSY write-through reaches it.
                 #
-                # ABOVE THE DISOWN, for the same reason as the chmod. Past
-                # that line `temp_path` is None and the outer cleanup no
-                # longer owns the name, so anything raising here strands the
-                # temp holding the complete new payload, unnamed and
-                # unmentioned. `except OSError` does not cover a signal.
+                # ABOVE THE DISOWN, and so is everything below it up to the
+                # copy. Past `source, temp_path = temp_path, None` the outer
+                # cleanup no longer owns the name and nothing prints it, so
+                # anything raising there strands the temp holding the complete
+                # new payload -- for `~/.claude.json` a credential-bearing one.
+                # `except OSError` does not cover a signal, and building
+                # `kept` enters `PurePath.name`, a Python-level property whose
+                # RESUME is where a pending SIGINT is delivered.
                 before = None
                 try:
                     _raw = path.read_bytes()
                     before = hashlib.sha256(_raw).hexdigest()
                 except OSError:
                     before = None
-                source, temp_path = temp_path, None
                 kept = (
                     f"{path.name} may now be truncated; the complete content "
-                    f"was kept at {source.name}"
+                    f"was kept at {temp_path.name}"
                 )
 
                 def _unnarrow():
@@ -773,6 +775,7 @@ class ClaudeAccountSwitcher:
                     except OSError:
                         pass  # best effort; `kept` still names the survivor
 
+                source, temp_path = temp_path, None
                 try:
                     shutil.copyfile(source, path)
                 except OSError as copy_err:
