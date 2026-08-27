@@ -459,14 +459,27 @@ class UnquarantineEvent(AutoSwitchEvent):
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
+    # TWO STATES REACH THIS ARM AND ONLY ONE IS EXHAUSTION. A deliberate wait
+    # is entered BECAUSE a candidate still holds quota -- the gate is
+    # `best_candidate_headroom > 0` -- so reporting it as an exhausted fleet
+    # contradicts its own precondition, in the panel, the JSON and the log.
+    deliberate_wait: bool = False
 
     def _fields(self) -> dict:
-        return {"earliestResetAt": self.earliest_reset_at}
+        return {
+            "earliestResetAt": self.earliest_reset_at,
+            "deliberateWait": self.deliberate_wait,
+        }
 
     def human(self) -> str:
+        what = (
+            "holding for a nearer reset than any peer offers"
+            if self.deliberate_wait
+            else "all accounts exhausted"
+        )
         if self.earliest_reset_at:
-            return f"all accounts exhausted; earliest reset {self.earliest_reset_at}"
-        return "all accounts exhausted; no reset time known"
+            return f"{what}; earliest reset {self.earliest_reset_at}"
+        return f"{what}; no reset time known"
 
 
 @dataclass(frozen=True)
@@ -1601,15 +1614,31 @@ class AutoSwitchEngine:
             # window and never named the reset it had just measured.
             self._blocked_wait_long = True
             earliest = self._earliest_recovery(usage)
-            if earliest is not None:
-                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+            earliest_ts = earliest.timestamp() if earliest is not None else None
+            if earliest_ts is None and not truly_exhausted:
+                # THE WAIT ALREADY KNOWS WHEN IT ENDS. `_earliest_recovery`
+                # answers None the moment ANY blocked account has an unprovable
+                # reset -- right for an exhausted fleet, where there is no
+                # better answer, wrong here: the gate that created this wait
+                # required the active's own recovery to be finite, so a peer's
+                # missing `resets_at` must not throw it away and drop back to
+                # the ordinary cadence.
+                own = _binding_recovery_ts(usage.get(current), self._models,
+                                           decided_now)
+                if own != float("inf"):
+                    earliest_ts = own
+            if earliest_ts is not None:
+                self._sleep_until_ts = earliest_ts + RESET_SLACK_S
             self._emit(
                 AllExhaustedEvent(
                     earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
+                        datetime.fromtimestamp(earliest_ts, tz=timezone.utc)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                        if earliest_ts is not None
                         else None
-                    )
+                    ),
+                    deliberate_wait=not truly_exhausted,
                 )
             )
             return TickOutcome.BLOCKED
