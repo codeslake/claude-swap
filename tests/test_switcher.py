@@ -12791,6 +12791,21 @@ def test_write_all_finishes_a_short_write():
     )
 
 
+def _os_names(tree) -> set[str]:
+    """Names this module can reach the `os` module through.
+
+    Matching the literal `os` leaves `import os as _o` invisible, and one
+    alias hid a regression from every scan that keys on it.
+    """
+    import ast
+
+    return {"os"} | {
+        (a.asname or a.name)
+        for imp in ast.walk(tree) if isinstance(imp, ast.Import)
+        for a in imp.names if a.name == "os"
+    }
+
+
 def test_no_writer_calls_os_write_bare():
     """`os.write` is write(2): it may write FEWER bytes than it was given.
 
@@ -12807,7 +12822,7 @@ def test_no_writer_calls_os_write_bare():
 
     src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders = []
-    for mod in sorted(src_dir.glob("*.py")):
+    for mod in sorted(src_dir.rglob("*.py")):
         tree = ast.parse(mod.read_text(encoding="utf-8"))
         # THE LOOP THAT EXISTS TO DO THIS IS THE ONE PLACE ALLOWED TO. Named
         # rather than exempting its module, so a second exemption has to be
@@ -12825,11 +12840,7 @@ def test_no_writer_calls_os_write_bare():
         # and in a module with other `write_all` sites it did not even move
         # the denominator, so a live regression in the credential writer ran
         # green.
-        os_names = {"os"} | {
-            (a.asname or a.name)
-            for imp in ast.walk(tree) if isinstance(imp, ast.Import)
-            for a in imp.names if a.name == "os"
-        }
+        os_names = _os_names(tree)
         # `from os import write as _w` binds a bare NAME, which an attribute
         # match cannot see; resolve the aliases this module actually created.
         aliases = {
@@ -12898,7 +12909,7 @@ def test_no_writer_calls_os_write_bare():
     # with "the instrument, not the code" -- the wrong sentence about a good
     # change. That is the refactor `_write_json` itself already uses.
     users = 0
-    for mod in src_dir.glob("*.py"):
+    for mod in src_dir.rglob("*.py"):
         tree = ast.parse(mod.read_text(encoding="utf-8"))
         named = {
             (a.asname or a.name)
@@ -12937,7 +12948,7 @@ def test_no_writer_chmods_after_it_publishes():
 
     src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders, publishes = [], 0
-    for mod in sorted(src_dir.glob("*.py")):
+    for mod in sorted(src_dir.rglob("*.py")):
         tree = ast.parse(mod.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Try):
@@ -13026,7 +13037,7 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
 
     src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
     offenders, seen = [], 0
-    for mod in sorted(src_dir.glob("*.py")):
+    for mod in sorted(src_dir.rglob("*.py")):
         tree = ast.parse(mod.read_text(encoding="utf-8"))
         # Every `Try` that lexically contains each node, innermost last.
         guarding: dict[int, list[ast.Try]] = {}
@@ -13074,14 +13085,18 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
                 offenders.append(f"{mod.name}:{node.lineno}"
                                  + (f" ({name})" if name else ""))
 
-    assert seen >= 8, (
-        f"the instrument, not the code: only {seen} `O_EXCL` open(s) were "
-        "found, so this would pass over almost nothing"
-    )
+    # THE SUBJECT FIRST. A denominator ahead of it reports a real regression
+    # as a broken parser: reverting six writers to `O_TRUNC` DROPS the count,
+    # so the compound regression came out as "the instrument, not the code"
+    # and the offender list was never printed.
     assert not offenders, (
         "an `O_EXCL` open has no branch on its own failure, so the name it "
         "was REFUSED is still in reach of the cleanup below -- it deletes "
         f"whatever the holder is writing: {offenders}"
+    )
+    assert seen >= 8, (
+        f"the instrument, not the code: only {seen} `O_EXCL` open(s) were "
+        "found, so this would pass over almost nothing"
     )
 
 
@@ -13103,15 +13118,19 @@ def test_every_temp_writer_opens_with_O_EXCL():
     import re
 
     src_dir = Path(__file__).resolve().parent.parent / "src" / "claude_swap"
-    offenders, seen = [], 0
-    for mod in sorted(src_dir.glob("*.py")):
+    offenders, unreadable, seen = [], [], 0
+    for mod in sorted(src_dir.rglob("*.py")):
         tree = ast.parse(mod.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
+            # EVERY NAME THAT REACHES THE MODULE. Its sibling scan resolves
+            # `import os as _o` and this one did not, so that one alias hid
+            # an `O_TRUNC` regression from BOTH -- the disown scan filters on
+            # the literal `O_EXCL`, which the aliased call no longer carries.
             if not (isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
                     and node.func.attr == "open"
                     and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "os"):
+                    and node.func.value.id in _os_names(tree)):
                 continue
             kw = {k.arg: k.value for k in node.keywords}
             arg = (node.args[1] if len(node.args) >= 2
@@ -13147,12 +13166,18 @@ def test_every_temp_writer_opens_with_O_EXCL():
             # that means "not creating anything". "I could not read it" and
             # "it is safe" must not share a branch, so anything that is not a
             # plain `|` chain of `os.O_*` names is an offender.
+            # ITS OWN VERDICT, because "I could not read it" is not "it can
+            # overwrite an existing file" -- reported under the offenders'
+            # sentence, a portable `| getattr(os, "O_NOFOLLOW", 0)` (strictly
+            # safer, `O_EXCL` intact) is accused of the opposite of what it
+            # does. A `getattr` with a literal name IS readable, so it is not
+            # unreadable either.
             terms = [t.strip() for t in flags.split("|")]
-            if not all(re.fullmatch(r"os\.O_[A-Z_]+", t) for t in terms):
-                offenders.append(
-                    f"{mod.name}:{node.lineno} flags `{flags}` are not a "
-                    "readable `os.O_*` chain, so O_EXCL cannot be proven"
-                )
+            readable = re.compile(
+                r'os\.O_[A-Z_]+'
+                r'|getattr\(\s*\w+\s*,\s*[\'"]O_[A-Z_]+[\'"]\s*(?:,[^)]*)?\)')
+            if not all(readable.fullmatch(t) for t in terms):
+                unreadable.append(f"{mod.name}:{node.lineno} `{flags}`")
                 continue
             if "O_CREAT" not in flags:
                 continue  # not creating anything
@@ -13160,13 +13185,20 @@ def test_every_temp_writer_opens_with_O_EXCL():
             if "O_EXCL" not in flags:
                 offenders.append(f"{mod.name}:{node.lineno} {flags}")
 
-    assert seen >= 10, (
-        f"the instrument, not the code: only {seen} creating `os.open` call(s) "
-        "were found, so this would pass over almost nothing"
-    )
+    # THE SUBJECT FIRST, for the reason its sibling states: reverting writers
+    # to `O_TRUNC` moves the count as well as the offender list, so a
+    # denominator asserted ahead of it blames the parser for the regression.
     assert not offenders, (
         "a temp writer can overwrite an existing file, which is what the "
         f"`_write_json` docstring says none of them does: {offenders}"
+    )
+    assert not unreadable, (
+        "a temp writer's open flags are not a plain `os.O_*` chain, so "
+        f"`O_EXCL` can be neither proven nor refuted here: {unreadable}"
+    )
+    assert seen >= 10, (
+        f"the instrument, not the code: only {seen} creating `os.open` call(s) "
+        "were found, so this would pass over almost nothing"
     )
 
 
