@@ -3080,13 +3080,22 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
             return {value.id}
         if isinstance(value, ast.Call):
             out = _names(value.func)
-            for a in value.args:          # `partial(_emit, ...)`
-                out |= _names(a)
+            f = value.func
+            # ARGUMENTS ONLY FOR `partial`, which is the one shape that
+            # returns its argument's printer. Following every call's
+            # arguments makes any constant built from a call that merely
+            # MENTIONS a printer a printer, and then anything built from
+            # that constant too -- unbounded, and the matcher then fails on
+            # lines that are not notices.
+            if ((isinstance(f, ast.Name) and f.id == "partial")
+                    or (isinstance(f, ast.Attribute) and f.attr == "partial")):
+                for a in value.args + [k.value for k in value.keywords]:
+                    out |= _names(a)
             return out
         return set()
 
     exported: set[str] = set()
-    bindings: dict[str, str] = {}
+    bindings: dict[str, set[str]] = {}
     for n in _own_scope(tree):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
             exported.add(n.name)
@@ -3099,8 +3108,11 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
             targets, value = [n.target.id], n.value
         exported |= set(targets)
         for t in targets:
-            for name in _names(value):
-                bindings[t] = name
+            # A SET, NOT THE LAST ONE. `_names` returns a set, so assigning
+            # per element kept whichever came last in ITERATION order -- i.e.
+            # PYTHONHASHSEED. Measured: `banner = partial(_emit, 'x')` derived
+            # the printer on 2 of 6 seeds and lost it on 4.
+            bindings.setdefault(t, set()).update(_names(value))
     funcs = [n for n in ast.walk(tree)
              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
              and n.name in exported]
@@ -3167,25 +3179,15 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
                    and (sub.func.id == "print" or sub.func.id in found)
                    for sub in ast.walk(f)):
                 grown.add(f.name)
+        # THE NAME IT IS EXPORTED UNDER, which need not be the name of the
+        # def: `banner = _emit`, `banner = _make_banner()`. Resolved in a
+        # SECOND loop after this one, the names it promotes could never be
+        # consumed by the delegation scan above, so a printer delegating to
+        # an ALIASED printer was silently missed.
+        grown |= {t for t, v in bindings.items() if v & (found | grown)}
         if grown <= found:
             break
         found |= grown
-    # THE NAME IT IS EXPORTED UNDER, which need not be the name of the def.
-    # `funcs` matches a `FunctionDef` by `.name`, so an alias whose target is
-    # spelled differently -- `banner = _emit`, `banner = _make_banner()`,
-    # `banner = partial(_emit, ...)` -- resolves to nothing and the printer is
-    # SILENT, which is the failure this guard exists to prevent. The previous
-    # cut passed its own case only because the inner def happened to share the
-    # exported spelling. Resolve the binding to whatever it names, and export
-    # the name a caller can actually reach.
-    while True:
-        more = {
-            t: v for t, v in bindings.items()
-            if t not in found and v in found
-        }
-        if not more:
-            break
-        found |= set(more)
     # NO FLOOR ON THE POPULATION. An empty answer is what a printer module
     # with no bare `print` gives, and that tree is strictly healthier. Asserted
     # here it fires at IMPORT: measured, rewriting the two printers to
@@ -3340,6 +3342,46 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             "Use `_note`."
         )
 
+    def test_a_printer_delegating_to_an_ALIASED_printer_is_derived(self):
+        """Resolving aliases in a loop AFTER the delegation fixpoint misses them.
+
+        Both features shipped together and did not compose: the names the
+        alias pass promoted could never re-enter the loop that consumes
+        `found`, so `notice` -- which reaches `print` through `warning = _emit`
+        -- was absent from `_PRINTERS` and every `notice(...)` in session.py
+        went unflagged. Silent, which is the direction that matters.
+        """
+        found = _bare_print_printers("""
+def _emit(m): print(m)
+warning = _emit
+def notice(m): warning(m)
+def deeper(m): notice(m)
+""")
+        assert {"notice", "deeper"} <= found, (
+            "delegation through an alias was not resolved: "
+            f"{sorted(found)}"
+        )
+
+    def test_a_constant_built_from_a_call_is_not_a_printer(self):
+        """Following EVERY call's arguments promotes non-printers without bound.
+
+        A module constant built by a call that merely mentions a printer would
+        become a printer, and then anything built from that constant too. The
+        cost is not a bounded false alarm: `_PRINTERS` holds a name that prints
+        nothing, and the matcher then fails on session.py lines that are not
+        notices -- a red suite with a wrong diagnosis.
+        """
+        found = _bare_print_printers("""
+def warning(m): print(m)
+def _len(x): return 1
+WIDTH = _len(warning)
+TABLE = dict(WIDTH)
+LABEL = str(TABLE)
+""")
+        assert found == {"warning"}, (
+            f"a non-printer was promoted through a call chain: {sorted(found)}"
+        )
+
     def test_a_factory_exported_printer_is_not_filtered_out(self):
         """The nesting filter dropped the reachable name and kept the unreachable
         one.
@@ -3370,6 +3412,21 @@ banner = _emit
 import functools
 def _emit(p, m): print(m)
 banner = functools.partial(_emit, 'x')
+"""),
+            # SPELLED BARE, so the candidate set is {'partial', '_emit'} and
+            # not the single name an `Attribute` callee leaves. Keeping one
+            # candidate per target answered this by PYTHONHASHSEED -- measured
+            # on the shipped code, derived on 2 of 6 seeds and lost on 4.
+            ("bare partial", """
+from functools import partial
+def _emit(p, m): print(m)
+banner = partial(_emit, 'x')
+"""),
+            # AND THE KEYWORD FORM, which the argument scan did not read.
+            ("partial by keyword", """
+from functools import partial
+def _emit(m): print(m)
+banner = partial(func=_emit)
 """),
         ):
             found = _bare_print_printers(src)
