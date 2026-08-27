@@ -2216,7 +2216,10 @@ class TestTheRollbackDecidesPerKey:
             _session.mark_session_stale = real_mark
 
         said = " ".join(records)
-        assert "could not be marked stale" in said, (
+        # THE SUMMARY'S CLAUSE, which only the COUNT produces. The arm also
+        # logs, and a log line is satisfied whether or not the rollback
+        # learned anything -- keyed on it, dropping the count passed.
+        assert "could not be invalidated or marked stale" in said, (
             "premise: the live marker branch did not fire, so the staged "
             f"copies below survive or vanish for another reason: {said!r}"
         )
