@@ -12417,11 +12417,20 @@ class TestTheLiveCredentialIsReadThroughTheStore:
     def test_an_unreadable_store_still_answers_None(
         self, temp_home: Path, monkeypatch
     ):
-        """THE CONTROL. `None` has to survive: it is what stops a keychain that
-        declines this process from reading as a different account."""
+        """THE CONTROL FOR THE FILE PATH. `None` has to survive: it is what
+        stops a keychain that declines this process from reading as a
+        different account.
+
+        It is NOT a control for the store guard beside it — measured, it stays
+        green with that guard deleted, because it leaves through the
+        missing-file `except` below. Its third field matches production too:
+        the only arm returning `value=None` is
+        `ActiveCredentials(None, keychain_failed, keychain_failed)`, so a
+        `degraded` of False beside a True would be a state nothing returns.
+        """
         s = self._switcher(temp_home)
         monkeypatch.setattr(s, "_read_active_credentials",
-                            lambda: ActiveCredentials(None, True))
+                            lambda: ActiveCredentials(None, True, True))
         assert s._live_credential_is("1", "a@example.com") is None
 
     def test_a_degraded_store_read_is_not_a_mismatch(
@@ -12469,14 +12478,28 @@ class TestTheLiveCredentialIsReadThroughTheStore:
         seen: list[object] = []
 
         def _spy(*a, **kw):
-            seen.append(kw.get("switcher", ...) if not a else a[0])
+            # RECORD HERE, ASSERT AFTER. `_refresh_policy_cache` wraps this
+            # call in `except Exception` by design, so an assert raised inside
+            # the spy is SWALLOWED -- the run then fails on whichever later
+            # assert happens to notice, naming the wrong cause.
+            seen.append({"args": a, "kwargs": kw})
             return None
 
         monkeypatch.setattr(switcher_mod, "fetch_policy_limits", _spy)
         s._refresh_policy_cache()
-        assert seen and seen[0] is s, (
+        assert seen, "premise: the refresh never called the seam at all"
+        got = seen[0]["kwargs"] if not seen[0]["args"] else {}
+        assert got.get("switcher") is s, (
             "the refresh called the seam without its switcher, so on a "
             f"keychain-only host the fetch has no token to ask with: {seen}"
+        )
+        # THE BUDGET TOO. Adding `timeout_s=...` at the call site left the
+        # suite byte-identical: the seam's own case pins its DEFAULT, and every
+        # stub here takes `**kwargs`, so nothing read what the call site
+        # passes. That budget bounds the switch tail the auto engine drives
+        # right before a lockout.
+        assert "timeout_s" not in got, (
+            f"the call site overrode the seam's own budget: {got['timeout_s']}"
         )
 
     def test_the_policy_fetch_asks_the_store_too(
