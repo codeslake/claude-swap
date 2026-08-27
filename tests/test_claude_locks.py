@@ -613,6 +613,44 @@ class TestEveryArmOfTheLoopBacksOff:
     to bound, and reached with no race at all.
     """
 
+    def test_a_held_fresh_lock_does_not_spin(self, tmp_path):
+        """THE ORDINARY CONTENDED PATH, and the arm this class is named for.
+
+        The symlink case below covers the stat-FNF arm. The JITTER arm -- the
+        one every normal waiter takes against a lock that is held and fresh --
+        had no spin bound at all, so a clamp that evaluates negative sleeps
+        zero and the loop runs flat out. Measured: `deadline - time.time()`
+        instead of `time.monotonic()` (boot-relative against epoch, so the
+        remainder is hugely negative and `max(0.0, ...)` yields 0) took the
+        attempts in a 0.3s budget from 2 to 5135, with both lock files green.
+
+        The bound is deliberately loose: what separates correct from broken
+        here is three orders of magnitude, not one attempt.
+        """
+        lock = tmp_path / "held.lock"
+        lock.mkdir()  # FRESH, so the stale-takeover arm is never entered
+        tries = {"n": 0}
+        real_mkdir = os.mkdir
+
+        def counting(path, *a, **k):
+            if os.fspath(path) == os.fspath(lock):
+                tries["n"] += 1
+            return real_mkdir(path, *a, **k)
+
+        os.mkdir = counting
+        try:
+            with pytest.raises(ClaudeCodeLockTimeout):
+                with proper_lockfile(lock, timeout=0.3):
+                    pass
+        finally:
+            os.mkdir = real_mkdir
+
+        assert tries["n"] >= 1, f"the instrument, not the code: {tries['n']}"
+        assert tries["n"] < 40, (
+            f"{tries['n']} mkdir attempts in a 0.3s budget — the jittered "
+            "arm is not sleeping, so a waiter pegs a core for the whole hold"
+        )
+
     def test_a_dangling_symlink_does_not_spin(self, tmp_path, monkeypatch):
         target = tmp_path / "target.lock"
         target.symlink_to(tmp_path / "nothing-here")

@@ -120,8 +120,9 @@ def proper_lockfile(
         except FileNotFoundError:
             # BACK OFF HERE TOO. A dangling symlink at the lock path answers
             # FileExistsError to mkdir and FileNotFoundError to stat, so this
-            # arm can repeat for the whole budget -- and it was the only one
-            # with no sleep in it.
+            # arm can repeat for the whole budget. No claim here about which
+            # OTHER arms sleep: a sibling adds one above, and that sentence
+            # goes false on the merged tree.
             time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
         if time.time() - held_mtime > staleness:

@@ -180,6 +180,55 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
     arrive, and on a saturated CI core they report a correct clamp as broken.
     """
 
+    def test_a_budget_smaller_than_the_flat_sleep_is_not_overshot(
+        self, tmp_path
+    ):
+        """THE CLAMP'S BOUND, which the case below cannot see.
+
+        That one scripts a budget of 0.407, so flooring the deadline to
+        anything up to 0.407 is a no-op for it -- and `deadline` has exactly
+        one consumer here, the clamp, so mutating the bound IS mutating the
+        clamp. Measured on the shipped tree: `deadline = start + max(timeout,
+        0.1)` leaves both lock files at 42 passed while a caller asking for
+        10 ms waits 100 ms, a 10x overshoot of the budget this module exists
+        to honour.
+
+        A budget BELOW the flat sleep is what makes any floor above it
+        visible, and the total is the reading that shows it -- a single
+        clamped sleep is the whole hold.
+        """
+        target = tmp_path / "held.json"
+        holder = FileLock(target, timeout=5)
+        assert holder.acquire(), "premise: the lock must be held to contend"
+        try:
+            budget, clock, slept = 0.01, [0.0], []
+            real_sleep = locking.time.sleep
+            real_monotonic = locking.time.monotonic
+            mine = threading.get_ident()
+
+            def fake_sleep(seconds):
+                if threading.get_ident() != mine:
+                    return real_sleep(seconds)
+                slept.append(seconds)
+                clock[0] += seconds + 0.001
+
+            locking.time.monotonic = lambda: clock[0]
+            locking.time.sleep = fake_sleep
+            try:
+                waiter = FileLock(target, timeout=budget)
+                assert not waiter.acquire(), "the held lock was handed over"
+            finally:
+                locking.time.sleep = real_sleep
+                locking.time.monotonic = real_monotonic
+
+            assert slept, f"the instrument, not the code: {slept}"
+            assert sum(slept) <= budget, (
+                f"slept {sum(slept)}s against a {budget}s budget -- the "
+                f"deadline was not the caller's (sleeps: {slept})"
+            )
+        finally:
+            holder.release()
+
     def test_no_retry_sleep_outlives_the_budget_it_was_given(self, tmp_path):
         """A SCRIPTED CLOCK: the remaining budget at each sleep is CHOSEN.
 
