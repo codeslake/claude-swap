@@ -129,6 +129,55 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("scalar,body,expected", [
+    (
+        ">",
+        ["# keep the shard list on one line",
+         "uv run pytest -n 4 -o testpaths= ${{ matrix.paths }}"],
+        0,
+    ),
+    (
+        "|",
+        ["# keep the shard list on one line",
+         "uv run pytest -n 4 -o testpaths= ${{ matrix.paths }}"],
+        1,
+    ),
+    (
+        "|",
+        ["uv run pytest -n 4 ${{ matrix.paths }}",
+         "uv run pytest -o testpaths= --version"],
+        2,
+    ),
+    (
+        "|",
+        ["uv run pytest -n 4 \\",
+         "  -o testpaths= ${{ matrix.paths }}"],
+        1,
+    ),
+])
+def test_the_reader_folds_a_block_the_way_its_scalar_says(
+    scalar, body, expected
+):
+    """`|` and `>` are different commands, and reading them alike is a hole.
+
+    `>` FOLDS its lines into one shell line, so a `#` anywhere before the
+    command comments out everything after it -- stripping per source line
+    first drops the `#` line and reassembles a live-looking invocation, which
+    is the false CLEAN the shared stripping was added to close, rebuilt one
+    spelling over. `paths: >-` is already used in this workflow, so `run: >`
+    is an ordinary next edit.
+
+    `|` keeps its lines SEPARATE, so joining them hides a second invocation
+    inside one block -- and the real collapse is a shard command that loses
+    `-o testpaths=` while a harmless second `pytest` carries it. The caller's
+    `len(runs) == 1` cannot see that through a join. A trailing backslash is
+    the one case that really is one command, so it is joined first.
+    """
+    job = "    - name: t\n      run: " + scalar + "\n" + "\n".join(
+        "        " + ln for ln in body)
+    assert len(_pytest_run_lines(job)) == expected
+
+
 def test_a_commented_out_macos_command_is_refused(tmp_path):
     """The comment stripping's own witness, which nothing had.
 
@@ -275,23 +324,22 @@ def _pytest_run_lines(job: str) -> list[str]:
     What actually separates the two is the comment stripping above, which is
     why it lives in this reader and not in one caller.
     """
-    # STRIPPED HERE, NOT PER CALLER. Folding joins a block scalar's lines, so
-    # a `#` that comments the real command out lands INSIDE the folded value
-    # and carries every marker with it. One caller stripped its job first and
-    # the other did not, which made that a correct refusal on one and a false
-    # CLEAN on the other.
-    lines = [re.sub(r"(?<!\S)#.*", "", ln) for ln in job.splitlines()]
-    folded, i = [], 0
+    def uncomment(text: str) -> str:
+        return re.sub(r"(?<!\S)#.*", "", text)
+
+    lines, folded, i = job.splitlines(), [], 0
     while i < len(lines):
-        head = re.match(r"(\s*)run: *[|>][-+]?\s*$", lines[i])
+        # `|2` / `>2-` carry an explicit indentation indicator and are legal.
+        head = re.match(r"(\s*)run: *([|>])[-+]?\d*[-+]?\s*$", lines[i])
         if not head:
-            folded.append(lines[i])
+            folded.append(uncomment(lines[i]))
             i += 1
             continue
         # A BLOCK SCALAR IS THE SAME COMMAND. `run: |` puts the invocation on
         # the following, deeper-indented lines; read literally the header has
         # no `pytest` in it and the job reads as running nothing.
-        indent, body = len(head.group(1)), []
+        pad, scalar, indent, body = head.group(1), head.group(2), None, []
+        indent = len(pad)
         i += 1
         while i < len(lines) and (
             not lines[i].strip()
@@ -299,7 +347,26 @@ def _pytest_run_lines(job: str) -> list[str]:
         ):
             body.append(lines[i].strip())
             i += 1
-        folded.append(head.group(1) + "run: " + " ".join(x for x in body if x))
+        body = [x for x in body if x]
+        if scalar == ">":
+            # FOLDED INTO ONE SHELL LINE, so a `#` anywhere before the command
+            # comments out everything after it. Stripping per SOURCE line
+            # first drops the `#` line and reassembles a live-looking
+            # invocation -- the same false CLEAN, one spelling over.
+            folded.append(pad + "run: " + uncomment(" ".join(body)))
+            continue
+        # `|` KEEPS ITS LINES SEPARATE, so each is its own command and joining
+        # them hides a second invocation inside one block. A trailing
+        # backslash is the one case that really is one command.
+        logical, buf = [], ""
+        for ln in body:
+            buf += ln[:-1] + " " if ln.endswith("\\") else ln
+            if not ln.endswith("\\"):
+                logical.append(buf)
+                buf = ""
+        if buf:
+            logical.append(buf)
+        folded += [pad + "run: " + uncomment(x) for x in logical]
     return [
         ln for ln in folded
         if re.match(r"\s*run: ", ln) and re.search(r"(?<![\w-])pytest(?![\w-])", ln)
@@ -311,7 +378,14 @@ def _assert_macos_job_is_intact(workflow: Path) -> None:
     assert _pytest_run_lines(job), (
         "the macOS job no longer invokes pytest — it would stay green testing nothing"
     )
-    for path in re.findall(r"tests/test_\w+\.py", job):
+    # STRIPPED FOR THIS SCAN TOO. `_macos_job` used to strip comments before
+    # returning, and removing that duplicate stripping was reported as a
+    # no-op -- it is not: the path scan reads this string, so an ordinary
+    # comment naming a since-deleted test file reddens the suite here AND
+    # masks `test_a_job_naming_a_deleted_file_is_refused`. Only what the job
+    # RUNS can name a file it needs.
+    live = "\n".join(re.sub(r"(?<!\S)#.*", "", ln) for ln in job.splitlines())
+    for path in re.findall(r"tests/test_\w+\.py", live):
         assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
     # A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned. LAST,
     # because it is the broadest: raised ahead of the path check it masked
