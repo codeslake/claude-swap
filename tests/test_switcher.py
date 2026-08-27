@@ -13071,6 +13071,54 @@ def test_a_stranded_temp_from_a_recycled_pid_does_not_wedge_the_write(
     )
 
 
+#: The plist carries no credential, so its temp is created at the ordinary
+#: mode. Everything else on this roster holds one at some point.
+_WIDE_BY_DESIGN = {"plist"}
+
+
+@pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
+def test_the_temp_is_created_narrow_at_every_writer(
+    temp_home: Path, tmp_path: Path, monkeypatch, site: str
+):
+    """The 0600 literal was pinned at TWO of the ten writers.
+
+    `credentials.py` has no `os.fchmod` at all, so on those three the literal
+    on `os.open` is the ONLY thing narrowing a temp that holds a live OAuth
+    token for the whole write window -- and widening every create to 0o666
+    failed just two cases, one of them pre-existing. `O_EXCL` is what makes
+    the mode argument load-bearing: the name is always fresh, so nothing
+    else can have set it.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    d, write, _stray, mod = _writer_site(site, temp_home, tmp_path)
+    seen: list[int] = []
+    real_open = os.open
+
+    def sampling_open(path, flags, *a, **kw):
+        fd = real_open(path, flags, *a, **kw)
+        name = os.path.basename(os.fspath(path))
+        if name.endswith(".tmp"):
+            seen.append(os.fstat(fd).st_mode & 0o777)
+        return fd
+
+    prev_umask = os.umask(0o022)          # permissive: 0o644 if nothing narrows
+    try:
+        monkeypatch.setattr(mod.os, "open", sampling_open)
+        write()
+    finally:
+        os.umask(prev_umask)
+
+    assert seen, "premise: no temp was created through os.open"
+    ceiling = 0o644 if site in _WIDE_BY_DESIGN else 0o600
+    wide = [oct(m) for m in seen if m & ~ceiling]
+    assert wide == [], (
+        f"{site}'s temp was created at {wide} against a {oct(ceiling)} "
+        "ceiling — the payload is readable by another uid for the whole "
+        "write window"
+    )
+
+
 @pytest.mark.parametrize("site", _ALL_ATOMIC_WRITERS)
 def test_an_interrupt_at_the_create_strands_nothing(
     temp_home: Path, tmp_path: Path, monkeypatch, site: str
@@ -13100,6 +13148,53 @@ def test_an_interrupt_at_the_create_strands_nothing(
 
     strays = sorted(set(os.listdir(d)) - before)
     assert strays == [], f"an interrupt at the create left {strays}"
+
+
+def test_a_partial_of_the_SAME_LENGTH_is_not_left_world_readable(
+    temp_home: Path, monkeypatch
+):
+    """The mtime half of the pair, which nothing pinned.
+
+    `_unnarrow` asks `(st_size, st_mtime_ns) != before`. Freezing
+    `st_mtime_ns` degrades that back to the size proxy round 5 replaced, and
+    the whole write-through group stays green: every case there changes the
+    length, so the size half alone answers them all. This one does not —
+    the partial is written at EXACTLY the prior byte count, so only the
+    mtime can say the file was touched.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    path = temp_home / ".claude.json"
+    original = '{"a": "000000000000000000000000000"}'
+    path.write_text(original)
+    os.chmod(path, 0o644)
+
+    partial = '{"primaryApiKey": "sk-ant-SECRET-P"}'
+    assert len(partial) == len(original), (
+        "premise: the partial must be exactly the prior length, or the size "
+        "half answers this and the mtime half is untested"
+    )
+
+    def same_length_partial(src, dst, *_a, **_kw):
+        Path(dst).write_text(partial)
+        raise OSError(errno.EIO, "the mount went away mid-copy")
+
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", same_length_partial)
+    monkeypatch.setattr(
+        switcher_mod, "replace_with_retry",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError(errno.EBUSY, "bind mount")))
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(path, {"primaryApiKey": "sk-ant-SECRET-PAYLOAD"})
+
+    left = path.read_text()
+    assert "SECRET" not in left, (
+        f"a same-length partial credential survived at "
+        f"mode {oct(path.stat().st_mode & 0o777)}: {left[:40]!r}"
+    )
 
 
 def test_a_partial_larger_than_the_original_is_not_left_world_readable(
