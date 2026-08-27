@@ -54,6 +54,10 @@ CREDENTIALS_STALENESS_S = 60.0
 CONFIG_STALENESS_S = 10.0
 # We touch a little faster than CC's 5s for margin.
 TOUCH_INTERVAL_S = 3.0
+# How long the release waits for a heartbeat tick that is holding the stamp
+# mutex. PER-LOCK, and a switch takes three. Unpinned platforms only: with a
+# descriptor pinning the inode there is no mutex and no wait.
+_RELEASE_WAIT_S = 5.0
 # WINDOWS CANNOT HOLD A DIRECTORY OPEN: `os.open` on one raises EACCES, and
 # the stdlib offers no other way. Identity there is the file index from a
 # plain stat -- still not a value we write, so still not adoptable the way an
@@ -132,7 +136,17 @@ def proper_lockfile(
             # ClaudeCodeLockTimeout.
             if _CAN_PIN_A_DIRECTORY:
                 held_fd = os.open(lock_dir, os.O_RDONLY)
-                st = os.fstat(held_fd)
+                try:
+                    st = os.fstat(held_fd)
+                except BaseException:
+                    # THE DESCRIPTOR IS OURS THE INSTANT `open` RETURNS, and
+                    # the `finally` that closes it is not reached until the
+                    # `yield` below. A raise here strands it on an inode the
+                    # arm further down then unlinks, so it stays pinned for
+                    # the life of the process.
+                    os.close(held_fd)
+                    held_fd = -1
+                    raise
             else:
                 st = os.stat(lock_dir)
             ident = (st.st_dev, st.st_ino)
@@ -158,8 +172,9 @@ def proper_lockfile(
             # the jittered sleep at the bottom -- ending at the budget while
             # pinning a core for all of it. The ordinary "holder released
             # between mkdir and stat" retry stays instant; only a name being
-            # swept out from under us backs off.
-            time.sleep(0.05)
+            # swept out from under us backs off -- and never past what is left
+            # of the caller's budget, which is the whole loop's contract.
+            time.sleep(max(0.0, min(0.05, timeout - (time.monotonic() - start))))
         except OSError:
             # `mkdir` made the directory and the open could not read it back,
             # so nobody holds it and every waiter is blocked for the full
@@ -194,7 +209,13 @@ def proper_lockfile(
     # read-modify-write the release also reads, and half-done -- utime landed,
     # read-back has not -- our own lock reads foreign. Pinned, identity is
     # immutable and there is nothing to serialise, so this costs nothing.
-    stamping = threading.Lock() if not _CAN_PIN_A_DIRECTORY else nullcontext()
+    # PINNED PLATFORMS HAVE NO MUTEX AT ALL: identity is immutable, so the
+    # release needs nothing from the heartbeat. Unpinned, `_touch` holds this
+    # across three syscalls, so the release's wait for it MUST be bounded --
+    # a stalled `utime` would otherwise hold a `finally` that a single switch
+    # reaches three times.
+    stamping = None if _CAN_PIN_A_DIRECTORY else threading.Lock()
+    _tick_guard = nullcontext() if stamping is None else stamping
 
     def _ours() -> bool:
         """Is the directory at this path still the one we created?
@@ -226,7 +247,7 @@ def proper_lockfile(
         # for the rest of the hold, and a mtime that stops advancing is a lock
         # a waiter may take over as stale, mid-swap.
         while not stop_touching.wait(TOUCH_INTERVAL_S):
-            with stamping:
+            with _tick_guard:
                 try:
                     if not _ours():
                         return  # taken over; refreshing it keeps THEIR lock alive
@@ -256,26 +277,34 @@ def proper_lockfile(
         yield
     finally:
         stop_touching.set()
-        # NO WAIT HERE. Pinned, identity is immutable, so the release needs
-        # nothing from the heartbeat: `stamping` is a nullcontext and a tick
-        # landing inside this block can at worst refresh a successor's lock
-        # once. It can never make one look like ours, which is what a stamp
-        # could and did. Unpinned, the mutex is what keeps the release from
-        # reading `last_stamp` half-written -- one wait, and only there.
+        # NO WAIT AT ALL WHEN PINNED: a tick landing inside this block can at
+        # worst refresh a successor's lock once, and can never make one look
+        # like ours. Unpinned, the mutex stops the release reading a STALE
+        # `last_stamp` against a freshly-utimed mtime, which would make our
+        # own lock read foreign -- and the wait for it is bounded, because a
+        # tick can stall inside a syscall for as long as the filesystem does.
+        # On expiry we LEAVE the lock rather than removing one we can no
+        # longer prove is ours; the stale sweep recovers that.
         #
         # NOT `return` ON ANY ARM: this whole block is the context manager's
         # `finally`, and a `return` there discards an exception the body
         # raised.
+        held_stamp = stamping is None or stamping.acquire(timeout=_RELEASE_WAIT_S)
         try:
-            with stamping:
-                if _ours():
-                    os.rmdir(lock_dir)
-                else:
-                    # A successor's critical section would be left with nothing on
-                    # disk, free for a third waiter to take.
-                    _logger.warning(
-                        "Lock %s was taken over while held; leaving it", lock_dir
-                    )
+            if not held_stamp:
+                _logger.warning(
+                    "Lock %s: its heartbeat did not return within %.1fs, so "
+                    "the release cannot prove the lock is still ours; leaving "
+                    "it for the stale sweep", lock_dir, _RELEASE_WAIT_S,
+                )
+            elif _ours():
+                os.rmdir(lock_dir)
+            else:
+                # A successor's critical section would be left with nothing on
+                # disk, free for a third waiter to take.
+                _logger.warning(
+                    "Lock %s was taken over while held; leaving it", lock_dir
+                )
         except FileNotFoundError:
             _logger.warning(
                 "Lock %s vanished while held (taken over as stale?)", lock_dir
@@ -283,9 +312,14 @@ def proper_lockfile(
         except OSError as e:
             _logger.warning("Failed to release lock %s: %s", lock_dir, e)
         finally:
-            # LAST, so the inode stays pinned across the decision above. Close
-            # it first and a takeover between the stat and the rmdir could
-            # reuse the number, which is the whole hole this replaced.
+            if held_stamp and stamping is not None:
+                stamping.release()
+            # LAST, so the inode stays pinned across the identity STAT above.
+            # Closing first reopens the window that stat exists to shut. It
+            # does not cover stat-to-rmdir: `os.rmdir` is by NAME and removes
+            # whatever is at the name then, which no descriptor can change --
+            # a window inherent to a name-based directory lock and unchanged
+            # from what this replaced.
             if held_fd >= 0:
                 os.close(held_fd)
 

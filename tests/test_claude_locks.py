@@ -458,6 +458,79 @@ class TestAPermanentENOENTIsNotARetry:
         )
 
 
+class TestTheAcquireAndReleaseAreBounded:
+    """Two things the identity rewrite took out and had to put back."""
+
+    def test_a_failed_identity_read_does_not_leak_the_descriptor(
+        self, tmp_path, monkeypatch
+    ):
+        """The descriptor is ours the instant `os.open` returns.
+
+        The `finally` that closes it is not reached until the body runs, so a
+        raise between the open and the yield strands it -- on an inode the
+        acquire's own error arm then unlinks, which pins it for the life of
+        the process.
+        """
+        if not claude_locks._CAN_PIN_A_DIRECTORY:
+            pytest.skip("no descriptor is held on this platform")
+        if not os.path.isdir("/proc/self/fd"):
+            pytest.skip("no /proc to count descriptors with")
+
+        lock = tmp_path / "target.lock"
+
+        def refuse(fd, *a, **k):
+            raise OSError(errno.EIO, "I/O error")
+
+        before = len(os.listdir("/proc/self/fd"))
+        monkeypatch.setattr(claude_locks.os, "fstat", refuse)
+        with pytest.raises(OSError):
+            with proper_lockfile(lock, timeout=0.2):
+                pass
+        monkeypatch.undo()
+
+        after = len(os.listdir("/proc/self/fd"))
+        assert after <= before, (
+            f"the acquire leaked {after - before} descriptor(s) on a failed "
+            "identity read, pinned to an inode it then unlinked"
+        )
+
+    def test_the_release_does_not_wait_out_a_stalled_tick(
+        self, tmp_path, monkeypatch
+    ):
+        """UNPINNED ONLY, where the release takes the stamp mutex at all.
+
+        `_touch` holds it across three syscalls, so an unbounded acquire
+        hands the release however long the filesystem stalls -- on a
+        `finally` that a single switch reaches three times.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+
+        lock = tmp_path / "target.lock"
+        real_utime = os.utime
+        entered = threading.Event()
+
+        def stalling(path, *a, **k):
+            if (not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)):
+                entered.set()
+                time.sleep(2.0)
+            return real_utime(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", stalling)
+        start = time.monotonic()
+        with proper_lockfile(lock, timeout=1.0):
+            assert entered.wait(1.0), "premise: no tick ever entered the stall"
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.5, (
+            f"the release waited {elapsed:.2f}s on a tick stalled 2.0s — the "
+            "acquire of the stamp mutex is unbounded, so the filesystem sets "
+            "the bound"
+        )
+
+
 class TestIdentityNotAStamp:
     """A stamp is a value we write; a successor's directory can carry it."""
 
