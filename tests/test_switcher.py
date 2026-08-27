@@ -12847,39 +12847,87 @@ def _bound_names(st) -> set[str]:
     """Names this statement binds or unbinds."""
     import ast
 
-    targets = []
+    def _bare(t):
+        # ONLY A NAME IS BOUND. `self.x = 1` and `d[k] = 1` READ their base;
+        # collecting it made `self._last_error = e; raise` -- the archetypal
+        # record-and-re-raise this predicate exists to refuse -- a disown.
+        if isinstance(t, ast.Name):
+            return {t.id}
+        if isinstance(t, (ast.Tuple, ast.List)):
+            return {n for e in t.elts for n in _bare(e)}
+        return set()
+
     if isinstance(st, ast.Assign):
-        targets = st.targets
-    elif isinstance(st, (ast.AnnAssign, ast.AugAssign)):
-        targets = [st.target]
-    elif isinstance(st, ast.Delete):
-        targets = st.targets
-    return {sub.id for t in targets for sub in ast.walk(t)
-            if isinstance(sub, ast.Name)}
+        return {n for t in st.targets for n in _bare(t)}
+    if isinstance(st, (ast.AnnAssign, ast.AugAssign)):
+        return _bare(st.target)
+    if isinstance(st, ast.Delete):
+        # A DELETE OF A SUBSCRIPT DISOWNS ITS CONTAINER. `del staged[key]`
+        # drops the entry the discard walks, which is a real disown even
+        # though the container itself stays bound.
+        out = set()
+        for t in st.targets:
+            out |= _bare(t)
+            out |= {n.id for n in ast.walk(t) if isinstance(n, ast.Name)}
+        return out
+    return set()
+
+
+def _removes_a_file(node) -> bool:
+    """Does this subtree call something that REMOVES a path."""
+    import ast
+
+    for n in ast.walk(node):
+        if not isinstance(n, ast.Call):
+            continue
+        f = n.func
+        name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+        if name in {"unlink", "remove", "rmtree", "rmdir"} or "discard" in name:
+            return True
+    return False
 
 
 def _cleanup_reads(tries, this_handler) -> set[str]:
-    """Names the cleanup around this call READS.
+    """Names that reach the cleanup's REMOVAL, not everything it reads.
 
-    That is the whole invariant: a handler disowns by changing something the
-    cleanup consults -- the temp name, the flag guarding the unlink, the
-    registry the discard walks. Its own `except` clause is excluded, or the
-    handler would answer about itself.
+    "Something the cleanup reads" is too wide: every cleanup here is
+    `if fd >= 0: os.close(fd)` followed by the unlink, so `fd` is in the read
+    set at almost every site -- and `fd = -1` is already written inside the
+    guarded functions. A handler that binds it disowns nothing and the temp
+    is still removed.
+
+    So only the removal counts: the statement that removes the path, and the
+    condition of any `if` guarding it. The handler's own `except` clause is
+    excluded, or it would answer about itself.
     """
     import ast
 
     out: set[str] = set()
+
+    def collect(st):
+        if isinstance(st, ast.If) and _removes_a_file(st):
+            for n in ast.walk(st.test):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                    out.add(n.id)
+            for sub in st.body + st.orelse:
+                collect(sub)
+            return
+        if not _removes_a_file(st):
+            return
+        for n in ast.walk(st):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                out.add(n.id)
+
     for t in tries:
         blocks = list(t.finalbody) + [
             st for h in t.handlers if h is not this_handler for st in h.body]
         for st in blocks:
-            for n in ast.walk(st):
-                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
-                    out.add(n.id)
+            collect(st)
     return out
 
 
-def _os_call_aliases(tree, func: str) -> set[str]:
+
+def _os_call_aliases(tree, func: str, os_names: set[str]) -> set[str]:
     """Bare names this module can call `os.<func>` through.
 
     `from os import open as _open` and `_open = os.open` both bind a NAME,
@@ -12887,17 +12935,49 @@ def _os_call_aliases(tree, func: str) -> set[str]:
     """
     import ast
 
-    return {
+    names = {
         (a.asname or a.name)
         for imp in ast.walk(tree) if isinstance(imp, ast.ImportFrom)
         and imp.module == "os"
         for a in imp.names if a.name == func
-    } | {
-        t.id
-        for n in ast.walk(tree) if isinstance(n, ast.Assign)
-        for t in n.targets if isinstance(t, ast.Name)
-        if isinstance(n.value, ast.Attribute) and n.value.attr == func
     }
+
+    def targets_of(n):
+        # ANNASSIGN AND TUPLES TOO. The hoist resolver in the flags scan
+        # already reads `AnnAssign`; these two were written knowing only
+        # `Assign` with a bare `Name`, which is the same hole one node type
+        # over.
+        if isinstance(n, ast.Assign):
+            ts = n.targets
+        elif isinstance(n, ast.AnnAssign):
+            ts = [n.target]
+        else:
+            return []
+        out = []
+        for t in ts:
+            out += ([e for e in t.elts]
+                    if isinstance(t, (ast.Tuple, ast.List)) else [t])
+        return [t.id for t in out if isinstance(t, ast.Name)]
+
+    # A FIXPOINT, because `_a = os.open; _b = _a` chains -- `_os_names` was
+    # given one and this was not, so the chain walked past both scans.
+    # AND THE BASE MUST BE AN `os` NAME: `X = shutil.open` is not an alias,
+    # and accepting it accuses an unrelated call of being a temp writer.
+    while True:
+        grown = names | {
+            t
+            for n in ast.walk(tree)
+            for t in targets_of(n)
+            if (isinstance(getattr(n, "value", None), ast.Attribute)
+                and n.value.attr == func
+                and isinstance(n.value.value, ast.Name)
+                and n.value.value.id in os_names)
+            or (isinstance(getattr(n, "value", None), ast.Name)
+                and n.value.id in names)
+        }
+        if grown == names:
+            return names
+        names = grown
 
 
 def _is_os_call(node, func: str, os_names: set[str], aliases: set[str]) -> bool:
@@ -12950,7 +13030,7 @@ def test_no_writer_calls_os_write_bare():
         os_names = _os_names(tree)
         # `from os import write as _w` binds a bare NAME, which an attribute
         # match cannot see; resolve the aliases this module actually created.
-        aliases = _os_call_aliases(tree, "write")
+        aliases = _os_call_aliases(tree, "write", os_names)
         # A LOCAL BOUND TO THE FUNCTION IS THE FUNCTION. `w = os.write` then
         # `w(fd, ...)` is the same call under a name the scans above cannot
         # see, and it is the spelling a reader reaches for when the call is
@@ -13158,7 +13238,7 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
         descend(tree, [])
 
         os_names = _os_names(tree)
-        open_aliases = _os_call_aliases(tree, "open")
+        open_aliases = _os_call_aliases(tree, "open", os_names)
         for node in ast.walk(tree):
             if not _is_os_call(node, "open", os_names, open_aliases):
                 continue
@@ -13191,13 +13271,18 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
                     # disowns are not all rebindings of the temp name either:
                     # one clears the flag the cleanup guards its unlink with,
                     # another drops the entry the discard walks.
-                    body = ast.dump(ast.Module(body=h.body, type_ignores=[]))
                     reads = _cleanup_reads(t_stack, h)
                     if name is not None:
                         reads.add(name)
-                    disowns = any(_bound_names(st) & reads
-                                  for st in _flat(h.body))
-                    if disowns and "Raise(" in body:
+                    # BOTH HALVES THROUGH THE SCOPE WALK. The re-raise was
+                    # still an `ast.dump` substring, which sees a `raise`
+                    # inside a nested `def` and under `if False` -- the very
+                    # shapes `_flat` was written to exclude from the other
+                    # half of the same conjunction.
+                    stmts = list(_flat(h.body))
+                    disowns = any(_bound_names(st) & reads for st in stmts)
+                    reraises = any(isinstance(st, ast.Raise) for st in stmts)
+                    if disowns and reraises:
                         ok = True
             if not ok:
                 offenders.append(f"{mod.name}:{node.lineno}"
@@ -13246,7 +13331,7 @@ def test_every_temp_writer_opens_with_O_EXCL():
         # PER MODULE, not per node: both resolvers walk the whole tree, so
         # calling them inside the loop is quadratic on the larger modules.
         os_names = _os_names(tree)
-        open_aliases = _os_call_aliases(tree, "open")
+        open_aliases = _os_call_aliases(tree, "open", os_names)
         for node in ast.walk(tree):
             if not _is_os_call(node, "open", os_names, open_aliases):
                 continue
