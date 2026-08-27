@@ -69,9 +69,17 @@ jobs:
         # the Keychain path never writes — and failed on macOS while every
         # job here stayed green, because this job never ran them.
         #
-        # faulthandler dumps every thread's stack if a test exceeds 60s — a
-        # `security` call blocking on an invisible SecurityAgent dialog would
-        # otherwise hang the job with no clue where. The step timeout is the
-        # backstop that actually kills it, raised for the wider selection.
+        # faulthandler dumps every thread's stack if a test exceeds the
+        # budget — a `security` call blocking on an invisible SecurityAgent
+        # dialog would otherwise hang the job with no clue where. The step
+        # timeout is the backstop that actually kills it.
+        #
+        # 600s, NOT 60. Sixty was chosen when this job ran two files; pointed
+        # at the whole suite on the slowest, fewest-core runner it is a budget
+        # per test that ordinary contention can reach. A dump is cheap and a
+        # false one is noise, but the cost is not symmetric once a sibling
+        # sets `faulthandler_exit_on_timeout` with `--max-worker-restart=0`:
+        # there the budget stops being a dump and becomes a worker kill with
+        # no replacement, and the queued tests on that worker never run.
         timeout-minutes: 15
-        run: uv run pytest -o faulthandler_timeout=60
+        run: uv run pytest -o faulthandler_timeout=600
