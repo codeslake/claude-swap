@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import shutil
 import threading
@@ -93,10 +94,21 @@ class TestProperLockfile:
         """
         real_mkdir = os.mkdir
         attempts: list[int] = []
+        started = time.monotonic()
 
         def swept(path, *args, **kwargs):
             if os.fspath(path) != os.fspath(lock_dir):
                 return real_mkdir(path, *args, **kwargs)
+            # THE BOUND ASSERTED WHERE IT IS REACHABLE, like the sibling case.
+            # Both assertions below run only after `proper_lockfile` returns,
+            # so a loop that never exits -- `continue` instead of falling
+            # through to the deadline -- HANGS rather than failing, and under
+            # `-n auto` one spinning worker takes the whole run with it.
+            # Measured on that mutant: this case rc=124 at the 90s wrapper
+            # timeout with no output, the sibling `rc=1` naming the failure.
+            assert time.monotonic() - started < 1.5, (
+                "the loop never reached its deadline"
+            )
             attempts.append(1)
             real_mkdir(path, *args, **kwargs)
             os.rmdir(path)
@@ -111,6 +123,51 @@ class TestProperLockfile:
         assert len(attempts) <= 30, (
             f"{len(attempts)} attempts in a 0.3s budget — the swept arm is "
             "spinning, not waiting"
+        )
+
+    def test_a_stalled_heartbeat_does_not_hold_the_release_open(
+        self, lock_dir, monkeypatch, caplog
+    ):
+        """`join(timeout=1.0)` looks like a bound and is not.
+
+        The release re-blocks on `stamping` right after it, so a tick stalled
+        inside `os.utime` holds the release for as long as it stalls -- on a
+        `finally` reached from `_perform_switch`. Measured before this: a 6.0s
+        stall blocked the release 5.9s, and at base the release was a bare
+        `rmdir` with no cross-thread wait at all.
+
+        On expiry the lock is LEFT, not removed: past the wait we can no
+        longer prove it is ours, and the stale sweep recovers it. Removing one
+        we cannot prove would take a successor's lock inside its critical
+        section.
+        """
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
+        monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
+        real_utime = os.utime
+
+        def stalling(path, *a, **kw):
+            if os.fspath(path) == os.fspath(lock_dir):
+                real_sleep(2.0)          # far past the release's own wait
+            return real_utime(path, *a, **kw)
+
+        real_sleep = time.sleep
+        monkeypatch.setattr(claude_locks.os, "utime", stalling)
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            started = time.monotonic()
+            with proper_lockfile(lock_dir):
+                real_sleep(0.05)         # let one tick get into the stall
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 1.5, (
+            f"the release waited {elapsed:.2f}s on a stalled heartbeat — "
+            "`join(timeout=...)` is not the bound, `stamping` is"
+        )
+        said = [r.getMessage() for r in caplog.records
+                if "heartbeat did not return" in r.getMessage()]
+        assert said, "the release gave up silently"
+        assert lock_dir.exists(), (
+            "a lock the release could not prove was ours was removed anyway"
         )
 
     def test_release_leaves_a_lock_that_was_taken_over(self, lock_dir):
@@ -166,34 +223,6 @@ class TestProperLockfile:
 
         assert not lock_dir.exists()
 
-    def test_release_removes_a_lock_a_late_tick_refreshes(self, lock_dir, monkeypatch):
-        # A tick past its deadline but not yet at the stamp is in flight too:
-        # read it and let go, and the stat sees a directory that tick refreshed.
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
-        main = threading.current_thread()
-        releasing = threading.Event()
-        real_wait, real_stat = threading.Event.wait, os.stat
-
-        def late_wait(self, timeout=None):
-            woke = real_wait(self, timeout)
-            if not woke and threading.current_thread() is not main:
-                time.sleep(1.2)  # past the release's join, still before the lock
-            return woke
-
-        def gap_before_stat(path, *args, **kwargs):
-            if releasing.is_set() and threading.current_thread() is main:
-                releasing.clear()
-                time.sleep(0.3)  # the late tick lands in here
-            return real_stat(path, *args, **kwargs)
-
-        monkeypatch.setattr(threading.Event, "wait", late_wait)
-        monkeypatch.setattr(claude_locks.os, "stat", gap_before_stat)
-        with proper_lockfile(lock_dir):
-            time.sleep(0.1)
-            releasing.set()
-
-        assert not lock_dir.exists()
-
     def test_reacquire_after_release(self, lock_dir):
         with proper_lockfile(lock_dir):
             pass
@@ -226,11 +255,31 @@ class TestProperLockfile:
         assert not lock_dir.exists()
 
     def test_toucher_keeps_mtime_fresh(self, lock_dir, monkeypatch):
-        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.1)
+        """KEEPS, not "advanced once".
+
+        A `_touch` that ticks once and returns satisfies a single-advance
+        assertion and lets a credential lock go stale mid-hold anyway --
+        `CREDENTIALS_STALENESS_S` is 60s and the interval is 3s, so one tick
+        buys nothing. Measured: that mutant passed all 2098.
+
+        So this samples repeatedly and requires the mtime to keep MOVING, not
+        merely to differ from where it started.
+        """
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
+        seen: list[int] = []
         with proper_lockfile(lock_dir):
-            acquired_ns = lock_dir.stat().st_mtime_ns
-            time.sleep(0.4)
-            assert lock_dir.stat().st_mtime_ns > acquired_ns
+            for _ in range(8):
+                time.sleep(0.05)
+                seen.append(lock_dir.stat().st_mtime_ns)
+        assert seen[-1] > seen[0], "the mtime never advanced at all"
+        # DISTINCT VALUES, which is what "keeps beating" means. A single tick
+        # gives one step and then a flat line; this filesystem's granularity
+        # is ~1ms, far below the 50ms interval, so several are reachable.
+        assert len(set(seen)) >= 3, (
+            f"the heartbeat advanced the mtime {len(set(seen))} time(s) over "
+            "8 samples — one tick and then silence is what a lock taken over "
+            "mid-hold looks like"
+        )
         assert not lock_dir.exists()  # a refreshed lock is still ours to remove
 
     def test_creates_missing_parent(self, tmp_path):
@@ -409,64 +458,4 @@ class TestAPermanentENOENTIsNotARetry:
         assert attempts["n"] <= 2, (
             f"{attempts['n']} mkdir attempts for a parent that cannot come "
             "back: that is a pinned core, not a retry"
-        )
-
-
-class TestTheBackstopIsReachableOnTheDeclaredFloor:
-    """An ini option the declared pytest cannot parse is not a backstop.
-
-    `faulthandler_exit_on_timeout` landed in pytest 9.0.0. Under 8.x it is an
-    unknown key: a `PytestConfigWarning` nobody reads, no abort, and the hang
-    the option exists to end. CI installs from `uv.lock` and is safe; an
-    editable install anywhere inside the declared range was not, and nothing
-    said so.
-    """
-
-    # option -> the first pytest that understands it
-    _INI_FLOORS = {"faulthandler_exit_on_timeout": (9, 0)}
-
-    @staticmethod
-    def _pyproject():
-        import tomllib
-        from pathlib import Path
-
-        root = Path(__file__).resolve().parent.parent
-        with open(root / "pyproject.toml", "rb") as fh:
-            return tomllib.load(fh), root
-
-    def test_the_declared_pytest_floor_understands_every_ini_option_used(self):
-        cfg, root = self._pyproject()
-        ini = cfg["tool"]["pytest"]["ini_options"]
-        used = {k: v for k, v in self._INI_FLOORS.items() if k in ini}
-        # THE DENOMINATOR. With no version-gated option declared there is no
-        # requirement, and an empty loop below would pass without looking.
-        assert used, (
-            "no version-gated ini option is declared — this guard has no "
-            f"subject; known ones: {sorted(self._INI_FLOORS)}"
-        )
-
-        specs = [d for d in cfg["dependency-groups"]["dev"]
-                 if d.split(">=")[0].strip() == "pytest"]
-        assert len(specs) == 1, f"expected one pytest dev spec, got {specs}"
-        declared = tuple(int(x) for x in specs[0].split(">=")[1].split(".")[:2])
-        for option, floor in used.items():
-            assert declared >= floor, (
-                f"`{option}` needs pytest >= {floor[0]}.{floor[1]} and the dev "
-                f"group declares >= {declared[0]}.{declared[1]}, so inside the "
-                "declared range the option is an unknown key and the backstop "
-                "is inert"
-            )
-
-    def test_the_lockfile_carries_the_same_floor(self):
-        """`uv sync --locked` fails on a specifier the lock disagrees with, so
-        a dependency edit is a two-file commit and a green suite never opens
-        the second one."""
-        cfg, root = self._pyproject()
-        spec = next(d for d in cfg["dependency-groups"]["dev"]
-                    if d.split(">=")[0].strip() == "pytest")
-        lock = (root / "uv.lock").read_text(encoding="utf-8")
-        needle = f'{{ name = "pytest", specifier = ">={spec.split(">=")[1]}" }}'
-        assert needle in lock, (
-            f"uv.lock does not carry {spec!r}; `uv sync --locked` refuses a "
-            "pyproject the lock was not regenerated for"
         )

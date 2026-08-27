@@ -53,6 +53,11 @@ CREDENTIALS_STALENESS_S = 60.0
 CONFIG_STALENESS_S = 10.0
 # We touch a little faster than CC's 5s for margin.
 TOUCH_INTERVAL_S = 3.0
+# How long a release waits for the heartbeat before giving the lock up to
+# the stale sweep. `Thread.join(timeout=...)` is not this bound: the
+# release then re-blocks on `stamping`, so a tick stalled inside
+# `os.utime` holds it for as long as it stalls.
+_RELEASE_WAIT_S = 5.0
 # Claude Code holds the credentials lock for one token-endpoint round trip
 # (sub-second to a few seconds); its config lock for a local RMW. 9s of
 # bounded waiting comfortably outlasts both without stalling the CLI forever.
@@ -183,25 +188,47 @@ def proper_lockfile(
         yield
     finally:
         stop_touching.set()
-        toucher.join(timeout=1.0)
-        try:
-            # Held across the decision, so no tick can move the stamp inside
-            # it; stop_touching bars any tick that has not started by now.
-            with stamping:
-                if os.stat(lock_dir).st_mtime_ns == stamped_ns:
-                    os.rmdir(lock_dir)
-                else:
-                    # A successor's critical section would be left with
-                    # nothing on disk, free for a third waiter to take.
-                    _logger.warning(
-                        "Lock %s was taken over while held; leaving it", lock_dir
-                    )
-        except FileNotFoundError:
+        # BOUNDED, and the `join` is not the bound. `join(timeout=1.0)` looks
+        # like one and is not: the `with stamping` below re-blocks on the same
+        # thread, so a tick stalled inside `os.utime` holds the release for as
+        # long as it stalls. Measured: a 6.0s stall blocked the release 5.9s,
+        # on a `finally` reached from `_perform_switch`. At base the release
+        # was a bare `rmdir` with no cross-thread wait at all.
+        #
+        # On expiry we LEAVE the lock rather than removing one we can no
+        # longer prove is ours. That self-heals through the stale sweep; the
+        # other direction removes a successor's lock inside its critical
+        # section.
+        toucher.join(timeout=_RELEASE_WAIT_S)
+        # NOT `return` ON THE MISS: this whole block is the context manager's
+        # `finally`, and a `return` there discards an exception the body
+        # raised.
+        if not stamping.acquire(timeout=_RELEASE_WAIT_S):
             _logger.warning(
-                "Lock %s vanished while held (taken over as stale?)", lock_dir
+                "Lock %s: its heartbeat did not return within %.1fs, so the "
+                "release cannot prove the lock is still ours; leaving it for "
+                "the stale sweep", lock_dir, _RELEASE_WAIT_S,
             )
-        except OSError as e:
-            _logger.warning("Failed to release lock %s: %s", lock_dir, e)
+        else:
+          try:
+              # Held across the decision, so no tick can move the stamp inside
+              # it; stop_touching bars any tick that has not started by now.
+              if os.stat(lock_dir).st_mtime_ns == stamped_ns:
+                  os.rmdir(lock_dir)
+              else:
+                  # A successor's critical section would be left with
+                  # nothing on disk, free for a third waiter to take.
+                  _logger.warning(
+                      "Lock %s was taken over while held; leaving it", lock_dir
+                  )
+          except FileNotFoundError:
+              _logger.warning(
+                  "Lock %s vanished while held (taken over as stale?)", lock_dir
+              )
+          except OSError as e:
+              _logger.warning("Failed to release lock %s: %s", lock_dir, e)
+          finally:
+              stamping.release()
 
 
 @contextmanager
