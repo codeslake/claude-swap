@@ -1418,53 +1418,36 @@ class ClaudeAccountSwitcher:
         staged pre-swap copies are kept on disk for manual recovery instead
         of being deleted.
         """
-        # DECIDED BEFORE IT IS ANNOUNCED. Every step below is gated on `moved`
-        # or `wrote_backups`, so an abort that mutated nothing skips all of
-        # them -- and the line still said both slots were being restored,
-        # which is the class of wrong text this change exists to remove.
-        # THREE STATES, NOT TWO. `bool(moved) or wrote_backups` collapsed a
-        # profile-only reversal into "restoring both slots", which is the class
-        # of wrong text this change exists to remove -- an interrupt just past
-        # a rename runs no credential restore at all.
-        # ANNOUNCED IN TWO PARTS, because the facts do not exist yet. This
-        # line carries only what is certain here, and survives a rollback that
-        # dies partway; the summary after the loop is built from what actually
-        # ran. `wrote_backups` is armed one statement BEFORE the first write on
-        # purpose, so "armed" and "wrote something" are different claims and
-        # only the second one is a report.
+        # ANNOUNCED BEFORE THE FACTS EXIST, so this line carries only what is
+        # certain here and the summary after the loop is the report. THREE
+        # STATES, NOT TWO: `bool(moved) or wrote_backups` collapsed a
+        # profile-only reversal into "restoring both slots", and an interrupt
+        # just past a rename runs no credential restore at all. `wrote_backups`
+        # is armed one statement BEFORE the first write on purpose -- "armed"
+        # and "wrote something" are different claims.
         self._logger.error(f"Swap {num_a} <-> {num_b} failed; rolling back")
         failures = 0
         wrote_any = False
-        # Unlike the credential steps below, this is not a no-op when its
-        # forward half never ran: with one email the two slots' keys are each
-        # other's destinations, so it would exchange two untouched profiles.
-        #
-        # ITS OWN SINK, not a throwaway list. `_swap_session_dirs` swallows
-        # `OSError` by design, so a reverse can put back FEWER profiles than
-        # the forward move took and leave one under the other slot's key. The
-        # value-equal skip below must not then leave it serving that account's
-        # token: reached with nothing injected, a leftover `.swapping`
-        # directory makes the park step raise ENOTEMPTY and both profiles stay
-        # crossed and live.
+        # NOT A NO-OP when its forward half never ran: with one email the two
+        # slots' keys are each other's destinations, so it would exchange two
+        # untouched profiles. ITS OWN SINK, because `_swap_session_dirs`
+        # swallows `OSError` by design -- a reverse can put back FEWER profiles
+        # than the forward move took, and the value-equal skip below must not
+        # leave the leftover serving that account's token.
         undone: list[Path] = []
         if moved:
             self._swap_session_dirs(num_b, email_a, num_a, email_b, undone)
             if undone:
                 self._logger.error("Reversed the session-profile exchange")
-        # PER KEY, not a whole-swap count. A reverse that put back one of two
-        # leaves the OTHER slot's profile stranded, not crossed -- forcing a
-        # write there costs a correctly-restored slot its session credentials,
-        # which is the exact price the value-equal skip exists to avoid.
-        # TWO LISTS, TWO PATHS, ASKED OF DIFFERENT NAMES. `moved` records
-        # where the FORWARD move landed each profile; `undone` records the
-        # HOME each reverse put one back to. So a key is still crossed when
-        # its crossed location is in `moved` and its home is not in `undone`.
-        # `moved` non-empty alone marked a slot crossed whose profile never
-        # left home -- the reverse then restored the OTHER slot, and this one
-        # was forced through a needless credential write that costs it its
-        # session profile, the exact price the value-equal skip exists to
-        # avoid. Testing `home in moved` instead disables the guard outright:
-        # with distinct emails no home is ever a move DESTINATION.
+        # PER KEY, AND FROM TWO LISTS ASKED OF DIFFERENT NAMES. `moved` records
+        # where the FORWARD move landed each profile; `undone` records the HOME
+        # each reverse put one back to, so a key is still crossed when its
+        # crossed location is in `moved` and its home is not in `back`.
+        # `moved` non-empty alone marks a slot crossed whose profile never left
+        # home, and `home in moved` disables the guard outright -- with
+        # distinct emails no home is ever a move DESTINATION. Either way a
+        # correctly restored slot is forced through a write that costs it its
+        # session credentials, the price the value-equal skip exists to avoid.
         back = set(undone)
         crossed_keys = {
             (num, email)
@@ -1481,15 +1464,15 @@ class ClaudeAccountSwitcher:
         # with the value already under it still drops that slot's session
         # credentials, so an abort that changed nothing would cost both
         # profiles their credential material.
+        # `wrote_backups` ALONE IS NOT THE GATE. `moved` is appended from a
+        # `finally`, so a signal past a rename records it while `wrote_backups`
+        # is still False -- every restore was then skipped, the repair below
+        # never ran, and both profiles stayed crossed and live.
         restores = (
             ("creds", num_a, email_a, creds_a),
             ("config", num_a, email_a, config_a),
             ("creds", num_b, email_b, creds_b),
             ("config", num_b, email_b, config_b),
-        # `wrote_backups` ALONE IS NOT THE GATE. `moved` is appended from a
-        # `finally`, so a signal past a rename records it while `wrote_backups`
-        # is still False -- and then every restore was skipped, the repair
-        # below never ran, and both profiles stayed crossed and live.
         ) if (wrote_backups or crossed_keys) else ()
         # WHAT A RESTORE ACTUALLY DISPLACED, TAKEN FROM THE WRITE ITSELF.
         # The purge below may only drop a `.prev` its own restore created, and
@@ -1577,19 +1560,13 @@ class ClaudeAccountSwitcher:
                 self._logger.error(
                     f"Rollback {kind} restore failed for slot {num}: {e}"
                 )
-        # THE SUMMARY, from what ran — see the two-part note above.
-        # FOUR STATES. "nothing was written" was claimed from `wrote_any`,
-        # which only the credential arm sets -- so a rollback whose every
-        # restore RAISED, and one that restored configs only, both reported
-        # that nothing had been written. A failure is the one a reader must
-        # not miss: it is what keeps the staged copies on disk.
-        # EVERY CLAUSE TRUE IN EVERY STATE IT COVERS. `failures` counts config
-        # restores and the overlap deletes as well as credential writes, so it
-        # is "restores", not "credential restores". And staged copies exist
-        # only when the two slots share an email -- `staging` is empty for
-        # every distinct-email swap -- so the clause naming them is gated on
-        # having any, not on having failed. A partial failure is named beside
-        # the success rather than hidden behind it.
+        # THE SUMMARY, from what ran, and EVERY CLAUSE TRUE IN EVERY STATE IT
+        # COVERS. "nothing was written" came from `wrote_any`, which only the
+        # credential arm sets, so an all-raising rollback and a configs-only
+        # one both reported it. `failures` counts config restores and overlap
+        # deletes too, hence "restores". Staged copies exist only when the two
+        # slots share an email, so their clause is gated on having any, not on
+        # having failed.
         kept = "; the staged copies are kept" if staging else ""
         if wrote_any and failures:
             what = f"credentials were restored; {failures} restore(s) failed{kept}"
@@ -1605,19 +1582,14 @@ class ClaudeAccountSwitcher:
             what = "the session-profile exchange was reversed; no credential was written"
         else:
             what = "no credential needed restoring"
-        # THE OTHER AXIS, and the five arms above do not have it. They all
-        # describe CREDENTIALS; a reverse that could not put a profile back
-        # falls in none of them, and `elif undone` cannot cover it either --
-        # it needs `wrote_any` False AND `failures` zero. So "credentials were
-        # restored" was printed at ERROR level while a slot's session profile
-        # was still living under the other slot's key, which needs no injected
-        # failure at all: a leftover directory at the home makes the park step
-        # raise ENOTEMPTY and `_swap_session_dirs` swallows it by design.
-        #
-        # One clause rather than five, because the fact is independent of
-        # which credential arm fired -- and appending it per arm is how the
-        # next arm added here would silently not carry it. `crossed_keys` is
-        # the set already computed for the forced writes, not a second reading.
+        # THE OTHER AXIS. Every arm above describes CREDENTIALS, so a reverse
+        # that could not put a profile back falls in none of them -- `elif
+        # undone` needs `wrote_any` False AND `failures` zero. "credentials
+        # were restored" was printed while a profile still lived under the
+        # other slot's key, which needs nothing injected: a leftover directory
+        # at the home raises ENOTEMPTY and `_swap_session_dirs` swallows it.
+        # ONE clause rather than five, because the fact is independent of which
+        # arm fired and a sixth arm would otherwise silently not carry it.
         if crossed_keys:
             what += (
                 f"; {len(crossed_keys)} session profile(s) are still under "
