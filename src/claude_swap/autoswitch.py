@@ -2391,9 +2391,15 @@ class AutoSwitchEngine:
         # arms earlier, so naming it here described something this line
         # cannot see. A row we could not read may be a healthy account, and
         # announcing a reset over it claims a fleet nobody measured.
+        # EVERY CANDIDATE READABLE, not merely one of them holding room.
+        # `best_candidate_headroom` is a max that SKIPS unreadable rows, so a
+        # single peer with a sliver satisfies it while another candidate's
+        # usage was never read -- and the wait then announces a fleet nobody
+        # measured and sleeps toward a reset chosen over it.
         waiting = bool(
             trigger == "at-limit" and by_recovery_axis and not ordered
             and best_candidate_headroom > 0
+            and all(headroom.get(n) is not None for n in oauth_candidates)
         )
         return ordered, any_known, active_reset_ts, waiting
 

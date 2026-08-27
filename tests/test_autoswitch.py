@@ -10284,6 +10284,40 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
             "the sleep armed toward a reset chosen over an account nobody read"
         )
 
+    def test_a_readable_peer_with_room_does_not_excuse_an_unread_one(
+        self, harness
+    ):
+        """The sibling above passes for a reason unrelated to the unread row.
+
+        Its only other candidate is exhausted, so `best_candidate_headroom > 0`
+        is False whatever the unreadable row holds. Give ONE peer a sliver and
+        the clause is satisfied by that peer while the row nobody read goes
+        through with it -- a deliberate wait announced and a reset-aware sleep
+        armed over an account this tick never measured.
+
+        The gate has to ask about the SAME accounts the comment names: every
+        candidate readable, not merely one of them holding room.
+        """
+        now = harness.clock.now
+        active = _usage7(100.0, 40.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 40 * 60)
+        outcome = harness.tick_with_usage({
+            "1": active,
+            "2": _usage7(1.0, 98.0, _iso_at(now + 11 * 86400)),
+            "3": "usage-unavailable",
+        })
+        assert outcome is TickOutcome.BLOCKED
+        assert not [e for e in harness.events if isinstance(e, AllExhaustedEvent)], (
+            "a wait was announced while one candidate's usage was never read; "
+            "the readable peer's sliver is what satisfied the gate"
+        )
+        assert harness.engine._sleep_until_ts is None, (
+            "the sleep armed toward a reset chosen over an account nobody read"
+        )
+        assert harness.engine._next_delay(outcome) < NO_RESET_FALLBACK_S, (
+            "the poll was slowed for a fleet one of whose rows is unmeasured"
+        )
+
     def test_an_ordinary_hysteresis_block_keeps_the_ordinary_cadence(
         self, harness
     ):
