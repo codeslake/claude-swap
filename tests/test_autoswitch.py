@@ -10203,9 +10203,9 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
     ):
         """The wait's own gate proves the fleet is not exhausted.
 
-        It is entered BECAUSE a candidate still holds quota — the gate is
-        `best_candidate_headroom > 0` — and then said "all accounts exhausted"
-        to the panel, the JSON payload and the decision log.
+        It is entered BECAUSE every candidate was read and one still holds
+        quota, and then said "all accounts exhausted" to the panel, the JSON
+        payload and the decision log.
         """
         outcome = self._tick(harness)
         assert outcome is TickOutcome.BLOCKED
@@ -10290,8 +10290,8 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
     def test_an_unreadable_candidate_is_not_announced_as_an_exhausted_fleet(
         self, harness
     ):
-        """The state the `best_candidate_headroom > 0` narrowing separates,
-        and it had no witness at all.
+        """The state the readability half of the gate separates, and it had
+        no witness at all.
 
         Every readable candidate is at zero, so there is nothing to land on --
         but one row could not be read, and an unreadable row is not a measured
@@ -10324,11 +10324,12 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
     ):
         """The sibling above passes for a reason unrelated to the unread row.
 
-        Its only other candidate is exhausted, so `best_candidate_headroom > 0`
-        is False whatever the unreadable row holds. Give ONE peer a sliver and
-        the clause is satisfied by that peer while the row nobody read goes
+        Its only other candidate is exhausted, so the headroom clause is
+        False whatever the unreadable row holds. Give ONE peer a sliver and
+        that clause is satisfied by the peer while the row nobody read goes
         through with it -- a deliberate wait announced and a reset-aware sleep
-        armed over an account this tick never measured.
+        armed over an account this tick never measured. Only the readability
+        conjunct stops it.
 
         The gate has to ask about the SAME accounts the comment names: every
         candidate readable, not merely one of them holding room.

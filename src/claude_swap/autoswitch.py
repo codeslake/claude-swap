@@ -460,9 +460,13 @@ class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
     # TWO STATES REACH THIS ARM AND ONLY ONE IS EXHAUSTION. A deliberate wait
-    # is entered BECAUSE a candidate still holds quota -- the gate is
-    # `best_candidate_headroom > 0` -- so reporting it as an exhausted fleet
-    # contradicts its own precondition, in the panel, the JSON and the log.
+    # is entered BECAUSE every candidate was READ and one still holds quota,
+    # so reporting it as an exhausted fleet contradicts its own precondition,
+    # in the panel, the JSON and the log. The readability half is what carries
+    # the gate; `best_candidate_headroom > 0` beside it is equivalent to
+    # `not truly_exhausted` once every row is readable, and that is separately
+    # required by the arm's own consumer. Do not read it as THE gate and drop
+    # the other half.
     deliberate_wait: bool = False
 
     def _fields(self) -> dict:
