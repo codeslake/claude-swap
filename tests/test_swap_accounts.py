@@ -1967,6 +1967,81 @@ class TestTheRollbackDecidesPerKey:
             f"marker, and nothing said so: {said!r}"
         )
 
+    def test_a_refused_repair_is_contained_but_counted_not_silent(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The repair's comment claims the chokepoint's containment; it does
+        not have it, and cannot.
+
+        The chokepoint catches `OSError` alone, so anything else — including
+        the suite's own `RealStoreWriteBlocked`, deliberately not an `OSError`
+        — propagates and can never be hidden. The repair sits inside the
+        per-key loop, whose `except Exception` counts a failure and carries on
+        so one key cannot abort the rest of the rollback. Measured: the block
+        does NOT propagate. Widening the repair's own arm therefore changes
+        nothing, which is why that mutation was undetectable.
+
+        So the property to hold here is not propagation but ACCOUNTING: a
+        contained failure must keep the staged copies and say so, or a refused
+        write leaves no trace.
+        """
+        from tests.conftest import RealStoreWriteBlocked
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        crossed.mkdir(parents=True, exist_ok=True)
+        (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
+
+        real_post = switcher._post_backup_write
+        blocked = {"n": 0}
+
+        def blocking(num, email, *a, **k):
+            if (num, email) == ("1", mail_b):
+                blocked["n"] += 1
+                raise RealStoreWriteBlocked(
+                    "refused: this write would land in the REAL account store"
+                )
+            return real_post(num, email, *a, **k)
+
+        switcher._post_backup_write = blocking
+        staged = tmp = switcher.backup_dir / ".swap-staging-probe"
+        tmp.write_text("pre-swap-copy", encoding="utf-8")
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={"creds-1": staged}, moved=moved, wrote_backups=True,
+            )
+        assert blocked["n"] >= 1, (
+            "premise: the repair never reached the blocked call, so this says "
+            "nothing about what it contains"
+        )
+        # CONTAINED, BUT NEVER SILENT. The per-key loop's `except Exception`
+        # counts this as a failure and carries on, which is the rollback's
+        # design -- one key must not abort the rest. So the chokepoint's
+        # rationale does NOT transfer here: widening the inner arm changes
+        # nothing, because the outer one already catches everything. What must
+        # hold instead is that the key is COUNTED, so the staged copy survives
+        # and the operator is told.
+        assert staged.exists(), (
+            "the staged pre-swap copy was discarded although a key's repair "
+            "was refused — the rollback treated a contained failure as success"
+        )
+        said = " ".join(records)
+        # THE ACCOUNTING LINE, not merely SOME error. A bare `assert said` is
+        # satisfied by any record the rollback happens to emit, so it stays
+        # green when the contained failure itself goes quiet.
+        assert "preserved in" in said or "kept for manual recovery" in said, (
+            "the refused repair was contained and never accounted for — the "
+            f"staged copies survive with nobody told where: {said!r}"
+        )
+
     def test_a_crossed_profile_the_marker_DID_reach_is_not_reported(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
