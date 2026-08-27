@@ -637,15 +637,6 @@ def test_mkdir_exist_ok_true_does_not_swallow_the_refusal(
         (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
 
 
-@pytest.mark.skipif(
-    sys.platform == "win32",
-    reason=(
-        "the third snapshot's mechanism is `Path.home()` falling back to the "
-        "POSIX pwd database once $HOME is cleared; Windows resolves the home "
-        "from USERPROFILE and has no `pwd` module, so the shape under test "
-        "does not exist there"
-    ),
-)
 def test_the_legacy_backup_root_is_protected_on_every_platform(monkeypatch):
     """`~/.claude-swap-backup` is a SEPARATE live path on Linux, and nothing
     was asserting it.
@@ -668,6 +659,15 @@ def test_the_legacy_backup_root_is_protected_on_every_platform(monkeypatch):
     )
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "the third snapshot's mechanism is `Path.home()` falling back to the "
+        "POSIX pwd database once $HOME is cleared; Windows resolves the home "
+        "from USERPROFILE and has no `pwd` module, so the shape under test "
+        "does not exist there"
+    ),
+)
 def test_c0_a_scratch_home_still_protects_the_os_account_home_store(monkeypatch, tmp_path):
     import pwd
 
