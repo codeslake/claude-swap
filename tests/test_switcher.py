@@ -12367,6 +12367,58 @@ def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
     assert strays == [], f"an interrupt at the mode call stranded {strays}"
 
 
+def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
+    temp_home: Path, monkeypatch
+):
+    """The source digest has to be taken while the temp is known-good.
+
+    Read inside the recovery, it shares an `except OSError` with the
+    destination's read — and the temp is unreadable on exactly the population
+    that ARRIVES there through a source-side error, which is not an
+    independent failure. Both obligations then became no-ops on the very
+    failures that need them: a partial destination stays partial, and the
+    narrowing to 0600 is never undone.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    fired = {"copied": False}
+
+    def partial_then_the_source_goes_away(src, dst, **kw):
+        payload = Path(src).read_bytes()
+        Path(dst).write_bytes(payload[:20])   # a genuine partial
+        os.unlink(src)                        # ...and now the temp is gone
+        fired["copied"] = True
+        raise OSError(errno.EIO, "source went away mid-copy")
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(
+        switcher_mod.shutil, "copyfile", partial_then_the_source_goes_away
+    )
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    assert fired["copied"], "premise: the copy never ran"
+    assert target.read_bytes() == b"", (
+        "the recovery left a PARTIAL destination on disk because it could no "
+        f"longer read the temp: {target.read_bytes()[:40]!r}"
+    )
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+        "the narrowing to 0600 was never undone, so another uid reading this "
+        "config gets EACCES for ever with only the copy error to go on"
+    )
+
+
 def test_a_completed_copy_is_not_emptied_by_the_recovery(
     temp_home: Path, monkeypatch
 ):
@@ -12430,8 +12482,6 @@ def test_an_interrupt_while_naming_the_survivor_does_not_strand_it(
     Python-level property whose RESUME is where a pending SIGINT lands, so
     the window is reachable rather than theoretical.
     """
-    if sys.platform == "win32":
-        pytest.skip("POSIX modes only")
     import pathlib as _pathlib
 
     from claude_swap import switcher as switcher_mod

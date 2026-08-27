@@ -726,6 +726,19 @@ class ClaudeAccountSwitcher:
                     before = hashlib.sha256(_raw).hexdigest()
                 except OSError:
                     before = None
+                # THE SOURCE DIGEST, WHILE THE TEMP IS STILL KNOWN-GOOD and
+                # the outer cleanup still owns it. Read inside the recovery
+                # instead, it shares an `except OSError` with the
+                # destination's read -- and the temp is unreadable on exactly
+                # the population that reaches the recovery through a
+                # source-side error, so the whole recovery, the emptying AND
+                # the mode restore, became a no-op there. `None` degrades to
+                # "cannot tell whether it landed", never to "do nothing".
+                landed = None
+                try:
+                    landed = hashlib.sha256(temp_path.read_bytes()).hexdigest()
+                except OSError:
+                    pass
                 kept = (
                     f"{path.name} may now be truncated; the complete content "
                     f"was kept at {temp_path.name}"
@@ -767,7 +780,6 @@ class ClaudeAccountSwitcher:
                     # file's bytes differ on Windows for every write.
                     try:
                         after = hashlib.sha256(path.read_bytes()).hexdigest()
-                        landed = hashlib.sha256(source.read_bytes()).hexdigest()
                     except OSError:
                         return  # `kept` still names the survivor
                     touched = (after != landed
