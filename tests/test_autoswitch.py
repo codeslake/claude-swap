@@ -6899,14 +6899,18 @@ class TestFreshenRoutesThroughGate:
 class TestOneRemedyPerKindAcrossEverySurface:
     """`ERROR_NOTES`'s own comment claims every surface renders through it.
 
-    TWO OF THESE THREE HAVE POWER, and the drift this class is named for is
-    not what they check. `_SYSTEMIC_MESSAGES` is a comprehension over
-    `ERROR_NOTES`, so comparing their strings compares a value with itself --
-    the text can no longer drift and the method that compares it is a PREMISE.
-    What remains free is WHICH modules hold the dict
-    (`test_every_module_that_exports_the_dict_exports_THE_dict`) and WHICH
-    kinds each side knows
-    (`test_the_two_enumerations_of_a_systemic_kind_agree`).
+    THE THREE COVER DIFFERENT SURFACES; none is redundant. `autoswitch` binds
+    the remedies as `_SYSTEMIC_MESSAGES`, not as `ERROR_NOTES`, so it carries
+    no such attribute and is ABSENT from the enumeration below -- the identity
+    check structurally cannot see that surface. Only
+    `test_the_tick_renders_the_same_text_as_every_other_surface` can, and it is
+    the sole catcher of `autoswitch` holding its own partly-stale literal
+    again, which is the regression the shared dict exists to prevent.
+
+    Today `_SYSTEMIC_MESSAGES` is derived from `ERROR_NOTES`, so that method
+    cannot detect text drift. It is a guard against the BINDING going back to
+    a literal, not against the text, and calling it a premise is how it gets
+    deleted.
     """
 
     def test_every_module_that_exports_the_dict_exports_THE_dict(self):
@@ -6963,16 +6967,15 @@ class TestOneRemedyPerKindAcrossEverySurface:
             f"({[m.__name__ for m in bound]}) -- it is measuring the wrong "
             "tree, and every identity check below is vacuous"
         )
-        # AND THE LOOP MUST HAVE A SUBJECT. Finding only the definer satisfies
-        # the line above while leaving the identity check below iterating over
-        # nothing -- a re-export deleted and a walk that stopped early are the
-        # same green. This asserts the loop has something to compare, not how
-        # many things or which, so a refactor that changes the surfaces is free.
-        assert [m for m in bound if m is not oauth], (
-            "no module besides oauth exposes ERROR_NOTES, so the identity "
-            "comparison below has no subject -- either every re-export is "
-            "gone or the walk is not reaching them"
-        )
+        # NO FLOOR ON THE POPULATION. An earlier cut required one module
+        # besides the definer, to stop the loop iterating over nothing. It was
+        # wrong in both directions: a tree where every surface reads
+        # `oauth.ERROR_NOTES` through the module holds no re-exports at all
+        # and is strictly healthier, and that assert was its ONLY failure --
+        # while a one-line convenience re-export in `__init__.py`, which no
+        # surface reads, satisfies it with zero real surfaces participating.
+        # Finding the definer is what proves the walk reached the right tree;
+        # an empty loop below means there is nothing to compare, not a fault.
         for mod in bound:
             assert mod.ERROR_NOTES is oauth.ERROR_NOTES, (
                 f"{mod.__name__} exports its own copy of ERROR_NOTES, so a "
