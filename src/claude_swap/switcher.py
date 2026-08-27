@@ -1541,8 +1541,24 @@ class ClaudeAccountSwitcher:
                                         mark_session_stale,
                                     )
 
-                                    mark_session_stale(
-                                        self._session_dir(other, email))
+                                    # AND SAY SO WHEN NEITHER LANDED. Nothing
+                                    # else reports this: the crossed clause in
+                                    # the summary is computed BEFORE the
+                                    # repair and prints the same when it
+                                    # succeeds. `setup_session` gates its
+                                    # re-bootstrap on the marker and checks
+                                    # identity, not generation, so an
+                                    # unmarked profile is reused.
+                                    if not mark_session_stale(
+                                            self._session_dir(other, email)):
+                                        self._logger.error(
+                                            "Rollback could NOT invalidate "
+                                            "slot %s's crossed session "
+                                            "profile OR mark it stale; it "
+                                            "may keep serving the superseded "
+                                            "generation until its token "
+                                            "expires.", other, exc_info=True,
+                                        )
                     else:
                         self._write_account_config(num, email, original)
                 elif overlap:

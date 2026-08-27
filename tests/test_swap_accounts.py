@@ -1465,6 +1465,10 @@ class TestTheRollbackSummaryReportsWhatRan:
         )
 
 
+def _raise_config_error(*_a, **_k):
+    raise ConfigError("injected restore failure")
+
+
 class TestTheRollbackDecidesPerKey:
     """Which SLOT is still crossed, and which report the summary owes."""
 
@@ -1884,10 +1888,13 @@ class TestTheRollbackDecidesPerKey:
             "an unwritable SESSION directory was reported as a failed "
             f"CREDENTIAL restore, for a restore that landed: {said!r}"
         )
-        assert "manual recovery" not in said, (
-            f"one unwritable profile turned a clean rollback into a "
-            f"manual-recovery notice: {said!r}"
-        )
+        # THE RECOVERY NOTICE IS NOT ASSERTED HERE. It lives under
+        # `if staging:`, and `staging` is only ever populated when the two
+        # slots share an email -- so with the distinct emails this case needs,
+        # the string cannot appear whatever `failures` is, and asserting its
+        # absence would be a check that cannot fail. Both arms of that branch
+        # are witnessed by `test_staged_copies_are_kept_on_a_partial_rollback`
+        # and its sibling below.
         from claude_swap.session import stale_marker_for
 
         assert stale_marker_for(crossed).exists(), (
@@ -1896,6 +1903,144 @@ class TestTheRollbackDecidesPerKey:
             "generation with nothing to say so. The marker is a SIBLING of "
             "the profile dir for exactly this fault -- the directory that "
             "denied the unlink is not asked to accept a create"
+        )
+
+    def test_a_crossed_profile_that_could_not_be_marked_either_is_reported(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The one state nothing else in the rollback can say.
+
+        Contained the failure, then dropped the answer: with the invalidation
+        denied AND the marker denied, the profile keeps the superseded
+        credential, carries no marker, and `setup_session` reuses it -- its
+        validity check is an identity check, not a generation check. The
+        crossed clause in the summary cannot stand in for this: it is computed
+        from `crossed_keys` BEFORE the repair and prints identically when the
+        repair succeeds.
+
+        The chokepoint one function above logs exactly this at ERROR. Removing
+        the wrong words from this arm removed the signal with them.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        crossed = switcher._session_dir("1", mail_b)
+        crossed.mkdir(parents=True, exist_ok=True)
+        (crossed / ".credentials.json").write_text("B-REAL-TOKEN")
+
+        real_inval = switcher._invalidate_session_credentials
+
+        def denying(num, email, *a, **k):
+            if (num, email) == ("1", mail_b):
+                raise PermissionError(errno.EACCES, "injected")
+            return real_inval(num, email, *a, **k)
+
+        switcher._invalidate_session_credentials = denying
+        import claude_swap.session as _session
+        monkeypatch_target = _session.mark_session_stale
+        _session.mark_session_stale = lambda _d: False
+        try:
+            with caplog_at_error() as records:
+                switcher._rollback_swap(
+                    "1", mail_a, "creds-a", "{}",
+                    "2", mail_b, "creds-b", "{}",
+                    staging={}, moved=moved, wrote_backups=True,
+                )
+        finally:
+            _session.mark_session_stale = monkeypatch_target
+
+        said = " ".join(records)
+        assert (crossed / ".credentials.json").exists(), (
+            "premise: the credential was dropped after all, so there is no "
+            "unrecorded state for this to report"
+        )
+        assert "OR mark it stale" in said or "could NOT" in said, (
+            "the crossed profile kept its superseded credential AND got no "
+            f"marker, and nothing said so: {said!r}"
+        )
+
+    def test_staged_copies_are_kept_on_a_partial_rollback(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """`if staging:` had no case at all -- neither arm, in this file.
+
+        The staged copies are the last preserved material after a half-written
+        swap, and whether they survive is decided entirely by `failures`. A
+        branch that decides that, with nothing exercising it, is one edit from
+        deleting the user's only copy in silence.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail = "shared@example.com"
+        switcher._write_account_credentials("1", mail, "creds-a")
+        switcher._write_account_credentials("2", mail, "creds-b")
+        staged = temp_home / "staged-pre-swap.json"
+        staged.write_text("PRE-SWAP-MATERIAL")
+
+        discarded: list = []
+        switcher._discard_staging = lambda st: discarded.append(st)
+        # One restore fails, so `failures` is non-zero and the copies stay.
+        switcher._write_account_config = _raise_config_error
+
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail, "creds-a", "{}",
+                "2", mail, "creds-b", "{}",
+                staging={"a": staged}, moved=[], wrote_backups=True,
+            )
+
+        said = " ".join(records)
+        assert "restore(s) failed" in said, (
+            f"premise: nothing failed, so the kept arm is not the one under "
+            f"test: {said!r}"
+        )
+        assert "manual recovery" in said and str(staged) in said, (
+            f"a partial rollback did not name where the pre-swap copies are: "
+            f"{said!r}"
+        )
+        assert discarded == [], (
+            "the staged copies were discarded after a PARTIAL rollback — they "
+            "are the only remaining pre-swap material"
+        )
+
+    def test_staged_copies_are_discarded_when_the_rollback_completed(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """THE CONTROL. Without it the case above passes on a rollback that
+        never discards anything, and the `else` arm is free to rot."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail = "shared@example.com"
+        switcher._write_account_credentials("1", mail, "creds-a")
+        switcher._write_account_credentials("2", mail, "creds-b")
+        staged = temp_home / "staged-pre-swap.json"
+        staged.write_text("PRE-SWAP-MATERIAL")
+
+        discarded: list = []
+        switcher._discard_staging = lambda st: discarded.append(st)
+
+        with caplog_at_error() as records:
+            switcher._rollback_swap(
+                "1", mail, "creds-a", "{}",
+                "2", mail, "creds-b", "{}",
+                staging={"a": staged}, moved=[], wrote_backups=True,
+            )
+
+        said = " ".join(records)
+        assert "restore(s) failed" not in said, (
+            f"premise: something failed, so this is the kept arm again, not "
+            f"the discard arm: {said!r}"
+        )
+        assert discarded == [{"a": staged}], (
+            "a rollback that restored everything left its staged copies on "
+            f"disk for ever: discarded={discarded!r}"
+        )
+        assert "manual recovery" not in said, (
+            f"a complete rollback told the user to recover by hand: {said!r}"
         )
 
     def test_a_live_session_on_the_crossed_profile_is_spared_like_its_home(
