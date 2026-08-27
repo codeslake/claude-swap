@@ -103,20 +103,43 @@ def _macos_pytest_run(text: str) -> str:
     """
     block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \w[\w-]*:\n|\Z)", text, re.S)
     assert block, "the macos-keychain job is gone or was renamed"
-    # FOUND BY WHAT IT IS, not by the key it hangs off. `run:` takes an inline
-    # string OR a `|` block scalar, and reading only `run: (.*)` captures the
-    # bare `|` for the second -- so a step spelled the ordinary way for two
-    # commands reported "0 pytest step(s)", which is loud but names the wrong
-    # cause. Comments are dropped: one mentioning pytest is not a step.
+    # ONLY `run:` VALUES, and INDENTATION is what says which lines are one.
+    # `run:` takes an inline string OR a block scalar, so the walk has to
+    # follow the scalar -- but stripping indentation to do that admits every
+    # line in the job, and then `- name: Run pytest` (the most ordinary step
+    # name in Actions), a `with:` value, and an install line all count as
+    # pytest commands. A line belongs to a scalar only while it is indented
+    # DEEPER than the `run:` that opened it.
     lines = []
+    scalar_at = None
     for raw in block.group(1).splitlines():
-        line = raw.strip()
-        if line.startswith("#"):
+        if not raw.strip() or raw.strip().startswith("#"):
             continue
-        if line.startswith("run: "):
-            line = line[len("run: "):].strip()
-        if line and line != "|":
-            lines.append(line)
+        indent = len(raw) - len(raw.lstrip())
+        if scalar_at is not None:
+            if indent > scalar_at:
+                lines.append(raw.strip())
+                continue
+            scalar_at = None  # dedented back out of the block
+        run = re.match(r"\s*(?:- )?run:\s*(.*)$", raw)
+        if not run:
+            continue
+        value = run.group(1).strip()
+        if value in ("|", "|-", "|+", ">", ">-", ">+"):
+            scalar_at = indent
+        elif value:
+            lines.append(value)
+    # A CONTINUED COMMAND IS ONE COMMAND. `uv run pytest \` + an indented
+    # path list is the ordinary way to write a long invocation, and reading
+    # only the first physical line drops every path after it -- silently, so
+    # the existence check below skips exactly the names it exists to check.
+    folded: list[str] = []
+    for line in lines:
+        if folded and folded[-1].endswith("\\"):
+            folded[-1] = folded[-1][:-1].rstrip() + " " + line
+        else:
+            folded.append(line)
+    lines = folded
     pytest_runs = [c for c in lines if re.search(r"(^|\s)pytest(\s|$)", c)]
     assert len(pytest_runs) == 1, (
         f"the macOS job has {len(pytest_runs)} pytest command(s), and this "
@@ -126,25 +149,30 @@ def _macos_pytest_run(text: str) -> str:
 
 
 def test_the_macos_job_runs_something_that_exists():
-    """Whatever the macOS job NAMES must exist; naming nothing is allowed only
-    when the reason is that it runs everything.
+    """Whatever the macOS job NAMES must exist.
 
     A path list in a workflow goes stale exactly the way the Windows shards
-    do. But a job that names no path is not that failure when the command is
-    a bare `pytest`: that IS every file, which is strictly more than the two
-    it used to name. Requiring a name made the guard fire on a job that had
-    gained coverage.
+    do. A job that names NO path is not that failure -- a bare `pytest` is
+    every file, strictly more than the two it used to name -- so requiring a
+    name made the guard fire on a job that had gained coverage.
+
+    WHAT THIS DOES NOT SAY is that naming nothing is fine ONLY because the
+    command runs everything. Nothing here checks that, and the arm that tried
+    to was wrong in both directions: `python -m pytest` runs the whole suite
+    and was refused, while `-kfoo`, `--deselect` and `--collect-only` select
+    nothing and passed. Judging a pytest command line from a regex needs
+    pytest's own parser.
+
+    So the loop below is EMPTY on the merged tree, where the job is a bare
+    `uv run pytest` -- vacuously true, and correct, because a command that
+    names nothing cannot name something stale. What guards the merged tree is
+    `_macos_pytest_run`'s own "exactly one pytest command" assertion, which
+    runs there whatever the command says.
     """
     run = _macos_pytest_run(_WORKFLOW.read_text(encoding="utf-8"))
     named = re.findall(r"(tests/test_\w+\.py)", run)
     for path in named:
         assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
-    # NO SECOND ARM. One tried to judge a no-path command by whether it
-    # carried `-k`/`-m`, and it was wrong in both directions: `python -m
-    # pytest` runs the whole suite and was refused, while `-kfoo`,
-    # `--deselect` and `--collect-only` select nothing and passed. Judging a
-    # pytest command line from a regex needs pytest's own parser; the
-    # invariant with real power is the one above.
 
 
 def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
@@ -183,10 +211,66 @@ def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
         + tail
     )
 
+    # A STEP NAME IS NOT A COMMAND. `- name: Run pytest` is the most
+    # idiomatic step name in Actions, and a walk that strips indentation
+    # counts it as a second pytest command -- reddening CI while naming a
+    # cause that is not the one. The reader stopped keying on the step name
+    # in the first place because it is prose that gets rewritten.
+    step_named = (
+        head
+        + "      - name: Run pytest\n"
+        + "        run: uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # NEITHER IS AN INSTALL, and this row is what makes the word boundary in
+    # the predicate load-bearing: widen it to `"pytest" in c` and this fails.
+    installs = (
+        head
+        + "      - name: Deps\n        run: uv pip install pytest-xdist\n"
+        + "      - name: X\n        run: uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # A SHELL COMMENT INSIDE THE SCALAR is the only place the comment skip
+    # still does anything: outside one, nothing but a `run:` value is
+    # admitted at all. Without this row that skip is unwitnessed.
+    scalar_comment = (
+        head
+        + "      - name: X\n        run: |\n"
+        + "          # two pytest shards were tried here\n"
+        + "          uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+    # A BACKSLASH CONTINUATION, which is how a long path list is written.
+    # Read one physical line at a time it returns "uv run pytest \\" and the
+    # existence check sees NO paths -- the silent hole, not a loud one.
+    continued = (
+        head
+        + "      - name: X\n        run: |\n"
+        + "          uv run pytest \\\n"
+        + "            tests/test_x.py \\\n"
+        + "            tests/test_y.py\n"
+        + tail
+    )
+    # NOR A `with:` MAPPING VALUE -- a step shape the real job carries and
+    # no row here had, which is why the table missed all three of these.
+    with_value = (
+        head
+        + "      - uses: actions/upload-artifact@v4\n"
+        + "        with:\n          name: pytest results\n"
+        + "      - name: X\n        run: uv run pytest -o faulthandler_timeout=60\n"
+        + tail
+    )
+
     assert _macos_pytest_run(named) == "uv run pytest tests/test_x.py -v"
     assert _macos_pytest_run(whole) == "uv run pytest -o faulthandler_timeout=60"
     assert _macos_pytest_run(block) == "uv run pytest -o faulthandler_timeout=60"
     assert _macos_pytest_run(commented) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(step_named) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(installs) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(with_value) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(scalar_comment) == "uv run pytest -o faulthandler_timeout=60"
+    assert _macos_pytest_run(continued) == (
+        "uv run pytest tests/test_x.py tests/test_y.py")
     with pytest.raises(AssertionError, match="gone or was renamed"):
         _macos_pytest_run("\n  test:\n    runs-on: ubuntu-latest\n")
     with pytest.raises(AssertionError, match="pytest command"):
