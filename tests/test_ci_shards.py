@@ -129,6 +129,34 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
     )
 
 
+def test_a_commented_out_windows_command_is_refused(tmp_path):
+    """The Windows reader is handed the RAW job; the macOS one is stripped.
+
+    Folding a block scalar joins its lines, so a `#` that comments the real
+    command out ends up INSIDE the folded value carrying `pytest`,
+    `${{ matrix.paths }}` and `-o testpaths=` — every marker the guard looks
+    for, on a job that runs `echo`. The asymmetry is what makes it a false
+    CLEAN on one job and a correct refusal on the other.
+    """
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    block = re.search(r"\n  test-windows:\n(.*?)(?=\n  \S|\Z)", text, re.S)
+    assert block, "the test-windows job is gone or was renamed"
+    real = re.search(r"\n( +)run: ([^\n]*(?<![\w-])pytest(?![\w-])[^\n]*)",
+                     block.group(1))
+    assert real, "premise: no inline pytest run line to comment out"
+    indent, cmd = real.group(1), real.group(2)
+    disabled = text.replace(
+        f"\n{indent}run: {cmd}",
+        f"\n{indent}run: |\n{indent}  # {cmd}\n{indent}  echo \"disabled\"",
+        1,
+    )
+    assert disabled != text, "nothing was mutated — this check lost its subject"
+    fake = tmp_path / "ci.yml"
+    fake.write_text(disabled, encoding="utf-8")
+    with pytest.raises(AssertionError, match="no longer invokes pytest"):
+        _assert_windows_job_consumes_the_matrix(fake)
+
+
 def test_the_windows_job_consumes_the_shard_matrix():
     _assert_windows_job_consumes_the_matrix(_WORKFLOW)
 
@@ -212,7 +240,13 @@ def _pytest_run_lines(job: str) -> list[str]:
     mutate" -- a loud refusal, which is the safe direction, but the cases then
     test their own scaffolding rather than the workflow.
     """
-    lines, folded, i = job.splitlines(), [], 0
+    # STRIPPED HERE, NOT PER CALLER. Folding joins a block scalar's lines, so
+    # a `#` that comments the real command out lands INSIDE the folded value
+    # and carries every marker with it. One caller stripped its job first and
+    # the other did not, which made that a correct refusal on one and a false
+    # CLEAN on the other.
+    lines = [re.sub(r"(?<!\S)#.*", "", ln) for ln in job.splitlines()]
+    folded, i = [], 0
     while i < len(lines):
         head = re.match(r"(\s*)run: *[|>][-+]?\s*$", lines[i])
         if not head:
