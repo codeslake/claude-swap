@@ -7291,6 +7291,114 @@ class TestLiveLock:
         finally:
             demoted.stop()
 
+    def test_a_promotion_before_any_announcement_stays_silent(self, harness):
+        """The clearing's own witness — its sibling above cannot be one.
+
+        There the first tick ANNOUNCES before it retries, so
+        `_demotion_announced` is already True and the announce short-circuits
+        whether or not the promotion cleared anything. The discriminating
+        state is an errno recorded while nothing has been announced yet: the
+        cause is armed, the promotion then succeeds, and without the clearing
+        the reordered announce emits the stale cause AFTER "now LIVE".
+        """
+        import errno as _errno
+
+        from claude_swap.locking import FileLock
+
+        demoted = harness._make_engine(dry_run=False)
+        try:
+            assert demoted.demoted_from_live, "premise: the harness holds LIVE"
+            real_acquire = FileLock.acquire
+
+            def refuse(self, *a, **kw):
+                raise OSError(_errno.EROFS, "read-only file system")
+
+            FileLock.acquire = refuse
+            try:
+                demoted._retry_live_promotion()      # records, announces NOTHING
+            finally:
+                FileLock.acquire = real_acquire
+            assert demoted._live_lock_error is not None, (
+                "premise: the errno was never recorded"
+            )
+            assert demoted._demotion_announced is False, (
+                "premise: something announced already, so this cannot "
+                "discriminate the clearing"
+            )
+
+            harness.engine.stop()                    # the holder exits
+            before = len(harness.events)
+            demoted.tick()                           # this one promotes
+
+            said = [getattr(e, "message", "") for e in harness.events[before:]]
+            assert any("now LIVE" in m for m in said), (
+                f"premise: the engine never promoted: {said}"
+            )
+            assert not [m for m in said if "could not be taken" in m], (
+                "the promotion did not clear the cause it resolved, so the "
+                f"stale fault is announced after the engine went LIVE: {said}"
+            )
+        finally:
+            demoted.stop()
+
+    def test_the_tick_that_promotes_says_only_that(self, harness):
+        """The promotion clearing is inert unless `tick()` retries FIRST.
+
+        `_announce_demotion` sets `_demotion_announced` on EVERY path, so with
+        the announce ahead of the retry the flag is already True by the time a
+        promotion could clear it -- and the tick that succeeds emits the stale
+        cause immediately followed by "now LIVE".
+
+        The order and the clearing are each other's witness: reordering alone
+        lets the stale line land AFTER "now LIVE", and clearing alone is dead
+        code. Neither is safe without the other -- which is why the clearing
+        must set `_demotion_announced = True`, or the reordered announce would
+        warn about a demotion for an engine that is now LIVE.
+        """
+        import errno as _errno
+
+        from claude_swap.locking import FileLock
+
+        demoted = harness._make_engine(dry_run=False)
+        try:
+            assert demoted.demoted_from_live, "premise: the harness holds LIVE"
+            real_acquire = FileLock.acquire
+            mode = {"raise": True}
+
+            def flaky(self, *a, **kw):
+                if mode["raise"]:
+                    raise OSError(_errno.EROFS, "read-only file system")
+                return real_acquire(self, *a, **kw)
+
+            FileLock.acquire = flaky
+            try:
+                demoted.tick()                      # records the errno
+                assert demoted._live_lock_error is not None, (
+                    "premise: the errno was never recorded"
+                )
+                harness.engine.stop()               # the holder exits
+                mode["raise"] = False               # and the mount is fixed
+                before = len(harness.events)
+                demoted.tick()                      # this one promotes
+            finally:
+                FileLock.acquire = real_acquire
+
+            said = [getattr(e, "message", "") for e in harness.events[before:]]
+            promoted = [m for m in said if "now LIVE" in m]
+            # EITHER demotion sentence. Reordering without the clearing would
+            # announce the OTHER one -- "another LIVE engine is already
+            # running" -- about an engine that just became LIVE itself.
+            stale = [m for m in said
+                     if "could not be taken" in m or "already running" in m]
+            assert promoted, f"premise: the engine never promoted: {said}"
+            assert not stale, (
+                "the tick that promoted also announced the cause it just "
+                f"cleared, so the operator reads a fault and its cure at once: {said}"
+            )
+            assert not demoted.dry_run, "premise: promotion left it demoted"
+        finally:
+            demoted.stop()
+
     def test_contention_clears_an_errno_it_no_longer_explains(self, harness):
         """A cause that goes ERRNO -> CONTENTION must stop being reported.
 

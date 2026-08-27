@@ -1073,8 +1073,14 @@ class AutoSwitchEngine:
 
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
-        self._announce_demotion()
+        # RETRY FIRST. `_announce_demotion` sets its flag on every path, so
+        # announcing ahead of the retry makes the promotion's own clearing
+        # unreachable and the tick that succeeds emits the stale cause
+        # immediately followed by "now LIVE". Safe only because that clearing
+        # also sets the flag: without it this order announces a demotion for
+        # an engine that is now LIVE.
         self._retry_live_promotion()
+        self._announce_demotion()
         # Brackets the WHOLE tick, not just the switch: every mutation below
         # belongs to the engine that started it, freshening included.
         # ID FIRST, THEN CLEAR. A signal handler runs inside the frame it
