@@ -715,3 +715,40 @@ class TestEveryArmOfTheLoopBacksOff:
         assert min(l for l, _ in slept) < 0.05, (
             f"the run must reach a remainder under the flat 0.05: {slept}"
         )
+
+
+def test_a_second_freeze_after_a_recovery_is_reported_again(
+    tmp_path, monkeypatch, caplog
+):
+    """The latch is "once per FREEZE", not "once per hold".
+
+    `warned` is set and never cleared, so a freeze that outlives `staleness`,
+    RECOVERS, and then freezes again is silent the second time -- and the
+    second one is a takeover the log would otherwise explain. The latch exists
+    to stop a per-attempt repeat inside ONE episode; a recovery ends that
+    episode, and `last_ok` moving is exactly what says so.
+    """
+    lock = tmp_path / "target.lock"
+    monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.01)
+    failing = {"on": True}
+    real_utime = os.utime
+
+    def flaky(path, *a, **k):
+        if failing["on"] and os.fspath(path) == os.fspath(lock):
+            raise OSError(errno.EIO, "injected")
+        return real_utime(path, *a, **k)
+
+    monkeypatch.setattr(claude_locks.os, "utime", flaky)
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        with proper_lockfile(lock, timeout=2.0, staleness=0.05):
+            time.sleep(0.2)                       # episode one, outlives staleness
+            failing["on"] = False
+            time.sleep(0.1)                       # recovery: last_ok moves again
+            failing["on"] = True
+            time.sleep(0.2)                       # episode two
+    said = [r.getMessage() for r in caplog.records if "stops advancing" in r.getMessage()]
+    assert len(said) == 2, (
+        f"{len(said)} warning(s) for two separate freezes — a freeze that "
+        "recovered and returned is the one the takeover follows, and the "
+        "latch swallowed it"
+    )

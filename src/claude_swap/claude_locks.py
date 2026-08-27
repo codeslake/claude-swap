@@ -151,7 +151,11 @@ def proper_lockfile(
         while not stop_touching.wait(TOUCH_INTERVAL_S):
             try:
                 os.utime(lock_dir)
-                last_ok = time.time()
+                # THE LATCH IS PER FREEZE, NOT PER HOLD. A refresh that lands
+                # ends the episode the warning describes, so the next one that
+                # outlives `staleness` is a new fact and the takeover it
+                # precedes would otherwise arrive unexplained.
+                last_ok, warned = time.time(), False
                 continue
             except FileNotFoundError:
                 return  # gone; nothing left to keep alive
