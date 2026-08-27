@@ -118,7 +118,14 @@ def proper_lockfile(
         try:
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
-            continue  # holder released between mkdir and stat; retry now
+            # BACK OFF HERE TOO. A holder releasing between our mkdir and our
+            # stat is one iteration; a lock PATH that is a dangling symlink
+            # answers FileExistsError to mkdir and FileNotFoundError to stat
+            # for the whole budget, and this was the one arm of the loop with
+            # no sleep in it -- measured 109,000 mkdir/s, four times the spin
+            # this branch exists to bound.
+            time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
+            continue
         if time.time() - held_mtime > staleness:
             # Dead holder per the protocol: remove and retake. Losing the
             # rmdir/mkdir race to another waiter just means looping again.

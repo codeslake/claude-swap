@@ -133,6 +133,14 @@ class TestProperLockfile:
             monkeypatch, lock_dir, fail_first=OSError("transient"))
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             with proper_lockfile(lock_dir):
+                # REWOUND FIRST, like the sibling. Without it the mtime only
+                # ever moves FORWARD from the mkdir, so `age` is bounded by
+                # the hold (0.3s) whatever the toucher does and the premise
+                # below cannot fail. Measured: with a toucher that calls
+                # `utime` but never advances the mtime, both siblings go red
+                # and this one stayed green.
+                past = time.time() - 30
+                real(lock_dir, (past, past))
                 time.sleep(0.3)
                 # INSIDE THE HOLD: the release removes the directory, so the
                 # freshness this is about is unobservable afterwards.
@@ -541,6 +549,41 @@ class TestCcRefreshLockProtocol:
         with claude_config_lock(timeout=2.0):
             assert cfg.is_dir()
         assert not cfg.exists()
+
+
+class TestEveryArmOfTheLoopBacksOff:
+    """The bounding pass clamped the two sleeping arms and skipped one.
+
+    A lock PATH that is a dangling symlink answers `FileExistsError` to
+    `mkdir` and `FileNotFoundError` to `stat`, so the retry took the one arm
+    with no sleep in it, for the whole budget. Measured before this: 109,000
+    mkdir attempts per second -- four times the spin this branch was written
+    to bound, and reached with no race at all.
+    """
+
+    def test_a_dangling_symlink_does_not_spin(self, tmp_path, monkeypatch):
+        target = tmp_path / "target.lock"
+        target.symlink_to(tmp_path / "nothing-here")
+        assert not target.exists(), "premise: the symlink must dangle"
+
+        real_mkdir = os.mkdir
+        tries = {"n": 0}
+
+        def counting(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                tries["n"] += 1
+            return real_mkdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(target, timeout=0.3):
+                pass
+
+        assert tries["n"] > 1, "premise: the loop must have retried at all"
+        assert tries["n"] < 40, (
+            f"{tries['n']} mkdir attempts in a 0.3s budget — the arm that "
+            "retries a vanished name never sleeps, so it pins a core"
+        )
 
 
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
