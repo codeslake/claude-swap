@@ -379,7 +379,15 @@ class TestProperLockfile:
                 raise OSError(errno.EACCES, "cannot remove")
             return real_rmdir(path, *a, **k)
 
+        mine = threading.get_ident()
+        real_sleep = claude_locks.time.sleep
+
         def fake_sleep(seconds):
+            # SCOPED TO THIS THREAD, or a leaked one spins through a sleep
+            # that never sleeps and writes its own calls into this budget --
+            # red on correct code, measured.
+            if threading.get_ident() != mine:
+                return real_sleep(seconds)
             slept.append((round(budget - clock[0], 3), round(seconds, 3)))
             clock[0] += seconds
 
@@ -425,7 +433,15 @@ class TestProperLockfile:
         monkeypatch.setattr(claude_locks.random, "random", lambda: 0.0)
         budget, clock, slept = 0.756, [0.0], []
 
+        mine = threading.get_ident()
+        real_sleep = claude_locks.time.sleep
+
         def fake_sleep(seconds):
+            # SCOPED, like its siblings: this patch is process-global, so an
+            # unscoped recorder writes every other thread's sleeps into this
+            # budget -- red on correct code.
+            if threading.get_ident() != mine:
+                return real_sleep(seconds)
             slept.append((round(budget - clock[0], 3), round(seconds, 3)))
             # ONE ITERATION OF WORK on top of the sleep. Nothing else advances
             # a scripted clock, so a clamped sleep of 0.0 would leave the
@@ -639,33 +655,56 @@ class TestEveryArmOfTheLoopBacksOff:
             "retries a vanished name never sleeps, so it pins a core"
         )
 
-    def test_a_dangling_symlink_still_ends_at_the_BUDGET(self, tmp_path):
-        """The attempt count cannot see the clamp, and this arm is the one
-        clamp on the branch with no other witness.
+    def test_the_swept_name_branch_sleeps_only_what_is_left(
+        self, tmp_path, monkeypatch
+    ):
+        """A SCRIPTED CLOCK, like its two siblings.
 
-        A flat `time.sleep(0.05)` makes exactly the same TWO mkdir attempts
-        the case above counts, while a 0.01s budget takes 0.05s. Measured on
-        the unclamped form: 0.0502s against 0.0101s clamped, 5x over. So the
-        count proves the sleep exists and nothing about the bound the branch
-        is named for.
+        The wall-clock form this replaces could only see a FLATTENING. With a
+        budget under the flat constant, `min(0.05, timeout)` and
+        `min(0.05, remaining)` are the same number -- which is exactly the
+        weakening this branch's clamps exist against. Measured on that form:
+        clamping to `timeout` instead of the remainder left the suite at 43
+        passed, and its lower bound could not fail at all, because the raise
+        it waits for is itself gated on the deadline having passed.
         """
         target = tmp_path / "target.lock"
         target.symlink_to(tmp_path / "nothing-here")
         assert not target.exists(), "premise: the symlink must dangle"
 
-        budget = 0.01
-        start = time.monotonic()
+        budget, clock, slept = 0.175, [0.0], []
+        real_mkdir = os.mkdir
+        mine = threading.get_ident()
+        real_sleep = claude_locks.time.sleep
+
+        def counting(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                clock[0] += 0.001                     # one iteration of work
+            return real_mkdir(path, *a, **k)
+
+        def fake_sleep(seconds):
+            # SCOPED TO THIS THREAD. `claude_locks.time` IS the `time` module,
+            # so an unscoped patch freezes the clock process-wide and records
+            # every other thread's sleeps into this budget.
+            if threading.get_ident() != mine:
+                return real_sleep(seconds)
+            slept.append((round(budget - clock[0], 3), round(seconds, 3)))
+            clock[0] += seconds
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        monkeypatch.setattr(claude_locks.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
+
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=budget):
                 pass
-        elapsed = time.monotonic() - start
 
-        assert elapsed >= budget, (
-            f"the acquire returned in {elapsed:.4f}s, under its own {budget}s "
-            "budget, so it cannot have waited the budget out at all"
-        )
-        assert elapsed < 0.03, (
-            f"{elapsed:.4f}s against a {budget}s budget — the vanished-name "
-            "arm sleeps a flat constant instead of what is LEFT, so a caller "
-            "asking for a short wait gets the constant"
+        assert len(slept) >= 3, f"the instrument, not the code: {slept}"
+        for left, seconds in slept:
+            assert seconds <= max(left, 0.0), (
+                f"slept {seconds}s with {left}s left — the clamp used "
+                f"`timeout`, not what remains of it (all sleeps: {slept})"
+            )
+        assert min(l for l, _ in slept) < 0.05, (
+            f"the run must reach a remainder under the flat 0.05: {slept}"
         )

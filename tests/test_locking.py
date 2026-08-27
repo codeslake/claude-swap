@@ -284,7 +284,15 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
             real_sleep = locking.time.sleep
             real_monotonic = locking.time.monotonic
 
+            mine = threading.get_ident()
+
             def fake_sleep(seconds):
+                # SCOPED, like its sibling above: this patch is process-global,
+                # so an unscoped recorder writes every other thread's sleeps
+                # into this budget and spins them through a sleep that never
+                # sleeps.
+                if threading.get_ident() != mine:
+                    return real_sleep(seconds)
                 slept.append((round(budget - clock[0], 3), round(seconds, 3)))
                 # ONE ITERATION OF WORK on top of the sleep: nothing else
                 # advances a scripted clock, so a clamped 0.0 would leave the
