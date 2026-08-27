@@ -12545,6 +12545,70 @@ def test_an_unreadable_destination_is_not_WIDENED_over_a_late_failure(
     )
 
 
+def test_a_real_midcopy_failure_names_the_SOURCE_and_must_not_widen(
+    temp_home: Path, monkeypatch
+):
+    """`copyfile` NAMES THE SOURCE ON A LATE FAILURE TOO, so `filename` alone
+    cannot say the destination was never opened.
+
+    Every fast-copy helper does `err.filename = fsrc.name; err.filename2 =
+    fdst.name` before re-raising -- AFTER `open(dst, 'wb')` has truncated and
+    partly written it. Measured with real, unmocked `shutil.copyfile` under
+    RLIMIT_FSIZE: errno EFBIG, `filename == src`, `filename2 == dst`, and the
+    destination holding a fragment of the credential.
+
+    `filename2` is the exclusive discriminator: None on every path that raises
+    before the destination is opened, set on every one that raises after.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False}
+    real_read = Path.read_bytes
+
+    def unreadable_after_the_copy(self):
+        if state["copied"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def midcopy(src, dst, **kw):
+        Path(dst).write_bytes(Path(src).read_bytes()[:20])
+        state["copied"] = True
+        # EXACTLY WHAT shutil SETS: the source in `filename`, the destination
+        # in `filename2`. An injected `filename=dst` is a shape real copyfile
+        # never produces for a late failure, and testing that one is what let
+        # this through.
+        err = OSError(errno.EFBIG, "File too large")
+        err.filename = os.fspath(src)
+        err.filename2 = os.fspath(dst)
+        raise err
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", midcopy)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_after_the_copy)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600, (
+        "a copy that DID open the destination was read as untouched because "
+        "`filename` names the source on that path too — so a truncated "
+        "credential was published at 0644"
+    )
+
+
 def test_an_unreadable_destination_IS_restored_when_the_copy_never_opened_it(
     temp_home: Path, monkeypatch
 ):

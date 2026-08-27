@@ -804,15 +804,18 @@ class ClaudeAccountSwitcher:
                     # published, and with neither the narrow mode stands:
                     #   - both digests read, so `touched` is a real verdict --
                     #     it either emptied a partial or found the original;
-                    #   - `copyfile` raises BEFORE opening the destination
-                    #     (SameFileError, SpecialFileError, a source-open
-                    #     failure, a signal in that prologue) and names the
-                    #     SOURCE in `filename`, which no destination-side error
-                    #     does.
+                    #   - `copyfile` raised BEFORE opening the destination,
+                    #     which ONLY `filename2` distinguishes. Every fast-copy
+                    #     helper sets `filename = fsrc.name` AND `filename2 =
+                    #     fdst.name` before re-raising, so a mid-copy EFBIG or
+                    #     ENOSPC names the SOURCE too -- measured with real
+                    #     `shutil.copyfile`, with a credential fragment already
+                    #     on disk. `filename2` is set on exactly the paths that
+                    #     had opened the destination and None on the rest.
                     comparable = after is not None and before is not None
                     untouched = (
                         isinstance(copy_err, OSError)
-                        and copy_err.filename is not None
+                        and getattr(copy_err, "filename2", None) is None
                         and copy_err.filename == os.fspath(source)
                     )
                     if not (comparable or untouched):
