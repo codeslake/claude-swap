@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOW = _ROOT / ".github" / "workflows" / "ci.yml"
 _TESTS = _ROOT / "tests"
@@ -92,13 +94,64 @@ def test_every_test_file_runs_in_exactly_one_windows_shard():
     assert not doubled, f"these run in more than one Windows shard: {doubled}"
 
 
-def test_the_macos_job_names_files_that_exist():
-    """The macOS job runs two files by name; a rename must not silently
-    reduce it to running nothing."""
-    text = _WORKFLOW.read_text(encoding="utf-8")
-    step = re.search(r"Run macOS Keychain tests.*?\n(?:.*\n)*?\s+run: (.*)", text)
-    assert step, "the macOS keychain step is gone or was renamed"
-    named = re.findall(r"(tests/test_\w+\.py)", step.group(1))
-    assert named, "the macOS job stopped naming any test file"
-    for path in named:
+def _macos_pytest_run(text: str) -> str:
+    """The macOS job's pytest command, found by JOB ID, never by step name.
+
+    The step name is prose and has already been rewritten once. The job id is
+    what branch protection matches on, so it is the only key here that cannot
+    move without somebody noticing.
+    """
+    block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \w[\w-]*:\n|\Z)", text, re.S)
+    assert block, "the macos-keychain job is gone or was renamed"
+    runs = [m.group(1) for m in re.finditer(r"\n\s+run: (.*)", block.group(1))]
+    pytest_runs = [r for r in runs if "pytest" in r]
+    assert len(pytest_runs) == 1, (
+        f"the macOS job has {len(pytest_runs)} pytest step(s), and this reads "
+        f"one: {runs}"
+    )
+    return pytest_runs[0]
+
+
+def test_the_macos_job_runs_something_that_exists():
+    """Whatever the macOS job NAMES must exist; naming nothing is allowed only
+    when the reason is that it runs everything.
+
+    A path list in a workflow goes stale exactly the way the Windows shards
+    do. But a job that names no path is not that failure when the command is
+    a bare `pytest`: that IS every file, which is strictly more than the two
+    it used to name. Requiring a name made the guard fire on a job that had
+    gained coverage.
+    """
+    run = _macos_pytest_run(_WORKFLOW.read_text(encoding="utf-8"))
+    for path in re.findall(r"(tests/test_\w+\.py)", run):
         assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
+    if not re.search(r"tests/test_\w+\.py", run):
+        assert not re.search(r"(^| )-[km]( |=)", run), (
+            f"the macOS job names no file and filters with {run!r} — that can "
+            "select nothing, which is the silent hole this guards"
+        )
+
+
+def test_the_reader_accepts_both_shapes_and_still_refuses_a_deletion():
+    """THE TABLE, because the file on disk can only ever be ONE shape.
+
+    Measured: the disk case alone read "runs the whole suite" as "stopped
+    naming any test file" and failed a workflow that had gained coverage —
+    and no branch could see it, because the guard and the widened job live on
+    different ones. The reader is exercised on both here, and on a workflow
+    that has lost the job entirely.
+    """
+    head = (
+        "\n  macos-keychain:\n    runs-on: macos-latest\n    steps:\n"
+        "      - name: Install dependencies\n        run: uv sync --locked\n"
+    )
+    tail = "\n  test-windows:\n    runs-on: windows-latest\n"
+    named = head + "      - name: X\n        run: uv run pytest tests/test_x.py -v\n" + tail
+    whole = head + "      - name: X\n        run: uv run pytest -o faulthandler_timeout=60\n" + tail
+
+    assert _macos_pytest_run(named) == "uv run pytest tests/test_x.py -v"
+    assert _macos_pytest_run(whole) == "uv run pytest -o faulthandler_timeout=60"
+    with pytest.raises(AssertionError, match="gone or was renamed"):
+        _macos_pytest_run("\n  test:\n    runs-on: ubuntu-latest\n")
+    with pytest.raises(AssertionError, match="pytest step"):
+        _macos_pytest_run(head + tail)
