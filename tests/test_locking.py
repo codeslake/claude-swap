@@ -212,7 +212,17 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
                 slept.append(seconds)
                 clock[0] += seconds + 0.001
 
-            locking.time.monotonic = lambda: clock[0]
+            def fake_monotonic():
+                # A HAIR PER READ, so a sleepless loop still reaches the
+                # deadline. With the clock advancing only inside `fake_sleep`,
+                # deleting the sleep call freezes it and the retry loop never
+                # ends -- the run hangs instead of going red, and `assert
+                # slept` below is never reached in the one direction it is
+                # written for.
+                clock[0] += 1e-6
+                return clock[0]
+
+            locking.time.monotonic = fake_monotonic
             locking.time.sleep = fake_sleep
             try:
                 waiter = FileLock(target, timeout=budget)
@@ -225,6 +235,15 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
             assert sum(slept) <= budget, (
                 f"slept {sum(slept)}s against a {budget}s budget -- the "
                 f"deadline was not the caller's (sleeps: {slept})"
+            )
+            # AND THE OTHER SIDE. An upper bound alone is satisfied by a list
+            # of zeros, which is precisely a hot spin: the clamp collapsing to
+            # 0.0 gives ten sleeps of nothing, sums to 0.0, and passes. The
+            # waiter must spend its whole budget waiting, not burning CPU.
+            assert sum(slept) >= budget * 0.9, (
+                f"slept only {sum(slept)}s of a {budget}s budget across "
+                f"{len(slept)} call(s) -- the retry loop is spinning rather "
+                f"than waiting (sleeps: {slept})"
             )
         finally:
             holder.release()

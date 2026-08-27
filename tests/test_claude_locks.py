@@ -624,8 +624,9 @@ class TestEveryArmOfTheLoopBacksOff:
         remainder is hugely negative and `max(0.0, ...)` yields 0) took the
         attempts in a 0.3s budget from 2 to 5135, with both lock files green.
 
-        The bound is deliberately loose: what separates correct from broken
-        here is three orders of magnitude, not one attempt.
+        The bound is 2x the measured count, not three orders of magnitude:
+        attempts are budget/sleep, so a loaded machine yields FEWER and the
+        noise cannot push it up. A 40 tolerated a 20x shrink in silence.
         """
         lock = tmp_path / "held.lock"
         lock.mkdir()  # FRESH, so the stale-takeover arm is never entered
@@ -646,9 +647,67 @@ class TestEveryArmOfTheLoopBacksOff:
             os.mkdir = real_mkdir
 
         assert tries["n"] >= 1, f"the instrument, not the code: {tries['n']}"
-        assert tries["n"] < 40, (
+        # 4, NOT 40. The jittered arm sleeps 0.25-0.5s, so a 0.3s budget is
+        # 2 attempts and 40 tolerates a 20x shrink in silence. Attempts are
+        # budget/sleep, so a slow or loaded machine yields FEWER -- the noise
+        # runs only downward and a tight bound cannot flake upward.
+        assert tries["n"] <= 4, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the jittered "
             "arm is not sleeping, so a waiter pegs a core for the whole hold"
+        )
+
+    def test_the_backoff_is_jittered_so_waiters_do_not_synchronise(
+        self, tmp_path, monkeypatch
+    ):
+        """A FLAT BACK-OFF PASSES EVERY COUNT BOUND IN THIS CLASS.
+
+        Attempts are budget/sleep, so replacing `0.25 + random() * 0.25` with
+        a flat `0.25` leaves the count identical and both spin bounds green.
+        What the jitter buys is that waiters released together do not retry in
+        lockstep, and only the SPREAD of the drawn values shows it.
+
+        The clock is scripted because a real run of this budget takes the
+        budget; the draws are what is under test, not the waiting.
+        """
+        lock = tmp_path / "held.lock"
+        lock.mkdir()  # FRESH, so the stale-takeover arm is never entered
+
+        clock, slept = [0.0], []
+        real_sleep = claude_locks.time.sleep
+        mine = threading.get_ident()
+
+        def fake_sleep(seconds):
+            # THREAD-SCOPED: the patch is process-global, and a stray thread
+            # sleeping here would both stall and pollute the sample.
+            if threading.get_ident() != mine:
+                return real_sleep(seconds)
+            slept.append(seconds)
+            clock[0] += seconds
+
+        def fake_monotonic():
+            # A HAIR PER READ. The last sleep is clamped to what is left, so
+            # it is exactly 0.0 and a clock that only moves inside `sleep`
+            # parks ON the deadline forever -- `> timeout` is strict. The
+            # loop then spins in real time until the holder ages past
+            # CONFIG_STALENESS_S and is taken over, so the case reports "the
+            # lock was acquired" after a ten-second real stall.
+            clock[0] += 1e-6
+            return clock[0]
+
+        monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
+        monkeypatch.setattr(claude_locks.time, "monotonic", fake_monotonic)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock, timeout=3.0):
+                pass
+
+        # UNCLAMPED DRAWS ONLY. The final sleep is `min(draw, what is left)`,
+        # which is a clamp rather than a draw, and a clamped tail could make
+        # one value look like spread or hide its absence.
+        draws = slept[:-1]
+        assert len(draws) >= 5, f"too few draws to judge spread: {slept}"
+        assert len(set(draws)) > 1, (
+            f"all {len(draws)} back-offs were {draws[0]}s — the jitter is "
+            "gone, so every waiter released together retries in lockstep"
         )
 
     def test_a_dangling_symlink_does_not_spin(self, tmp_path, monkeypatch):
@@ -670,7 +729,9 @@ class TestEveryArmOfTheLoopBacksOff:
                 pass
 
         assert tries["n"] > 1, "premise: the loop must have retried at all"
-        assert tries["n"] < 40, (
+        # 10, NOT 40. This arm sleeps a flat 0.05s, so the count is
+        # 0.3/0.05 + 1 = 7 and deterministic; 40 tolerates a 6x shrink.
+        assert tries["n"] <= 10, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the arm that "
             "retries a vanished name never sleeps, so it pins a core"
         )
