@@ -71,16 +71,19 @@ jobs:
         #
         # faulthandler dumps every thread's stack past the budget, which is
         # the only clue when a `security` call blocks on an invisible
-        # SecurityAgent dialog. Merged, a sibling sets
-        # `faulthandler_exit_on_timeout` repo-wide and this step overrides
-        # only the budget, so the dump also ABORTS the worker. Which backstop
-        # fires first is deliberately not claimed here: that sentence has been
-        # written both ways in successive rounds, and `timeout-minutes` below
-        # is the one that does not go stale.
+        # SecurityAgent dialog.
         #
-        # 600 is that sibling's ini value, so this override is a no-op once
-        # merged rather than a second number to keep in step. It is NOT a
-        # per-test contention margin -- the whole suite runs in ~40s on this
-        # runner, so the 60 it replaces already exceeded the suite total.
+        # AS OF THIS BRANCH THIS `-o` IS THE ONLY THING SETTING IT. The base
+        # has no faulthandler keys at all; PR 287 adds them repo-wide, and
+        # only once THAT lands does this override become a no-op and the dump
+        # also abort the worker. Both orderings are possible, so nothing here
+        # claims which backstop fires first -- that sentence has been written
+        # both ways in successive rounds, and `timeout-minutes` below is the
+        # one that does not go stale.
+        #
+        # 600 matches the value PR 287 sets, so the two cannot drift. It is
+        # NOT a per-test contention margin: the whole suite runs in well under
+        # a minute on this runner, so the 60 it replaces already exceeded the
+        # suite total.
         timeout-minutes: 15
         run: uv run pytest -o faulthandler_timeout=600
