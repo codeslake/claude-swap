@@ -7,6 +7,7 @@ import errno
 import json
 import logging
 import os
+import stat
 import sys
 import time
 from pathlib import Path
@@ -12364,6 +12365,109 @@ def test_an_interrupt_at_the_mode_call_does_not_strand_the_temp(
     assert fired["chmod"], "premise: the injected interrupt never fired"
     strays = list(target.parent.glob(f".{target.name}.*.tmp"))
     assert strays == [], f"an interrupt at the mode call stranded {strays}"
+
+
+def test_a_completed_copy_is_not_emptied_by_the_recovery(
+    temp_home: Path, monkeypatch
+):
+    """The recovery must empty only what the copy TRUNCATED.
+
+    `copyfile` uses `sendfile` on Linux, and the last byte lands before the
+    signal is delivered -- so the ordinary interrupt here is one where the
+    destination is already complete and correct. Deciding on "differs from
+    `before`" cannot tell that from a partial: a finished write differs too.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    real_copyfile = switcher_mod.shutil.copyfile
+    fired = {"copied": False}
+
+    def copy_then_interrupt(src, dst, **kw):
+        real_copyfile(src, dst, **kw)          # every byte lands
+        fired["copied"] = True
+        raise KeyboardInterrupt                # ...and then the signal
+
+    payload = {"activeAccountNumber": 2, "accounts": {"2": {"email": "x@y.z"}}}
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", copy_then_interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, payload)
+
+    assert fired["copied"], "premise: the copy never ran, so nothing completed"
+    assert target.read_bytes(), (
+        "the recovery emptied a destination the copy had COMPLETED, turning a "
+        "benign interrupt into a destroyed config plus a manual restore"
+    )
+    assert json.loads(target.read_text()) == payload, (
+        "the destination survived but does not hold the new payload"
+    )
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
+        "the copy completed, so the narrowing still has to be undone -- "
+        "skipping the whole recovery leaves the destination at 0600"
+    )
+
+
+def test_an_interrupt_while_naming_the_survivor_does_not_strand_it(
+    temp_home: Path, monkeypatch
+):
+    """`kept` and `def _unnarrow()` have to sit ABOVE the disown.
+
+    Past `source, temp_path = temp_path, None` the outer cleanup no longer
+    owns the temp and nothing prints where it went, so a signal there leaves
+    the complete new payload -- for `~/.claude.json` a credential-bearing
+    file -- stranded and unnamed. Building `kept` reads `PurePath.name`, a
+    Python-level property whose RESUME is where a pending SIGINT lands, so
+    the window is reachable rather than theoretical.
+    """
+    if sys.platform == "win32":
+        pytest.skip("POSIX modes only")
+    import pathlib as _pathlib
+
+    from claude_swap import switcher as switcher_mod
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+
+    def busy(*_a, **_kw):
+        raise OSError(errno.EBUSY, "Device or resource busy")
+
+    real_name = _pathlib.PurePath.name
+    fired = {"named": False}
+
+    def interrupt_when_the_temp_is_named(self):
+        value = real_name.fget(self)
+        if not fired["named"] and value.endswith(".tmp"):
+            fired["named"] = True
+            raise KeyboardInterrupt
+        return value
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry", busy)
+    monkeypatch.setattr(
+        _pathlib.PurePath, "name", property(interrupt_when_the_temp_is_named)
+    )
+    with pytest.raises(KeyboardInterrupt):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+    monkeypatch.undo()
+
+    assert fired["named"], "premise: the injected interrupt never fired"
+    strays = list(target.parent.glob(f".{target.name}.*.tmp"))
+    assert strays == [], (
+        f"an interrupt while naming the survivor stranded {strays}, which "
+        "holds the complete payload with nothing owning or printing it"
+    )
 
 
 def test_an_interrupt_at_the_digest_does_not_strand_the_temp(

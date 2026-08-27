@@ -756,12 +756,22 @@ class ClaudeAccountSwitcher:
                     # Gating both on it left Windows holding a truncated
                     # credential -- measured in CI, `mode 0o666` with the
                     # secret still in the file.
+                    #
+                    # A COMPLETE COPY ALSO DIFFERS FROM `before`, and on Linux
+                    # that is the ORDINARY interrupt here: `copyfile` uses
+                    # `sendfile`, so the last byte lands before the signal is
+                    # delivered. Deciding on `before` alone empties a finished
+                    # write. Compare against the SOURCE rather than `content`:
+                    # the temp is what the copy copies, and a text-mode
+                    # newline translation would make `content`'s bytes and the
+                    # file's bytes differ on Windows for every write.
                     try:
-                        touched = (before is not None
-                                   and hashlib.sha256(
-                                       path.read_bytes()).hexdigest() != before)
+                        after = hashlib.sha256(path.read_bytes()).hexdigest()
+                        landed = hashlib.sha256(source.read_bytes()).hexdigest()
                     except OSError:
                         return  # `kept` still names the survivor
+                    touched = (after != landed
+                               and before is not None and after != before)
                     if touched:
                         try:
                             with open(path, "wb"):
