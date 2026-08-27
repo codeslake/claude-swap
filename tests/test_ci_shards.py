@@ -104,6 +104,70 @@ def test_every_test_file_runs_in_exactly_one_windows_shard():
 
 
 
+def _workflow_jobs(workflow: Path) -> dict[str, str]:
+    """Every job in the workflow, by name -- ENUMERATED, not listed.
+
+    A hardcoded pair is right until someone adds a job, and the job this file
+    forgot was the ubuntu one that runs the WHOLE suite: made
+    `continue-on-error`, stripped of its pytest call, or pointed at a file
+    that does not exist, the suite stayed green through all three.
+    """
+    text = workflow.read_text(encoding="utf-8")
+    body = text.split("\njobs:\n", 1)[1] if "\njobs:\n" in text else text
+    out, name, start = {}, None, 0
+    lines = body.splitlines(keepends=True)
+    for i, ln in enumerate(lines):
+        m = re.match(r"  ([A-Za-z0-9_-]+):\s*$", ln)
+        if not m:
+            continue
+        if name is not None:
+            out[name] = "".join(lines[start:i])
+        name, start = m.group(1), i + 1
+    if name is not None:
+        out[name] = "".join(lines[start:])
+    return out
+
+
+def test_no_job_in_the_workflow_can_swallow_its_own_failure():
+    """Every job, not the two this file happens to name.
+
+    The ubuntu `test` job runs the entire suite and nothing here referenced
+    it, so one line made the primary gate green regardless of failures.
+    """
+    jobs = _workflow_jobs(_WORKFLOW)
+    # THE DENOMINATOR. An empty parse reports a clean sweep over nothing.
+    assert len(jobs) >= 3, (
+        f"the workflow parse found {len(jobs)} job(s), so this would pass "
+        f"over almost nothing: {sorted(jobs)}"
+    )
+    for name, body in sorted(jobs.items()):
+        _assert_no_step_can_swallow_failure(body, name)
+
+
+@pytest.mark.parametrize("spelling", ["true", "True", "TRUE"])
+def test_a_job_that_cannot_fail_is_refused_for_every_job(tmp_path, spelling):
+    """The guard had no witness at all -- both call sites could be deleted.
+
+    Run per JOB, so a job added without the guard fails here rather than
+    going quiet. The three spellings are one assert apart and YAML resolves
+    all of them to boolean true.
+    """
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    names = sorted(_workflow_jobs(_WORKFLOW))
+    assert len(names) >= 3, f"nothing to sabotage: {names}"
+    for name in names:
+        anchor = f"\n  {name}:\n"
+        assert text.count(anchor) == 1, f"{name}: anchor is not unique"
+        broken = text.replace(
+            anchor, f"{anchor}    continue-on-error: {spelling}\n", 1)
+        assert broken != text, f"{name}: nothing was mutated"
+        f = tmp_path / "ci.yml"
+        f.write_text(broken, encoding="utf-8")
+        with pytest.raises(AssertionError, match="continue-on-error"):
+            for jn, body in sorted(_workflow_jobs(f).items()):
+                _assert_no_step_can_swallow_failure(body, jn)
+
+
 def _assert_no_step_can_swallow_failure(job: str, which: str) -> None:
     """A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned.
 
@@ -111,7 +175,10 @@ def _assert_no_step_can_swallow_failure(job: str, which: str) -> None:
     is the loudest form of "this file silently stopped running in CI". It
     was guarded on one job and not on the other, so it lives here.
     """
-    assert not re.search(r"^\s*continue-on-error:\s*true", job, re.M), (
+    # ANY YAML SPELLING OF TRUE. `true|True|TRUE` all resolve to boolean
+    # true in YAML 1.2's core schema, and a case-sensitive match reads two of
+    # the three as absent.
+    assert not re.search(r"^\s*continue-on-error:\s*(?i:true)\s*$", job, re.M), (
         f"the {which} job's step is continue-on-error, so a failure there "
         "is green"
     )
@@ -130,7 +197,6 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
     text = workflow.read_text(encoding="utf-8")
     block = re.search(r"\n  test-windows:\n(.*?)(?=\n  \S|\Z)", text, re.S)
     assert block, "the test-windows job is gone or was renamed"
-    _assert_no_step_can_swallow_failure(block.group(1), "Windows")
     runs = _pytest_run_lines(block.group(1))
     assert runs, "the Windows job no longer invokes pytest — the shards run nowhere"
     # ONE INVOCATION, NOT THEIR CONCATENATION. Joined, a second pytest step
@@ -157,6 +223,11 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
         "the Windows pytest command does not clear `testpaths`, so a shard "
         f"cannot ignore the testpaths root itself: {line!r}"
     )
+    # LAST, because it is the broadest -- the reason its macOS caller already
+    # states. Raised first it masks every assert above it, and four of them
+    # then report "regex did not match" about a workflow whose real defect is
+    # elsewhere.
+    _assert_no_step_can_swallow_failure(block.group(1), "Windows")
 
 
 def test_a_backslash_continuation_keeps_the_tail_it_continues_into():
