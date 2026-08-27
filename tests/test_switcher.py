@@ -12424,12 +12424,11 @@ def test_an_unreadable_temp_does_not_disarm_the_whole_recovery(
         )
 
 
-def test_an_unreadable_destination_still_undoes_the_narrowing(
+def test_an_unreadable_destination_is_not_EMPTIED_by_the_recovery(
     temp_home: Path, monkeypatch
 ):
     """THE OTHER READER. Its sibling above covers an unreadable TEMP; this is
-    the destination, and it reaches the same two obligations by a different
-    door.
+    the destination.
 
     The digest read's `except OSError: return` sits ABOVE the mode restore, so
     a destination that becomes unreadable between the `before` read and the
@@ -12482,10 +12481,120 @@ def test_an_unreadable_destination_still_undoes_the_narrowing(
         "the recovery emptied a destination it could not read, so it cannot "
         "have known whether it was destroying a partial or a finished write"
     )
+    # THE MODE IS NOT ASSERTED HERE, and that is the point. This case's copy
+    # died LATE, past the destination open, so the bytes on disk may be half a
+    # token -- and the recovery cannot read them to find out. Widening there
+    # publishes whichever it is, which the narrowing refusal above ranks worse
+    # than a stuck mode. The restore has its own case, on the one shape where
+    # the destination is provably untouched:
+    # `test_an_unreadable_destination_IS_restored_when_the_copy_never_opened_it`.
+
+
+def test_an_unreadable_destination_is_not_WIDENED_over_a_late_failure(
+    temp_home: Path, monkeypatch
+):
+    """Freeing the mode restore must not publish what we cannot read.
+
+    When the destination read fails, `touched` is False and the recovery
+    cannot tell a finished write from a partial one holding half a token. The
+    file's own ranking, at the narrowing refusal above, is that continuing
+    "writes a credential the destination need not have held before, at a mode
+    other users can read" -- so in THAT state the narrow mode is the safe
+    answer, not the stale one.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"copied": False}
+    real_read = Path.read_bytes
+
+    def unreadable_after_the_copy(self):
+        if state["copied"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def partial_copy(src, dst, **kw):
+        # LATE, past the destination open: the bytes are on disk.
+        Path(dst).write_bytes(Path(src).read_bytes()[:20])
+        state["copied"] = True
+        raise OSError(errno.EIO, "copy died mid-write", os.fspath(dst))
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", partial_copy)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_after_the_copy)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["copied"], "premise: the copy never ran"
+    assert stat.S_IMODE(os.stat(target).st_mode) == 0o600, (
+        "the recovery widened a destination it could NOT read, after a copy "
+        "that had already written to it — so a truncated credential is now "
+        "readable by every other uid on the box"
+    )
+
+
+def test_an_unreadable_destination_IS_restored_when_the_copy_never_opened_it(
+    temp_home: Path, monkeypatch
+):
+    """THE CONTROL, and the case the narrow answer must not swallow.
+
+    `copyfile` raises on four paths BEFORE it opens the destination, and there
+    the destination still holds its original bytes -- so there is nothing that
+    could have been published and the mode must come back. `copy_err.filename`
+    is the SOURCE on exactly those paths, which is how the two are told apart
+    without reading a destination that will not answer.
+    """
+    from claude_swap import switcher as switcher_mod
+
+    if sys.platform == "win32":
+        pytest.skip("`prior_mode` is captured on POSIX only")
+
+    switcher = ClaudeAccountSwitcher()
+    target = switcher.backup_dir / "sequence.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
+    os.chmod(target, 0o644)
+
+    state = {"tried": False, "src": None}
+    real_read = Path.read_bytes
+
+    def unreadable_destination(self):
+        if state["tried"] and os.fspath(self) == os.fspath(target):
+            raise OSError(errno.EIO, "destination went unreadable")
+        return real_read(self)
+
+    def source_open_failure(src, dst, **kw):
+        state["tried"], state["src"] = True, os.fspath(src)
+        # The destination is NEVER opened; filename names the SOURCE.
+        raise FileNotFoundError(errno.ENOENT, "No such file", os.fspath(src))
+
+    monkeypatch.setattr(switcher_mod, "replace_with_retry",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            OSError(errno.EBUSY, "Device or resource busy")))
+    monkeypatch.setattr(switcher_mod.shutil, "copyfile", source_open_failure)
+    monkeypatch.setattr(Path, "read_bytes", unreadable_destination)
+
+    with pytest.raises(ConfigError):
+        switcher._write_json(target, {"primaryApiKey": "sk-ant-EXAMPLE"})
+
+    monkeypatch.undo()
+    assert state["tried"], "premise: the copy never ran"
     assert stat.S_IMODE(os.stat(target).st_mode) == 0o644, (
-        "the 0600 narrowing was never undone on a destination that was 0o644 "
-        "before the write, so another uid reading this config gets EACCES "
-        "for ever with only the copy error to go on"
+        "the narrowing was never undone on a destination the copy never "
+        "opened — nothing could have been published, so leaving it at 0600 "
+        "gives another uid EACCES for ever over a write that never happened"
     )
 
 

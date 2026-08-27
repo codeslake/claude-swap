@@ -747,7 +747,7 @@ class ClaudeAccountSwitcher:
                     f"was kept at {temp_path.name}"
                 )
 
-                def _unnarrow():
+                def _unnarrow(copy_err: BaseException | None = None):
                     # ONLY WHAT THE COPY ACTUALLY TRUNCATED. `copyfile` raises
                     # on four paths BEFORE it opens the destination 'wb' --
                     # SameFileError, SpecialFileError, any failure opening the
@@ -796,6 +796,27 @@ class ClaudeAccountSwitcher:
                             pass
                     if prior_mode is None or prior_mode == 0o600:
                         return
+                    # AND NEVER WIDER THAN WHAT THIS CAN VOUCH FOR. Restoring
+                    # the mode is not free when the destination may hold half a
+                    # token: it publishes whatever is there to every other uid,
+                    # and the narrowing refusal above already ranks that worse
+                    # than a stuck mode. Two ways to be sure nothing was
+                    # published, and with neither the narrow mode stands:
+                    #   - both digests read, so `touched` is a real verdict --
+                    #     it either emptied a partial or found the original;
+                    #   - `copyfile` raises BEFORE opening the destination
+                    #     (SameFileError, SpecialFileError, a source-open
+                    #     failure, a signal in that prologue) and names the
+                    #     SOURCE in `filename`, which no destination-side error
+                    #     does.
+                    comparable = after is not None and before is not None
+                    untouched = (
+                        isinstance(copy_err, OSError)
+                        and copy_err.filename is not None
+                        and copy_err.filename == os.fspath(source)
+                    )
+                    if not (comparable or untouched):
+                        return
                     try:
                         os.chmod(path, prior_mode)
                     except OSError:
@@ -805,7 +826,7 @@ class ClaudeAccountSwitcher:
                 try:
                     shutil.copyfile(source, path)
                 except OSError as copy_err:
-                    _unnarrow()
+                    _unnarrow(copy_err)
                     raise ConfigError(f"{kept} ({copy_err})") from copy_err
                 except BaseException:
                     _unnarrow()
