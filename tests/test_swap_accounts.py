@@ -1448,3 +1448,117 @@ class TestTheRollbackSummaryReportsWhatRan:
             "a reversal that moved nothing was announced as having happened:"
             f"\n{said}"
         )
+
+
+class TestTheRollbackDecidesPerKey:
+    """Which SLOT is still crossed, and which report the summary owes."""
+
+    def _write(self, switcher, data):
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+
+    def _one_crossed_one_home(self, switcher, mail_a, mail_b):
+        """Disk state where exactly ONE of the two profiles is still crossed.
+
+        Slot B's profile sits in its crossed location and its home is
+        occupied, so the reverse refuses to move it back. Slot A never had a
+        profile, so nothing of A's ever left home.
+        """
+        crossed_b = switcher._session_dir("1", mail_b)
+        crossed_b.mkdir(parents=True, exist_ok=True)
+        switcher._session_dir("2", mail_b).mkdir(parents=True, exist_ok=True)
+        return [crossed_b]
+
+    def test_only_the_slot_still_crossed_is_forced_through_a_write(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """`moved` is not a per-key fact, and neither is "some move happened".
+
+        A reverse that put back one of two leaves the OTHER slot's profile
+        crossed. Marking BOTH keys crossed forces a credential write on a
+        slot whose profile never moved, and every credential write routes
+        through `_post_backup_write` -- so a correctly-untouched slot loses
+        its session credentials for a swap that did nothing to it.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        wrote: list[str] = []
+        real = switcher._write_account_credentials
+
+        def record(num, mail, creds):
+            wrote.append(num)
+            return real(num, mail, creds)
+
+        switcher._write_account_credentials = record
+        try:
+            switcher._rollback_swap(
+                "1", mail_a, "creds-a", "{}",
+                "2", mail_b, "creds-b", "{}",
+                staging={}, moved=moved, wrote_backups=True,
+            )
+        finally:
+            switcher._write_account_credentials = real
+
+        assert "2" in wrote, (
+            "premise: the slot that IS still crossed was not forced through a "
+            f"write, so this case cannot see the other one either: {wrote}"
+        )
+        assert "1" not in wrote, (
+            "a slot whose profile never left home was forced through a "
+            "credential restore of the value already under it, which costs "
+            f"it its session profile: writes were {wrote}"
+        )
+
+    def test_a_rollback_whose_every_restore_raised_does_not_say_nothing_ran(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """`wrote_any` is set AFTER the write, so a raising restore leaves it
+        False -- and the summary then read that as "nothing was written".
+
+        Those are opposite reports. Nothing-was-written needs no action; every
+        restore failing is what keeps the staged copies on disk for manual
+        recovery, and the line is the only place that says so.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data_with_org)
+        mail_a, mail_b = "a@example.com", "b@example.com"
+        switcher._write_account_credentials("1", mail_a, "creds-a")
+        switcher._write_account_credentials("2", mail_b, "creds-b")
+        moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
+
+        attempted: list[str] = []
+
+        def die(num, mail, creds):
+            attempted.append(num)
+            raise CredentialError("injected: the restore cannot land")
+
+        real = switcher._write_account_credentials
+        switcher._write_account_credentials = die
+        try:
+            with caplog_at_error() as records:
+                switcher._rollback_swap(
+                    "1", mail_a, "creds-a", "{}",
+                    "2", mail_b, "creds-b", "{}",
+                    staging={}, moved=moved, wrote_backups=True,
+                )
+        finally:
+            switcher._write_account_credentials = real
+
+        said = " ".join(records)
+        assert attempted, (
+            "premise: no restore was even attempted, so there was nothing "
+            "that could have failed"
+        )
+        assert "rollback:" in said, "premise: no summary was emitted at all"
+        assert "credentials were restored" not in said, (
+            f"a restore that raised was reported as a restore: {said!r}"
+        )
+        assert "nothing" not in said.split("rollback:")[-1], (
+            "every restore FAILED and the summary said nothing was written, "
+            f"which is the report that hides the kept staged copies: {said!r}"
+        )

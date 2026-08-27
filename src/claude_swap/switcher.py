@@ -1448,14 +1448,26 @@ class ClaudeAccountSwitcher:
         # leaves the OTHER slot's profile stranded, not crossed -- forcing a
         # write there costs a correctly-restored slot its session credentials,
         # which is the exact price the value-equal skip exists to avoid.
+        # TWO LISTS, TWO PATHS, ASKED OF DIFFERENT NAMES. `moved` records
+        # where the FORWARD move landed each profile; `undone` records the
+        # HOME each reverse put one back to. So a key is still crossed when
+        # its crossed location is in `moved` and its home is not in `undone`.
+        # `moved` non-empty alone marked a slot crossed whose profile never
+        # left home -- the reverse then restored the OTHER slot, and this one
+        # was forced through a needless credential write that costs it its
+        # session profile, the exact price the value-equal skip exists to
+        # avoid. Testing `home in moved` instead disables the guard outright:
+        # with distinct emails no home is ever a move DESTINATION.
         back = set(undone)
         crossed_keys = {
             (num, email)
-            for num, email, home in (
-                (num_a, email_a, self._session_dir(num_a, email_a)),
-                (num_b, email_b, self._session_dir(num_b, email_b)),
+            for num, email, home, crossed in (
+                (num_a, email_a, self._session_dir(num_a, email_a),
+                 self._session_dir(num_b, email_a)),
+                (num_b, email_b, self._session_dir(num_b, email_b),
+                 self._session_dir(num_a, email_b)),
             )
-            if moved and home not in back
+            if crossed in moved and home not in back
         }
         overlap = email_a == email_b
         # Restoring a key that was never written is not a no-op: rewriting it
@@ -1531,12 +1543,20 @@ class ClaudeAccountSwitcher:
                     f"Rollback {kind} restore failed for slot {num}: {e}"
                 )
         # THE SUMMARY, from what ran — see the two-part note above.
+        # FOUR STATES. "nothing was written" was claimed from `wrote_any`,
+        # which only the credential arm sets -- so a rollback whose every
+        # restore RAISED, and one that restored configs only, both reported
+        # that nothing had been written. A failure is the one a reader must
+        # not miss: it is what keeps the staged copies on disk.
         if wrote_any:
             what = "credentials were restored"
+        elif failures:
+            what = (f"no credential restore landed and {failures} failed; "
+                    "the staged copies are kept")
         elif undone:
             what = "the session-profile exchange was reversed; no credential was written"
         else:
-            what = "nothing was written, so there was nothing to restore"
+            what = "no credential needed restoring"
         self._logger.error(f"Swap {num_a} <-> {num_b} rollback: {what}")
         if wrote_backups and email_a != email_b:
             # Drop half-written copies under the new keys; the records still
