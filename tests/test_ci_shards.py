@@ -123,9 +123,44 @@ def _assert_windows_job_consumes_the_matrix(workflow: Path) -> None:
         "the Windows pytest command does not consume `matrix.paths`, so the "
         f"shard matrix is dead data and every shard runs the same thing: {line!r}"
     )
+    # KEPT, BUT NOT FOR THE REASON THIS ONCE GAVE. Measured: the `rest` shard
+    # collects 1337 tests with the flag and 1337 without, and every other
+    # shard matches too -- positional paths already beat `testpaths`, so the
+    # consequence the old message named ("each shard runs it all") does not
+    # occur. The control that the flag is honoured at all is `-o
+    # testpaths=docs`, which collects nothing. What it protects is a shard
+    # that ever needs to ignore the testpaths root itself.
     assert "-o testpaths=" in line, (
-        "the Windows pytest command does not clear `testpaths`, so pyproject's "
-        f"own value overrides the shard paths and each shard runs it all: {line!r}"
+        "the Windows pytest command does not clear `testpaths`, so a shard "
+        f"cannot ignore the testpaths root itself: {line!r}"
+    )
+
+
+@pytest.mark.parametrize("command", [
+    'uv run pytest -k "smoke # fast" -n 4 -o testpaths= ${{ matrix.paths }}',
+    "uv run pytest -k 'a # b' -n 4 -o testpaths= ${{ matrix.paths }}",
+    "uv run pytest -n 4 -o testpaths= ${{ matrix.paths }}  # shard it",
+])
+def test_a_hash_the_shell_does_not_treat_as_a_comment_is_not_cut(command):
+    """COUNTING LINES CANNOT SEE THIS. A truncated command still contains the
+    word `pytest`, so the reader still returns one `run:` line and every
+    count-based case passes -- what is lost is the TAIL, which is where every
+    marker the caller asserts lives. So the content is what has to be read.
+
+    `-k "smoke # fast"` carries a `#` that starts no comment, and cutting
+    there refuses a correct workflow: the opposite failure to the one the
+    strip exists for. A real trailing comment is still removed, and the
+    command in front of it survives whole.
+    """
+    job = "    - name: t\n      run: |\n        " + command
+    runs = _pytest_run_lines(job)
+    assert len(runs) == 1, runs
+    assert "${{ matrix.paths }}" in runs[0], (
+        f"the command was truncated at a `#` the shell does not honour: {runs[0]!r}"
+    )
+    assert "-o testpaths=" in runs[0], runs[0]
+    assert "# shard it" not in runs[0], (
+        f"a real trailing comment survived the strip: {runs[0]!r}"
     )
 
 
@@ -172,6 +207,12 @@ def test_the_reader_folds_a_block_the_way_its_scalar_says(
     `-o testpaths=` while a harmless second `pytest` carries it. The caller's
     `len(runs) == 1` cannot see that through a join. A trailing backslash is
     the one case that really is one command, so it is joined first.
+
+    THE STRIP IS QUOTE-AWARE for the same reason the shell is: `-k "smoke #
+    fast"` carries a `#` that starts no comment, and cutting there truncates a
+    LIVE command to something with no markers -- a false refusal on a correct
+    workflow, the opposite failure to the one the strip exists for. A real
+    trailing comment is still removed and the command still read.
     """
     job = "    - name: t\n      run: " + scalar + "\n" + "\n".join(
         "        " + ln for ln in body)
@@ -272,7 +313,8 @@ def _mutate_windows_run(text: str, repl: str) -> str:
     [
         ("", "no longer invokes pytest"),
         (lambda m: m.group(1).replace(" ${{ matrix.paths }}", ""), "dead data"),
-        (lambda m: m.group(1).replace(" -o testpaths=", ""), "overrides the shard paths"),
+        (lambda m: m.group(1).replace(" -o testpaths=", ""),
+         "cannot ignore the testpaths root itself"),
     ],
     ids=["invocation-deleted", "matrix-not-consumed", "testpaths-not-cleared"],
 )
@@ -325,7 +367,20 @@ def _pytest_run_lines(job: str) -> list[str]:
     why it lives in this reader and not in one caller.
     """
     def uncomment(text: str) -> str:
-        return re.sub(r"(?<!\S)#.*", "", text)
+        # QUOTE-AWARE, because the shell is. `pytest -k "smoke # fast"` carries
+        # a `#` that starts no comment, and cutting there truncated a LIVE
+        # command to something with no markers -- a false refusal on a correct
+        # workflow, which is the opposite failure to the one this exists for.
+        quote = None
+        for i, ch in enumerate(text):
+            if quote:
+                if ch == quote:
+                    quote = None
+            elif ch in "'\"":
+                quote = ch
+            elif ch == "#" and (i == 0 or text[i - 1] in " \t"):
+                return text[:i]
+        return text
 
     lines, folded, i = job.splitlines(), [], 0
     while i < len(lines):
