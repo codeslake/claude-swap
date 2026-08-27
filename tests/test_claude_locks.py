@@ -1197,34 +1197,6 @@ class TestATransientErrnoIsNotFatalToTheHold:
             "a stamp it never proved"
         )
 
-    def test_the_coarse_case_really_exhausts_the_candidates(self):
-        """Its sibling asserts `1`, which is also the unfaked answer here.
-
-        So the assertion alone cannot tell "the fallthrough ran" from
-        "candidate #1 matched immediately". The loop tries six candidates
-        before falling through and exactly one when it matches, so the call
-        count is what separates them.
-        """
-        calls = []
-        real_utime = os.utime
-        coarser = 4_000_000_000
-
-        def counting(path, *a, **k):
-            calls.append(1)
-            ns = k.get("ns")
-            if isinstance(ns, tuple) and len(ns) == 2:
-                k["ns"] = tuple((int(v) // coarser) * coarser for v in ns)
-            return real_utime(path, *a, **k)
-
-        with tempfile.TemporaryDirectory() as d:
-            with patch.object(claude_locks.os, "utime", counting):
-                got = claude_locks._mtime_quantum_ns(Path(d))
-        assert got == 1, got
-        assert len(calls) == 6, (
-            f"the probe wrote {len(calls)} time(s), so it did not reject "
-            "every candidate -- this case would pass without its own fake"
-        )
-
     def test_a_directory_we_cannot_write_answers_1_rather_than_raising(
         self, tmp_path
     ):
@@ -1273,8 +1245,10 @@ class TestATransientErrnoIsNotFatalToTheHold:
         """
         coarser = 4_000_000_000
         real_utime = os.utime
+        writes = []
 
         def coarser_than_all(path, *a, **k):
+            writes.append(1)
             ns = k.get("ns")
             if isinstance(ns, tuple) and len(ns) == 2:
                 k["ns"] = tuple((int(v) // coarser) * coarser for v in ns)
@@ -1282,6 +1256,14 @@ class TestATransientErrnoIsNotFatalToTheHold:
 
         monkeypatch.setattr(claude_locks.os, "utime", coarser_than_all)
         got = claude_locks._mtime_quantum_ns(tmp_path)
+        # THE COUNT, BECAUSE THE VALUE CANNOT TELL THEM APART. `1` is also
+        # what the unfaked probe answers on a fine filesystem, so asserting
+        # it alone passes whether the fallthrough ran or the FIRST candidate
+        # matched. The loop writes once per candidate before falling through.
+        assert len(writes) == 6, (
+            f"the probe wrote {len(writes)} time(s), so it did not reject "
+            "every candidate -- this case would pass with its own fake dead"
+        )
         assert got == 1, (
             f"nothing round-tripped, so the quantum is unmeasured -- answering "
             f"{got}ns lets the release act on a stamp it never proved"
