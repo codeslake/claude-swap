@@ -1223,9 +1223,10 @@ class TestSwapUnreadableSourceIsNotAbsent:
             "contamination this swap created"
         )
 
+    @pytest.mark.parametrize("retained", [True, False])
     @pytest.mark.parametrize("backend", ["file", "keychain"])
     def test_the_write_reports_what_it_retained_on_both_backends(
-        self, temp_home: Path, monkeypatch, backend
+        self, temp_home: Path, monkeypatch, backend, retained
     ):
         """The verdict the rollback purge keys on, at its source.
 
@@ -1238,7 +1239,13 @@ class TestSwapUnreadableSourceIsNotAbsent:
         the contaminated `.prev` survives.
         """
         store = ClaudeAccountSwitcher()._store
-        monkeypatch.setattr(store, "_retain_previous_backup", lambda *a, **k: True)
+        # BOTH DIRECTIONS. A constant stub pins only the half where the verdict
+        # goes False. The other half -- a constant True -- makes the purge
+        # delete a `.prev` the restore never created, which is the user's own
+        # pre-swap copy, and it passed.
+        monkeypatch.setattr(
+            store, "_retain_previous_backup", lambda *a, **k: retained
+        )
         monkeypatch.setattr(store, "_use_keychain", lambda: backend == "keychain")
         monkeypatch.setattr(store, "_kc_write_backup", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -1249,9 +1256,12 @@ class TestSwapUnreadableSourceIsNotAbsent:
             store, "_delete_backup_keychain_quiet", lambda *a, **k: None
         )
 
-        assert store._write_account_credentials("1", "u@example.com", "c") is True, (
-            f"the {backend} arm dropped the retained verdict; the rollback "
-            "purge keys on it and would leave the contaminated .prev in place"
+        got = store._write_account_credentials("1", "u@example.com", "c")
+        assert got is retained, (
+            f"the {backend} arm answered {got} where the retention decided "
+            f"{retained}; the rollback purge keys on this, so a lost False "
+            "deletes a pre-swap copy nothing displaced and a lost True leaves "
+            "the contaminated one in place"
         )
 
     def test_a_rollback_drops_prev_it_really_did_contaminate(
@@ -2140,15 +2150,25 @@ class TestTheRollbackDecidesPerKey:
         # CONTAINED, BUT NEVER SILENT. The per-key loop's `except Exception`
         # counts this as a failure and carries on, which is the rollback's
         # design -- one key must not abort the rest. So the chokepoint's
-        # rationale does NOT transfer here: widening the inner arm changes
-        # nothing, because the outer one already catches everything. What must
-        # hold instead is that the key is COUNTED, so the staged copy survives
-        # and the operator is told.
+        # rationale does NOT transfer here. What must hold instead is that the
+        # key is COUNTED, so the staged copy survives and the operator is told,
+        # and that the failure is named for what actually failed.
         assert staged.exists(), (
             "the staged pre-swap copy was discarded although a key's repair "
             "was refused — the rollback treated a contained failure as success"
         )
         said = " ".join(records)
+        # THE ARM'S OWN SENTENCE. Deleting the whole `except Exception` that
+        # names the repair leaves every count, the summary and the staged copy
+        # identical -- the wording is the only observable, so nothing else can
+        # witness it.
+        assert "could not invalidate slot" in said, (
+            f"the repair failure was not named as one: {said!r}"
+        )
+        assert "creds restore failed" not in said, (
+            "the repair failure was reported as a credential restore failure, "
+            f"about a restore that landed: {said!r}"
+        )
         # THE ACCOUNTING LINE, not merely SOME error. A bare `assert said` is
         # satisfied by any record the rollback happens to emit, so it stays
         # green when the contained failure itself goes quiet.
@@ -2222,7 +2242,7 @@ class TestTheRollbackDecidesPerKey:
         assert "credentials were restored" in said, (
             f"a clean rollback did not say what it did: {said!r}"
         )
-        assert "restore(s) failed" not in said, (
+        assert "step(s) failed" not in said, (
             f"a clean rollback reported a restore failure: {said!r}"
         )
 
@@ -2259,7 +2279,7 @@ class TestTheRollbackDecidesPerKey:
             )
 
         said = " ".join(records)
-        assert "restore(s) failed" in said, (
+        assert "step(s) failed" in said, (
             f"premise: nothing failed, so the kept arm is not the one under "
             f"test: {said!r}"
         )

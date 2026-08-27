@@ -1601,7 +1601,7 @@ class ClaudeAccountSwitcher:
         # having failed.
         kept = "; the staged copies are kept" if staging else ""
         if wrote_any and failures:
-            what = f"credentials were restored; {failures} restore(s) failed{kept}"
+            what = f"credentials were restored; {failures} step(s) failed{kept}"
         elif wrote_any:
             what = "credentials were restored"
         elif failures:
@@ -1609,7 +1609,7 @@ class ClaudeAccountSwitcher:
             # `_write_account_config` never sets it. Widening this noun to
             # "restore" denies config restores that DID land and wrote files.
             what = (f"no credential restore landed and {failures} "
-                    f"restore(s) failed{kept}")
+                    f"step(s) failed{kept}")
         elif undone:
             what = "the session-profile exchange was reversed; no credential was written"
         else:
