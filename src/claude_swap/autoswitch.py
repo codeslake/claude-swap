@@ -1991,20 +1991,20 @@ class AutoSwitchEngine:
             peer_recovery_ts = _binding_recovery_ts(usage.get(barred), self._models, now)
             active_recovery_ts = _binding_recovery_ts(usage.get(current), self._models, now)
             # The active's recovery must be a REAL measurement, not merely
-            # "larger" -- `_binding_recovery_ts` returns `inf` for both
-            # "never resets" and "we do not know" (no windows, no
-            # `resets_at`, or a stale/past `resets_at`). Reading `inf` as
-            # "never" here made `peer < inf - HYST` true for ANY finite
-            # peer reset, releasing onto a peer arbitrarily far out on no
-            # evidence. `math.isfinite` requires the active to have a
-            # genuine, known reset before the comparison even runs --
-            # unknown holds, exactly like unreadable already does on the
-            # headroom axis.
+            # "larger". `_binding_recovery_ts` returns `inf` in exactly THREE
+            # states, and they do not mean the same thing: no relevant window
+            # at all, no tied window naming a parseable `resets_at`, or every
+            # tied reset already elapsed. Reading `inf` as "never" made
+            # `peer < inf - HYST` true for ANY finite peer reset, releasing
+            # onto a peer arbitrarily far out on no evidence. `math.isfinite`
+            # requires the active to have a genuine, known reset before the
+            # comparison even runs -- unknown holds, exactly like unreadable
+            # already does on the headroom axis.
             #
-            # But two of the five `inf` states are ordinary shapes for an
-            # active that is plainly alive and burning -- a `pct` reported
-            # with no `resets_at`, or a `resets_at` already elapsed -- not
-            # unknowns. Reading all five as "unknown, hold" pins the engine
+            # But two of those three are ordinary shapes for an active that is
+            # plainly alive and burning -- a `pct` with no `resets_at`, or one
+            # already elapsed -- not unknowns. Reading all three as "unknown,
+            # hold" pins the engine
             # on a near-spent active for up to a full window even when the
             # peer is back within `RECOVERY_HORIZON_S`, the
             # same constant this PR already uses for "near enough to
