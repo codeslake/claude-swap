@@ -655,10 +655,17 @@ class TestEveryArmOfTheLoopBacksOff:
             "retries a vanished name never sleeps, so it pins a core"
         )
 
-    def test_the_swept_name_branch_sleeps_only_what_is_left(
+    def test_the_dangling_symlink_arm_sleeps_only_what_is_left(
         self, tmp_path, monkeypatch
     ):
         """A SCRIPTED CLOCK, like its two siblings.
+
+        NAMED FOR THE ARM IT REACHES. A dangling symlink answers
+        FileExistsError to `mkdir`, so this drives the arm where the READ-BACK
+        stat raises ENOENT -- not a name swept between `mkdir` and `stat`.
+        The two are one `except` on this branch and two on the merged tree,
+        where the swept-name arm has its own back-off that this case never
+        touches.
 
         The wall-clock form this replaces could only see a FLATTENING. With a
         budget under the flat constant, `min(0.05, timeout)` and
