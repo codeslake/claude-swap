@@ -46,6 +46,9 @@ jobs:
         # runs on stock Windows, and this job is the proof.
         run: uv run pytest
 
+  # The id stays `macos-keychain` although the job now runs everything: it is
+  # the name branch protection matches on, and renaming it silently drops the
+  # required check.
   macos-keychain:
     runs-on: macos-latest
 
@@ -60,10 +63,15 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Run macOS Keychain tests (contract + real security wrapper)
+      - name: Run the whole suite (not only the Keychain files)
+        # THE NARROW SELECTION WAS A BLIND SPOT, not a saving. Three cases
+        # assert a Linux store layout — the XDG backup root, and an `.enc`
+        # the Keychain path never writes — and failed on macOS while every
+        # job here stayed green, because this job never ran them.
+        #
         # faulthandler dumps every thread's stack if a test exceeds 60s — a
         # `security` call blocking on an invisible SecurityAgent dialog would
         # otherwise hang the job with no clue where. The step timeout is the
-        # backstop that actually kills it.
-        timeout-minutes: 5
-        run: uv run pytest tests/test_macos_keychain_contract.py tests/test_macos_keychain.py -v -o faulthandler_timeout=60
+        # backstop that actually kills it, raised for the wider selection.
+        timeout-minutes: 15
+        run: uv run pytest -o faulthandler_timeout=60

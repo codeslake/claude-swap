@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from claude_swap.credentials import CredentialStore
 from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
@@ -449,6 +450,20 @@ class TestSwapUnreadableSourceIsNotAbsent:
     an empty credential at its new number. Fixed with
     ``_read_account_credentials_ex``, aborting BEFORE anything moves.
     """
+
+    @pytest.fixture(autouse=True)
+    def _file_mode(self, monkeypatch):
+        """THE `.enc`/`.prev` FILES ARE THIS CLASS'S SUBJECT, so the store
+        must route to them on every platform.
+
+        On macOS a usable Keychain takes the write and reconciles the `.enc`
+        away, so the backup these cases make unreadable was never written as
+        a file at all: `chmod` raises FileNotFoundError, and the retained
+        generation lands in the Keychain where `_prev_backup_path` cannot
+        see it. The conflation under test belongs to the FILE reader, and
+        this is the routing that reaches it.
+        """
+        monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
 
     def _write(self, switcher, data):
         switcher._setup_directories()
