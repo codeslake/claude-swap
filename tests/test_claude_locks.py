@@ -494,6 +494,14 @@ class TestTheAcquireAndReleaseAreBounded:
             f"the acquire leaked {after - before} descriptor(s) on a failed "
             "identity read, pinned to an inode it then unlinked"
         )
+        # AND THE DIRECTORY IS GONE. The arm makes the lock and then cannot
+        # read it back; leaving it behind is a lock with no holder and no
+        # heartbeat, which every waiter must sit out for the whole staleness
+        # window. The fd count alone does not see that.
+        assert not lock.exists(), (
+            "the acquire left the lock directory behind after failing to "
+            "identify it — an orphan no process holds and none will refresh"
+        )
 
     def _successor_at(self, lock, mtime_ns):
         """Replace the lock with a fresh directory carrying `mtime_ns`."""
@@ -504,8 +512,13 @@ class TestTheAcquireAndReleaseAreBounded:
 
     @pytest.mark.parametrize(
         "offset_ns,label",
-        [(-2_000_000_000, "stamped BEFORE our last write"),
-         (2_000_000_000, "stamped AFTER it, adopted through a failed read-back")],
+        # BOTH REACH THE SAME GUARD, and the labels used to claim otherwise.
+        # Instrumented, each param fires only the read-back-mismatch site --
+        # neither reaches `_ours`'s rewind branch nor the adopt branch, which
+        # has its own case. What varies is the SUCCESSOR's stamp relative to
+        # ours, and the guard must refuse to remove in both directions.
+        [(-2_000_000_000, "successor stamped EARLIER than our last write"),
+         (2_000_000_000, "successor stamped LATER than our last write")],
     )
     def test_an_unproven_tick_forbids_the_release_from_removing(
         self, tmp_path, monkeypatch, caplog, offset_ns, label
