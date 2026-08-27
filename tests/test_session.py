@@ -3043,8 +3043,21 @@ def _bare_print_printers() -> set[str]:
         (Path(__file__).resolve().parent.parent
          / "src" / "claude_swap" / "printer.py").read_text(encoding="utf-8")
     )
+    # REACHABLE AS `printer.<name>(...)`, which is what the matcher looks for.
+    # A def inside an `if`/`try` at module level is; one inside a class or
+    # another function is not, and counting it exports a name that then marks
+    # an unrelated local of the same name in another module as a printer.
+    nested = {
+        id(inner)
+        for outer in ast.walk(tree)
+        if isinstance(outer, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        for inner in ast.walk(outer)
+        if inner is not outer
+        and isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
     funcs = [n for n in ast.walk(tree)
-             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and id(n) not in nested]
     # `ast.walk`, not `tree.body`: a printer defined inside an `if`, a `try`
     # or a class is still a printer. And a FIXPOINT, because a printer that
     # DELEGATES to one reaches `print` just as surely -- a new `notice()`
@@ -3052,16 +3065,31 @@ def _bare_print_printers() -> set[str]:
     # scan alone reports it as safe.
     found: set[str] = set()
     while True:
-        grown = {
-            f.name for f in funcs
+        grown = set()
+        for f in funcs:
+            # A NAME THE FUNCTION DEFINES ITSELF IS NOT THE PRINTER. A local
+            # `def warning(x): return x` shadows the module one, prints
+            # nothing, and would otherwise promote its enclosing function --
+            # which then marks every unrelated call of that name elsewhere.
+            shadowed = {
+                n.name for n in ast.walk(f)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n is not f
+            }
             if any(isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                   and sub.func.id not in shadowed
                    and (sub.func.id == "print" or sub.func.id in found)
-                   for sub in ast.walk(f))
-        }
+                   for sub in ast.walk(f)):
+                grown.add(f.name)
         if grown <= found:
             break
         found |= grown
-    assert found, "no bare-print printer found — the parse or the layout moved"
+    # NO FLOOR ON THE POPULATION. An empty answer is what a printer module
+    # with no bare `print` gives, and that tree is strictly healthier. Asserted
+    # here it fires at IMPORT: measured, rewriting the two printers to
+    # `sys.stdout.write` -- a real weakening, still erased by the screen blank
+    # -- collected 0 of 199 tests and blamed "the parse or the layout". The
+    # matcher keeps its own denominator, and `_PRINTERS` always holds `print`.
     return found
 
 
