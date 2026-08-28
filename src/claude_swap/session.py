@@ -336,9 +336,8 @@ def _artifacts_say_usable(
     # alone. `reseeded` is the caller saying the artifacts are the BACKUP's,
     # which is the only state in which that leniency has a premise.
     # ponytail: a backup whose `oauthAccount` carries no `emailAddress` keeps
-    # the identity unreadable through every re-seed, so such a profile
-    # re-seeds on each launch whose probe fails -- one refresh grant each.
-    # Repair the backup; do not relax this.
+    # the identity unreadable through every re-seed, so that profile re-seeds
+    # on each launch whose probe fails. Repair the backup, not this.
     if not reseeded and read_session_identity(session_dir) is None:
         return False
     return _may_have_credential_material(session_dir) and (
@@ -850,13 +849,11 @@ class SessionManager:
             if verdict not in ("valid", "unreachable") and not reseeded:
                 # THE GATE'S OWN REASON, or the remedy below is one the user
                 # cannot act on -- so every verdict the GATE blocked lands
-                # here, not just "invalid". `unreachable` is not one of them:
-                # `claude` could not be spawned, which no amount of exiting
-                # instances or repairing records changes, and both remedies
-                # below cost the user something to learn that. An unreadable
-                # record makes every gate on this path defer, and nothing in
-                # cswap prunes a record -- so `--add-account` routes through
-                # the same chokepoint and repairs nothing, and
+                # here, not just "invalid". `unreachable` is not one: `claude`
+                # could not be spawned, which neither remedy below changes.
+                # An unreadable record makes every gate on this path defer,
+                # and nothing in cswap prunes a record -- so `--add-account`
+                # routes through the same chokepoint and repairs nothing, and
                 # `--remove-account` refuses for the same reason. Only the
                 # file itself.
                 _live, _unreadable = scan_live_sessions(session_dir)

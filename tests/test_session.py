@@ -923,6 +923,21 @@ class TestBootstrap:
             "error the user sees says the profile is left in place"
         )
 
+    @staticmethod
+    def _spy_on_sweep(monkeypatch) -> list[str]:
+        """Record every `_cleanup_failed_session`, still running the real one."""
+        swept: list[str] = []
+        real = session_mod.SessionManager._cleanup_failed_session
+
+        def spy(self, path):
+            swept.append(str(path))
+            return real(self, path)
+
+        monkeypatch.setattr(
+            session_mod.SessionManager, "_cleanup_failed_session", spy
+        )
+        return swept
+
     def test_a_swept_profile_keeps_the_only_copy_of_its_mcp_servers(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
         block_real_keychain
@@ -996,16 +1011,7 @@ class TestBootstrap:
         (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
         (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
 
-        swept: list[str] = []
-        real = session_mod.SessionManager._cleanup_failed_session
-
-        def spy(self, path):
-            swept.append(str(path))
-            return real(self, path)
-
-        monkeypatch.setattr(
-            session_mod.SessionManager, "_cleanup_failed_session", spy
-        )
+        swept = self._spy_on_sweep(monkeypatch)
 
         import subprocess
 
@@ -1037,16 +1043,7 @@ class TestBootstrap:
         (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
         (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
 
-        swept: list[str] = []
-        real = session_mod.SessionManager._cleanup_failed_session
-
-        def spy(self, path):
-            swept.append(str(path))
-            return real(self, path)
-
-        monkeypatch.setattr(
-            session_mod.SessionManager, "_cleanup_failed_session", spy
-        )
+        swept = self._spy_on_sweep(monkeypatch)
 
         def always_invalid(cmd, env=None, **kwargs):
             return SimpleNamespace(
