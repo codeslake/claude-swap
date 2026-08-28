@@ -9301,6 +9301,85 @@ class TestSetPinNamesTheAccountItIsPinning:
             "afterwards is owned by the account that was UNPINNED")
 
 
+class TestTheUnspliceComparesOneVocabulary:
+    """The record and the config say the org uuid from two different sources.
+
+    `set_pin` stores the ROSTER row's org in the record -- `account_is_pinned`
+    reads it that way -- while the splice writes the account's OWN
+    `oauthAccount`, which is what Claude Code compares a bridge owner against
+    and which a backup config may carry without an org key at all. Comparing
+    across them made the un-splice decline, so `--clear` reported success over
+    a config that still named the pin.
+    """
+
+    def _sw(self, *, config_org=None, acct="UUID-2"):
+        import json as _json
+
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        sw._get_sequence_data = lambda: {"accounts": {
+            "2": {"email": "cloud@example.com", "organizationUuid": "org-B",
+                  "uuid": "UUID-2"},
+        }}
+        sw._resolve_account_identifier = lambda _ident: "2"
+        stored = {"emailAddress": "cloud@example.com", "accountUuid": "UUID-2"}
+        if config_org is not None:
+            stored["organizationUuid"] = config_org
+        sw._read_account_config = lambda num, email: _json.dumps(
+            {"oauthAccount": stored})
+        current = dict(stored)
+        current["accountUuid"] = acct
+        return sw, current
+
+    def test_a_backup_config_with_no_org_still_names_the_pin(self):
+        from claude_swap import pin
+
+        sw, current = self._sw(config_org=None)
+        # PREMISE: this is exactly the disagreement -- the record says org-B,
+        # the config carries no org key at all.
+        assert "organizationUuid" not in current
+        assert pin._config_names_the_pin(
+            sw, current, ("cloud@example.com", "org-B")
+        ), (
+            "DEFECT: the config names the pin and the un-splice declined, so "
+            "`--clear` leaves ~/.claude.json naming the ex-pin and reports "
+            "success"
+        )
+
+    def test_the_reverse_disagreement_also_names_it(self):
+        from claude_swap import pin
+
+        sw, current = self._sw(config_org="org-B")
+        assert pin._config_names_the_pin(
+            sw, current, ("cloud@example.com", "")
+        )
+
+    def test_control_a_sibling_at_the_same_address_does_not(self):
+        """CONTROL: the check must still refuse a config the pin never wrote.
+
+        One address in two slots is cswap's documented personal/org pattern,
+        and rewriting the sibling's config would swap the account identity
+        outright. The accountUuid is what separates them -- a stronger key
+        than the composite this replaced, not a weaker one.
+        """
+        from claude_swap import pin
+
+        sw, current = self._sw(config_org=None, acct="UUID-SIBLING")
+        assert not pin._config_names_the_pin(
+            sw, current, ("cloud@example.com", "org-B")
+        )
+
+    def test_control_a_different_address_does_not(self):
+        from claude_swap import pin
+
+        sw, current = self._sw(config_org=None)
+        assert not pin._config_names_the_pin(
+            sw, current, ("someone-else@example.com", "org-B")
+        )
+
+
 class TestAnAmbiguousAddressStillNamesThePin:
     """One address in two slots must not silence the splice.
 

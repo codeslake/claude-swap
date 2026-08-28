@@ -225,6 +225,41 @@ def clear_wiring(switcher, timeout: float | None = None, only=None,
     return changed
 
 
+def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
+    """Does this config's ``oauthAccount`` name the pinned account?
+
+    THE RECORD AND THE CONFIG SPEAK DIFFERENT VOCABULARIES for the org uuid,
+    and the un-splice used to compare across them. The record's
+    ``pinnedOrganizationUuid`` is the ROSTER row's -- `account_is_pinned`
+    reads it that way -- while the splice writes the account's OWN
+    ``oauthAccount``, which is what Claude Code compares a bridge owner
+    against and which a backup config may carry without an org key at all.
+    The two disagree routinely, the equality then failed, and `--clear`
+    reported success over a config that still named the pin.
+
+    So ask the WRITER. Whatever `identity_for_config` answers for the pinned
+    address is what was spliced, and it carries an ``accountUuid`` -- a
+    stronger key than the composite, and one the record does not hold.
+
+    THE COMPOSITE REMAINS THE FALLBACK, because an address alone is not an
+    account: the documented personal/org pattern puts one address in two
+    slots, and an email-only test cannot tell a splice from a genuine /login
+    into a same-address sibling.
+    """
+    if (current.get("emailAddress") or "").casefold() != (
+        pinned[0] or ""
+    ).casefold():
+        return False
+    try:
+        mine = identity_for_config(switcher, email=pinned[0])
+    except Exception:  # noqa: BLE001 — a lookup must not block a clear
+        mine = None
+    uuid = (mine or {}).get("accountUuid")
+    if uuid:
+        return current.get("accountUuid") == uuid
+    return (current.get("organizationUuid") or "") == (pinned[1] or "")
+
+
 def _clear_wiring_locked(switcher, path, unsplice=None) -> bool:
     """The read-modify-write of :func:`clear_wiring`, under its lock.
 
@@ -256,16 +291,8 @@ def _clear_wiring_locked(switcher, path, unsplice=None) -> bool:
     if unsplice:
         pinned, identity = unsplice
         current = raw.get("oauthAccount")
-        # THE COMPOSITE, because an address alone is not an account. The
-        # documented personal/org pattern puts one address in two slots, and
-        # `_live_login_identity` makes the same argument in the same words:
-        # an email-only test cannot tell a splice from a genuine /login into
-        # a same-address sibling, so it rewrites a config the pin never
-        # touched and swaps the account identity outright.
-        if identity and isinstance(current, dict) and (
-            ((current.get("emailAddress") or "").casefold(),
-             current.get("organizationUuid") or "")
-            == ((pinned[0] or "").casefold(), pinned[1] or "")
+        if identity and isinstance(current, dict) and _config_names_the_pin(
+            switcher, current, pinned
         ):
             raw["oauthAccount"] = identity
             unspliced = True
