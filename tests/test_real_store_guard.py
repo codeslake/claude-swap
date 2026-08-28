@@ -651,6 +651,39 @@ def test_mkdir_exist_ok_true_does_not_swallow_the_refusal(
         (stand_in_root / "sequence.json").write_text("{}", encoding="utf-8")
 
 
+def test_a_relative_candidate_that_already_carries_a_hint_is_still_joined(
+    tmp_path, monkeypatch
+):
+    """A relative path that ALREADY matches the pre-filter must still be
+    joined against the cwd, or it can never match an absolute root.
+
+    The store's own layout supplies such spellings — `configs/.claude-config
+    -<n>-<email>.json` carries `.claude` in the relative string itself — so
+    gating the join on `not hinted` let precisely the store-shaped relative
+    writes through while refusing the bare-filename ones.
+    """
+    stand_in_root = tmp_path / "claude-swap"
+    (stand_in_root / "configs").mkdir(parents=True)
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((stand_in_root, True),))
+    monkeypatch.chdir(stand_in_root)
+
+    # CONTROL: the bare filename misses the pre-filter, so it takes the join
+    # and is refused. If this stops failing the case below proves nothing.
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        with open("sequence.json", "w", encoding="utf-8") as handle:
+            handle.write("{}")
+
+    hinted_relative = "configs/.claude-config-1-someone_example.com.json"
+    assert any(h in hinted_relative for h in conftest._REAL_STORE_HINTS), (
+        "premise: this spelling must PASS the cheap reject, or the case is "
+        "exercising the control's path instead of the one under test"
+    )
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        with open(hinted_relative, "w", encoding="utf-8") as handle:
+            handle.write('{"pwned": true}')
+    assert not (stand_in_root / hinted_relative).exists()
+
+
 def test_the_legacy_backup_root_is_protected_recursively():
     """`~/.claude-swap-backup` is a SEPARATE live path on Linux -- `switcher`
     migrates data out of it and purges it -- and nothing was asserting it.

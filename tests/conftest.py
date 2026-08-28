@@ -356,14 +356,16 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         # case (an absolute path with no hint substring) never pays for a
         # cwd lookup or a Path() construction below.
         hinted = any(hint in candidate for hint in _REAL_STORE_HINTS)
-        if not hinted and not os.path.isabs(candidate):
+        if not os.path.isabs(candidate):
             # I-3: a RELATIVE path is resolved against os.getcwd() by every
             # syscall this hook guards — `open("sequence.json", "w")` with a
             # cwd inside a protected root writes there exactly as much as
-            # the absolute spelling would. The raw relative string never
-            # contains a hint substring on its own (it's just a filename),
-            # so the cheap reject above cannot be trusted for it alone —
-            # join against the real cwd and re-check before rejecting.
+            # the absolute spelling would. EVERY relative candidate is
+            # joined, hinted or not: a relative path that already carries a
+            # hint (`configs/.claude-config-1-<email>.json`) passes the
+            # cheap reject and then can never equal, or sit under, an
+            # ABSOLUTE root — so gating the join on a missed pre-filter
+            # let exactly the store-shaped spellings through.
             # Relative candidates are rare (pytest/import-machinery/stdlib
             # activity — the overwhelming majority of audit events — pass
             # absolute paths), so this extra join only costs the uncommon
