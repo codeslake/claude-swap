@@ -7147,7 +7147,13 @@ class ClaudeAccountSwitcher:
                     # transaction path says "rollback also failed"; so does
                     # this one.
                     unrestored: list[str] = []
+                    # SET WHERE THE GUARD LIVES, not recomputed beside it. A
+                    # token says an arm was ARMED; each arm needs a snapshot
+                    # too, and a copy of those three conditions would desync
+                    # the moment one of them changed.
+                    attempted = False
                     if sequence_written and rollback_sequence_text:
+                        attempted = True
                         try:
                             # RESTORE, DO NOT INSPECT. The gate here asked
                             # whether the roster was EMPTY, and the recovery
@@ -7165,6 +7171,7 @@ class ClaudeAccountSwitcher:
                             )
                             unrestored.append(f"{self.sequence_file.name} ({e})")
                     if config_written and rollback_config_text is not None:
+                        attempted = True
                         try:
                             # THE THIRD RESTORE ARM. `config_written` is armed
                             # before the write, so this runs on faults where
@@ -7180,6 +7187,7 @@ class ClaudeAccountSwitcher:
                             )
                             unrestored.append(f"{config_path.name} ({e})")
                     if creds_written and rollback_creds is not None:
+                        attempted = True
                         try:
                             self._write_credentials(rollback_creds)
                         except Exception as e:
@@ -7200,12 +7208,20 @@ class ClaudeAccountSwitcher:
                         # rollback left the common one raising `_write_json`'s
                         # bare `OSError`, which is not a `ClaudeSwitchError` --
                         # so `--json` printed nothing on stdout and a traceback
-                        # instead. Gated on an arm having run, like the
-                        # sibling's `if transaction.completed_steps`, so a
-                        # failure before the first write still reports itself.
+                        # instead. Gated on a WRITE having happened, like the
+                        # sibling's `if transaction.completed_steps`.
+                        #
+                        # The gate is wider than the arms on purpose: with no
+                        # prior login and no config -- a fresh or just-imported
+                        # machine -- the target credential is written and every
+                        # snapshot is absent, so nothing is restored and the
+                        # user still has to be told. Saying "rolled back"
+                        # there would be the same false sentence this arm
+                        # exists to prevent.
                         raise SwitchError(
-                            f"Activation failed and was rolled back: "
-                            f"{activation_error}"
+                            f"Activation failed and "
+                            f"{'was rolled back' if attempted else 'could NOT be rolled back (no prior state to restore)'}"
+                            f": {activation_error}"
                         ) from activation_error
                     raise
 

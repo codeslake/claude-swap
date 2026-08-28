@@ -4128,7 +4128,7 @@ class TestPerformSwitchPostDisplay:
         try:
             with patch.object(
                 switcher, "_write_json", side_effect=failing_write_json,
-            ), pytest.raises(SwitchError, match="disk full"):
+            ), pytest.raises(SwitchError, match="was rolled back"):
                 switcher._perform_switch("1")
         finally:
             for p in patches:
@@ -8533,9 +8533,12 @@ class TestDirectActivationPreservation:
                 raise OSError(errno.ENOSPC, "no space left on device")
             return real_write_json(self, path, data)
 
+        refused = []
+
         def refuse_every_restore(src, dst, *a, **k):
             # At `models`' own binding, so only `_restore_atomically` sees it.
             # EACCES is not EBUSY, so the helper refuses instead of rewriting.
+            refused.append(os.path.basename(os.fspath(dst)))
             raise OSError(errno.EACCES, "permission denied")
 
         def creds_ok_then_refused(creds):
@@ -8561,6 +8564,12 @@ class TestDirectActivationPreservation:
             f"premise: the credentials arm must run, got {wrote['creds']} "
             "write(s)"
         )
+        # PREMISE: the other two arms were entered and refused too. Without
+        # this an arm that stopped RUNNING would fail below as though the
+        # report had gone silent, which is a different defect.
+        assert {"sequence.json", ".claude.json"} <= set(refused), (
+            f"premise: both file arms must attempt a restore, got {refused}"
+        )
         message = str(excinfo.value)
         for destination in (
             switcher.sequence_file.name, config_path.name, "the live credential",
@@ -8570,6 +8579,56 @@ class TestDirectActivationPreservation:
                 f"report does not name it. The user is told the activation "
                 f"failed and nothing else: {message}"
             )
+
+    def test_direct_activation_does_not_claim_a_rollback_it_never_made(
+        self, temp_home
+    ):
+        """The tokens say an arm was ARMED, not that it restored anything.
+
+        Each arm carries a second condition the report must mirror: there
+        has to be a snapshot to put back. On a machine with no prior live
+        login and no `~/.claude.json` -- fresh, post-purge, or just
+        imported, which is the population this path exists for -- the
+        target credential is written and then the config write fails. Every
+        snapshot is None, so every arm is skipped and nothing is restored.
+
+        Announcing "was rolled back" there is the same false sentence this
+        branch treats as a defect everywhere else, and it is worse than
+        silence: the target's token IS the live credential now, and the
+        roster does not know it.
+        """
+        switcher, _ = self._setup(temp_home, live_identity_email=None)
+        # No prior live login either: both snapshots are absent.
+        (temp_home / ".claude" / ".credentials.json").unlink()
+        config_path = temp_home / ".claude.json"
+        assert not config_path.exists(), "premise: no prior config"
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+
+        def fail_the_config(self, path, data):
+            if os.path.basename(os.fspath(path)) == ".claude.json":
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_config,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: nothing was restored, or there is no false claim to make.
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one", (
+            "premise: the target credential must be live and unrestored"
+        )
+
+        assert "was rolled back" not in str(excinfo.value), (
+            "DEFECT: the report claims a rollback that never happened. Every "
+            "snapshot was absent so every arm was skipped, and the target's "
+            "credential is the live login while the roster does not know it: "
+            f"{excinfo.value}"
+        )
 
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
@@ -8647,7 +8706,7 @@ class TestDirectActivationPreservation:
 
         with patch.object(
             switcher, "_write_json", side_effect=fail_sequence_write
-        ), pytest.raises(SwitchError, match="disk full"):
+        ), pytest.raises(SwitchError, match="was rolled back"):
             switcher._perform_switch("1", emit_output=False)
 
         # Both halves rolled back: the settings config and the orphaned login.
