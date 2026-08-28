@@ -1277,11 +1277,11 @@ class ClaudeAccountSwitcher:
         # keys' profile paths the two NEW homes, so this prune deletes both
         # accounts' profiles. A leaked backup is the failure mode this block
         # already accepts; a deleted profile is not.
-        homes = {
-            self._session_dir(num_b, email_a),
-            self._session_dir(num_a, email_b),
-        }
         if email_a != email_b:
+            homes = {
+                self._session_dir(num_b, email_a),
+                self._session_dir(num_a, email_b),
+            }
             for num, email in ((num_a, email_a), (num_b, email_b)):
                 if self._session_dir(num, email) in homes:
                     self._logger.error(
@@ -1478,15 +1478,10 @@ class ClaudeAccountSwitcher:
             # are the same two names, and setting first would erase it.
             # WHETHER THE RENAME LANDED, never whether the destination
             # exists: with one shared email `new_a` IS `dir_b`, so existence
-            # is true when nothing moved at all and the two profiles resolve
-            # to each other. The flags then swap onto the wrong profiles on
-            # every path that skips the renames.
-            # AND A THAT DID NOT LAND IS NOT NECESSARILY AT `dir_a`. It is
-            # parked under the staging name first, and the recovery below
-            # refuses to put it back when `dir_a` is occupied -- which is
-            # exactly what B landing there does under one shared email. Left
-            # as `dir_a`, A's flag is written onto B's profile and A's own
-            # is dropped.
+            # is true when nothing moved at all. And a profile that did not
+            # land is not necessarily at its old name -- it is parked under
+            # the staging name, and the recovery refuses to put it back when
+            # the other one has arrived there.
             if a_landed:
                 here_a = new_a
             elif staging is not None and os.path.exists(staging):

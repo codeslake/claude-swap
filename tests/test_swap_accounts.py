@@ -2964,7 +2964,6 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         # PREMISE: with one shared email the destination names ARE the sources.
         assert s._session_dir("2", email) == d2 and s._session_dir("1", email) == d1
 
-        real = os.replace
         calls = []
 
         def refuse(src, dst, *a, **k):
@@ -2976,9 +2975,6 @@ class TestASwapKeepsEachProfilesOwnGeneration:
             s._swap_session_dirs("1", email, "2", email, moved)
 
         # PREMISE: nothing moved, so both profiles are exactly where they were.
-        print(f"\nreplace attempts: {len(calls)}   moved: {moved}")
-        print(f"slot1 holds {(d1 / 'marker').read_text()}   slot2 holds {(d2 / 'marker').read_text()}")
-        print(f"slot1 flagged={is_session_stale(d1)}   slot2 flagged={is_session_stale(d2)}")
         assert len(calls) >= 1, "premise: a rename must have been attempted"
         assert (d1 / "marker").read_text() == "SLOT-1-HISTORY"
         assert (d2 / "marker").read_text() == "SLOT-2-HISTORY"
@@ -3016,10 +3012,8 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         assert is_session_stale(d1) and not is_session_stale(d2)
 
         real = os.replace
-        calls = []
 
         def refuse_a_second_leg(src, dst, *a, **k):
-            calls.append((os.path.basename(str(src)), os.path.basename(str(dst))))
             if str(src).endswith(".swapping"):
                 raise OSError(errno.EACCES, "refused")
             return real(src, dst, *a, **k)
@@ -3053,7 +3047,6 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         # PREMISES: the addresses differ and their slugs collide.
         assert e1 != e2
         assert s._session_dir("1", e1).name == s._session_dir("2", e2).name.replace("2-", "1-")
-        before = sorted(p.name for p in s.backup_dir.glob("sessions/*/marker"))
         before_txt = sorted((p / "marker").read_text() for p in (s.backup_dir / "sessions").iterdir())
         assert len(before_txt) == 2, f"premise: two profiles on disk, got {before_txt}"
 
