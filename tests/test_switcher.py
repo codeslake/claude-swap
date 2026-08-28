@@ -3555,7 +3555,11 @@ class TestPerformSwitchPostDisplay:
         )
         tx.record_step("sequence_updated")
 
-        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        # RESTORED, like its three siblings. A disposition is PROCESS-WIDE and
+        # pytest runs the file in one process, so leaving SIGXFSZ at SIG_IGN
+        # leaks into every later test in this worker -- a case that means to
+        # be killed by the signal then sees an EFBIG it never asked for.
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
         soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
         # PREMISE: a quota that cannot hold the roster, so the restore fails
         # for the same reason the write did.
@@ -3565,6 +3569,7 @@ class TestPerformSwitchPostDisplay:
             tx.rollback(_Switcher())
         finally:
             resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
 
         text = roster.read_text(encoding="utf-8")
         assert text == original, (
@@ -3672,6 +3677,67 @@ class TestPerformSwitchPostDisplay:
             f"{dest.stat().st_size}B)"
         )
 
+    def test_a_restore_refuses_a_publish_error_that_is_not_ebusy(
+        self,
+        temp_home: Path,
+    ) -> None:
+        """Only EBUSY authorises the in-place rewrite.
+
+        EBUSY on the publish is a fact about the DESTINATION -- a bind-mounted
+        file pins the inode, so no rename can ever land there and writing
+        through is the only way. Every other publish errno says something
+        else (an immutable destination answers EPERM), and rewriting on that
+        reading opens the destination with O_TRUNC on nothing but a guess.
+        Refusing costs the caller a restore it is told about; rewriting can
+        cost it the file.
+
+        The second half is the control: the same call, the same instrument,
+        the one errno that DOES write through -- without it "no rewrite
+        happened" is a claim the test has no power to make.
+        """
+        from claude_swap import models as models_mod
+
+        dest = temp_home / ".claude.json"
+        original = json.dumps({"projects": {f"/p/{i}": [1] * 20
+                                            for i in range(200)}})
+        dest.write_text(original, encoding="utf-8")
+
+        def refuse(src, dst, *a, **k):
+            raise OSError(errno.EPERM, "operation not permitted")
+
+        with patch.object(models_mod, "replace_with_retry", side_effect=refuse):
+            with pytest.raises(OSError) as caught:
+                _restore_atomically(dest, original)
+
+        assert caught.value.errno == errno.EPERM, (
+            "DEFECT: a publish error that is not EBUSY was swallowed by an "
+            "in-place rewrite, so the caller is told the restore landed when "
+            f"nothing checked whether it could ({caught.value.errno})"
+        )
+        assert dest.read_text(encoding="utf-8") == original, (
+            "the refused restore must leave the destination as it was"
+        )
+        assert not [q for q in temp_home.iterdir() if ".restore." in q.name], (
+            "a refused restore must not strand its temp"
+        )
+
+        # CONTROL: the one errno that IS about the destination. The rename
+        # never succeeds under either patch, so a destination that comes back
+        # holding `original` can only have been written through -- which is
+        # what proves the case above measured a refusal and not an inert test.
+        dest.write_text("", encoding="utf-8")
+
+        def busy(src, dst, *a, **k):
+            raise OSError(errno.EBUSY, "device or resource busy")
+
+        with patch.object(models_mod, "replace_with_retry", side_effect=busy):
+            _restore_atomically(dest, original)
+
+        assert dest.read_text(encoding="utf-8") == original, (
+            "premise: EBUSY must still write through, or the case above "
+            "proves nothing about the narrowing"
+        )
+
     def test_a_write_through_that_empties_the_roster_is_rolled_back(
         self,
         temp_home: Path,
@@ -3768,6 +3834,109 @@ class TestPerformSwitchPostDisplay:
         back = json.loads(text)
         assert back["accounts"] == roster["accounts"], (
             "the roster survived but its accounts did not"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is POSIX-only",
+    )
+    def test_the_transaction_rollback_does_not_truncate_an_intact_config(
+        self,
+        temp_home: Path,
+    ):
+        """The transaction's config arm, on a destination the write never
+        opened.
+
+        `record_step("config_written")` is armed BEFORE the write, so the arm
+        runs on faults where `_write_json`'s temp write failed and
+        `~/.claude.json` still holds the intact original. `Path.write_text`
+        opens with O_TRUNC, so restoring that way destroys the very bytes it
+        is holding when the rewrite hits the same fault.
+
+        The direct-activation path has this witness; the transaction path is
+        the sibling that did not.
+        """
+        import resource
+        import signal
+
+        from claude_swap import models as models_mod
+
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "current@example.com", "accountUuid": "",
+                "organizationUuid": "", "organizationName": "",
+            },
+            "userID": "user-abcdef",
+            "mcpServers": {"a": {"command": "x"}},
+            "projects": {
+                f"/p/{i}": {"allowedTools": ["Bash", "Read"] * 8}
+                for i in range(700)
+            },
+        }))
+        original = config_path.read_text(encoding="utf-8")
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 2,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                n: {"email": f"{w}@example.com", "uuid": f"u{n}",
+                    "organizationUuid": "", "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z"}
+                for n, w in (("1", "target"), ("2", "current"))
+            },
+        })
+        for n, w in (("1", "target"), ("2", "current")):
+            switcher._write_account_credentials(n, f"{w}@example.com", json.dumps(
+                {"claudeAiOauth": {"accessToken": f"t-{w}", "refreshToken": "r"}}))
+            switcher._write_account_config(n, f"{w}@example.com", json.dumps(
+                {"oauthAccount": {"emailAddress": f"{w}@example.com",
+                                  "accountUuid": f"u{n}"}}))
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "t-current", "refreshToken": "r"}}))
+
+        cap = 100_000
+        # PREMISE: the config cannot fit under the cap, so the write faults.
+        assert len(original) > cap
+
+        real_rollback = models_mod.SwitchTransaction.rollback
+        armed = []
+
+        def spy(self, sw):
+            armed.extend(self.completed_steps)
+            return real_rollback(self, sw)
+
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+        try:
+            # The backup step writes this SAME oversized config to the slot
+            # store, which the cap also refuses -- that raise lands before any
+            # step is recorded, so the rollback would never run and this case
+            # would certify a branch it never entered.
+            with patch.object(switcher, "_write_account_config"), patch.object(
+                models_mod.SwitchTransaction, "rollback", spy,
+            ), patch.object(switcher, "list_accounts"), pytest.raises(
+                SwitchError
+            ):
+                switcher._perform_switch("1", emit_output=False)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+
+        # PREMISE: the arm really ran, or this asserts the absence of damage
+        # nothing attempted.
+        assert "config_written" in armed, (
+            f"premise: the config arm must be armed when the rollback ran, "
+            f"got {armed}"
+        )
+        text = config_path.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the transaction rollback truncated the config the failed "
+            f"write never touched ({len(original)}B -> {len(text)}B) -- "
+            "`oauthAccount`, `userID`, `mcpServers` and `projects` are gone"
         )
 
     def test_a_write_through_that_empties_the_config_is_rolled_back(
@@ -8072,8 +8241,15 @@ class TestDirectActivationPreservation:
         soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
         resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
         try:
+            # `SwitchError`, not the write's own `OSError`. The cap refuses
+            # the RESTORE's temp too, so this fault is also a refused
+            # rollback -- and a refused rollback is now reported rather than
+            # logged, exactly as the transaction path reports it. The report
+            # is conservative on this shape: it says the bytes were not put
+            # back, which is true, while the assertion below shows the
+            # destination never lost them.
             with patch.object(switcher, "list_accounts"):
-                with pytest.raises(OSError):
+                with pytest.raises(SwitchError) as excinfo:
                     switcher._perform_switch("1", emit_output=False)
         finally:
             resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
@@ -8083,6 +8259,263 @@ class TestDirectActivationPreservation:
         assert text == original, (
             "DEFECT: the direct-activation rollback truncated the config the "
             f"failed write never touched ({len(original)}B -> {len(text)}B)"
+        )
+        assert "rollback also failed" in str(excinfo.value), (
+            "a restore the helper refused must reach the caller, not just "
+            f"the log: {excinfo.value}"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="a 0o444 destination refusing the recovery's own emptying is "
+               "a POSIX shape",
+    )
+    def test_direct_activation_rollback_restores_a_partial_roster(
+        self, temp_home
+    ):
+        """The roster arm must restore, not inspect what it finds.
+
+        `_write_json`'s write-through recovery empties a partial only when
+        the emptying itself succeeds; refused, the destination keeps a few
+        bytes of half-written JSON. An arm that restores only an EMPTY
+        roster leaves that partial in place, and `_get_sequence_data` reads
+        strictly -- so every later cswap invocation refuses to run.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        switcher, _ = self._setup(temp_home)
+        original = switcher.sequence_file.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = switcher_mod.replace_with_retry
+        real_write_json = ClaudeAccountSwitcher._write_json
+        calls = []
+        at_arm = {}
+
+        def busy_publish(src, dst, *a, **k):
+            if os.path.basename(os.fspath(dst)) == "sequence.json":
+                calls.append("replace")
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == "sequence.json":
+                calls.append("copy")
+                fd = os.open(dest, os.O_WRONLY | os.O_TRUNC)
+                os.write(fd, b"{par")
+                os.close(fd)
+                # THE SAME FAULT BLOCKS THE RECOVERY'S OWN EMPTYING, which
+                # `_unnarrow` performs by opening the destination 'wb'. That
+                # is the branch it documents: refused, the partial stays.
+                os.chmod(dest, 0o444)
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        def spy_write_json(self, path, data):
+            # WHAT THE ARM IS HANDED, read independently of the arm -- an
+            # arm that never runs must still fail on the defect assertion,
+            # not on this premise.
+            try:
+                return real_write_json(self, path, data)
+            except BaseException:
+                if os.path.basename(os.fspath(path)) == "sequence.json":
+                    at_arm["text"] = path.read_text(encoding="utf-8")
+                raise
+
+        try:
+            with patch.object(
+                switcher_mod, "replace_with_retry", side_effect=busy_publish,
+            ), patch.object(
+                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+            ), patch.object(
+                ClaudeAccountSwitcher, "_write_json", spy_write_json,
+            ), patch.object(switcher, "list_accounts"), pytest.raises(
+                ConfigError
+            ):
+                switcher._perform_switch("1", emit_output=False)
+        finally:
+            os.chmod(switcher.sequence_file, 0o600)
+            switcher_mod.shutil.copyfile = real_copyfile
+
+        # PREMISES: the roster's write-through really ran, and the recovery
+        # really could not empty what it left -- or this case asserts the
+        # repair of damage nothing did.
+        assert calls == ["replace", "copy"], (
+            f"premise: the roster's write-through must run, got {calls}"
+        )
+        assert at_arm.get("text") == "{par", (
+            "premise: the arm must be entered on a PARTIAL roster, got "
+            f"{at_arm.get('text')!r}"
+        )
+
+        text = switcher.sequence_file.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the rollback left a partial roster in place. The arm "
+            "restores only an EMPTY one, and a few bytes of half-written "
+            f"JSON is not empty ({len(original)}B -> {len(text)}B, "
+            f"{text[:16]!r})"
+        )
+        # The consequence, at the seam that suffers it.
+        later = ClaudeAccountSwitcher()
+        later.platform = Platform.LINUX
+        assert (later._get_sequence_data() or {}).get("accounts", {}).keys() == {
+            "1"
+        }, "the roster came back but cswap still cannot read it"
+
+    def test_direct_activation_rollback_restores_an_emptied_config(
+        self, temp_home
+    ):
+        """The `config_written` token must be armed BEFORE the write.
+
+        A destination that refuses the rename makes `_write_json` copy
+        THROUGH it, and a copy that dies part-way empties it -- correctly, a
+        partial credential is worse than none -- and then raises. Armed
+        after the write returns, the token is still False there, so the arm
+        skips a restore whose bytes it is holding and the user keeps an
+        empty `~/.claude.json`.
+        """
+        from claude_swap import switcher as switcher_mod
+        import claude_swap.fsutil as fsutil_mod
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+            "mcpServers": {"a": {"command": "x"}},
+            "projects": {"/some/repo": {"allowedTools": ["Bash", "Read"]}},
+        }))
+        original = config_path.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = fsutil_mod.os.replace
+        calls = []
+
+        def busy_replace(src, dst, *a, **k):
+            # AT THE SHARED CALLEE. `models` holds its own binding of
+            # `replace_with_retry`, so patching switcher's name leaves the
+            # RESTORE's rename real and this case certifies a branch it
+            # never entered.
+            if os.path.basename(os.fspath(dst)) == ".claude.json":
+                calls.append("replace")
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == ".claude.json":
+                calls.append("copy")
+                # `copyfile` opens the destination 'wb' before the first
+                # source byte, so it is already empty when this raises.
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        try:
+            with patch.object(
+                fsutil_mod.os, "replace", side_effect=busy_replace,
+            ), patch.object(
+                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+            ), patch.object(switcher, "list_accounts"), pytest.raises(
+                ConfigError
+            ):
+                switcher._perform_switch("1", emit_output=False)
+        finally:
+            switcher_mod.shutil.copyfile = real_copyfile
+
+        # PREMISE: the write's EBUSY and its write-through must run, or this
+        # asserts the repair of damage nothing did. ONLY THE FIRST TWO. The
+        # restore's own rename is the third, and that one is the arm under
+        # test -- asserting it here would make an unarmed token fail the
+        # premise instead of the defect, which is the failure this case
+        # exists to report.
+        assert calls[:2] == ["replace", "copy"], (
+            f"premise: the config's write-through must run, got {calls}"
+        )
+        assert config_path.read_text() != "{par", (
+            "premise: the partial must not survive -- the recovery empties it"
+        )
+        assert config_path.read_text(encoding="utf-8") == original, (
+            "DEFECT: the write-through emptied the config and raised, and "
+            "the direct-activation rollback did not restore it. `userID`, "
+            "`mcpServers` and `projects` are gone, and the arm only logs, so "
+            "nothing tells the user the config was destroyed"
+        )
+
+    def test_direct_activation_reports_a_rollback_it_could_not_make(
+        self, temp_home
+    ):
+        """A refused restore must reach the caller, not just the log.
+
+        `_restore_atomically` REFUSES a publish error that is not EBUSY --
+        that refusal is the point of the helper -- so the arm now has a
+        reachable failure branch. It only `_logger.error`s it, and the
+        console handler exists only under debug, so the user is told the
+        activation failed while `~/.claude.json` is actually empty. The
+        transaction path is the control: it raises "rollback also failed".
+        """
+        from claude_swap import switcher as switcher_mod
+        from claude_swap import models as models_mod
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+            "projects": {"/some/repo": {"allowedTools": ["Bash"]}},
+        }))
+        original = config_path.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = switcher_mod.replace_with_retry
+
+        def busy_publish(src, dst, *a, **k):
+            if os.path.basename(os.fspath(dst)) == ".claude.json":
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == ".claude.json":
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        def refuse_restore(src, dst, *a, **k):
+            # THE RESTORE'S OWN PUBLISH, at `models`' binding so only
+            # `_restore_atomically` sees it. A non-EBUSY refusal, so the
+            # helper raises rather than rewriting in place.
+            raise OSError(errno.EACCES, "permission denied")
+
+        try:
+            with patch.object(
+                switcher_mod, "replace_with_retry", side_effect=busy_publish,
+            ), patch.object(
+                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+            ), patch.object(
+                models_mod, "replace_with_retry", side_effect=refuse_restore,
+            ), patch.object(switcher, "list_accounts"), pytest.raises(
+                SwitchError
+            ) as excinfo:
+                switcher._perform_switch("1", emit_output=False)
+        finally:
+            switcher_mod.shutil.copyfile = real_copyfile
+
+        # PREMISE: the config really was lost, or "the caller must be told"
+        # is a message about nothing.
+        assert config_path.read_text(encoding="utf-8") != original, (
+            "premise: the restore must actually have been refused"
+        )
+        assert "rollback also failed" in str(excinfo.value), (
+            "DEFECT: the restore was refused and `~/.claude.json` is empty, "
+            "and the caller is told only that the activation failed. The "
+            f"config is unrecoverable and nothing says so: {excinfo.value}"
         )
 
     def test_stash_failure_aborts_direct_activation(self, temp_home):

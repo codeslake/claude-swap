@@ -7137,19 +7137,33 @@ class ClaudeAccountSwitcher:
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
-                except Exception:
+                except Exception as activation_error:
+                    # WHAT THE RESTORE COULD NOT PUT BACK. `_restore_atomically`
+                    # REFUSES a publish error that is not EBUSY, so each arm
+                    # below has a reachable failure branch that leaves the
+                    # destination destroyed. Logged alone it reaches nobody --
+                    # the console handler exists only under debug -- and the
+                    # caller is told only that the activation failed. The
+                    # transaction path says "rollback also failed"; so does
+                    # this one.
+                    unrestored: list[str] = []
                     if sequence_written and rollback_sequence_text:
                         try:
-                            if not self.sequence_file.read_text(
-                                encoding="utf-8"
-                            ).strip():
-                                self.sequence_file.write_text(
-                                    rollback_sequence_text, encoding="utf-8"
-                                )
+                            # RESTORE, DO NOT INSPECT. The gate here asked
+                            # whether the roster was EMPTY, and the recovery
+                            # empties a partial only when that emptying
+                            # itself succeeds -- refused, half-written JSON
+                            # survives, which is neither empty nor parseable.
+                            # This arm runs only on a failed switch, so the
+                            # snapshot goes back verbatim.
+                            _restore_atomically(
+                                self.sequence_file, rollback_sequence_text
+                            )
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback the roster: {e}"
                             )
+                            unrestored.append(f"{self.sequence_file.name} ({e})")
                     if config_written and rollback_config_text is not None:
                         try:
                             # THE THIRD RESTORE ARM. `config_written` is armed
@@ -7164,6 +7178,7 @@ class ClaudeAccountSwitcher:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"
                             )
+                            unrestored.append(f"{config_path.name} ({e})")
                     if creds_written and rollback_creds is not None:
                         try:
                             self._write_credentials(rollback_creds)
@@ -7171,6 +7186,14 @@ class ClaudeAccountSwitcher:
                             self._logger.error(
                                 f"Failed to rollback credentials: {e}"
                             )
+                            unrestored.append(f"the live credential ({e})")
+                    if unrestored:
+                        raise SwitchError(
+                            f"Activation failed and rollback also failed: "
+                            f"{activation_error}. Could not restore "
+                            f"{'; '.join(unrestored)}. Manual recovery may be "
+                            f"needed."
+                        ) from activation_error
                     raise
 
                 if force_activate and current_identity is not None:
