@@ -629,12 +629,11 @@ class TestEveryArmOfTheLoopBacksOff:
             "gone or narrowed, so waiters released together retry in lockstep"
         )
 
-    def test_a_dangling_symlink_does_not_spin(self, tmp_path, monkeypatch):
+    def test_a_swept_name_does_not_spin(self, tmp_path, monkeypatch):
         target = tmp_path / "target.lock"
-        target.symlink_to(tmp_path / "nothing-here")
-        assert not target.exists(), "premise: the symlink must dangle"
+        target.mkdir()
 
-        real_mkdir = os.mkdir
+        real_mkdir, real_stat = os.mkdir, os.stat
         tries = {"n": 0}
 
         def counting(path, *a, **k):
@@ -642,7 +641,13 @@ class TestEveryArmOfTheLoopBacksOff:
                 tries["n"] += 1
             return real_mkdir(path, *a, **k)
 
+        def swept(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                raise FileNotFoundError(errno.ENOENT, "swept")
+            return real_stat(path, *a, **k)
+
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        monkeypatch.setattr(claude_locks.os, "stat", swept)
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.3):
                 pass
@@ -704,7 +709,7 @@ class TestEveryArmOfTheLoopBacksOff:
             "cannot remove a stale lock backed off less than it claims to"
         )
 
-    def test_the_dangling_symlink_arm_sleeps_only_what_is_left(
+    def test_the_swept_name_arm_sleeps_only_what_is_left(
         self, tmp_path, monkeypatch
     ):
         """A SCRIPTED CLOCK, like its two siblings.
@@ -725,11 +730,10 @@ class TestEveryArmOfTheLoopBacksOff:
         it waits for is itself gated on the deadline having passed.
         """
         target = tmp_path / "target.lock"
-        target.symlink_to(tmp_path / "nothing-here")
-        assert not target.exists(), "premise: the symlink must dangle"
+        target.mkdir()
 
         budget, clock, slept = 0.175, [0.0], []
-        real_mkdir = os.mkdir
+        real_mkdir, real_stat = os.mkdir, os.stat
         mine = threading.get_ident()
         real_sleep = claude_locks.time.sleep
 
@@ -737,6 +741,11 @@ class TestEveryArmOfTheLoopBacksOff:
             if os.fspath(path) == os.fspath(target):
                 clock[0] += 0.001                     # one iteration of work
             return real_mkdir(path, *a, **k)
+
+        def swept(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                raise FileNotFoundError(errno.ENOENT, "swept")
+            return real_stat(path, *a, **k)
 
         def fake_sleep(seconds):
             # SCOPED TO THIS THREAD. `claude_locks.time` IS the `time` module,
@@ -748,6 +757,7 @@ class TestEveryArmOfTheLoopBacksOff:
             clock[0] += seconds
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        monkeypatch.setattr(claude_locks.os, "stat", swept)
         monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
 
@@ -893,20 +903,27 @@ class TestADeadlineCanPassMidIterationForEveryArm:
 
         return clock
 
-    def test_a_deadline_crossed_mid_dangling_symlink_arm_is_not_a_ValueError(
+    def test_a_deadline_crossed_mid_swept_name_arm_is_not_a_ValueError(
         self, tmp_path, monkeypatch
     ):
         target = tmp_path / "target.lock"
-        target.symlink_to(tmp_path / "nothing-here")
-        assert not target.exists(), "premise: the symlink must dangle"
+        target.mkdir()
+
+        real_stat = os.stat
+
+        def swept(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                raise FileNotFoundError(errno.ENOENT, "swept")
+            return real_stat(path, *a, **k)
 
         reads = []
+        monkeypatch.setattr(claude_locks.os, "stat", swept)
         monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5):
                 pass
         assert reads == [0.0, 0.0, 0.6, 0.6], (
-            f"the dangling-symlink arm's clamp was never entered: {reads}"
+            f"the swept-name arm's clamp was never entered: {reads}"
         )
 
     def test_a_deadline_crossed_mid_rmdir_failed_arm_is_not_a_ValueError(
