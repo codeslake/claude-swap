@@ -7147,10 +7147,9 @@ class ClaudeAccountSwitcher:
                     # transaction path says "rollback also failed"; so does
                     # this one.
                     unrestored: list[str] = []
-                    # SET WHERE THE GUARD LIVES, not recomputed beside it. A
-                    # token says an arm was ARMED; each arm needs a snapshot
-                    # too, and a copy of those three conditions would desync
-                    # the moment one of them changed.
+                    # SET WHERE EACH GUARD LIVES. A token says an arm was
+                    # armed, not that it had a snapshot to put back; a copy of
+                    # the three guards would desync the moment one changed.
                     attempted = False
                     if sequence_written and rollback_sequence_text:
                         attempted = True
@@ -7209,19 +7208,18 @@ class ClaudeAccountSwitcher:
                         # bare `OSError`, which is not a `ClaudeSwitchError` --
                         # so `--json` printed nothing on stdout and a traceback
                         # instead. Gated on a WRITE having happened, like the
-                        # sibling's `if transaction.completed_steps`.
-                        #
-                        # The gate is wider than the arms on purpose: with no
-                        # prior login and no config -- a fresh or just-imported
-                        # machine -- the target credential is written and every
-                        # snapshot is absent, so nothing is restored and the
-                        # user still has to be told. Saying "rolled back"
-                        # there would be the same false sentence this arm
-                        # exists to prevent.
+                        # sibling's `if transaction.completed_steps` -- wider
+                        # than the arms on purpose, because a machine with no
+                        # snapshot to restore still needs telling, just not
+                        # that it was rolled back.
+                        outcome = (
+                            "was rolled back" if attempted
+                            else "could NOT be rolled back "
+                                 "(no prior state to restore)"
+                        )
                         raise SwitchError(
-                            f"Activation failed and "
-                            f"{'was rolled back' if attempted else 'could NOT be rolled back (no prior state to restore)'}"
-                            f": {activation_error}"
+                            f"Activation failed and {outcome}: "
+                            f"{activation_error}"
                         ) from activation_error
                     raise
 
