@@ -809,15 +809,6 @@ class ClaudeAccountSwitcher:
         # recovery material is still needed cannot act on a log line. The
         # forward path at `_write_account_credentials` ignores this; the
         # rollback's repair counts it.
-        # A SWAP MOVES A KEY, IT DOES NOT CHANGE A CREDENTIAL. This exists
-        # because a CHANGED backup makes the profile's copy stale; a swap
-        # writes the same bytes under a new key and moves the matching
-        # profile with them, so that profile is still this account's own --
-        # and NEWER, since claude rotates inside it and nothing syncs that
-        # back. Deleting it there leaves only the generation the server has
-        # already seen consumed.
-        if self._moving_keys:
-            return True
         if self._live_session_pids(account_num, email):
             from claude_swap.session import mark_session_stale
 
@@ -877,7 +868,21 @@ class ClaudeAccountSwitcher:
         retained = self._store._write_account_credentials(
             account_num, email, credentials)
         try:
-            self._post_backup_write(account_num, email)
+            # A KEY MOVE IS NOT A CREDENTIAL CHANGE. The chokepoint exists
+            # because a CHANGED backup makes the profile's copy stale. A
+            # swap or a move writes the SAME bytes under a new key and takes
+            # the matching profile with them, and a rollback's restore puts
+            # back the very value that profile was bootstrapped from -- it
+            # can only make the backup OLDER than the profile, never newer.
+            # Either way the profile still holds the generation claude
+            # rotated to, and nothing syncs that back, so deleting it leaves
+            # only a grant the server has already seen consumed.
+            #
+            # HERE, not inside the chokepoint: the rollback's crossed-key
+            # repair calls it DIRECTLY, on the other slot's profile, and
+            # that one really is stale.
+            if not self._moving_keys:
+                self._post_backup_write(account_num, email)
         except OSError:
             from claude_swap.session import mark_session_stale
 
@@ -1554,7 +1559,17 @@ class ClaudeAccountSwitcher:
                             # AFTER THE CALL. A raising write lands in the
                             # `except` below, and setting this first made the
                             # summary report restores that every slot refused.
-                            if self._write_account_credentials(num, email, original):
+                            # A restore puts back the value this key's profile
+                            # was bootstrapped from, so it is a key move too;
+                            # scoped, because the crossed repair below must
+                            # still invalidate the OTHER slot's profile.
+                            self._moving_keys = True
+                            try:
+                                retained = self._write_account_credentials(
+                                    num, email, original)
+                            finally:
+                                self._moving_keys = False
+                            if retained:
                                 displaced.add((num, email))
                             wrote_any = True
                             # AND THE PROFILE THAT IS ACTUALLY CROSSED. The
@@ -1890,14 +1905,21 @@ class ClaudeAccountSwitcher:
             # must not adopt stale material leaked under the target key by an
             # earlier crash. The old key is cleared only after the commit
             # below, so the records never point at missing material.
-            if creds:
-                self._write_account_credentials(target, email, creds)
-            else:
-                self._delete_account_credentials_strict(target, email)
-            if config:
-                self._write_account_config(target, email, config)
-            else:
-                self._delete_config_backup(target, email)
+            # A MOVE IS A KEY MOVE, like the swap. `os.replace` above took
+            # the matching profile to the new key, so it is still this
+            # account's own and still newer than these bytes.
+            self._moving_keys = True
+            try:
+                if creds:
+                    self._write_account_credentials(target, email, creds)
+                else:
+                    self._delete_account_credentials_strict(target, email)
+                if config:
+                    self._write_account_config(target, email, config)
+                else:
+                    self._delete_config_backup(target, email)
+            finally:
+                self._moving_keys = False
 
             data["accounts"][target] = record
             del data["accounts"][num_src]

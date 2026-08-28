@@ -246,6 +246,56 @@ class TestSwapAccounts:
     def _marker(self, switcher, num: str, email: str) -> str:
         return (switcher._session_dir(num, email) / "marker").read_text()
 
+    def test_a_rollback_restore_does_not_strip_the_home_profile(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """A restore puts back the value the profile was bootstrapped FROM.
+
+        It can only make the backup older than the profile, never newer, so
+        invalidating on it is a strict downgrade. With one shared email the
+        forward writes displace the very keys the restores put back, so the
+        value-equal skip cannot mask it.
+        """
+        from unittest.mock import patch
+
+        switcher = ClaudeAccountSwitcher()
+        email = self._same_email_slots(switcher, sample_sequence_data_with_org)
+        for num in ("1", "2"):
+            (switcher._session_dir(num, email) / ".credentials.json").write_text(
+                f"profile-{num}-G1", encoding="utf-8")
+
+        # Fail the ROSTER write: both forward credential writes have landed
+        # by then, so the rollback restores two keys it really displaced.
+        real_json = ClaudeAccountSwitcher._write_json
+        calls = {"n": 0}
+
+        def failing_json(self, path, data):
+            if path == self.sequence_file:
+                calls["n"] += 1
+                raise OSError("disk full (injected)")
+            return real_json(self, path, data)
+
+        with patch.object(ClaudeAccountSwitcher, "_write_json", failing_json):
+            with pytest.raises(Exception):
+                switcher.swap_accounts("1", "2")
+
+        # PREMISES: the failing step ran and the rollback really put both
+        # keys back, so what follows is about the RESTORE.
+        assert calls["n"] >= 1, "premise: the roster write must have failed"
+        assert switcher.read_account_credentials("1", email) == "creds-org"
+        assert switcher.read_account_credentials("2", email) == "creds-personal"
+
+        for num in ("1", "2"):
+            seed = switcher._session_dir(num, email) / ".credentials.json"
+            assert seed.exists(), (
+                f"DEFECT: the rollback stripped slot {num}'s home profile "
+                "after restoring the key to the value that profile already "
+                "descended from. The backup holds the consumed generation, "
+                "so both accounts need a re-login after a swap that changed "
+                "nothing"
+            )
+            assert seed.read_text(encoding="utf-8") == f"profile-{num}-G1"
+
     def test_swap_aborted_in_staging_touches_neither_slot(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
@@ -2773,6 +2823,51 @@ class TestTheRollbackDecidesPerKey:
 class TestASwapKeepsEachProfilesOwnGeneration:
     """A swap moves a KEY. The credential does not change, and the matching
     session profile moves with it, so nothing about it went stale."""
+
+    def test_a_move_to_an_empty_slot_does_not_strip_the_moved_profile(
+        self, temp_home: Path
+    ):
+        """`cswap move` is the same key move as a swap, one command over."""
+        import json
+
+        from claude_swap.session import session_dir_for
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        a = "a@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {"email": a, "uuid": "", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+            }})
+
+        def gen(g):
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": f"at-{g}", "refreshToken": f"rt-{g}"}})
+
+        s._write_account_credentials("1", a, gen("G0"))
+        src = session_dir_for(s.backup_dir, "1", a)
+        src.mkdir(parents=True, exist_ok=True)
+        (src / ".credentials.json").write_text(gen("G1"), encoding="utf-8")
+
+        assert json.loads(s.read_account_credentials("1", a))[
+            "claudeAiOauth"]["refreshToken"] == "rt-G0", (
+            "premise: the backup must differ from the profile"
+        )
+
+        s.move_account("1", "5")
+
+        seed = session_dir_for(s.backup_dir, "5", a) / ".credentials.json"
+        assert seed.exists(), (
+            "DEFECT: `cswap move` stripped the moved profile. The backup "
+            "holds the generation claude already rotated past, so the next "
+            "run POSTs a consumed refresh token"
+        )
+        assert json.loads(seed.read_text())[
+            "claudeAiOauth"]["refreshToken"] == "rt-G1"
 
     def test_a_successful_swap_does_not_strip_the_moved_profiles(
         self, temp_home: Path
