@@ -447,6 +447,10 @@ class TestADanglingSymlinkDoesNotPinACore:
             return real_mkdir(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        # LIKE THE FILE'S THREE OTHER WARNING WITNESSES. Today the configured
+        # level is always below WARNING, so the record propagates either way;
+        # pinning it here keeps the witness from going quiet if that changes.
+        caplog.set_level(logging.WARNING, logger="claude-swap")
         with pytest.raises(ClaudeCodeLockTimeout) as caught:
             with proper_lockfile(target, timeout=3.0):
                 pass
