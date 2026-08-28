@@ -51,24 +51,14 @@ def test_control_a_tmp_path_write_is_allowed(tmp_path: Path):
 
 
 def _remove_our_marker(marker: Path) -> None:
-    """Remove OUR probe marker with the guard stood down for that path alone.
-
-    Every unlink of it targets the real store by construction -- that is what
-    the controls below are proving -- so the audit hook refuses the cleanup
-    too. One leaked marker then fails this case on every later run until a
-    human removes it by hand, and the local suite gates the deploy.
-
-    The name is asserted first: the guard is only ever stood down for the one
-    path this module chose.
+    """Remove OUR probe marker. No window: `conftest`'s hook exempts exactly
+    this basename for `os.remove`, so the guard stays armed for every other
+    path and every other thread while this runs. Blanking the specs around
+    the unlink instead disarmed the hook process-wide for the width of the
+    call, which is a worse trade than the litter it was fixing.
     """
-    assert marker.name == ".cswap-test-real-store-guard-probe-DELETE-ME", marker
-    saved = conftest._REAL_STORE_SPECS
-    conftest._REAL_STORE_SPECS = ()
-    try:
-        if marker.exists():
-            marker.unlink()
-    finally:
-        conftest._REAL_STORE_SPECS = saved
+    assert marker.name == conftest._GUARD_PROBE_MARKER, marker
+    marker.unlink(missing_ok=True)
 
 
 def test_control_b_and_c_real_store_write_is_refused(monkeypatch):

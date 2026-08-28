@@ -238,6 +238,11 @@ def _derive_real_store_hints(
 
 _REAL_STORE_HINTS = _derive_real_store_hints(_REAL_STORE_SPECS, _HOME_AT_FREEZE_TIME)
 
+# The single filename test_real_store_guard.py's controls plant in the real
+# store to prove the hook refuses them. Its removal is exempt so those cases
+# can clean up after themselves; nothing else may carry this name.
+_GUARD_PROBE_MARKER = ".cswap-test-real-store-guard-probe-DELETE-ME"
+
 _WRITE_EVENTS = frozenset(
     {
         "open", "os.rename", "os.mkdir", "os.remove", "os.rmdir",
@@ -368,6 +373,15 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
             candidate = joined
         if not hinted:
             continue  # cheap reject — the common case
+        # The controls in test_real_store_guard.py must be able to remove the
+        # one marker they plant, and only that. Exempting it HERE keeps the
+        # exemption path-scoped: blanking the specs around the unlink instead
+        # would disarm the hook for every path and every thread in the
+        # process for the width of that call. `os.remove` only, so the
+        # controls' own `open`-mode writes of the same name stay refused.
+        if (event == "os.remove"
+                and os.path.basename(candidate) == _GUARD_PROBE_MARKER):
+            continue
         target = Path(candidate)
         for root, recursive in _REAL_STORE_SPECS:
             hit = (
