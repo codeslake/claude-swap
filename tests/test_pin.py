@@ -3205,6 +3205,78 @@ class TestAClearThatCouldNotUnspliceSaysSo:
             f"still names the ex-pin. got {msg!r}")
 
 
+    def test_a_stale_receipt_does_not_swallow_the_stranded_config(
+            self, temp_home):
+        """Two endings competed; the first one won and dropped the other.
+
+        A `pin-wiring/` that cannot be written is the documented failure the
+        stale-receipt branch exists for, and it happens AFTER a successful
+        config write -- so the env keys are gone, `env_keys_survive` is empty,
+        and the early return does not fire. That branch then returns first and
+        the splice is never mentioned, on a clear that left the config naming
+        the ex-pin.
+        """
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        live, pinned = "live@example.com", "cloud@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2, 3],
+            "accounts": {
+                "1": {"email": live, "uuid": "uuid-1", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+                "2": {"email": pinned, "uuid": "uuid-2",
+                      "organizationUuid": "org-B", "organizationName": "B",
+                      "added": "2024-01-01T00:00:00Z"},
+                "3": {"email": pinned, "uuid": "uuid-3",
+                      "organizationUuid": "org-C", "organizationName": "C",
+                      "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", live, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        s._write_account_config("1", live, json.dumps(
+            {"oauthAccount": {"emailAddress": live, "accountUuid": "uuid-1"}}))
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": pinned}})
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({
+            # _dead_port(), never a literal: a hardcoded 36301 describes a
+            # LIVE wiring on any machine actually running the pin.
+            "env": {"HTTPS_PROXY": f"http://127.0.0.1:{_dead_port()}"},
+            "_cswapPinWiredKeys": ["HTTPS_PROXY"],
+            "oauthAccount": {"emailAddress": pinned,
+                             "accountUuid": "uuid-3"}}))
+        # THE SIDECAR is what `wired_config_paths` reads after the config's
+        # own marker is popped, so the stale branch needs it to survive.
+        led = pin_mod._ledger_path(cfg)
+        led.parent.mkdir(parents=True, exist_ok=True)
+        led.write_text(json.dumps({"_cswapPinWiredKeys": ["HTTPS_PROXY"]}))
+
+        class _Dead:
+            def apply_pin(self, *a, **k):
+                raise ImportError("cryptography")
+
+        with patch.object(pin_mod, "_impl", lambda: _Dead()), \
+                patch.object(pin_mod, "_clear_ledger", lambda _p: False):
+            ok, msg = pin_mod.clear_pin(s)
+
+        after = (json.loads(cfg.read_text()).get("oauthAccount") or {})
+        print(f"\nclear_pin -> ok={ok}\n  msg={msg!r}")
+        print(f"config after: {after.get('emailAddress')!r}")
+        assert after.get("emailAddress") == pinned, (
+            "premise: the un-splice declined, leaving the ex-pin named")
+        assert "receipt" in msg, "premise: the stale-receipt branch is the one"
+        assert "still names" in msg, (
+            "DEFECT: the stale-receipt ending returned first and the stranded "
+            f"config went unmentioned. got {msg!r}")
+
     def test_control_pinning_the_account_you_use_still_reports_plainly(
             self, temp_home):
         """CONTROL: the address alone is not the signal.
@@ -3254,6 +3326,99 @@ class TestAClearThatCouldNotUnspliceSaysSo:
         assert "still names" not in msg, (
             "DEFECT: warned about a config that names the pinned address "
             f"because it is the account logged in. got {msg!r}")
+
+
+class TestTheStrandedConfigCheck:
+    """`_config_still_names` decides the sentence a purged user gets."""
+
+    def _cfg(self, temp_home, oauth):
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({"oauthAccount": oauth}) if oauth is not None
+                       else "{}")
+        return cfg
+
+    def test_the_address_compare_ignores_case(self, temp_home):
+        from claude_swap import pin
+
+        self._cfg(temp_home, {"emailAddress": "CLOUD@Example.com",
+                              "accountUuid": "uuid-2"})
+        assert pin._config_still_names("cloud@example.com", None), (
+            "DEFECT: letter case hid a stranded config")
+
+    def test_a_non_dict_oauthaccount_is_skipped_not_raised(self, temp_home):
+        """Requirement 3: nothing on the clear path may raise."""
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text(
+            json.dumps({"oauthAccount": "not-a-dict"}))
+        assert pin._config_still_names("cloud@example.com", None) is False
+
+    def test_an_unreadable_config_counts_as_still_naming(self, temp_home):
+        """"I cannot check it" must not print as "it is clean".
+
+        `env_keys_survive` -- the sibling reader deciding the SAME message --
+        argues exactly this and takes the conservative side. Two opposite
+        conventions for one question in one sentence is the drift.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text("{ this is not json")
+        assert pin._config_still_names("cloud@example.com", None), (
+            "DEFECT: an unreadable config read as clean")
+
+    def test_the_session_config_is_read_too(self, temp_home, monkeypatch,
+                                            tmp_path):
+        """BOTH configs. The per-session one is the one only the pin splices."""
+        from claude_swap import pin
+
+        # ORDER MATTERS: `_each_config` yields CLAUDE_CONFIG_DIR's copy FIRST,
+        # so the ex-pin goes in the SECOND one. Put it in the first and a
+        # check that stops after one config still finds it, proving nothing.
+        self._cfg(temp_home, {"emailAddress": "cloud@example.com"})
+        sess = tmp_path / "sess"
+        sess.mkdir()
+        (sess / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "someone@example.com"}}))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sess))
+        from claude_swap.paths import get_global_config_path
+        assert get_global_config_path() == sess / ".claude.json", (
+            "premise: the session config is the one read first")
+        assert pin._config_still_names("cloud@example.com", None), (
+            "DEFECT: only the first config was read")
+
+    def test_no_intended_uuid_means_the_address_decides(self, temp_home):
+        """An identity with no accountUuid cannot exempt anything.
+
+        Warning is the safe direction for the requirement this exists to
+        serve, so the address alone decides. Pins it, because the opposite
+        reading is a requirement-1 hole a future reader could argue into.
+        """
+        from claude_swap import pin
+
+        self._cfg(temp_home, {"emailAddress": "cloud@example.com",
+                              "displayName": "Slot 2"})
+        assert pin._config_still_names(
+            "cloud@example.com", {"emailAddress": "cloud@example.com"})
+
+
+class TestAPinnedEmailThatIsNotAString:
+    """The record is a file a human can edit, and one reader casefolds it."""
+
+    def test_the_record_reader_refuses_a_non_string(self, temp_home):
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        for bad in (123, ["a@example.com"], {"x": 1}, True):
+            _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                                 {"remoteControl": {"pinnedEmail": bad}})
+            assert pin_mod._pinned_email_now(s) is None, (
+                f"DEFECT: {bad!r} reached every consumer of pinnedEmail, and "
+                "one of them calls .casefold() on it")
 
 
 class TestClearRunsWithTheExtraGone:
@@ -9499,13 +9664,6 @@ class TestTheUnspliceComparesOneVocabulary:
         )
 
 
-def _json_dumps_oauth():
-    """A stored backup config whose ``oauthAccount`` carries no accountUuid."""
-    import json as _j
-    return _j.dumps({"oauthAccount": {"emailAddress": "cloud@example.com",
-                                      "displayName": "Slot 2"}})
-
-
 class TestTheUnspliceOnAnAmbiguousAddress:
     """The un-splice must survive the roster the composite key exists for.
 
@@ -9728,7 +9886,9 @@ class TestTheUnspliceOnAnAmbiguousAddress:
                   "uuid": ""},
         }}
         sw = self._sw(roster)
-        sw._read_account_config = lambda num, email: _json_dumps_oauth()
+        sw._read_account_config = lambda num, email: json.dumps(
+            {"oauthAccount": {"emailAddress": "cloud@example.com",
+                              "displayName": "Slot 2"}})
         assert pin._slot_for(sw, "cloud@example.com", "org-B") == "2", (
             "premise: the slot IS known, so the ambiguity guard is skipped")
         assert not pin._config_names_the_pin(

@@ -1232,7 +1232,14 @@ def _pinned_email_now(switcher) -> tuple[str, str] | None:
     if not isinstance(section, dict):
         return None
     email = section.get("pinnedEmail")
-    if not email:
+    # A STRING, checked HERE. `settings.json` is a file a human edits, and a
+    # non-string `pinnedEmail` is truthy all the way down to the one consumer
+    # that calls `.casefold()` on it -- raising out of `clear_pin` AFTER the
+    # record and the wiring are gone, so a clear that fully succeeded exits 1
+    # blaming the optional package. `_port_of_config` fixed the identical
+    # class at its own source for the same reason: treat it as "no opinion"
+    # here and every downstream reader inherits the fix.
+    if not isinstance(email, str) or not email:
         return None
     # `or ""` to match the WRITER. cswap_pin.save_pin always writes
     # `org_uuid or ""`, so a record with no org key read back as None here
@@ -1371,16 +1378,21 @@ def _config_still_names(email: str, instead_of: "dict | None") -> bool:
     ``instead_of`` is the identity the clear handed the un-splice, and it is
     what separates the two states: pinning the account you are logged in as
     is ordinary, and a FINISHED clear then leaves that same address named,
-    correctly. The accountUuid tells them apart. An identity without one
-    decides nothing, which is the same "leave it alone" every other reader
-    here gives that case.
+    correctly. The accountUuid tells them apart. An identity WITHOUT one
+    cannot exempt anything, so the address alone decides and this warns --
+    the safe direction here, because the cost of a wrong warning is a
+    sentence and the cost of a wrong silence is a stranded config.
+
+    AN UNREADABLE CONFIG COUNTS AS NAMING IT, matching `env_keys_survive`,
+    the sibling reader that decides this same message: "I cannot check it"
+    must not render as "it is clean" in the one sentence a purged user gets.
     """
     want = (instead_of or {}).get("accountUuid")
     for path in _each_config():
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            continue        # unreadable decides nothing, as everywhere here
+            return True     # cannot check is not clean -- see the docstring
         oauth = raw.get("oauthAccount") if isinstance(raw, dict) else None
         if not isinstance(oauth, dict):
             continue
@@ -1621,6 +1633,18 @@ def clear_pin(switcher) -> tuple[bool, str]:
             if on
         )
         return False, f"Could not remove {what}; re-run once it frees up"
+    # ONE VERDICT, SEVERAL ENDINGS. Computed BEFORE the stale-receipt return,
+    # because that branch fired first and dropped this entirely: an unwritable
+    # `pin-wiring/` fails AFTER a successful config write, so the env keys are
+    # already gone, `env_keys_survive` is empty, and nothing else in this
+    # function can see the splice. Two endings that compete lose one.
+    left_spliced = bool(
+        _pinned and _pinned[0] and _config_still_names(_pinned[0], _back_to)
+    )
+    _also_stranded = (
+        " A config also still names the ex-pin as the logged-in account; "
+        "switch to the account you want."
+    )
     stale = wired_config_paths(switcher)
     if stale:
         # A DIFFERENT STATE AND A DIFFERENT SENTENCE. Nothing dials a dead
@@ -1631,8 +1655,9 @@ def clear_pin(switcher) -> tuple[bool, str]:
             "deleted; remove "
             + " and ".join(str(_ledger_path(p)) for p in stale)
             + " by hand, or cswap will keep reporting a wiring that is gone"
+            + (_also_stranded if left_spliced else "")
         )
-    if _pinned and _pinned[0] and _config_still_names(_pinned[0], _back_to):
+    if left_spliced:
         # A DIFFERENT STATE AND A DIFFERENT SENTENCE, exactly like the stale
         # receipt above. The pin is gone and nothing dials a dead port, but a
         # config still names the ex-pin, so Claude Code keeps making sessions
