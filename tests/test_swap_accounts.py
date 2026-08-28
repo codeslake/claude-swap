@@ -44,7 +44,7 @@ def caplog_at_error():
         logger.removeHandler(h)
 
 
-def _r37_two_slots(s, data, e1, e2):
+def _two_slots_one_address(s, data, e1, e2):
     s._setup_directories()
     d = dict(data)
     d["accounts"] = {
@@ -2945,7 +2945,6 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         profiles then resolve to each other and the flags swap onto the
         wrong ones -- the same two-part defect, on the failure path.
         """
-        import os
         from unittest.mock import patch
 
         from claude_swap.session import is_session_stale, mark_session_stale
@@ -3006,7 +3005,7 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         from claude_swap.session import is_session_stale, mark_session_stale
 
         e = "user@example.com"
-        s = _r37_two_slots(ClaudeAccountSwitcher(), sample_sequence_data_with_org, e, e)
+        s = _two_slots_one_address(ClaudeAccountSwitcher(), sample_sequence_data_with_org, e, e)
         d1, d2 = s._session_dir("1", e), s._session_dir("2", e)
         assert mark_session_stale(d1)
         assert is_session_stale(d1) and not is_session_stale(d2)
@@ -3043,7 +3042,7 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         prune deletes both accounts' profiles."""
 
         e1, e2 = "a+x@b.com", "a_x@b.com"
-        s = _r37_two_slots(ClaudeAccountSwitcher(), sample_sequence_data_with_org, e1, e2)
+        s = _two_slots_one_address(ClaudeAccountSwitcher(), sample_sequence_data_with_org, e1, e2)
         # PREMISES: the addresses differ and their slugs collide.
         assert e1 != e2
         assert s._session_dir("1", e1).name == s._session_dir("2", e2).name.replace("2-", "1-")

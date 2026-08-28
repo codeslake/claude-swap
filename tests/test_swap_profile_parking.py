@@ -90,3 +90,78 @@ def test_an_interrupt_after_the_park_lands_still_recovers_A(temp_home: Path):
     assert dir_a.exists() and (dir_a / "marker").read_text() == "A-HISTORY", (
         "DEFECT: A did not come back to its own name"
     )
+
+
+def test_a_park_that_raised_never_names_the_leftover_as_A(temp_home: Path):
+    """A vanished `dir_a` is not evidence that the rename went through.
+
+    The rename and its record must be one statement for an ASYNC exception,
+    and separately must NOT consult the filesystem when the rename itself
+    failed: there A is still A's, and reading `dir_a`'s absence as "the park
+    landed" names the foreign leftover as A and promotes it into A's slot.
+    """
+    import errno
+    import os
+    import shutil
+
+    s = ClaudeAccountSwitcher()
+    dir_a, _ = _prep(s)
+    mark_session_stale(dir_a)
+    leftover = dir_a.with_name(dir_a.name + ".swapping")
+    leftover.mkdir(parents=True)
+    (leftover / "marker").write_text("FOREIGN-LEFTOVER")
+
+    real_replace = os.replace
+
+    def vanish_then_refuse(src, dst, *a, **k):
+        if str(dst).endswith(".swapping"):
+            # The window: something outside removes A between the rename and
+            # any check of it, and the rename fails on the leftover anyway.
+            shutil.rmtree(src)
+            raise OSError(errno.ENOTEMPTY, "Directory not empty")
+        return real_replace(src, dst, *a, **k)
+
+    moved: list[Path] = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "replace", vanish_then_refuse)
+        s._swap_session_dirs("1", EA, "2", EB, moved)
+
+    assert leftover.exists() and (leftover / "marker").read_text() == (
+        "FOREIGN-LEFTOVER"
+    ), "the leftover was moved, so it was mistaken for A"
+    assert not dir_a.exists() or (dir_a / "marker").read_text() != (
+        "FOREIGN-LEFTOVER"
+    ), "DEFECT: an unrelated leftover was promoted into A's own slot name"
+
+
+def test_a_landed_park_is_recorded_even_if_As_old_name_reappears(
+    temp_home: Path,
+):
+    """The park landed; whether the old name is occupied afterwards is a
+    different question, and answering it with `dir_a` skips A's second leg.
+    """
+    import os
+
+    s = ClaudeAccountSwitcher()
+    dir_a, _ = _prep(s)
+    real_replace = os.replace
+
+    def land_then_reappear(src, dst, *a, **k):
+        out = real_replace(src, dst, *a, **k)
+        if str(dst).endswith(".swapping"):
+            # Something outside recreates the name the park just freed.
+            dir_a.mkdir(parents=True, exist_ok=True)
+            (dir_a / "marker").write_text("RECREATED")
+        return out
+
+    moved: list[Path] = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "replace", land_then_reappear)
+        s._swap_session_dirs("1", EA, "2", EB, moved)
+
+    stranded = dir_a.with_name(dir_a.name + ".swapping")
+    assert not stranded.exists(), (
+        "DEFECT: the park landed and was not recorded, so A never took its "
+        "second leg and is stranded under the staging name"
+    )
+    assert (s._session_dir("2", EA) / "marker").read_text() == "A-HISTORY"

@@ -1438,9 +1438,23 @@ class ClaudeAccountSwitcher:
                 parked = dir_a.with_name(dir_a.name + ".swapping")
                 try:
                     os.replace(dir_a, parked)
-                finally:
+                    staging = parked
+                except OSError:
+                    # THE RENAME ITSELF FAILED, so A is still at `dir_a` and
+                    # `parked` holds whatever was already there. Re-raised
+                    # before the arm below so a vanished `dir_a` cannot be
+                    # read as "the park landed" -- that would name the
+                    # leftover as A.
+                    raise
+                except BaseException:
+                    # AN ASYNC EXCEPTION, which can land between the rename
+                    # and its record: a signal in that gap left A under the
+                    # staging name with the strand recovery disarmed. Only
+                    # here is the filesystem the one thing that can say
+                    # whether the rename went through.
                     if not os.path.exists(dir_a):
                         staging = parked
+                    raise
             if dir_b.exists() and not new_b.exists():
                 try:
                     os.replace(dir_b, new_b)
