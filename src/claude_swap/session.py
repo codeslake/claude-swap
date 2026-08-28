@@ -316,7 +316,9 @@ def _may_have_credential_material(session_dir: Path) -> bool:
     return material is not None
 
 
-def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
+def _artifacts_say_usable(
+    session_dir: Path, email: str, org_uuid: str, *, reseeded: bool
+) -> bool:
     """What local artifacts can say about a profile without running the probe.
 
     Upstream's probe-timeout fallback (#224 follow-up), lifted to a function
@@ -327,20 +329,17 @@ def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
     Deliberately NOT consulted for "unreachable". There the question is
     whether `claude` can be run at all, and no file on disk answers it.
     """
-    # A RECORDED IDENTITY IS PART OF BEING USABLE. `_cleanup_failed_session`
-    # deletes `.claude.json` and spares the account's history, so the
-    # directory survives a failed validation -- and every other signal here
-    # leans "present" for that profile: on macOS a keychain delete is
-    # best-effort, so an unreadable entry reads as material, and a MISSING
-    # identity reads as "no drift" because an unreadable one must not
-    # abandon a working profile. Without this the swept profile passes as
-    # usable and `claude` is exec'd into it with nothing to authenticate.
-    # A profile claude MIGRATED still has its identity; only one that never
-    # finished a bootstrap, or was swept, does not. EXISTENCE, not
-    # readability: a broken `.claude.json` degrades to trusting the profile
-    # on purpose, because a backup whose `oauthAccount` lacks an email keeps
-    # the identity unreadable even after a re-bootstrap.
-    if not (session_dir / ".claude.json").exists():
+    # A READABLE IDENTITY IS PART OF BEING USABLE, and only a re-seed
+    # excuses its absence. Every other signal here leans "present": on macOS
+    # a keychain delete is best-effort, so an unreadable entry reads as
+    # material, and an unreadable identity reads as "no drift" because a
+    # broken `.claude.json` must not abandon a working profile. That last
+    # leniency is sound only once a bootstrap has rewritten the artifacts
+    # from the BACKUP -- `reseeded` is the caller saying so. Without one they
+    # are the profile's own, so a swept profile passes as usable with nothing
+    # to authenticate, and an in-session /login plus a torn `.claude.json`
+    # launches under the account the profile drifted to.
+    if not reseeded and read_session_identity(session_dir) is None:
         return False
     return _may_have_credential_material(session_dir) and (
         not session_identity_drifted(session_dir, email, org_uuid)
@@ -850,25 +849,20 @@ class SessionManager:
             # /login plus a torn `.claude.json` promotes to valid and
             # launches under the account the profile drifted to, announced
             # as the one that was asked for.
-            if verdict == "unknown" and reseeded and _artifacts_say_usable(
-                session_dir, email, org_uuid
+            if verdict == "unknown" and _artifacts_say_usable(
+                session_dir, email, org_uuid, reseeded=reseeded
             ):
                 verdict = "valid"
-            if verdict in ("unknown", "unreachable"):
-                raise SessionError(
-                    f"Session profile for Account-{account_num} ({email}) could "
-                    f"not be verified: `claude auth status` did not run or did "
-                    f"not answer. The profile is left in place — check that "
-                    f"`claude` is on PATH, then retry."
-                )
-            if verdict != "valid":
+            if verdict != "valid" and not reseeded:
                 # THE GATE'S OWN REASON, or the remedy below is one the
-                # user cannot act on. An unreadable record makes every
-                # gate on this path defer, and nothing in cswap prunes a
-                # record -- so `--add-account` routes through the same
+                # user cannot act on -- and it is the gate, not the probe,
+                # that blocked this launch, so EVERY non-valid verdict lands
+                # here and not just "invalid". An unreadable record makes
+                # every gate on this path defer, and nothing in cswap prunes
+                # a record -- so `--add-account` routes through the same
                 # chokepoint and repairs nothing, and `--remove-account`
                 # refuses for the same reason. Only the file itself.
-                _, _unreadable = scan_live_sessions(session_dir)
+                _live, _unreadable = scan_live_sessions(session_dir)
                 if _unreadable:
                     raise SessionError(
                         f"Session profile for Account-{account_num} "
@@ -878,6 +872,23 @@ class SessionManager:
                         f"Inspect {session_dir / 'sessions'} and remove or "
                         f"repair them, then retry."
                     )
+                if _live:
+                    raise SessionError(
+                        f"Session profile for Account-{account_num} "
+                        f"({email}) failed validation and a session-mode "
+                        f"Claude instance is live against it (PID "
+                        f"{', '.join(str(s.pid) for s in _live)}), so it "
+                        f"was left in place rather than re-seeded under a "
+                        f"running instance. Exit it, then retry."
+                    )
+            if verdict in ("unknown", "unreachable"):
+                raise SessionError(
+                    f"Session profile for Account-{account_num} ({email}) could "
+                    f"not be verified: `claude auth status` did not run or did "
+                    f"not answer. The profile is left in place — check that "
+                    f"`claude` is on PATH, then retry."
+                )
+            if verdict != "valid":
                 # NEVER UNDER A LIVE CLAUDE, the rule every other
                 # invalidation site in this file already follows. The sweep
                 # deletes the seed and the identity out from under a running
@@ -1011,6 +1022,12 @@ class SessionManager:
         for child in session_dir.iterdir():
             if child.name in HISTORY_ITEMS and not child.is_symlink():
                 continue
+            # THE ONLY COPY, and `_sync_sharing` can write it minutes before
+            # this runs: `_stash_displaced_mcp` refuses to reset a profile's
+            # MCP servers unless this file holds them, so taking it destroys
+            # what that refusal exists to preserve.
+            if child.name == MCP_DISPLACED_STASH and not child.is_symlink():
+                continue
             # `sessions/` IS THE LIVENESS LEDGER, and `scan_sessions` reads
             # nothing else. Taking it makes `profile_is_quiescent` answer
             # True forever for this profile, so every guard that asks "is
@@ -1134,7 +1151,9 @@ class SessionManager:
         """
         verdict = self._session_validity(session_dir, email, org_uuid)
         if verdict == "unknown":
-            return _artifacts_say_usable(session_dir, email, org_uuid)
+            return _artifacts_say_usable(
+                session_dir, email, org_uuid, reseeded=False
+            )
         return verdict == "valid"
 
     # -- sharing ---------------------------------------------------------

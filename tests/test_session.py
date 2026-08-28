@@ -631,10 +631,16 @@ class TestBootstrap:
         # drift", and unreadable, so nothing can contradict it.
         (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
         make_live(session_dir)
-        # PREMISES: the re-seed is skipped, and the artifacts read usable.
+        # PREMISES: the re-seed is skipped, and the artifacts would read
+        # usable if one had run -- `reseeded=True` is what that says. Without
+        # it the unreadable identity now refuses on its own, which is a
+        # different reason and would leave this test asserting nothing.
         assert not session_mod.profile_is_quiescent(session_dir)
         assert session_mod._artifacts_say_usable(
-            session_dir, ACCOUNT_EMAIL, ""
+            session_dir, ACCOUNT_EMAIL, "", reseeded=True
+        )
+        assert not session_mod._artifacts_say_usable(
+            session_dir, ACCOUNT_EMAIL, "", reseeded=False
         )
 
         import subprocess
@@ -1299,18 +1305,31 @@ class TestIsSessionValid:
     def test_probe_timeout_lenient_on_unreadable_identity(
         self, manager, tmp_path, monkeypatch
     ):
-        """A broken .claude.json degrades to trusting the profile.
+        """A broken .claude.json is not a profile we may reuse.
 
-        Mirrors session_identity_drifted's stance: unreadable metadata is
-        not drift. Failing closed here would re-open the destructive
-        cleanup path #224 removed: a backup whose oauthAccount lacks an
-        emailAddress keeps the identity unreadable even after re-bootstrap,
-        so the post-bootstrap check would delete the profile on every
-        loaded launch.
+        This asserted the opposite, on the grounds that failing closed would
+        re-open the destructive cleanup #224 removed. It no longer can: a
+        probe-failure verdict cannot reach `_cleanup_failed_session`, and the
+        sweep sits behind `profile_is_quiescent` besides. What failing closed
+        costs now is a re-seed from the backup, and what it buys is that an
+        in-session /login plus a torn `.claude.json` cannot reuse the profile
+        and exec claude into the account it drifted to.
         """
         tmp_path.mkdir(exist_ok=True)
         self._seed_profile(tmp_path)
         (tmp_path / ".claude.json").write_text("not json")
+        self._probe_times_out(monkeypatch)
+        assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
+        # AND THE PROFILE IS STILL THERE. Refusing to REUSE is a re-seed, not
+        # a delete -- the distinction the old rationale collapsed.
+        assert (tmp_path / ".credentials.json").exists()
+
+    def test_a_readable_identity_still_survives_a_probe_timeout(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """CONTROL: the leniency is gone only for the unreadable case."""
+        tmp_path.mkdir(exist_ok=True)
+        self._seed_profile(tmp_path)
         self._probe_times_out(monkeypatch)
         assert manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
