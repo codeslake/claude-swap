@@ -1740,10 +1740,15 @@ class TestImportClearsDeadTokenQuarantine:
         # current_account_number() resolves the active slot from the LIVE
         # login's identity, so activeness is set the way the product sets it.
         def activate(email: str) -> None:
-            s._write_json(s._get_claude_config_path(), {"oauthAccount": {
+            # Splice, as the switch itself does: replacing the file would drop
+            # every other key and fail this test for an unrelated reason.
+            cfg = s._get_claude_config_path()
+            data = (s._read_json(cfg) if cfg.exists() else None) or {}
+            data["oauthAccount"] = {
                 "emailAddress": email, "accountUuid": "acct",
                 "organizationUuid": ORG, "organizationName": "",
-            }})
+            }
+            s._write_json(cfg, data)
 
         activate("bob@example.com")
         assert s.current_account_number() == "2"
@@ -1752,10 +1757,10 @@ class TestImportClearsDeadTokenQuarantine:
             "", False, False
         ), "premise: the live read is cleanly ABSENT, never a failed read"
 
-        # CONTROL: one non-empty stored source that does NOT match the strike
-        # still answers not-dead. Without it nothing pins the SECOND half of
-        # the condition, and a guard keyed on the empty live bytes alone --
-        # which is the whole mistake being fixed -- would pass.
+        # CONTROL: the BACKUP is non-empty and does not match the strike, so
+        # the slot still answers not-dead. Without this nothing pins the
+        # SECOND half of the condition, and a guard keyed on the empty live
+        # bytes alone -- the very mistake being fixed -- would pass.
         assert not s._slot_token_dead("2", "bob@example.com"), (
             "a stored source that disproves the strike was ignored"
         )

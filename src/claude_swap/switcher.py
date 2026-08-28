@@ -4950,7 +4950,11 @@ class ClaudeAccountSwitcher:
         Comparing the strike only against the live bytes mis-heals it on
         every pass whenever the two lineages differ — the strike/heal/re-POST
         loop that keeps a dead backup out of quarantine forever. The strike
-        holds while ANY stored source still matches the struck generation.
+        holds while ANY stored source still matches the struck generation;
+        with NO stored source to range over, the raw strike count answers (the
+        closing branch). A DEGRADED read is not "no source" -- it is a source
+        nobody looked at, which is the ``None`` above, so that branch must
+        stay BELOW this one.
         """
         # A DEGRADED active read means `stored` may be a superseded generation
         # (CC rotates keychain-only, so a plaintext fallback can lag), so it

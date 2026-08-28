@@ -354,6 +354,21 @@ class TestADegradedReadNeverCONFIRMSaSlotHEALED:
             "no source that could have healed the strike"
         )
 
+    def test_NO_source_at_all_is_ambiguous_on_a_degraded_read(self):
+        """The closing raw-count branch must stay BELOW the degraded guard.
+
+        With both sources empty that branch answers the raw strike count --
+        right when the live read was trustworthy, wrong here, because a
+        degraded read examined nothing and `None` is the only honest answer.
+        The ordering IS that distinction, and nothing else pins it: moving the
+        branch above the guard leaves the rest of the suite green.
+        """
+        v = self._verdict("", False, stored="")
+        assert v is None, (
+            f"got {v!r}: a slot whose live bytes were WITHHELD and whose "
+            "backup is absent was condemned on a read that examined nothing"
+        )
+
     def test_a_HEALTHY_read_still_clears_on_a_divergent_backup(self):
         """CONTROL, and the invariant the round-9/10 tests pin: ``None`` must
         NOT widen into the non-degraded path. There the live bytes WERE

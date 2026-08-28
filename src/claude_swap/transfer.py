@@ -502,8 +502,8 @@ def import_accounts(
                 # guarded — a stale row for a different account returns an
                 # empty entry — so healthy slots still require --force. An
                 # empty live store alone does not trigger it either, not being
-                # attributable to the backup; a slot with NO stored source at
-                # all does, and there is nothing there to overwrite.
+                # attributable to the backup; on a slot with NO stored source
+                # at all a STRUCK row does, and nothing is there to overwrite.
                 outcome = "replaced"
             else:
                 _eprint(
