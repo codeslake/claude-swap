@@ -10394,6 +10394,58 @@ class TestOneLoopbackProbe:
             "serving_port opens its own socket instead of asking the module's "
             f"one probe, so a change to _port_answers cannot reach it: {seen}")
 
+    def test_serving_port_rejects_an_out_of_range_port(self, tmp_path):
+        """The range guard is the only thing between a malformed recorded
+        port and `OverflowError` out of `_port_answers`'s own
+        `socket.connect` -- it catches only `OSError`, and `OverflowError`
+        is not one. A record naming a port outside 0-65535 must come back
+        None instead of reaching the probe."""
+        import json
+
+        from claude_swap import pin
+
+        (tmp_path / "pin-proxy").mkdir()
+        out_of_range_port = 99999
+        assert not 0 < out_of_range_port <= 65535, (
+            "premise: the port this case writes must actually be out of "
+            "range, or the assertion below is vacuous")
+        (tmp_path / "pin-proxy" / "proxy.json").write_text(
+            json.dumps({"port": out_of_range_port}), encoding="utf-8")
+
+        class _SW:
+            backup_dir = tmp_path
+
+        assert pin.serving_port(_SW()) is None
+
+
+class TestAskSwallowsThePackagesOwnExceptions:
+    """`_ask` is the one seam every passthrough (`ca_path_for_trust`,
+    `live_bridge_names`, `titles_to_restore`) shares with the package.
+    `oauth._pin_ca_fingerprint` deleted its own guard in favour of it --
+    "THROUGH THE SEAM. `pin.ca_path_for_trust` already returns None for
+    'cannot ask'" -- so a raise inside the package must still come back
+    None here, never escape through the passthrough."""
+
+    def test_ca_path_for_trust_swallows_the_packages_own_raise(
+        self, monkeypatch
+    ):
+        from claude_swap import pin
+
+        calls = []
+
+        class _I:
+            def ca_path_for_trust(self):
+                calls.append(1)
+                raise OSError("disk gone")
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: _I())
+        assert pin.ca_path_for_trust() is None
+        assert calls, (
+            "the patched ca_path_for_trust was never reached -- without "
+            "this, a patch that silently failed to bind would still see "
+            "None (no live impl in the test environment either) and the "
+            "case would prove nothing about the swallow")
+
 
 class TestThePinFlagsAreMutuallyExclusive:
     """`cswap pin` takes exactly one of NUM|EMAIL / --clear / --heal /
