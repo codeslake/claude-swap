@@ -13041,7 +13041,7 @@ def _is_os_call(node, func: str, os_names: set[str], aliases: set[str]) -> bool:
     # direct call leaves both scans -- offenders AND denominator -- so no
     # floor can notice it and `unreadable` never fires.
     if (isinstance(f, ast.Call) and isinstance(f.func, ast.Name)
-            and f.func.id == "getattr" and len(f.args) == 2
+            and f.func.id == "getattr" and 2 <= len(f.args) <= 3
             and isinstance(f.args[0], ast.Name) and f.args[0].id in os_names
             and isinstance(f.args[1], ast.Constant)
             and f.args[1].value == func):
@@ -13119,7 +13119,7 @@ def test_no_writer_calls_os_write_bare():
             # `getattr` call, which neither branch above is shaped to see.
             fetched = (
                 isinstance(f, ast.Call) and isinstance(f.func, ast.Name)
-                and f.func.id == "getattr" and len(f.args) == 2
+                and f.func.id == "getattr" and 2 <= len(f.args) <= 3
                 and isinstance(f.args[0], ast.Name)
                 and f.args[0].id in os_names
                 and isinstance(f.args[1], ast.Constant)
@@ -13316,7 +13316,10 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
                     and isinstance(node.args[0], ast.Name) else None)
             ok = False
             t_stack = guarding.get(id(node), [])
-            for t in t_stack:
+            # THE INNERMOST `Try` ONLY. A disown in an enclosing handler runs
+            # AFTER the inner cleanup has already unlinked the winner's file,
+            # so crediting it certifies the exact harm this scan forbids.
+            for t in t_stack[-1:]:
                 for h in t.handlers:
                     if h.type is None:
                         continue
