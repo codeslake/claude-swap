@@ -243,6 +243,11 @@ def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
     account: the documented personal/org pattern puts one address in two
     slots, and an email-only test cannot tell a splice from a genuine /login
     into a same-address sibling.
+
+    The address gate below is deliberately LOOSER than everything under it:
+    it casefolds, because Claude Code round-trips ``emailAddress`` through
+    its own login, while `_slot_for` and the row count match the roster
+    exactly, as `_resolve_account_identifier` does.
     """
     if (current.get("emailAddress") or "").casefold() != (
         pinned[0] or ""

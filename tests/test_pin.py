@@ -9454,7 +9454,8 @@ class TestTheUnspliceOnAnAmbiguousAddress:
         ), ("DEFECT: the un-splice claimed the SIBLING's config, which the pin "
             "never wrote")
 
-    def test_a_sibling_is_refused_when_the_record_org_names_no_slot(self):
+    def test_a_sibling_is_refused_when_the_record_org_names_no_slot(
+            self, caplog):
         """The composite cannot arbitrate between two rows at one address.
 
         A record whose org matches NO roster row -- a legacy record, whose
@@ -9468,14 +9469,25 @@ class TestTheUnspliceOnAnAmbiguousAddress:
         Declining is the only honest answer here. Which of the two rows the
         pin was cannot be recovered: the record's org names neither.
         """
+        import logging
+
         from claude_swap import pin
 
         sibling = {"emailAddress": "cloud@example.com",
                    "accountUuid": "UUID-5"}
-        assert not pin._config_names_the_pin(
-            self._sw(), sibling, ("cloud@example.com", ""),
-        ), ("DEFECT: the composite matched a SIBLING on an empty org, so "
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            named = pin._config_names_the_pin(
+                self._sw(), sibling, ("cloud@example.com", ""))
+        assert not named, (
+            "DEFECT: the composite matched a SIBLING on an empty org, so "
             "`--clear` would rewrite an oauthAccount the pin never spliced")
+        # AND IT SAID SO. `clear_pin` decides on the record and the env keys,
+        # neither of which sees the splice, so this warning is the only record
+        # that `--clear` reported success over a config still naming the
+        # ex-pin. The count is in the text too, so a miscount dies here.
+        assert "cannot say which" in caplog.text, (
+            "DEFECT: the un-splice declined silently")
+        assert "2 accounts" in caplog.text, caplog.text
 
     def test_a_found_slot_still_lets_the_composite_decide(self):
         """The guard turns on NO SLOT, not on the address being ambiguous.
@@ -9526,6 +9538,12 @@ class TestTheUnspliceOnAnAmbiguousAddress:
 
         roster = {"accounts": {
             "2": {"email": "cloud@example.com", "organizationUuid": "org-B",
+                  "uuid": ""},
+            # A SECOND ACCOUNT AT ANOTHER ADDRESS, so the count has to be
+            # scoped to the pinned one. Counting rows instead of rows-at-this-
+            # address declines every ordinary multi-account roster, and says
+            # so in a warning that is not true.
+            "1": {"email": "other@example.com", "organizationUuid": "org-A",
                   "uuid": ""},
         }}
         sw = self._sw(roster)
@@ -9583,6 +9601,22 @@ class TestTheUnspliceOnAnAmbiguousAddress:
             ("cloud@example.com", "org-B"),
         ), ("DEFECT: an unreadable roster was treated as an ambiguous "
             "address, so the un-splice declined a config it used to fix")
+
+    def test_the_address_gate_ignores_case(self):
+        """The gate is deliberately looser than the guard beneath it.
+
+        Claude Code round-trips `emailAddress` through its own login, so the
+        config's spelling is not guaranteed to match the roster's byte for
+        byte. Nothing else here casefolds -- `_slot_for` and the count both
+        match the roster exactly, as `_resolve_account_identifier` does.
+        """
+        from claude_swap import pin
+
+        assert pin._config_names_the_pin(
+            self._sw(),
+            {"emailAddress": "CLOUD@Example.com", "accountUuid": "UUID-2"},
+            ("cloud@example.com", "org-B"),
+        ), "DEFECT: the gate rejected the pin's own config on letter case"
 
     def test_control_the_composite_still_refuses_a_different_org(self):
         """CONTROL for the branch above: the composite's False is reachable.
