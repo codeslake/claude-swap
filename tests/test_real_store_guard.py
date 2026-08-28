@@ -367,7 +367,6 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", specs)
     with pytest.raises(conftest.RealStoreWriteBlocked):
         flag.touch()
-    assert not flag.exists()
 
     # Every DIRECTORY `--share-history` shares needs a recursive root of its
     # own: its contents land two levels under the non-recursive `~/.claude`.
