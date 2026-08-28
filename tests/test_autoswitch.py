@@ -77,6 +77,14 @@ def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
     return UsageEntry()
 
 
+def _seed_org_twin(h, num, email, org):
+    """Seed a slot, then give its roster row an organizationUuid."""
+    h.seed(num, email)
+    d = h.switcher._get_sequence_data()
+    d["accounts"][str(num)]["organizationUuid"] = org
+    h.switcher._write_json(h.switcher.sequence_file, d)
+
+
 class EngineHarness:
     """Seeded switcher + engine + captured events, on the Linux file backend."""
 
@@ -2203,6 +2211,82 @@ class TestQuarantineLifecycle:
             "DEFECT: the swap moved the barred lineage to slot 3 and the bar "
             "stayed on slot 2, where it was correctly dropped as account-replaced; "
             "one tick later the engine is logged in on the account it barred"
+        )
+
+    def test_a_bar_is_not_carried_onto_a_same_address_sibling(
+        self, harness, temp_home
+    ):
+        """An address is not an account.
+
+        The personal/org pattern puts one address in two slots, and the
+        codebase keys accounts on the `(email, organizationUuid)` composite
+        everywhere else. Carrying on the address alone moves the bar onto
+        the sibling -- and a blind record then BINDS that sibling's own
+        generation, so no later compare can ever lift it.
+        """
+        _seed_org_twin(harness, 4, "b@example.com", "org-acme")
+
+        # BLIND at record time: with a generation recorded, the next tick's
+        # ordinary compare releases the carried bar and the harm is invisible.
+        store = harness.switcher._store
+        real_read = store._read_account_credentials
+
+        def unreadable(account_num, email, failed=None):
+            if account_num == "2":
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            return real_read(account_num, email, failed)
+
+        with patch.object(store, "_read_account_credentials", side_effect=unreadable):
+            harness.engine._quarantine("2", "b@example.com", "identity-conflict")
+        assert (harness.state()["quarantine"]["2"]).get("fingerprintUnknown") is True, (
+            "premise: the record must be blind"
+        )
+        assert "2" in (harness.state().get("quarantine") or {}), "premise: slot 2 barred"
+        # PREMISE: two slots share the email and differ only by org.
+        r = harness.switcher._get_sequence_data()["accounts"]
+        assert r["2"]["email"] == r["4"]["email"] and r["2"]["organizationUuid"] != r["4"]["organizationUuid"]
+
+        harness.switcher.remove_account("2", assume_yes=True)
+        harness.events.clear()
+        for _ in range(4):
+            harness.tick_with_usage({"1": _usage(95), "3": _usage(50), "4": _usage(0)})
+
+        q = harness.state().get("quarantine") or {}
+        unq = [e for e in harness.events if isinstance(e, UnquarantineEvent)]
+        assert "4" not in q, (
+            "DEFECT: the bar was carried onto slot 4, a DIFFERENT account that "
+            "shares only the email; the blind-bind then wrote slot 4's own "
+            "fingerprint so no later compare can lift it"
+        )
+
+    def test_two_barred_slots_that_exchanged_keep_both_bars(
+        self, harness, temp_home
+    ):
+        """A slot that is vacating is a place a bar may move to.
+
+        Excluding every quarantined slot makes each carry blind to the
+        other exactly when both moved, so one swap drops both bars and the
+        engine is free to switch into the account it barred.
+        """
+        _seed_org_twin(harness, 4, "b@example.com", "org-acme")
+
+        harness.engine._quarantine("2", "b@example.com", "identity-conflict")
+        harness.engine._quarantine("3", "c@example.com", "identity-conflict")
+        q0 = harness.state().get("quarantine") or {}
+        assert set(q0) == {"2", "3"}, f"premise: both barred, got {list(q0)}"
+
+        harness.switcher.swap_accounts("2", "3")
+        r = harness.switcher._get_sequence_data()["accounts"]
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(95), "2": _usage(0), "3": _usage(0), "4": _usage(100)})
+
+        q = harness.state().get("quarantine") or {}
+        unq = [(e.number, e.reason) for e in harness.events if isinstance(e, UnquarantineEvent)]
+        assert set(q) == {"2", "3"}, (
+            "DEFECT: swapping two barred slots dropped BOTH bars -- each carry "
+            f"could not see the other because it is itself quarantined: {list(q)}"
         )
 
     def test_an_unreadable_backup_does_not_lift_a_quarantine(self, harness):

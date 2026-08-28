@@ -881,8 +881,15 @@ class AutoSwitchEngine:
         )
 
         def add(state: dict) -> None:
+            row = ((self.switcher._get_sequence_data() or {})
+                   .get("accounts", {}).get(number) or {})
             state.setdefault("quarantine", {})[number] = {
                 "email": email,
+                # THE COMPOSITE, because an address alone is not an account:
+                # the personal/org pattern puts one address in two slots, and
+                # a carry that matches on the address moves the bar onto the
+                # sibling. Absent on a record written before this.
+                "organizationUuid": row.get("organizationUuid") or "",
                 "reason": reason,
                 "at": _now_iso(),
                 "refreshTokenFingerprint": fingerprint,
@@ -908,10 +915,35 @@ class AutoSwitchEngine:
         to_bind: list[tuple[str, str | None]] = []
         to_rekey: list[tuple[str, str]] = []
         roster = (self.switcher._get_sequence_data() or {}).get("accounts", {})
+
+        def _identity(num: str) -> tuple[str, str] | None:
+            row = roster.get(num)
+            if not isinstance(row, dict):
+                return None
+            return (row.get("email") or "", row.get("organizationUuid") or "")
+
+        def _recorded(e: dict) -> tuple[str, str | None]:
+            org = e.get("organizationUuid")
+            return (e.get("email", ""), org if isinstance(org, str) else None)
+
+        def _is(now: tuple[str, str] | None, rec: tuple[str, str | None]) -> bool:
+            if now is None or not rec[0]:
+                return False
+            # A record written before the org was captured can only match on
+            # the address, which is why an ambiguous one is released below
+            # rather than guessed at.
+            return now[0] == rec[0] if rec[1] is None else now == (rec[0], rec[1])
+
+        # A slot whose identity is UNCHANGED keeps its own bar, so it is not
+        # a place another may move to. One that MOVED is vacating, which is
+        # what lets two barred slots exchange.
+        staying = {
+            n for n, e in quarantine.items() if _is(_identity(n), _recorded(e))
+        }
         for number, entry in quarantine.items():
-            email_now = self.switcher.account_email(number)
-            barred_email = entry.get("email", "")
-            if not email_now or email_now != barred_email:
+            recorded = _recorded(entry)
+            barred_email = recorded[0]
+            if not _is(_identity(number), recorded):
                 # THE BAR IS ON A SLOT AND THE ACCOUNT CAN MOVE. `swap` and
                 # `move` exchange the roster rows AND the credentials, so the
                 # barred lineage lands on another number while this one has
@@ -920,11 +952,10 @@ class AutoSwitchEngine:
                 # identity conflict before the switch. Only when exactly one
                 # OTHER unbarred slot holds it: two would be a guess.
                 elsewhere = [
-                    n for n, row in roster.items()
-                    if isinstance(row, dict)
-                    and row.get("email") == barred_email
-                    and n != number
-                    and n not in quarantine
+                    n for n in roster
+                    if n != number
+                    and n not in staying
+                    and _is(_identity(n), recorded)
                 ]
                 if barred_email and len(elsewhere) == 1:
                     to_rekey.append((number, elsewhere[0]))
@@ -933,6 +964,9 @@ class AutoSwitchEngine:
                     (number, barred_email, "account-replaced")
                 )
                 continue
+            # Past the identity test, so the slot still holds the account
+            # the record names and the two spellings are the same string.
+            email_now = barred_email
             # THE READ THAT SEPARATES FAILED FROM ABSENT. The plain reader
             # answers "" for both, so one locked Keychain or one EACCES
             # fingerprints as None, differs from the recorded value, and
@@ -980,10 +1014,15 @@ class AutoSwitchEngine:
         def drop(s: dict) -> None:
             q = s.get("quarantine")
             if isinstance(q, dict):
+                # POP EVERY SOURCE BEFORE WRITING ANY TARGET. Two barred
+                # slots that exchanged are each other's target, so writing
+                # in step would overwrite the second bar with the first.
+                carried: dict[str, dict] = {}
                 for old_num, new_num in to_rekey:
                     row = q.pop(old_num, None)
                     if isinstance(row, dict):
-                        q[new_num] = row
+                        carried[new_num] = row
+                q.update(carried)
                 for number, fp in to_bind:
                     row = q.get(number)
                     if isinstance(row, dict):
