@@ -362,6 +362,11 @@ class TestADegradedReadNeverCONFIRMSaSlotHEALED:
         degraded read examined nothing and `None` is the only honest answer.
         The ordering IS that distinction, and nothing else pins it: moving the
         branch above the guard leaves the rest of the suite green.
+
+        No caller reaches this row today: `_slot_token_dead` screens the
+        degraded read itself and leaves the flag defaulted, and the collector
+        sentinels an empty-creds active slot before the scan. The invariant is
+        held here for the caller that stops doing one of those.
         """
         v = self._verdict("", False, stored="")
         assert v is None, (

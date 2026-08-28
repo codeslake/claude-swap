@@ -4953,8 +4953,8 @@ class ClaudeAccountSwitcher:
         holds while ANY stored source still matches the struck generation;
         with NO stored source to range over, the raw strike count answers (the
         closing branch). A DEGRADED read is not "no source" -- it is a source
-        nobody looked at, which is the ``None`` above, so that branch must
-        stay BELOW this one.
+        nobody looked at, and answers ``None`` instead, so the closing branch
+        must stay BELOW the ``active_read_degraded`` guard.
         """
         # A DEGRADED active read means `stored` may be a superseded generation
         # (CC rotates keychain-only, so a plaintext fallback can lag), so it
