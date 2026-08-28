@@ -3579,41 +3579,57 @@ class TestPerformSwitchPostDisplay:
 
     @pytest.mark.skipif(
         sys.platform == "win32",
-        reason="a 0o500 parent is a POSIX permission shape",
+        reason="a 0o500 parent and RLIMIT_FSIZE are POSIX shapes",
     )
-    def test_a_restore_writes_through_when_the_rename_cannot_land(
+    def test_a_restore_never_rewrites_a_destination_in_place(
         self,
         temp_home: Path,
     ) -> None:
-        """A rename needs a writable PARENT; a rewrite needs only the file.
+        """A rename it cannot make is not a rewrite it may make.
 
-        A bind-mounted destination pins the inode (a container mounting
-        ~/.claude.json) and an unwritable parent refuses the temp outright.
-        `Path.write_text` handled both, so the helper that replaced it must
-        not leave the caller holding the half-switched state.
+        The only evidence available at that point is the errno from the
+        TEMP, which is a fact about the PARENT DIRECTORY -- and the
+        destination need not even be on the same filesystem. A rewrite
+        authorised that way truncates a file whose own room nothing
+        measured, which is the loss this helper exists to prevent.
         """
+        import resource
+        import signal
+
         dest = temp_home / "sub" / ".claude.json"
         dest.parent.mkdir()
-        dest.write_text("THE-OTHER-ACCOUNT", encoding="utf-8")
-        # PREMISE: the file is writable and its parent is not.
+        original = json.dumps({"projects": {f"/p/{i}": [1] * 20 for i in range(2500)}})
+        dest.write_text(original, encoding="utf-8")
+        cap = len(original) // 2
+        # PREMISE: the parent refuses the temp, so the errno the helper sees
+        # is EACCES -- nothing about the destination's own room.
         os.chmod(dest.parent, 0o500)
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
         try:
-            with open(dest, "a", encoding="utf-8"):
-                pass
             with pytest.raises(PermissionError):
                 (dest.parent / "probe").touch()
-
-            _restore_atomically(dest, "ORIGINAL")
+            with pytest.raises(OSError) as caught:
+                _restore_atomically(dest, original)
         finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
             os.chmod(dest.parent, 0o700)
 
-        assert dest.read_text(encoding="utf-8") == "ORIGINAL", (
-            "DEFECT: the restore refused where a rewrite would have "
-            "succeeded, leaving the destination on the other account"
+        text = dest.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the restore rewrote a destination in place on the "
+            "strength of an errno about a different filesystem, and the "
+            f"rewrite ran out of room ({len(original)}B -> {len(text)}B)"
+        )
+        assert caught.value.errno == errno.EACCES, (
+            "the refusal must carry the temp's own errno, not one from a "
+            "rewrite it should never have attempted"
         )
         assert not [
             p for p in dest.parent.iterdir() if ".restore." in p.name
-        ], "the write-through must not strand its temp"
+        ], "a refused restore must not strand its temp"
 
     @pytest.mark.skipif(
         sys.platform == "win32",

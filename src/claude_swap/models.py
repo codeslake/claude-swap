@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import json
 import os
 import re
@@ -164,11 +163,6 @@ class AccountsSnapshot:
     taken_at: float
 
 
-# THE FAULTS THAT MAKE A WRITE-THROUGH LOSSY. On these the destination is
-# still intact, so refusing the restore beats truncating it.
-_NO_ROOM = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EFBIG})
-
-
 def _restore_atomically(path: Path, text: str) -> None:
     """Put `text` back without truncating what is already there.
 
@@ -180,6 +174,14 @@ def _restore_atomically(path: Path, text: str) -> None:
     or an exhausted quota, which is the failure class this restore exists
     for. Name first, publish by rename, so a failed restore leaves the
     destination exactly as it was.
+
+    NEVER falls back to rewriting in place. The only evidence a fallback
+    could weigh is the errno from the TEMP, which is a fact about the
+    parent directory -- and a bind-mounted destination is not even on the
+    same filesystem, so a rewrite authorised that way truncates a file
+    whose own room nothing measured. Refusing leaves the caller holding
+    the state this restore exists to undo, which one switch recovers; a
+    truncated destination is not recoverable at all.
     """
     tmp = path.parent / f".{path.name}.restore.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     fd = -1
@@ -199,17 +201,6 @@ def _restore_atomically(path: Path, text: str) -> None:
             os.chmod(tmp, 0o600)
         replace_with_retry(tmp, path)
         tmp = None
-    except OSError as e:
-        if e.errno in _NO_ROOM:
-            raise
-        # THE RENAME CANNOT LAND HERE. A bind-mounted destination pins the
-        # inode (a container mounting ~/.claude.json) and an unwritable parent
-        # refuses the temp outright -- both cases `Path.write_text` handled,
-        # so writing through beats leaving the caller in the half-switched
-        # state this restore exists to undo.
-        path.write_text(text, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(path, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)
