@@ -678,6 +678,93 @@ class TestBootstrap:
             "premise: nothing may have re-seeded the profile"
         )
 
+    def test_a_stuck_profile_names_the_repair_that_actually_works(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """An unreadable record makes every gate on this path defer, and
+        nothing in cswap prunes a record -- so `--add-account` routes
+        through the same chokepoint and repairs nothing, and
+        `--remove-account` refuses for the same reason. Naming it is the
+        difference between a slot the user can fix and one they cannot.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / "9999.json").write_text('{"pid": 9999, "cw')
+        # PREMISES: not quiescent, and nothing live -- the permanent case.
+        assert not session_mod.profile_is_quiescent(session_dir)
+        live, unreadable = session_mod.scan_live_sessions(session_dir)
+        assert live == [] and unreadable == 1
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        message = str(caught.value)
+        assert "could not be read" in message and "sessions" in message, (
+            "DEFECT: the launch refuses and names none of the obstruction "
+            f"that blocked it: {message}"
+        )
+        assert "--add-account" not in message, (
+            "DEFECT: the launch names a remedy that routes through the same "
+            "chokepoint and repairs nothing on this state"
+        )
+
+    def test_a_marker_that_cannot_be_honoured_is_announced(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain, capsys
+    ):
+        """Both readers of the flag require quiescence, so on an unreadable
+        record the reuse path serves the very generation the flag exists to
+        retire -- and says nothing."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "SUPERSEDED", encoding="utf-8"
+        )
+        (session_dir / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": ACCOUNT_EMAIL,
+                              "accountUuid": "u"}}))
+        assert session_mod.mark_session_stale(session_dir)
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / "9999.json").write_text('{"pid": 9999, "cw')
+        # PREMISES: flagged, not quiescent, nothing live.
+        assert session_mod.is_session_stale(session_dir)
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert session_mod.scan_live_sessions(session_dir)[0] == []
+
+        def valid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": True, "authMethod": "claudeai",
+                                   "email": ACCOUNT_EMAIL}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", valid)
+        try:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        except SessionError:
+            pass
+        said = capsys.readouterr()
+        assert "cannot be honoured" in (said.out + said.err), (
+            "DEFECT: the profile is flagged for re-bootstrap, the flag can "
+            "never be honoured, and the launch says nothing"
+        )
+
     def test_a_live_profile_is_not_swept_at_all(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
         block_real_keychain

@@ -689,6 +689,21 @@ class SessionManager:
         # a second `cswap run` joining a live session must not invalidate
         # under the running claude (the marker survives for later).
         stale = is_session_stale(session_dir) and profile_is_quiescent(session_dir)
+        if is_session_stale(session_dir) and not stale:
+            # THE DEFERRAL HAS NO END WHEN THE RECORDS CANNOT BE READ. The
+            # marker asks for a re-bootstrap and both readers of it require
+            # quiescence, so on an unreadable record the reuse path below
+            # serves the generation the marker exists to retire -- silently.
+            _live, _unreadable = scan_live_sessions(session_dir)
+            if _unreadable and not _live:
+                self._warn(
+                    f"Account-{account_num}'s session profile is flagged for "
+                    f"re-bootstrap but has {_unreadable} session record(s) "
+                    f"that could not be read, so the flag cannot be honoured "
+                    f"and this launch may serve a superseded credential. "
+                    f"Inspect {session_dir / 'sessions'} and remove or repair "
+                    f"them."
+                )
 
         # Cheap reuse check without the lock: most launches hit this.
         if not stale and self._is_session_valid(session_dir, email, org_uuid):
@@ -847,6 +862,22 @@ class SessionManager:
                     f"`claude` is on PATH, then retry."
                 )
             if verdict != "valid":
+                # THE GATE'S OWN REASON, or the remedy below is one the
+                # user cannot act on. An unreadable record makes every
+                # gate on this path defer, and nothing in cswap prunes a
+                # record -- so `--add-account` routes through the same
+                # chokepoint and repairs nothing, and `--remove-account`
+                # refuses for the same reason. Only the file itself.
+                _, _unreadable = scan_live_sessions(session_dir)
+                if _unreadable:
+                    raise SessionError(
+                        f"Session profile for Account-{account_num} "
+                        f"({email}) failed validation, and it has "
+                        f"{_unreadable} session record(s) that could not "
+                        f"be read, so it cannot be re-seeded either. "
+                        f"Inspect {session_dir / 'sessions'} and remove or "
+                        f"repair them, then retry."
+                    )
                 # NEVER UNDER A LIVE CLAUDE, the rule every other
                 # invalidation site in this file already follows. The sweep
                 # deletes the seed and the identity out from under a running
