@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -13,6 +14,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.usage_store import UsageEntry
 
 if TYPE_CHECKING:
@@ -162,6 +164,11 @@ class AccountsSnapshot:
     taken_at: float
 
 
+# THE FAULTS THAT MAKE A WRITE-THROUGH LOSSY. On these the destination is
+# still intact, so refusing the restore beats truncating it.
+_NO_ROOM = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EFBIG})
+
+
 def _restore_atomically(path: Path, text: str) -> None:
     """Put `text` back without truncating what is already there.
 
@@ -190,8 +197,19 @@ def _restore_atomically(path: Path, text: str) -> None:
             handle.write(text)
         if sys.platform != "win32":
             os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        replace_with_retry(tmp, path)
         tmp = None
+    except OSError as e:
+        if e.errno in _NO_ROOM:
+            raise
+        # THE RENAME CANNOT LAND HERE. A bind-mounted destination pins the
+        # inode (a container mounting ~/.claude.json) and an unwritable parent
+        # refuses the temp outright -- both cases `Path.write_text` handled,
+        # so writing through beats leaving the caller in the half-switched
+        # state this restore exists to undo.
+        path.write_text(text, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(path, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)

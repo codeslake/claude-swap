@@ -62,6 +62,7 @@ from claude_swap.models import (
     AccountsSnapshot,
     Platform,
     SwitchTransaction,
+    _restore_atomically,
     get_timestamp,
     normalize_alias,
 )
@@ -7151,11 +7152,14 @@ class ClaudeAccountSwitcher:
                             )
                     if config_written and rollback_config_text is not None:
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
+                            # THE THIRD RESTORE ARM. `config_written` is armed
+                            # before the write, so this runs on faults where
+                            # `_write_json` never opened the destination and
+                            # those bytes are the intact original -- and
+                            # `write_text` opened with O_TRUNC destroyed them.
+                            _restore_atomically(
+                                config_path, rollback_config_text
                             )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"

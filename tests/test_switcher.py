@@ -29,7 +29,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
-from claude_swap.models import Platform, normalize_alias
+from claude_swap.models import Platform, _restore_atomically, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
@@ -3575,6 +3575,85 @@ class TestPerformSwitchPostDisplay:
         )
         assert not [p for p in temp_home.iterdir() if ".restore." in p.name], (
             "a failed restore must not strand its temp"
+        )
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="a 0o500 parent is a POSIX permission shape",
+    )
+    def test_a_restore_writes_through_when_the_rename_cannot_land(
+        self,
+        temp_home: Path,
+    ) -> None:
+        """A rename needs a writable PARENT; a rewrite needs only the file.
+
+        A bind-mounted destination pins the inode (a container mounting
+        ~/.claude.json) and an unwritable parent refuses the temp outright.
+        `Path.write_text` handled both, so the helper that replaced it must
+        not leave the caller holding the half-switched state.
+        """
+        dest = temp_home / "sub" / ".claude.json"
+        dest.parent.mkdir()
+        dest.write_text("THE-OTHER-ACCOUNT", encoding="utf-8")
+        # PREMISE: the file is writable and its parent is not.
+        os.chmod(dest.parent, 0o500)
+        try:
+            with open(dest, "a", encoding="utf-8"):
+                pass
+            with pytest.raises(PermissionError):
+                (dest.parent / "probe").touch()
+
+            _restore_atomically(dest, "ORIGINAL")
+        finally:
+            os.chmod(dest.parent, 0o700)
+
+        assert dest.read_text(encoding="utf-8") == "ORIGINAL", (
+            "DEFECT: the restore refused where a rewrite would have "
+            "succeeded, leaving the destination on the other account"
+        )
+        assert not [
+            p for p in dest.parent.iterdir() if ".restore." in p.name
+        ], "the write-through must not strand its temp"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is POSIX-only",
+    )
+    def test_a_restore_refuses_rather_than_write_through_a_space_fault(
+        self,
+        temp_home: Path,
+    ) -> None:
+        """The write-through above must not swallow the fault it exists for.
+
+        A full filesystem fails the rewrite too, and the rewrite truncates
+        first — so on those errnos the intact destination is worth more than
+        the attempt.
+        """
+        dest = temp_home / ".claude.json"
+        original = json.dumps({"projects": {f"/p/{i}": [1] * 20 for i in range(2500)}})
+        dest.write_text(original, encoding="utf-8")
+        cap = len(original) // 2
+        # PREMISE: the payload cannot fit under the cap, so the write faults.
+        assert cap < len(original)
+
+        import resource
+        import signal
+
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+        try:
+            with pytest.raises(OSError) as caught:
+                _restore_atomically(dest, original)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+
+        assert caught.value.errno == errno.EFBIG
+        assert dest.read_text(encoding="utf-8") == original, (
+            "DEFECT: the write-through fallback truncated a destination the "
+            f"failed write never touched ({len(original)}B -> "
+            f"{dest.stat().st_size}B)"
         )
 
     def test_a_write_through_that_empties_the_roster_is_rolled_back(
@@ -7923,6 +8002,60 @@ class TestDirectActivationPreservation:
         (entry_id,) = entries
         assert _read_safety_copy(switcher, entry_id) == unmanaged
         assert entries[entry_id]["reason"] == "displaced-live-login"
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is POSIX-only",
+    )
+    def test_direct_activation_rollback_does_not_truncate_the_config(
+        self, temp_home
+    ):
+        """The THIRD restore arm, on ~/.claude.json.
+
+        `config_written` is armed before the write, so this arm runs on the
+        faults where `_write_json` never opened the destination and those
+        bytes are the intact original. A truncating rewrite there destroys
+        `oauthAccount`, `projects`, `mcpServers` and `userID` — and the arm
+        only logs, so nothing tells the user the config is gone.
+        """
+        import resource
+        import signal
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+            "mcpServers": {"a": {"command": "x"}},
+            "projects": {
+                f"/p/{i}": {"allowedTools": ["Bash", "Read"] * 8}
+                for i in range(700)
+            },
+        }))
+        original = config_path.read_text(encoding="utf-8")
+        cap = 100_000
+        # PREMISE: the config cannot fit under the cap, so the write faults.
+        assert len(original) > cap
+
+        old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
+        try:
+            with patch.object(switcher, "list_accounts"):
+                with pytest.raises(OSError):
+                    switcher._perform_switch("1", emit_output=False)
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+            signal.signal(signal.SIGXFSZ, old_sig)
+
+        text = config_path.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the direct-activation rollback truncated the config the "
+            f"failed write never touched ({len(original)}B -> {len(text)}B)"
+        )
 
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
