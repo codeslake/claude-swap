@@ -8124,6 +8124,68 @@ class TestProvenanceGuard:
         # The switch itself proceeded, onto the stored backup.
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
+    def test_a_foreign_credential_heals_a_slot_whose_stored_token_is_dead(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """A foreign credential is refused a slot because identity proves
+        ownership, not generation freshness. When the resolved slot's stored
+        generation is QUARANTINED as refresh-token-dead there is no freshness
+        left to protect: its stored token can mint nothing, so live bytes the
+        oracle resolved to it are strictly better than what it holds.
+
+        `cswap import` already heals exactly this case (issue #136,
+        `_slot_token_dead`). The switch-time stash did not, so a user who
+        logged the account back in had the fresh credential preserved into a
+        safety copy that nothing adopts, while the slot kept the dead token
+        and asked for a re-login again on the next pass.
+        """
+        from claude_swap import oauth
+        from claude_swap.usage_store import FetchRecord
+
+        sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-2"
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = creds_store[("2", "account2@example.com")]
+        ident = {"2": ("account2@example.com", "org-2")}
+        switcher._usage_store.record(
+            {"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(a2_backup),
+            )},
+            ident,
+        )
+        assert switcher._slot_token_dead("2", "account2@example.com"), (
+            "premise: slot 2 is quarantined ON THE GENERATION IT STORES"
+        )
+        foreign = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-relogin", "refreshToken": "rt-2-relogin",
+        }})
+        live_state = {"creds": foreign}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "org-2",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP, (
+            "the outgoing slot is still never written"
+        )
+        assert creds_store[("2", "account2@example.com")] == foreign, (
+            "DEFECT: the dead slot did not adopt the credential the oracle "
+            "resolved to it, so it still cannot authenticate"
+        )
+        assert not switcher._slot_token_dead("2", "account2@example.com"), (
+            "DEFECT: the slot holds a live credential and is still "
+            "quarantined, so it keeps reporting re-login needed"
+        )
+
     def test_foreign_synced_lineage_warns_without_any_write(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):

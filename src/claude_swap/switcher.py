@@ -4796,14 +4796,45 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
         }
 
+    def _adopt_into_dead_slot(
+        self, foreign_slot: str | None, credentials: str, data: dict
+    ) -> bool:
+        """Write foreign live bytes into their own slot iff that slot is dead.
+
+        A foreign credential is normally refused every slot because identity
+        proves ownership, not generation freshness. A slot quarantined as
+        refresh-token-dead has no freshness left to protect -- its stored
+        token can mint nothing -- so bytes the oracle resolved to it are
+        strictly better than what it holds. Same trade-off `cswap import`
+        already takes (issue #136); without it the safety copy is a dead end,
+        because nothing adopts a stash and the slot asks for a re-login again
+        on the next pass.
+
+        Returns whether the adoption happened, so the caller can say which of
+        the two things it did.
+        """
+        if not foreign_slot:
+            return False
+        record = (data.get("accounts") or {}).get(str(foreign_slot)) or {}
+        email = record.get("email") or ""
+        if not email or not self._slot_token_dead(str(foreign_slot), email):
+            return False
+        self._write_account_credentials(str(foreign_slot), email, credentials)
+        self._usage_store.clear_dead_token(
+            [str(foreign_slot)],
+            {str(foreign_slot): (email, record.get("organizationUuid") or "")},
+        )
+        return True
+
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
 
         The same question :meth:`_entry_token_dead` answers for the collectors,
         reachable from a caller that has only a slot number — `cswap import`'s
-        auto-heal, which must agree with them: the heal exists to release a
-        quarantine the collectors imposed, so a different verdict means the
-        remedy the "re-login needed" message names silently does nothing.
+        auto-heal and the switch-time adoption of a foreign credential, which
+        must agree with them: the heal exists to release a quarantine the
+        collectors imposed, so a different verdict means the remedy the
+        "re-login needed" message names silently does nothing.
 
         In particular the ACTIVE slot has two stored sources, and a strike may
         be bound to either (see :meth:`_entry_token_dead`). Comparing only the
@@ -4812,12 +4843,12 @@ class ClaudeAccountSwitcher:
         quarantined in the first place.
 
         ``_entry_token_dead`` can also answer ``None`` — cannot determine,
-        an unreadable backup on a struck active slot. This method's only
-        caller (`cswap import`'s auto-heal) uses it as a plain boolean gate
-        between "replace" and "already exists, use --force": ``None``
+        an unreadable backup on a struck active slot. Both callers use it as a
+        plain boolean gate — "replace" vs "already exists, use --force" for
+        the import, "adopt" vs "preserve only" for the stash: ``None``
         coerces to ``False`` here, the conservative direction — an ambiguous
         read must not silently authorize an overwrite the user never
-        confirmed with ``--force``.
+        confirmed.
         """
         # The org uuid is part of the row identity (UsageStore._matches
         # compares it for EQUALITY), so an empty one silently matches nothing:
@@ -7038,7 +7069,17 @@ class ClaudeAccountSwitcher:
                         original_creds, kind, current_account,
                         provenance.get("resolved"),
                     )
-                    if kind == "foreign":
+                    if kind == "foreign" and self._adopt_into_dead_slot(
+                        foreign_slot, original_creds, data,
+                    ):
+                        msg = (
+                            "Credential ownership mismatch detected. The live "
+                            f"credential belongs to Account-{foreign_slot}, "
+                            "whose stored token the endpoint had already "
+                            "condemned, so it was adopted there instead of "
+                            f"into Account-{current_account}."
+                        )
+                    elif kind == "foreign":
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             "credential was preserved and was not written "
