@@ -6,6 +6,7 @@ import errno
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -1080,7 +1081,10 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
 
         def spy(parent):
             asked.append(parent)
-            return True
+            # The PLATFORM answer, not True: Windows cannot hold a directory
+            # open at all, so forcing the pinned path there raises EACCES
+            # out of the acquire -- the difference this commit exists for.
+            return cl._CAN_PIN_A_DIRECTORY
 
         monkeypatch.setattr(cl, "_fd_pins_an_inode", spy)
         lock_dir = tmp_path / "x.lock"
@@ -1118,6 +1122,11 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             "is still a descriptor on a filesystem that pins nothing"
         )
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows cannot hold a directory open, so the probe is False "
+               "there by construction and has nothing to report",
+    )
     def test_the_probe_reports_a_presence(self, tmp_path):
         """The control: on this filesystem the descriptor DOES pin."""
         import claude_swap.claude_locks as cl
