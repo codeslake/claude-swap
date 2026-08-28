@@ -518,6 +518,37 @@ class TestCcRefreshLockProtocol:
         assert not new.exists()
         assert not legacy.exists()
 
+    def test_the_primary_lock_is_taken_before_the_legacy_one(
+        self, temp_home, monkeypatch
+    ):
+        """The order is the whole point, and the two contention cases
+        cannot see it: each asserts a lock is ABSENT after the `with`,
+        which the release guarantees whichever order they were taken in.
+        Claude Code takes the primary first and releases it on a legacy
+        ELOCKED; taken the other way round, cswap holds the legacy lock
+        while CC is still trying for it and burns CC's whole retry budget
+        instead of failing it cheaply on the primary.
+        """
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        created = []
+        real_mkdir = claude_locks.os.mkdir
+
+        def recording(path, *a, **k):
+            created.append(str(path))
+            return real_mkdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", recording)
+        with claude_credentials_lock(timeout=2.0):
+            pass
+
+        locks = [p for p in created if p.endswith(".lock")]
+        # PREMISE: both locks were taken, or the order below is vacuous.
+        assert len(locks) == 2, f"premise: both locks must be taken, got {locks}"
+        assert locks[0].endswith(".oauth_refresh.lock"), (
+            "DEFECT: the primary must be taken FIRST, as Claude Code does; "
+            f"the order was {locks}"
+        )
+
     def test_primary_contention_never_touches_legacy(self, temp_home, monkeypatch):
         """CC's order: primary first. If the primary is held we must time out
         without ever creating the legacy lock."""
