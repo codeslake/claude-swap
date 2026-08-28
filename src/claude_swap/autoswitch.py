@@ -906,12 +906,31 @@ class AutoSwitchEngine:
             return state
         to_release: list[tuple[str, str, str]] = []
         to_bind: list[tuple[str, str | None]] = []
+        to_rekey: list[tuple[str, str]] = []
         roster = (self.switcher._get_sequence_data() or {}).get("accounts", {})
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
-            if not email_now or email_now != entry.get("email"):
+            barred_email = entry.get("email", "")
+            if not email_now or email_now != barred_email:
+                # THE BAR IS ON A SLOT AND THE ACCOUNT CAN MOVE. `swap` and
+                # `move` exchange the roster rows AND the credentials, so the
+                # barred lineage lands on another number while this one has
+                # correctly stopped being about it. Releasing without looking
+                # puts it straight back in rotation, and nothing re-checks an
+                # identity conflict before the switch. Only when exactly one
+                # OTHER unbarred slot holds it: two would be a guess.
+                elsewhere = [
+                    n for n, row in roster.items()
+                    if isinstance(row, dict)
+                    and row.get("email") == barred_email
+                    and n != number
+                    and n not in quarantine
+                ]
+                if barred_email and len(elsewhere) == 1:
+                    to_rekey.append((number, elsewhere[0]))
+                    continue
                 to_release.append(
-                    (number, entry.get("email", ""), "account-replaced")
+                    (number, barred_email, "account-replaced")
                 )
                 continue
             # THE READ THAT SEPARATES FAILED FROM ABSENT. The plain reader
@@ -955,12 +974,16 @@ class AutoSwitchEngine:
                 continue
             if fingerprint != entry.get("refreshTokenFingerprint"):
                 to_release.append((number, email_now, "credentials-replaced"))
-        if not to_release and not to_bind:
+        if not to_release and not to_bind and not to_rekey:
             return state
 
         def drop(s: dict) -> None:
             q = s.get("quarantine")
             if isinstance(q, dict):
+                for old_num, new_num in to_rekey:
+                    row = q.pop(old_num, None)
+                    if isinstance(row, dict):
+                        q[new_num] = row
                 for number, fp in to_bind:
                     row = q.get(number)
                     if isinstance(row, dict):

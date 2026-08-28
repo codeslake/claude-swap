@@ -558,7 +558,14 @@ def import_accounts(
             "uuid": entry["uuid"],
             "organizationUuid": entry["org_uuid"],
             "organizationName": entry["org_name"],
-            "added": entry["added"],
+            # WHEN THIS ROSTER GAINED THE ACCOUNT, not when the source
+            # machine did. The bundle's stamp is a fact about the export,
+            # and copying it makes the roster claim a credential this
+            # import just replaced has been in place since then -- which
+            # is what the auto-switch release reads to tell a recovery
+            # from an unchanged slot. `clear_dead_token` above lifts the
+            # usage-store quarantine for the same reason.
+            "added": get_timestamp(),
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"

@@ -2107,6 +2107,104 @@ class TestQuarantineLifecycle:
             isinstance(e, UnquarantineEvent) for e in harness.events
         ), "the release must be announced"
 
+    def test_an_import_recovery_lifts_a_blind_quarantine(
+        self, harness, tmp_path
+    ):
+        """`--import --force` replaces a slot's credential too.
+
+        The roster stamp is what separates a recovery from an unchanged
+        slot, so every command that replaces the credential has to move it.
+        The import used to copy the bundle's stamp, which is a fact about
+        the EXPORT -- older than any later quarantine by construction -- so
+        the bind took the restored credential as the quarantine's own
+        generation and the slot stayed barred. A second import writes the
+        same bytes, so it does not free it either.
+        """
+        from claude_swap.transfer import import_accounts
+
+        store = harness.switcher._store
+        real_read = store._read_account_credentials
+
+        def unreadable(account_num, email, failed=None):
+            if account_num == "2":
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            return real_read(account_num, email, failed)
+
+        # The quarantine is recorded first; the user reads the notice and acts
+        # later. Freeze its stamp rather than race the import inside one second.
+        with patch.object(store, "_read_account_credentials", side_effect=unreadable), \
+             patch("claude_swap.autoswitch._now_iso", return_value="2024-06-01T00:00:00Z"):
+            harness.engine._quarantine("2", "b@example.com", "identity-conflict")
+        entry = (harness.state().get("quarantine") or {})["2"]
+        at = entry["at"]
+        assert entry["refreshTokenFingerprint"] is None, "premise: blind record"
+
+        # A bundle exported on a healthy day: it carries the ORIGINAL added.
+        bundle = {"version": 1, "accounts": [{
+            "email": "b@example.com", "number": 2, "uuid": "uuid-2",
+            "organizationUuid": "", "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+            "credentials": {"claudeAiOauth": {"accessToken": "sk-RESTORED",
+                                              "refreshToken": "rt-RESTORED"}},
+            "config": {"oauthAccount": {"emailAddress": "b@example.com",
+                                        "accountUuid": "uuid-2"}},
+        }]}
+        f = tmp_path / "backup.json"
+        f.write_text(json.dumps(bundle))
+        import_accounts(harness.switcher, str(f), force=True)
+
+        added = harness.switcher._get_sequence_data()["accounts"]["2"]["added"]
+        restored = harness.switcher._read_account_credentials("2", "b@example.com")
+        print(f"\nafter import: added={added!r}  at={at!r}  added>at={added > at}")
+        print(f"credential restored: {'sk-RESTORED' in (restored or '')}")
+        # PREMISES: the import really replaced the credential.
+        assert "sk-RESTORED" in (restored or ""), "premise: the import must land"
+        harness.events.clear()
+        for i in range(3):
+            harness.tick_with_usage({"1": _usage(95), "2": _usage(0), "3": _usage(50)})
+        q = harness.state().get("quarantine") or {}
+        print(f"after 3 ticks: quarantined={'2' in q}  unq events={sum(isinstance(e, UnquarantineEvent) for e in harness.events)}")
+        assert "2" not in q, (
+            "DEFECT: the user restored a working credential with the product's own "
+            f"import and the slot is still barred: {q.get('2')}"
+        )
+
+    def test_a_swap_carries_the_bar_to_the_account_s_new_slot(self, harness):
+        """The bar is on a slot; `swap` and `move` move the account.
+
+        Both exchange the roster rows AND the credentials, so the barred
+        lineage lands on another number while this one has correctly
+        stopped being about it. Released there, it is back in rotation
+        immediately -- and `_freshen_target` answers "ok" without
+        consuming a grant, so nothing re-checks the identity before the
+        engine switches into it.
+        """
+        from claude_swap.autoswitch import SwitchEvent
+
+        harness.engine._quarantine("2", "b@example.com", "identity-conflict")
+        assert "2" in (harness.state().get("quarantine") or {}), "premise: slot 2 barred"
+
+        harness.switcher.swap_accounts("2", "3")
+        roster = harness.switcher._get_sequence_data()["accounts"]
+        print(f"\nafter swap: slot2={roster['2']['email']}  slot3={roster['3']['email']}")
+        # PREMISE: the barred ACCOUNT is now at slot 3.
+        assert roster["3"]["email"] == "b@example.com"
+
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(95), "2": _usage(100), "3": _usage(0)})
+        q = harness.state().get("quarantine") or {}
+        switched = [e for e in harness.events if isinstance(e, SwitchEvent)]
+        unq = [e for e in harness.events if isinstance(e, UnquarantineEvent)]
+        print(f"quarantine={list(q)}  unq={len(unq)}  switched={[getattr(e,'number',None) for e in switched]}")
+        print(f"active={harness.active_number()}")
+        assert harness.active_number() != 3, (
+            "DEFECT: the swap moved the barred lineage to slot 3 and the bar "
+            "stayed on slot 2, where it was correctly dropped as account-replaced; "
+            "one tick later the engine is logged in on the account it barred"
+        )
+
     def test_an_unreadable_backup_does_not_lift_a_quarantine(self, harness):
         """"Could not read it" is not "the user replaced it".
 
