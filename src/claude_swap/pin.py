@@ -264,13 +264,25 @@ def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
         # address equally plausible, and an org-less sibling config satisfies
         # email-and-org while being a genuine /login. A stale name costs a
         # bridge; a wrong rewrite swaps the identity -- so decline.
-        # `_resolve_account_identifier` IS this codebase's ambiguity signal,
-        # so ask it rather than counting rows. An address it does not know
-        # answers None without raising and still reaches the composite, which
-        # is the pinned-account-has-no-roster-row case that needs it.
+        #
+        # COUNTED, not inferred from a raise. `_resolve_account_identifier`
+        # raises on this shape, but it raises on an unreadable `sequence.json`
+        # too, and turning on the exception declines on a roster we merely
+        # could not read -- narrowing the clear on the path that exists for
+        # when things are broken. An unreadable roster is not ambiguity.
         try:
-            switcher._resolve_account_identifier(pinned[0])
-        except Exception:  # noqa: BLE001 — cannot tell is a decline, not a raise
+            rows = (switcher._get_sequence_data() or {}).get("accounts") or {}
+            same = sum(1 for r in rows.values()
+                       if isinstance(r, dict) and r.get("email") == pinned[0])
+        except Exception:  # noqa: BLE001 — unreadable is not ambiguous
+            same = 0
+        if same > 1:
+            # THE ONLY RECORD THAT THIS HAPPENED. `clear_pin` decides on the
+            # record and the env keys, neither of which sees the splice, so
+            # it reports success over a config that still names the ex-pin.
+            _logger.warning(
+                "the pin record names an address held by %d accounts and "
+                "cannot say which; leaving oauthAccount alone", same)
             return False
     return (current.get("organizationUuid") or "") == (pinned[1] or "")
 

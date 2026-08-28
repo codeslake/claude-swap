@@ -9477,6 +9477,92 @@ class TestTheUnspliceOnAnAmbiguousAddress:
         ), ("DEFECT: the composite matched a SIBLING on an empty org, so "
             "`--clear` would rewrite an oauthAccount the pin never spliced")
 
+    def test_a_found_slot_still_lets_the_composite_decide(self):
+        """The guard turns on NO SLOT, not on the address being ambiguous.
+
+        Pins the condition itself. When the record's org DOES name a row the
+        slot is known, so the ambiguity of the address is irrelevant and the
+        composite must still decide -- probing anyway would decline a config
+        that is identified. Without this, widening the guard to fire on every
+        ambiguous address kills no test.
+
+        The writer answers nothing here (an empty roster ``uuid``, which
+        `add_account` really writes, plus a stored config with no
+        ``accountUuid``), which is what routes an identified slot down to the
+        composite at all.
+        """
+        from claude_swap import pin
+
+        roster = {"accounts": {
+            "2": {"email": "cloud@example.com", "organizationUuid": "org-B",
+                  "uuid": ""},
+            "5": {"email": "cloud@example.com", "organizationUuid": "org-C",
+                  "uuid": ""},
+        }}
+        sw = self._sw(roster)
+        sw._read_account_config = lambda num, email: ""
+        assert pin._slot_for(sw, "cloud@example.com", "org-B") == "2", (
+            "premise: the record's org names a row, so the slot IS known")
+        assert pin._config_names_the_pin(
+            sw,
+            {"emailAddress": "cloud@example.com", "organizationUuid": "org-B"},
+            ("cloud@example.com", "org-B"),
+        ), ("DEFECT: the slot was identified, so the address naming two rows "
+            "does not matter and the composite had to decide")
+
+    def test_one_account_at_the_address_still_lets_the_composite_decide(self):
+        """TWO rows is the trigger, not "the address is known".
+
+        With a single row there is no sibling to confuse, so the composite is
+        safe and declining would only strand a config the clear could fix.
+        Pins the threshold: counting `> 0` instead of `> 1` kills no other
+        test.
+
+        Reached because the record's org is STALE -- it names no row -- while
+        the row itself carries no ``uuid`` and has no stored config, so the
+        writer cannot answer and the slot is unknown.
+        """
+        from claude_swap import pin
+
+        roster = {"accounts": {
+            "2": {"email": "cloud@example.com", "organizationUuid": "org-B",
+                  "uuid": ""},
+        }}
+        sw = self._sw(roster)
+        sw._read_account_config = lambda num, email: ""
+        assert pin._slot_for(sw, "cloud@example.com", "org-STALE") is None, (
+            "premise: the record's org names no row, so the slot is unknown")
+        assert pin._config_names_the_pin(
+            sw,
+            {"emailAddress": "cloud@example.com",
+             "organizationUuid": "org-STALE"},
+            ("cloud@example.com", "org-STALE"),
+        ), ("DEFECT: one account at this address cannot be confused with a "
+            "sibling, so the composite had to decide")
+
+    def test_an_unreadable_roster_is_not_ambiguity(self):
+        """A torn `sequence.json` must not read as "two slots".
+
+        The ambiguity probe and an unreadable roster raise the SAME
+        `ConfigError`, so a check that turns on the exception declines on a
+        roster it merely could not read -- narrowing a clear on exactly the
+        path that exists for when things are broken.
+        """
+        from claude_swap import pin
+        from claude_swap.exceptions import ConfigError
+
+        def _torn():
+            raise ConfigError("sequence.json is not valid JSON")
+
+        sw = self._sw()
+        sw._get_sequence_data = _torn
+        assert pin._config_names_the_pin(
+            sw,
+            {"emailAddress": "cloud@example.com", "organizationUuid": "org-B"},
+            ("cloud@example.com", "org-B"),
+        ), ("DEFECT: an unreadable roster was treated as an ambiguous "
+            "address, so the un-splice declined a config it used to fix")
+
     def test_control_the_composite_still_refuses_a_different_org(self):
         """CONTROL for the branch above: the composite's False is reachable.
 
