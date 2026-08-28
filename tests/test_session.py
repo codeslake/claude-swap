@@ -566,6 +566,87 @@ class TestBootstrap:
                 "account's history into the DEFAULT profile, with no flag."
             )
 
+    def test_a_swept_profile_is_RE_BOOTSTRAPPED_on_the_next_launch(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The behaviour, not the flag: the next launch must re-seed.
+
+        Asserting the marker is a proxy -- the stale arm consumes it and
+        then re-asks validity, which answers from the same artifacts that
+        made the sweep's verdict unprovable, so the profile passed as
+        usable and `claude` was exec'd into an empty directory.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        svc = session_mod.keychain_service_name(session_dir)
+        acct = session_mod._keychain_account_name()
+        real_get = session_mod.macos_keychain.get_password
+        real_del = session_mod.macos_keychain.delete_password
+
+        def locked(real):
+            def _f(service, account, *a, **k):
+                if (service, account) == (svc, acct):
+                    raise session_mod.macos_keychain.KeychainError("locked")
+                return real(service, account, *a, **k)
+            return _f
+
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "get_password", locked(real_get))
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "delete_password", locked(real_del))
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISES: the sweep really emptied it, and the flag really landed.
+        assert manager.switcher.platform == session_mod.Platform.MACOS
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep took the seed"
+        )
+        assert session_mod.is_session_stale(session_dir), (
+            "premise: the sweep flagged it for re-bootstrap"
+        )
+
+        # The next launch: the probe merely TIMES OUT, which is what makes
+        # the artifacts alone decide.
+        def times_out(cmd, env=None, **kwargs):
+            raise session_mod.subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", times_out)
+        # PREMISES that hold in BOTH worlds and pin the exact combination
+        # the reuse check decides on: the keychain is unreadable so material
+        # leans PRESENT, and the identity the sweep deleted is absent.
+        assert session_mod._may_have_credential_material(session_dir) is True, (
+            "premise: an unreadable keychain reads as material-may-be-present"
+        )
+        assert not (session_dir / ".claude.json").exists(), (
+            "premise: the sweep took the recorded identity"
+        )
+        assert manager._session_validity(
+            session_dir, ACCOUNT_EMAIL, ORG_UUID) == "unknown", (
+            "premise: the probe merely did not answer, so artifacts decide"
+        )
+
+        manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert (session_dir / ".credentials.json").exists(), (
+            "DEFECT: the launch after a swept profile REUSED it. The stale "
+            "arm consumed the marker and then re-asked validity, which "
+            "answers from the same unprovable artifacts, so claude is "
+            "exec'd into a directory with no credential and no identity -- "
+            "any login there writes to the profile, never to the backup"
+        )
+
     def test_a_swept_profile_is_not_reused_on_the_next_launch(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
         block_real_keychain
@@ -626,11 +707,6 @@ class TestBootstrap:
         assert manager._session_validity(
             session_dir, ACCOUNT_EMAIL, ORG_UUID) == "unknown", (
             "premise: the next launch's probe merely did not answer"
-        )
-        assert manager._is_session_valid(
-            session_dir, ACCOUNT_EMAIL, ORG_UUID), (
-            "premise: local artifacts alone say 'usable' -- so only the "
-            "stale flag can stop the reuse, which is what this asserts"
         )
 
         assert session_mod.is_session_stale(session_dir), (

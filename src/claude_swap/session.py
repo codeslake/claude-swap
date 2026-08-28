@@ -327,6 +327,21 @@ def _artifacts_say_usable(session_dir: Path, email: str, org_uuid: str) -> bool:
     Deliberately NOT consulted for "unreachable". There the question is
     whether `claude` can be run at all, and no file on disk answers it.
     """
+    # A RECORDED IDENTITY IS PART OF BEING USABLE. `_cleanup_failed_session`
+    # deletes `.claude.json` and spares the account's history, so the
+    # directory survives a failed validation -- and every other signal here
+    # leans "present" for that profile: on macOS a keychain delete is
+    # best-effort, so an unreadable entry reads as material, and a MISSING
+    # identity reads as "no drift" because an unreadable one must not
+    # abandon a working profile. Without this the swept profile passes as
+    # usable and `claude` is exec'd into it with nothing to authenticate.
+    # A profile claude MIGRATED still has its identity; only one that never
+    # finished a bootstrap, or was swept, does not. EXISTENCE, not
+    # readability: a broken `.claude.json` degrades to trusting the profile
+    # on purpose, because a backup whose `oauthAccount` lacks an email keeps
+    # the identity unreadable even after a re-bootstrap.
+    if not (session_dir / ".claude.json").exists():
+        return False
     return _may_have_credential_material(session_dir) and (
         not session_identity_drifted(session_dir, email, org_uuid)
     )
