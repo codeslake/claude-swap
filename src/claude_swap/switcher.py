@@ -7092,6 +7092,14 @@ class ClaudeAccountSwitcher:
                     existing_config = (
                         self._read_json(config_path) if config_path.exists() else None
                     )
+                    # ARMED BEFORE THE WRITE, not after. `_write_json`'s
+                    # write-through recovery EMPTIES the destination when the
+                    # copy dies part-way -- correctly, a partial credential is
+                    # worse than none -- and then raises. Armed after, the
+                    # token is still False there, so the rollback below skips
+                    # a restore whose bytes it is holding, and the caller is
+                    # told the switch "was rolled back" over an empty config.
+                    config_written = True
                     if existing_config is not None:
                         # `is not None`, not truthiness. A VALID but empty `{}`
                         # is readable and loses nothing by being spliced; the
@@ -7107,7 +7115,6 @@ class ClaudeAccountSwitcher:
                             )
                             del salvage
                         self._write_json(config_path, target_config_data)
-                    config_written = True
 
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
@@ -7362,6 +7369,10 @@ class ClaudeAccountSwitcher:
                 # config for good. Absent/unreadable both fall to the same
                 # salvage-then-replace the direct-activation branch uses.
                 current_config_data = self._read_json(config_path)
+                # Armed before the write, for the reason at the sibling
+                # site: the write-through recovery empties the destination
+                # and then raises.
+                transaction.record_step("config_written")
                 if current_config_data is not None:
                     current_config_data["oauthAccount"] = oauth_section
                     self._write_json(config_path, current_config_data)
@@ -7371,7 +7382,6 @@ class ClaudeAccountSwitcher:
                             config_path, emit_output, warnings_out
                         )
                     self._write_json(config_path, target_config_data)
-                transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 
                 # Step 5: Update sequence state

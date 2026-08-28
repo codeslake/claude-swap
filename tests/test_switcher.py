@@ -3492,6 +3492,122 @@ class TestPerformSwitchPostDisplay:
             "target-token"
         )
 
+    def test_a_write_through_that_empties_the_config_is_rolled_back(
+        self,
+        temp_home: Path,
+    ):
+        """A destination that refuses the rename makes `_write_json` copy
+        THROUGH it, and a copy that dies part-way empties it -- correctly,
+        a partial credential is worse than none -- and then raises.
+
+        The rollback token must already be armed at that point, or the
+        caller skips a restore whose bytes it is holding and tells the user
+        the switch "was rolled back" over an emptied config.
+        """
+        config_path = temp_home / ".claude.json"
+        original_config_text = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "current@example.com",
+                "accountUuid": "",
+                "organizationUuid": "",
+                "organizationName": "",
+            },
+            "projects": {"/some/repo": {"allowedTools": []}},
+        })
+        config_path.write_text(original_config_text)
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 2,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+                "2": {
+                    "email": "current@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                },
+            },
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}),
+            ("2", "current@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "c", "refreshToken": "cr"}}),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "target@example.com",
+                    "accountUuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                }
+            }),
+        }
+        live_state = {"creds": creds_store[("2", "current@example.com")]}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        from claude_swap import switcher as switcher_mod
+
+        real_copyfile = switcher_mod.shutil.copyfile
+
+        calls = []
+
+        def busy_replace(src, dst):
+            calls.append(("replace", str(dst)))
+            raise OSError(errno.EBUSY, "device or resource busy")
+
+        def dies_partway(source, dest, *a, **k):
+            # `copyfile` opens the destination 'wb' before the first source
+            # byte, so the destination is already empty when this raises.
+            calls.append(("copy", str(dest)))
+            with open(dest, "wb") as handle:
+                handle.write(b"{par")
+            raise OSError(errno.ENOSPC, "no space left on device")
+
+        try:
+            with patch.object(
+                switcher_mod, "replace_with_retry", side_effect=busy_replace,
+            ), patch.object(
+                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+            ), pytest.raises(SwitchError) as excinfo:
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+            switcher_mod.shutil.copyfile = real_copyfile
+
+        # PREMISES: the write-through really ran, or this case asserts the
+        # absence of damage nothing attempted.
+        assert [c[0] for c in calls] == ["replace", "copy"], (
+            f"premise: the EBUSY write-through must run, got {calls}"
+        )
+        assert "may now be truncated" in str(excinfo.value), (
+            "premise: the failure must be the write-through's own"
+        )
+        assert config_path.read_text() != "{par", (
+            "premise: the partial must not survive -- the recovery empties it"
+        )
+        assert config_path.read_text() == original_config_text, (
+            "DEFECT: the write-through emptied the config and raised, and "
+            "the rollback did not restore it -- the caller's token is armed "
+            "only after the write returns, so a failure DURING the write "
+            "leaves it False while the original bytes sit in memory. The "
+            "user is told the switch was rolled back."
+        )
+
     def test_direct_activation_rolls_back_live_creds_on_sequence_write_failure(
         self,
         temp_home: Path,
