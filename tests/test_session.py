@@ -499,11 +499,28 @@ class TestBootstrap:
         service = keychain_service_name(session_dir)
         account = session_mod._keychain_account_name()
         block_real_keychain.set_password(service, account, "stale")
+        # The account's own conversation history, which a validation failure
+        # must not take with it.
+        (session_dir / "projects" / "a-repo").mkdir(parents=True, exist_ok=True)
+        transcript = session_dir / "projects" / "a-repo" / "chat.jsonl"
+        transcript.write_text('{"type":"user"}\n', encoding="utf-8")
 
         with pytest.raises(SessionError, match="failed\\s+validation"):
             manager.setup_session("2", share=False)
 
-        assert not session_dir.exists()
+        assert transcript.exists(), (
+            "DEFECT: a failed validation deleted the account's conversation "
+            "history -- reachable from an upstream change alone, since a "
+            "`claude auth status --json` that exits non-zero reads as invalid"
+        )
+        assert transcript.read_text(encoding="utf-8") == '{"type":"user"}\n', (
+            "the history survived the cleanup but its content did not"
+        )
+
+        # THE SEED, not the directory. A failed validation must stop the
+        # profile being reused; the account's own conversation history is
+        # user data and survives.
+        assert not (session_dir / ".credentials.json").exists()
         assert block_real_keychain.get_password(service, account) is None
 
     def test_stale_keychain_entry_deleted_before_seed(
@@ -2926,7 +2943,10 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
         with pytest.raises(SessionError, match="failed validation"):
             manager.setup_session(ACCOUNT_NUM, share=False)
 
-        assert not session_dir.exists()
+        # THE SEED, not the directory. A failed validation must stop the
+        # profile being reused; the account's own conversation history is
+        # user data and survives.
+        assert not (session_dir / ".credentials.json").exists()
 
     def test_a_failed_persist_does_not_seed_the_profile_from_a_spent_grant(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch

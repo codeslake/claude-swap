@@ -931,9 +931,21 @@ class SessionManager:
     def _cleanup_failed_session(self, session_dir: Path) -> None:
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone. The
-        # stale marker is a sibling, so rmtree does not take it.
+        # stale marker is a sibling, so the sweep below does not take it.
         delete_macos_keychain_entry(session_dir)
-        shutil.rmtree(session_dir, ignore_errors=True)
+        # NOT the whole directory. `HISTORY_ITEMS` is the account's own
+        # conversation history, kept per-account unless --share-history says
+        # otherwise, so it is user data and not a cswap-owned copy. A verdict
+        # of "invalid" is reachable from an upstream change alone -- a
+        # `claude auth status --json` that exits non-zero reads as invalid --
+        # and deleting the seed is what stops the profile being reused.
+        for child in session_dir.iterdir():
+            if child.name in HISTORY_ITEMS:
+                continue
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
         clear_session_stale(session_dir)
 
     # -- validation ------------------------------------------------------
