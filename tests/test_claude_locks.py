@@ -518,8 +518,9 @@ class TestCcRefreshLockProtocol:
         assert not new.exists()
         assert not legacy.exists()
 
+    @pytest.mark.parametrize("stale_at", [None, "primary", "legacy"])
     def test_the_primary_lock_is_taken_before_the_legacy_one(
-        self, temp_home, monkeypatch
+        self, temp_home, monkeypatch, stale_at
     ):
         """The order is the whole point, and the two contention cases
         cannot see it: each asserts a lock is ABSENT after the `with`,
@@ -528,14 +529,31 @@ class TestCcRefreshLockProtocol:
         ELOCKED; taken the other way round, cswap holds the legacy lock
         while CC is still trying for it and burns CC's whole retry budget
         instead of failing it cheaply on the primary.
+
+        One stale corpse at either path -- exactly what `_take_over_stale`
+        exists to handle -- makes that path's `mkdir` run twice, so the
+        recorder must count what SUCCEEDED. Recording the ATTEMPT put a
+        third entry in the list and fired the premise below on an ordinary
+        retry, reporting a broken acquisition order for a run that had one.
         """
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        corpse = {
+            None: None,
+            "primary": temp_home / ".claude" / ".oauth_refresh.lock",
+            "legacy": temp_home / ".claude.lock",
+        }[stale_at]
+        if corpse is not None:
+            corpse.mkdir(parents=True)
+            past = time.time() - 100  # past CREDENTIALS_STALENESS_S
+            os.utime(corpse, (past, past))
+
         created = []
         real_mkdir = claude_locks.os.mkdir
 
         def recording(path, *a, **k):
-            created.append(str(path))
-            return real_mkdir(path, *a, **k)
+            result = real_mkdir(path, *a, **k)
+            created.append(str(path))  # what SUCCEEDED, not what was tried
+            return result
 
         monkeypatch.setattr(claude_locks.os, "mkdir", recording)
         with claude_credentials_lock(timeout=2.0):
@@ -586,6 +604,27 @@ class TestCcRefreshLockProtocol:
             with claude_credentials_lock(timeout=0.5):
                 pass
         assert new.is_dir()
+
+    def test_the_legacy_lock_carries_the_60s_staleness_too(
+        self, temp_home, monkeypatch
+    ):
+        """SECOND WITNESS. The two locks are separate calls with a staleness
+        argument each, and the case above backdates only the primary -- so it
+        times out there and the legacy call is never reached. Measured: with
+        the legacy call's staleness dropped to CONFIG_STALENESS_S the whole
+        suite stayed green, while the same edit on the primary failed the case
+        above. A 30s-old legacy lock is a live CC's, and stealing it puts a
+        swap inside CC's refresh window.
+        """
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        legacy = temp_home / ".claude.lock"
+        legacy.mkdir()
+        past = time.time() - 30
+        os.utime(legacy, (past, past))
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with claude_credentials_lock(timeout=0.5):
+                pass
+        assert legacy.is_dir()
 
     def test_credentials_lock_stale_past_60s_is_taken_over(
         self, temp_home, monkeypatch
