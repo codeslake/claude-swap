@@ -8171,6 +8171,11 @@ class TestProvenanceGuard:
                 "uuid": "uuid-2", "email": "account2@example.com",
                 "organizationUuid": "org-2",
             })
+            assert switcher._usage_store._read_rows()["2"]["authDeadStrikes"] == 0, (
+                "DEFECT: the adoption wrote the credential but never lifted "
+                "the quarantine, so the slot stays fetch-ineligible and is "
+                "never fetched again"
+            )
             # Inside the patched store: `_slot_token_dead` READS the backup to
             # bind the verdict to a generation, and an unreadable one answers
             # dead whatever the slot holds.
