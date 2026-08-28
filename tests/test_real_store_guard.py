@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from claude_swap import paths
+from claude_swap import paths, session
 from claude_swap.models import Platform
 from tests import conftest
 
@@ -355,14 +355,25 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
         # `$HOME`, whose own root already covers it.
         assert flag.parent not in roots
 
-    projects = home / ".claude" / "projects"
-    assert projects in recursive_roots, (
-        "`--share-history` moves transcripts to projects/<slug>/<uuid>.jsonl, "
-        "which a non-recursive ~/.claude does not reach"
-    )
-    # PREMISE: ~/.claude is still non-recursive -- this worktree lives under
-    # it, so making it recursive would refuse the suite's own writes.
-    assert (home / ".claude") not in recursive_roots
+    # Every DIRECTORY `--share-history` shares needs a recursive root of its
+    # own: its contents land two levels under the non-recursive `~/.claude`.
+    # A `.jsonl` item is a file and a direct child, already covered -- the
+    # same discriminator `_prepare_history_share` itself branches on. Read
+    # from `HISTORY_ITEMS` rather than naming `projects`, so the day a
+    # second directory joins it this fails instead of covering one of two.
+    for name in session.HISTORY_ITEMS:
+        if name.endswith(".jsonl"):
+            continue
+        assert home / ".claude" / name in recursive_roots, (
+            f"`--share-history` writes into {name}/<slug>/..., which a "
+            f"non-recursive ~/.claude does not reach"
+        )
+    # PREMISE: ~/.claude is a root AND still non-recursive -- this suite runs
+    # from under it, so making it recursive would refuse its own writes.
+    # Asserted as membership in the non-recursive set, not as absence from
+    # the recursive one: absence is also true when it is no root at all,
+    # which is the exact regression the commit below this range fixed.
+    assert (home / ".claude") in {root for root, rec in specs if not rec}
 
 
 def test_frozen_specs_ignore_a_developer_exported_claude_config_dir(
