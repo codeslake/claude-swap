@@ -9454,6 +9454,48 @@ class TestTheUnspliceOnAnAmbiguousAddress:
         ), ("DEFECT: the un-splice claimed the SIBLING's config, which the pin "
             "never wrote")
 
+    def test_a_sibling_is_refused_when_the_record_org_names_no_slot(self):
+        """The composite cannot arbitrate between two rows at one address.
+
+        A record whose org matches NO roster row -- a legacy record, whose
+        missing `pinnedOrganizationUuid` `_pinned_email_now` normalises to
+        "" -- leaves `_slot_for` with nothing to match, so the lookup falls
+        to the raising address and answers None. The composite then compares
+        email and org ALONE, and an org-less sibling config satisfies both:
+        the un-splice claims a config Claude Code wrote at a genuine /login
+        and swaps the account identity outright.
+
+        Declining is the only honest answer here. Which of the two rows the
+        pin was cannot be recovered: the record's org names neither.
+        """
+        from claude_swap import pin
+
+        sibling = {"emailAddress": "cloud@example.com",
+                   "accountUuid": "UUID-5"}
+        assert not pin._config_names_the_pin(
+            self._sw(), sibling, ("cloud@example.com", ""),
+        ), ("DEFECT: the composite matched a SIBLING on an empty org, so "
+            "`--clear` would rewrite an oauthAccount the pin never spliced")
+
+    def test_control_the_composite_still_refuses_a_different_org(self):
+        """CONTROL for the branch above: the composite's False is reachable.
+
+        Without this, `return True` in place of the composite kills no test
+        (measured: it survived the reviewer's mutation battery). Here the
+        address is unambiguous and names no slot, so the lookup answers None
+        without raising and the composite legitimately decides -- and must
+        say False when the orgs differ.
+        """
+        from claude_swap import pin
+
+        one = {"accounts": {"1": {"email": "someone@example.com",
+                                  "organizationUuid": "org-Z",
+                                  "uuid": "UUID-1"}}}
+        assert not pin._config_names_the_pin(
+            self._sw(one),
+            {"emailAddress": "cloud@example.com", "organizationUuid": "org-X"},
+            ("cloud@example.com", "org-B"))
+
     def test_control_the_same_two_verdicts_on_an_unambiguous_roster(self):
         """CONTROL: the check has both answers when the lookup can resolve.
 

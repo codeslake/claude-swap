@@ -248,22 +248,30 @@ def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
         pinned[0] or ""
     ).casefold():
         return False
-    # THE SLOT, NEVER THE ADDRESS ALONE. Given only an email,
-    # `identity_for_config` falls through to `_resolve_account_identifier`,
-    # which RAISES on an address naming two slots -- and the raise becomes
-    # None, which drops to the composite below. That inverts BOTH verdicts on
-    # exactly the roster the composite exists for: the pin's own spliced
-    # config is declined, and a sibling `/login` carrying the record's org is
-    # claimed. Every other `identity_for_config(email=...)` here pairs it with
-    # `_slot_for` for this reason.
-    #
-    # No try around it: `identity_for_config` wraps its whole body in
-    # `except Exception: return None`, so it answers None instead of raising.
-    uuid = (identity_for_config(
-        switcher, email=pinned[0],
-        num=_slot_for(switcher, pinned[0], pinned[1])) or {}).get("accountUuid")
+    # THE SLOT, NEVER THE ADDRESS ALONE: given only an email,
+    # `identity_for_config` falls to `_resolve_account_identifier`, which
+    # RAISES on an address naming two slots. Every other caller here pairs
+    # the two for that reason. No try needed -- `identity_for_config` wraps
+    # its whole body in `except Exception: return None`.
+    slot = _slot_for(switcher, pinned[0], pinned[1])
+    mine = identity_for_config(switcher, email=pinned[0], num=slot) or {}
+    uuid = mine.get("accountUuid")
     if uuid:
         return current.get("accountUuid") == uuid
+    if slot is None:
+        # NO SLOT PLUS AN AMBIGUOUS ADDRESS: the composite cannot arbitrate.
+        # A record whose org names no roster row leaves both rows at this
+        # address equally plausible, and an org-less sibling config satisfies
+        # email-and-org while being a genuine /login. A stale name costs a
+        # bridge; a wrong rewrite swaps the identity -- so decline.
+        # `_resolve_account_identifier` IS this codebase's ambiguity signal,
+        # so ask it rather than counting rows. An address it does not know
+        # answers None without raising and still reaches the composite, which
+        # is the pinned-account-has-no-roster-row case that needs it.
+        try:
+            switcher._resolve_account_identifier(pinned[0])
+        except Exception:  # noqa: BLE001 — cannot tell is a decline, not a raise
+            return False
     return (current.get("organizationUuid") or "") == (pinned[1] or "")
 
 
