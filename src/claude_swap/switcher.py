@@ -7202,9 +7202,7 @@ class ClaudeAccountSwitcher:
                             f"{'; '.join(unrestored)}. Manual recovery may be "
                             f"needed."
                         ) from activation_error
-                    armed = sum(map(bool, (
-                        sequence_written, config_written, creds_written,
-                    )))
+                    armed = sequence_written + config_written + creds_written
                     if armed:
                         # THE OTHER HALF OF THE SAME MIRROR. The transaction
                         # path wraps BOTH outcomes; wrapping only the failed

@@ -8695,6 +8695,94 @@ class TestDirectActivationPreservation:
             f"the report must say which way it was partial: {excinfo.value}"
         )
 
+    def test_direct_activation_calls_a_whole_rollback_whole(
+        self, temp_home
+    ):
+        """The denominator's other reachable value.
+
+        Two arms armed, both with snapshots, both restoring, is a COMPLETE
+        rollback -- the roster write is never reached, so it was never
+        written and owes nothing. Counting a fixed three there downgrades a
+        true rollback to a false partial and sends the user hunting for
+        damage that does not exist.
+        """
+        switcher, unmanaged = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        original_config = config_path.read_text(encoding="utf-8")
+        roster_before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+
+        def fail_the_config(self, path, data):
+            if os.path.basename(os.fspath(path)) == ".claude.json":
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_config,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: everything that was written really did come back, or
+        # "whole" is not what this state is.
+        assert config_path.read_text(encoding="utf-8") == original_config
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == (
+            unmanaged
+        )
+        assert switcher.sequence_file.read_text(encoding="utf-8") == (
+            roster_before
+        ), "premise: the roster was never written, so it owes nothing"
+
+        message = str(excinfo.value)
+        assert "was rolled back" in message, (
+            f"DEFECT: a complete rollback must say so, got: {message}"
+        )
+        assert "PARTLY" not in message, (
+            "DEFECT: two arms armed and two restored is WHOLE. A fixed "
+            "denominator calls it partial and sends the user looking for "
+            f"damage that is not there: {message}"
+        )
+
+    def test_direct_activation_does_not_wrap_a_failure_before_any_write(
+        self, temp_home
+    ):
+        """Nothing written is not a rollback of any kind.
+
+        The wrap is gated on a write having happened. When the very first
+        write fails, no token is set, nothing needs undoing, and the
+        original error is the whole story -- wrapping it would invent a
+        rollback that had nothing to act on.
+        """
+        switcher, unmanaged = self._setup(temp_home)
+
+        def fail_first_write(_creds):
+            raise OSError(errno.EACCES, "permission denied")
+
+        with patch.object(
+            switcher, "_write_credentials", fail_first_write,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            # BOTH CANDIDATES, so the assertion below is what discriminates.
+            # Naming only `OSError` makes a wrap fail at this boundary and
+            # the DEFECT message never reaches the log.
+            (OSError, SwitchError)
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: the live login is untouched, so there was nothing to undo.
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == (
+            unmanaged
+        )
+        assert not isinstance(excinfo.value, SwitchError), (
+            "DEFECT: no write happened, so the wrap must not fire and "
+            f"rename the failure: {excinfo.value!r}"
+        )
+        assert "rolled back" not in str(excinfo.value), (
+            f"DEFECT: nothing was written, so nothing was rolled back: "
+            f"{excinfo.value}"
+        )
+
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
         with patch.object(
