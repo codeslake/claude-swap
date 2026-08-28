@@ -13036,6 +13036,16 @@ def _is_os_call(node, func: str, os_names: set[str], aliases: set[str]) -> bool:
     if isinstance(f, ast.Attribute):
         return (f.attr == func and isinstance(f.value, ast.Name)
                 and f.value.id in os_names)
+    # `getattr(os, "open")(...)` called DIRECTLY. The assigned form
+    # (`X = getattr(os, "open")`) is already an alias; without this the
+    # direct call leaves both scans -- offenders AND denominator -- so no
+    # floor can notice it and `unreadable` never fires.
+    if (isinstance(f, ast.Call) and isinstance(f.func, ast.Name)
+            and f.func.id == "getattr" and len(f.args) == 2
+            and isinstance(f.args[0], ast.Name) and f.args[0].id in os_names
+            and isinstance(f.args[1], ast.Constant)
+            and f.args[1].value == func):
+        return True
     return isinstance(f, ast.Name) and f.id in aliases
 
 
