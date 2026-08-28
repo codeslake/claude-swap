@@ -9540,6 +9540,27 @@ class TestTheUnspliceOnAnAmbiguousAddress:
         ), ("DEFECT: one account at this address cannot be confused with a "
             "sibling, so the composite had to decide")
 
+    def test_a_corrupt_row_does_not_switch_the_sibling_guard_off(self):
+        """One bad row must not make the count answer zero.
+
+        The count runs under a blanket `except` so it cannot raise, and that
+        is exactly how a corrupt row becomes silent: `.get` on a non-dict
+        aborts the whole sum, zero reads as "not ambiguous", and the composite
+        then claims the sibling. Skipping the row instead keeps the two real
+        ones counted, which is the difference between a stale name and a
+        swapped account identity.
+        """
+        from claude_swap import pin
+
+        roster = dict(self.ROSTER)
+        roster["accounts"] = dict(self.ROSTER["accounts"], **{"9": "corrupt"})
+        assert not pin._config_names_the_pin(
+            self._sw(roster),
+            {"emailAddress": "cloud@example.com", "accountUuid": "UUID-5"},
+            ("cloud@example.com", ""),
+        ), ("DEFECT: a corrupt roster row aborted the count, so the sibling "
+            "guard read as 'not ambiguous' and claimed a foreign config")
+
     def test_an_unreadable_roster_is_not_ambiguity(self):
         """A torn `sequence.json` must not read as "two slots".
 
