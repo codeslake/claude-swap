@@ -610,10 +610,10 @@ class TestCcRefreshLockProtocol:
     ):
         """SECOND WITNESS. The two locks are separate calls with a staleness
         argument each, and the case above backdates only the primary -- so it
-        times out there and the legacy call is never reached. Measured: with
-        the legacy call's staleness dropped to CONFIG_STALENESS_S the whole
-        suite stayed green, while the same edit on the primary failed the case
-        above. A 30s-old legacy lock is a live CC's, and stealing it puts a
+        times out there and the legacy call is never reached. Measured BEFORE
+        this case existed: with the legacy call's staleness dropped to
+        CONFIG_STALENESS_S the whole suite stayed green, while the same edit
+        on the primary failed the case above. A 30s-old legacy lock is a live CC's, and stealing it puts a
         swap inside CC's refresh window.
         """
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
@@ -947,12 +947,25 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
     three of these locks.
     """
 
-    def test_a_contended_guard_does_not_outlive_the_budget(self, tmp_path):
+    def test_a_contended_guard_does_not_outlive_the_budget(self, tmp_path, monkeypatch):
         target = tmp_path / "target.lock"
         target.mkdir()
         stale = time.time() - 100
         os.utime(target, (stale, stale))
         guard = target.parent / f"{target.name}.takeover"
+
+        # `elapsed` cannot tell the clamped guard from the jitter arm's own
+        # clamp beside it: measured, this case passed with the staleness
+        # branch short-circuited to `if False and ...`, while 8 siblings
+        # failed. The count is what ties the number to this arm.
+        entered = {"n": 0}
+        real_take_over = claude_locks._take_over_stale
+
+        def counting(*a, **k):
+            entered["n"] += 1
+            return real_take_over(*a, **k)
+
+        monkeypatch.setattr(claude_locks, "_take_over_stale", counting)
 
         held = threading.Event()
         release = threading.Event()
@@ -976,6 +989,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             release.set()
             t.join(5)
 
+        assert entered["n"] >= 1, "premise: the takeover arm never ran"
         assert elapsed < budget + 0.15, (
             f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
             f"guard is not clamped to the remaining time"

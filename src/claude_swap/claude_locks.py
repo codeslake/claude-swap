@@ -85,6 +85,8 @@ def config_lock_dir() -> Path:
     return path.parent / (path.name + ".lock")
 
 
+# A CAP on the guard wait; the caller's remaining budget is the bound. Measured
+# green at 0.0 and at 30.0, so it is a tuning knob, not a correctness constant.
 _TAKEOVER_GUARD_S = 0.5
 
 
@@ -105,7 +107,13 @@ def _take_over_stale(
     directory a peer already retook is left alone. Claude Code performs the
     same takeover and takes no lock of ours, so this closes the race
     between cswap processes and narrows, but cannot close, the
-    cross-implementation one. Returns whether the corpse was removed.
+    cross-implementation one.
+
+    `budget` is the caller's remaining time; the guard waits the smaller of it
+    and `_TAKEOVER_GUARD_S`, so a contended guard cannot push the caller past
+    its own deadline. Returns whether the corpse was removed -- False also
+    covers a peer having retaken it, a refused rmdir, and an exhausted budget,
+    which mean the same thing here: back off and retry.
     """
     guard = lock_dir.parent / f"{lock_dir.name}.takeover"
     try:
@@ -169,7 +177,7 @@ def proper_lockfile(
             # a peer retook it, or the corpse could not be removed -- must
             # not spin hot, and must not sleep past the deadline.
             if not _take_over_stale(
-                lock_dir, staleness, deadline - time.monotonic()
+                lock_dir, staleness, budget=deadline - time.monotonic()
             ):
                 time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
