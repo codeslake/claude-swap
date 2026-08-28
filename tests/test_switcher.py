@@ -8509,7 +8509,6 @@ class TestDirectActivationPreservation:
         One fault reaches all three: the roster write fails with every arm
         already armed, and every restore is then refused.
         """
-        from claude_swap import switcher as switcher_mod
         from claude_swap import models as models_mod
 
         switcher, _ = self._setup(temp_home)
@@ -8571,7 +8570,6 @@ class TestDirectActivationPreservation:
                 f"report does not name it. The user is told the activation "
                 f"failed and nothing else: {message}"
             )
-        del switcher_mod
 
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
