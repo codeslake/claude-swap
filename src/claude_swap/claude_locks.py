@@ -103,52 +103,6 @@ def _nap(want: float, start: float, timeout: float) -> None:
         time.sleep(min(want, left))
 
 
-# A CAP on the guard wait; the caller's remaining budget is the real bound.
-# Shrink it and the contended-guard test refuses on its own premise.
-_TAKEOVER_GUARD_S = 0.5
-# A short back-off after an arm declines, so the retry loop cannot spin hot.
-_DECLINE_BACKOFF_S = 0.05
-
-
-def _take_over_stale(
-    lock_dir, staleness: float, budget: float = float("inf")
-) -> bool:
-    """Remove a lock whose holder is gone, but never a successor's.
-
-    `os.stat` decides and `os.rmdir` acts, and between them another waiter
-    can win the same race and create ITS lock at this name -- which the
-    rmdir then removes, putting two processes inside the critical section
-    at once. Measured on this tree: 7 of 320 holds saw a co-holder with a
-    stale lock present, 0 of 320 without one, and widening only that gap in
-    one waiter made it dominant (30 of 160 at 50 ms).
-
-    The window is serialized on an flock -- the one primitive here a peer
-    cannot steal -- and the staleness is re-read while holding it, so a
-    directory a peer already retook is left alone. Claude Code performs the
-    same takeover and takes no lock of ours, so this closes the race
-    between cswap processes and narrows, but cannot close, the
-    cross-implementation one.
-
-    `budget` is the caller's remaining time; the guard waits the smaller of it
-    and `_TAKEOVER_GUARD_S`, so a contended guard cannot push the caller past
-    its own deadline. Returns whether the corpse was removed -- False also
-    covers a peer having retaken it, a refused rmdir, and an exhausted budget,
-    which mean the same thing here: back off and retry.
-    """
-    guard = lock_dir.parent / f"{lock_dir.name}.takeover"
-    try:
-        with FileLock(guard, timeout=max(0.0, min(_TAKEOVER_GUARD_S, budget))):
-            try:
-                if time.time() - os.stat(lock_dir).st_mtime <= staleness:
-                    return False  # a peer retook it; it is not ours to remove
-            except FileNotFoundError:
-                return False  # already gone; the mkdir above will race for it
-            os.rmdir(lock_dir)
-            return True
-    except (LockError, OSError):
-        return False
-
-
 @contextmanager
 def proper_lockfile(
     lock_dir: Path,
@@ -250,6 +204,52 @@ def proper_lockfile(
             )
         except OSError as e:
             _logger.warning("Failed to release lock %s: %s", lock_dir, e)
+
+
+# A CAP on the guard wait; the caller's remaining budget is the real bound.
+# Shrink it and the contended-guard test refuses on its own premise.
+_TAKEOVER_GUARD_S = 0.5
+# A short back-off after an arm declines, so the retry loop cannot spin hot.
+_DECLINE_BACKOFF_S = 0.05
+
+
+def _take_over_stale(
+    lock_dir, staleness: float, budget: float = float("inf")
+) -> bool:
+    """Remove a lock whose holder is gone, but never a successor's.
+
+    `os.stat` decides and `os.rmdir` acts, and between them another waiter
+    can win the same race and create ITS lock at this name -- which the
+    rmdir then removes, putting two processes inside the critical section
+    at once. Measured on this tree: 7 of 320 holds saw a co-holder with a
+    stale lock present, 0 of 320 without one, and widening only that gap in
+    one waiter made it dominant (30 of 160 at 50 ms).
+
+    The window is serialized on an flock -- the one primitive here a peer
+    cannot steal -- and the staleness is re-read while holding it, so a
+    directory a peer already retook is left alone. Claude Code performs the
+    same takeover and takes no lock of ours, so this closes the race
+    between cswap processes and narrows, but cannot close, the
+    cross-implementation one.
+
+    `budget` is the caller's remaining time; the guard waits the smaller of it
+    and `_TAKEOVER_GUARD_S`, so a contended guard cannot push the caller past
+    its own deadline. Returns whether the corpse was removed -- False also
+    covers a peer having retaken it, a refused rmdir, and an exhausted budget,
+    which mean the same thing here: back off and retry.
+    """
+    guard = lock_dir.parent / f"{lock_dir.name}.takeover"
+    try:
+        with FileLock(guard, timeout=max(0.0, min(_TAKEOVER_GUARD_S, budget))):
+            try:
+                if time.time() - os.stat(lock_dir).st_mtime <= staleness:
+                    return False  # a peer retook it; it is not ours to remove
+            except FileNotFoundError:
+                return False  # already gone; the mkdir above will race for it
+            os.rmdir(lock_dir)
+            return True
+    except (LockError, OSError):
+        return False
 
 
 @contextmanager
