@@ -3698,8 +3698,7 @@ class TestPerformSwitchPostDisplay:
         from claude_swap import models as models_mod
 
         dest = temp_home / ".claude.json"
-        original = json.dumps({"projects": {f"/p/{i}": [1] * 20
-                                            for i in range(200)}})
+        original = json.dumps({"userID": "u", "projects": {"/p": [1, 2, 3]}})
         dest.write_text(original, encoding="utf-8")
 
         def refuse(src, dst, *a, **k):
@@ -3843,6 +3842,7 @@ class TestPerformSwitchPostDisplay:
     def test_the_transaction_rollback_does_not_truncate_an_intact_config(
         self,
         temp_home: Path,
+        caplog,
     ):
         """The transaction's config arm, on a destination the write never
         opened.
@@ -3858,8 +3858,6 @@ class TestPerformSwitchPostDisplay:
         """
         import resource
         import signal
-
-        from claude_swap import models as models_mod
 
         config_path = temp_home / ".claude.json"
         config_path.write_text(json.dumps({
@@ -3901,13 +3899,6 @@ class TestPerformSwitchPostDisplay:
         # PREMISE: the config cannot fit under the cap, so the write faults.
         assert len(original) > cap
 
-        real_rollback = models_mod.SwitchTransaction.rollback
-        armed = []
-
-        def spy(self, sw):
-            armed.extend(self.completed_steps)
-            return real_rollback(self, sw)
-
         old_sig = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
         soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
         resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
@@ -3917,20 +3908,21 @@ class TestPerformSwitchPostDisplay:
             # step is recorded, so the rollback would never run and this case
             # would certify a branch it never entered.
             with patch.object(switcher, "_write_account_config"), patch.object(
-                models_mod.SwitchTransaction, "rollback", spy,
-            ), patch.object(switcher, "list_accounts"), pytest.raises(
-                SwitchError
-            ):
+                switcher, "list_accounts"
+            ), pytest.raises(SwitchError):
                 switcher._perform_switch("1", emit_output=False)
         finally:
             resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
             signal.signal(signal.SIGXFSZ, old_sig)
 
         # PREMISE: the arm really ran, or this asserts the absence of damage
-        # nothing attempted.
-        assert "config_written" in armed, (
-            f"premise: the config arm must be armed when the rollback ran, "
-            f"got {armed}"
+        # nothing attempted. The step NAME, not its outcome -- the rollback
+        # logs "Rolled back step" or "Failed to rollback step" for the same
+        # step, and a restore that truncates takes the second, so keying on
+        # success would fail the premise on exactly the defect under test.
+        assert "config_written" in caplog.text, (
+            f"premise: the config arm must run in the rollback, got "
+            f"{caplog.text!r}"
         )
         text = config_path.read_text(encoding="utf-8")
         assert text == original, (
@@ -8322,20 +8314,14 @@ class TestDirectActivationPreservation:
                     at_arm["text"] = path.read_text(encoding="utf-8")
                 raise
 
-        try:
-            with patch.object(
-                switcher_mod, "replace_with_retry", side_effect=busy_publish,
-            ), patch.object(
-                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
-            ), patch.object(
-                ClaudeAccountSwitcher, "_write_json", spy_write_json,
-            ), patch.object(switcher, "list_accounts"), pytest.raises(
-                ConfigError
-            ):
-                switcher._perform_switch("1", emit_output=False)
-        finally:
-            os.chmod(switcher.sequence_file, 0o600)
-            switcher_mod.shutil.copyfile = real_copyfile
+        with patch.object(
+            switcher_mod, "replace_with_retry", side_effect=busy_publish,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(
+            ClaudeAccountSwitcher, "_write_json", spy_write_json,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(ConfigError):
+            switcher._perform_switch("1", emit_output=False)
 
         # PREMISES: the roster's write-through really ran, and the recovery
         # really could not empty what it left -- or this case asserts the
@@ -8414,17 +8400,12 @@ class TestDirectActivationPreservation:
                 raise OSError(errno.ENOSPC, "no space left on device")
             return real_copyfile(source, dest, *a, **k)
 
-        try:
-            with patch.object(
-                fsutil_mod.os, "replace", side_effect=busy_replace,
-            ), patch.object(
-                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
-            ), patch.object(switcher, "list_accounts"), pytest.raises(
-                ConfigError
-            ):
-                switcher._perform_switch("1", emit_output=False)
-        finally:
-            switcher_mod.shutil.copyfile = real_copyfile
+        with patch.object(
+            fsutil_mod.os, "replace", side_effect=busy_replace,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(ConfigError):
+            switcher._perform_switch("1", emit_output=False)
 
         # PREMISE: the write's EBUSY and its write-through must run, or this
         # asserts the repair of damage nothing did. ONLY THE FIRST TWO. The
@@ -8493,19 +8474,16 @@ class TestDirectActivationPreservation:
             # helper raises rather than rewriting in place.
             raise OSError(errno.EACCES, "permission denied")
 
-        try:
-            with patch.object(
-                switcher_mod, "replace_with_retry", side_effect=busy_publish,
-            ), patch.object(
-                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
-            ), patch.object(
-                models_mod, "replace_with_retry", side_effect=refuse_restore,
-            ), patch.object(switcher, "list_accounts"), pytest.raises(
-                SwitchError
-            ) as excinfo:
-                switcher._perform_switch("1", emit_output=False)
-        finally:
-            switcher_mod.shutil.copyfile = real_copyfile
+        with patch.object(
+            switcher_mod, "replace_with_retry", side_effect=busy_publish,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(
+            models_mod, "replace_with_retry", side_effect=refuse_restore,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
 
         # PREMISE: the config really was lost, or "the caller must be told"
         # is a message about nothing.
