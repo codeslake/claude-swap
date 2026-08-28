@@ -1989,6 +1989,67 @@ class TestQuarantineLifecycle:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
+    def test_a_quarantine_recorded_blind_is_not_lifted_by_a_readable_tick(
+        self, harness
+    ):
+        """Guarding the RELEASE is half of it: the RECORD can be blind too.
+
+        A read that failed when the quarantine was written fingerprints as
+        None -- the same value a genuinely ABSENT backup records -- and the
+        release then reads any later readable credential as "the user
+        replaced it". The credential here never changes.
+        """
+        store = harness.switcher._store
+        real_read = store._read_account_credentials
+
+        def unreadable(account_num, email, failed=None):
+            if account_num == "2":
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            return real_read(account_num, email, failed)
+
+        # Blind at RECORD time only; the read works for every later tick.
+        with patch.object(
+            store, "_read_account_credentials", side_effect=unreadable,
+        ):
+            assert harness.switcher._read_account_credentials_ex(
+                "2", "b@example.com") == ("", True), (
+                "premise: the record-time read must report the failed verdict"
+            )
+            harness.engine._quarantine("2", "b@example.com", "identity-conflict")
+
+        entry = (harness.state().get("quarantine") or {}).get("2")
+        assert entry is not None, "premise: the slot must be quarantined"
+        # PREMISE that holds in BOTH worlds: the record is blind. Asserting
+        # the flag here instead would fail before the harm on the unfixed
+        # code, where the key does not exist at all.
+        assert entry.get("refreshTokenFingerprint") is None, (
+            "premise: the record-time read failed, so no generation was learned"
+        )
+        harness.events.clear()
+
+        harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(0), "3": _usage(50),
+        })
+
+        assert "2" in (harness.state().get("quarantine") or {}), (
+            "DEFECT: a quarantine whose generation was never learned was "
+            "released on a compare against a value nobody measured. For an "
+            "identity conflict nothing re-checks before the switch, so the "
+            "engine lands on the barred slot with every gauge normal"
+        )
+        assert not any(isinstance(e, UnquarantineEvent) for e in harness.events)
+        # ...and the readable tick BOUND it, so the slot is not stuck blind.
+        bound = (harness.state().get("quarantine") or {}).get("2")
+        assert bound.get("fingerprintUnknown") is False, (
+            "the tick that could read it must bind the generation, or the "
+            "slot can never be released by an ordinary re-login"
+        )
+        assert bound.get("refreshTokenFingerprint"), (
+            "binding must record the generation it just read"
+        )
+
     def test_an_unreadable_backup_does_not_lift_a_quarantine(self, harness):
         """"Could not read it" is not "the user replaced it".
 

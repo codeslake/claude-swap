@@ -868,8 +868,17 @@ class AutoSwitchEngine:
     # -- quarantine -----------------------------------------------------------
 
     def _quarantine(self, number: str, email: str, reason: str) -> None:
-        creds = self.switcher.read_account_credentials(number, email)
-        fingerprint = _refresh_fingerprint(creds) if creds else None
+        # THE READER THAT SEPARATES FAILED FROM ABSENT, here as well as at
+        # the release. A failed read fingerprints as None, which is exactly
+        # what a genuinely ABSENT backup records -- and the release then
+        # reads any later readable credential as "the user replaced it".
+        # Guarding only the release leaves that hole open from this end.
+        creds, unreadable = self.switcher._read_account_credentials_ex(
+            number, email
+        )
+        fingerprint = None if unreadable else (
+            _refresh_fingerprint(creds) if creds else None
+        )
 
         def add(state: dict) -> None:
             state.setdefault("quarantine", {})[number] = {
@@ -877,6 +886,9 @@ class AutoSwitchEngine:
                 "reason": reason,
                 "at": _now_iso(),
                 "refreshTokenFingerprint": fingerprint,
+                # None means ABSENT; this says the generation was never
+                # learned, so nothing may release on a compare against it.
+                "fingerprintUnknown": unreadable,
             }
 
         self._mutate_state(add)
@@ -893,6 +905,7 @@ class AutoSwitchEngine:
         if not isinstance(quarantine, dict) or not quarantine:
             return state
         to_release: list[tuple[str, str, str]] = []
+        to_bind: list[tuple[str, str | None]] = []
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
@@ -915,14 +928,27 @@ class AutoSwitchEngine:
             if unreadable:
                 continue
             fingerprint = _refresh_fingerprint(creds) if creds else None
+            if entry.get("fingerprintUnknown"):
+                # The generation this quarantine binds to was never learned,
+                # so a difference here is not evidence of a replacement.
+                # Bind it now that the read worked and let the ordinary
+                # compare decide from the next tick -- releasing instead is
+                # how a slot barred for an identity conflict came back.
+                to_bind.append((number, fingerprint))
+                continue
             if fingerprint != entry.get("refreshTokenFingerprint"):
                 to_release.append((number, email_now, "credentials-replaced"))
-        if not to_release:
+        if not to_release and not to_bind:
             return state
 
         def drop(s: dict) -> None:
             q = s.get("quarantine")
             if isinstance(q, dict):
+                for number, fp in to_bind:
+                    row = q.get(number)
+                    if isinstance(row, dict):
+                        row["refreshTokenFingerprint"] = fp
+                        row["fingerprintUnknown"] = False
                 for number, _, _ in to_release:
                     q.pop(number, None)
 
