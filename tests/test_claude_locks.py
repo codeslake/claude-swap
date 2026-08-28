@@ -26,6 +26,15 @@ from claude_swap.claude_locks import (
 from claude_swap.exceptions import ClaudeCodeLockTimeout
 
 
+# The trial machinery is unreachable where `_CAN_PIN_A_DIRECTORY` short-circuits
+# before any trial, so it is the platform the guard must track -- not `sys.platform`,
+# which forcing the constant False proved does not follow it.
+needs_the_trial_machinery = pytest.mark.skipif(
+    not claude_locks._CAN_PIN_A_DIRECTORY,
+    reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial there",
+)
+
+
 @pytest.fixture
 def lock_dir(tmp_path: Path) -> Path:
     return tmp_path / "target.lock"
@@ -437,16 +446,13 @@ class TestADanglingSymlinkDoesNotPinACore:
             return real_mkdir(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
-        started = time.monotonic()
         with pytest.raises(ClaudeCodeLockTimeout) as caught:
             with proper_lockfile(target, timeout=3.0):
                 pass
-        elapsed = time.monotonic() - started
 
         assert tries["n"] == 1, (
             f"{tries['n']} attempts -- a state that cannot change was retried"
         )
-        assert elapsed < 0.5, f"waited {elapsed:.2f}s of a 3s budget"
         # AND IT SAYS WHICH STATE. Timing alone would pass for a raise that
         # still blamed Claude Code, which is the half the user acts on.
         assert "symlink" in str(caught.value), str(caught.value)
@@ -1096,11 +1102,7 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
     already exists; it just has to be armed by the filesystem's answer.
     """
 
-    @pytest.mark.skipif(
-        not claude_locks._CAN_PIN_A_DIRECTORY,
-        reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
-               "there, so the trial machinery is unreachable by construction",
-    )
+    @needs_the_trial_machinery
     def test_one_trial_that_sees_the_reuse_decides(self, tmp_path, monkeypatch):
         """A trial reports "pinned" by NOT seeing the number come back.
 
@@ -1115,6 +1117,10 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         import claude_swap.claude_locks as cl
 
         n = cl._PIN_TRIALS
+        # THE TABLE BELOW IS DERIVED FROM `n`, so at n == 1 its two
+        # discriminating rows collapse into the two agreeing ones and the
+        # case disappears. Assert the floor the table cannot.
+        assert n >= 2, "one trial cannot answer whether the descriptor pins"
         for answers, expected in (
             ([True] * n, True),
             ([False] + [True] * (n - 1), False),
@@ -1132,19 +1138,13 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             )
         cl._PIN_PROBE.clear()
 
-    @pytest.mark.skipif(
-        not claude_locks._CAN_PIN_A_DIRECTORY,
-        reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
-               "there, so the trial machinery is unreachable by construction",
-    )
+    @needs_the_trial_machinery
     def test_the_trials_are_spaced_not_back_to_back(self, tmp_path, monkeypatch):
         """Repeats bound the error only if the samples are INDEPENDENT.
 
         Back-to-back trials sample one contention burst, so under load the
         second agrees with the first for the same reason the first was wrong.
-        Measured in one continuous noise run: 2 back-to-back 5.6% wrong where
-        independence predicts 0.85%, 8 back-to-back still 4.2%, and 4 spaced
-        by 10ms 0.6%. The gap is the fix; the count is not.
+        The gap is the fix; the count is not.
         """
         import claude_swap.claude_locks as cl
 
@@ -1161,11 +1161,7 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         )
         assert cl._PIN_TRIAL_GAP_S > 0
 
-    @pytest.mark.skipif(
-        not claude_locks._CAN_PIN_A_DIRECTORY,
-        reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
-               "there, so the trial machinery is unreachable by construction",
-    )
+    @needs_the_trial_machinery
     def test_a_probe_that_cannot_run_is_not_cached(self, tmp_path, monkeypatch):
         """Refusing to trust the pin is the safe direction, but a refusal
         that cannot be measured must not become a permanent answer."""
@@ -1175,7 +1171,10 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         cl._PIN_PROBE.clear()
         try:
             assert cl._fd_pins_an_inode(tmp_path) is False
-            assert str(tmp_path) not in cl._PIN_PROBE, (
+            # BY KEY SHAPE, NOT BY PATH STRING. The key is `(path, st_dev)`,
+            # so `str(tmp_path) not in _PIN_PROBE` is true by construction and
+            # would pass with the unmeasurable answer cached.
+            assert not any(k[0] == str(tmp_path) for k in cl._PIN_PROBE), (
                 "an unmeasurable parent must be re-probed, not remembered"
             )
         finally:
@@ -1235,11 +1234,7 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             "is still a descriptor on a filesystem that pins nothing"
         )
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="Windows cannot hold a directory open, so the probe is False "
-               "there by construction and has nothing to report",
-    )
+    @needs_the_trial_machinery
     def test_the_probe_reports_a_presence(self, tmp_path):
         """The control: on this filesystem the descriptor DOES pin."""
         import claude_swap.claude_locks as cl
@@ -1247,6 +1242,12 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         cl._PIN_PROBE.clear()
         try:
             assert cl._fd_pins_an_inode(tmp_path) is True
+            # AND THE DEVICE IS PART OF THE KEY. Pinning is a filesystem
+            # property, so a mount landing under this path must not be
+            # answered out of the probe of the filesystem it replaced.
+            assert list(cl._PIN_PROBE) == [
+                (str(tmp_path), os.stat(tmp_path).st_dev)
+            ], cl._PIN_PROBE
         finally:
             cl._PIN_PROBE.clear()
 

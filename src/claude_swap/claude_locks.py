@@ -67,12 +67,11 @@ _CAN_PIN_A_DIRECTORY = sys.platform != "win32"
 
 # Keyed on the PARENT, which is where the mkdir happens. One probe per
 # directory per process; a stray answer is never cached.
-_PIN_PROBE: dict[str, bool] = {}
+_PIN_PROBE: dict[tuple[str, int], bool] = {}
 _PIN_TRIALS = 4
-# Trials microseconds apart sample ONE contention burst, so repeating them
-# barely moves the error: measured under one continuous noise run, 2 back-to-back
-# gave 5.6% wrong "pinned" where independence predicts 0.85%, and 8 back-to-back
-# still gave 4.2%. Spacing four by 10ms gave 0.6%. The gap is what pays.
+# Repeats bound the error only if the samples are INDEPENDENT. Trials
+# microseconds apart sample one contention burst, so the gap is what pays,
+# not the count -- eight back-to-back measured worse than four spaced.
 _PIN_TRIAL_GAP_S = 0.010
 
 
@@ -96,9 +95,8 @@ def _fd_pins_an_inode(parent: Path) -> bool:
     """
     if not _CAN_PIN_A_DIRECTORY:
         return False
-    # THE DEVICE IS PART OF THE SUBJECT. Pinning is a filesystem property, so
-    # a mount landing under this path after the first probe makes the cached
-    # answer describe a filesystem that is no longer there.
+    # THE DEVICE IS PART OF THE SUBJECT: pinning is a filesystem property, so
+    # a mount landing here would be answered out of the old filesystem's probe.
     try:
         key = (str(parent), os.stat(parent).st_dev)
     except OSError:
@@ -385,11 +383,10 @@ def proper_lockfile(
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
             # A NAME THAT EXISTS AND CANNOT RESOLVE WILL NEVER SUCCEED, the
-            # same separation the mkdir arm above makes with one stat. Left to
-            # retry it spends the whole budget and then blames Claude Code for
-            # a lock nobody holds. `lexists` is the wrong test: it also answers
-            # True for a directory recreated between our stat and the check,
-            # which is a busy handoff and must keep retrying.
+            # same separation the mkdir arm above makes with one stat.
+            # `lexists` is the wrong test: it also answers True for a directory
+            # recreated between our stat and the check, which is a busy
+            # handoff and must keep retrying.
             if os.path.islink(lock_dir):
                 raise ClaudeCodeLockTimeout(
                     f"{lock_dir} is a symlink that points nowhere, so no lock "
