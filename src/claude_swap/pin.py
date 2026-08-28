@@ -1362,12 +1362,13 @@ def _config_already_names(identity: "dict | None") -> bool:
     the same `False`, and only the file can separate them.
 
     THE UUID ALONE, NOT THE ORG, when both sides carry one -- the same call
-    `_config_names_the_pin` makes. `_find_account_slot`'s model is that the
-    account uuid is globally unique and the org only corroborates, so a
-    same-uuid/different-org config is the same account with a stale org, not
-    a sibling. `_live_identity_matches` reaches the opposite verdict from the
-    EMAIL, which cannot tell two accounts apart on its own; this has the
-    stronger key and does not need the org to disambiguate.
+    `_config_names_the_pin` makes, and a DELIBERATE divergence from
+    `_resolved_matches_slot_identity`, which keeps a lenient org conjunct
+    ("uuid is globally unique; the org only corroborates"). Here the org
+    would only ever narrow a verdict the uuid has already settled, and a
+    wrong False is what strands the rollback message. The composite
+    fallback below still carries the org, so the personal/org pair at one
+    address stays separated on the path where no uuid is available.
     """
     if not identity:
         return False
