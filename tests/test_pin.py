@@ -3501,6 +3501,70 @@ class TestTheStrandedConfigCheck:
         assert pin._config_still_names("cloud@example.com", None), (
             "DEFECT: only the first config was read")
 
+    def _two_configs(self, temp_home, tmp_path, monkeypatch, first):
+        """Session config FIRST (holding ``first``), stranded default SECOND.
+
+        `_each_config` yields CLAUDE_CONFIG_DIR's copy first, so every
+        `continue` in the scan is only load-bearing when the config that
+        still names the ex-pin sits BEHIND another one.
+        """
+        sess = tmp_path / "sess"
+        sess.mkdir(exist_ok=True)      # the callers loop over several shapes
+        (sess / ".claude.json").write_text(json.dumps(first))
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sess))
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "cloud@example.com", "accountUuid": "UUID-EX"}}))
+
+    def test_a_first_config_with_no_oauth_does_not_stop_the_scan(
+            self, temp_home, tmp_path, monkeypatch):
+        """The non-dict exit must `continue`, not decide.
+
+        A session config that exists but has no `oauthAccount` yet is more
+        ordinary than the absent file already covered -- and turning this
+        `continue` into a verdict hides a stranded default config behind it.
+        """
+        from claude_swap import pin
+
+        for first in ({"env": {}}, {"oauthAccount": None},
+                      {"oauthAccount": "not-a-dict"}):
+            self._two_configs(temp_home, tmp_path, monkeypatch, first)
+            assert pin._config_still_names("cloud@example.com", None), (
+                f"DEFECT: first config {first!r} ended the scan, so the "
+                "stranded second config went unseen")
+
+    def test_an_exempt_first_config_does_not_stop_the_scan(
+            self, temp_home, tmp_path, monkeypatch):
+        """The accountUuid-exempt exit must `continue` too.
+
+        Pinning the account you are logged in as is what this docstring
+        calls ordinary, so the FIRST config legitimately carries the
+        identity the clear put back -- while the second is still stranded.
+        """
+        from claude_swap import pin
+
+        self._two_configs(temp_home, tmp_path, monkeypatch, {"oauthAccount": {
+            "emailAddress": "cloud@example.com", "accountUuid": "UUID-BACK"}})
+        assert pin._config_still_names(
+            "cloud@example.com", {"accountUuid": "UUID-BACK"}), (
+            "DEFECT: an exempt first config ended the scan and the stranded "
+            "second one was never reached")
+
+    def test_the_RECORD_half_of_the_compare_is_casefolded_too(self, temp_home):
+        """Both halves, not just the config's.
+
+        `_config_address` lowercases the CONFIG side, so every existing
+        case test passes with the record side left raw. The record's spelling
+        comes from the roster, and the code's own comment says Claude Code
+        round-trips `emailAddress` through its login -- so the two can
+        legitimately disagree in case.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "cloud@example.com"}}))
+        assert pin._config_still_names("CLOUD@Example.com", None), (
+            "DEFECT: a mixed-case RECORD hid a stranded config")
+
     def test_no_intended_uuid_means_the_address_decides(self, temp_home):
         """An identity with no accountUuid cannot exempt anything.
 
@@ -3640,6 +3704,47 @@ class TestTheThirdReaderOfTheSameField:
                 {"emailAddress": bad, "organizationUuid": ""}) is False, (
                 f"DEFECT: identity emailAddress={bad!r} raised")
 
+    def test_the_accountuuid_decides_before_the_blanked_composite(
+            self, temp_home):
+        """The blank guard must not answer False about an EXACT match.
+
+        `identity_for_config` returns a stored account config's
+        `oauthAccount` VERBATIM when it has an accountUuid, so the identity
+        itself can carry a non-string address. The composite then blanks and
+        the guard declines -- about a config carrying that identity byte for
+        byte. `_restore_pin` reads that False as "the un-splice did not
+        happen" and `_rollback_tail` sends the user to check a record the
+        rollback already cleared: the exact sentence this range exists to
+        stop, recreated on the identity side.
+
+        `_config_names_the_pin`, one function over, already decides this way
+        -- accountUuid first, composite only as the fallback.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": 42, "accountUuid": "UUID-9",
+            "organizationUuid": "org-A"}}))
+        assert pin._config_already_names(
+            {"emailAddress": 42, "accountUuid": "UUID-9",
+             "organizationUuid": "org-A"}) is True, (
+            "DEFECT: the blank guard declined a config that carries the "
+            "identity exactly, so a clean rollback reports as a failure")
+
+    def test_control_a_different_accountuuid_is_still_refused(self, temp_home):
+        """CONTROL: the strong key must be able to say No.
+
+        Without this, `return True` whenever an accountUuid is present kills
+        no test.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "me@example.com", "accountUuid": "UUID-OTHER"}}))
+        assert pin._config_already_names(
+            {"emailAddress": "me@example.com",
+             "accountUuid": "UUID-9"}) is False
+
     def test_control_a_matching_pair_still_answers_true(self, temp_home):
         """CONTROL: the guard must not turn the reader off.
 
@@ -3665,10 +3770,12 @@ class TestTheThirdReaderOfTheSameField:
         """
         from claude_swap import pin
 
+        # A NON-BLANK ORG on both sides, so a guard written on the org
+        # instead of the address cannot satisfy this.
         (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
-            "emailAddress": 42, "organizationUuid": ""}}))
+            "emailAddress": 42, "organizationUuid": "org-A"}}))
         assert pin._config_already_names(
-            {"emailAddress": 42, "organizationUuid": ""}) is False, (
+            {"emailAddress": 42, "organizationUuid": "org-A"}) is False, (
             "DEFECT: two blanked addresses matched, so a broken config read "
             "as 'already names the identity'")
 

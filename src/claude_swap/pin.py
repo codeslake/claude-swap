@@ -233,7 +233,7 @@ def _config_address(oauth) -> str:
     raises", and `_config_already_names` on the rollback, where a raise is
     swallowed into a False that reports a clean rollback as a failure.
     """
-    value = (oauth or {}).get("emailAddress")
+    value = oauth.get("emailAddress")
     return value.casefold() if isinstance(value, str) else ""
 
 
@@ -1363,12 +1363,6 @@ def _config_already_names(identity: "dict | None") -> bool:
     """
     if not identity:
         return False
-    want = (_config_address(identity), identity.get("organizationUuid") or "")
-    if not want[0]:
-        # A BLANK IS NOT A MATCH. Both sides blank to "" on a non-string,
-        # so a broken identity and a broken config would compare equal and
-        # report "already correct" -- the one answer this must not invent.
-        return False
     try:
         from claude_swap.paths import get_global_config_path
 
@@ -1377,6 +1371,19 @@ def _config_already_names(identity: "dict | None") -> bool:
         return False
     current = raw.get("oauthAccount") if isinstance(raw, dict) else None
     if not isinstance(current, dict):
+        return False
+    # THE STRONG KEY FIRST, as `_config_names_the_pin` decides the same
+    # question. `identity_for_config` hands back a stored config VERBATIM,
+    # so the identity itself can carry a non-string address: the composite
+    # then blanks and declines about a config that matches byte for byte,
+    # and `_restore_pin` reads that as a rollback that did not happen.
+    uuid = identity.get("accountUuid")
+    if uuid:
+        return current.get("accountUuid") == uuid
+    want = (_config_address(identity), identity.get("organizationUuid") or "")
+    # A BLANK IS NOT A MATCH: with no uuid to fall back on, two unreadable
+    # addresses would compare equal and invent an "already correct".
+    if not want[0]:
         return False
     return (_config_address(current),
             current.get("organizationUuid") or "") == want
