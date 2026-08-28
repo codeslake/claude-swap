@@ -946,7 +946,16 @@ class SessionManager:
                 shutil.rmtree(child, ignore_errors=True)
             else:
                 child.unlink(missing_ok=True)
-        clear_session_stale(session_dir)
+        # MARK, not clear. The profile survives now, so `_session_validity`
+        # no longer short-circuits on `not session_dir.is_dir()` the way it
+        # did when this removed the whole directory -- and on macOS the seed
+        # is not the only credential material: `delete_macos_keychain_entry`
+        # above swallows a locked keychain, so a later probe TIMEOUT falls to
+        # `_artifacts_say_usable`, where the surviving entry reads as present
+        # and the deleted `.claude.json` reads as "no drift". The marker is
+        # what still says "re-bootstrap, do not reuse"; the next successful
+        # bootstrap clears it.
+        mark_session_stale(session_dir)
 
     # -- validation ------------------------------------------------------
 

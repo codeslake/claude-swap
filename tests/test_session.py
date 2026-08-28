@@ -566,6 +566,84 @@ class TestBootstrap:
                 "account's history into the DEFAULT profile, with no flag."
             )
 
+    def test_a_swept_profile_is_not_reused_on_the_next_launch(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """A profile the cleanup swept must re-bootstrap, never be reused.
+
+        The sweep spares user data, so the directory now SURVIVES and
+        `_session_validity` no longer short-circuits on `not is_dir()`. On
+        macOS the seed is not the only credential material: the keychain
+        delete is best-effort, so a later probe TIMEOUT falls to
+        `_artifacts_say_usable`, where an unreadable entry reads as present
+        and the deleted `.claude.json` reads as "no drift".
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        svc = session_mod.keychain_service_name(session_dir)
+        acct = session_mod._keychain_account_name()
+        real_get = session_mod.macos_keychain.get_password
+        real_del = session_mod.macos_keychain.delete_password
+
+        def locked(real):
+            def _f(service, account, *a, **k):
+                if (service, account) == (svc, acct):
+                    raise session_mod.macos_keychain.KeychainError("locked")
+                return real(service, account, *a, **k)
+            return _f
+
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "get_password", locked(real_get))
+        monkeypatch.setattr(
+            session_mod.macos_keychain, "delete_password", locked(real_del))
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISES: the state that makes the reuse check answer "usable".
+        assert manager.switcher.platform == session_mod.Platform.MACOS
+        assert session_dir.is_dir(), "premise: the sweep spares the directory"
+        assert not (session_dir / ".credentials.json").exists()
+        assert not (session_dir / ".claude.json").exists()
+        assert session_mod._may_have_credential_material(session_dir) is True, (
+            "premise: the unreadable keychain reads as material-may-be-present"
+        )
+
+        def times_out(cmd, env=None, **kwargs):
+            raise session_mod.subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", times_out)
+        assert manager._session_validity(
+            session_dir, ACCOUNT_EMAIL, ORG_UUID) == "unknown", (
+            "premise: the next launch's probe merely did not answer"
+        )
+        assert manager._is_session_valid(
+            session_dir, ACCOUNT_EMAIL, ORG_UUID), (
+            "premise: local artifacts alone say 'usable' -- so only the "
+            "stale flag can stop the reuse, which is what this asserts"
+        )
+
+        assert session_mod.is_session_stale(session_dir), (
+            "DEFECT: the profile that FAILED validation carries no "
+            "re-bootstrap flag, so the next launch takes the reuse fast "
+            "path and execs claude into a profile with no identity and a "
+            "credential that just failed -- any login there writes to the "
+            "profile and never to the slot's backup"
+        )
+        assert session_mod.profile_is_quiescent(session_dir), (
+            "control: the flag is only honoured on a quiescent profile"
+        )
+
     def test_stale_keychain_entry_deleted_before_seed(
         self,
         manager,
