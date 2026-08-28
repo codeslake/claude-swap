@@ -539,30 +539,61 @@ class TestADanglingSymlinkDoesNotPinACore:
         assert elapsed < 0.5, f"waited {elapsed:.2f}s of a 2s budget"
 
     def test_control_a_real_directory_still_retries(self, tmp_path, monkeypatch):
-        """CONTROL: the refusal keys on the symlink, not on any ENOENT.
+        """CONTROL: the refusal keys on the name's TYPE, not on any ENOENT.
 
-        A directory swept between our mkdir and our stat is a busy handoff and
-        MUST keep retrying -- which is why `lexists` is the wrong test.
+        A directory swept between our mkdir and our read-back stat is a busy
+        handoff and MUST keep retrying -- which is why `lexists` is the wrong
+        test. It also carries that arm's BACK-OFF, which nothing else can any
+        more: a dangling symlink used to be the vehicle for it and is now
+        refused above the loop, so a spin bound written against a symlink
+        measures the refusal instead of the arm.
         """
-        target = tmp_path / "busy.lock"
-        target.mkdir()
+        swept = tmp_path / "busy.lock"
+        swept.mkdir()
+        budget, seen, slept = 0.3, {"n": 0}, []
         real_stat = os.stat
-        seen = {"n": 0}
+        real_sleep = claude_locks.time.sleep
+        mine, t0 = threading.get_ident(), time.monotonic()
 
         def vanishing(path, *a, **k):
-            if os.fspath(path) == os.fspath(target):
+            if os.fspath(path) == os.fspath(swept):
                 seen["n"] += 1
                 raise FileNotFoundError(errno.ENOENT, "swept")
             return real_stat(path, *a, **k)
 
+        def recording(seconds):
+            # SCOPED TO THIS THREAD. `claude_locks.time` IS the time module,
+            # so an unscoped patch records every other thread's sleeps here.
+            if threading.get_ident() == mine:
+                slept.append((round(budget - (time.monotonic() - t0), 3),
+                              round(seconds, 3)))
+            return real_sleep(seconds)
+
         monkeypatch.setattr(claude_locks.os, "stat", vanishing)
+        monkeypatch.setattr(claude_locks.time, "sleep", recording)
         with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(target, timeout=0.3):
+            with proper_lockfile(swept, timeout=budget):
                 pass
+
         assert seen["n"] > 1, (
             f"{seen['n']} stat calls -- a swept name stopped retrying, so the "
             "symlink refusal is catching the handoff case too"
         )
+        # AND IT SLEEPS ITS WAY THERE. Retrying is half the contract: with no
+        # back-off this arm is 100% of a core until the deadline, and then a
+        # timeout that blames Claude Code for a lock nobody holds.
+        assert seen["n"] < 50, (
+            f"{seen['n']} attempts in a {budget}s budget -- the arm that "
+            "retries a swept name never slept, so it pinned a core for it"
+        )
+        # AND ONLY WHAT IS LEFT. `min(flat, timeout)` is the same number as
+        # `min(flat, remaining)` until the budget runs low, so the overshoot
+        # is only visible on the LAST sleep of the run.
+        for left, seconds in slept:
+            assert seconds <= max(left, 0.0) + 0.005, (
+                f"slept {seconds}s with {left}s left -- the swept-name clamp "
+                f"used `timeout`, not what remains of it (all: {slept})"
+            )
 
 
 class TestAPermanentENOENTIsNotARetry:
@@ -1389,6 +1420,42 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         with cl.proper_lockfile(lock_dir, timeout=2.0, staleness=60.0):
             assert lock_dir.exists()
         assert not lock_dir.exists()
+
+    @needs_the_trial_machinery
+    def test_a_contended_acquire_never_probes(self, tmp_path, monkeypatch):
+        """The probe is on the path that READS its answer, not above the loop.
+
+        `can_pin` is only ever consulted after a `mkdir` that succeeded, and
+        the probe sleeps `_PIN_TRIALS - 1` gaps on the first call per
+        filesystem. Above the loop that time is charged to every waiter that
+        never takes the name -- which is exactly the callers whose budget is
+        under contention, and whose retry arms clamp to what is LEFT of it.
+        """
+        import claude_swap.claude_locks as cl
+
+        held = tmp_path / "held.lock"
+        held.mkdir()  # fresh mtime -> contended, and never stale
+        probes = []
+        monkeypatch.setattr(
+            cl, "_fd_pins_an_inode", lambda parent: probes.append(parent) or False
+        )
+
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(held, timeout=0.2):
+                pass
+        assert probes == [], (
+            f"{len(probes)} probe(s) on a contended acquire -- the gaps ran "
+            "inside a budget whose caller never reads the answer"
+        )
+
+        # THE CONTROL, or the assertion above passes on a probe that was
+        # deleted rather than moved.
+        held.rmdir()
+        with proper_lockfile(held, timeout=2.0):
+            pass
+        assert probes == [held.parent], (
+            f"{probes} -- an acquire that TAKES the name still has to ask"
+        )
 
 
 class TestATransientErrnoIsNotFatalToTheHold:

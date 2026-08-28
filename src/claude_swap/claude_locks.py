@@ -306,13 +306,16 @@ def proper_lockfile(
     if timeout is None:
         timeout = DEFAULT_TIMEOUT_S
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
-    # BEFORE THE ACQUIRE LOOP, which is the first reader.
-    can_pin = _fd_pins_an_inode(lock_dir.parent)
+    # PROBED BELOW, on the path that reads it: every reader of `can_pin` is
+    # downstream of a `mkdir` that SUCCEEDED, and the probe sleeps between
+    # its trials, so above the loop a waiter pays for an answer it never asks.
+    can_pin = False
     held_fd = -1
     start = time.monotonic()
     while True:
         try:
             os.mkdir(lock_dir)
+            can_pin = _fd_pins_an_inode(lock_dir.parent)
             # HOLD A DESCRIPTOR ON THE DIRECTORY WE MADE, and take identity
             # from it. An mtime is a value we WRITE, so a successor's
             # directory can come to carry ours; (st_dev, st_ino) is the object
