@@ -660,10 +660,7 @@ class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
     ITS ELAPSED BOUND IS TIGHT ENOUGH TO SEE A WEAKENED CLAMP, not only a
-    deleted one, which is the property that matters. It makes NO CLAIM about
-    how many other cases can do the same: every commit that has stated that
-    count has gone stale on the next clamp case added, and the claim above
-    does not need it.
+    deleted one, which is the property that matters.
 
     The jitter is pinned, or the weakened form's overshoot is a random draw
     that can land inside any fixed margin.
@@ -1016,6 +1013,33 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         assert elapsed < budget + margin, (
             f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
             f"guard is not clamped to the remaining time"
+        )
+
+    def test_the_default_budget_is_read_at_call_time(
+        self, tmp_path, monkeypatch
+    ):
+        """A default of `_TAKEOVER_GUARD_S` freezes the IMPORT-time value.
+
+        The cap inside `min(...)` is read per call, so patching the constant
+        moves it and every caller that passes `budget=` -- while this
+        function's own default keeps the old number, and the wait comes out
+        the smaller of the two. The comment above the constant invites
+        trying a new value, and monkeypatch is how that is done here.
+        """
+        seen = []
+        real = claude_locks.FileLock
+
+        def recording(path, **kw):
+            seen.append(kw["timeout"])
+            return real(path, **kw)
+
+        monkeypatch.setattr(claude_locks, "FileLock", recording)
+        monkeypatch.setattr(claude_locks, "_TAKEOVER_GUARD_S", 7.0)
+        gone = tmp_path / "gone.lock"
+        assert claude_locks._take_over_stale(gone, 60.0) is False
+        assert seen == [7.0], (
+            f"the guard waited {seen} under a cap patched to 7.0 -- the "
+            "default budget was bound at import, not read at the call"
         )
 
 

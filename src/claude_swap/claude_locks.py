@@ -85,23 +85,18 @@ def config_lock_dir() -> Path:
     return path.parent / (path.name + ".lock")
 
 
-# A CAP on the guard wait; the caller's remaining budget is the bound, so the
-# product tolerates any value. Its contended-guard test handles the two ends
-# differently. Too small, and the clamped and unclamped forms stop separating
-# by more than the margin it allows -- the case refuses on its own premise
-# rather than passing. Too large is fine now: the peer's hold derives from
-# this, so that end rescales. Both are derived there rather than pinned, so it
-# cannot go quietly green at a new value.
+# A CAP on the guard wait; the caller's remaining budget is the real bound, so
+# the product tolerates any value. Its contended-guard test does not: shrink
+# this and the clamped and unclamped forms stop separating by more than its
+# margin, which that case's own premise assert refuses rather than passing.
 _TAKEOVER_GUARD_S = 0.5
 # A short back-off after an arm declines, so the retry loop cannot spin hot.
-# Four cases hard-code this rather than read it, and pin it from both sides:
-# shrink it and the two `_does_not_spin` attempt bounds blow, grow it and
-# `_assert_backed_off`'s sizing and the contended guard's 2nd iteration go.
+# Not freely tunable: the lock suite bounds it from both sides, and fails loud.
 _DECLINE_BACKOFF_S = 0.05
 
 
 def _take_over_stale(
-    lock_dir, staleness: float, budget: float = _TAKEOVER_GUARD_S
+    lock_dir, staleness: float, budget: float | None = None
 ) -> bool:
     """Remove a lock whose holder is gone, but never a successor's.
 
@@ -121,10 +116,15 @@ def _take_over_stale(
 
     `budget` is the caller's remaining time; the guard waits the smaller of it
     and `_TAKEOVER_GUARD_S`, so a contended guard cannot push the caller past
-    its own deadline. Returns whether the corpse was removed -- False also
+    its own deadline. It defaults to None rather than to the cap so the cap is
+    READ per call: a default expression is bound at import, and would ignore a
+    patched constant while the `min` beside it followed one.
+    Returns whether the corpse was removed -- False also
     covers a peer having retaken it, a refused rmdir, and an exhausted budget,
     which mean the same thing here: back off and retry.
     """
+    if budget is None:
+        budget = _TAKEOVER_GUARD_S
     guard = lock_dir.parent / f"{lock_dir.name}.takeover"
     try:
         with FileLock(guard, timeout=max(0.0, min(_TAKEOVER_GUARD_S, budget))):
