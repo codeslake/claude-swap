@@ -319,10 +319,8 @@ def proper_lockfile(
                 can_pin = _fd_pins_an_inode(lock_dir.parent)
             except BaseException:
                 # THE NAME IS OURS AND THE `finally` THAT REMOVES IT IS NOT
-                # REACHED UNTIL THE `yield`. The probe sleeps, which is where
-                # a KeyboardInterrupt lands, and only `OSError` reaches the
-                # arm below -- so anything else would leave an unheld lock for
-                # the whole staleness window.
+                # REACHED UNTIL THE `yield`. Only `OSError` reaches the arm
+                # below, and the probe sleeps -- where an interrupt lands.
                 try:
                     os.rmdir(lock_dir)
                 except OSError:

@@ -1163,10 +1163,9 @@ class TestADanglingSymlinkDoesNotPinACore:
         refusal instead of the arm.
 
         THE BUDGET IS NOT A MULTIPLE OF THE FLAT CAP. At 0.3 the last sleep
-        starts with ~0.0497s left, so `min(0.05, timeout)` and
-        `min(0.05, remaining)` differ by the loop's own overhead and the
-        weakening survives -- measured, the mutant passed. 0.175 leaves a
-        remainder the cap overshoots by 25ms.
+        starts with 0.0497s left and `min(0.05, timeout)` is inside the
+        slack -- measured, the mutant passed. 0.175 leaves 0.024s, which it
+        overshoots by half.
         """
         swept = tmp_path / "busy.lock"
         swept.mkdir()
@@ -1207,10 +1206,8 @@ class TestADanglingSymlinkDoesNotPinACore:
             f"{seen['n']} attempts in a {budget}s budget -- the arm that "
             "retries a swept name never slept, so it pinned a core for it"
         )
-        # AND ONLY WHAT IS LEFT. `min(flat, timeout)` is the same number as
-        # `min(flat, remaining)` until the budget runs low, so the overshoot
-        # is only visible on the LAST sleep of the run -- which the floor
-        # below is what makes the run reach at all.
+        # AND ONLY WHAT IS LEFT. The overshoot is visible on the LAST sleep
+        # alone, so the floor is what makes the run reach one.
         assert min(left for left, _ in slept) < 0.05, (
             f"the run never reached a clamped sleep: {slept}"
         )
