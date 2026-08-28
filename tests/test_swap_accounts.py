@@ -2915,6 +2915,64 @@ class TestASwapKeepsEachProfilesOwnGeneration:
             "re-bootstrap it was flagged for never happens"
         )
 
+    def test_a_swap_that_moved_nothing_leaves_each_flag_where_it_was(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """"Where did this profile end up" cannot be asked by existence.
+
+        With one shared email the destination names ARE the sources, so
+        `os.path.exists(new_a)` is true when A landed there AND when B
+        simply never left. On every path that skips the renames the two
+        profiles then resolve to each other and the flags swap onto the
+        wrong ones -- the same two-part defect, on the failure path.
+        """
+        import os
+        from unittest.mock import patch
+
+        from claude_swap.session import is_session_stale, mark_session_stale
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data_with_org)
+        email = "user@example.com"
+        d1, d2 = s._session_dir("1", email), s._session_dir("2", email)
+        for num, d in (("1", d1), ("2", d2)):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "marker").write_text(f"SLOT-{num}-HISTORY")
+        assert mark_session_stale(d1)
+        # PREMISE: exactly one profile is flagged, and it is slot 1's.
+        assert is_session_stale(d1) and not is_session_stale(d2)
+        # PREMISE: with one shared email the destination names ARE the sources.
+        assert s._session_dir("2", email) == d2 and s._session_dir("1", email) == d1
+
+        real = os.replace
+        calls = []
+
+        def refuse(src, dst, *a, **k):
+            calls.append((str(src), str(dst)))
+            raise OSError(13, "Permission denied")
+
+        moved = []
+        with patch("claude_swap.switcher.os.replace", side_effect=refuse):
+            s._swap_session_dirs("1", email, "2", email, moved)
+
+        # PREMISE: nothing moved, so both profiles are exactly where they were.
+        print(f"\nreplace attempts: {len(calls)}   moved: {moved}")
+        print(f"slot1 holds {(d1 / 'marker').read_text()}   slot2 holds {(d2 / 'marker').read_text()}")
+        print(f"slot1 flagged={is_session_stale(d1)}   slot2 flagged={is_session_stale(d2)}")
+        assert len(calls) >= 1, "premise: a rename must have been attempted"
+        assert (d1 / "marker").read_text() == "SLOT-1-HISTORY"
+        assert (d2 / "marker").read_text() == "SLOT-2-HISTORY"
+
+        assert is_session_stale(d1), (
+            "DEFECT: slot 1's profile never moved and its flag was deleted, so "
+            "the re-bootstrap it was flagged for never happens"
+        )
+        assert not is_session_stale(d2), (
+            "DEFECT: slot 2's profile never moved and INHERITED slot 1's flag, so "
+            "its next launch re-bootstraps it from a backup it has rotated past"
+        )
+
     def test_a_move_carries_the_profile_s_stale_flag_with_it(
         self, temp_home: Path
     ):

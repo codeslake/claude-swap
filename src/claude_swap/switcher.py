@@ -1407,6 +1407,8 @@ class ClaudeAccountSwitcher:
         stale_b = stale_marker_for(dir_b).exists()
 
         staging = None
+        a_landed = False
+        b_landed = False
         try:
             if dir_a.exists():
                 staging = dir_a.with_name(dir_a.name + ".swapping")
@@ -1417,12 +1419,14 @@ class ClaudeAccountSwitcher:
                 finally:
                     if os.path.exists(new_b):
                         moved.append(new_b)
+                        b_landed = True
             if staging is not None and not new_a.exists():
                 try:
                     os.replace(staging, new_a)
                 finally:
                     if os.path.exists(new_a):
                         moved.append(new_a)
+                        a_landed = True
                     if not os.path.exists(staging):
                         # CLEARED ONCE THE MOVE LANDS. Left set, the strand
                         # recovery below runs on every SUCCESSFUL swap and
@@ -1444,8 +1448,13 @@ class ClaudeAccountSwitcher:
             # strand-recovered move is not misreported. Every old name is
             # cleared before any new one is set: with one shared email they
             # are the same two names, and setting first would erase it.
-            here_a = new_a if os.path.exists(new_a) else dir_a
-            here_b = new_b if os.path.exists(new_b) else dir_b
+            # WHETHER THE RENAME LANDED, never whether the destination
+            # exists: with one shared email `new_a` IS `dir_b`, so existence
+            # is true when nothing moved at all and the two profiles resolve
+            # to each other. The flags then swap onto the wrong profiles on
+            # every path that skips the renames.
+            here_a = new_a if a_landed else dir_a
+            here_b = new_b if b_landed else dir_b
             for old_dir in (dir_a, dir_b):
                 try:
                     stale_marker_for(old_dir).unlink(missing_ok=True)
