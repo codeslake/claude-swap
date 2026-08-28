@@ -4128,7 +4128,7 @@ class TestPerformSwitchPostDisplay:
         try:
             with patch.object(
                 switcher, "_write_json", side_effect=failing_write_json,
-            ), pytest.raises(SwitchError, match="was rolled back"):
+            ), pytest.raises(SwitchError, match=r"was rolled back.*disk full"):
                 switcher._perform_switch("1")
         finally:
             for p in patches:
@@ -8629,6 +8629,71 @@ class TestDirectActivationPreservation:
             "credential is the live login while the roster does not know it: "
             f"{excinfo.value}"
         )
+        # And POSITIVELY, or any replacement text passes -- including none.
+        assert "could NOT be rolled back" in str(excinfo.value), (
+            f"the report must say what did not happen: {excinfo.value}"
+        )
+
+    def test_direct_activation_does_not_call_a_partial_rollback_a_whole_one(
+        self, temp_home
+    ):
+        """One arm of three is not "was rolled back".
+
+        The flag says SOME arm ran; the sentence speaks for all of them. On a
+        machine with no `~/.claude.json` and no prior live login but a
+        populated roster, the roster write fails with all three tokens armed
+        -- and only the roster has a snapshot. It goes back; the credential
+        and the config do not.
+
+        The user is then told the switch was rolled back while the target's
+        token is the live login and a config that never existed names the
+        target: the orphaned-identity state the snapshot exists to prevent.
+        """
+        switcher, _ = self._setup(temp_home, live_identity_email=None)
+        (temp_home / ".claude" / ".credentials.json").unlink()
+        config_path = temp_home / ".claude.json"
+        assert not config_path.exists(), "premise: no prior config"
+        roster_before = switcher.sequence_file.read_text(encoding="utf-8")
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+
+        def fail_the_roster(self, path, data):
+            # LAST write in the block: all three tokens are armed, and only
+            # the roster has anything to put back.
+            if os.path.basename(os.fspath(path)) == "sequence.json" and \
+                    data.get("activeAccountNumber") == 1:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_roster,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISES: exactly one arm restored, and the other two left the
+        # machine changed -- or there is no partial to misdescribe.
+        assert switcher.sequence_file.read_text(encoding="utf-8") == roster_before, (
+            "premise: the roster arm must have restored"
+        )
+        live = (temp_home / ".claude" / ".credentials.json").read_text()
+        assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one", (
+            "premise: the target credential must still be live"
+        )
+        assert config_path.exists(), (
+            "premise: a config that did not exist must now name the target"
+        )
+
+        assert "was rolled back" not in str(excinfo.value), (
+            "DEFECT: one arm of three restored and the report calls it a "
+            "rollback. The target's token is the live login and a config "
+            "that never existed names the target, which is the orphaned "
+            f"identity the snapshot exists to prevent: {excinfo.value}"
+        )
+        assert "PARTLY" in str(excinfo.value), (
+            f"the report must say which way it was partial: {excinfo.value}"
+        )
 
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
@@ -8706,7 +8771,7 @@ class TestDirectActivationPreservation:
 
         with patch.object(
             switcher, "_write_json", side_effect=fail_sequence_write
-        ), pytest.raises(SwitchError, match="was rolled back"):
+        ), pytest.raises(SwitchError, match=r"was rolled back.*disk full"):
             switcher._perform_switch("1", emit_output=False)
 
         # Both halves rolled back: the settings config and the orphaned login.

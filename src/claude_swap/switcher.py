@@ -7147,12 +7147,13 @@ class ClaudeAccountSwitcher:
                     # transaction path says "rollback also failed"; so does
                     # this one.
                     unrestored: list[str] = []
-                    # SET WHERE EACH GUARD LIVES. A token says an arm was
-                    # armed, not that it had a snapshot to put back; a copy of
-                    # the three guards would desync the moment one changed.
-                    attempted = False
+                    # COUNTED, NOT FLAGGED, and incremented where each guard
+                    # lives. A token says a write happened; the arm also needs
+                    # a snapshot to put back. One arm of three restoring is
+                    # not a rollback, and a flag cannot tell those apart.
+                    attempted = 0
                     if sequence_written and rollback_sequence_text:
-                        attempted = True
+                        attempted += 1
                         try:
                             # RESTORE, DO NOT INSPECT. The gate here asked
                             # whether the roster was EMPTY, and the recovery
@@ -7170,7 +7171,7 @@ class ClaudeAccountSwitcher:
                             )
                             unrestored.append(f"{self.sequence_file.name} ({e})")
                     if config_written and rollback_config_text is not None:
-                        attempted = True
+                        attempted += 1
                         try:
                             # THE THIRD RESTORE ARM. `config_written` is armed
                             # before the write, so this runs on faults where
@@ -7186,7 +7187,7 @@ class ClaudeAccountSwitcher:
                             )
                             unrestored.append(f"{config_path.name} ({e})")
                     if creds_written and rollback_creds is not None:
-                        attempted = True
+                        attempted += 1
                         try:
                             self._write_credentials(rollback_creds)
                         except Exception as e:
@@ -7201,7 +7202,10 @@ class ClaudeAccountSwitcher:
                             f"{'; '.join(unrestored)}. Manual recovery may be "
                             f"needed."
                         ) from activation_error
-                    if creds_written or config_written or sequence_written:
+                    armed = sum(map(bool, (
+                        sequence_written, config_written, creds_written,
+                    )))
+                    if armed:
                         # THE OTHER HALF OF THE SAME MIRROR. The transaction
                         # path wraps BOTH outcomes; wrapping only the failed
                         # rollback left the common one raising `_write_json`'s
@@ -7212,11 +7216,14 @@ class ClaudeAccountSwitcher:
                         # than the arms on purpose, because a machine with no
                         # snapshot to restore still needs telling, just not
                         # that it was rolled back.
-                        outcome = (
-                            "was rolled back" if attempted
-                            else "could NOT be rolled back "
-                                 "(no prior state to restore)"
-                        )
+                        if attempted == armed:
+                            outcome = "was rolled back"
+                        elif attempted:
+                            outcome = ("was only PARTLY rolled back (no prior "
+                                       "state to restore for the rest)")
+                        else:
+                            outcome = ("could NOT be rolled back (no prior "
+                                       "state to restore)")
                         raise SwitchError(
                             f"Activation failed and {outcome}: "
                             f"{activation_error}"
