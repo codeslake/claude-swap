@@ -8783,6 +8783,74 @@ class TestDirectActivationPreservation:
             f"{excinfo.value}"
         )
 
+    def test_direct_activation_counts_only_arms_that_had_a_snapshot(
+        self, temp_home
+    ):
+        """An armed token with no snapshot must not count as restored.
+
+        `_roster_snapshot` answers "" when its read fails -- its documented
+        behaviour -- so the roster arm can be armed with nothing to put
+        back, while the write that armed it EMPTIES the file. The counter
+        has to mirror the arm's second conjunct, not just its token, or the
+        roster is left unreadable under a sentence saying it came back.
+
+        This is the conjunct the two earlier false sentences turned on, on
+        the one arm where nothing else pins it.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        switcher, unmanaged = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        original_config = config_path.read_text(encoding="utf-8")
+
+        real_copyfile = switcher_mod.shutil.copyfile
+        real_replace = switcher_mod.replace_with_retry
+
+        def busy_publish(src, dst, *a, **k):
+            if os.path.basename(os.fspath(dst)) == "sequence.json":
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(os.fspath(dest)) == "sequence.json":
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        with patch.object(
+            # THE SNAPSHOT READ LOST THE RACE. `_get_sequence_data` had
+            # already succeeded, so the switch runs; the read that follows
+            # hit an OSError and answered "", exactly as documented.
+            switcher_mod, "_roster_snapshot", return_value="",
+        ), patch.object(
+            switcher_mod, "replace_with_retry", side_effect=busy_publish,
+        ), patch.object(
+            switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISES: the roster really was destroyed and really was NOT put
+        # back, while the other two arms did restore -- so exactly one arm
+        # is outstanding and the sentence has something to be wrong about.
+        assert not switcher.sequence_file.read_text(encoding="utf-8").strip(), (
+            "premise: the write-through must have emptied the roster"
+        )
+        assert config_path.read_text(encoding="utf-8") == original_config
+        assert (temp_home / ".claude" / ".credentials.json").read_text() == (
+            unmanaged
+        )
+
+        assert "was rolled back" not in str(excinfo.value), (
+            "DEFECT: the roster arm was armed with no snapshot, restored "
+            "nothing, and the report counts it as though it had. "
+            "`sequence.json` is empty -- every later cswap invocation "
+            f"refuses to run -- and the user is told it came back: "
+            f"{excinfo.value}"
+        )
+
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
         with patch.object(
