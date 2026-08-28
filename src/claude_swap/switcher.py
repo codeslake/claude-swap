@@ -4832,7 +4832,13 @@ class ClaudeAccountSwitcher:
                 {str(foreign_slot): (email,
                                      record.get("organizationUuid") or "")},
             )
-        except Exception as e:
+        except (OSError, LockError) as e:
+            # NOT `Exception`. The suite's real-store guard is deliberately
+            # not an OSError subclass so no containment can hide a write into
+            # the REAL store, and `_write_account_credentials` says so at its
+            # own raise site. `LockError` is here because `clear_dead_token`
+            # takes a FileLock whose timeout is ordinary contention, not a
+            # reason to abort a switch the stash already made safe.
             self._logger.warning(
                 "Could not heal Account-%s from the foreign credential: %s. "
                 "It stays preserved in the safety copy.", foreign_slot, e,
