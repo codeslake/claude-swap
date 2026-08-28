@@ -659,16 +659,11 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    ITS ELAPSED BOUND IS TIGHT ENOUGH TO SEE A WEAKENED CLAMP, which is the
-    property that matters. NO CLAIM ABOUT THE OTHER CASES: that half has gone
-    stale three times (ONLY -> ONE OF TWO -> "the others are too loose"), because
-    it is a statement the next case added can falsify. Some of this file's clamp cases
-    run the real clock, so being one of them is not what makes this one worth
-    keeping. NO COUNT HERE, deliberately: the ratio has been restated three
-    times in three commits and went stale inside the very commit that
-    corrected it, because the next clamp case moves it again. The claim the
-    sentence carries survives without a number. On the weakening
-    below this case is redundant with the jitter arm's.
+    ITS ELAPSED BOUND IS TIGHT ENOUGH TO SEE A WEAKENED CLAMP, not only a
+    deleted one, which is the property that matters. It makes NO CLAIM about
+    how many other cases can do the same: every commit that has stated that
+    count has gone stale on the next clamp case added, and the claim above
+    does not need it.
 
     The jitter is pinned, or the weakened form's overshoot is a random draw
     that can land inside any fixed margin.

@@ -86,14 +86,17 @@ def config_lock_dir() -> Path:
 
 
 # A CAP on the guard wait; the caller's remaining budget is the bound, so the
-# product tolerates any value. Its contended-guard test does not, at EITHER
-# end: too small and the clamped and unclamped forms stop separating by more
-# than the margin it allows, too large and it outruns its own peer. Both ends
-# are derived there rather than pinned, so the test refuses or rescales itself
-# instead of lying -- but do not read a green suite at some value as proof the
-# test still watches this one.
+# product tolerates any value. Its contended-guard test handles the two ends
+# differently. Too small, and the clamped and unclamped forms stop separating
+# by more than the margin it allows -- the case refuses on its own premise
+# rather than passing. Too large is fine now: the peer's hold derives from
+# this, so that end rescales. Both are derived there rather than pinned, so it
+# cannot go quietly green at a new value.
 _TAKEOVER_GUARD_S = 0.5
 # A short back-off after an arm declines, so the retry loop cannot spin hot.
+# Four cases hard-code this rather than read it, and pin it from both sides:
+# shrink it and the two `_does_not_spin` attempt bounds blow, grow it and
+# `_assert_backed_off`'s sizing and the contended guard's 2nd iteration go.
 _DECLINE_BACKOFF_S = 0.05
 
 
