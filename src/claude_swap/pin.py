@@ -228,12 +228,8 @@ def clear_wiring(switcher, timeout: float | None = None, only=None,
 def _config_address(oauth) -> str:
     """``oauthAccount``'s ``emailAddress``, casefolded. "" when not a string.
 
-    `.claude.json` is a file a human edits, and both readers below compare
-    this field with `.casefold()`. Unguarded it RAISES on the one path whose
-    contract is "never raises": out of `clear_pin` after the record and the
-    wiring are already gone, and inside `clear_wiring`'s per-path `except`,
-    where it takes that config's env-key removal with it. `_pinned_email_now`
-    guards the record's half of the same comparison for the same reason.
+    `.claude.json` is a file a human edits, and both readers below casefold
+    this field on the clear path, whose contract is "never raises".
     """
     value = (oauth or {}).get("emailAddress")
     return value.casefold() if isinstance(value, str) else ""
@@ -1399,11 +1395,9 @@ def _config_still_names(email: str, instead_of: "dict | None") -> bool:
     the sibling reader that decides this same message: "I cannot check it"
     must not render as "it is clean" in the one sentence a purged user gets.
 
-    AN ABSENT ONE DOES NOT, which is a different question wearing the same
-    `OSError`. `env_keys_survive` never faces it -- it iterates configs that
-    were WIRED, so they existed -- while this walks every path `_each_config`
-    can name, bootstrapped or not. A file that is not there names nobody, and
-    counting it warned on a completely clean clear.
+    AN ABSENT ONE DOES NOT -- a different question wearing the same
+    `OSError`. `env_keys_survive` only ever iterates configs that WERE wired,
+    hence existed; this walks every path `_each_config` can name.
     """
     want = (instead_of or {}).get("accountUuid")
     for path in _each_config():
