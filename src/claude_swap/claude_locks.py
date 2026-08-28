@@ -85,18 +85,33 @@ def config_lock_dir() -> Path:
     return path.parent / (path.name + ".lock")
 
 
-# A CAP on the guard wait; the caller's remaining budget is the real bound, so
-# the product tolerates any value. Its contended-guard test does not: shrink
-# this and the clamped and unclamped forms stop separating by more than its
-# margin, which that case's own premise assert refuses rather than passing.
+def _nap(want: float, start: float, timeout: float) -> None:
+    """Sleep at most what is LEFT of the budget, never a full jitter draw.
+
+    The deadline is checked at the top of the loop, so a sleep longer than the
+    remainder runs to completion first and the raise lands late: measured, a
+    0.01s budget took 0.302s and a 0.1s budget 0.258s. Clamping to the
+    remainder rather than to `timeout` is what makes that true on the SECOND
+    retry too -- `min(want, timeout)` is a no-op once most of the budget is
+    already spent.
+
+    Never negative: an expired budget sleeps zero and the caller's next
+    deadline check raises, which is the same instant either way.
+    """
+    left = timeout - (time.monotonic() - start)
+    if left > 0:
+        time.sleep(min(want, left))
+
+
+# A CAP on the guard wait; the caller's remaining budget is the real bound.
+# Shrink it and the contended-guard test refuses on its own premise.
 _TAKEOVER_GUARD_S = 0.5
 # A short back-off after an arm declines, so the retry loop cannot spin hot.
-# Not freely tunable: the lock suite bounds it from both sides, and fails loud.
 _DECLINE_BACKOFF_S = 0.05
 
 
 def _take_over_stale(
-    lock_dir, staleness: float, budget: float | None = None
+    lock_dir, staleness: float, budget: float = float("inf")
 ) -> bool:
     """Remove a lock whose holder is gone, but never a successor's.
 
@@ -116,15 +131,10 @@ def _take_over_stale(
 
     `budget` is the caller's remaining time; the guard waits the smaller of it
     and `_TAKEOVER_GUARD_S`, so a contended guard cannot push the caller past
-    its own deadline. It defaults to None rather than to the cap so the cap is
-    READ per call: a default expression is bound at import, and would ignore a
-    patched constant while the `min` beside it followed one.
-    Returns whether the corpse was removed -- False also
+    its own deadline. Returns whether the corpse was removed -- False also
     covers a peer having retaken it, a refused rmdir, and an exhausted budget,
     which mean the same thing here: back off and retry.
     """
-    if budget is None:
-        budget = _TAKEOVER_GUARD_S
     guard = lock_dir.parent / f"{lock_dir.name}.takeover"
     try:
         with FileLock(guard, timeout=max(0.0, min(_TAKEOVER_GUARD_S, budget))):
@@ -160,7 +170,6 @@ def proper_lockfile(
         timeout = DEFAULT_TIMEOUT_S
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
     start = time.monotonic()
-    deadline = start + timeout
     while True:
         try:
             os.mkdir(lock_dir)
@@ -177,29 +186,19 @@ def proper_lockfile(
         except FileNotFoundError:
             # BACK OFF HERE TOO. A dangling symlink at the lock path answers
             # FileExistsError to mkdir and FileNotFoundError to stat, so this
-            # arm can repeat for the whole budget. No claim here about which
-            # OTHER arms sleep: a sibling adds one above, and that sentence
-            # goes false on the merged tree.
-            time.sleep(
-                max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic()))
-            )
+            # arm can repeat for the whole budget.
+            _nap(_DECLINE_BACKOFF_S, start, timeout)
             continue
         if time.time() - held_mtime > staleness:
             # Dead holder per the protocol: remove and retake. Declining --
             # a peer retook it, or the corpse could not be removed -- must
             # not spin hot, and must not sleep past the deadline.
             if not _take_over_stale(
-                lock_dir, staleness, budget=deadline - time.monotonic()
+                lock_dir, staleness, budget=timeout - (time.monotonic() - start)
             ):
-                time.sleep(
-                    max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic()))
-                )
+                _nap(_DECLINE_BACKOFF_S, start, timeout)
             continue
-        # Clamped to the remaining budget, so `timeout` bounds the whole
-        # call: the deadline check above cannot fire while a full-length
-        # sleep is still running past it. With budget to spare the clamp is a
-        # no-op and the jitter still spreads waiters apart.
-        time.sleep(max(0.0, min(0.25 + random.random() * 0.25, deadline - time.monotonic())))
+        _nap(0.25 + random.random() * 0.25, start, timeout)
 
     stop_touching = threading.Event()
     warned = False

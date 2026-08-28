@@ -659,11 +659,9 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    ITS ELAPSED BOUND IS TIGHT ENOUGH TO SEE A WEAKENED CLAMP, not only a
-    deleted one, which is the property that matters.
-
-    The jitter is pinned, or the weakened form's overshoot is a random draw
-    that can land inside any fixed margin.
+    The elapsed bound is tight enough to see a WEAKENED clamp, not only a
+    deleted one. The jitter is pinned, or the weakened form's overshoot is a
+    random draw that can land inside any fixed margin.
     """
 
     def test_a_timeout_above_the_sleep_still_bounds_the_call(
@@ -1018,14 +1016,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
     def test_the_default_budget_is_read_at_call_time(
         self, tmp_path, monkeypatch
     ):
-        """A default of `_TAKEOVER_GUARD_S` freezes the IMPORT-time value.
-
-        The cap inside `min(...)` is read per call, so patching the constant
-        moves it and every caller that passes `budget=` -- while this
-        function's own default keeps the old number, and the wait comes out
-        the smaller of the two. The comment above the constant invites
-        trying a new value, and monkeypatch is how that is done here.
-        """
+        """A default of `_TAKEOVER_GUARD_S` would freeze the import value."""
         seen = []
         real = claude_locks.FileLock
 
@@ -1037,11 +1028,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         monkeypatch.setattr(claude_locks, "_TAKEOVER_GUARD_S", 7.0)
         gone = tmp_path / "gone.lock"
         assert claude_locks._take_over_stale(gone, 60.0) is False
-        assert seen == [7.0], (
-            f"the guard waited {seen} under a cap patched to 7.0 -- the "
-            "default budget was bound at import, not read at the call"
-        )
-
+        assert seen == [7.0], f"the guard waited {seen} under a cap of 7.0"
 
 class TestADeadlineCanPassMidIterationForEveryArm:
     """The floor under each arm's clamp, which nothing here exercised.
