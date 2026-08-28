@@ -125,6 +125,15 @@ def _workflow_jobs(workflow: Path) -> dict[str, str]:
         name, start = m.group(1), i + 1
     if name is not None:
         out[name] = "".join(lines[start:])
+    # A DROPPED KEY IS SILENT, and a refused FIRST key discards its whole
+    # body -- everything before the next match is attributed to nobody. The
+    # strict pattern above refuses legal spellings (a quoted key, a trailing
+    # comment), so a permissive count is what makes the drop loud instead.
+    loose = re.findall(r"(?m)^  (?![ #])\S.*?:", body)
+    assert len(out) == len(loose), (
+        f"the job parse dropped a key: parsed {sorted(out)} against "
+        f"{len(loose)} key(s) on the page"
+    )
     return out
 
 
@@ -144,7 +153,12 @@ def test_no_job_in_the_workflow_can_swallow_its_own_failure():
         _assert_no_step_can_swallow_failure(body, name)
 
 
-@pytest.mark.parametrize("spelling", ["true", "True", "TRUE"])
+@pytest.mark.parametrize("spelling", [
+    "true", "True", "TRUE",
+    "true  # flaky on the shared runner",
+    "${{ true }}",
+    "'true'",
+])
 def test_a_job_that_cannot_fail_is_refused_for_every_job(tmp_path, spelling):
     """The guard had no witness at all -- both call sites could be deleted.
 
@@ -175,10 +189,11 @@ def _assert_no_step_can_swallow_failure(job: str, which: str) -> None:
     is the loudest form of "this file silently stopped running in CI". It
     was guarded on one job and not on the other, so it lives here.
     """
-    # ANY YAML SPELLING OF TRUE. `true|True|TRUE` all resolve to boolean
-    # true in YAML 1.2's core schema, and a case-sensitive match reads two of
-    # the three as absent.
-    assert not re.search(r"^\s*continue-on-error:\s*(?i:true)\s*$", job, re.M), (
+    # ANYTHING THAT IS NOT LITERALLY `false`. Matching spellings of TRUE
+    # loses every one nobody enumerated: a trailing comment defeats an
+    # end-anchor (`true  # flaky on the shared runner` is how a person
+    # actually writes it), and `${{ }}` is GitHub's own documented form.
+    assert not re.search(r"^\s*continue-on-error:\s*(?!false\b)\S", job, re.M), (
         f"the {which} job's step is continue-on-error, so a failure there "
         "is green"
     )
