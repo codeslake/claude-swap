@@ -1028,5 +1028,40 @@ class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
         )
         assert lock_dir.exists(), "the successor's lock must survive"
 
+    def test_the_decide_and_remove_window_is_exclusive(self, tmp_path):
+        """The re-read is only half the fix; the other half is that two
+        waiters cannot be inside this window at once.
+
+        Without the exclusion the re-read still reads a corpse in both
+        processes, both remove it, and the second one removes whatever the
+        first has already created.
+        """
+        from claude_swap.locking import FileLock
+
+        lock_dir = tmp_path / "target.lock"
+        staleness = 60.0
+        lock_dir.mkdir()
+        past = time.time() - 10 * staleness
+        os.utime(lock_dir, (past, past))
+        guard = lock_dir.parent / f"{lock_dir.name}.takeover"
+
+        peer = FileLock(guard, timeout=0.5)
+        assert peer.acquire(), "premise: the peer must hold the guard first"
+        try:
+            assert claude_locks._take_over_stale(lock_dir, staleness) is False, (
+                "DEFECT: a second waiter entered the decide-and-remove window "
+                "while a peer was inside it. Both then remove the corpse and "
+                "the loser's fresh lock goes with it, putting two processes "
+                "in the critical section"
+            )
+            assert lock_dir.exists(), "the corpse must be left for the peer"
+        finally:
+            peer.release()
+
+        # CONTROL: with the guard free the SAME corpse is taken over, so the
+        # False above cannot be a takeover that never works at all.
+        assert claude_locks._take_over_stale(lock_dir, staleness) is True
+        assert not lock_dir.exists()
+
     def test_a_vanished_lock_is_not_an_error(self, tmp_path):
         assert claude_locks._take_over_stale(tmp_path / "gone.lock", 60.0) is False
