@@ -2794,6 +2794,123 @@ class TestPurgeDoesNotStrandTheWiring:
         assert "HTTPS_PROXY" not in raw.get("env", {})
 
 
+SHARED_PIN_EMAIL = "shared@example.com"
+
+
+def _r37_pin_switcher(temp_home, org_of_slot1=""):
+    from claude_swap.models import Platform
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    s = ClaudeAccountSwitcher(); s.platform = Platform.LINUX; s._setup_directories()
+    s._write_json(s.sequence_file, {
+        "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z", "sequence": [1],
+        "accounts": {"1": {"email": SHARED_PIN_EMAIL, "uuid": "uuid-personal",
+                           "organizationUuid": org_of_slot1, "organizationName": "",
+                           "added": "2024-01-01T00:00:00Z"}}})
+    s._write_account_credentials("1", SHARED_PIN_EMAIL, json.dumps(
+        {"claudeAiOauth": {"accessToken": "sk", "refreshToken": "rt"}}))
+    s._write_account_config("1", SHARED_PIN_EMAIL, json.dumps({"oauthAccount": {
+        "emailAddress": SHARED_PIN_EMAIL, "accountUuid": "uuid-personal", "organizationUuid": ""}}))
+    return s
+
+
+class TestTheUnspliceDecidesOnTheAccount:
+    """An address is not an account, and the package's False is two answers.
+
+    The personal/org pattern puts one address in two slots, so an
+    email-only test cannot tell a splice from a genuine /login into a
+    same-address sibling. And `splice_config_identity` returns False both
+    for a write it SKIPPED and for a config that already names the
+    identity -- only the file separates them.
+    """
+
+    class _Dead:
+        def apply_pin(self, *a, **k):
+            raise ImportError("cryptography")
+
+
+    def test_a_same_address_sibling_config_is_not_rewritten(self, temp_home):
+        """The pin is the PERSONAL slot; the config names the ORG sibling,
+        written by Claude Code at /login and never spliced."""
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+
+        s = _r37_pin_switcher(temp_home)
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": SHARED_PIN_EMAIL,
+                                                "pinnedOrganizationUuid": ""}})
+        cfg = temp_home / ".claude.json"
+        sibling = {"emailAddress": SHARED_PIN_EMAIL, "accountUuid": "uuid-org",
+                   "organizationUuid": "org-B", "displayName": "Org User",
+                   "organizationName": "Org", "organizationRole": "admin",
+                   "hasClaudeMax": True}
+        cfg.write_text(json.dumps({"env": {}, "oauthAccount": dict(sibling)}))
+        replacement = {"emailAddress": SHARED_PIN_EMAIL, "accountUuid": "uuid-personal",
+                       "organizationUuid": ""}
+        # PREMISES: a pin IS recorded, an identity IS available, and the config
+        # names the SAME ADDRESS at a DIFFERENT org.
+        rec = pin_mod._pinned_email_now(s)
+        assert rec and rec[0] == SHARED_PIN_EMAIL and (rec[1] or "") == ""
+        assert json.loads(cfg.read_text())["oauthAccount"]["organizationUuid"] == "org-B"
+
+        with patch.object(pin_mod, "_impl", lambda: self._Dead()), \
+             patch.object(pin_mod, "_live_login_for_config", return_value=replacement):
+            pin_mod.clear_pin(s)
+
+        now = json.loads(cfg.read_text())["oauthAccount"]
+        print(f"\n[C2] after: uuid={now.get('accountUuid')!r} org={now.get('organizationUuid')!r} keys={len(now)}")
+        assert now == sibling, (
+            "DEFECT: the un-splice rewrote a config naming the same ADDRESS at a "
+            f"different org; it now says {now.get('accountUuid')!r} with {len(now)} keys"
+        )
+
+
+    def test_an_already_correct_config_is_not_a_failed_rollback(self, temp_home):
+        """`splice_config_identity` returns False for a SKIPPED write and for a
+        config that already names the identity. Only the file separates them."""
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+
+        s = _r37_pin_switcher(temp_home)
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({"env": {}, "oauthAccount": {
+            "emailAddress": SHARED_PIN_EMAIL, "accountUuid": "uuid-personal",
+            "organizationUuid": ""}}))
+
+        class _NoProxy:
+            def apply_pin(self, sw, email=None, org=None, identity=None):
+                path = _s.settings_path(sw.backup_dir)
+                if email:
+                    _s.atomic_write_json(path, {"remoteControl": {"pinnedEmail": email}})
+                else:
+                    raw = _s._read_raw_for_write(path)
+                    raw.pop("remoteControl", None)
+                    _s.atomic_write_json(path, raw)
+                return False                      # no proxy running
+
+            def splice_config_identity(self, identity):
+                return False                      # the config ALREADY names it
+
+        with patch.object(pin_mod, "_impl", lambda: _NoProxy()):
+            ok, msg = pin_mod.set_pin(s, SHARED_PIN_EMAIL, None)
+
+        after = json.loads(cfg.read_text())["oauthAccount"]["emailAddress"]
+        print(f"\n[C1] ok={ok} record={pin_mod._pinned_email_now(s)!r} config={after!r}")
+        print(f"[C1] msg={msg!r}")
+        # PREMISES: the pin did not take, the record IS rolled back, and the
+        # config already carries the right identity.
+        assert ok is False
+        assert pin_mod._pinned_email_now(s) is None
+        assert after == SHARED_PIN_EMAIL
+        assert "check with" not in msg.lower(), (
+            "DEFECT: the rollback was clean and the command sent the user to "
+            f"check a state it could already disprove: {msg}"
+        )
+
 class TestTheUnspliceTouchesOnlyWhatThePinSpliced:
     """The un-splice is a repair, so it must decide on the ACCOUNT.
 

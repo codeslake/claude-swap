@@ -254,11 +254,18 @@ def _clear_wiring_locked(switcher, path, unsplice=None) -> bool:
     # writes an identity into) and drops the fields CC owns there.
     unspliced = False
     if unsplice:
-        pinned_email, identity = unsplice
+        pinned, identity = unsplice
         current = raw.get("oauthAccount")
+        # THE COMPOSITE, because an address alone is not an account. The
+        # documented personal/org pattern puts one address in two slots, and
+        # `_live_login_identity` makes the same argument in the same words:
+        # an email-only test cannot tell a splice from a genuine /login into
+        # a same-address sibling, so it rewrites a config the pin never
+        # touched and swaps the account identity outright.
         if identity and isinstance(current, dict) and (
-            (current.get("emailAddress") or "").casefold()
-            == pinned_email.casefold()
+            ((current.get("emailAddress") or "").casefold(),
+             current.get("organizationUuid") or "")
+            == ((pinned[0] or "").casefold(), pinned[1] or "")
         ):
             raw["oauthAccount"] = identity
             unspliced = True
@@ -1258,10 +1265,41 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
         # False on a contended config lock rather than raising, so reading
         # only the record announces that as a clean rollback.
         result = _impl().splice_config_identity(_back)
-        unspliced = unspliced or _back is None or bool(result)
+        # FALSE IS TWO ANSWERS. `splice_config_identity` returns it for a
+        # write it SKIPPED and for a config that already names the identity
+        # -- the success case. Reading the bool alone graded a clean
+        # rollback as a failure and sent the user to check a state the code
+        # could already disprove, which is the defect one frame up.
+        unspliced = (
+            unspliced or _back is None or bool(result)
+            or _config_already_names(_back)
+        )
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
     return unspliced and _pinned_email_now(switcher) == before
+
+
+def _config_already_names(identity: "dict | None") -> bool:
+    """Does the global config already carry this identity? On the ACCOUNT.
+
+    The package answers a skipped write and an already-correct config with
+    the same `False`, and only the file can separate them.
+    """
+    if not identity:
+        return False
+    want = ((identity.get("emailAddress") or "").casefold(),
+            identity.get("organizationUuid") or "")
+    try:
+        from claude_swap.paths import get_global_config_path
+
+        raw = json.loads(get_global_config_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — an unreadable config decides nothing
+        return False
+    current = raw.get("oauthAccount") if isinstance(raw, dict) else None
+    if not isinstance(current, dict):
+        return False
+    return ((current.get("emailAddress") or "").casefold(),
+            current.get("organizationUuid") or "") == want
 
 
 def _clear_pin_record(switcher) -> None:
@@ -1431,7 +1469,6 @@ def clear_pin(switcher) -> tuple[bool, str]:
     """
     _pinned = _pinned_email_now(switcher)
     had_pin = _pinned is not None
-    pinned_email = (_pinned[0] if _pinned else "") or ""
     # Captured before the first thing that unwires, which is `apply_pin`, not
     # `clear_wiring`. Below both, the survivor check ran against a config the
     # package had already rewritten, and reported `(True, 'Unpinned the cloud
@@ -1475,8 +1512,8 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # leaves it: a working `apply_pin` already un-spliced with this identity.
     cleared = clear_wiring(
         switcher,
-        unsplice=(pinned_email, _back_to)
-        if (_unsplice and pinned_email and _back_to)
+        unsplice=(_pinned, _back_to)
+        if (_unsplice and _pinned and _pinned[0] and _back_to)
         else None,
     )
     still_pinned = _pinned_email_now(switcher) is not None
