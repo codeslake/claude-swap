@@ -1989,6 +1989,57 @@ class TestQuarantineLifecycle:
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
+    def test_an_unreadable_backup_does_not_lift_a_quarantine(self, harness):
+        """"Could not read it" is not "the user replaced it".
+
+        The plain reader answers "" for a failed read and for an absent one
+        alike, so one locked Keychain or one EACCES fingerprints as None,
+        differs from the recorded value, and drops the quarantine for good.
+        An identity-conflict quarantine dropped that way does not re-arm.
+        """
+        harness.engine._quarantine("2", "b@example.com", "identity-conflict")
+        assert "2" in (harness.state().get("quarantine") or {}), (
+            "premise: the slot must start quarantined"
+        )
+        harness.events.clear()
+
+        # Patched at the STORE, the one reader BOTH paths go through, so the
+        # case exercises the same failure whichever reader the code uses --
+        # a patch on the `_ex` variant alone would leave the plain reader
+        # answering the real credential and the case would pass for the
+        # wrong reason.
+        store = harness.switcher._store
+        real_read = store._read_account_credentials
+
+        def unreadable(account_num, email, failed=None):
+            if account_num == "2":
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            return real_read(account_num, email, failed)
+
+        with patch.object(
+            store, "_read_account_credentials", side_effect=unreadable,
+        ):
+            # PREMISE: both readers now report the canonical failed-read
+            # verdicts, or this case is not about an unreadable backup.
+            assert harness.switcher.read_account_credentials(
+                "2", "b@example.com") == ""
+            assert harness.switcher._read_account_credentials_ex(
+                "2", "b@example.com") == ("", True)
+            harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(0), "3": _usage(50),
+            })
+
+        assert "2" in (harness.state().get("quarantine") or {}), (
+            "DEFECT: a transient read failure released the quarantine. The "
+            "reason recorded is `credentials-replaced`, which is false, and "
+            "for an identity conflict nothing re-checks before the switch: "
+            "the engine then switches onto the barred slot with every gauge "
+            "reading normal"
+        )
+        assert not any(isinstance(e, UnquarantineEvent) for e in harness.events)
+
     def test_replaced_credentials_lift_quarantine(self, harness):
         harness.engine._quarantine("2", "b@example.com", "invalid_grant")
         # User re-logged in and re-captured the slot: new refresh token.

@@ -900,7 +900,20 @@ class AutoSwitchEngine:
                     (number, entry.get("email", ""), "account-replaced")
                 )
                 continue
-            creds = self.switcher.read_account_credentials(number, email_now)
+            # THE READ THAT SEPARATES FAILED FROM ABSENT. The plain reader
+            # answers "" for both, so one locked Keychain or one EACCES
+            # fingerprints as None, differs from the recorded value, and
+            # releases a quarantine on nothing -- permanently, and with a
+            # `credentials-replaced` reason that is false. An
+            # identity-conflict quarantine released that way does not
+            # re-arm: the next tick's `_freshen_target` returns "ok"
+            # without consuming a grant, so nothing re-checks the identity
+            # before the switch.
+            creds, unreadable = self.switcher._read_account_credentials_ex(
+                number, email_now
+            )
+            if unreadable:
+                continue
             fingerprint = _refresh_fingerprint(creds) if creds else None
             if fingerprint != entry.get("refreshTokenFingerprint"):
                 to_release.append((number, email_now, "credentials-replaced"))
