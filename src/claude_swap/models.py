@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -161,6 +162,46 @@ class AccountsSnapshot:
     taken_at: float
 
 
+def _restore_atomically(path: Path, text: str) -> None:
+    """Put `text` back without truncating what is already there.
+
+    `Path.write_text` opens with O_TRUNC, so it destroys the destination
+    BEFORE it can fail -- and the rollback runs on failures where the write
+    never opened the destination at all (a temp-write ENOSPC, an invalid
+    payload, a non-EBUSY rename error), where those bytes are the intact
+    original. The one fault that produces both halves is a full filesystem
+    or an exhausted quota, which is the failure class this restore exists
+    for. Name first, publish by rename, so a failed restore leaves the
+    destination exactly as it was.
+    """
+    tmp = path.parent / f".{path.name}.restore.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+    fd = -1
+    try:
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            # DISOWN A NAME WE DID NOT CREATE. `O_EXCL` refused it, so it
+            # belongs to whoever is writing it; the cleanup below must not
+            # reach for it.
+            tmp = None
+            raise
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(text)
+        if sys.platform != "win32":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 @dataclass
 class SwitchTransaction:
     """Represents a switch operation that can be rolled back."""
@@ -193,11 +234,7 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
-                    )
-                    if sys.platform != "win32":
-                        os.chmod(self.config_path, 0o600)
+                    _restore_atomically(self.config_path, self.original_config)
                 elif step == "sequence_updated":
                     if self.original_sequence:
                         # PLAIN WRITE, like the config arm above. Restoring
@@ -205,8 +242,8 @@ class SwitchTransaction:
                         # that emptied the file, so the restore empties it
                         # again. The snapshot already carries the original
                         # `activeAccountNumber`, so it goes back verbatim.
-                        switcher.sequence_file.write_text(
-                            self.original_sequence, encoding="utf-8"
+                        _restore_atomically(
+                            switcher.sequence_file, self.original_sequence
                         )
                     else:
                         data = switcher._get_sequence_data()

@@ -3492,6 +3492,91 @@ class TestPerformSwitchPostDisplay:
             "target-token"
         )
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="RLIMIT_FSIZE is the one fault that fails the write AND the "
+               "restore; `resource` is POSIX-only, and no Windows API gives "
+               "the same single-fault shape",
+    )
+    def test_a_rollback_does_not_truncate_a_destination_it_cannot_rewrite(
+        self,
+        temp_home: Path,
+    ):
+        """The rollback runs on failures where the write never opened the
+        destination, and `Path.write_text` opens with O_TRUNC -- so the one
+        fault that fails the write also destroys the intact original when
+        the restore fails the same way.
+        """
+        import resource
+        import signal
+
+        from claude_swap.models import SwitchTransaction
+
+        roster = temp_home / "sequence.json"
+        original = json.dumps({
+            "activeAccountNumber": 1,
+            "accounts": {
+                str(i): {"email": f"a{i}@example.com", "uuid": "",
+                         "organizationUuid": "", "organizationName": "",
+                         "added": "2024-01-01T00:00:00Z"}
+                for i in range(1, 6)
+            },
+        }, indent=2)
+        roster.write_text(original, encoding="utf-8")
+        before = roster.stat().st_size
+
+        class _Switcher:
+            sequence_file = roster
+
+            class _logger:
+                @staticmethod
+                def info(*_a, **_k):
+                    pass
+
+                @staticmethod
+                def error(*_a, **_k):
+                    pass
+
+            def _write_credentials(self, *_a):
+                pass
+
+            def _get_sequence_data(self):
+                return None
+
+            def _write_json(self, *_a, **_k):
+                raise AssertionError("the restore must not re-enter _write_json")
+
+        config_path = temp_home / ".claude.json"
+        config_path.write_text("{}", encoding="utf-8")
+        tx = SwitchTransaction(
+            original_credentials="", original_config="{}",
+            original_account_num="1", original_email="a1@example.com",
+            config_path=config_path, original_sequence=original,
+        )
+        tx.record_step("sequence_updated")
+
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        # PREMISE: a quota that cannot hold the roster, so the restore fails
+        # for the same reason the write did.
+        assert before // 2 < before
+        resource.setrlimit(resource.RLIMIT_FSIZE, (before // 2, hard))
+        try:
+            tx.rollback(_Switcher())
+        finally:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+
+        text = roster.read_text(encoding="utf-8")
+        assert text == original, (
+            "DEFECT: the rollback truncated a roster the failed write never "
+            "touched. `_get_sequence_data` reads strictly, so a partial file "
+            f"makes every later cswap invocation refuse to run ({before}B -> "
+            f"{len(text)}B)"
+        )
+        assert not [p for p in temp_home.iterdir() if ".restore." in p.name], (
+            "a failed restore must not strand its temp"
+        )
+
     def test_a_write_through_that_empties_the_roster_is_rolled_back(
         self,
         temp_home: Path,
