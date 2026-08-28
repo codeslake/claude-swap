@@ -835,16 +835,24 @@ class TestBootstrap:
             "and the retry fails identically"
         )
 
-    def test_a_live_profile_that_failed_validation_names_its_pid(
+    @pytest.mark.parametrize("probe_fails", [False, True])
+    def test_a_live_profile_that_could_not_launch_names_its_pid(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
-        block_real_keychain
+        block_real_keychain, probe_fails
     ):
         """CONTROL for the test above, and the remedy's own guard.
 
-        When the probe DID answer, the gate is what blocked the launch: the
-        re-seed was skipped because a claude is live in there. `--add-account`
-        routes through the same chokepoint and refuses, so the only remedy is
-        the instance, and the user cannot act on it without the PID.
+        The gate is what blocked the launch: the re-seed was skipped because
+        a claude is live in there. `--add-account` routes through the same
+        chokepoint and refuses, so the only remedy is the instance, and the
+        user cannot act on it without the PID.
+
+        BOTH verdicts, because only one of them is tested by accident. An
+        answered probe (`invalid`) and one that timed out (`unknown`) reach
+        this raise by different routes, and narrowing the gate to `invalid`
+        would drop the `unknown` user onto the PATH message with every
+        committed test still green -- and `unknown` + live is the cell this
+        whole branch is about.
         """
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
@@ -857,14 +865,18 @@ class TestBootstrap:
         # above it cannot be the one that fires.
         assert len(live) == 1 and unreadable == 0
 
-        def always_invalid(cmd, env=None, **kwargs):
+        import subprocess
+
+        def probe(cmd, env=None, **kwargs):
+            if probe_fails:
+                raise subprocess.TimeoutExpired(cmd, 10)
             return SimpleNamespace(
                 returncode=0,
                 stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
                 stderr="",
             )
 
-        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        monkeypatch.setattr(session_mod.subprocess, "run", probe)
         with pytest.raises(SessionError) as caught:
             manager.setup_session(ACCOUNT_NUM, share=False)
 

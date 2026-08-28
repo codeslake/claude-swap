@@ -330,8 +330,8 @@ def _artifacts_say_usable(
     whether `claude` can be run at all, and no file on disk answers it.
 
     ``reseeded`` is the caller saying a bootstrap just rewrote these files
-    from the BACKUP. It relaxes one clause only -- see below -- and is never
-    a reason to ask in the first place: both callers decide that themselves.
+    from the BACKUP. It relaxes one clause only, below; whether to ask at all
+    is the caller's own decision.
     """
     # A READABLE IDENTITY IS PART OF BEING USABLE, and only a re-seed
     # excuses its absence. Every other signal here leans "present" -- an
@@ -845,12 +845,10 @@ class SessionManager:
             # tell us whether `claude` runs, and a session we cannot exec into
             # is not a session.
             # THE RE-SEED IS THIS PROMOTION'S PREMISE, and the gate above can
-            # skip it. `_artifacts_say_usable` answers from the profile's own
-            # files, which on this path the probe has already contradicted --
-            # so without a re-seed there is nothing here worth promoting on,
-            # readable identity or not. `reseeded=True` inside is that same
-            # fact doing its second job: excusing an identity the BACKUP
-            # cannot make readable.
+            # skip it. Without one these files are the profile's own, which
+            # the probe has already contradicted on this path -- readable or
+            # not. `reseeded=True` inside is that same fact excusing an
+            # identity the BACKUP cannot make readable.
             if verdict == "unknown" and reseeded and _artifacts_say_usable(
                 session_dir, email, org_uuid, reseeded=True
             ):
@@ -1029,11 +1027,10 @@ class SessionManager:
             # THE ONLY COPY, and `_sync_sharing` can write it minutes before
             # this runs: `_stash_displaced_mcp` refuses to reset a profile's
             # MCP servers unless this file holds them, so taking it destroys
-            # what that refusal exists to preserve. NOT `is_file()`, which
-            # swallows the stat error and answers False -- that deletes the
-            # only copy over a busy mount. A directory squatting the name
-            # survives instead, and `_stash_displaced_mcp` warns with the
-            # filename every launch.
+            # what that refusal exists to preserve. NOT `is_file()` -- that
+            # swallows the stat error and answers False, deleting the only
+            # copy over a busy mount. A squatting directory survives instead,
+            # warned about by name every launch.
             if child.name == MCP_DISPLACED_STASH and not child.is_symlink():
                 continue
             # `sessions/` IS THE LIVENESS LEDGER, and `scan_sessions` reads
