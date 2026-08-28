@@ -979,10 +979,11 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         t.start()
         assert held.wait(5), "premise: the peer must hold the guard"
         try:
-            # ABOVE `_TAKEOVER_GUARD_S`, like the sibling clamp case: under the
-            # cap only one iteration runs and `min(cap, remaining)` equals
-            # `min(cap, timeout)`, so the case cannot see its own fix.
-            budget = 0.6
+            # PAST THE FIRST ITERATION: it costs the guard's cap plus the
+            # declined-takeover back-off, and only the SECOND call separates
+            # `min(cap, remaining)` from `min(cap, timeout)`. Derived, so the
+            # cap can move without blinding this case.
+            budget = claude_locks._TAKEOVER_GUARD_S + 0.2
             started = time.monotonic()
             with pytest.raises(ClaudeCodeLockTimeout):
                 with proper_lockfile(target, timeout=budget, staleness=1.0):
@@ -992,7 +993,10 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             release.set()
             t.join(5)
 
-        assert entered["n"] >= 1, "premise: the takeover arm never ran"
+        assert entered["n"] >= 2, (
+            "premise: only one iteration ran, and on the first one "
+            "`min(cap, remaining)` and `min(cap, timeout)` are the same number"
+        )
         assert elapsed < budget + 0.15, (
             f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
             f"guard is not clamped to the remaining time"
