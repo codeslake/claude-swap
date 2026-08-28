@@ -886,9 +886,9 @@ class SessionManager:
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) could "
                     f"not be verified: `claude auth status` did not run or did "
-                    f"not answer. The profile is left in place — check that "
-                    f"`claude` is on PATH and that the machine is not too "
-                    f"loaded to spawn it, then retry."
+                    f"not answer in time. The profile is left in place — check "
+                    f"that `claude` is on PATH, and that the machine is not "
+                    f"too loaded for it to answer, then retry."
                 )
             if verdict != "valid":
                 # NEVER UNDER A LIVE CLAUDE, the rule every other
