@@ -177,7 +177,9 @@ def proper_lockfile(
             # arm can repeat for the whole budget. No claim here about which
             # OTHER arms sleep: a sibling adds one above, and that sentence
             # goes false on the merged tree.
-            time.sleep(max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic())))
+            time.sleep(
+                max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic()))
+            )
             continue
         if time.time() - held_mtime > staleness:
             # Dead holder per the protocol: remove and retake. Declining --
@@ -186,7 +188,9 @@ def proper_lockfile(
             if not _take_over_stale(
                 lock_dir, staleness, budget=deadline - time.monotonic()
             ):
-                time.sleep(max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic())))
+                time.sleep(
+                    max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic()))
+                )
             continue
         # Clamped to the remaining budget, so `timeout` bounds the whole
         # call: the deadline check above cannot fire while a full-length
