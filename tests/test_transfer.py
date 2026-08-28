@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import macos_keychain, oauth
+from claude_swap.credentials import ActiveCredentials
 from claude_swap.exceptions import TransferError
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
@@ -1698,6 +1699,45 @@ class TestImportClearsDeadTokenQuarantine:
         assert json.loads(creds).get("_marker") != "BOB_OVERWRITTEN", (
             "a healthy slot's credential was overwritten by a plain import"
         )
+
+    def test_a_slot_with_no_stored_source_at_all_answers_the_strike(
+        self, temp_home: Path, monkeypatch
+    ):
+        """Empty live bytes stop CONFIRMING; they must not start REFUSING.
+
+        The guard that keeps an empty live credential from binding a strike no
+        source matches also runs when the backup is empty, and there nothing
+        else can answer -- so the method fell through to a CONFIRMED not-dead
+        and `_adopt_into_dead_slot` declined to write the foreign live bytes
+        into their own slot. An idle slot with the same emptiness already
+        answers the raw strike count; this is that parity.
+        """
+        s = _linux_switcher(temp_home)
+        ORG = "org-uuid-1234"
+        _seed_account(s, 2, "bob@example.com", org_uuid=ORG)
+        ident = {"2": ("bob@example.com", ORG)}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        # PREMISE: the row is struck on its raw count.
+        assert s._usage_store.entries(ident)["2"].token_dead()
+
+        # No stored source anywhere: the backup removed, the live read
+        # answering cleanly-absent rather than erroring.
+        s._delete_account_credentials("2", "bob@example.com")
+        assert s._read_account_credentials("2", "bob@example.com") == ""
+        monkeypatch.setattr(
+            s._store, "_read_active_credentials",
+            lambda: ActiveCredentials("", False, False),
+        )
+
+        monkeypatch.setattr(s, "current_account_number", lambda: "2")
+        assert s._slot_token_dead("2", "bob@example.com"), (
+            "an ACTIVE slot with nothing stored refused the strike, so the "
+            "adoption that exists for exactly this slot is declined"
+        )
+        # CONTROL: the same emptiness on an IDLE slot already answered True,
+        # so this is a parity restored, not a new verdict invented.
+        monkeypatch.setattr(s, "current_account_number", lambda: "1")
+        assert s._slot_token_dead("2", "bob@example.com")
 
     def test_the_heal_finds_the_row_of_an_org_scoped_account(
         self, temp_home: Path, capsys

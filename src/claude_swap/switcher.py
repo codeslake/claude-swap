@@ -5007,6 +5007,14 @@ class ClaudeAccountSwitcher:
             # examined (skipped above), so a non-matching backup is no evidence
             # about the generation nobody looked at.
             return None if entry.token_dead() else False
+        if not stored and not backup:
+            # NO stored source EXISTS. Both reads succeeded and both found
+            # nothing, so there is no generation left to disprove the strike
+            # with and nothing to protect -- answer the raw strike count, which
+            # is what an IDLE slot's empty backup already answers. `False` here
+            # instead refuses the adoption `_adopt_into_dead_slot` exists for,
+            # on the one slot that holds nothing worth refusing over.
+            return entry.token_dead()
         return False
 
     def _plans_after_fetch(
