@@ -228,8 +228,10 @@ def clear_wiring(switcher, timeout: float | None = None, only=None,
 def _config_address(oauth) -> str:
     """``oauthAccount``'s ``emailAddress``, casefolded. "" when not a string.
 
-    `.claude.json` is a file a human edits, and both readers below casefold
-    this field on the clear path, whose contract is "never raises".
+    `.claude.json` is a file a human edits, and all THREE readers of this
+    field casefold it: two on the clear path, whose contract is "never
+    raises", and `_config_already_names` on the rollback, where a raise is
+    swallowed into a False that reports a clean rollback as a failure.
     """
     value = (oauth or {}).get("emailAddress")
     return value.casefold() if isinstance(value, str) else ""
@@ -1361,8 +1363,12 @@ def _config_already_names(identity: "dict | None") -> bool:
     """
     if not identity:
         return False
-    want = ((identity.get("emailAddress") or "").casefold(),
-            identity.get("organizationUuid") or "")
+    want = (_config_address(identity), identity.get("organizationUuid") or "")
+    if not want[0]:
+        # A BLANK IS NOT A MATCH. Both sides blank to "" on a non-string,
+        # so a broken identity and a broken config would compare equal and
+        # report "already correct" -- the one answer this must not invent.
+        return False
     try:
         from claude_swap.paths import get_global_config_path
 
@@ -1372,7 +1378,7 @@ def _config_already_names(identity: "dict | None") -> bool:
     current = raw.get("oauthAccount") if isinstance(raw, dict) else None
     if not isinstance(current, dict):
         return False
-    return ((current.get("emailAddress") or "").casefold(),
+    return (_config_address(current),
             current.get("organizationUuid") or "") == want
 
 

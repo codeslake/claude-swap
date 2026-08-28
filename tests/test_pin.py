@@ -3392,19 +3392,55 @@ class TestAClearOnAMachineWithNoConfig:
             "DEFECT: an absent config was counted as still naming the ex-pin, "
             f"so a clean clear warned about a file that does not exist. {msg!r}")
 
-    def test_control_an_unreadable_config_still_warns(self, temp_home):
-        """CONTROL: the fix must not undo requirement 4.
+    def test_control_a_config_that_cannot_be_READ_still_warns(self, temp_home):
+        """CONTROL: the OTHER arm of `except (OSError, ValueError)`.
 
-        A config that EXISTS and cannot be parsed is the case the clause was
-        written for, and it must keep warning. Without this, narrowing the
-        except to skip absent files could be widened to skip every failure
-        and nothing would say so.
+        `test_an_unreadable_config_counts_as_still_naming` already covers the
+        `ValueError` arm (invalid JSON). NOTHING covered the `OSError` arm,
+        so the single most plausible next edit -- widening the new clause to
+        `except OSError: continue`, since `FileNotFoundError` IS one -- left
+        the whole suite green while silently skipping a config that could not
+        be read. `env_keys_survive`, the sibling this clause claims parity
+        with, splits the same two arms deliberately for the same reason.
         """
         from claude_swap import pin
 
-        (temp_home / ".claude.json").write_text("{ this is not json")
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "someone@example.com"}}))
+        cfg.chmod(0o000)
+        try:
+            if os.access(cfg, os.R_OK):        # root reads anything
+                pytest.skip("cannot make an unreadable file here (root, or Windows)")
+            named = pin._config_still_names("cloud@example.com", None)
+        finally:
+            cfg.chmod(0o600)
+        assert named, (
+            "DEFECT: a config that could not be READ was skipped, so --clear "
+            "reports a bare success over a config it never checked")
+
+    def test_an_absent_config_does_not_stop_the_scan(self, temp_home, tmp_path,
+                                                     monkeypatch):
+        """The clause `continue`s; it must not `return`.
+
+        `_each_config` yields CLAUDE_CONFIG_DIR's copy FIRST, so a cswap
+        session terminal whose config dir has no `.claude.json` yet would
+        stop at the absent one and never see the splice in the default
+        config. Pins the only behavioural decision in the new clause.
+        """
+        from claude_swap import pin
+
+        sess = tmp_path / "sess-empty"
+        sess.mkdir()                            # exists, but holds no config
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(sess))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "cloud@example.com"}}))
+        from claude_swap.paths import get_global_config_path
+        assert not get_global_config_path().exists(), (
+            "premise: the FIRST config yielded is the absent one")
         assert pin._config_still_names("cloud@example.com", None), (
-            "DEFECT: the absent-file fix also silenced an unreadable one")
+            "DEFECT: the scan stopped at an absent config and never reached "
+            "the one that still names the ex-pin")
 
 
 class TestTheStrandedConfigCheck:
@@ -3572,6 +3608,69 @@ class TestAConfigWhoseEmailIsNotAString:
                 ("cloud@example.com", "org-B")) is False, (
                 f"DEFECT: emailAddress={bad!r} raised in the un-splice test, "
                 "which clear_wiring swallows along with the env-key removal")
+
+
+class TestTheThirdReaderOfTheSameField:
+    """`_config_already_names` reads `emailAddress` with the same casefold.
+
+    The helper was added for two readers and there are three. This one is on
+    the SET path, not the clear path, and its raise is swallowed by
+    `_restore_pin`'s blanket `except` -- which is the harm, not the relief:
+    `unspliced` keeps its pre-call value, `_restore_pin` returns False, and
+    `_rollback_tail` sends the user to check a record the code just cleared.
+    """
+
+    def test_neither_side_of_the_compare_raises(self, temp_home):
+        from claude_swap import pin
+
+        cfg = temp_home / ".claude.json"
+        for bad in (42, ["a@example.com"], {"x": 1}, True):
+            # The CONFIG's half.
+            cfg.write_text(json.dumps({"oauthAccount": {
+                "emailAddress": bad, "organizationUuid": ""}}))
+            assert pin._config_already_names(
+                {"emailAddress": "me@example.com",
+                 "organizationUuid": ""}) is False, (
+                f"DEFECT: config emailAddress={bad!r} raised in the rollback "
+                "verdict, which _restore_pin swallows into a False")
+            # The IDENTITY's half, which comes from a stored account config.
+            cfg.write_text(json.dumps({"oauthAccount": {
+                "emailAddress": "me@example.com", "organizationUuid": ""}}))
+            assert pin._config_already_names(
+                {"emailAddress": bad, "organizationUuid": ""}) is False, (
+                f"DEFECT: identity emailAddress={bad!r} raised")
+
+    def test_control_a_matching_pair_still_answers_true(self, temp_home):
+        """CONTROL: the guard must not turn the reader off.
+
+        Without this, returning a constant False would satisfy every
+        assertion above -- and False is the answer that makes `_restore_pin`
+        report a clean rollback as a failure.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "Me@Example.com", "organizationUuid": "org-A"}}))
+        assert pin._config_already_names(
+            {"emailAddress": "me@example.com",
+             "organizationUuid": "org-A"}) is True
+
+    def test_a_blank_identity_address_cannot_exempt(self, temp_home):
+        """Two unreadable addresses are not a match.
+
+        With both sides blanked to "" a broken identity and a broken config
+        compare EQUAL, and the rollback reports the config already names it
+        -- a false "already correct", which is the one answer this function
+        exists to separate from a skipped write.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": 42, "organizationUuid": ""}}))
+        assert pin._config_already_names(
+            {"emailAddress": 42, "organizationUuid": ""}) is False, (
+            "DEFECT: two blanked addresses matched, so a broken config read "
+            "as 'already names the identity'")
 
 
 class TestAPinnedEmailThatIsNotAString:
