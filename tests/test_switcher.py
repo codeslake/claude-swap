@@ -8171,6 +8171,42 @@ class TestProvenanceGuard:
                 "uuid": "uuid-2", "email": "account2@example.com",
                 "organizationUuid": "org-2",
             })
+            # Inside the patched store: `_slot_token_dead` READS the backup to
+            # bind the verdict to a generation, and an unreadable one answers
+            # dead whatever the slot holds.
+            assert not switcher._slot_token_dead("2", "account2@example.com"), (
+                "DEFECT: the slot holds a live credential and is still "
+                "quarantined, so it keeps reporting re-login needed"
+            )
+            # The adoption races a usage pass that already read the DEAD bytes:
+            # its POST fails and strikes the slot we just healed. The strike is
+            # bound to the generation it POSTed, which the slot no longer
+            # stores, so the fingerprint binding heals it with no extra lock.
+            switcher._usage_store.record(
+                {"2": FetchRecord(
+                    error="invalid_grant",
+                    struck_fp=oauth.credential_fingerprint(a2_backup),
+                )},
+                ident,
+            )
+            assert not switcher._slot_token_dead("2", "account2@example.com"), (
+                "DEFECT: a strike bound to the generation the adoption "
+                "REPLACED re-quarantines the slot, undoing the heal"
+            )
+            # CONTROL: the same question CAN still report a presence. A
+            # strike bound to the generation the slot now stores is the one
+            # verdict the binding must not heal.
+            switcher._usage_store.record(
+                {"2": FetchRecord(
+                    error="invalid_grant",
+                    struck_fp=oauth.credential_fingerprint(foreign),
+                )},
+                ident,
+            )
+            assert switcher._slot_token_dead("2", "account2@example.com"), (
+                "CONTROL: a strike on the STORED generation must still read "
+                "dead, or the assertion above proves nothing"
+            )
         finally:
             for p in patches:
                 p.stop()
@@ -8180,10 +8216,6 @@ class TestProvenanceGuard:
         assert creds_store[("2", "account2@example.com")] == foreign, (
             "DEFECT: the dead slot did not adopt the credential the oracle "
             "resolved to it, so it still cannot authenticate"
-        )
-        assert not switcher._slot_token_dead("2", "account2@example.com"), (
-            "DEFECT: the slot holds a live credential and is still "
-            "quarantined, so it keeps reporting re-login needed"
         )
 
     def test_foreign_synced_lineage_warns_without_any_write(
