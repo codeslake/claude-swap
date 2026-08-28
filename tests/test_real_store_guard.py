@@ -50,6 +50,27 @@ def test_control_a_tmp_path_write_is_allowed(tmp_path: Path):
     assert target.read_text(encoding="utf-8") == "ok"
 
 
+def _remove_our_marker(marker: Path) -> None:
+    """Remove OUR probe marker with the guard stood down for that path alone.
+
+    Every unlink of it targets the real store by construction -- that is what
+    the controls below are proving -- so the audit hook refuses the cleanup
+    too. One leaked marker then fails this case on every later run until a
+    human removes it by hand, and the local suite gates the deploy.
+
+    The name is asserted first: the guard is only ever stood down for the one
+    path this module chose.
+    """
+    assert marker.name == ".cswap-test-real-store-guard-probe-DELETE-ME", marker
+    saved = conftest._REAL_STORE_SPECS
+    conftest._REAL_STORE_SPECS = ()
+    try:
+        if marker.exists():
+            marker.unlink()
+    finally:
+        conftest._REAL_STORE_SPECS = saved
+
+
 def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
     """CONTROL B (main thread) and CONTROL C (a thread that outlives its
     own test's isolation, the case that actually matters) both attempt a
@@ -71,8 +92,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
 
     real_backup_root = paths.get_backup_root()
     real_marker = real_backup_root / marker_name
-    if real_marker.exists():
-        real_marker.unlink()  # defensive: a prior failed run left one behind
+    _remove_our_marker(real_marker)  # a prior failed run may have left one
 
     # -- CONTROL B: main thread --------------------------------------
     outcome_main: dict = {}
@@ -92,8 +112,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
             "the write was reported as refused but the file exists anyway"
         )
     finally:
-        if real_marker.exists():
-            real_marker.unlink()  # never leave real-store litter, pass or fail
+        _remove_our_marker(real_marker)  # never leave real-store litter
 
     # -- CONTROL C: a thread that outlives its own test's teardown ---
     # (the case the incident actually was: a thread started while isolation
@@ -127,8 +146,7 @@ def test_control_b_and_c_real_store_write_is_refused(monkeypatch):
             "the thread's write was reported as refused but the file exists anyway"
         )
     finally:
-        if real_marker.exists():
-            real_marker.unlink()
+        _remove_our_marker(real_marker)
 
 
 def test_rmtree_of_a_protected_root_is_refused_before_any_child_is_removed(
