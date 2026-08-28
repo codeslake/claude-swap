@@ -566,6 +566,118 @@ class TestBootstrap:
                 "account's history into the DEFAULT profile, with no flag."
             )
 
+    def test_an_unreadable_record_does_not_delete_the_profiles_credential(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`_live_session_pids` is scan-shaped; a destructive guard is not.
+
+        An unreadable record contributes no PID, so the chokepoint of every
+        backup write reads it as "nothing is running" and deletes the
+        profile's seed and its Keychain entry. Nothing can say whether a
+        claude is in there, and the launch gate one frame later refuses to
+        re-seed it -- so the slot is unlaunchable by any cswap command, and
+        `--add-account` fires the same chokepoint again.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "live-generation", encoding="utf-8"
+        )
+        (session_dir / "sessions").mkdir(parents=True, exist_ok=True)
+        (session_dir / "sessions" / "4242.json").write_text(
+            '{"pid": 4242, "cw', encoding="utf-8"
+        )
+        # PREMISES: nothing can certify the profile as idle, and the
+        # scan-shaped question answers "nothing is running".
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert seeded_switcher._live_session_pids(
+            ACCOUNT_NUM, ACCOUNT_EMAIL) == []
+
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL,
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-new",
+                                          "refreshToken": "rt-new"}}),
+        )
+
+        assert (session_dir / ".credentials.json").exists(), (
+            "DEFECT: the backup write deleted the credential of a profile "
+            "nothing could certify as idle, and the launch gate then "
+            "refuses to re-seed it"
+        )
+
+    def test_a_skipped_re_seed_does_not_promote_an_unknown_verdict(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The promotion's premise is that a bootstrap just ran.
+
+        `_artifacts_say_usable` reads an unreadable identity as "no drift",
+        which is sound only when the artifacts are the BACKUP's. On a live
+        profile the re-seed is skipped, so they are the profile's own -- and
+        an in-session /login plus a torn `.claude.json` then launches under
+        the account it drifted to, announced as the one that was asked for.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "ANOTHER-ACCOUNTS-CREDENTIAL", encoding="utf-8"
+        )
+        # A torn identity: present, so `_artifacts_say_usable` says "no
+        # drift", and unreadable, so nothing can contradict it.
+        (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
+        make_live(session_dir)
+        # PREMISES: the re-seed is skipped, and the artifacts read usable.
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert session_mod._artifacts_say_usable(
+            session_dir, ACCOUNT_EMAIL, ""
+        )
+
+        import subprocess
+
+        probes = []
+
+        def timing_out(cmd, env=None, **kwargs):
+            # invalid, invalid, then a timeout: the reuse path refuses, the
+            # re-seed is skipped, and the third probe reaches the promotion.
+            probes.append(1)
+            if len(probes) <= 2:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "loggedIn": True, "authMethod": "claudeai",
+                        "email": "someone-else@example.com",
+                    }),
+                    stderr="",
+                )
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", timing_out)
+        outcome = "LAUNCH"
+        try:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        except SessionError:
+            outcome = "RAISE"
+        print(f"\nprobes={len(probes)} outcome={outcome}")
+        # PREMISE: the reuse path did NOT answer; this reached the arm
+        # after the skipped re-seed.
+        assert len(probes) >= 2, "premise: the bootstrap arm must be reached"
+        assert outcome == "RAISE", (
+            "DEFECT: the unknown verdict was promoted to valid on a profile "
+            "the gate had just refused to re-seed, so the launch runs under "
+            "whatever account the profile drifted to"
+        )
+
+        assert (session_dir / ".credentials.json").read_text(
+            encoding="utf-8"
+        ) == "ANOTHER-ACCOUNTS-CREDENTIAL", (
+            "premise: nothing may have re-seeded the profile"
+        )
+
     def test_a_live_profile_is_not_swept_at_all(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
         block_real_keychain

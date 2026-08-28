@@ -809,7 +809,8 @@ class SessionManager:
             # entry and overwrites `.credentials.json`, so under a live
             # claude it costs that instance its session, and the raise below
             # then tells the user the profile was left in place.
-            if profile_is_quiescent(session_dir):
+            reseeded = profile_is_quiescent(session_dir)
+            if reseeded:
                 self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share, share_history)
 
@@ -826,7 +827,15 @@ class SessionManager:
             # follow-up). Only "unreachable" still stops: no local file can
             # tell us whether `claude` runs, and a session we cannot exec into
             # is not a session.
-            if verdict == "unknown" and _artifacts_say_usable(
+            # THE RE-SEED IS THIS PROMOTION'S PREMISE, and the gate above
+            # can skip it. `_artifacts_say_usable` reads an unreadable
+            # identity as "no drift" -- sound only once a bootstrap has
+            # rewritten it, because then the artifacts are the BACKUP's.
+            # Without one they are the profile's own, so an in-session
+            # /login plus a torn `.claude.json` promotes to valid and
+            # launches under the account the profile drifted to, announced
+            # as the one that was asked for.
+            if verdict == "unknown" and reseeded and _artifacts_say_usable(
                 session_dir, email, org_uuid
             ):
                 verdict = "valid"
