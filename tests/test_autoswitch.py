@@ -2050,6 +2050,63 @@ class TestQuarantineLifecycle:
             "binding must record the generation it just read"
         )
 
+    def test_the_documented_recovery_lifts_a_blind_quarantine(self, harness):
+        """`--add-account --slot N` is the recovery the product prints.
+
+        A blind record has no generation to compare against, so the bind
+        that keeps a transient read failure from releasing it would also
+        take the REPLACEMENT as the quarantine's own generation. Every
+        later compare then matches and the slot stays barred with nothing
+        said — the user follows the printed instruction and watches it do
+        nothing. The roster's own stamp separates the two.
+        """
+        store = harness.switcher._store
+        real_read = store._read_account_credentials
+
+        def unreadable(account_num, email, failed=None):
+            if account_num == "2":
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            return real_read(account_num, email, failed)
+
+        with patch.object(
+            store, "_read_account_credentials", side_effect=unreadable,
+        ):
+            harness.engine._quarantine("2", "b@example.com", "identity-conflict")
+
+        entry = (harness.state().get("quarantine") or {}).get("2")
+        # PREMISE, true in both worlds: the record carries no generation.
+        assert entry is not None
+        assert entry.get("refreshTokenFingerprint") is None
+
+        # The recovery: a fresh login captured into the same slot.
+        harness.switcher._write_account_credentials(
+            "2", "b@example.com",
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-recovered", "refreshToken": "rt-recovered",
+            }}),
+        )
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["2"]["added"] = "2099-01-01T00:00:00Z"
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        # PREMISE: the re-add is recorded strictly after the quarantine.
+        assert data["accounts"]["2"]["added"] > entry["at"]
+        harness.events.clear()
+
+        harness.tick_with_usage({
+            "1": _usage(95), "2": _usage(0), "3": _usage(50),
+        })
+
+        assert "2" not in (harness.state().get("quarantine") or {}), (
+            "DEFECT: the user ran the recovery the quarantine notice names "
+            "and the tick bound the replacement as the quarantine's own "
+            "generation instead of releasing on it, so the slot stays barred"
+        )
+        assert any(
+            isinstance(e, UnquarantineEvent) for e in harness.events
+        ), "the release must be announced"
+
     def test_an_unreadable_backup_does_not_lift_a_quarantine(self, harness):
         """"Could not read it" is not "the user replaced it".
 

@@ -906,6 +906,7 @@ class AutoSwitchEngine:
             return state
         to_release: list[tuple[str, str, str]] = []
         to_bind: list[tuple[str, str | None]] = []
+        roster = (self.switcher._get_sequence_data() or {}).get("accounts", {})
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
@@ -929,6 +930,22 @@ class AutoSwitchEngine:
                 continue
             fingerprint = _refresh_fingerprint(creds) if creds else None
             if entry.get("fingerprintUnknown"):
+                # THE DOCUMENTED RECOVERY, WHICH THE BIND WOULD SWALLOW.
+                # `QuarantineEvent.human` tells the user to log in and run
+                # `--add-account --slot N`, and that rewrites this stamp.
+                # Without the check the bind takes the replacement as the
+                # quarantine's OWN generation, every later compare matches,
+                # and the slot stays barred with nothing said. Strictly
+                # after, so an add in the same second as the quarantine --
+                # a slot that conflicted the moment it was added -- is not
+                # read as a recovery. Both stamps are fixed-width UTC ISO.
+                added = roster.get(number, {}).get("added", "")
+                at = entry.get("at", "")
+                if added and at and added > at:
+                    to_release.append(
+                        (number, email_now, "credentials-replaced")
+                    )
+                    continue
                 # The generation this quarantine binds to was never learned,
                 # so a difference here is not evidence of a replacement.
                 # Bind it now that the read worked and let the ordinary
