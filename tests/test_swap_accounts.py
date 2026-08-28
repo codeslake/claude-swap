@@ -687,6 +687,41 @@ class TestSwapAccounts:
 
         assert not list(switcher.credentials_dir.glob("*.enc.prev"))
 
+    def test_swap_clears_the_prev_under_the_DESTINATION_key(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """DISTINCT emails, which the same-email sibling cannot express.
+
+        With one email the destination keys and the source keys are the same
+        two pairs, so that case passes whichever pair the purge names. Here
+        they differ: the writes retain their .prev under (2, ea) and (1, eb),
+        and naming the source keys instead leaves another account's
+        credential as the recovery generation of a key whose owner just
+        changed.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        ea, eb = "account1@example.com", "account2@example.com"
+        switcher._write_account_credentials("1", ea, "rt-a")
+        switcher._write_account_credentials("2", eb, "rt-b")
+        # A stale value already sitting under the DESTINATION key, which is
+        # the state the purge's own comment says recovery must never reach.
+        switcher._store._write_account_credentials("2", ea, "stale-foreign")
+        assert switcher._store._read_previous_backup("2", ea) == "", (
+            "premise: the destination key has no .prev before the swap, so "
+            "anything found after it was retained BY the swap"
+        )
+
+        switcher.swap_accounts("1", "2")
+
+        assert switcher._store._read_previous_backup("2", ea) == "", (
+            "DEFECT: the swap left another account's credential as the .prev "
+            "of a key whose owner changed — recovery would resurrect it"
+        )
+        assert switcher._store._read_previous_backup("1", eb) == "", (
+            "DEFECT: the same, on the other destination key"
+        )
+
     def test_swap_holds_account_lock(
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
