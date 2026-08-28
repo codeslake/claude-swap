@@ -12981,11 +12981,50 @@ def _os_call_aliases(tree, func: str, os_names: set[str]) -> set[str]:
                 and n.value.value.id in os_names)
             or (isinstance(getattr(n, "value", None), ast.Name)
                 and n.value.id in names)
+            # `X = getattr(os, "open")` -- the sibling write scan already
+            # reads this spelling at its call site, and neither open scan
+            # could see it: the site left BOTH denominators and an `O_TRUNC`
+            # weakening ran green.
+            or (isinstance(getattr(n, "value", None), ast.Call)
+                and isinstance(n.value.func, ast.Name)
+                and n.value.func.id == "getattr" and len(n.value.args) == 2
+                and isinstance(n.value.args[0], ast.Name)
+                and n.value.args[0].id in os_names
+                and isinstance(n.value.args[1], ast.Constant)
+                and n.value.args[1].value == func)
         }
         if grown == names:
             return names
         names = grown
 
+
+def _resolved_flags(tree, node) -> str:
+    """The `os.open` flags of this call, with a single hoisted binding resolved.
+
+    Both open scans key on the flag names, and a name is not a verdict: a
+    hoist hid a writer from the flags scan's offender list once, and from the
+    disown scan's site set entirely.
+    """
+    import ast
+
+    kw = {k.arg: k.value for k in node.keywords}
+    arg = node.args[1] if len(node.args) >= 2 else kw.get("flags")
+    if arg is None:
+        return ""
+    flags = ast.unparse(arg)
+    if not flags.isidentifier():
+        return flags
+    bound = [
+        ast.unparse(a.value) for a in ast.walk(tree)
+        if ((isinstance(a, ast.Assign) and len(a.targets) == 1
+             and isinstance(a.targets[0], ast.Name)
+             and a.targets[0].id == flags)
+            or (isinstance(a, ast.AnnAssign)
+                and isinstance(a.target, ast.Name)
+                and a.target.id == flags))
+        and a.value is not None
+    ]
+    return bound[0] if len(bound) == 1 else flags
 
 def _is_os_call(node, func: str, os_names: set[str], aliases: set[str]) -> bool:
     """Does this `Call` reach `os.<func>` under ANY of its spellings."""
@@ -13249,7 +13288,11 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
         for node in ast.walk(tree):
             if not _is_os_call(node, "open", os_names, open_aliases):
                 continue
-            if "O_EXCL" not in ast.unparse(node):
+            # THE SAME HOIST ITS SIBLING RESOLVES. A substring test on the
+            # unparsed call drops `os.open(tmp, _EXCL_FLAGS, 0o600)` out of
+            # this scan entirely -- measured, with the disown deleted and
+            # both scans green -- while the flags scan still reads it.
+            if "O_EXCL" not in _resolved_flags(tree, node):
                 continue
             seen += 1
             # NOT "IS THERE A HANDLER" -- that is true of every site here,
@@ -13278,17 +13321,20 @@ def test_every_O_EXCL_writer_disowns_a_name_it_refused_to_create():
                     # disowns are not all rebindings of the temp name either:
                     # one clears the flag the cleanup guards its unlink with,
                     # another drops the entry the discard walks.
+                    # THE CLEANUP'S OWN SUBJECT. Adding the `os.open` arg
+                    # unconditionally accepted a disown of the wrong name:
+                    # the staging cleanup walks `staged`, never the temp, so
+                    # `path = None` satisfied it while the discard still
+                    # unlinked the winner's file.
                     reads = _cleanup_reads(t_stack, h)
-                    if name is not None:
-                        reads.add(name)
-                    # BOTH HALVES THROUGH THE SCOPE WALK. The re-raise was
-                    # still an `ast.dump` substring, which sees a `raise`
-                    # inside a nested `def` and under `if False` -- the very
-                    # shapes `_flat` was written to exclude from the other
-                    # half of the same conjunction.
-                    stmts = list(_flat(h.body))
-                    disowns = any(_bound_names(st) & reads for st in stmts)
-                    reraises = any(isinstance(st, ast.Raise) for st in stmts)
+                    # THE HANDLER'S OWN STRAIGHT LINE. A scope walk asks
+                    # whether the disown is PRESENT; what has to hold is that
+                    # it RUNS. `if fd >= 0: tmp = None` is false on every
+                    # EEXIST path -- `fd` is -1 there -- so the temp is back
+                    # in the cleanup's reach, and nine of twelve sites stayed
+                    # green with the suite byte-identical.
+                    disowns = any(_bound_names(st) & reads for st in h.body)
+                    reraises = any(isinstance(st, ast.Raise) for st in h.body)
                     if disowns and reraises:
                         ok = True
             if not ok:
