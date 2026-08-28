@@ -727,6 +727,89 @@ class TestBootstrap:
             "chokepoint and repairs nothing on this state"
         )
 
+    def test_an_unspawnable_claude_names_PATH_not_the_live_instance(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`unreachable` is the BINARY's reason, and the gate has no better one.
+
+        The gate's own reason is owed to the user only when it is the gate
+        that blocked the launch. A `claude` that cannot be spawned blocked it
+        before any gate looked, so "exit the live instance" spends a running
+        session -- the user's in-progress work -- to reach a retry that
+        cannot spawn it either.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        make_live(session_dir)
+        # PREMISE: the re-seed is skipped, which is what routes a non-valid
+        # verdict into the gate's-own-reason block.
+        assert not session_mod.profile_is_quiescent(session_dir)
+
+        def unspawnable(cmd, env=None, **kwargs):
+            raise OSError("claude: no such file")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", unspawnable)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        message = str(caught.value)
+        assert "on PATH" in message, (
+            f"DEFECT: the binary could not be spawned and the launch says "
+            f"nothing about it: {message}"
+        )
+        assert "Exit it" not in message, (
+            "DEFECT: the launch tells the user to exit a live claude to fix "
+            "a binary that cannot be spawned -- it costs them the session "
+            "and the retry fails identically"
+        )
+
+    def test_a_live_profile_that_failed_validation_names_its_pid(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """CONTROL for the test above, and the remedy's own guard.
+
+        When the probe DID answer, the gate is what blocked the launch: the
+        re-seed was skipped because a claude is live in there. `--add-account`
+        routes through the same chokepoint and refuses, so the only remedy is
+        the instance, and the user cannot act on it without the PID.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        make_live(session_dir)
+        live, unreadable = session_mod.scan_live_sessions(session_dir)
+        # PREMISES: live, and readable -- so the unreadable-record raise
+        # above it cannot be the one that fires.
+        assert len(live) == 1 and unreadable == 0
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        message = str(caught.value)
+        assert str(live[0].pid) in message, (
+            f"DEFECT: the only remedy is a process the message does not "
+            f"name: {message}"
+        )
+        assert "--add-account" not in message, (
+            "DEFECT: the launch names a remedy that routes through the same "
+            "liveness chokepoint and refuses"
+        )
+
     def test_a_marker_that_cannot_be_honoured_is_announced(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
         block_real_keychain, capsys
@@ -839,6 +922,144 @@ class TestBootstrap:
             "DEFECT: _bootstrap rewrote a LIVE profile's credential, and the "
             "error the user sees says the profile is left in place"
         )
+
+    def test_a_swept_profile_keeps_the_only_copy_of_its_mcp_servers(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`_sync_sharing` can write the stash minutes before the sweep runs.
+
+        `_stash_displaced_mcp` is write-once and refuses to reset a profile's
+        MCP servers unless this file already holds them, so it is the only
+        copy of the profile's pre-mirror definitions. Sweeping it destroys
+        exactly what that refusal exists to preserve, and nothing re-derives
+        it: the definitions it held are gone from the profile too.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        stash = session_dir / session_mod.MCP_DISPLACED_STASH
+        stash.write_text(json.dumps(
+            {"schemaVersion": 1, "mcpServers": {"pre-feature": LOCAL_MCP}}
+        ), encoding="utf-8")
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISE: the sweep ran. Without this the assert below passes on a
+        # version that simply never cleans anything up.
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep did not run, so this proves nothing"
+        )
+        assert stash.exists() and json.loads(stash.read_text())[
+            "mcpServers"
+        ] == {"pre-feature": LOCAL_MCP}, (
+            "DEFECT: the sweep took the write-once stash, which is the only "
+            "copy of the profile's pre-mirror MCP definitions"
+        )
+
+    def test_a_probe_that_failed_never_reaches_the_sweep(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The premise the reuse gate's strictness rests on.
+
+        Refusing to REUSE an unreadable identity sends the launch down the
+        bootstrap path, where a probe that then times out must not be read as
+        a verdict about the profile: the sweep deletes the seed and the
+        Keychain entry over nothing worse than a loaded machine (#224).
+
+        The re-seed must NOT promote the timeout, or this passes without ever
+        reaching the arm it is about -- so the backup names another account,
+        which is drift the promotion still refuses post-bootstrap.
+        """
+        seeded_switcher._write_account_config(
+            ACCOUNT_NUM, ACCOUNT_EMAIL,
+            json.dumps({"oauthAccount": {
+                "emailAddress": "someone-else@example.com",
+                "organizationUuid": ORG_UUID}, "theme": "dark"}),
+        )
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
+
+        swept: list[str] = []
+        real = session_mod.SessionManager._cleanup_failed_session
+
+        def spy(self, path):
+            swept.append(str(path))
+            return real(self, path)
+
+        monkeypatch.setattr(
+            session_mod.SessionManager, "_cleanup_failed_session", spy
+        )
+
+        import subprocess
+
+        def times_out(cmd, env=None, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", times_out)
+        with pytest.raises(SessionError) as caught:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        # PREMISE: the verdict stayed "unknown" and reached the probe-failure
+        # raise. Anything else and this asserts about an arm it never entered.
+        assert "could not be verified" in str(caught.value), str(caught.value)
+        assert swept == [], (
+            "DEFECT: a probe that merely timed out destroyed a profile it "
+            "never managed to look at"
+        )
+
+    def test_an_invalid_verdict_still_reaches_the_sweep(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """CONTROL for the test above: a spy that can never see a sweep would
+        pass it on a version that swept every launch."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("OLD", encoding="utf-8")
+        (session_dir / ".claude.json").write_text("{{{torn", encoding="utf-8")
+
+        swept: list[str] = []
+        real = session_mod.SessionManager._cleanup_failed_session
+
+        def spy(self, path):
+            swept.append(str(path))
+            return real(self, path)
+
+        monkeypatch.setattr(
+            session_mod.SessionManager, "_cleanup_failed_session", spy
+        )
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert swept, "premise: the spy cannot see a sweep, so it proves nothing"
 
     def test_a_swept_profile_keeps_its_liveness_ledger(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
@@ -1302,27 +1523,20 @@ class TestIsSessionValid:
         self._probe_times_out(monkeypatch)
         assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
 
-    def test_probe_timeout_lenient_on_unreadable_identity(
+    def test_probe_timeout_refuses_an_unreadable_identity(
         self, manager, tmp_path, monkeypatch
     ):
-        """A broken .claude.json is not a profile we may reuse.
+        """A broken .claude.json is not a profile we may REUSE.
 
-        This asserted the opposite, on the grounds that failing closed would
-        re-open the destructive cleanup #224 removed. It no longer can: a
-        probe-failure verdict cannot reach `_cleanup_failed_session`, and the
-        sweep sits behind `profile_is_quiescent` besides. What failing closed
-        costs now is a re-seed from the backup, and what it buys is that an
-        in-session /login plus a torn `.claude.json` cannot reuse the profile
-        and exec claude into the account it drifted to.
+        Reuse runs before any bootstrap, so the artifacts are the profile's
+        own: an in-session /login plus a torn `.claude.json` would otherwise
+        exec claude into the account it drifted to.
         """
         tmp_path.mkdir(exist_ok=True)
         self._seed_profile(tmp_path)
         (tmp_path / ".claude.json").write_text("not json")
         self._probe_times_out(monkeypatch)
         assert not manager._is_session_valid(tmp_path, ACCOUNT_EMAIL, ORG_UUID)
-        # AND THE PROFILE IS STILL THERE. Refusing to REUSE is a re-seed, not
-        # a delete -- the distinction the old rationale collapsed.
-        assert (tmp_path / ".credentials.json").exists()
 
     def test_a_readable_identity_still_survives_a_probe_timeout(
         self, manager, tmp_path, monkeypatch

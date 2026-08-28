@@ -330,15 +330,15 @@ def _artifacts_say_usable(
     whether `claude` can be run at all, and no file on disk answers it.
     """
     # A READABLE IDENTITY IS PART OF BEING USABLE, and only a re-seed
-    # excuses its absence. Every other signal here leans "present": on macOS
-    # a keychain delete is best-effort, so an unreadable entry reads as
-    # material, and an unreadable identity reads as "no drift" because a
-    # broken `.claude.json` must not abandon a working profile. That last
-    # leniency is sound only once a bootstrap has rewritten the artifacts
-    # from the BACKUP -- `reseeded` is the caller saying so. Without one they
-    # are the profile's own, so a swept profile passes as usable with nothing
-    # to authenticate, and an in-session /login plus a torn `.claude.json`
-    # launches under the account the profile drifted to.
+    # excuses its absence. Every other signal here leans "present" -- an
+    # unreadable keychain entry reads as material, an unreadable identity as
+    # "no drift" -- so with nothing readable the profile passes on leniency
+    # alone. `reseeded` is the caller saying the artifacts are the BACKUP's,
+    # which is the only state in which that leniency has a premise.
+    # ponytail: a backup whose `oauthAccount` carries no `emailAddress` keeps
+    # the identity unreadable through every re-seed, so such a profile
+    # re-seeds on each launch whose probe fails -- one refresh grant each.
+    # Repair the backup; do not relax this.
     if not reseeded and read_session_identity(session_dir) is None:
         return False
     return _may_have_credential_material(session_dir) and (
@@ -841,27 +841,24 @@ class SessionManager:
             # follow-up). Only "unreachable" still stops: no local file can
             # tell us whether `claude` runs, and a session we cannot exec into
             # is not a session.
-            # THE RE-SEED IS THIS PROMOTION'S PREMISE, and the gate above
-            # can skip it. `_artifacts_say_usable` reads an unreadable
-            # identity as "no drift" -- sound only once a bootstrap has
-            # rewritten it, because then the artifacts are the BACKUP's.
-            # Without one they are the profile's own, so an in-session
-            # /login plus a torn `.claude.json` promotes to valid and
-            # launches under the account the profile drifted to, announced
-            # as the one that was asked for.
+            # THE RE-SEED IS THIS PROMOTION'S PREMISE, which the gate above
+            # can skip; `_artifacts_say_usable` holds the rule.
             if verdict == "unknown" and _artifacts_say_usable(
                 session_dir, email, org_uuid, reseeded=reseeded
             ):
                 verdict = "valid"
-            if verdict != "valid" and not reseeded:
-                # THE GATE'S OWN REASON, or the remedy below is one the
-                # user cannot act on -- and it is the gate, not the probe,
-                # that blocked this launch, so EVERY non-valid verdict lands
-                # here and not just "invalid". An unreadable record makes
-                # every gate on this path defer, and nothing in cswap prunes
-                # a record -- so `--add-account` routes through the same
-                # chokepoint and repairs nothing, and `--remove-account`
-                # refuses for the same reason. Only the file itself.
+            if verdict not in ("valid", "unreachable") and not reseeded:
+                # THE GATE'S OWN REASON, or the remedy below is one the user
+                # cannot act on -- so every verdict the GATE blocked lands
+                # here, not just "invalid". `unreachable` is not one of them:
+                # `claude` could not be spawned, which no amount of exiting
+                # instances or repairing records changes, and both remedies
+                # below cost the user something to learn that. An unreadable
+                # record makes every gate on this path defer, and nothing in
+                # cswap prunes a record -- so `--add-account` routes through
+                # the same chokepoint and repairs nothing, and
+                # `--remove-account` refuses for the same reason. Only the
+                # file itself.
                 _live, _unreadable = scan_live_sessions(session_dir)
                 if _unreadable:
                     raise SessionError(
@@ -1137,7 +1134,9 @@ class SessionManager:
         be definitely absent (keychain-aware — claude migrates a macOS
         profile's credential into the keychain and deletes the plaintext seed,
         while stale invalidation deletes both) and the recorded identity must
-        not have drifted (in-session /login to another account). Anything
+        not have drifted (in-session /login to another account) — which
+        requires it to be READABLE, since reuse runs before any bootstrap and
+        an unreadable identity would otherwise pass as "no drift". Anything
         subtler still fails on first real use.
 
         ``"unreachable"`` answers False without consulting artifacts: the
