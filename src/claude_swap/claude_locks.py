@@ -85,8 +85,8 @@ def config_lock_dir() -> Path:
     return path.parent / (path.name + ".lock")
 
 
-# A CAP on the guard wait; the caller's remaining budget is the bound. Measured
-# green at 0.0 and at 30.0, so it is a tuning knob, not a correctness constant.
+# A CAP on the guard wait; the caller's remaining budget is the bound. No
+# requirement is violated at any value here -- it is a tuning knob.
 _TAKEOVER_GUARD_S = 0.5
 
 

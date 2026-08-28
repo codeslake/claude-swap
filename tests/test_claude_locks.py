@@ -659,7 +659,8 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    THE ONLY CASE THAT MEASURES TOTAL ELAPSED. Some of this file's clamp cases
+    ONE OF TWO CASES THAT MEASURE TOTAL ELAPSED -- the takeover guard's is the
+    other, on a different arm. Some of this file's clamp cases
     run the real clock, so being one of them is not what makes this one worth
     keeping. NO COUNT HERE, deliberately: the ratio has been restated three
     times in three commits and went stale inside the very commit that
@@ -955,9 +956,8 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         guard = target.parent / f"{target.name}.takeover"
 
         # `elapsed` cannot tell the clamped guard from the jitter arm's own
-        # clamp beside it: measured, this case passed with the staleness
-        # branch short-circuited to `if False and ...`, while 8 siblings
-        # failed. The count is what ties the number to this arm.
+        # clamp beside it, so the number alone does not say which arm produced
+        # it. The count is what ties it to this one.
         entered = {"n": 0}
         real_take_over = claude_locks._take_over_stale
 
@@ -979,7 +979,10 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         t.start()
         assert held.wait(5), "premise: the peer must hold the guard"
         try:
-            budget = 0.2
+            # ABOVE `_TAKEOVER_GUARD_S`, like the sibling clamp case: under the
+            # cap only one iteration runs and `min(cap, remaining)` equals
+            # `min(cap, timeout)`, so the case cannot see its own fix.
+            budget = 0.6
             started = time.monotonic()
             with pytest.raises(ClaudeCodeLockTimeout):
                 with proper_lockfile(target, timeout=budget, staleness=1.0):
