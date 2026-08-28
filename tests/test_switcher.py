@@ -8204,8 +8204,9 @@ class TestDirectActivationPreservation:
         `config_written` is armed before the write, so this arm runs on the
         faults where `_write_json` never opened the destination and those
         bytes are the intact original. A truncating rewrite there destroys
-        `oauthAccount`, `projects`, `mcpServers` and `userID` — and the arm
-        only logs, so nothing tells the user the config is gone.
+        `oauthAccount`, `projects`, `mcpServers` and `userID` — and the cap
+        refuses the restore's own temp too, so this fault is a refused
+        rollback as well, which the caller must hear about.
         """
         import resource
         import signal
@@ -8422,8 +8423,9 @@ class TestDirectActivationPreservation:
         assert config_path.read_text(encoding="utf-8") == original, (
             "DEFECT: the write-through emptied the config and raised, and "
             "the direct-activation rollback did not restore it. `userID`, "
-            "`mcpServers` and `projects` are gone, and the arm only logs, so "
-            "nothing tells the user the config was destroyed"
+            "`mcpServers` and `projects` are gone -- and an unarmed token "
+            "attempts no restore, so nothing is reported either and the user "
+            "is told only that the activation failed"
         )
 
     def test_direct_activation_reports_a_rollback_it_could_not_make(
@@ -8432,11 +8434,11 @@ class TestDirectActivationPreservation:
         """A refused restore must reach the caller, not just the log.
 
         `_restore_atomically` REFUSES a publish error that is not EBUSY --
-        that refusal is the point of the helper -- so the arm now has a
-        reachable failure branch. It only `_logger.error`s it, and the
-        console handler exists only under debug, so the user is told the
-        activation failed while `~/.claude.json` is actually empty. The
-        transaction path is the control: it raises "rollback also failed".
+        that refusal is the point of the helper -- so the arm has a reachable
+        failure branch. It used to be `_logger.error`d and nothing more, and
+        the console handler exists only under debug, so the user was told the
+        activation failed while `~/.claude.json` was empty. The transaction
+        path is the control: it raises "rollback also failed".
         """
         from claude_swap import switcher as switcher_mod
         from claude_swap import models as models_mod
