@@ -145,6 +145,18 @@ def _wipe_throwaway_artifacts(target: Path) -> None:
     target.rmdir()
 
 
+def migration_flag_for(target: Path) -> Path:
+    """The interrupted-migration flag for ``target``.
+
+    A SIBLING of the backup root, so no protected root that covers the root
+    itself covers this file. Anything that has to name it -- the test
+    suite's real-store guard among them -- must name it from here: a second
+    spelling drifts, and the flag is what turns the migration's collision
+    refusal into an rmtree of the destination.
+    """
+    return target.parent / f".{target.name}.migrating"
+
+
 def migrate_legacy_backup_dir(target: Path) -> bool:
     """Move the legacy backup directory to ``target`` if needed.
 
@@ -177,7 +189,7 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
     if same_path:
         return False
 
-    flag = target.parent / f".{target.name}.migrating"
+    flag = migration_flag_for(target)
 
     if not legacy.exists():
         # Successful prior run that died before unlinking the flag.

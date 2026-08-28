@@ -129,6 +129,21 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             # this docstring names as the protected set -- drops out of the
             # frozen roots entirely.
             (Path.home(), False),
+            # THE MIGRATION FLAG, which no other root reaches: it is a
+            # SIBLING of the backup root, not a child. A test allowed to
+            # create it leaves it behind -- `RealStoreWriteBlocked` is not an
+            # OSError, so the migration's own `flag.unlink()` never runs --
+            # and the next real run reads it as "a prior migration was
+            # interrupted" and rmtree's the live store instead of refusing
+            # the collision.
+            (_paths.migration_flag_for(_paths.get_backup_root()), False),
+            # TWO LEVELS DOWN, so the non-recursive `~/.claude` above does
+            # not reach them. `--share-history` moves real transcripts to
+            # `~/.claude/projects/<slug>/<uuid>.jsonl`, and `_mkdir_private`
+            # walks only while the path is missing -- on a real box that
+            # directory exists, so not one mkdir is attempted above them.
+            (_paths.get_default_claude_config_home() / "projects", True),
+            (_paths.get_claude_config_home() / "projects", True),
         )
 
     ambient_specs = _resolve()

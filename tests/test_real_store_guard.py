@@ -290,6 +290,45 @@ def test_frozen_specs_include_the_two_non_recursive_roots(
     assert home in non_recursive_roots
 
 
+def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
+    monkeypatch, tmp_path
+):
+    """Two writes that reach past every root the test above checks.
+
+    The migration flag is a SIBLING of the backup root, and transcripts land
+    two levels under a ``~/.claude`` that is non-recursive on purpose. Both
+    were allowed while every root here was armed, so a spec test that only
+    counts the roots cannot see either.
+    """
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"):
+        monkeypatch.delenv(var, raising=False)
+
+    specs = conftest._freeze_real_store_specs()
+    roots = {root for root, _ in specs}
+    recursive_roots = {root for root, recursive in specs if recursive}
+
+    flag = paths.migration_flag_for(paths.get_backup_root())
+    assert flag in roots, (
+        f"the migration flag is unprotected; a test that creates it leaves it "
+        f"behind and the next real run rmtree's the store it names. {flag}"
+    )
+    # PREMISE: it really is outside every root that covers the backup root,
+    # so this entry is the only thing that can cover it.
+    assert flag.parent not in roots and flag not in recursive_roots
+
+    projects = home / ".claude" / "projects"
+    assert projects in recursive_roots, (
+        "`--share-history` moves transcripts to projects/<slug>/<uuid>.jsonl, "
+        "which a non-recursive ~/.claude does not reach"
+    )
+    # PREMISE: ~/.claude is still non-recursive -- this worktree lives under
+    # it, so making it recursive would refuse the suite's own writes.
+    assert (home / ".claude") in roots and (home / ".claude") not in recursive_roots
+
+
 def test_frozen_specs_ignore_a_developer_exported_claude_config_dir(
     monkeypatch, tmp_path
 ):
