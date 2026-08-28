@@ -1171,6 +1171,49 @@ class TestATransientErrnoIsNotFatalToTheHold:
             f"(fake floor {fs_quantum}ns over a host that keeps {host}ns)"
         )
 
+    def test_a_deadline_crossed_mid_iteration_is_not_a_ValueError(
+        self, tmp_path, monkeypatch
+    ):
+        """The floor under the swept-name clamp had no witness.
+
+        The arm reads the clock to size its sleep AFTER the check that let
+        the iteration through, with a `mkdir` and a parent `stat` in between.
+        When the budget expires in that gap the argument is negative and
+        `time.sleep` raises `ValueError` out of `proper_lockfile`, which
+        documents only `ClaudeCodeLockTimeout`. The constant this replaced
+        could never be negative, so hazard and guard arrived together.
+        """
+        target = tmp_path / "x.lock"
+        real_mkdir = os.mkdir
+        seen = []
+
+        def swept(path, *a, **k):
+            # The arm needs the PARENT alive and only the LOCK name gone, so
+            # the parent's own mkdir must still succeed.
+            if os.fspath(path) != os.fspath(target):
+                return real_mkdir(path, *a, **k)
+            seen.append(1)
+            raise FileNotFoundError(errno.ENOENT, "swept between the calls")
+
+        # Every read after the first lands past a 0.05s budget, so the clamp
+        # is handed a negative remainder.
+        ticks = iter([0.0])
+        def clock():
+            try:
+                return next(ticks)
+            except StopIteration:
+                return 9.0
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", swept)
+        monkeypatch.setattr(claude_locks.time, "monotonic", clock)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with claude_locks.proper_lockfile(target, timeout=0.05):
+                pass
+        assert seen, (
+            "premise: the swept-name arm was never entered, so this says "
+            "nothing about its clamp"
+        )
+
     def test_a_probe_that_raises_answers_1_too(self):
         """The third `return 1` had no value coverage.
 
