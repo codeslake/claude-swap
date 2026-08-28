@@ -145,7 +145,7 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
 
 
 def clear_wiring(switcher, timeout: float | None = None, only=None,
-                 unsplice_to=None) -> bool:
+                 unsplice=None) -> bool:
     """Remove a pin wiring from the global config. True when it removed one.
 
     ``only`` narrows it to the given config paths. The default -- every wired
@@ -213,7 +213,7 @@ def clear_wiring(switcher, timeout: float | None = None, only=None,
             with proper_lockfile(
                 path.parent / (path.name + ".lock"), timeout=share
             ):
-                if _clear_wiring_locked(switcher, path, unsplice_to):
+                if _clear_wiring_locked(switcher, path, unsplice):
                     changed = True
         except Exception as exc:  # noqa: BLE001
             # A lock we cannot take skips THIS file, never the other one.
@@ -225,10 +225,10 @@ def clear_wiring(switcher, timeout: float | None = None, only=None,
     return changed
 
 
-def _clear_wiring_locked(switcher, path, unsplice_to=None) -> bool:
+def _clear_wiring_locked(switcher, path, unsplice=None) -> bool:
     """The read-modify-write of :func:`clear_wiring`, under its lock.
 
-    ``unsplice_to`` puts ``oauthAccount`` back, and only ``clear_pin``'s
+    ``unsplice`` is ``(pinned_email, identity)`` and only ``clear_pin``'s
     package-gone fallback passes it. It rides this function because the
     identity and the env block live in the same file under the same lock,
     and a second locked pass over both configs would be a second budget.
@@ -245,10 +245,23 @@ def _clear_wiring_locked(switcher, path, unsplice_to=None) -> bool:
     # records a pin, so `_live_login_identity` has no pin to un-splice
     # against and returns it literally -- and the next switch backs the live
     # credential up under that account's slot key.
+    #
+    # DECIDE ON THE ACCOUNT, NOT ON THE DICT, and only for a config that is
+    # actually spliced. `identity_for_config` may answer a three-key roster
+    # synthesis, so a whole-dict compare is never equal against a file
+    # Claude Code maintains -- and rewriting on that verdict replaces one
+    # cswap never spliced (the per-session config, which only the package
+    # writes an identity into) and drops the fields CC owns there.
     unspliced = False
-    if unsplice_to and raw.get("oauthAccount") != unsplice_to:
-        raw["oauthAccount"] = unsplice_to
-        unspliced = True
+    if unsplice:
+        pinned_email, identity = unsplice
+        current = raw.get("oauthAccount")
+        if identity and isinstance(current, dict) and (
+            (current.get("emailAddress") or "").casefold()
+            == pinned_email.casefold()
+        ):
+            raw["oauthAccount"] = identity
+            unspliced = True
 
     ours = _wire_mark_of(raw, path)
     if ours is None:
@@ -1211,6 +1224,8 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
     # is the job, and a raising lookup sharing the guard below skipped
     # `apply_pin` entirely.
     _back = None
+    # Best-effort whenever there IS a pin to go back to; see below.
+    unspliced = bool(before)
     if not before:
         try:
             _back = _live_login_for_config(switcher)
@@ -1232,10 +1247,21 @@ def _restore_pin(switcher, before: tuple[str, str] | None) -> bool:
             _back = identity_for_config(
                 switcher, email=before[0],
                 num=_slot_for(switcher, before[0], before[1]))
-        _impl().splice_config_identity(_back)
+        # PART OF THE VERDICT ONLY WHEN THERE IS NO PIN TO GO BACK TO.
+        # Restoring a PREVIOUS pin leaves the record naming it, so a config
+        # that lags is a worse pin and not a failed one -- best-effort, as
+        # every other splice site treats it. Restoring NOTHING is a
+        # different state: the record is cleared, so a config still naming
+        # the pin that never started has no record to un-splice against,
+        # and the next switch backs the live credential up under that
+        # account's slot key. `splice_config_identity` SKIPS and returns
+        # False on a contended config lock rather than raising, so reading
+        # only the record announces that as a clean rollback.
+        result = _impl().splice_config_identity(_back)
+        unspliced = unspliced or _back is None or bool(result)
     except Exception:  # noqa: BLE001 — the re-read below is the verdict
         pass
-    return _pinned_email_now(switcher) == before
+    return unspliced and _pinned_email_now(switcher) == before
 
 
 def _clear_pin_record(switcher) -> None:
@@ -1403,7 +1429,9 @@ def clear_pin(switcher) -> tuple[bool, str]:
     "nothing to remove" and for "the lock was contended so this path was
     skipped" — only the second is a failure, and the skip is deliberate.
     """
-    had_pin = _pinned_email_now(switcher) is not None
+    _pinned = _pinned_email_now(switcher)
+    had_pin = _pinned is not None
+    pinned_email = (_pinned[0] if _pinned else "") or ""
     # Captured before the first thing that unwires, which is `apply_pin`, not
     # `clear_wiring`. Below both, the survivor check ran against a config the
     # package had already rewritten, and reported `(True, 'Unpinned the cloud
@@ -1445,7 +1473,12 @@ def clear_pin(switcher) -> tuple[bool, str]:
         _unsplice = True
     # THE SPLICE IS THE OTHER HALF OF THE SAME STATE, and only the fallback
     # leaves it: a working `apply_pin` already un-spliced with this identity.
-    cleared = clear_wiring(switcher, unsplice_to=_back_to if _unsplice else None)
+    cleared = clear_wiring(
+        switcher,
+        unsplice=(pinned_email, _back_to)
+        if (_unsplice and pinned_email and _back_to)
+        else None,
+    )
     still_pinned = _pinned_email_now(switcher) is not None
     # THE ENV BLOCK, NOT THE MARKER. `_clear_wiring_locked` returns
     # `_clear_ledger(path)` AFTER the config write, so an unwritable

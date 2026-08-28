@@ -2794,6 +2794,170 @@ class TestPurgeDoesNotStrandTheWiring:
         assert "HTTPS_PROXY" not in raw.get("env", {})
 
 
+class TestTheUnspliceTouchesOnlyWhatThePinSpliced:
+    """The un-splice is a repair, so it must decide on the ACCOUNT.
+
+    `identity_for_config` may answer a three-key roster synthesis, so a
+    whole-dict compare is never equal against a file Claude Code
+    maintains -- and rewriting on that verdict replaces a config cswap
+    never spliced and drops the fields CC owns there.
+    """
+
+    LIVE = "live@example.com"
+    PINNED = "cloud@example.com"
+    FULL = {
+        "emailAddress": LIVE, "accountUuid": "uuid-1",
+        "organizationUuid": "org-1", "organizationName": "Org",
+        "organizationRole": "admin", "displayName": "Live User",
+        "hasClaudeMax": True,
+    }
+
+    def _switcher(self, temp_home):
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {"1": {
+                "email": self.LIVE, "uuid": "uuid-1", "organizationUuid": "",
+                "organizationName": "", "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", self.LIVE, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        s._write_account_config("1", self.LIVE, json.dumps(
+            {"oauthAccount": {"emailAddress": self.LIVE,
+                              "accountUuid": "uuid-1"}}))
+        return s
+
+    class _Dead:
+        def apply_pin(self, *a, **k):
+            raise ImportError("cryptography")
+
+    def test_a_clear_with_nothing_pinned_must_not_rewrite_the_config(
+        self, temp_home
+    ):
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+
+        s = self._switcher(temp_home)
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({"env": {}, "oauthAccount": dict(self.FULL)}))
+        # PREMISES: nothing is pinned, and the config carries CC's own keys.
+        assert pin_mod._pinned_email_now(s) is None
+        before = sorted(json.loads(cfg.read_text())["oauthAccount"])
+        assert len(before) == 7
+
+        with patch.object(pin_mod, "_impl", lambda: self._Dead()):
+            pin_mod.clear_pin(s)
+
+        after = sorted(json.loads(cfg.read_text())["oauthAccount"])
+        assert after == before, (
+            "DEFECT: a clear that pinned nothing rewrote the config and "
+            f"dropped the fields Claude Code owns: "
+            f"{sorted(set(before) - set(after))}"
+        )
+
+    def test_a_config_the_pin_never_spliced_must_not_be_rewritten(
+        self, temp_home
+    ):
+        """The write decision is the subject; identity resolution is not."""
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+
+        s = self._switcher(temp_home)
+        _s.atomic_write_json(
+            _s.settings_path(s.backup_dir),
+            {"remoteControl": {"pinnedEmail": self.PINNED}})
+        cfg = temp_home / ".claude.json"
+        other = {"emailAddress": "other@example.com",
+                 "accountUuid": "uuid-other", "displayName": "Someone Else"}
+        cfg.write_text(json.dumps({"env": {}, "oauthAccount": dict(other)}))
+        replacement = {"emailAddress": self.LIVE, "accountUuid": "uuid-1",
+                       "organizationUuid": ""}
+        # PREMISES: a pin IS recorded, an identity IS available to write,
+        # and this config names neither of them.
+        assert (pin_mod._pinned_email_now(s) or (None,))[0] == self.PINNED
+        with patch.object(pin_mod, "_impl", lambda: self._Dead()), \
+             patch.object(pin_mod, "_live_login_for_config",
+                          return_value=replacement) as spy:
+            pin_mod.clear_pin(s)
+        assert spy.called, "premise: the clear must have an identity to write"
+
+        now = json.loads(cfg.read_text())["oauthAccount"]
+        assert now == other, (
+            "DEFECT: the un-splice rewrote a config that never named the "
+            f"pin; it now says {now.get('emailAddress')!r}"
+        )
+
+    def test_a_rollback_that_skipped_the_splice_must_not_report_success(
+        self, temp_home
+    ):
+        """`splice_config_identity` SKIPS and returns False on a busy lock.
+
+        Reading only the record announces a clean rollback over a config
+        that still names the pin that failed.
+        """
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+
+        s = self._switcher(temp_home)
+        data = s._get_sequence_data()
+        data["accounts"]["2"] = {
+            "email": self.PINNED, "uuid": "uuid-cloud", "organizationUuid": "",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z"}
+        data["sequence"] = [1, 2]
+        s._write_json(s.sequence_file, data)
+        s._write_account_credentials("2", self.PINNED, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2"}}))
+        s._write_account_config("2", self.PINNED, json.dumps(
+            {"oauthAccount": {"emailAddress": self.PINNED,
+                              "accountUuid": "uuid-cloud"}}))
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({"env": {}, "oauthAccount": {
+            "emailAddress": self.LIVE, "accountUuid": "uuid-1"}}))
+        pinned = self.PINNED
+
+        class _PinThenSkip:
+            def apply_pin(self, sw, email=None, org=None, identity=None):
+                path = _s.settings_path(sw.backup_dir)
+                if email:
+                    _s.atomic_write_json(
+                        path, {"remoteControl": {"pinnedEmail": email}})
+                    cfg.write_text(json.dumps({"env": {}, "oauthAccount": {
+                        "emailAddress": email, "accountUuid": "uuid-cloud"}}))
+                else:
+                    raw = _s._read_raw_for_write(path)
+                    raw.pop("remoteControl", None)
+                    _s.atomic_write_json(path, raw)
+                return False
+
+            def splice_config_identity(self, identity):
+                return False
+
+        with patch.object(pin_mod, "_impl", lambda: _PinThenSkip()):
+            ok, msg = pin_mod.set_pin(s, pinned, None)
+
+        after = json.loads(cfg.read_text())["oauthAccount"]["emailAddress"]
+        # PREMISES: the pin did not take and the record was rolled back.
+        assert ok is False
+        assert pin_mod._pinned_email_now(s) is None
+        # `set_pin`'s own prefix legitimately says "nothing is pinned yet";
+        # the ROLLBACK TAIL is what must not claim a clean state.
+        assert "check with" in msg.lower(), (
+            "DEFECT: the rollback verdict reads only the record, so a "
+            "skipped un-splice is announced as a clean rollback -- the "
+            f"config still names {after!r}"
+        )
+
+
 class TestAClearWithoutThePackageUnsplicesTheConfig:
     """The record and the config splice are two halves of one state.
 
