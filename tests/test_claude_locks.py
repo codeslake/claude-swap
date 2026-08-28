@@ -1056,6 +1056,88 @@ class TestIdentityNotAStamp:
         )
 
 
+
+class TestThePinIsAFilesystemFactNotAPlatformOne:
+    """The release's ownership guard rests on an open fd pinning the inode.
+
+    That is the local-filesystem orphan list. A network filesystem has no
+    server-side open state to hold it, so the fd pins nothing, the identity
+    compare matches a stranger's directory, and the release removes a live
+    successor's lock. The unpinned path (stamp, `unproven`, release mutex)
+    already exists; it just has to be armed by the filesystem's answer.
+    """
+
+    def test_the_lock_asks_the_filesystem_not_the_platform(
+        self, tmp_path, monkeypatch
+    ):
+        """The end-to-end harm needs a filesystem that does not pin, which
+        no portable test can provide. What IS portable is that the answer
+        is asked of the lock's own parent rather than read off a constant.
+        """
+        import claude_swap.claude_locks as cl
+
+        asked = []
+
+        def spy(parent):
+            asked.append(parent)
+            return True
+
+        monkeypatch.setattr(cl, "_fd_pins_an_inode", spy)
+        lock_dir = tmp_path / "x.lock"
+        with cl.proper_lockfile(lock_dir, timeout=2.0, staleness=60.0):
+            pass
+        assert asked == [lock_dir.parent], (
+            "DEFECT: the release's ownership guard rests on the descriptor "
+            "pinning the inode, which is a filesystem property; read off a "
+            "platform constant it cannot fail on a network home, and the "
+            f"release removes a successor's live lock (asked={asked})"
+        )
+
+    def test_an_unpinned_parent_arms_the_stamp_read_back(
+        self, tmp_path, monkeypatch
+    ):
+        """False must reach the machinery, not just be computed."""
+        import claude_swap.claude_locks as cl
+
+        monkeypatch.setattr(cl, "_fd_pins_an_inode", lambda parent: False)
+        opened = []
+        real_open = cl.os.open
+
+        def watch(path, flags, *a, **k):
+            opened.append(str(path))
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr(cl.os, "open", watch)
+        lock_dir = tmp_path / "z.lock"
+        with cl.proper_lockfile(lock_dir, timeout=2.0, staleness=60.0):
+            pass
+        # The pinned path opens the lock directory to hold its identity;
+        # the unpinned path must not, because there is nothing to pin.
+        assert str(lock_dir) not in opened, (
+            "DEFECT: the False did not reach the acquire, so the identity "
+            "is still a descriptor on a filesystem that pins nothing"
+        )
+
+    def test_the_probe_reports_a_presence(self, tmp_path):
+        """The control: on this filesystem the descriptor DOES pin."""
+        import claude_swap.claude_locks as cl
+
+        cl._PIN_PROBE.clear()
+        try:
+            assert cl._fd_pins_an_inode(tmp_path) is True
+        finally:
+            cl._PIN_PROBE.clear()
+
+    def test_a_parent_that_pins_still_removes_its_own_lock(self, tmp_path):
+        """And the ordinary case is unchanged."""
+        import claude_swap.claude_locks as cl
+
+        lock_dir = tmp_path / "y.lock"
+        with cl.proper_lockfile(lock_dir, timeout=2.0, staleness=60.0):
+            assert lock_dir.exists()
+        assert not lock_dir.exists()
+
+
 class TestATransientErrnoIsNotFatalToTheHold:
     """Two arms reached by an ordinary errno on a network `~/.claude`, and
     neither is reachable from any case that asserts a return value.
