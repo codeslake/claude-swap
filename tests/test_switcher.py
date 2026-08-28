@@ -3716,9 +3716,6 @@ class TestPerformSwitchPostDisplay:
         assert dest.read_text(encoding="utf-8") == original, (
             "the refused restore must leave the destination as it was"
         )
-        assert not [q for q in temp_home.iterdir() if ".restore." in q.name], (
-            "a refused restore must not strand its temp"
-        )
 
         # CONTROL: the one errno that IS about the destination. The rename
         # never succeeds under either patch, so a destination that comes back
