@@ -1150,16 +1150,27 @@ class TestADanglingSymlinkDoesNotPinACore:
     def test_control_a_real_directory_still_retries(self, tmp_path, monkeypatch):
         """CONTROL: the refusal keys on the name's TYPE, not on any ENOENT.
 
-        A directory swept between our mkdir and our read-back stat is a busy
-        handoff and MUST keep retrying -- which is why `lexists` is the wrong
-        test. It also carries that arm's BACK-OFF, which nothing else can any
-        more: a dangling symlink used to be the vehicle for it and is now
-        refused above the loop, so a spin bound written against a symlink
-        measures the refusal instead of the arm.
+        NAMED FOR THE ARM IT REACHES: the STALE-CHECK stat, the one that reads
+        `held_mtime` after `mkdir` answered FileExistsError. A directory swept
+        between those two is a busy handoff and MUST keep retrying -- which is
+        why `lexists` is the wrong test. The post-mkdir read-back is a
+        different `except FileNotFoundError` with its own copy of the clamp,
+        and nothing here holds it.
+
+        It also carries this arm's BACK-OFF, which nothing else can any more:
+        a dangling symlink used to be the vehicle for it and is now refused
+        above the loop, so a spin bound written against a symlink measures the
+        refusal instead of the arm.
+
+        THE BUDGET IS NOT A MULTIPLE OF THE FLAT CAP. At 0.3 the last sleep
+        starts with ~0.0497s left, so `min(0.05, timeout)` and
+        `min(0.05, remaining)` differ by the loop's own overhead and the
+        weakening survives -- measured, the mutant passed. 0.175 leaves a
+        remainder the cap overshoots by 25ms.
         """
         swept = tmp_path / "busy.lock"
         swept.mkdir()
-        budget, seen, slept = 0.3, {"n": 0}, []
+        budget, seen, slept = 0.175, {"n": 0}, []
         real_stat = os.stat
         real_sleep = claude_locks.time.sleep
         mine, t0 = threading.get_ident(), time.monotonic()
@@ -1174,8 +1185,9 @@ class TestADanglingSymlinkDoesNotPinACore:
             # SCOPED TO THIS THREAD. `claude_locks.time` IS the time module,
             # so an unscoped patch records every other thread's sleeps here.
             if threading.get_ident() == mine:
-                slept.append((round(budget - (time.monotonic() - t0), 3),
-                              round(seconds, 3)))
+                # RAW, not rounded: the subject is a sub-millisecond
+                # difference and `round(_, 3)` is a millisecond of error.
+                slept.append((budget - (time.monotonic() - t0), seconds))
             return real_sleep(seconds)
 
         monkeypatch.setattr(claude_locks.os, "stat", vanishing)
@@ -1197,11 +1209,16 @@ class TestADanglingSymlinkDoesNotPinACore:
         )
         # AND ONLY WHAT IS LEFT. `min(flat, timeout)` is the same number as
         # `min(flat, remaining)` until the budget runs low, so the overshoot
-        # is only visible on the LAST sleep of the run.
+        # is only visible on the LAST sleep of the run -- which the floor
+        # below is what makes the run reach at all.
+        assert min(left for left, _ in slept) < 0.05, (
+            f"the run never reached a clamped sleep: {slept}"
+        )
         for left, seconds in slept:
             assert seconds <= max(left, 0.0) + 0.005, (
-                f"slept {seconds}s with {left}s left -- the swept-name clamp "
-                f"used `timeout`, not what remains of it (all: {slept})"
+                f"slept {seconds:.4f}s with {left:.4f}s left -- the swept-name "
+                f"clamp used `timeout`, not what remains of it (all: "
+                f"{[(round(l, 4), round(s, 4)) for l, s in slept]})"
             )
 
 
@@ -1423,7 +1440,6 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             assert lock_dir.exists()
         assert not lock_dir.exists()
 
-    @needs_the_trial_machinery
     def test_a_contended_acquire_never_probes(self, tmp_path, monkeypatch):
         """The probe is on the path that READS its answer, not above the loop.
 
@@ -1457,6 +1473,34 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             pass
         assert probes == [held.parent], (
             f"{probes} -- an acquire that TAKES the name still has to ask"
+        )
+
+    def test_a_raise_inside_the_probe_does_not_strand_the_name(
+        self, tmp_path, monkeypatch
+    ):
+        """The probe now runs while we hold the name and nothing else does.
+
+        It sleeps between its trials, which is where a KeyboardInterrupt is
+        delivered, and it sits between the `mkdir` that took the name and the
+        `try:` whose `finally:` removes it. A raise there leaves an unheld
+        lock for the whole staleness window -- 60s on the credentials lock,
+        which is Claude Code's own refresh blocked on nobody. Only `OSError`
+        reaches the arm that cleans up, and the probe never raises that one.
+        """
+        import claude_swap.claude_locks as cl
+
+        target = tmp_path / "a.lock"
+
+        def interrupted(parent):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(cl, "_fd_pins_an_inode", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            with proper_lockfile(target, timeout=2.0):
+                pass
+        assert not target.exists(), (
+            f"{sorted(p.name for p in tmp_path.iterdir())} -- the name was "
+            "taken and then abandoned, so every waiter blocks on nobody"
         )
 
 

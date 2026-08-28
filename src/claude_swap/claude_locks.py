@@ -315,7 +315,19 @@ def proper_lockfile(
     while True:
         try:
             os.mkdir(lock_dir)
-            can_pin = _fd_pins_an_inode(lock_dir.parent)
+            try:
+                can_pin = _fd_pins_an_inode(lock_dir.parent)
+            except BaseException:
+                # THE NAME IS OURS AND THE `finally` THAT REMOVES IT IS NOT
+                # REACHED UNTIL THE `yield`. The probe sleeps, which is where
+                # a KeyboardInterrupt lands, and only `OSError` reaches the
+                # arm below -- so anything else would leave an unheld lock for
+                # the whole staleness window.
+                try:
+                    os.rmdir(lock_dir)
+                except OSError:
+                    pass
+                raise
             # HOLD A DESCRIPTOR ON THE DIRECTORY WE MADE, and take identity
             # from it. An mtime is a value we WRITE, so a successor's
             # directory can come to carry ours; (st_dev, st_ino) is the object
