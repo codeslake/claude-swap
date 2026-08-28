@@ -704,13 +704,18 @@ class TestSwapAccounts:
         ea, eb = "account1@example.com", "account2@example.com"
         switcher._write_account_credentials("1", ea, "rt-a")
         switcher._write_account_credentials("2", eb, "rt-b")
-        # A stale value already sitting under the DESTINATION key, which is
-        # the state the purge's own comment says recovery must never reach.
-        switcher._store._write_account_credentials("2", ea, "stale-foreign")
-        assert switcher._store._read_previous_backup("2", ea) == "", (
-            "premise: the destination key has no .prev before the swap, so "
-            "anything found after it was retained BY the swap"
-        )
+        # A stale value under EACH destination key, which is the state the
+        # purge's own comment says recovery must never reach. Both, because
+        # a key with nothing under it retains no .prev, so asserting on one
+        # of those says the same thing whatever the purge names.
+        switcher._store._write_account_credentials("2", ea, "stale-foreign-a")
+        switcher._store._write_account_credentials("1", eb, "stale-foreign-b")
+        for num, email in (("2", ea), ("1", eb)):
+            assert switcher._store._read_previous_backup(num, email) == "", (
+                f"premise: destination key ({num}, {email}) has no .prev "
+                "before the swap, so anything found after it was retained "
+                "BY the swap"
+            )
 
         switcher.swap_accounts("1", "2")
 
