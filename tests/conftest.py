@@ -408,13 +408,10 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
                 and os.path.basename(candidate) == _GUARD_PROBE_MARKER):
             continue
         # A non-recursive root matches on `target.parent`, which pathlib
-        # reports literally -- `<root>/sub/..` is not `<root>`, so a direct
-        # child stayed reachable by spelling its own parent the long way.
-        # Pure string work, no syscall. A symlinked spelling still walks
-        # past; realpath on the candidate ALONE is worse than the gap --
-        # measured, it lets the plain spelling through whenever a root is
-        # itself a symlink (a dotfiles `~/.claude`), because the resolved
-        # candidate no longer equals the unresolved root.
+        # reports literally, so `<root>/sub/..` reached a direct child the
+        # long way. A symlinked spelling still does: closing THAT needs the
+        # frozen roots resolved too -- resolving only the candidate lets the
+        # plain spelling through whenever a root is itself a symlink.
         candidate = os.path.normpath(candidate)
         target = Path(candidate)
         for root, recursive in _REAL_STORE_SPECS:

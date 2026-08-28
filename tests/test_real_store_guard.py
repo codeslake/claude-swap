@@ -277,7 +277,8 @@ def test_a_dot_dot_spelling_cannot_walk_past_a_non_recursive_root(
 
     walked = f"{non_recursive_root}/sub/../.credentials.json"
     with pytest.raises(conftest.RealStoreWriteBlocked):
-        open(walked, "w").close()
+        with open(walked, "w"):
+            pass
     assert not (non_recursive_root / ".credentials.json").exists()
 
 
@@ -337,6 +338,14 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
 
+    # CONTROL: the patch above really selected this layout. Without it both
+    # arms resolve the same store, and the legacy coverage this test exists
+    # for disappears with nothing failing.
+    assert paths.get_backup_root() == (
+        home / ".claude-swap-backup" if platform is Platform.MACOS
+        else home / ".local" / "share" / "claude-swap"
+    )
+
     specs = conftest._freeze_real_store_specs()
     roots = {root for root, _ in specs}
     recursive_roots = {root for root, recursive in specs if recursive}
@@ -349,11 +358,16 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     # PREMISE: a SIBLING of the backup root, so no recursive root covering
     # that root ever reaches it -- on either layout.
     assert not any(root in flag.parents for root in recursive_roots)
-    if platform is Platform.LINUX:
-        # And on THIS layout nothing else covers it either, which is what
-        # the entry is for. The legacy layout puts the flag directly in
-        # `$HOME`, whose own root already covers it.
-        assert flag.parent not in roots
+    # BEHAVIOUR, not membership. A FILE root is reachable only through the
+    # `target == root` arm -- nothing can sit under a file -- and deleting
+    # that arm leaves the ENTIRE suite green, so assert the refusal itself.
+    # The parent is made first, while nothing protects it yet, so a
+    # regression reads as a write that was ALLOWED, not a missing directory.
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", specs)
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        flag.touch()
+    assert not flag.exists()
 
     # Every DIRECTORY `--share-history` shares needs a recursive root of its
     # own: its contents land two levels under the non-recursive `~/.claude`.

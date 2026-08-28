@@ -146,12 +146,11 @@ def _wipe_throwaway_artifacts(target: Path) -> None:
 
 
 def migration_flag_for(target: Path) -> Path:
-    """The interrupted-migration flag for ``target``.
+    """The interrupted-migration flag for ``target``: a SIBLING of the
+    backup root, not a child.
 
-    A SIBLING of the backup root, so no protected root that covers the root
-    itself covers this file. Spell it here only: this flag is what turns the
-    collision refusal below into an rmtree of the destination, and a second
-    copy drifts.
+    Spell it here only -- this flag is what turns the collision refusal
+    below into an rmtree of the destination, and a second copy drifts.
     """
     return target.parent / f".{target.name}.migrating"
 
