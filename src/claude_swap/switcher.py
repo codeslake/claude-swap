@@ -4957,7 +4957,18 @@ class ClaudeAccountSwitcher:
         # is not examined at all — it can neither confirm a dead verdict nor
         # witness a heal. The backup below becomes the only source that can
         # answer.
-        if not (is_active and active_read_degraded) and entry.token_dead(
+        # EMPTY live bytes confirm nothing. `credential_fingerprint("")` is
+        # None, and `token_dead(stored_fp=None)` skips the binding check and
+        # answers on the raw strike count -- so an active slot whose live
+        # credential is cleanly absent would bind a strike no source matches,
+        # against this method's own rule that the strike holds while ANY
+        # stored source still matches. The backup below is the source that
+        # can answer, and it already guards on being non-empty. An IDLE
+        # slot's empty backup keeps confirming: there `stored` IS the only
+        # source, and nothing is at stake in replacing it.
+        if (stored or not is_active) and not (
+            is_active and active_read_degraded
+        ) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(stored)
         ):
             return True

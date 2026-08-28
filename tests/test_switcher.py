@@ -14000,6 +14000,69 @@ class TestActiveSlotStrikeParity:
             "refused to let us disprove"
         )
 
+    def test_an_empty_live_credential_does_not_confirm_a_strike(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch, block_real_keychain
+    ):
+        """An active slot whose live credential is cleanly ABSENT confirms
+        nothing: `credential_fingerprint("")` is None, and `token_dead`
+        skips the binding check on a None fingerprint and answers on the
+        raw strike count. The backup is the source that can answer.
+
+        Both directions in one case, because a blanket refusal would pass
+        the first assert and lose the second.
+        """
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        struck_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-struck",
+                              "refreshToken": "rt-struck", "expiresAt": 1000}})
+        healed_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-healed",
+                              "refreshToken": "rt-healed", "expiresAt": 2000}})
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(struck_gen))},
+            identities,
+        )
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "b@example.com", "accountUuid": "acct-2",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        assert s.current_account_number() == "2"
+
+        # PREMISE: the live read is CLEANLY empty -- no failure on either
+        # axis, so neither flag nor the `.value is None` arm can refuse, and
+        # only the emptiness itself is left to decide.
+        active = s._store._read_active_credentials()
+        assert active == ("", False, False), (
+            f"premise: a clean empty active read, got {active!r}"
+        )
+
+        # The healed backup: no source matches the struck generation.
+        s._write_account_credentials("2", "b@example.com", healed_gen)
+        assert s._slot_token_dead("2", "b@example.com") is False, (
+            "DEFECT: an active slot was condemned on nothing -- the live "
+            "bytes are absent and the backup is a different generation, so "
+            "no stored source matches the strike. `cswap import` then "
+            "replaces the healthy backup without --force"
+        )
+
+        # CONTROL: the backup DOES match the struck generation, so the
+        # strike is confirmed by a source that was actually read. A blanket
+        # refusal on an empty live value would lose this.
+        s._write_account_credentials("2", "b@example.com", struck_gen)
+        assert s._slot_token_dead("2", "b@example.com") is True, (
+            "control: a matching backup must still confirm dead"
+        )
+
 class TestUltraReviewCoverageGaps:
     """Ultra-review test-coverage findings: demotion re-read branch,
     degraded+force_refresh, active-path struck_fp stamping, add-path
