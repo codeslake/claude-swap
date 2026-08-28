@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -1152,7 +1153,7 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             ([True] * n, True),
             ([False] + [True] * (n - 1), False),
             ([True] * (n - 1) + [False], False),
-            ([False] * n, False),
+            ([True, False] + [True] * (n - 2), False),
         ):
             seq = iter(answers)
             monkeypatch.setattr(cl, "_one_pin_trial", lambda p: next(seq))
@@ -1180,7 +1181,13 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         # naps alone passes for a mutation that takes every sleep before the
         # loop, which is back-to-back sampling with the right arithmetic.
         events: list = []
-        monkeypatch.setattr(cl.time, "sleep", events.append)
+        monkeypatch.setattr(
+            cl, "time",
+            types.SimpleNamespace(
+                sleep=events.append, monotonic=time.monotonic,
+                time=time.time, time_ns=time.time_ns,
+            ),
+        )
         monkeypatch.setattr(
             cl, "_one_pin_trial", lambda p: (events.append("trial"), True)[1]
         )
@@ -1277,7 +1284,14 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
                "there by construction and has nothing to report",
     )
     def test_the_probe_reports_a_presence(self, tmp_path):
-        """The control: on this filesystem the descriptor DOES pin."""
+        """The control: on this filesystem the descriptor DOES pin.
+
+        Guarded on the PLATFORM and not on `_CAN_PIN_A_DIRECTORY`, which is
+        what it exists to check: keyed on that constant it would skip where it
+        must fail, and it is the only test that notices the constant wrongly
+        False. So a failure here means one of two things -- the constant is
+        wrong, or `tmp_path` is on a filesystem that does not pin.
+        """
         import claude_swap.claude_locks as cl
 
         cl._PIN_PROBE.clear()
@@ -1286,9 +1300,9 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             # AND THE DEVICE IS PART OF THE KEY. Pinning is a filesystem
             # property, so a mount landing under this path must not be
             # answered out of the probe of the filesystem it replaced.
-            assert list(cl._PIN_PROBE) == [
-                (str(tmp_path), os.stat(tmp_path).st_dev)
-            ], cl._PIN_PROBE
+            assert list(cl._PIN_PROBE) == [os.stat(tmp_path).st_dev], (
+                cl._PIN_PROBE
+            )
         finally:
             cl._PIN_PROBE.clear()
 

@@ -65,9 +65,9 @@ _RELEASE_WAIT_S = 5.0
 # mtime stamp was, but not pinned, so an index a takeover frees can come back.
 _CAN_PIN_A_DIRECTORY = sys.platform != "win32"
 
-# Keyed on the PARENT, which is where the mkdir happens. One probe per
-# directory per process; a stray answer is never cached.
-_PIN_PROBE: dict[tuple[str, int], bool] = {}
+# Keyed on the DEVICE the mkdir lands on. One probe per filesystem per
+# process; a stray answer is never cached.
+_PIN_PROBE: dict[int, bool] = {}
 _PIN_TRIALS = 4
 # Repeats bound the error only if the samples are INDEPENDENT. Trials
 # microseconds apart fit inside one contention burst and agree wrongly, and a
@@ -96,10 +96,12 @@ def _fd_pins_an_inode(parent: Path) -> bool:
     """
     if not _CAN_PIN_A_DIRECTORY:
         return False
-    # THE DEVICE IS PART OF THE SUBJECT: pinning is a filesystem property, so
-    # a mount landing here would be answered out of the old filesystem's probe.
+    # THE DEVICE IS THE WHOLE SUBJECT: pinning is a property of the mount, not
+    # of a path on it. Keyed on the path as well, a mount landing here answered
+    # out of the filesystem it replaced, and the two parents a switch probes
+    # paid for two probes of one filesystem.
     try:
-        key = (str(parent), os.stat(parent).st_dev)
+        key = os.stat(parent).st_dev
     except OSError:
         return False
     cached = _PIN_PROBE.get(key)
