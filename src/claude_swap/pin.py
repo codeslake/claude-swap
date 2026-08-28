@@ -1360,6 +1360,14 @@ def _config_already_names(identity: "dict | None") -> bool:
 
     The package answers a skipped write and an already-correct config with
     the same `False`, and only the file can separate them.
+
+    THE UUID ALONE, NOT THE ORG, when both sides carry one -- the same call
+    `_config_names_the_pin` makes. `_find_account_slot`'s model is that the
+    account uuid is globally unique and the org only corroborates, so a
+    same-uuid/different-org config is the same account with a stale org, not
+    a sibling. `_live_identity_matches` reaches the opposite verdict from the
+    EMAIL, which cannot tell two accounts apart on its own; this has the
+    stronger key and does not need the org to disambiguate.
     """
     if not identity:
         return False
@@ -1378,7 +1386,13 @@ def _config_already_names(identity: "dict | None") -> bool:
     # then blanks and declines about a config that matches byte for byte,
     # and `_restore_pin` reads that as a rollback that did not happen.
     uuid = identity.get("accountUuid")
-    if uuid:
+    # AND THE CONFIG MUST HAVE ONE TOO, or the strong key is not available
+    # and the composite is still the best evidence. `cswap add --token`
+    # writes a stored config with a BLANK `accountUuid` while
+    # `backfill_account_uuid` fills only the roster row, so the identity can
+    # carry a uuid the config has never held -- and keying on the identity's
+    # alone declines a config matching every field it actually has.
+    if uuid and current.get("accountUuid"):
         return current.get("accountUuid") == uuid
     want = (_config_address(identity), identity.get("organizationUuid") or "")
     # A BLANK IS NOT A MATCH: with no uuid to fall back on, two unreadable

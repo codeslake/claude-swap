@@ -3731,6 +3731,56 @@ class TestTheThirdReaderOfTheSameField:
             "DEFECT: the blank guard declined a config that carries the "
             "identity exactly, so a clean rollback reports as a failure")
 
+    def test_a_config_with_no_accountuuid_falls_back_to_the_composite(
+            self, temp_home):
+        """The strong key decides only when the CONFIG has one too.
+
+        `cswap add --token` writes a stored config with `accountUuid: ""`
+        and a roster row with `uuid: ""`; `backfill_account_uuid` later
+        fills the ROW and never rewrites the live config. So the identity
+        can carry a uuid the config does not have -- and keying on the
+        identity's uuid alone answers False about a config that matches on
+        every field it actually holds, which `_restore_pin` reads as a
+        rollback that did not happen.
+
+        Both shapes: a blank accountUuid, and no such key at all.
+        """
+        from claude_swap import pin
+
+        for oauth in ({"emailAddress": "cloud@example.com",
+                       "accountUuid": "", "organizationUuid": ""},
+                      {"emailAddress": "cloud@example.com",
+                       "organizationUuid": ""}):
+            (temp_home / ".claude.json").write_text(
+                json.dumps({"oauthAccount": oauth}))
+            assert pin._config_already_names(
+                {"emailAddress": "cloud@example.com",
+                 "organizationUuid": "", "accountUuid": "acct-U"}) is True, (
+                f"DEFECT: config {oauth!r} matches on every field it holds, "
+                "but the identity's uuid made this answer False -- so the "
+                "rollback tail says the record may still name it")
+
+    def test_an_identity_with_no_uuid_lets_the_composite_decide(
+            self, temp_home):
+        """MIRROR of the case above: the identity is the half without a uuid.
+
+        `identity_for_config` returns a stored config verbatim when the
+        roster row's `uuid` is blank, so the identity can lack the key while
+        the live config has one. Requiring the IDENTITY's uuid alone would
+        compare `current.get("accountUuid") == None` and answer False about
+        a config the composite matches exactly.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "cloud@example.com", "accountUuid": "UUID-LIVE",
+            "organizationUuid": "org-A"}}))
+        assert pin._config_already_names(
+            {"emailAddress": "cloud@example.com",
+             "organizationUuid": "org-A"}) is True, (
+            "DEFECT: the identity has no uuid, so the composite had to "
+            "decide -- and it matches")
+
     def test_control_a_different_accountuuid_is_still_refused(self, temp_home):
         """CONTROL: the strong key must be able to say No.
 
