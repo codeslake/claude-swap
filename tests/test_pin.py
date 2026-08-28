@@ -2794,6 +2794,68 @@ class TestPurgeDoesNotStrandTheWiring:
         assert "HTTPS_PROXY" not in raw.get("env", {})
 
 
+class TestAClearWithoutThePackageUnsplicesTheConfig:
+    """The record and the config splice are two halves of one state.
+
+    `_clear_pin_record` is the fallback for cswap's half. The package owns
+    the other half, and this path is the one where there IS no package, so
+    leaving it there means nothing records a pin while the config still
+    names the pinned account — and `_live_login_identity` then has nothing
+    to un-splice against and answers it literally.
+    """
+
+    def test_the_splice_is_undone_when_the_package_cannot(self, temp_home):
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        live = "live@example.com"
+        pinned = "cloud@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {"1": {"email": live, "uuid": "uuid-1", "organizationUuid": "",
+                               "organizationName": "", "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", live, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        s._write_account_config("1", live, json.dumps(
+            {"oauthAccount": {"emailAddress": live, "accountUuid": "uuid-1"}}))
+        # A pin record, and the config SPLICED to name the pinned account.
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": pinned}})
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {}, "oauthAccount": {"emailAddress": pinned, "accountUuid": "uuid-cloud"}}))
+        # PREMISES: a pin is recorded, and the config names it, not the live account.
+        assert (pin_mod._pinned_email_now(s) or (None,))[0] == pinned
+        assert json.loads(cfg.read_text())["oauthAccount"]["emailAddress"] == pinned
+
+        class _Dead:
+            def apply_pin(self, *a, **k):
+                raise ImportError("cryptography")
+
+        with patch.object(pin_mod, "_impl", lambda: _Dead()):
+            ok, msg = pin_mod.clear_pin(s)
+
+        after = json.loads(cfg.read_text()).get("oauthAccount") or {}
+        print(f"\nclear_pin -> ok={ok} msg={msg!r}")
+        print(f"record after : {pin_mod._pinned_email_now(s)!r}")
+        print(f"config after : {after.get('emailAddress')!r}")
+        assert ok, "premise: the clear must report success (that is the reported behaviour)"
+        assert pin_mod._pinned_email_now(s) is None, "premise: the record half IS cleared"
+        assert after.get("emailAddress") == live, (
+            "DEFECT: the record was cleared and the config splice was left, so "
+            "nothing records a pin while the config still names the pinned "
+            "account; the next switch backs the live credential up to that slot"
+        )
+
+
 class TestClearRunsWithTheExtraGone:
     """`cswap pin --clear` is priority 1 and the whole reason clear_wiring
     lives in cswap rather than the optional package.
@@ -7745,7 +7807,7 @@ class TestClearPinCapturesEvidenceBeforeAnythingUnwires:
             pin, "wired_env_keys",
             lambda _s: order.append("snapshot") or {})
         monkeypatch.setattr(pin, "_pinned_email_now", lambda _s: None)
-        monkeypatch.setattr(pin, "clear_wiring", lambda _s: False)
+        monkeypatch.setattr(pin, "clear_wiring", lambda _s, **_k: False)
         monkeypatch.setattr(pin, "env_keys_survive", lambda _b: {})
         monkeypatch.setattr(pin, "_clear_pin_record", lambda _s: None)
 

@@ -144,7 +144,8 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     ]
 
 
-def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
+def clear_wiring(switcher, timeout: float | None = None, only=None,
+                 unsplice_to=None) -> bool:
     """Remove a pin wiring from the global config. True when it removed one.
 
     ``only`` narrows it to the given config paths. The default -- every wired
@@ -212,7 +213,7 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
             with proper_lockfile(
                 path.parent / (path.name + ".lock"), timeout=share
             ):
-                if _clear_wiring_locked(switcher, path):
+                if _clear_wiring_locked(switcher, path, unsplice_to):
                     changed = True
         except Exception as exc:  # noqa: BLE001
             # A lock we cannot take skips THIS file, never the other one.
@@ -224,8 +225,14 @@ def clear_wiring(switcher, timeout: float | None = None, only=None) -> bool:
     return changed
 
 
-def _clear_wiring_locked(switcher, path) -> bool:
-    """The read-modify-write of :func:`clear_wiring`, under its lock."""
+def _clear_wiring_locked(switcher, path, unsplice_to=None) -> bool:
+    """The read-modify-write of :func:`clear_wiring`, under its lock.
+
+    ``unsplice_to`` puts ``oauthAccount`` back, and only ``clear_pin``'s
+    package-gone fallback passes it. It rides this function because the
+    identity and the env block live in the same file under the same lock,
+    and a second locked pass over both configs would be a second budget.
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -233,8 +240,24 @@ def _clear_wiring_locked(switcher, path) -> bool:
     if not isinstance(raw, dict):
         return False
 
+    # THE PACKAGE'S HALF OF THE PIN, ON THE PATH WHERE THERE IS NO PACKAGE.
+    # Left spliced, the config names the pinned account while nothing
+    # records a pin, so `_live_login_identity` has no pin to un-splice
+    # against and returns it literally -- and the next switch backs the live
+    # credential up under that account's slot key.
+    unspliced = False
+    if unsplice_to and raw.get("oauthAccount") != unsplice_to:
+        raw["oauthAccount"] = unsplice_to
+        unspliced = True
+
     ours = _wire_mark_of(raw, path)
     if ours is None:
+        # No wiring of ours, but the splice is still ours to undo.
+        if unspliced:
+            try:
+                switcher._write_json(path, raw)
+            except (OSError, ConfigError):
+                pass
         return False  # nothing of ours in there
 
     env = raw.get("env")
@@ -1400,6 +1423,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
     try:
         impl = _impl()
         impl.apply_pin(switcher, None, None, identity=_back_to)
+        _unsplice = False
     except Exception:  # noqa: BLE001 — this command must work when the pin does not
         # The record is cswap's own file, so clear it here rather than
         # reporting that the package could not. With the extra uninstalled,
@@ -1408,6 +1432,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
         # did. `settings.json` -> `remoteControl` is as much cswap's file as
         # the wiring `clear_wiring` was moved here to remove.
         _clear_pin_record(switcher)
+        _unsplice = True
     # AND THE SAME FALLBACK WHEN IT DID NOT RAISE. A peer whose `apply_pin`
     # RETURNS and clears nothing reaches the dead end the branch above exists
     # to prevent, without going through it: the record is still there, the re-
@@ -1417,7 +1442,10 @@ def clear_pin(switcher) -> tuple[bool, str]:
     # does precisely this.
     if _pinned_email_now(switcher) is not None:
         _clear_pin_record(switcher)
-    cleared = clear_wiring(switcher)
+        _unsplice = True
+    # THE SPLICE IS THE OTHER HALF OF THE SAME STATE, and only the fallback
+    # leaves it: a working `apply_pin` already un-spliced with this identity.
+    cleared = clear_wiring(switcher, unsplice_to=_back_to if _unsplice else None)
     still_pinned = _pinned_email_now(switcher) is not None
     # THE ENV BLOCK, NOT THE MARKER. `_clear_wiring_locked` returns
     # `_clear_ledger(path)` AFTER the config write, so an unwritable
