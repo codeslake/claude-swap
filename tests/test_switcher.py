@@ -4128,7 +4128,7 @@ class TestPerformSwitchPostDisplay:
         try:
             with patch.object(
                 switcher, "_write_json", side_effect=failing_write_json,
-            ), pytest.raises(OSError, match="disk full"):
+            ), pytest.raises(SwitchError, match="disk full"):
                 switcher._perform_switch("1")
         finally:
             for p in patches:
@@ -8318,7 +8318,7 @@ class TestDirectActivationPreservation:
             switcher_mod.shutil, "copyfile", side_effect=dies_partway,
         ), patch.object(
             ClaudeAccountSwitcher, "_write_json", spy_write_json,
-        ), patch.object(switcher, "list_accounts"), pytest.raises(ConfigError):
+        ), patch.object(switcher, "list_accounts"), pytest.raises(SwitchError):
             switcher._perform_switch("1", emit_output=False)
 
         # PREMISES: the roster's write-through really ran, and the recovery
@@ -8402,7 +8402,7 @@ class TestDirectActivationPreservation:
             fsutil_mod.os, "replace", side_effect=busy_replace,
         ), patch.object(
             switcher_mod.shutil, "copyfile", side_effect=dies_partway,
-        ), patch.object(switcher, "list_accounts"), pytest.raises(ConfigError):
+        ), patch.object(switcher, "list_accounts"), pytest.raises(SwitchError):
             switcher._perform_switch("1", emit_output=False)
 
         # PREMISE: the write's EBUSY and its write-through must run, or this
@@ -8495,6 +8495,84 @@ class TestDirectActivationPreservation:
             f"config is unrecoverable and nothing says so: {excinfo.value}"
         )
 
+    def test_direct_activation_names_every_arm_it_could_not_restore(
+        self, temp_home
+    ):
+        """All three arms, not just the one that happened to be covered.
+
+        The report exists so a refused restore reaches the caller, and there
+        are three destinations it can name. The credentials one matters most:
+        its failure means the live OAuth credential was NOT put back, so the
+        machine keeps the target's token while `~/.claude.json` says
+        otherwise, and this message is the only thing that says so.
+
+        One fault reaches all three: the roster write fails with every arm
+        already armed, and every restore is then refused.
+        """
+        from claude_swap import switcher as switcher_mod
+        from claude_swap import models as models_mod
+
+        switcher, _ = self._setup(temp_home)
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com", "accountUuid": "",
+                "organizationUuid": None, "organizationName": None,
+            },
+            "userID": "user-abcdef",
+        }))
+
+        real_write_json = ClaudeAccountSwitcher._write_json
+        real_write_creds = switcher._write_credentials
+        wrote = {"creds": 0}
+
+        def fail_the_roster(self, path, data):
+            # LAST write in the block, so `creds_written`, `config_written`
+            # and `sequence_written` are all armed when it raises.
+            if os.path.basename(os.fspath(path)) == "sequence.json" and \
+                    data.get("activeAccountNumber") == 1:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write_json(self, path, data)
+
+        def refuse_every_restore(src, dst, *a, **k):
+            # At `models`' own binding, so only `_restore_atomically` sees it.
+            # EACCES is not EBUSY, so the helper refuses instead of rewriting.
+            raise OSError(errno.EACCES, "permission denied")
+
+        def creds_ok_then_refused(creds):
+            wrote["creds"] += 1
+            if wrote["creds"] == 1:
+                return real_write_creds(creds)
+            raise OSError(errno.EACCES, "permission denied")
+
+        with patch.object(
+            ClaudeAccountSwitcher, "_write_json", fail_the_roster,
+        ), patch.object(
+            models_mod, "replace_with_retry", side_effect=refuse_every_restore,
+        ), patch.object(
+            switcher, "_write_credentials", creds_ok_then_refused,
+        ), patch.object(switcher, "list_accounts"), pytest.raises(
+            SwitchError
+        ) as excinfo:
+            switcher._perform_switch("1", emit_output=False)
+
+        # PREMISE: the rollback really attempted the credential restore, or
+        # the assertion below is about an arm that never ran.
+        assert wrote["creds"] == 2, (
+            f"premise: the credentials arm must run, got {wrote['creds']} "
+            "write(s)"
+        )
+        message = str(excinfo.value)
+        for destination in (
+            switcher.sequence_file.name, config_path.name, "the live credential",
+        ):
+            assert destination in message, (
+                f"DEFECT: {destination!r} could not be restored and the "
+                f"report does not name it. The user is told the activation "
+                f"failed and nothing else: {message}"
+            )
+        del switcher_mod
+
     def test_stash_failure_aborts_direct_activation(self, temp_home):
         switcher, unmanaged = self._setup(temp_home)
         with patch.object(
@@ -8571,7 +8649,7 @@ class TestDirectActivationPreservation:
 
         with patch.object(
             switcher, "_write_json", side_effect=fail_sequence_write
-        ), pytest.raises(OSError, match="disk full"):
+        ), pytest.raises(SwitchError, match="disk full"):
             switcher._perform_switch("1", emit_output=False)
 
         # Both halves rolled back: the settings config and the orphaned login.

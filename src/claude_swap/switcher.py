@@ -7194,6 +7194,19 @@ class ClaudeAccountSwitcher:
                             f"{'; '.join(unrestored)}. Manual recovery may be "
                             f"needed."
                         ) from activation_error
+                    if creds_written or config_written or sequence_written:
+                        # THE OTHER HALF OF THE SAME MIRROR. The transaction
+                        # path wraps BOTH outcomes; wrapping only the failed
+                        # rollback left the common one raising `_write_json`'s
+                        # bare `OSError`, which is not a `ClaudeSwitchError` --
+                        # so `--json` printed nothing on stdout and a traceback
+                        # instead. Gated on an arm having run, like the
+                        # sibling's `if transaction.completed_steps`, so a
+                        # failure before the first write still reports itself.
+                        raise SwitchError(
+                            f"Activation failed and was rolled back: "
+                            f"{activation_error}"
+                        ) from activation_error
                     raise
 
                 if force_activate and current_identity is not None:
