@@ -2768,3 +2768,61 @@ class TestTheRollbackDecidesPerKey:
             f"the arm reached into the other slot for a key that was never "
             f"crossed: {reached}"
         )
+
+
+class TestASwapKeepsEachProfilesOwnGeneration:
+    """A swap moves a KEY. The credential does not change, and the matching
+    session profile moves with it, so nothing about it went stale."""
+
+    def test_a_successful_swap_does_not_strip_the_moved_profiles(
+        self, temp_home: Path
+    ):
+        import json
+
+        from claude_swap.session import session_dir_for
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        a, b = "a@example.com", "b@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                "1": {"email": a, "uuid": "", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+                "2": {"email": b, "uuid": "", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+            }})
+
+        def gen(who, g):
+            return json.dumps({"claudeAiOauth": {
+                "accessToken": f"at-{who}-{g}", "refreshToken": f"rt-{who}-{g}"}})
+
+        s._write_account_credentials("1", a, gen("A", "G0"))
+        s._write_account_credentials("2", b, gen("B", "G0"))
+        # Both profiles have RUN, so claude rotated inside them and nothing
+        # syncs that back: the profile holds the only usable generation.
+        for num, email, who in (("1", a, "A"), ("2", b, "B")):
+            d = session_dir_for(s.backup_dir, num, email)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / ".credentials.json").write_text(gen(who, "G1"), encoding="utf-8")
+
+        # PREMISE: the seeded generations really differ from the backups, or
+        # losing one would cost nothing and this case measures nothing.
+        assert json.loads(s.read_account_credentials("1", a))[
+            "claudeAiOauth"]["refreshToken"] == "rt-A-G0"
+
+        s.swap_accounts("1", "2")
+
+        for num, email, who in (("2", a, "A"), ("1", b, "B")):
+            seed = session_dir_for(s.backup_dir, num, email) / ".credentials.json"
+            assert seed.exists(), (
+                f"DEFECT: the swap stripped account {who}'s session profile. "
+                "The backup holds the generation claude already rotated past, "
+                "so the next run POSTs a consumed refresh token and the "
+                "account needs a re-login -- both slots, from one command "
+                "that reported success"
+            )
+            assert json.loads(seed.read_text())[
+                "claudeAiOauth"]["refreshToken"] == f"rt-{who}-G1"

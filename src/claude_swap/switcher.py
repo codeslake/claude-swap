@@ -306,6 +306,13 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
+    # CLASS-level, not set in __init__: the credential wrapper is reached
+    # by objects built with `__new__` -- a case constructs one that way to
+    # drive the write/invalidate pair directly -- and an instance-only
+    # default makes that an AttributeError instead of the "not moving
+    # keys" it means.
+    _moving_keys = False
+
     def __init__(self, debug: bool = False):
         self.home = Path.home()
         self.platform = Platform.detect()
@@ -384,6 +391,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.migrations import run_migrations
 
         run_migrations(self)
+        self._moving_keys = False
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -801,6 +809,15 @@ class ClaudeAccountSwitcher:
         # recovery material is still needed cannot act on a log line. The
         # forward path at `_write_account_credentials` ignores this; the
         # rollback's repair counts it.
+        # A SWAP MOVES A KEY, IT DOES NOT CHANGE A CREDENTIAL. This exists
+        # because a CHANGED backup makes the profile's copy stale; a swap
+        # writes the same bytes under a new key and moves the matching
+        # profile with them, so that profile is still this account's own --
+        # and NEWER, since claude rotates inside it and nothing syncs that
+        # back. Deleting it there leaves only the generation the server has
+        # already seen consumed.
+        if self._moving_keys:
+            return True
         if self._live_session_pids(account_num, email):
             from claude_swap.session import mark_session_stale
 
@@ -1194,22 +1211,29 @@ class ClaudeAccountSwitcher:
             # one needless restore, while arming it after the first write
             # would let an abort skip a restore that was owed.
             wrote_backups = True
-            if creds_a:
-                self._write_account_credentials(num_b, email_a, creds_a)
-            else:
-                self._delete_account_credentials_strict(num_b, email_a)
-            if config_a:
-                self._write_account_config(num_b, email_a, config_a)
-            else:
-                self._delete_config_backup(num_b, email_a)
-            if creds_b:
-                self._write_account_credentials(num_a, email_b, creds_b)
-            else:
-                self._delete_account_credentials_strict(num_a, email_b)
-            if config_b:
-                self._write_account_config(num_a, email_b, config_b)
-            else:
-                self._delete_config_backup(num_a, email_b)
+            # Scoped to the FORWARD writes only. The rollback's restores put
+            # back a value the profile's lineage really did move past, so
+            # they must invalidate as usual.
+            self._moving_keys = True
+            try:
+                if creds_a:
+                    self._write_account_credentials(num_b, email_a, creds_a)
+                else:
+                    self._delete_account_credentials_strict(num_b, email_a)
+                if config_a:
+                    self._write_account_config(num_b, email_a, config_a)
+                else:
+                    self._delete_config_backup(num_b, email_a)
+                if creds_b:
+                    self._write_account_credentials(num_a, email_b, creds_b)
+                else:
+                    self._delete_account_credentials_strict(num_a, email_b)
+                if config_b:
+                    self._write_account_config(num_a, email_b, config_b)
+                else:
+                    self._delete_config_backup(num_a, email_b)
+            finally:
+                self._moving_keys = False
 
             data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
             int_a, int_b = int(num_a), int(num_b)
