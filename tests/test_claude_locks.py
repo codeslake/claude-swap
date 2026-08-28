@@ -1068,6 +1068,11 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
     already exists; it just has to be armed by the filesystem's answer.
     """
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
+               "there, so the trial machinery is unreachable by construction",
+    )
     def test_one_trial_that_sees_the_reuse_decides(self, tmp_path, monkeypatch):
         """A trial reports "pinned" by NOT seeing the number come back.
 
@@ -1098,6 +1103,11 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             )
         cl._PIN_PROBE.clear()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
+               "there, so the trial machinery is unreachable by construction",
+    )
     def test_a_probe_that_cannot_run_is_not_cached(self, tmp_path, monkeypatch):
         """Refusing to trust the pin is the safe direction, but a refusal
         that cannot be measured must not become a permanent answer."""
