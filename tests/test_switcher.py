@@ -13914,6 +13914,92 @@ class TestActiveSlotStrikeParity:
         )
 
 
+    def test_a_refused_active_item_does_not_condemn_the_slot(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch, block_real_keychain
+    ):
+        """The refusal's two FLAGS, not its `.value is None` arm, are what
+        stop a degraded active read condemning a healed slot.
+
+        Keychain ACLs are per ITEM, so Claude Code's credential can refuse a
+        read while cswap's own backup answers -- the state an ssh-driven
+        session reaches routinely. The active read then falls back to the
+        plaintext file, which on macOS LAGS (Claude Code rotates
+        keychain-only), so it serves the STRUCK generation while the healed
+        one is unreadable. Answering "dead" from those bytes lets `cswap
+        import` replace the slot without --force and switch-time adoption
+        overwrite it with a foreign credential.
+
+        The sibling arms cannot stand in: the backup is readable here, and
+        `value` is the struck generation rather than None.
+        """
+        from claude_swap.usage_store import FetchRecord as FR
+        sample_sequence_data["accounts"]["2"]["email"] = "b@example.com"
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        struck_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-struck",
+                              "refreshToken": "rt-struck", "expiresAt": 1000}})
+        healed_gen = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-healed",
+                              "refreshToken": "rt-healed", "expiresAt": 2000}})
+        s._write_account_credentials("2", "b@example.com", healed_gen)
+        identities = {"2": ("b@example.com", "")}
+        s._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(struck_gen))},
+            identities,
+        )
+        cfg = s._get_claude_config_path()
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        s._write_json(cfg, {"oauthAccount": {
+            "emailAddress": "b@example.com", "accountUuid": "acct-2",
+            "organizationUuid": "", "organizationName": "",
+        }})
+        s._store._write_active_credentials_file(struck_gen)
+        assert s.current_account_number() == "2"
+
+        real_get = block_real_keychain.get_password
+
+        def only_the_active_item_is_refused(service, account):
+            if service == CLAUDE_CODE_KEYCHAIN_SERVICE:
+                raise KeychainError("locked")
+            return real_get(service, account)
+
+        monkeypatch.setattr(
+            macos_keychain, "get_password", only_the_active_item_is_refused)
+
+        # PREMISES. Without these the case can pass on an arm that is
+        # already covered: an unreadable BACKUP returns False several lines
+        # earlier, and a `None` value is the third arm of this same refusal.
+        backup, unreadable = s._read_account_credentials_ex(
+            "2", "b@example.com")
+        assert not unreadable and backup == healed_gen, (
+            "premise: the backup must stay readable, or the earlier "
+            "unreadable-backup arm decides this and the flags decide nothing"
+        )
+        active = s._store._read_active_credentials()
+        assert active.value is not None, (
+            "premise: the fallback must supply bytes, or `.value is None` "
+            "produces the refusal"
+        )
+        assert active.keychain_unavailable or active.degraded, (
+            "premise: the read must report the refused item"
+        )
+        entry = s._usage_store.entries(identities).get("2")
+        assert entry is not None and entry.token_dead(
+            stored_fp=oauth.credential_fingerprint(active.value)), (
+            "premise: those served bytes must be the struck generation, or "
+            "the fingerprint compare answers not-dead without the guard"
+        )
+
+        assert s._slot_token_dead("2", "b@example.com") is False, (
+            "DEFECT: a slot was condemned on a generation the Keychain "
+            "refused to let us disprove"
+        )
+
 class TestUltraReviewCoverageGaps:
     """Ultra-review test-coverage findings: demotion re-read branch,
     degraded+force_refresh, active-path struck_fp stamping, add-path
