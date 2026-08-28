@@ -193,7 +193,9 @@ def _assert_no_step_can_swallow_failure(job: str, which: str) -> None:
     # loses every one nobody enumerated: a trailing comment defeats an
     # end-anchor (`true  # flaky on the shared runner` is how a person
     # actually writes it), and `${{ }}` is GitHub's own documented form.
-    assert not re.search(r"^\s*continue-on-error:\s*(?!false\b)\S", job, re.M), (
+    assert not re.search(
+        r"^\s*continue-on-error\s*:\s*(?!(?:'|\"|\$\{\{\s*)?false\b)\S",
+        job, re.M | re.I), (
         f"the {which} job's step is continue-on-error, so a failure there "
         "is green"
     )
