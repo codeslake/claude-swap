@@ -802,7 +802,15 @@ class SessionManager:
                 self._sync_sharing(session_dir, share, share_history)
                 return session_dir, account_num, email
 
-            self._bootstrap(session_dir, account_num, email, org_uuid)
+            # SAME RULE AS THE BRANCH ABOVE, and this arm is the one that
+            # runs when the probe merely FAILED -- a binary mid-update, a
+            # loaded machine, an in-session /login -- none of which means
+            # nothing is running in there. `_bootstrap` deletes the Keychain
+            # entry and overwrites `.credentials.json`, so under a live
+            # claude it costs that instance its session, and the raise below
+            # then tells the user the profile was left in place.
+            if profile_is_quiescent(session_dir):
+                self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share, share_history)
 
             verdict = self._session_validity(session_dir, email, org_uuid)

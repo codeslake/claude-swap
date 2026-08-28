@@ -599,6 +599,42 @@ class TestBootstrap:
             "and the identity out from under a running instance"
         )
 
+    def test_a_live_profile_is_not_reseeded_when_the_probe_fails(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """A failed probe is not evidence that nothing is running.
+
+        `_bootstrap` deletes the Keychain entry and overwrites
+        `.credentials.json` with the backup lineage. Under a live claude
+        that is the generation the running instance rotated into, held
+        nowhere else — its next refresh gets invalid_grant and the session
+        dies. The raise that follows says the profile was left in place.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "live-generation", encoding="utf-8"
+        )
+        make_live(session_dir)
+        assert not session_mod.profile_is_quiescent(session_dir)
+
+        def unreachable(cmd, env=None, **kwargs):
+            raise OSError("claude is mid-update")
+
+        monkeypatch.setattr(session_mod.subprocess, "run", unreachable)
+        with pytest.raises(SessionError, match="left in place"):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        seed = (session_dir / ".credentials.json").read_text(encoding="utf-8")
+        print(f"\nSEED AFTER: {seed[:60]!r}")
+        assert seed == "live-generation", (
+            "DEFECT: _bootstrap rewrote a LIVE profile's credential, and the "
+            "error the user sees says the profile is left in place"
+        )
+
     def test_a_swept_profile_keeps_its_liveness_ledger(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
         block_real_keychain
