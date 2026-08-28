@@ -88,7 +88,9 @@ def config_lock_dir() -> Path:
 _TAKEOVER_GUARD_S = 0.5
 
 
-def _take_over_stale(lock_dir, staleness: float) -> bool:
+def _take_over_stale(
+    lock_dir, staleness: float, budget: float = _TAKEOVER_GUARD_S
+) -> bool:
     """Remove a lock whose holder is gone, but never a successor's.
 
     `os.stat` decides and `os.rmdir` acts, and between them another waiter
@@ -107,7 +109,7 @@ def _take_over_stale(lock_dir, staleness: float) -> bool:
     """
     guard = lock_dir.parent / f"{lock_dir.name}.takeover"
     try:
-        with FileLock(guard, timeout=_TAKEOVER_GUARD_S):
+        with FileLock(guard, timeout=max(0.0, min(_TAKEOVER_GUARD_S, budget))):
             try:
                 if time.time() - os.stat(lock_dir).st_mtime <= staleness:
                     return False  # a peer retook it; it is not ours to remove
@@ -166,7 +168,9 @@ def proper_lockfile(
             # Dead holder per the protocol: remove and retake. Declining --
             # a peer retook it, or the corpse could not be removed -- must
             # not spin hot, and must not sleep past the deadline.
-            if not _take_over_stale(lock_dir, staleness):
+            if not _take_over_stale(
+                lock_dir, staleness, deadline - time.monotonic()
+            ):
                 time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
         # Clamped to the remaining budget, so `timeout` bounds the whole

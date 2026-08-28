@@ -898,6 +898,64 @@ class TestEveryArmOfTheLoopBacksOff:
         _assert_backed_off(slept, budget)
 
 
+class TestTheTakeoverGuardIsInsideTheTimeout:
+    """`timeout` bounds the whole call, and the guard is the one place it did not.
+
+    The clamped sleeps in the retry loop exist so a deadline crossed
+    mid-iteration cannot overrun. The takeover's own `FileLock` was handed a
+    fixed wait instead of the remaining budget, so a contended guard added up
+    to its own timeout ON TOP, once per call -- and a single switch takes
+    three of these locks.
+    """
+
+    def test_a_contended_guard_does_not_outlive_the_budget(self, tmp_path):
+        import threading
+
+        FileLock = claude_locks.FileLock
+
+        target = tmp_path / "target.lock"
+        target.mkdir()
+        stale = time.time() - 100
+        os.utime(target, (stale, stale))
+        guard = target.parent / f"{target.name}.takeover"
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with FileLock(guard, timeout=5):
+                held.set()
+                release.wait(5)
+
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        assert held.wait(5), "premise: the peer must hold the guard"
+        try:
+            budget = 0.2
+            started = time.monotonic()
+            with pytest.raises(ClaudeCodeLockTimeout):
+                with proper_lockfile(target, timeout=budget, staleness=1.0):
+                    pass
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            t.join(5)
+
+        assert elapsed < budget + 0.15, (
+            f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
+            f"guard is not clamped to the remaining time"
+        )
+
+    def test_control_an_uncontended_guard_takes_the_corpse(self, tmp_path):
+        """CONTROL: the clamp must not stop a takeover that should happen."""
+        target = tmp_path / "target.lock"
+        target.mkdir()
+        stale = time.time() - 100
+        os.utime(target, (stale, stale))
+        with proper_lockfile(target, timeout=2.0, staleness=1.0):
+            pass
+
+
 class TestADeadlineCanPassMidIterationForEveryArm:
     """The floor under each arm's clamp, which nothing here exercised.
 
@@ -956,9 +1014,11 @@ class TestADeadlineCanPassMidIterationForEveryArm:
         os.utime(target, (stale, stale))
 
         real_rmdir = os.rmdir
+        refused = {"n": 0}
 
         def refusing(path, *a, **k):
             if os.fspath(path) == os.fspath(target):
+                refused["n"] += 1
                 raise PermissionError(errno.EACCES, "cannot remove it either")
             return real_rmdir(path, *a, **k)
 
@@ -966,14 +1026,20 @@ class TestADeadlineCanPassMidIterationForEveryArm:
 
         reads = []
         monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
+        # THE RAISE IS THE ASSERTION: without the clamp the arm reaches
+        # `time.sleep` with a negative value and that is a ValueError, which
+        # this `raises` would not accept. The checks below are premises --
+        # that this arm ran at all, and that the clock really crossed the
+        # deadline inside it. Pinning the exact READ SEQUENCE instead makes
+        # the test a change-detector: it has already been bumped 4 -> 5 for a
+        # correct change, and the takeover's own clock read would bump it
+        # again for another.
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5, staleness=1.0):
                 pass
-        # One more read than the other arms: the takeover is serialized on
-        # an flock, and `FileLock.acquire` reads the same `time` module the
-        # scripted clock patches.
-        assert reads == [0.0, 0.0, 0.6, 0.6, 0.6], (
-            f"the rmdir-failed arm's clamp was never entered: {reads}"
+        assert refused["n"] >= 1, "premise: the rmdir-failed arm never ran"
+        assert reads and reads[0] == 0.0 and reads[-1] > 0.5, (
+            f"premise: the clock must cross the deadline mid-iteration: {reads}"
         )
 
     def test_a_deadline_crossed_mid_jitter_arm_is_not_a_ValueError(
