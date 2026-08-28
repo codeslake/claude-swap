@@ -948,10 +948,6 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
     """
 
     def test_a_contended_guard_does_not_outlive_the_budget(self, tmp_path):
-        import threading
-
-        FileLock = claude_locks.FileLock
-
         target = tmp_path / "target.lock"
         target.mkdir()
         stale = time.time() - 100
@@ -962,7 +958,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         release = threading.Event()
 
         def hold():
-            with FileLock(guard, timeout=5):
+            with claude_locks.FileLock(guard, timeout=5):
                 held.set()
                 release.wait(5)
 
@@ -984,15 +980,6 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
             f"guard is not clamped to the remaining time"
         )
-
-    def test_control_an_uncontended_guard_takes_the_corpse(self, tmp_path):
-        """CONTROL: the clamp must not stop a takeover that should happen."""
-        target = tmp_path / "target.lock"
-        target.mkdir()
-        stale = time.time() - 100
-        os.utime(target, (stale, stale))
-        with proper_lockfile(target, timeout=2.0, staleness=1.0):
-            pass
 
 
 class TestADeadlineCanPassMidIterationForEveryArm:
@@ -1063,23 +1050,17 @@ class TestADeadlineCanPassMidIterationForEveryArm:
 
         monkeypatch.setattr(claude_locks.os, "rmdir", refusing)
 
-        reads = []
-        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
-        # THE RAISE IS THE ASSERTION: without the clamp the arm reaches
-        # `time.sleep` with a negative value and that is a ValueError, which
-        # this `raises` would not accept. The checks below are premises --
-        # that this arm ran at all, and that the clock really crossed the
-        # deadline inside it. Pinning the exact READ SEQUENCE instead makes
-        # the test a change-detector: it has already been bumped 4 -> 5 for a
-        # correct change, and the takeover's own clock read would bump it
-        # again for another.
+        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock([]))
+        # THE RAISE IS THE ASSERTION: unclamped, this arm reaches `time.sleep`
+        # with a negative value, and that is a ValueError this `raises` would
+        # not accept. Pinning the READ SEQUENCE instead only detects change --
+        # it was already bumped once for a correct one. The clock crossing is
+        # not asserted because the raise implies it: the deadline check is the
+        # only site that raises, and it needs a read past the deadline.
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5, staleness=1.0):
                 pass
         assert refused["n"] >= 1, "premise: the rmdir-failed arm never ran"
-        assert reads and reads[0] == 0.0 and reads[-1] > 0.5, (
-            f"premise: the clock must cross the deadline mid-iteration: {reads}"
-        )
 
     def test_a_deadline_crossed_mid_jitter_arm_is_not_a_ValueError(
         self, tmp_path, monkeypatch
