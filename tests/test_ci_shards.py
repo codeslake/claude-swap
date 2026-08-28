@@ -510,23 +510,6 @@ def test_each_way_the_windows_shards_collapse_is_refused(tmp_path, repl, expecte
         _assert_windows_job_consumes_the_matrix(fake)
 
 
-def _macos_job(workflow: Path) -> str:
-    """The `macos-keychain` job's block, raw.
-
-    Comments are stripped by `_pytest_run_lines`, for both jobs, because a `#`
-    line that merely mentions pytest answers the invocation question for the
-    wrong reason -- and because folding a block scalar puts a commented-out
-    command INSIDE the value. Doing it here as well changed nothing and hid
-    which pass was load-bearing.
-    """
-    text = workflow.read_text(encoding="utf-8")
-    block = re.search(r"\n  macos-keychain:\n(.*?)(?=\n  \S|\Z)", text, re.S)
-    assert block, "the macos-keychain job is gone or was renamed"
-    # NOT STRIPPED HERE. `_pytest_run_lines` strips, once, for both jobs --
-    # a second pass changes nothing and hid which one was load-bearing.
-    return block.group(1)
-
-
 def _uncomment(text: str) -> str:
     """`text` up to the `#` that starts a comment, by the SHELL's rule.
 
@@ -722,19 +705,22 @@ def _pytest_run_lines(job: str) -> list[str]:
 
 
 def _assert_macos_job_is_intact(workflow: Path) -> None:
-    job = _macos_job(workflow)
-    assert _pytest_run_lines(job), (
-        "the macOS job no longer invokes pytest — it would stay green testing nothing"
-    )
-    # STRIPPED FOR THIS SCAN TOO. `_macos_job` used to strip comments before
-    # returning, and removing that duplicate stripping was reported as a
-    # no-op -- it is not: the path scan reads this string, so an ordinary
-    # comment naming a since-deleted test file reddens the suite here AND
-    # masks `test_a_job_naming_a_deleted_file_is_refused`. Only what the job
-    # RUNS can name a file it needs.
-    live = "\n".join(_uncomment(ln) for ln in job.splitlines())
-    for path in re.findall(r"tests/test_\w+\.py", live):
-        assert (_ROOT / path).exists(), f"the macOS job names {path}, which does not exist"
+    # EVERY JOB, not just macos-keychain: the ubuntu `test` job runs the
+    # whole suite and had neither of these two checks, so `run: echo
+    # skipping` and a `run:` naming a deleted test file both stayed green.
+    for name, job in sorted(_workflow_jobs(workflow).items()):
+        assert _pytest_run_lines(job), (
+            f"the {name} job no longer invokes pytest — it would stay green testing nothing"
+        )
+        # STRIPPED FOR THIS SCAN TOO. `_macos_job` used to strip comments
+        # before returning, and removing that duplicate stripping was
+        # reported as a no-op -- it is not: the path scan reads this string,
+        # so an ordinary comment naming a since-deleted test file reddens the
+        # suite here AND masks `test_a_job_naming_a_deleted_file_is_refused`.
+        # Only what the job RUNS can name a file it needs.
+        live = "\n".join(_uncomment(ln) for ln in job.splitlines())
+        for path in re.findall(r"tests/test_\w+\.py", live):
+            assert (_ROOT / path).exists(), f"the {name} job names {path}, which does not exist"
     # A STEP THAT CANNOT FAIL RUNS NOTHING, as far as CI is concerned. LAST,
     # because it is the broadest: raised ahead of the path check it masked
     # `test_a_job_naming_a_deleted_file_is_refused`, which then failed with
