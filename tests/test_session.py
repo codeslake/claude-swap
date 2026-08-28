@@ -668,7 +668,6 @@ class TestBootstrap:
             manager.setup_session(ACCOUNT_NUM, share=False)
         except SessionError:
             outcome = "RAISE"
-        print(f"\nprobes={len(probes)} outcome={outcome}")
         # PREMISE: the reuse path did NOT answer; this reached the arm
         # after the skipped re-seed.
         assert len(probes) >= 2, "premise: the bootstrap arm must be reached"
@@ -682,6 +681,75 @@ class TestBootstrap:
             encoding="utf-8"
         ) == "ANOTHER-ACCOUNTS-CREDENTIAL", (
             "premise: nothing may have re-seeded the profile"
+        )
+
+    def test_a_readable_identity_does_not_promote_without_a_re_seed_either(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The premise is the RE-SEED, and no artifact substitutes for it.
+
+        `_artifacts_say_usable` answers from the profile's own files, and on
+        this path the probe has already contradicted them twice: it reported
+        another account, then stopped answering. Promoting on the third
+        result -- the one that said nothing -- launches `claude` under the
+        credential those two verdicts were about, announced as the slot's.
+
+        The re-seed is what makes the artifacts the BACKUP's and worth
+        believing. Skipped, they are the record of whatever the profile
+        drifted to, readable or not.
+        """
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(
+            "ANOTHER-ACCOUNTS-CREDENTIAL", encoding="utf-8"
+        )
+        # READABLE and matching -- the only difference from the torn-identity
+        # case beside it, so what this pins is the re-seed and nothing else.
+        (session_dir / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": ACCOUNT_EMAIL,
+                              "organizationUuid": ORG_UUID}}
+        ), encoding="utf-8")
+        make_live(session_dir)
+        # PREMISES: the re-seed is skipped, and the artifacts DO read usable
+        # -- so only the missing re-seed can be what refuses.
+        assert not session_mod.profile_is_quiescent(session_dir)
+        assert session_mod._artifacts_say_usable(
+            session_dir, ACCOUNT_EMAIL, ORG_UUID, reseeded=False
+        )
+
+        import subprocess
+
+        probes = []
+
+        def timing_out(cmd, env=None, **kwargs):
+            # invalid, invalid, then a timeout: the reuse path refuses, the
+            # re-seed is skipped, and the third probe reaches the promotion.
+            probes.append(1)
+            if len(probes) <= 2:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "loggedIn": True, "authMethod": "claude.ai",
+                        "email": "someone-else@example.com",
+                    }),
+                    stderr="",
+                )
+            raise subprocess.TimeoutExpired(cmd, 10)
+
+        monkeypatch.setattr(session_mod.subprocess, "run", timing_out)
+        outcome = "LAUNCH"
+        try:
+            manager.setup_session(ACCOUNT_NUM, share=False)
+        except SessionError:
+            outcome = "RAISE"
+        assert len(probes) >= 3, "premise: the promotion arm must be reached"
+        assert outcome == "RAISE", (
+            "DEFECT: the launch carries the credential two probes just "
+            "reported as another account's, promoted by a third that "
+            "answered nothing"
         )
 
     def test_a_stuck_profile_names_the_repair_that_actually_works(

@@ -328,6 +328,10 @@ def _artifacts_say_usable(
 
     Deliberately NOT consulted for "unreachable". There the question is
     whether `claude` can be run at all, and no file on disk answers it.
+
+    ``reseeded`` is the caller saying a bootstrap just rewrote these files
+    from the BACKUP. It relaxes one clause only -- see below -- and is never
+    a reason to ask in the first place: both callers decide that themselves.
     """
     # A READABLE IDENTITY IS PART OF BEING USABLE, and only a re-seed
     # excuses its absence. Every other signal here leans "present" -- an
@@ -840,10 +844,15 @@ class SessionManager:
             # follow-up). Only "unreachable" still stops: no local file can
             # tell us whether `claude` runs, and a session we cannot exec into
             # is not a session.
-            # THE RE-SEED IS THIS PROMOTION'S PREMISE, which the gate above
-            # can skip; `_artifacts_say_usable` holds the rule.
-            if verdict == "unknown" and _artifacts_say_usable(
-                session_dir, email, org_uuid, reseeded=reseeded
+            # THE RE-SEED IS THIS PROMOTION'S PREMISE, and the gate above can
+            # skip it. `_artifacts_say_usable` answers from the profile's own
+            # files, which on this path the probe has already contradicted --
+            # so without a re-seed there is nothing here worth promoting on,
+            # readable identity or not. `reseeded=True` inside is that same
+            # fact doing its second job: excusing an identity the BACKUP
+            # cannot make readable.
+            if verdict == "unknown" and reseeded and _artifacts_say_usable(
+                session_dir, email, org_uuid, reseeded=True
             ):
                 verdict = "valid"
             if verdict not in ("valid", "unreachable") and not reseeded:
@@ -860,7 +869,7 @@ class SessionManager:
                 if _unreadable:
                     raise SessionError(
                         f"Session profile for Account-{account_num} "
-                        f"({email}) failed validation, and it has "
+                        f"({email}) could not be launched, and it has "
                         f"{_unreadable} session record(s) that could not "
                         f"be read, so it cannot be re-seeded either. "
                         f"Inspect {session_dir / 'sessions'} and remove or "
@@ -869,7 +878,7 @@ class SessionManager:
                 if _live:
                     raise SessionError(
                         f"Session profile for Account-{account_num} "
-                        f"({email}) failed validation and a session-mode "
+                        f"({email}) could not be launched and a session-mode "
                         f"Claude instance is live against it (PID "
                         f"{', '.join(str(s.pid) for s in _live)}), so it "
                         f"was left in place rather than re-seeded under a "
@@ -880,7 +889,8 @@ class SessionManager:
                     f"Session profile for Account-{account_num} ({email}) could "
                     f"not be verified: `claude auth status` did not run or did "
                     f"not answer. The profile is left in place — check that "
-                    f"`claude` is on PATH, then retry."
+                    f"`claude` is on PATH and that the machine is not too "
+                    f"loaded to spawn it, then retry."
                 )
             if verdict != "valid":
                 # NEVER UNDER A LIVE CLAUDE, the rule every other
@@ -1019,7 +1029,11 @@ class SessionManager:
             # THE ONLY COPY, and `_sync_sharing` can write it minutes before
             # this runs: `_stash_displaced_mcp` refuses to reset a profile's
             # MCP servers unless this file holds them, so taking it destroys
-            # what that refusal exists to preserve.
+            # what that refusal exists to preserve. NOT `is_file()`, which
+            # swallows the stat error and answers False -- that deletes the
+            # only copy over a busy mount. A directory squatting the name
+            # survives instead, and `_stash_displaced_mcp` warns with the
+            # filename every launch.
             if child.name == MCP_DISPLACED_STASH and not child.is_symlink():
                 continue
             # `sessions/` IS THE LIVENESS LEDGER, and `scan_sessions` reads
