@@ -780,12 +780,16 @@ class ClaudeAccountSwitcher:
         """
         from claude_swap.session import mark_session_stale, profile_is_quiescent
 
-        # NOT `_live_session_pids`, which is scan-shaped: an unreadable
-        # record contributes no PID, so it reads as "nothing is running" and
-        # this branch DELETES the seed and the Keychain entry. Not knowing is
-        # not knowing nothing is there, and every other destructive site in
-        # the pair of files asks the readability-aware question.
-        if not profile_is_quiescent(self._session_dir(account_num, email)):
+        # BOTH, because they answer different halves. `_live_session_pids`
+        # is scan-shaped -- an unreadable record contributes no PID, so it
+        # reads as "nothing is running" and the else-branch DELETES the seed
+        # and the Keychain entry. Not knowing is not knowing nothing is
+        # there, and every other destructive site in the pair of files asks
+        # the readability-aware question. Either saying "it might be live"
+        # takes the non-destructive branch.
+        if self._live_session_pids(account_num, email) or not profile_is_quiescent(
+            self._session_dir(account_num, email)
+        ):
             if not mark_session_stale(self._session_dir(account_num, email)):
                 self._logger.error(
                     "Account %s's backup credentials changed but its live "
