@@ -12987,7 +12987,7 @@ def _os_call_aliases(tree, func: str, os_names: set[str]) -> set[str]:
             # weakening ran green.
             or (isinstance(getattr(n, "value", None), ast.Call)
                 and isinstance(n.value.func, ast.Name)
-                and n.value.func.id == "getattr" and len(n.value.args) == 2
+                and n.value.func.id == "getattr" and 2 <= len(n.value.args) <= 3
                 and isinstance(n.value.args[0], ast.Name)
                 and n.value.args[0].id in os_names
                 and isinstance(n.value.args[1], ast.Constant)
