@@ -27,13 +27,6 @@ from claude_swap.claude_locks import (
 from claude_swap.exceptions import ClaudeCodeLockTimeout
 
 
-# The trial machinery is unreachable where `_CAN_PIN_A_DIRECTORY` short-circuits
-# before any trial, so it is the platform the guard must track -- not `sys.platform`,
-# which forcing the constant False proved does not follow it.
-needs_the_trial_machinery = pytest.mark.skipif(
-    not claude_locks._CAN_PIN_A_DIRECTORY,
-    reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial there",
-)
 
 
 @pytest.fixture
@@ -420,180 +413,6 @@ class TestCcRefreshLockProtocol:
         with claude_config_lock(timeout=2.0):
             assert cfg.is_dir()
         assert not cfg.exists()
-
-
-class TestADanglingSymlinkDoesNotPinACore:
-    """A name that exists and cannot resolve is not a lock, and never will be.
-
-    A dangling symlink at the lock path answers `FileExistsError` to `mkdir`
-    and `FileNotFoundError` to `stat`, so retrying it spends the whole budget
-    and then blames Claude Code for a lock nobody holds. Nothing about the
-    state can change while the symlink is there, so the budget buys nothing.
-    """
-
-    def test_a_dangling_symlink_is_refused_at_once_and_named(
-        self, tmp_path, monkeypatch, caplog
-    ):
-        target = tmp_path / "target.lock"
-        target.symlink_to(tmp_path / "nothing-here")
-        assert not target.exists(), "premise: the symlink must dangle"
-
-        real_mkdir = os.mkdir
-        tries = {"n": 0}
-
-        def counting(path, *a, **k):
-            if os.fspath(path) == os.fspath(target):
-                tries["n"] += 1
-            return real_mkdir(path, *a, **k)
-
-        monkeypatch.setattr(claude_locks.os, "mkdir", counting)
-        # LIKE THE FILE'S THREE OTHER WARNING WITNESSES. Today the configured
-        # level is always below WARNING, so the record propagates either way;
-        # pinning it here keeps the witness from going quiet if that changes.
-        caplog.set_level(logging.WARNING, logger="claude-swap")
-        with pytest.raises(ClaudeCodeLockTimeout) as caught:
-            with proper_lockfile(target, timeout=3.0):
-                pass
-
-        assert tries["n"] == 1, (
-            f"{tries['n']} attempts -- a state that cannot change was retried"
-        )
-        # AND IT SAYS WHICH STATE. Timing alone would pass for a raise that
-        # still blamed Claude Code, which is the half the user acts on.
-        assert "symlink" in str(caught.value), str(caught.value)
-        assert "Claude Code" not in str(caught.value), str(caught.value)
-        # AND IT IS LOGGED. Four of the `LockError` catchers discard the
-        # exception's message entirely, so the warning is the only way a
-        # background caller can ever learn why it keeps deferring.
-        assert any("symlink" in r.getMessage() for r in caplog.records), (
-            [r.getMessage() for r in caplog.records]
-        )
-
-    def test_a_symlink_to_a_real_directory_is_refused_too(self, tmp_path):
-        """The stat FOLLOWS the link, so it only ever saw the dangling case.
-
-        A symlink pointing at a directory answers a successful `stat` of its
-        target, and `rmdir` answers ENOTDIR, so even the stale branch cannot
-        clear it. It spent the whole budget and blamed Claude Code.
-        """
-        target = tmp_path / "real"
-        target.mkdir()
-        link = tmp_path / "link.lock"
-        link.symlink_to(target)
-
-        started = time.monotonic()
-        with pytest.raises(ClaudeCodeLockTimeout) as caught:
-            with proper_lockfile(link, timeout=2.0, staleness=0.0):
-                pass
-        elapsed = time.monotonic() - started
-
-        assert "symlink" in str(caught.value), str(caught.value)
-        assert "Claude Code" not in str(caught.value), str(caught.value)
-        # STALENESS 0 IS THE DISCRIMINATOR: a real directory is retaken at once
-        # there, so any budget spent here is spent on a state nothing changes.
-        assert elapsed < 0.5, (
-            f"waited {elapsed:.2f}s of a 2s budget on a name whose mkdir and "
-            "rmdir both fail permanently"
-        )
-
-    @pytest.mark.parametrize(
-        "kind",
-        [
-            "file",
-            # GUARDED ON THE CAPABILITY, NOT THE PLATFORM NAME: `os.mkfifo` is
-            # Unix-only, so naming it here would ERROR rather than skip on
-            # Windows. The `file` case carries the same assertion everywhere.
-            pytest.param(
-                "fifo",
-                marks=pytest.mark.skipif(
-                    not hasattr(os, "mkfifo"),
-                    reason="no FIFOs on this platform",
-                ),
-            ),
-        ],
-    )
-    def test_a_name_that_is_not_a_directory_is_refused_too(self, tmp_path, kind):
-        """`islink` implements half the class's own principle.
-
-        A plain file answers `FileExistsError` to `mkdir` and a SUCCESSFUL
-        `stat` -- it has a readable mtime -- so the stale branch fires and
-        `rmdir` answers ENOTDIR, every turn, for the whole budget. Nothing
-        about it is a symlink, and nothing about it can ever become a lock.
-        """
-        target = tmp_path / f"{kind}.lock"
-        if kind == "file":
-            target.write_text("not a lock")
-        else:
-            os.mkfifo(target)
-
-        started = time.monotonic()
-        with pytest.raises(ClaudeCodeLockTimeout) as caught:
-            with proper_lockfile(target, timeout=2.0, staleness=0.0):
-                pass
-        elapsed = time.monotonic() - started
-
-        assert "not a directory" in str(caught.value), str(caught.value)
-        assert "Claude Code" not in str(caught.value), str(caught.value)
-        # STALENESS 0 IS THE DISCRIMINATOR: a real directory is retaken at once
-        # there, so any budget spent is spent on a state nothing changes.
-        assert elapsed < 0.5, f"waited {elapsed:.2f}s of a 2s budget"
-
-    def test_control_a_real_directory_still_retries(self, tmp_path, monkeypatch):
-        """CONTROL: the refusal keys on the name's TYPE, not on any ENOENT.
-
-        A directory swept between our mkdir and our read-back stat is a busy
-        handoff and MUST keep retrying -- which is why `lexists` is the wrong
-        test. It also carries that arm's BACK-OFF, which nothing else can any
-        more: a dangling symlink used to be the vehicle for it and is now
-        refused above the loop, so a spin bound written against a symlink
-        measures the refusal instead of the arm.
-        """
-        swept = tmp_path / "busy.lock"
-        swept.mkdir()
-        budget, seen, slept = 0.3, {"n": 0}, []
-        real_stat = os.stat
-        real_sleep = claude_locks.time.sleep
-        mine, t0 = threading.get_ident(), time.monotonic()
-
-        def vanishing(path, *a, **k):
-            if os.fspath(path) == os.fspath(swept):
-                seen["n"] += 1
-                raise FileNotFoundError(errno.ENOENT, "swept")
-            return real_stat(path, *a, **k)
-
-        def recording(seconds):
-            # SCOPED TO THIS THREAD. `claude_locks.time` IS the time module,
-            # so an unscoped patch records every other thread's sleeps here.
-            if threading.get_ident() == mine:
-                slept.append((round(budget - (time.monotonic() - t0), 3),
-                              round(seconds, 3)))
-            return real_sleep(seconds)
-
-        monkeypatch.setattr(claude_locks.os, "stat", vanishing)
-        monkeypatch.setattr(claude_locks.time, "sleep", recording)
-        with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(swept, timeout=budget):
-                pass
-
-        assert seen["n"] > 1, (
-            f"{seen['n']} stat calls -- a swept name stopped retrying, so the "
-            "symlink refusal is catching the handoff case too"
-        )
-        # AND IT SLEEPS ITS WAY THERE. Retrying is half the contract: with no
-        # back-off this arm is 100% of a core until the deadline, and then a
-        # timeout that blames Claude Code for a lock nobody holds.
-        assert seen["n"] < 50, (
-            f"{seen['n']} attempts in a {budget}s budget -- the arm that "
-            "retries a swept name never slept, so it pinned a core for it"
-        )
-        # AND ONLY WHAT IS LEFT. `min(flat, timeout)` is the same number as
-        # `min(flat, remaining)` until the budget runs low, so the overshoot
-        # is only visible on the LAST sleep of the run.
-        for left, seconds in slept:
-            assert seconds <= max(left, 0.0) + 0.005, (
-                f"slept {seconds}s with {left}s left -- the swept-name clamp "
-                f"used `timeout`, not what remains of it (all: {slept})"
-            )
 
 
 class TestAPermanentENOENTIsNotARetry:
@@ -1201,6 +1020,189 @@ class TestIdentityNotAStamp:
             "identity can be adopted the same way a stamp was"
         )
 
+
+
+# The trial machinery is unreachable where `_CAN_PIN_A_DIRECTORY` short-circuits
+# before any trial, so it is the platform the guard must track -- not `sys.platform`,
+# which forcing the constant False proved does not follow it.
+needs_the_trial_machinery = pytest.mark.skipif(
+    not claude_locks._CAN_PIN_A_DIRECTORY,
+    reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial there",
+)
+
+
+class TestADanglingSymlinkDoesNotPinACore:
+    """A name that exists and cannot resolve is not a lock, and never will be.
+
+    A dangling symlink at the lock path answers `FileExistsError` to `mkdir`
+    and `FileNotFoundError` to `stat`, so retrying it spends the whole budget
+    and then blames Claude Code for a lock nobody holds. Nothing about the
+    state can change while the symlink is there, so the budget buys nothing.
+    """
+
+    def test_a_dangling_symlink_is_refused_at_once_and_named(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        target = tmp_path / "target.lock"
+        target.symlink_to(tmp_path / "nothing-here")
+        assert not target.exists(), "premise: the symlink must dangle"
+
+        real_mkdir = os.mkdir
+        tries = {"n": 0}
+
+        def counting(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                tries["n"] += 1
+            return real_mkdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        # LIKE THE FILE'S THREE OTHER WARNING WITNESSES. Today the configured
+        # level is always below WARNING, so the record propagates either way;
+        # pinning it here keeps the witness from going quiet if that changes.
+        caplog.set_level(logging.WARNING, logger="claude-swap")
+        with pytest.raises(ClaudeCodeLockTimeout) as caught:
+            with proper_lockfile(target, timeout=3.0):
+                pass
+
+        assert tries["n"] == 1, (
+            f"{tries['n']} attempts -- a state that cannot change was retried"
+        )
+        # AND IT SAYS WHICH STATE. Timing alone would pass for a raise that
+        # still blamed Claude Code, which is the half the user acts on.
+        assert "symlink" in str(caught.value), str(caught.value)
+        assert "Claude Code" not in str(caught.value), str(caught.value)
+        # AND IT IS LOGGED. Four of the `LockError` catchers discard the
+        # exception's message entirely, so the warning is the only way a
+        # background caller can ever learn why it keeps deferring.
+        assert any("symlink" in r.getMessage() for r in caplog.records), (
+            [r.getMessage() for r in caplog.records]
+        )
+
+    def test_a_symlink_to_a_real_directory_is_refused_too(self, tmp_path):
+        """The stat FOLLOWS the link, so it only ever saw the dangling case.
+
+        A symlink pointing at a directory answers a successful `stat` of its
+        target, and `rmdir` answers ENOTDIR, so even the stale branch cannot
+        clear it. It spent the whole budget and blamed Claude Code.
+        """
+        target = tmp_path / "real"
+        target.mkdir()
+        link = tmp_path / "link.lock"
+        link.symlink_to(target)
+
+        started = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout) as caught:
+            with proper_lockfile(link, timeout=2.0, staleness=0.0):
+                pass
+        elapsed = time.monotonic() - started
+
+        assert "symlink" in str(caught.value), str(caught.value)
+        assert "Claude Code" not in str(caught.value), str(caught.value)
+        # STALENESS 0 IS THE DISCRIMINATOR: a real directory is retaken at once
+        # there, so any budget spent here is spent on a state nothing changes.
+        assert elapsed < 0.5, (
+            f"waited {elapsed:.2f}s of a 2s budget on a name whose mkdir and "
+            "rmdir both fail permanently"
+        )
+
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "file",
+            # GUARDED ON THE CAPABILITY, NOT THE PLATFORM NAME: `os.mkfifo` is
+            # Unix-only, so naming it here would ERROR rather than skip on
+            # Windows. The `file` case carries the same assertion everywhere.
+            pytest.param(
+                "fifo",
+                marks=pytest.mark.skipif(
+                    not hasattr(os, "mkfifo"),
+                    reason="no FIFOs on this platform",
+                ),
+            ),
+        ],
+    )
+    def test_a_name_that_is_not_a_directory_is_refused_too(self, tmp_path, kind):
+        """`islink` implements half the class's own principle.
+
+        A plain file answers `FileExistsError` to `mkdir` and a SUCCESSFUL
+        `stat` -- it has a readable mtime -- so the stale branch fires and
+        `rmdir` answers ENOTDIR, every turn, for the whole budget. Nothing
+        about it is a symlink, and nothing about it can ever become a lock.
+        """
+        target = tmp_path / f"{kind}.lock"
+        if kind == "file":
+            target.write_text("not a lock")
+        else:
+            os.mkfifo(target)
+
+        started = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout) as caught:
+            with proper_lockfile(target, timeout=2.0, staleness=0.0):
+                pass
+        elapsed = time.monotonic() - started
+
+        assert "not a directory" in str(caught.value), str(caught.value)
+        assert "Claude Code" not in str(caught.value), str(caught.value)
+        # STALENESS 0 IS THE DISCRIMINATOR: a real directory is retaken at once
+        # there, so any budget spent is spent on a state nothing changes.
+        assert elapsed < 0.5, f"waited {elapsed:.2f}s of a 2s budget"
+
+    def test_control_a_real_directory_still_retries(self, tmp_path, monkeypatch):
+        """CONTROL: the refusal keys on the name's TYPE, not on any ENOENT.
+
+        A directory swept between our mkdir and our read-back stat is a busy
+        handoff and MUST keep retrying -- which is why `lexists` is the wrong
+        test. It also carries that arm's BACK-OFF, which nothing else can any
+        more: a dangling symlink used to be the vehicle for it and is now
+        refused above the loop, so a spin bound written against a symlink
+        measures the refusal instead of the arm.
+        """
+        swept = tmp_path / "busy.lock"
+        swept.mkdir()
+        budget, seen, slept = 0.3, {"n": 0}, []
+        real_stat = os.stat
+        real_sleep = claude_locks.time.sleep
+        mine, t0 = threading.get_ident(), time.monotonic()
+
+        def vanishing(path, *a, **k):
+            if os.fspath(path) == os.fspath(swept):
+                seen["n"] += 1
+                raise FileNotFoundError(errno.ENOENT, "swept")
+            return real_stat(path, *a, **k)
+
+        def recording(seconds):
+            # SCOPED TO THIS THREAD. `claude_locks.time` IS the time module,
+            # so an unscoped patch records every other thread's sleeps here.
+            if threading.get_ident() == mine:
+                slept.append((round(budget - (time.monotonic() - t0), 3),
+                              round(seconds, 3)))
+            return real_sleep(seconds)
+
+        monkeypatch.setattr(claude_locks.os, "stat", vanishing)
+        monkeypatch.setattr(claude_locks.time, "sleep", recording)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(swept, timeout=budget):
+                pass
+
+        assert seen["n"] > 1, (
+            f"{seen['n']} stat calls -- a swept name stopped retrying, so the "
+            "symlink refusal is catching the handoff case too"
+        )
+        # AND IT SLEEPS ITS WAY THERE. Retrying is half the contract: with no
+        # back-off this arm is 100% of a core until the deadline, and then a
+        # timeout that blames Claude Code for a lock nobody holds.
+        assert seen["n"] < 50, (
+            f"{seen['n']} attempts in a {budget}s budget -- the arm that "
+            "retries a swept name never slept, so it pinned a core for it"
+        )
+        # AND ONLY WHAT IS LEFT. `min(flat, timeout)` is the same number as
+        # `min(flat, remaining)` until the budget runs low, so the overshoot
+        # is only visible on the LAST sleep of the run.
+        for left, seconds in slept:
+            assert seconds <= max(left, 0.0) + 0.005, (
+                f"slept {seconds}s with {left}s left -- the swept-name clamp "
+                f"used `timeout`, not what remains of it (all: {slept})"
+            )
 
 
 class TestThePinIsAFilesystemFactNotAPlatformOne:
