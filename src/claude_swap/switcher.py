@@ -1397,6 +1397,15 @@ class ClaudeAccountSwitcher:
         new_a = self._session_dir(num_b, email_a)  # account A's new home
         new_b = self._session_dir(num_a, email_b)  # account B's new home
 
+        from claude_swap.session import mark_session_stale, stale_marker_for
+
+        # THE FLAG IS A SIBLING OF THE DIRECTORY, so the renames below move
+        # the profile and leave it behind. Captured here and re-applied
+        # after, because with one shared email the two marker names are each
+        # other's destination.
+        stale_a = stale_marker_for(dir_a).exists()
+        stale_b = stale_marker_for(dir_b).exists()
+
         staging = None
         try:
             if dir_a.exists():
@@ -1431,6 +1440,20 @@ class ClaudeAccountSwitcher:
                         os.replace(staging, dir_a)
                 except OSError:
                     pass
+            # Keyed on where each profile actually ENDED UP, so a skipped or
+            # strand-recovered move is not misreported. Every old name is
+            # cleared before any new one is set: with one shared email they
+            # are the same two names, and setting first would erase it.
+            here_a = new_a if os.path.exists(new_a) else dir_a
+            here_b = new_b if os.path.exists(new_b) else dir_b
+            for old_dir in (dir_a, dir_b):
+                try:
+                    stale_marker_for(old_dir).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            for here, was_stale in ((here_a, stale_a), (here_b, stale_b)):
+                if was_stale and os.path.exists(here):
+                    mark_session_stale(here)
 
     def _rollback_swap(
         self,
@@ -1892,6 +1915,15 @@ class ClaudeAccountSwitcher:
             # old slot's backups, and setup_session re-bootstraps a missing
             # one from the relocated backups — a skipped move costs at most
             # this slot's history.
+            from claude_swap.session import (
+                mark_session_stale,
+                stale_marker_for,
+            )
+
+            # Same sibling problem as the swap: the rename below takes the
+            # profile and leaves its flag at the old key, where the post-
+            # commit prune deletes it.
+            was_stale = stale_marker_for(src_dir).exists()
             if src_dir.exists() and not dst_dir.exists():
                 try:
                     os.replace(src_dir, dst_dir)
@@ -1899,6 +1931,12 @@ class ClaudeAccountSwitcher:
                     self._logger.warning(
                         f"Session profile move skipped during move: {e}"
                     )
+            if was_stale and dst_dir.exists():
+                try:
+                    stale_marker_for(src_dir).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                mark_session_stale(dst_dir)
 
             # Set the target key to the account's exact state: write material
             # that exists, actively clear what doesn't — an unbacked account

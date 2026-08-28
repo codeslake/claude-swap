@@ -2869,6 +2869,93 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         assert json.loads(seed.read_text())[
             "claudeAiOauth"]["refreshToken"] == "rt-G1"
 
+    def test_a_swap_carries_each_profile_s_stale_flag_with_it(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """The flag is a SIBLING of the directory the swap renames.
+
+        With one shared email the two marker names are each other's
+        destination, so a rename of the directories alone leaves the flag
+        pointing at whichever profile arrived. `setup_session` acts on it:
+        it invalidates the credential and re-bootstraps from a backup that
+        profile has already rotated past, which costs a re-login.
+        """
+        from claude_swap.session import is_session_stale, mark_session_stale
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(
+            switcher.sequence_file, sample_sequence_data_with_org
+        )
+        email = "user@example.com"
+        switcher._write_account_credentials("1", email, "creds-org")
+        switcher._write_account_credentials("2", email, "creds-personal")
+        dir_1 = switcher._session_dir("1", email)
+        dir_2 = switcher._session_dir("2", email)
+        for num, d in (("1", dir_1), ("2", dir_2)):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "marker").write_text(f"SLOT-{num}-HISTORY")
+        # PREMISE: exactly one of the two profiles is flagged.
+        assert mark_session_stale(dir_1)
+        assert is_session_stale(dir_1) and not is_session_stale(dir_2)
+
+        switcher.swap_accounts("1", "2")
+
+        # PREMISE: the profiles really did exchange keys.
+        assert (dir_1 / "marker").read_text() == "SLOT-2-HISTORY"
+        assert (dir_2 / "marker").read_text() == "SLOT-1-HISTORY"
+
+        assert not is_session_stale(dir_1), (
+            "DEFECT: the profile that arrived at this key inherited a flag "
+            "set for the other account, so its next launch re-bootstraps it "
+            "from a backup it has already rotated past"
+        )
+        assert is_session_stale(dir_2), (
+            "DEFECT: the flagged profile moved without its flag, so the "
+            "re-bootstrap it was flagged for never happens"
+        )
+
+    def test_a_move_carries_the_profile_s_stale_flag_with_it(
+        self, temp_home: Path
+    ):
+        """Same sibling problem, one command over — and here the old key's
+        flag is deleted by the post-commit prune, so it is simply lost."""
+        from claude_swap.session import (
+            is_session_stale,
+            mark_session_stale,
+            session_dir_for,
+        )
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        a = "a@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {"email": a, "uuid": "", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+            }})
+        s._write_account_credentials("1", a, "creds")
+        src = session_dir_for(s.backup_dir, "1", a)
+        src.mkdir(parents=True, exist_ok=True)
+        (src / ".credentials.json").write_text("seed", encoding="utf-8")
+        # PREMISE: the profile is flagged before the move.
+        assert mark_session_stale(src)
+        assert is_session_stale(src)
+
+        s.move_account("1", "5")
+
+        moved = session_dir_for(s.backup_dir, "5", a)
+        # PREMISE: the profile itself did move.
+        assert (moved / ".credentials.json").exists()
+        assert is_session_stale(moved), (
+            "DEFECT: `cswap move` left the flag at the old key, where the "
+            "post-commit prune deletes it, so the re-bootstrap it was "
+            "flagged for never happens"
+        )
+
     def test_a_successful_swap_does_not_strip_the_moved_profiles(
         self, temp_home: Path
     ):
