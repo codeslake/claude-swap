@@ -8171,10 +8171,16 @@ class TestProvenanceGuard:
                 "uuid": "uuid-2", "email": "account2@example.com",
                 "organizationUuid": "org-2",
             })
-            assert switcher._usage_store._read_rows()["2"]["authDeadStrikes"] == 0, (
-                "DEFECT: the adoption wrote the credential but never lifted "
-                "the quarantine, so the slot stays fetch-ineligible and is "
-                "never fetched again"
+            # THE ROW'S IDENTITY TOO. `_mutate` REPLACES a row whose
+            # identity does not match rather than clearing it, so a wrong
+            # org uuid also lands `authDeadStrikes == 0` -- on a blank row
+            # that has lost the slot's history, backoff and claim.
+            _r = switcher._usage_store._read_rows()["2"]
+            assert (_r.get("organizationUuid"), _r["authDeadStrikes"],
+                    _r.get("struckFingerprint"), _r.get("claimId"),
+                    _r.get("backoffUntil")) == ("org-2", 0, None, None, None), (
+                "DEFECT: the adoption did not lift the quarantine on THIS "
+                f"slot's row -- it reads {_r}"
             )
             # Inside the patched store: `_slot_token_dead` READS the backup to
             # bind the verdict to a generation, and an unreadable one answers
@@ -8221,6 +8227,78 @@ class TestProvenanceGuard:
         assert creds_store[("2", "account2@example.com")] == foreign, (
             "DEFECT: the dead slot did not adopt the credential the oracle "
             "resolved to it, so it still cannot authenticate"
+        )
+
+    def test_a_heal_that_cannot_write_does_not_abort_the_switch(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The stash is the license to proceed; the heal is a bonus.
+
+        `_stash_live_credential` runs first and raises on failure, so past it
+        the live bytes are preserved and the switch has nothing left to lose.
+        A raise from the heal would abort a switch that was already safe, and
+        it would leave `switch_account` as a bare OSError -- which the CLI
+        renders as a traceback rather than an error envelope, because it
+        routes `ClaudeSwitchError` only.
+        """
+        from claude_swap import oauth
+        from claude_swap.usage_store import FetchRecord
+
+        sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-2"
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = creds_store[("2", "account2@example.com")]
+        ident = {"2": ("account2@example.com", "org-2")}
+        switcher._usage_store.record(
+            {"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(a2_backup),
+            )},
+            ident,
+        )
+        assert switcher._slot_token_dead("2", "account2@example.com"), (
+            "premise: the heal would otherwise fire on this slot"
+        )
+        foreign = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-relogin", "refreshToken": "rt-2-relogin",
+        }})
+        live_state = {"creds": foreign}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        real_write = switcher._write_account_credentials
+        refused = []
+
+        def refusing(num, email, creds):
+            if str(num) == "2":
+                refused.append(num)
+                raise OSError(errno.EACCES, "the slot's store is read-only")
+            return real_write(num, email, creds)
+
+        switcher._write_account_credentials = refusing
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "org-2",
+            })
+        finally:
+            switcher._write_account_credentials = real_write
+            for p in patches:
+                p.stop()
+
+        assert refused, (
+            "premise: the heal never attempted the write it was meant to fail"
+        )
+        assert op is not None, (
+            "DEFECT: a heal that could not write aborted a switch the stash "
+            "had already made safe"
+        )
+        entries = switcher.list_unclaimed_credentials()
+        assert len(entries) == 1 and _read_safety_copy(
+            switcher, next(iter(entries))) == foreign, (
+            "the live bytes must still be preserved when the heal fails"
         )
 
     def test_foreign_synced_lineage_warns_without_any_write(

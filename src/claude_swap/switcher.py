@@ -4819,11 +4819,25 @@ class ClaudeAccountSwitcher:
         email = record.get("email") or ""
         if not email or not self._slot_token_dead(str(foreign_slot), email):
             return False
-        self._write_account_credentials(str(foreign_slot), email, credentials)
-        self._usage_store.clear_dead_token(
-            [str(foreign_slot)],
-            {str(foreign_slot): (email, record.get("organizationUuid") or "")},
-        )
+        # CONTAINED. The stash above already preserved the live bytes and is
+        # the license to proceed, so the switch is safe to complete whether or
+        # not this heal lands. A raise here would abort a switch that has
+        # nothing left to go wrong, and escape as an OSError the CLI renders
+        # as a traceback rather than an error envelope.
+        try:
+            self._write_account_credentials(
+                str(foreign_slot), email, credentials)
+            self._usage_store.clear_dead_token(
+                [str(foreign_slot)],
+                {str(foreign_slot): (email,
+                                     record.get("organizationUuid") or "")},
+            )
+        except Exception as e:
+            self._logger.warning(
+                "Could not heal Account-%s from the foreign credential: %s. "
+                "It stays preserved in the safety copy.", foreign_slot, e,
+            )
+            return False
         return True
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
