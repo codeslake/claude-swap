@@ -3233,7 +3233,13 @@ def _bare_print_printers(src: str | None = None) -> set[str]:
         # SECOND loop after this one, the names it promotes could never be
         # consumed by the delegation scan above, so a printer delegating to
         # an ALIASED printer was silently missed.
-        grown |= {t for t, v in bindings.items() if v & (found | grown)}
+        # `print` TOO. `found` holds module functions that REACH the
+        # builtin, so it never contains the builtin itself -- and a
+        # binding whose only candidate is `print` (`banner = print`,
+        # `banner = lambda m: print(m)`) then promoted nothing. That is
+        # the most direct printer there is.
+        grown |= {t for t, v in bindings.items()
+                  if v & (found | grown | {"print"})}
         if grown <= found:
             break
         found |= grown
@@ -3545,6 +3551,27 @@ banner = partial(_emit, 'x')
 from functools import partial
 def _emit(m): print(m)
 banner = partial(func=_emit)
+"""),
+            # THE MOST DIRECT PRINTER THERE IS, and it derived nothing: the
+            # promotion tests membership in `found`, which never holds the
+            # builtin.
+            ("lambda straight to print", """
+banner = lambda m: print(m)
+"""),
+            ("plain alias of the builtin", """
+banner = print
+"""),
+            # `partial` UNDER AN IMPORT ALIAS. Matched by the literal
+            # spelling this was a silent miss.
+            ("partial imported as another name", """
+from functools import partial as pt
+def _emit(p, m): print(m)
+banner = pt(_emit, 'x')
+"""),
+            ("functools under an alias", """
+import functools as ft
+def _emit(p, m): print(m)
+banner = ft.partial(_emit, 'x')
 """),
         ):
             # COLLECTED, NOT ASSERTED PER ROW. Asserting inside the loop
