@@ -449,6 +449,14 @@ class TestAPermanentENOENTIsNotARetry:
             with proper_lockfile(target, timeout=1.0):
                 pass
         elapsed = time.monotonic() - start
+        assert attempts["n"] >= 1, (
+            "premise: the loop never reached `os.mkdir`, so nothing here "
+            "says what a vanished parent does"
+        )
+        assert not gone.is_dir(), (
+            "premise: the parent came back, so this measured a swept name "
+            "rather than the permanent ENOENT it is named for"
+        )
         assert elapsed < 0.5, (
             f"a permanent ENOENT burned {elapsed:.2f}s of the budget spinning "
             f"over {attempts['n']} attempts instead of surfacing — and the "
