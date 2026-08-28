@@ -3137,6 +3137,125 @@ class TestAClearWithoutThePackageUnsplicesTheConfig:
         )
 
 
+class TestAClearThatCouldNotUnspliceSaysSo:
+    """`--clear` must not report a bare success over a config it left spliced.
+
+    `clear_pin` decides on the record and the env keys. NEITHER sees the
+    `oauthAccount` splice, so every reason the un-splice did not happen ends
+    at the same sentence a fully successful clear prints -- and Claude Code
+    goes on minting bridges owned by an account nothing is pinned to, with
+    the only trace in a log file nobody is looking at.
+    """
+
+    def test_the_message_names_the_config_it_left_alone(self, temp_home):
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        live, pinned = "live@example.com", "cloud@example.com"
+        # ONE ADDRESS IN TWO SLOTS -- the roster the ambiguity guard exists
+        # for -- and a record whose org names neither of them.
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2, 3],
+            "accounts": {
+                "1": {"email": live, "uuid": "uuid-1", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"},
+                "2": {"email": pinned, "uuid": "uuid-2",
+                      "organizationUuid": "org-B", "organizationName": "B",
+                      "added": "2024-01-01T00:00:00Z"},
+                "3": {"email": pinned, "uuid": "uuid-3",
+                      "organizationUuid": "org-C", "organizationName": "C",
+                      "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", live, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        s._write_account_config("1", live, json.dumps(
+            {"oauthAccount": {"emailAddress": live, "accountUuid": "uuid-1"}}))
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": pinned}})
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {},
+            "oauthAccount": {"emailAddress": pinned, "accountUuid": "uuid-3"}}))
+
+        class _Dead:
+            def apply_pin(self, *a, **k):
+                raise ImportError("cryptography")
+
+        with patch.object(pin_mod, "_impl", lambda: _Dead()):
+            ok, msg = pin_mod.clear_pin(s)
+
+        after = (json.loads(cfg.read_text()).get("oauthAccount") or {})
+        print(f"\nclear_pin -> ok={ok} msg={msg!r}")
+        print(f"config after: {after.get('emailAddress')!r}")
+        # PREMISES: the record went, and the splice stayed. Without both, the
+        # assertion below would be about some other state.
+        assert pin_mod._pinned_email_now(s) is None, "premise: record cleared"
+        assert after.get("emailAddress") == pinned, (
+            "premise: the un-splice declined, which is the accepted trade")
+        assert ok, "premise: this reports success, and that is the problem"
+        assert "still names" in msg, (
+            "DEFECT: `--clear` reported a bare success over a config that "
+            f"still names the ex-pin. got {msg!r}")
+
+
+    def test_control_pinning_the_account_you_use_still_reports_plainly(
+            self, temp_home):
+        """CONTROL: the address alone is not the signal.
+
+        Pinning the account you are logged in as is ordinary, and a FINISHED
+        clear then leaves that same address named -- correctly, because that
+        is who is logged in. Keyed on the address alone this would warn on
+        every such clear; the accountUuid is what separates them.
+        """
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        me = "me@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {"1": {"email": me, "uuid": "uuid-1",
+                               "organizationUuid": "", "organizationName": "",
+                               "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", me, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        s._write_account_config("1", me, json.dumps(
+            {"oauthAccount": {"emailAddress": me, "accountUuid": "uuid-1"}}))
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": me}})
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({
+            "env": {},
+            "oauthAccount": {"emailAddress": me, "accountUuid": "uuid-1"}}))
+
+        class _Dead:
+            def apply_pin(self, *a, **k):
+                raise ImportError("cryptography")
+
+        with patch.object(pin_mod, "_impl", lambda: _Dead()):
+            ok, msg = pin_mod.clear_pin(s)
+
+        print(f"\ncontrol clear_pin -> ok={ok} msg={msg!r}")
+        assert ok, msg
+        assert "still names" not in msg, (
+            "DEFECT: warned about a config that names the pinned address "
+            f"because it is the account logged in. got {msg!r}")
+
+
 class TestClearRunsWithTheExtraGone:
     """`cswap pin --clear` is priority 1 and the whole reason clear_wiring
     lives in cswap rather than the optional package.
@@ -9380,6 +9499,13 @@ class TestTheUnspliceComparesOneVocabulary:
         )
 
 
+def _json_dumps_oauth():
+    """A stored backup config whose ``oauthAccount`` carries no accountUuid."""
+    import json as _j
+    return _j.dumps({"oauthAccount": {"emailAddress": "cloud@example.com",
+                                      "displayName": "Slot 2"}})
+
+
 class TestTheUnspliceOnAnAmbiguousAddress:
     """The un-splice must survive the roster the composite key exists for.
 
@@ -9578,6 +9704,39 @@ class TestTheUnspliceOnAnAmbiguousAddress:
             ("cloud@example.com", ""),
         ), ("DEFECT: a corrupt roster row aborted the count, so the sibling "
             "guard read as 'not ambiguous' and claimed a foreign config")
+
+    def test_boundary_a_known_slot_with_no_uuid_anywhere_still_compares_orgs(
+            self):
+        """DOCUMENTED BOUNDARY, not an endorsement.
+
+        One residual path still compares the two vocabularies: the slot IS
+        known, so the ambiguity guard is skipped, but the writer answers a
+        dict carrying no ``accountUuid`` (a roster row whose ``uuid`` is ""
+        -- the shape `add_account` writes before the backfill -- plus a
+        stored config Claude Code did not put an ``accountUuid`` in). The
+        composite then decides on the org, and declines a config the pin
+        itself spliced.
+
+        No product writer is known for the stored-config half, which is why
+        this is pinned rather than fixed: a test that fails the day someone
+        changes it is how the choice stays deliberate.
+        """
+        from claude_swap import pin
+
+        roster = {"accounts": {
+            "2": {"email": "cloud@example.com", "organizationUuid": "org-B",
+                  "uuid": ""},
+        }}
+        sw = self._sw(roster)
+        sw._read_account_config = lambda num, email: _json_dumps_oauth()
+        assert pin._slot_for(sw, "cloud@example.com", "org-B") == "2", (
+            "premise: the slot IS known, so the ambiguity guard is skipped")
+        assert not pin._config_names_the_pin(
+            sw,
+            {"emailAddress": "cloud@example.com", "displayName": "Slot 2"},
+            ("cloud@example.com", "org-B"),
+        ), ("BOUNDARY CHANGED: the composite now accepts here. That is "
+            "probably an improvement -- update this test deliberately")
 
     def test_an_unreadable_roster_is_not_ambiguity(self):
         """A torn `sequence.json` must not read as "two slots".

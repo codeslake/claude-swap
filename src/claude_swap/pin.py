@@ -1361,6 +1361,37 @@ def _config_already_names(identity: "dict | None") -> bool:
             current.get("organizationUuid") or "") == want
 
 
+def _config_still_names(email: str, instead_of: "dict | None") -> bool:
+    """A config still carrying ``email`` that is NOT what the clear meant.
+
+    `clear_pin` decides on the record and the env block and NEITHER sees the
+    `oauthAccount` splice, so every reason the un-splice did not happen ends
+    at the same sentence a finished clear prints.
+
+    ``instead_of`` is the identity the clear handed the un-splice, and it is
+    what separates the two states: pinning the account you are logged in as
+    is ordinary, and a FINISHED clear then leaves that same address named,
+    correctly. The accountUuid tells them apart. An identity without one
+    decides nothing, which is the same "leave it alone" every other reader
+    here gives that case.
+    """
+    want = (instead_of or {}).get("accountUuid")
+    for path in _each_config():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue        # unreadable decides nothing, as everywhere here
+        oauth = raw.get("oauthAccount") if isinstance(raw, dict) else None
+        if not isinstance(oauth, dict):
+            continue
+        if (oauth.get("emailAddress") or "").casefold() != email.casefold():
+            continue
+        if want and oauth.get("accountUuid") == want:
+            continue        # this IS the identity the clear put there
+        return True
+    return False
+
+
 def _clear_pin_record(switcher) -> None:
     """Drop ``remoteControl`` from settings.json. Never raises.
 
@@ -1600,6 +1631,21 @@ def clear_pin(switcher) -> tuple[bool, str]:
             "deleted; remove "
             + " and ".join(str(_ledger_path(p)) for p in stale)
             + " by hand, or cswap will keep reporting a wiring that is gone"
+        )
+    if _pinned and _pinned[0] and _config_still_names(_pinned[0], _back_to):
+        # A DIFFERENT STATE AND A DIFFERENT SENTENCE, exactly like the stale
+        # receipt above. The pin is gone and nothing dials a dead port, but a
+        # config still names the ex-pin, so Claude Code keeps making sessions
+        # owned by an account nothing is pinned to -- the state the un-splice
+        # exists to prevent, reported until now as a plain success.
+        #
+        # NOT GATED ON THE AMBIGUITY DECLINE. Every route that leaves the
+        # splice ends here, including the one where `_live_login_for_config`
+        # answered None and there was no un-splice to attempt at all.
+        return True, (
+            "Unpinned the cloud account, but a config still names it as the "
+            "logged-in account. Switch to the account you want, so new "
+            "sessions stop being owned by the old one"
         )
     if not cleared and not had_pin:
         return True, "No cloud account pinned"
