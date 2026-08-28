@@ -523,6 +523,49 @@ class TestBootstrap:
         assert not (session_dir / ".credentials.json").exists()
         assert block_real_keychain.get_password(service, account) is None
 
+    def test_validation_failure_takes_the_share_links_with_the_manifest(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates, block_real_keychain
+    ):
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        # `_sync_sharing` mirrors from the DEFAULT ~/.claude, so the source
+        # has to exist for any history link to be created at all.
+        source = Path.home() / ".claude"
+        (source / "projects").mkdir(parents=True, exist_ok=True)
+        (source / "history.jsonl").touch()
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+
+        with pytest.raises(SessionError, match="failed\\s+validation"):
+            manager.setup_session("2", share=False, share_history=True)
+
+        # PREMISE: the run took the sharing path and the sweep ran. Without
+        # these the assertions below are the absence of something that was
+        # never created -- measured: the first cut of this case passed
+        # against the unfixed code for exactly that reason.
+        assert manager.switcher.platform != session_mod.Platform.WINDOWS
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep ran"
+        )
+        manifest = session_dir / session_mod.SHARE_MANIFEST
+        assert not manifest.exists(), "premise: the sweep took the manifest"
+
+        for name in session_mod.HISTORY_ITEMS:
+            assert not (session_dir / name).is_symlink(), (
+                f"DEFECT: the share link {name!r} outlived the manifest that "
+                "is the only record cswap created it. `_sync_sharing` removes "
+                "a link only if the manifest names it, so this one can never "
+                "be removed again -- every later plain `cswap run` writes the "
+                "account's history into the DEFAULT profile, with no flag."
+            )
+
     def test_stale_keychain_entry_deleted_before_seed(
         self,
         manager,

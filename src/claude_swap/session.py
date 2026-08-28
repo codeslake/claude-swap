@@ -940,7 +940,7 @@ class SessionManager:
         # `claude auth status --json` that exits non-zero reads as invalid --
         # and deleting the seed is what stops the profile being reused.
         for child in session_dir.iterdir():
-            if child.name in HISTORY_ITEMS:
+            if child.name in HISTORY_ITEMS and not child.is_symlink():
                 continue
             if child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child, ignore_errors=True)
