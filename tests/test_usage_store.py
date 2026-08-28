@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -1236,6 +1237,42 @@ class TestDeadTokenQuarantine:
         assert store.entries(IDENT)["1"].auth_dead_strikes == 1
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         assert store.entries(IDENT)["1"].auth_dead_strikes == 2
+
+    def test_a_quarantine_says_who_it_quarantined_and_why(self, store, caplog):
+        """A permanent verdict that leaves no trace cannot be diagnosed.
+
+        One `invalid_grant` is enough to quarantine a slot (the threshold is
+        1), the account then reads "re-login needed" until a human logs in
+        again, and nothing anywhere records that it happened. Measured in a
+        live incident: four accounts across two machines were quarantined and
+        the log held not one line about any of them, so the cause took hours
+        to find and could only be reconstructed from the store's own row.
+
+        The strike is the ONE place that knows the slot, the identity and the
+        verdict at the moment it binds.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "1" in said and "a@x.com" in said, (
+            f"the quarantine names neither the slot nor the account: {said!r}"
+        )
+        assert "invalid_grant" in said, (
+            f"the quarantine does not say what the server answered: {said!r}"
+        )
+
+    def test_a_transient_failure_stays_quiet(self, store, caplog):
+        """The control: a 429 must not produce the quarantine line.
+
+        Without this the assertion above is satisfied by logging on every
+        failure, which buries the one verdict that needs a human.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "re-login" not in said and "quarantin" not in said, (
+            f"a transient failure produced the quarantine line: {said!r}"
+        )
 
     def test_transient_error_does_not_advance_or_reset(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)

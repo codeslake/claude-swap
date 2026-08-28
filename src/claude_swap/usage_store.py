@@ -28,6 +28,7 @@ batch, not one request.
 
 from __future__ import annotations
 
+import logging
 import json
 import time
 import uuid
@@ -47,6 +48,8 @@ from claude_swap.poll_policy import (
     parse_reset_ts,
 )
 from claude_swap.settings import atomic_write_json
+
+_logger = logging.getLogger("claude-swap")
 
 SCHEMA_VERSION = 2
 
@@ -1099,6 +1102,27 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # SAY SO. This is the only place that knows the slot, the
+                    # identity and the verdict at the moment it binds, and at
+                    # AUTH_DEAD_STRIKES=1 one line here is the whole
+                    # difference between a diagnosable quarantine and an
+                    # account that silently starts demanding a re-login.
+                    # Measured in a live incident: four accounts across two
+                    # machines quarantined, not one line about any of them.
+                    if int(row["authDeadStrikes"]) >= AUTH_DEAD_STRIKES:
+                        _ident = identities.get(num) if identities else None
+                        _logger.warning(
+                            "Account %s (%s) is quarantined: the token "
+                            "endpoint answered %s, so its refresh lineage is "
+                            "treated as dead and it will report "
+                            "\"re-login needed\" until a re-login replaces "
+                            "the stored credential. Strike %s of %s.",
+                            num,
+                            (_ident[0] if _ident else "unknown"),
+                            rec.error,
+                            row["authDeadStrikes"],
+                            AUTH_DEAD_STRIKES,
+                        )
                     # Additive field (absent/None = legacy unconditional
                     # binding). Always overwrite: a legacy writer's strike
                     # must bind unconditionally, not inherit a stale
@@ -1242,6 +1266,7 @@ def _row_eligible(
         _num_or_none(row.get("pollIntervalS")),
         now,
     )
+
     if respect_plans:
         return stale and (poll_due or next_poll_at is None or overslept)
     if repair_overslept:
