@@ -1181,13 +1181,7 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         # naps alone passes for a mutation that takes every sleep before the
         # loop, which is back-to-back sampling with the right arithmetic.
         events: list = []
-        monkeypatch.setattr(
-            cl, "time",
-            types.SimpleNamespace(
-                sleep=events.append, monotonic=time.monotonic,
-                time=time.time, time_ns=time.time_ns,
-            ),
-        )
+        monkeypatch.setattr(cl, "time", types.SimpleNamespace(sleep=events.append))
         monkeypatch.setattr(
             cl, "_one_pin_trial", lambda p: (events.append("trial"), True)[1]
         )

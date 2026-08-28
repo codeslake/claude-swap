@@ -97,9 +97,8 @@ def _fd_pins_an_inode(parent: Path) -> bool:
     if not _CAN_PIN_A_DIRECTORY:
         return False
     # THE DEVICE IS THE WHOLE SUBJECT: pinning is a property of the mount, not
-    # of a path on it. Keyed on the path as well, a mount landing here answered
-    # out of the filesystem it replaced, and the two parents a switch probes
-    # paid for two probes of one filesystem.
+    # of a path on it, so a mount landing here is a miss (which is the point)
+    # and a second parent on the same filesystem is not (which the path cost).
     try:
         key = os.stat(parent).st_dev
     except OSError:
