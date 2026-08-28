@@ -861,6 +861,99 @@ class TestEveryArmOfTheLoopBacksOff:
         _assert_backed_off(slept, budget)
 
 
+class TestADeadlineCanPassMidIterationForEveryArm:
+    """The floor under each arm's clamp, which nothing here exercised.
+
+    Same hazard as `locking.py`'s witnessed one (`TestTheDeadlineCanPassBetween
+    TheCheckAndTheClamp` in ``test_locking.py``): the loop checks the deadline,
+    then reads the clock again to size the sleep, and a `stat`/`rmdir` syscall
+    can land between the two. When the budget expires in that gap,
+    `deadline - time.monotonic()` goes negative and an unfloored `time.sleep`
+    raises ValueError -- undocumented by `proper_lockfile`, which documents
+    itself as raising only `ClaudeCodeLockTimeout`.
+
+    Every clamp case above scripts `time.sleep` itself, so the real function
+    -- and the ValueError it would raise on a negative duration -- never runs.
+    These instead script only `time.monotonic`, leaving the real `time.sleep`
+    in place, so a deleted floor is a genuine crash here.
+    """
+
+    def _crossing_clock(self, reads):
+        """0.0 twice (start, deadline check), then 0.6 (the clamp's own read
+        lands past a 0.5 deadline), then 0.6 forever."""
+        ticks = iter([0.0, 0.0, 0.6, 0.6, 0.6, 0.6])
+        last = [0.6]
+
+        def clock():
+            try:
+                last[0] = next(ticks)
+            except StopIteration:
+                pass
+            reads.append(last[0])
+            return last[0]
+
+        return clock
+
+    def test_a_deadline_crossed_mid_dangling_symlink_arm_is_not_a_ValueError(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "target.lock"
+        target.symlink_to(tmp_path / "nothing-here")
+        assert not target.exists(), "premise: the symlink must dangle"
+
+        reads = []
+        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(target, timeout=0.5):
+                pass
+        assert reads[:3] == [0.0, 0.0, 0.6], (
+            f"the dangling-symlink arm's clamp was never entered: {reads}"
+        )
+
+    def test_a_deadline_crossed_mid_rmdir_failed_arm_is_not_a_ValueError(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "target.lock"
+        target.mkdir()
+        stale = time.time() - 100
+        os.utime(target, (stale, stale))
+
+        real_rmdir = os.rmdir
+
+        def refusing(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                raise PermissionError(errno.EACCES, "cannot remove it either")
+            return real_rmdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "rmdir", refusing)
+
+        reads = []
+        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(target, timeout=0.5, staleness=1.0):
+                pass
+        assert reads[:3] == [0.0, 0.0, 0.6], (
+            f"the rmdir-failed arm's clamp was never entered: {reads}"
+        )
+
+    def test_a_deadline_crossed_mid_jitter_arm_is_not_a_ValueError(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "target.lock"
+        target.mkdir()  # FRESH mtime -> contended, not stale -> jitter branch
+
+        monkeypatch.setattr(claude_locks.random, "random", lambda: 0.0)
+
+        reads = []
+        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(target, timeout=0.5):
+                pass
+        assert reads[:3] == [0.0, 0.0, 0.6], (
+            f"the jitter arm's clamp was never entered: {reads}"
+        )
+
+
 def test_a_second_freeze_after_a_recovery_is_reported_again(
     tmp_path, monkeypatch, caplog
 ):

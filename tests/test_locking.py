@@ -191,6 +191,7 @@ class TestTheDeadlineCanPassBetweenTheCheckAndTheClamp:
         try:
             # The 3rd read is the clamp's, and it lands PAST the deadline the
             # 2nd read was measured against.
+            reads = []
             ticks = iter([0.0, 0.0, 0.6, 0.6, 0.6, 0.6])
             last = [0.6]
 
@@ -199,6 +200,7 @@ class TestTheDeadlineCanPassBetweenTheCheckAndTheClamp:
                     last[0] = next(ticks)
                 except StopIteration:
                     pass
+                reads.append(last[0])
                 return last[0]
 
             monkeypatch.setattr(locking.time, "monotonic", clock)
@@ -206,6 +208,21 @@ class TestTheDeadlineCanPassBetweenTheCheckAndTheClamp:
             got = waiter.acquire()
         finally:
             holder.release()
+        # THE PREMISE, AND THE FULL SCHEDULE. `got is False` alone is
+        # satisfied by any clock that simply runs out the budget, including
+        # one that never revisits the clamp at all. A prefix check is not
+        # enough either: ticks[0] and ticks[1] are both 0.0, so one foreign
+        # `time.monotonic()` read before this closure's own first call shifts
+        # every later read by one slot while `reads[:3]` still reads
+        # `[0.0, 0.0, 0.6]` -- the deadline check then trips on that shifted
+        # 0.6 and returns False WITHOUT ever reaching the clamp, so a deleted
+        # floor is invisible again. The clamp branch, reached, produces
+        # exactly four reads (start, deadline check, clamp, deadline check);
+        # a shifted schedule produces three and never gets a fourth, so only
+        # the full sequence -- not a prefix -- proves the clamp arm ran.
+        assert reads == [0.0, 0.0, 0.6, 0.6], (
+            f"the clamp arm was never entered: {reads}"
+        )
         assert got is False, (
             f"acquire() answered {got!r}; it documents True or False"
         )
