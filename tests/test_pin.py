@@ -9380,6 +9380,101 @@ class TestTheUnspliceComparesOneVocabulary:
         )
 
 
+class TestTheUnspliceOnAnAmbiguousAddress:
+    """The un-splice must survive the roster the composite key exists for.
+
+    `_config_names_the_pin` asks `identity_for_config` what was spliced. Given
+    an ADDRESS and no slot, that falls through to
+    `_resolve_account_identifier`, which RAISES on an address naming two slots
+    -- cswap's documented personal+org pattern, the same trap
+    `TestAnAmbiguousAddressStillNamesThePin` and `set_pin`'s docstring name.
+    The raise becomes None, None drops to the composite fallback, and BOTH
+    answers then invert on exactly the roster the composite was written for.
+
+    Every other `identity_for_config(email=...)` caller in pin.py pairs it
+    with `num=_slot_for(...)`; this one did not.
+    """
+
+    ROSTER = {"accounts": {
+        "2": {"email": "cloud@example.com", "organizationUuid": "org-B",
+              "uuid": "UUID-2"},
+        "5": {"email": "cloud@example.com", "organizationUuid": "org-C",
+              "uuid": "UUID-5"},
+    }}
+    PINNED = ("cloud@example.com", "org-B")
+
+    def _sw(self, roster=None):
+        import json as _json
+
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        sw._get_sequence_data = lambda: roster or self.ROSTER
+        # The REAL `_resolve_account_identifier` -- the raise is the premise.
+        sw._read_account_config = lambda num, email: _json.dumps(
+            {"oauthAccount": {"emailAddress": "cloud@example.com",
+                              "accountUuid": "UUID-%s" % num}})
+        return sw
+
+    def test_the_spliced_config_is_still_recognised(self):
+        """DEFECT, direction one: the un-splice declines its own writer.
+
+        The config here carries exactly what the splice wrote for the pinned
+        slot, so `--clear` must un-splice it. It declined instead, leaving
+        `~/.claude.json` naming the ex-pin while reporting success -- which is
+        the whole defect this function was added to fix, unfixed on this
+        roster.
+        """
+        from claude_swap import pin
+
+        assert pin._config_names_the_pin(
+            self._sw(),
+            {"emailAddress": "cloud@example.com", "accountUuid": "UUID-2"},
+            self.PINNED,
+        ), ("DEFECT: the address names two slots, the lookup raised, and the "
+            "un-splice fell back to the composite it exists to replace")
+
+    def test_a_sibling_signed_in_is_still_refused(self):
+        """DEFECT, direction two: the same lookup failure ACCEPTS a stranger.
+
+        The sibling at the same address is signed in -- a genuine `/login`,
+        not a splice -- and its config happens to carry the record's org. On
+        the composite fallback that reads as the pin, so the un-splice
+        rewrites a config cswap never spliced and swaps the account identity
+        outright. Only the `accountUuid` separates them.
+        """
+        from claude_swap import pin
+
+        assert not pin._config_names_the_pin(
+            self._sw(),
+            {"emailAddress": "cloud@example.com", "accountUuid": "UUID-5",
+             "organizationUuid": "org-B"},
+            self.PINNED,
+        ), ("DEFECT: the un-splice claimed the SIBLING's config, which the pin "
+            "never wrote")
+
+    def test_control_the_same_two_verdicts_on_an_unambiguous_roster(self):
+        """CONTROL: the check has both answers when the lookup can resolve.
+
+        Without this, the two assertions above cannot say whether the roster
+        shape decided the verdict or the function simply always answers one
+        way.
+        """
+        from claude_swap import pin
+
+        one = {"accounts": {"2": dict(self.ROSTER["accounts"]["2"])}}
+        assert pin._config_names_the_pin(
+            self._sw(one),
+            {"emailAddress": "cloud@example.com", "accountUuid": "UUID-2"},
+            self.PINNED)
+        assert not pin._config_names_the_pin(
+            self._sw(one),
+            {"emailAddress": "cloud@example.com", "accountUuid": "UUID-5",
+             "organizationUuid": "org-B"},
+            self.PINNED)
+
+
 class TestAnAmbiguousAddressStillNamesThePin:
     """One address in two slots must not silence the splice.
 

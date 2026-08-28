@@ -229,16 +229,14 @@ def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
     """Does this config's ``oauthAccount`` name the pinned account?
 
     THE RECORD AND THE CONFIG SPEAK DIFFERENT VOCABULARIES for the org uuid,
-    and the un-splice used to compare across them. The record's
-    ``pinnedOrganizationUuid`` is the ROSTER row's -- `account_is_pinned`
-    reads it that way -- while the splice writes the account's OWN
-    ``oauthAccount``, which is what Claude Code compares a bridge owner
-    against and which a backup config may carry without an org key at all.
-    The two disagree routinely, the equality then failed, and `--clear`
-    reported success over a config that still named the pin.
+    so never compare across them. The record's ``pinnedOrganizationUuid`` is
+    the ROSTER row's -- `account_is_pinned` reads it that way -- while the
+    splice writes the account's OWN ``oauthAccount``, which is what Claude
+    Code compares a bridge owner against and which a backup config may carry
+    with no org key at all.
 
     So ask the WRITER. Whatever `identity_for_config` answers for the pinned
-    address is what was spliced, and it carries an ``accountUuid`` -- a
+    account is what was spliced, and it carries an ``accountUuid`` -- a
     stronger key than the composite, and one the record does not hold.
 
     THE COMPOSITE REMAINS THE FALLBACK, because an address alone is not an
@@ -250,11 +248,20 @@ def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
         pinned[0] or ""
     ).casefold():
         return False
-    try:
-        mine = identity_for_config(switcher, email=pinned[0])
-    except Exception:  # noqa: BLE001 — a lookup must not block a clear
-        mine = None
-    uuid = (mine or {}).get("accountUuid")
+    # THE SLOT, NEVER THE ADDRESS ALONE. Given only an email,
+    # `identity_for_config` falls through to `_resolve_account_identifier`,
+    # which RAISES on an address naming two slots -- and the raise becomes
+    # None, which drops to the composite below. That inverts BOTH verdicts on
+    # exactly the roster the composite exists for: the pin's own spliced
+    # config is declined, and a sibling `/login` carrying the record's org is
+    # claimed. Every other `identity_for_config(email=...)` here pairs it with
+    # `_slot_for` for this reason.
+    #
+    # No try around it: `identity_for_config` wraps its whole body in
+    # `except Exception: return None`, so it answers None instead of raising.
+    uuid = (identity_for_config(
+        switcher, email=pinned[0],
+        num=_slot_for(switcher, pinned[0], pinned[1])) or {}).get("accountUuid")
     if uuid:
         return current.get("accountUuid") == uuid
     return (current.get("organizationUuid") or "") == (pinned[1] or "")
