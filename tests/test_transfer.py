@@ -13,7 +13,6 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import macos_keychain, oauth
-from claude_swap.credentials import ActiveCredentials
 from claude_swap.exceptions import TransferError
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
@@ -1701,43 +1700,86 @@ class TestImportClearsDeadTokenQuarantine:
         )
 
     def test_a_slot_with_no_stored_source_at_all_answers_the_strike(
-        self, temp_home: Path, monkeypatch
+        self, temp_home: Path, capsys
     ):
         """Empty live bytes stop CONFIRMING; they must not start REFUSING.
 
         The guard that keeps an empty live credential from binding a strike no
         source matches also runs when the backup is empty, and there nothing
         else can answer -- so the method fell through to a CONFIRMED not-dead
-        and `_adopt_into_dead_slot` declined to write the foreign live bytes
-        into their own slot. An idle slot with the same emptiness already
-        answers the raw strike count; this is that parity.
+        and a plain import demanded --force on the one slot that holds nothing
+        to protect. An IDLE slot with the same emptiness already answers the
+        raw strike count; this is that parity.
+
+        Activeness and the empty live read are both the REAL ones -- the
+        identity in the live config, and a store nothing ever wrote -- because
+        a mock for either would stand in for the absent-vs-unreadable
+        distinction this verdict turns on.
         """
         s = _linux_switcher(temp_home)
         ORG = "org-uuid-1234"
+        _seed_account(s, 1, "alice@example.com", org_uuid=ORG)
         _seed_account(s, 2, "bob@example.com", org_uuid=ORG)
         ident = {"2": ("bob@example.com", ORG)}
-        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        # Struck on a generation the slot does NOT store, so the strike binds
+        # only while some stored source still matches it.
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant",
+                              struck_fp="sha256:someothergeneration")},
+            ident,
+        )
         # PREMISE: the row is struck on its raw count.
         assert s._usage_store.entries(ident)["2"].token_dead()
 
-        # No stored source anywhere: the backup removed, the live read
-        # answering cleanly-absent rather than erroring.
-        s._delete_account_credentials("2", "bob@example.com")
-        assert s._read_account_credentials("2", "bob@example.com") == ""
-        monkeypatch.setattr(
-            s._store, "_read_active_credentials",
-            lambda: ActiveCredentials("", False, False),
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "BOB_HEALED"
+        out.write_text(json.dumps(env))
+
+        # current_account_number() resolves the active slot from the LIVE
+        # login's identity, so activeness is set the way the product sets it.
+        def activate(email: str) -> None:
+            s._write_json(s._get_claude_config_path(), {"oauthAccount": {
+                "emailAddress": email, "accountUuid": "acct",
+                "organizationUuid": ORG, "organizationName": "",
+            }})
+
+        activate("bob@example.com")
+        assert s.current_account_number() == "2"
+        live = s._store._read_active_credentials()
+        assert (live.value, live.degraded, live.keychain_unavailable) == (
+            "", False, False
+        ), "premise: the live read is cleanly ABSENT, never a failed read"
+
+        # CONTROL: one non-empty stored source that does NOT match the strike
+        # still answers not-dead. Without it nothing pins the SECOND half of
+        # the condition, and a guard keyed on the empty live bytes alone --
+        # which is the whole mistake being fixed -- would pass.
+        assert not s._slot_token_dead("2", "bob@example.com"), (
+            "a stored source that disproves the strike was ignored"
         )
 
-        monkeypatch.setattr(s, "current_account_number", lambda: "2")
+        s._delete_account_credentials("2", "bob@example.com")
+        assert s._read_account_credentials("2", "bob@example.com") == ""
         assert s._slot_token_dead("2", "bob@example.com"), (
             "an ACTIVE slot with nothing stored refused the strike, so the "
-            "adoption that exists for exactly this slot is declined"
+            "import that exists to release this quarantine demands --force"
         )
-        # CONTROL: the same emptiness on an IDLE slot already answered True,
-        # so this is a parity restored, not a new verdict invented.
-        monkeypatch.setattr(s, "current_account_number", lambda: "1")
+        # The IDLE slot with the same emptiness already answered True, so this
+        # is a parity restored rather than a new verdict invented.
+        activate("alice@example.com")
+        assert s.current_account_number() == "1"
         assert s._slot_token_dead("2", "bob@example.com")
+
+        # ...and the verdict reaches the outcome it exists for. This is the
+        # only production behaviour the fix changes, so nothing else pins it.
+        activate("bob@example.com")
+        import_accounts(s, str(out), force=False)
+        assert "was quarantined: refresh token dead" in capsys.readouterr().err
+        assert json.loads(
+            s._read_account_credentials("2", "bob@example.com")
+        )["_marker"] == "BOB_HEALED"
 
     def test_the_heal_finds_the_row_of_an_org_scoped_account(
         self, temp_home: Path, capsys

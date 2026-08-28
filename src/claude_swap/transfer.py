@@ -500,9 +500,10 @@ def import_accounts(
                 # failed after being stored (known exception and full
                 # trade-off: INVESTIGATION-import-dead-token.md). Identity-
                 # guarded — a stale row for a different account returns an
-                # empty entry — so healthy slots still require --force. Never
-                # triggered by the live store's "no credentials" state, which
-                # isn't attributable to the backup.
+                # empty entry — so healthy slots still require --force. An
+                # empty live store alone does not trigger it either, not being
+                # attributable to the backup; a slot with NO stored source at
+                # all does, and there is nothing there to overwrite.
                 outcome = "replaced"
             else:
                 _eprint(

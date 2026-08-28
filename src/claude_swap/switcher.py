@@ -5009,11 +5009,17 @@ class ClaudeAccountSwitcher:
             return None if entry.token_dead() else False
         if not stored and not backup:
             # NO stored source EXISTS. Both reads succeeded and both found
-            # nothing, so there is no generation left to disprove the strike
-            # with and nothing to protect -- answer the raw strike count, which
-            # is what an IDLE slot's empty backup already answers. `False` here
-            # instead refuses the adoption `_adopt_into_dead_slot` exists for,
-            # on the one slot that holds nothing worth refusing over.
+            # nothing, so nothing is left to disprove the strike with and
+            # nothing to protect -- answer the raw strike count, which is what
+            # an IDLE slot's empty backup already answers. `False` here instead
+            # makes `cswap import`'s auto-heal demand --force on the one slot
+            # that holds nothing worth refusing over.
+            #
+            # Only `_slot_token_dead` reaches this: it screens the unreadable
+            # and degraded reads itself. The collector's `stored` would flatten
+            # a FAILED read to "" (`active.value or ""`), but it never arrives
+            # -- `_static_usage_sentinel` sentinels every empty-creds active
+            # slot, and a sentinelled slot is dropped before `accepted`.
             return entry.token_dead()
         return False
 
