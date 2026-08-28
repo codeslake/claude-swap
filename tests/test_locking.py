@@ -166,6 +166,50 @@ class TestFileLockConcurrency:
         lock.release()
 
 
+class TestTheDeadlineCanPassBetweenTheCheckAndTheClamp:
+    """The floor under the clamp, which nothing exercised.
+
+    The loop reads the clock to decide whether the budget is gone, then reads
+    it AGAIN to size the sleep. Between those two reads it does a `flock`
+    attempt; on a network `~/.claude` that is milliseconds, not nanoseconds.
+    When the budget expires in the gap, `deadline - monotonic()` is negative
+    and `time.sleep` raises `ValueError` out of `acquire()`, which documents
+    itself as returning True or False -- and the surrounding
+    `except (BlockingIOError, OSError)` does not catch it, because the sleep
+    is inside that handler.
+
+    The constant this replaced could never be negative, so the hazard and its
+    guard arrived together and neither had a witness.
+    """
+
+    def test_a_deadline_crossed_mid_iteration_is_not_a_ValueError(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "held.json"
+        holder = FileLock(target, timeout=5)
+        assert holder.acquire() is True
+        try:
+            # The 3rd read is the clamp's, and it lands PAST the deadline the
+            # 2nd read was measured against.
+            ticks = iter([0.0, 0.0, 0.6, 0.6, 0.6, 0.6])
+            last = [0.6]
+
+            def clock():
+                try:
+                    last[0] = next(ticks)
+                except StopIteration:
+                    pass
+                return last[0]
+
+            monkeypatch.setattr(locking.time, "monotonic", clock)
+            waiter = FileLock(target, timeout=0.5)
+            got = waiter.acquire()
+        finally:
+            holder.release()
+        assert got is False, (
+            f"acquire() answered {got!r}; it documents True or False"
+        )
+
 class TestTheClampSurvivesWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
