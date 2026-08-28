@@ -360,8 +360,9 @@ class TestADegradedReadNeverCONFIRMSaSlotHEALED:
         With both sources empty that branch answers the raw strike count --
         right when the live read was trustworthy, wrong here, because a
         degraded read examined nothing and `None` is the only honest answer.
-        The ordering IS that distinction, and nothing else pins it: moving the
-        branch above the guard leaves the rest of the suite green.
+        The ordering IS that distinction, and this is the only row that pins
+        it: every sibling passes a non-empty `stored`, so the closing branch
+        cannot fire for them wherever it sits.
 
         No caller reaches this row today: `_slot_token_dead` screens the
         degraded read itself and leaves the flag defaulted, and the collector
