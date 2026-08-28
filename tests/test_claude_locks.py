@@ -492,7 +492,22 @@ class TestADanglingSymlinkDoesNotPinACore:
             "rmdir both fail permanently"
         )
 
-    @pytest.mark.parametrize("kind", ["file", "fifo"])
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "file",
+            # GUARDED ON THE CAPABILITY, NOT THE PLATFORM NAME: `os.mkfifo` is
+            # Unix-only, so naming it here would ERROR rather than skip on
+            # Windows. The `file` case carries the same assertion everywhere.
+            pytest.param(
+                "fifo",
+                marks=pytest.mark.skipif(
+                    not hasattr(os, "mkfifo"),
+                    reason="no FIFOs on this platform",
+                ),
+            ),
+        ],
+    )
     def test_a_name_that_is_not_a_directory_is_refused_too(self, tmp_path, kind):
         """`islink` implements half the class's own principle.
 
