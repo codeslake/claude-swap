@@ -311,8 +311,9 @@ def test_frozen_specs_include_the_two_non_recursive_roots(
     assert home in non_recursive_roots
 
 
+@pytest.mark.parametrize("platform", [Platform.LINUX, Platform.MACOS])
 def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, platform
 ):
     """Two writes that reach past every root the test above checks.
 
@@ -320,10 +321,19 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     two levels under a ``~/.claude`` that is non-recursive on purpose. Both
     were allowed while every root here was armed, so a spec test that only
     counts the roots cannot see either.
+
+    Parametrized over the two store layouts, because they put the flag in
+    different places: XDG at ``~/.local/share/.claude-swap.migrating``,
+    whose parent is no root at all, and legacy (macOS, and Windows through
+    the same branch) at ``~/..claude-swap-backup.migrating``, a direct child
+    of the ``$HOME`` root. Only the XDG layout leaves it uncovered without
+    this entry, so a premise phrased for that one alone is false on the
+    other two platforms.
     """
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setattr(Platform, "detect", staticmethod(lambda: platform))
     for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
 
@@ -336,9 +346,14 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
         f"the migration flag is unprotected; a test that creates it leaves it "
         f"behind and the next real run rmtree's the store it names. {flag}"
     )
-    # PREMISE: it really is outside every root that covers the backup root,
-    # so this entry is the only thing that can cover it.
-    assert flag.parent not in roots
+    # PREMISE: a SIBLING of the backup root, so no recursive root covering
+    # that root ever reaches it -- on either layout.
+    assert not any(root in flag.parents for root in recursive_roots)
+    if platform is Platform.LINUX:
+        # And on THIS layout nothing else covers it either, which is what
+        # the entry is for. The legacy layout puts the flag directly in
+        # `$HOME`, whose own root already covers it.
+        assert flag.parent not in roots
 
     projects = home / ".claude" / "projects"
     assert projects in recursive_roots, (
