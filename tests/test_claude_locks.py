@@ -432,7 +432,7 @@ class TestADanglingSymlinkDoesNotPinACore:
     """
 
     def test_a_dangling_symlink_is_refused_at_once_and_named(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, caplog
     ):
         target = tmp_path / "target.lock"
         target.symlink_to(tmp_path / "nothing-here")
@@ -458,6 +458,12 @@ class TestADanglingSymlinkDoesNotPinACore:
         # still blamed Claude Code, which is the half the user acts on.
         assert "symlink" in str(caught.value), str(caught.value)
         assert "Claude Code" not in str(caught.value), str(caught.value)
+        # AND IT IS LOGGED. Four of the `LockError` catchers discard the
+        # exception's message entirely, so the warning is the only way a
+        # background caller can ever learn why it keeps deferring.
+        assert any("symlink" in r.getMessage() for r in caplog.records), (
+            [r.getMessage() for r in caplog.records]
+        )
 
     def test_a_symlink_to_a_real_directory_is_refused_too(self, tmp_path):
         """The stat FOLLOWS the link, so it only ever saw the dangling case.
@@ -485,6 +491,33 @@ class TestADanglingSymlinkDoesNotPinACore:
             f"waited {elapsed:.2f}s of a 2s budget on a name whose mkdir and "
             "rmdir both fail permanently"
         )
+
+    @pytest.mark.parametrize("kind", ["file", "fifo"])
+    def test_a_name_that_is_not_a_directory_is_refused_too(self, tmp_path, kind):
+        """`islink` implements half the class's own principle.
+
+        A plain file answers `FileExistsError` to `mkdir` and a SUCCESSFUL
+        `stat` -- it has a readable mtime -- so the stale branch fires and
+        `rmdir` answers ENOTDIR, every turn, for the whole budget. Nothing
+        about it is a symlink, and nothing about it can ever become a lock.
+        """
+        target = tmp_path / f"{kind}.lock"
+        if kind == "file":
+            target.write_text("not a lock")
+        else:
+            os.mkfifo(target)
+
+        started = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout) as caught:
+            with proper_lockfile(target, timeout=2.0, staleness=0.0):
+                pass
+        elapsed = time.monotonic() - started
+
+        assert "not a directory" in str(caught.value), str(caught.value)
+        assert "Claude Code" not in str(caught.value), str(caught.value)
+        # STALENESS 0 IS THE DISCRIMINATOR: a real directory is retaken at once
+        # there, so any budget spent is spent on a state nothing changes.
+        assert elapsed < 0.5, f"waited {elapsed:.2f}s of a 2s budget"
 
     def test_control_a_real_directory_still_retries(self, tmp_path, monkeypatch):
         """CONTROL: the refusal keys on the symlink, not on any ENOENT.
@@ -1151,9 +1184,12 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         assert n >= 2, "one trial cannot answer whether the descriptor pins"
         for answers, expected in (
             ([True] * n, True),
-            ([False] + [True] * (n - 1), False),
-            ([True] * (n - 1) + [False], False),
-            ([True, False] + [True] * (n - 2), False),
+            # EVERY position, so no index is left unpinned: a mutant that
+            # ignores the False at one of them fails exactly one row.
+            *(
+                ([True] * k + [False] + [True] * (n - 1 - k), False)
+                for k in range(n)
+            ),
         ):
             seq = iter(answers)
             monkeypatch.setattr(cl, "_one_pin_trial", lambda p: next(seq))
@@ -1199,6 +1235,34 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         assert cl._PIN_TRIAL_GAP_S > 0
 
     @needs_the_trial_machinery
+    def test_a_parent_whose_device_cannot_be_read_is_not_pinned(
+        self, tmp_path, monkeypatch
+    ):
+        """The key IS a stat, and a stat can fail.
+
+        False is the safe direction, and it must not be remembered: nothing
+        was measured, and the next call may be able to read the device.
+        """
+        import claude_swap.claude_locks as cl
+
+        real_stat = cl.os.stat
+
+        def refuse(path, *a, **k):
+            if os.fspath(path) == os.fspath(tmp_path):
+                raise PermissionError(errno.EACCES, "cannot read the device")
+            return real_stat(path, *a, **k)
+
+        monkeypatch.setattr(cl.os, "stat", refuse)
+        cl._PIN_PROBE.clear()
+        try:
+            assert cl._fd_pins_an_inode(tmp_path) is False
+            assert not cl._PIN_PROBE, (
+                "a parent whose device could not be read was remembered"
+            )
+        finally:
+            cl._PIN_PROBE.clear()
+
+    @needs_the_trial_machinery
     def test_a_probe_that_cannot_run_is_not_cached(self, tmp_path, monkeypatch):
         """Refusing to trust the pin is the safe direction, but a refusal
         that cannot be measured must not become a permanent answer."""
@@ -1208,10 +1272,8 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         cl._PIN_PROBE.clear()
         try:
             assert cl._fd_pins_an_inode(tmp_path) is False
-            # NOT `str(tmp_path) not in _PIN_PROBE`, which the tuple key
-            # makes true by construction, and not `k[0] == ...` either, which
-            # a bare-string key satisfies with `k[0] == "/"`. The dict was
-            # cleared and exactly one path probed, so emptiness IS the claim.
+            # The dict was cleared and exactly one path probed, so
+            # emptiness IS the claim, whatever shape the key has.
             assert not cl._PIN_PROBE, (
                 "an unmeasurable parent must be re-probed, not remembered"
             )
