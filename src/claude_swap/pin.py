@@ -225,6 +225,20 @@ def clear_wiring(switcher, timeout: float | None = None, only=None,
     return changed
 
 
+def _config_address(oauth) -> str:
+    """``oauthAccount``'s ``emailAddress``, casefolded. "" when not a string.
+
+    `.claude.json` is a file a human edits, and both readers below compare
+    this field with `.casefold()`. Unguarded it RAISES on the one path whose
+    contract is "never raises": out of `clear_pin` after the record and the
+    wiring are already gone, and inside `clear_wiring`'s per-path `except`,
+    where it takes that config's env-key removal with it. `_pinned_email_now`
+    guards the record's half of the same comparison for the same reason.
+    """
+    value = (oauth or {}).get("emailAddress")
+    return value.casefold() if isinstance(value, str) else ""
+
+
 def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
     """Does this config's ``oauthAccount`` name the pinned account?
 
@@ -249,9 +263,7 @@ def _config_names_the_pin(switcher, current: dict, pinned) -> bool:
     its own login, while `_slot_for` and the row count match the roster
     exactly, as `_resolve_account_identifier` does.
     """
-    if (current.get("emailAddress") or "").casefold() != (
-        pinned[0] or ""
-    ).casefold():
+    if _config_address(current) != (pinned[0] or "").casefold():
         return False
     # THE SLOT, NEVER THE ADDRESS ALONE: given only an email,
     # `identity_for_config` falls to `_resolve_account_identifier`, which
@@ -1386,17 +1398,25 @@ def _config_still_names(email: str, instead_of: "dict | None") -> bool:
     AN UNREADABLE CONFIG COUNTS AS NAMING IT, matching `env_keys_survive`,
     the sibling reader that decides this same message: "I cannot check it"
     must not render as "it is clean" in the one sentence a purged user gets.
+
+    AN ABSENT ONE DOES NOT, which is a different question wearing the same
+    `OSError`. `env_keys_survive` never faces it -- it iterates configs that
+    were WIRED, so they existed -- while this walks every path `_each_config`
+    can name, bootstrapped or not. A file that is not there names nobody, and
+    counting it warned on a completely clean clear.
     """
     want = (instead_of or {}).get("accountUuid")
     for path in _each_config():
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue        # a config that is not there names nobody
         except (OSError, ValueError):
             return True     # cannot check is not clean -- see the docstring
         oauth = raw.get("oauthAccount") if isinstance(raw, dict) else None
         if not isinstance(oauth, dict):
             continue
-        if (oauth.get("emailAddress") or "").casefold() != email.casefold():
+        if _config_address(oauth) != email.casefold():
             continue
         if want and oauth.get("accountUuid") == want:
             continue        # this IS the identity the clear put there
@@ -1642,7 +1662,7 @@ def clear_pin(switcher) -> tuple[bool, str]:
         _pinned and _pinned[0] and _config_still_names(_pinned[0], _back_to)
     )
     _also_stranded = (
-        " A config also still names the ex-pin as the logged-in account; "
+        ". A config also still names the ex-pin as the logged-in account; "
         "switch to the account you want."
     )
     stale = wired_config_paths(switcher)

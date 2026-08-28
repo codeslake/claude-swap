@@ -3276,6 +3276,8 @@ class TestAClearThatCouldNotUnspliceSaysSo:
         assert "still names" in msg, (
             "DEFECT: the stale-receipt ending returned first and the stranded "
             f"config went unmentioned. got {msg!r}")
+        assert "gone. A config" in msg, (
+            f"DEFECT: the two sentences ran together. got {msg!r}")
 
     def test_control_pinning_the_account_you_use_still_reports_plainly(
             self, temp_home):
@@ -3326,6 +3328,83 @@ class TestAClearThatCouldNotUnspliceSaysSo:
         assert "still names" not in msg, (
             "DEFECT: warned about a config that names the pinned address "
             f"because it is the account logged in. got {msg!r}")
+
+
+class TestAClearOnAMachineWithNoConfig:
+    """A config that is not there names nobody.
+
+    `FileNotFoundError` IS an `OSError`, so the "cannot check is not clean"
+    clause claims a config that does not exist -- and the warning fires on a
+    completely clean clear. It fires exactly where the feature is meant to be
+    trustworthy (a half-set-up machine, a `CLAUDE_CONFIG_DIR` pointing at a
+    directory nothing has bootstrapped yet), and a signal that cries wolf on a
+    clean clear is one users learn to skip.
+    """
+
+    def test_the_ordinary_clear_says_exactly_the_ordinary_sentence(
+            self, temp_home):
+        """THE EXACT MESSAGE, not a substring.
+
+        Every other assertion on this path is `"Unpinned" in msg`, which the
+        long stranded-config sentence also satisfies -- which is how a message
+        that grew a whole extra clause stayed green. The CLI keys its own
+        rendering on equality (`msg == "Unpinned the cloud account"`), so the
+        substring tests do not stand in for this one.
+        """
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        live, pinned = "live@example.com", "cloud@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {"email": live, "uuid": "uuid-1", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", live, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": pinned}})
+        # PREMISE: no config at all. Nothing is wired, nothing is spliced,
+        # there is simply no file -- the ordinary shape on a machine where
+        # Claude Code has not run yet.
+        from claude_swap.paths import get_global_config_path
+        assert not get_global_config_path().exists(), (
+            "premise: this test is about the config being ABSENT")
+
+        class _Dead:
+            def apply_pin(self, *a, **k):
+                raise ImportError("cryptography")
+
+        with patch.object(pin_mod, "_impl", lambda: _Dead()):
+            ok, msg = pin_mod.clear_pin(s)
+
+        print(f"\nclear_pin -> ok={ok} msg={msg!r}")
+        assert ok, msg
+        assert msg == "Unpinned the cloud account", (
+            "DEFECT: an absent config was counted as still naming the ex-pin, "
+            f"so a clean clear warned about a file that does not exist. {msg!r}")
+
+    def test_control_an_unreadable_config_still_warns(self, temp_home):
+        """CONTROL: the fix must not undo requirement 4.
+
+        A config that EXISTS and cannot be parsed is the case the clause was
+        written for, and it must keep warning. Without this, narrowing the
+        except to skip absent files could be widened to skip every failure
+        and nothing would say so.
+        """
+        from claude_swap import pin
+
+        (temp_home / ".claude.json").write_text("{ this is not json")
+        assert pin._config_still_names("cloud@example.com", None), (
+            "DEFECT: the absent-file fix also silenced an unreadable one")
 
 
 class TestTheStrandedConfigCheck:
@@ -3399,6 +3478,100 @@ class TestTheStrandedConfigCheck:
                               "displayName": "Slot 2"})
         assert pin._config_still_names(
             "cloud@example.com", {"emailAddress": "cloud@example.com"})
+
+
+class TestAConfigWhoseEmailIsNotAString:
+    """`.claude.json` is a file a human edits, and the clear path casefolds it.
+
+    `_pinned_email_now` guards the RECORD's half of this comparison. The
+    config's half was left unguarded, and it is the more exposed of the two:
+    `.claude.json` is edited far more often than `settings.json`, and the
+    reader sits on the one path whose whole contract is "never raises".
+    """
+
+    def _switcher(self, temp_home, config_oauth):
+        from claude_swap import settings as _s
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        live, pinned = "live@example.com", "cloud@example.com"
+        s._write_json(s.sequence_file, {
+            "activeAccountNumber": 1, "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {"email": live, "uuid": "uuid-1", "organizationUuid": "",
+                      "organizationName": "", "added": "2024-01-01T00:00:00Z"}}})
+        s._write_account_credentials("1", live, json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-1", "refreshToken": "rt-1"}}))
+        s._write_account_config("1", live, json.dumps(
+            {"oauthAccount": {"emailAddress": live, "accountUuid": "uuid-1"}}))
+        _s.atomic_write_json(_s.settings_path(s.backup_dir),
+                             {"remoteControl": {"pinnedEmail": pinned}})
+        cfg = temp_home / ".claude.json"
+        cfg.write_text(json.dumps({"env": {}, "oauthAccount": config_oauth}))
+        return s, cfg
+
+    def test_the_clear_does_not_raise_over_a_non_string_address(
+            self, temp_home):
+        """Requirement 1, on the field the record's guard does not cover.
+
+        The clear has ALREADY removed the record and the wiring by the time
+        this reader runs, so an AttributeError here is a clear that fully
+        succeeded exiting 1 and blaming the optional package -- the exact
+        sentence the `pinnedEmail` guard was written for, one field over.
+        """
+        from unittest.mock import patch
+
+        from claude_swap import pin as pin_mod
+
+        class _Dead:
+            def apply_pin(self, *a, **k):
+                raise ImportError("cryptography")
+
+        for bad in (42, ["a@example.com"], {"x": 1}, True):
+            s, _cfg = self._switcher(temp_home, {"emailAddress": bad})
+            with patch.object(pin_mod, "_impl", lambda: _Dead()):
+                ok, msg = pin_mod.clear_pin(s)
+            print(f"\nemailAddress={bad!r} -> ok={ok} msg={msg!r}")
+            assert pin_mod._pinned_email_now(s) is None, (
+                "premise: the clear removed the record before this reader ran")
+            assert ok, (
+                f"DEFECT: a non-string emailAddress ({bad!r}) raised out of "
+                "clear_pin AFTER the clear succeeded, so the command exits 1 "
+                "over work that is fully done")
+
+    def test_the_unsplice_reader_does_not_raise_either(self):
+        """The SAME expression, one function over, at its own seam.
+
+        `_config_names_the_pin` carries the identical unguarded casefold on
+        the identical field. Its raise is swallowed by `clear_wiring`'s
+        per-path `except` -- and takes that config's env-key removal with it,
+        so the clear reports "re-run once it frees up", advice that cannot
+        converge because the next run raises in the same place.
+
+        SCOPE, stated honestly: this is the reader's own contract, tested at
+        the reader. A route to it through `clear_pin` is NOT established --
+        the un-splice is gated on `_live_login_for_config`, which reads the
+        same broken field -- so this pins the guard, not a reproduced
+        end-to-end failure.
+        """
+        from claude_swap import pin
+        from claude_swap import switcher as _sw
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw.backup_dir = "/nowhere"
+        sw._get_sequence_data = lambda: {"accounts": {
+            "2": {"email": "cloud@example.com", "organizationUuid": "org-B",
+                  "uuid": "UUID-2"}}}
+        for bad in (42, ["a@example.com"], {"x": 1}, True):
+            assert pin._config_names_the_pin(
+                sw, {"emailAddress": bad, "accountUuid": "UUID-2"},
+                ("cloud@example.com", "org-B")) is False, (
+                f"DEFECT: emailAddress={bad!r} raised in the un-splice test, "
+                "which clear_wiring swallows along with the env-key removal")
 
 
 class TestAPinnedEmailThatIsNotAString:
