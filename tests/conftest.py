@@ -121,6 +121,14 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             (_paths.get_default_claude_config_home(), False),
             (_paths.get_global_config_path().parent, False),
             (_paths.get_default_global_config_path().parent, False),
+            # $HOME EXPLICITLY, not only via those two parents. Both
+            # resolvers return `<config home>/.config.json` when that legacy
+            # file exists, so on a machine carrying it both `.parent` values
+            # collapse to `~/.claude` and $HOME -- whose direct children
+            # `~/.claude.json`, `~/.claude.json.lock` and `~/.claude.lock`
+            # this docstring names as the protected set -- drops out of the
+            # frozen roots entirely.
+            (Path.home(), False),
         )
 
     ambient_specs = _resolve()

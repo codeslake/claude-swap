@@ -260,14 +260,25 @@ def test_non_recursive_root_protects_only_direct_children(
     assert not direct_target.exists()
 
 
-def test_frozen_specs_include_the_two_non_recursive_roots(monkeypatch, tmp_path):
+@pytest.mark.parametrize("legacy_global_config", [False, True])
+def test_frozen_specs_include_the_two_non_recursive_roots(
+    monkeypatch, tmp_path, legacy_global_config
+):
     """M11: dropping the four non-recursive-root entries survived because
     no test inspects ``_REAL_STORE_SPECS`` directly — these two roots
     (``~/.claude``, ``$HOME``) are the ONLY protection for
-    ``~/.claude/.credentials.json`` and ``~/.claude.json``."""
+    ``~/.claude/.credentials.json`` and ``~/.claude.json``.
+
+    The ``legacy_global_config`` arm is the one that could not fail before:
+    both global-config resolvers return ``<config home>/.config.json`` when
+    that file exists, so both ``.parent`` values collapse to ``~/.claude``
+    and $HOME reached the specs through nothing at all.
+    """
     home = tmp_path / "home"
     home.mkdir()
     (home / ".claude").mkdir()
+    if legacy_global_config:
+        (home / ".claude" / ".config.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     for var in ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR", "XDG_DATA_HOME"):
         monkeypatch.delenv(var, raising=False)
