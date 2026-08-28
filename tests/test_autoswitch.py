@@ -85,6 +85,21 @@ def _seed_org_twin(h, num, email, org):
     h.switcher._write_json(h.switcher.sequence_file, d)
 
 
+def _blind_quarantine(h, num, email, reason="identity-conflict"):
+    store = h.switcher._store
+    real = store._read_account_credentials
+
+    def unreadable(account_num, e, failed=None):
+        if account_num == num:
+            if failed is not None:
+                failed.append(True)
+            return ""
+        return real(account_num, e, failed)
+
+    with patch.object(store, "_read_account_credentials", side_effect=unreadable):
+        h.engine._quarantine(num, email, reason)
+
+
 class EngineHarness:
     """Seeded switcher + engine + captured events, on the Linux file backend."""
 
@@ -2287,6 +2302,106 @@ class TestQuarantineLifecycle:
         assert set(q) == {"2", "3"}, (
             "DEFECT: swapping two barred slots dropped BOTH bars -- each carry "
             f"could not see the other because it is itself quarantined: {list(q)}"
+        )
+
+    def test_a_legacy_record_never_carries_a_bar(self, harness):
+        """A record written before the composite names an ADDRESS.
+
+        On the personal/org pair it cannot say which slot now holds the
+        barred account, and carrying on the address alone puts the bar on
+        the sibling -- where the blind bind writes THAT account's own
+        generation and no later compare can lift it. Releasing is what
+        this did before the carry existed; a guess is not.
+        """
+        _seed_org_twin(harness, 4, "b@example.com", "org-acme")
+
+        """Every record the code wrote BEFORE the composite landed has no org
+        key, and nothing upgrades one."""
+        _blind_quarantine(harness, "2", "b@example.com")
+        # Make it LEGACY, exactly as a record written by the shipped code is.
+        def strip(state):
+            state["quarantine"]["2"].pop("organizationUuid", None)
+        harness.engine._mutate_state(strip)
+        entry = harness.state()["quarantine"]["2"]
+        assert "organizationUuid" not in entry, "premise: the record is legacy"
+        assert entry.get("fingerprintUnknown") is True, "premise: blind"
+
+        harness.switcher.remove_account("2", assume_yes=True)
+        harness.events.clear()
+        for _ in range(4):
+            harness.tick_with_usage({"1": _usage(95), "3": _usage(50), "4": _usage(0)})
+
+        q = harness.state().get("quarantine") or {}
+        unq = [e for e in harness.events if isinstance(e, UnquarantineEvent)]
+        assert "4" not in q, (
+            "DEFECT: a LEGACY record matched on the address alone and carried the "
+            "bar onto the org sibling; the blind bind then wrote slot 4's own "
+            "generation so no later compare can lift it"
+        )
+
+    def test_a_release_does_not_eat_a_bar_carried_onto_the_same_slot(
+        self, harness
+    ):
+        """A slot whose own record has nowhere to go is released, and the
+        same slot is a legal carry TARGET -- so popping after writing drops
+        the bar that just arrived, with no event naming its account."""
+        _seed_org_twin(harness, 4, "b@example.com", "org-acme")
+
+        """A slot can be both a carry TARGET and its own release source."""
+        _blind_quarantine(harness, "2", "b@example.com")
+        _blind_quarantine(harness, "3", "c@example.com")
+        assert set(harness.state()["quarantine"]) == {"2", "3"}, "premise"
+
+        harness.switcher.swap_accounts("2", "3")
+        harness.switcher.remove_account("2", assume_yes=True)   # c@ leaves
+        r = harness.switcher._get_sequence_data()["accounts"]
+        assert "3" in r and r["3"]["email"] == "b@example.com", "premise: b@ is at slot 3"
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(95), "3": _usage(0), "4": _usage(100)})
+
+        q = harness.state().get("quarantine") or {}
+        unq = [(e.number, e.email, e.reason) for e in harness.events
+               if isinstance(e, UnquarantineEvent)]
+        sw = [e for e in harness.events if isinstance(e, SwitchEvent)]
+        assert "3" in q, (
+            "DEFECT: the bar on b@ was carried to slot 3 and then popped by slot "
+            f"3's OWN release, with no event naming b@; unq={unq}"
+        )
+        assert harness.active_number() != 3, (
+            "DEFECT: the engine switched into the account it barred"
+        )
+
+    def test_an_org_backfill_is_not_the_account_moving(self, harness, temp_home):
+        """`_migrate_org_fields` backfills `organizationUuid` on a pre-org
+        row, and every other caller reads the migrated roster. Reading the
+        plain one at either end makes that backfill look like a move."""
+
+        """`_quarantine` and the release read the UNMIGRATED roster; every other
+        caller reads the migrated one, which backfills organizationUuid."""
+        d = harness.switcher._get_sequence_data()
+        d["accounts"]["3"].pop("organizationUuid", None)      # a pre-org roster row
+        harness.switcher._write_json(harness.switcher.sequence_file, d)
+        harness.switcher._write_account_config("3", "c@example.com", json.dumps(
+            {"oauthAccount": {"emailAddress": "c@example.com", "accountUuid": "uuid-3",
+                              "organizationUuid": "org-backfilled",
+                              "organizationName": "Backfilled"}}))
+        # PREMISE, true in BOTH worlds: the roster row carries no org yet.
+        assert "organizationUuid" not in harness.switcher._get_sequence_data()[
+            "accounts"]["3"]
+        harness.engine._quarantine("3", "c@example.com", "invalid_grant")
+        rec = harness.state()["quarantine"]["3"]
+
+        harness.switcher._get_sequence_data_migrated()        # the backfill any command runs
+        row = harness.switcher._get_sequence_data()["accounts"]["3"]
+        assert row.get("organizationUuid") == "org-backfilled", "premise: the backfill ran"
+        harness.events.clear()
+        harness.tick_with_usage({"1": _usage(95), "2": _usage(50), "3": _usage(0), "4": _usage(50)})
+
+        q = harness.state().get("quarantine") or {}
+        unq = [(e.number, e.reason) for e in harness.events if isinstance(e, UnquarantineEvent)]
+        assert "3" in q, (
+            f"DEFECT: an org BACKFILL read as the account moving and released a "
+            f"standing bar with the false reason account-replaced; unq={unq}"
         )
 
     def test_an_unreadable_backup_does_not_lift_a_quarantine(self, harness):

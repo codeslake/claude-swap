@@ -881,7 +881,12 @@ class AutoSwitchEngine:
         )
 
         def add(state: dict) -> None:
-            row = ((self.switcher._get_sequence_data() or {})
+            # THE MIGRATED ROSTER, as every other caller reads. The plain
+            # one has no `organizationUuid` on a pre-org row, so a later
+            # backfill -- which any ordinary command runs -- makes the
+            # composite compare read a standing bar as "the account moved"
+            # and release it with a false `account-replaced`.
+            row = ((self.switcher._get_sequence_data_migrated() or {})
                    .get("accounts", {}).get(number) or {})
             state.setdefault("quarantine", {})[number] = {
                 "email": email,
@@ -914,7 +919,9 @@ class AutoSwitchEngine:
         to_release: list[tuple[str, str, str]] = []
         to_bind: list[tuple[str, str | None]] = []
         to_rekey: list[tuple[str, str]] = []
-        roster = (self.switcher._get_sequence_data() or {}).get("accounts", {})
+        roster = (
+            self.switcher._get_sequence_data_migrated() or {}
+        ).get("accounts", {})
 
         def _identity(num: str) -> tuple[str, str] | None:
             row = roster.get(num)
@@ -951,7 +958,14 @@ class AutoSwitchEngine:
                 # puts it straight back in rotation, and nothing re-checks an
                 # identity conflict before the switch. Only when exactly one
                 # OTHER unbarred slot holds it: two would be a guess.
-                elsewhere = [
+                # A LEGACY RECORD NEVER CARRIES. It names an address, not
+                # an account, so on the personal/org pair it cannot say
+                # which slot now holds the barred one -- and carrying on
+                # the address alone puts the bar on the sibling, where the
+                # blind bind writes THAT account's generation and no later
+                # compare can lift it. Releasing is what this did before
+                # the carry existed; a guess is not.
+                elsewhere = [] if recorded[1] is None else [
                     n for n in roster
                     if n != number
                     and n not in staying
@@ -1017,6 +1031,12 @@ class AutoSwitchEngine:
                 # POP EVERY SOURCE BEFORE WRITING ANY TARGET. Two barred
                 # slots that exchanged are each other's target, so writing
                 # in step would overwrite the second bar with the first.
+                # RELEASES FIRST. A slot whose own record has nowhere to
+                # go is released, and the same slot is a legal carry TARGET
+                # -- so popping after writing drops the bar that just
+                # arrived, with no event naming the account it was about.
+                for number, _, _ in to_release:
+                    q.pop(number, None)
                 carried: dict[str, dict] = {}
                 for old_num, new_num in to_rekey:
                     row = q.pop(old_num, None)
@@ -1028,8 +1048,6 @@ class AutoSwitchEngine:
                     if isinstance(row, dict):
                         row["refreshTokenFingerprint"] = fp
                         row["fingerprintUnknown"] = False
-                for number, _, _ in to_release:
-                    q.pop(number, None)
 
         state = self._mutate_state(drop)
         for number, email, reason in to_release:
