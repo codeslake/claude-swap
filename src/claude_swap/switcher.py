@@ -1270,8 +1270,26 @@ class ClaudeAccountSwitcher:
         # the new keys only. A failure here leaks a stale file, never a wrong
         # read — logged loudly because a stale key under a freed slot would
         # poison a future same-email account landing on that number.
+        # BY THE PROFILE PATHS TOO, not by the addresses alone.
+        # `slugify_email` is documented non-injective and says uniqueness
+        # comes from the `<num>-` prefix -- which a swap is precisely the
+        # operation that exchanges. Two addresses with one slug make the OLD
+        # keys' profile paths the two NEW homes, so this prune deletes both
+        # accounts' profiles. A leaked backup is the failure mode this block
+        # already accepts; a deleted profile is not.
+        homes = {
+            self._session_dir(num_b, email_a),
+            self._session_dir(num_a, email_b),
+        }
         if email_a != email_b:
             for num, email in ((num_a, email_a), (num_b, email_b)):
+                if self._session_dir(num, email) in homes:
+                    self._logger.error(
+                        "Stale backup left under old key %s: its session "
+                        "profile path is now the other account's home "
+                        "(the two addresses share one slug)", num,
+                    )
+                    continue
                 try:
                     self._delete_account_files(num, email)
                 except Exception as e:
@@ -1453,7 +1471,18 @@ class ClaudeAccountSwitcher:
             # is true when nothing moved at all and the two profiles resolve
             # to each other. The flags then swap onto the wrong profiles on
             # every path that skips the renames.
-            here_a = new_a if a_landed else dir_a
+            # AND A THAT DID NOT LAND IS NOT NECESSARILY AT `dir_a`. It is
+            # parked under the staging name first, and the recovery below
+            # refuses to put it back when `dir_a` is occupied -- which is
+            # exactly what B landing there does under one shared email. Left
+            # as `dir_a`, A's flag is written onto B's profile and A's own
+            # is dropped.
+            if a_landed:
+                here_a = new_a
+            elif staging is not None and os.path.exists(staging):
+                here_a = staging
+            else:
+                here_a = dir_a
             here_b = new_b if b_landed else dir_b
             for old_dir in (dir_a, dir_b):
                 try:

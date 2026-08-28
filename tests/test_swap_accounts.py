@@ -44,6 +44,25 @@ def caplog_at_error():
         logger.removeHandler(h)
 
 
+def _r37_two_slots(s, data, e1, e2):
+    s._setup_directories()
+    d = dict(data)
+    d["accounts"] = {
+        "1": {"email": e1, "uuid": "u1", "organizationUuid": "", "organizationName": "",
+              "added": "2024-01-01T00:00:00Z"},
+        "2": {"email": e2, "uuid": "u2", "organizationUuid": "", "organizationName": "",
+              "added": "2024-01-01T00:00:00Z"}}
+    d["sequence"] = [1, 2]
+    s._write_json(s.sequence_file, d)
+    s._write_account_credentials("1", e1, "creds-A")
+    s._write_account_credentials("2", e2, "creds-B")
+    for num, email, tag in (("1", e1, "A"), ("2", e2, "B")):
+        p = s._session_dir(num, email)
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "marker").write_text(f"{tag}-HISTORY")
+    return s
+
+
 class TestSwapAccounts:
     """Test ClaudeAccountSwitcher.swap_accounts()."""
 
@@ -2971,6 +2990,79 @@ class TestASwapKeepsEachProfilesOwnGeneration:
         assert not is_session_stale(d2), (
             "DEFECT: slot 2's profile never moved and INHERITED slot 1's flag, so "
             "its next launch re-bootstraps it from a backup it has rotated past"
+        )
+
+    def test_a_one_sided_swap_leaves_each_flag_on_its_own_profile(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """A profile that did not land is not necessarily at its old name.
+
+        It is parked under the staging name first, and the recovery
+        refuses to put it back when the old name is occupied -- which is
+        what the other profile landing there does under one shared email.
+        Read as "still at `dir_a`", its flag is written onto the arrived
+        profile and its own is dropped.
+        """
+        import errno
+        import os
+        from unittest.mock import patch
+
+        from claude_swap.session import is_session_stale, mark_session_stale
+
+        e = "user@example.com"
+        s = _r37_two_slots(ClaudeAccountSwitcher(), sample_sequence_data_with_org, e, e)
+        d1, d2 = s._session_dir("1", e), s._session_dir("2", e)
+        assert mark_session_stale(d1)
+        assert is_session_stale(d1) and not is_session_stale(d2)
+
+        real = os.replace
+        calls = []
+
+        def refuse_a_second_leg(src, dst, *a, **k):
+            calls.append((os.path.basename(str(src)), os.path.basename(str(dst))))
+            if str(src).endswith(".swapping"):
+                raise OSError(errno.EACCES, "refused")
+            return real(src, dst, *a, **k)
+
+        moved = []
+        with patch("claude_swap.switcher.os.replace", side_effect=refuse_a_second_leg):
+            s._swap_session_dirs("1", e, "2", e, moved)
+
+        stranded = d1.with_name(d1.name + ".swapping")
+        # PREMISE: B landed at slot 1's key and A is stranded under .swapping.
+        assert stranded.exists() and (stranded / "marker").read_text() == "A-HISTORY"
+        assert d1.exists() and (d1 / "marker").read_text() == "B-HISTORY"
+
+        assert not is_session_stale(d1), (
+            "DEFECT: B's profile arrived at slot 1's key and INHERITED A's flag"
+        )
+        assert is_session_stale(stranded), (
+            "DEFECT: A's profile is stranded and its flag was dropped"
+        )
+
+    def test_two_addresses_with_one_slug_keep_their_profiles(
+        self, temp_home: Path, sample_sequence_data_with_org: dict
+    ):
+        """`slugify_email` is documented non-injective, and says uniqueness
+        comes from the `<num>-` prefix -- which a swap exchanges. The old
+        keys' profile paths are then the two NEW homes, and the post-commit
+        prune deletes both accounts' profiles."""
+
+        e1, e2 = "a+x@b.com", "a_x@b.com"
+        s = _r37_two_slots(ClaudeAccountSwitcher(), sample_sequence_data_with_org, e1, e2)
+        # PREMISES: the addresses differ and their slugs collide.
+        assert e1 != e2
+        assert s._session_dir("1", e1).name == s._session_dir("2", e2).name.replace("2-", "1-")
+        before = sorted(p.name for p in s.backup_dir.glob("sessions/*/marker"))
+        before_txt = sorted((p / "marker").read_text() for p in (s.backup_dir / "sessions").iterdir())
+        assert len(before_txt) == 2, f"premise: two profiles on disk, got {before_txt}"
+
+        s.swap_accounts("1", "2")
+
+        now = sorted((p / "marker").read_text() for p in (s.backup_dir / "sessions").iterdir()
+                     if (p / "marker").exists())
+        assert now == before_txt, (
+            f"DEFECT: the swap DESTROYED session profiles. before={before_txt} after={now}"
         )
 
     def test_a_move_carries_the_profile_s_stale_flag_with_it(
