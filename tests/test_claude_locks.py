@@ -797,17 +797,25 @@ class TestTheAcquireAndReleaseAreBounded:
         )
 
     def test_the_release_does_not_wait_out_a_stalled_tick(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, caplog
     ):
         """UNPINNED ONLY, where the release takes the stamp mutex at all.
 
         `_touch` holds it across three syscalls, so an unbounded acquire
         hands the release however long the filesystem stalls -- on a
         `finally` that a single switch reaches three times.
+
+        Timing out the bounded acquire does not mean the mutex went unowned
+        -- the stalled tick still holds it, and only the tick may release it.
+        A release that ignores `held_stamp` and calls `stamping.release()`
+        anyway un-locks it out from under the tick; when the tick's own
+        `with _tick_guard:` then exits, ITS release call finds the lock
+        already unlocked and raises in the daemon thread.
         """
         monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
         monkeypatch.setattr(claude_locks, "_RELEASE_WAIT_S", 0.2)
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
+        caplog.set_level(logging.WARNING, logger="claude-swap")
 
         lock = tmp_path / "target.lock"
         real_utime = os.utime
@@ -821,15 +829,89 @@ class TestTheAcquireAndReleaseAreBounded:
             return real_utime(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "utime", stalling)
-        start = time.monotonic()
-        with proper_lockfile(lock, timeout=1.0):
-            assert entered.wait(1.0), "premise: no tick ever entered the stall"
-        elapsed = time.monotonic() - start
+
+        thread_errors = []
+        original_excepthook = threading.excepthook
+        threading.excepthook = thread_errors.append
+        try:
+            start = time.monotonic()
+            with proper_lockfile(lock, timeout=1.0):
+                assert entered.wait(1.0), "premise: no tick ever entered the stall"
+            elapsed = time.monotonic() - start
+            # Wait past the 2.0s stall so the tick's own release of the
+            # mutex -- and any exception it raises -- has had time to run.
+            time.sleep(max(0.0, 2.5 - (time.monotonic() - start)))
+        finally:
+            threading.excepthook = original_excepthook
 
         assert elapsed < 1.5, (
             f"the release waited {elapsed:.2f}s on a tick stalled 2.0s — the "
             "acquire of the stamp mutex is unbounded, so the filesystem sets "
             "the bound"
+        )
+        assert any(
+            "did not return within" in r.getMessage() for r in caplog.records
+        ), (
+            "premise: the release never logged the stamp-mutex timeout, so "
+            "this says nothing about what the timeout path then does: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+        assert not thread_errors, (
+            "the stalled tick's own release of the stamp mutex raised in "
+            f"the daemon thread: {[repr(e.exc_value) for e in thread_errors]}"
+        )
+
+    def test_the_release_leaves_a_lock_rewound_by_an_external_writer(
+        self, tmp_path, monkeypatch
+    ):
+        """UNPINNED, no lenient tick to fall back on.
+
+        An external writer (`rsync --times`, a restore, a clock step) can
+        rewind the lock's mtime while we hold it. `_ours(strict=True)`
+        requires an EXACT match, so a rewind fails it exactly as a real
+        takeover would; `unproven` only covers a rewind the HEARTBEAT itself
+        saw, and with no tick during the hold nothing ever sets it. The
+        release checks `unproven` before `_ours`, so `strict` is the only
+        thing standing between this rewind and `os.rmdir` -- which would take
+        a successor's lock out from under its critical section.
+        """
+        monkeypatch.setattr(claude_locks, "_CAN_PIN_A_DIRECTORY", False)
+        monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 60.0)
+
+        lock = tmp_path / "target.lock"
+        main_tid = threading.get_ident()
+        real_utime = os.utime
+        tick_calls = []
+
+        def tracking_utime(path, *a, **k):
+            if (not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)
+                    and threading.get_ident() != main_tid):
+                tick_calls.append(threading.get_ident())
+            return real_utime(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "utime", tracking_utime)
+        with proper_lockfile(lock, timeout=1.0):
+            stamp_before = lock.stat().st_mtime_ns
+            rewound = stamp_before - 5_000_000_000
+            os.utime(lock, ns=(rewound, rewound))
+            stamp_after = lock.stat().st_mtime_ns
+            assert stamp_after < stamp_before, (
+                "premise: the external rewrite did not move the mtime "
+                f"backwards ({stamp_before} -> {stamp_after})"
+            )
+        monkeypatch.undo()
+
+        assert not tick_calls, (
+            f"premise: a heartbeat tick fired during the hold "
+            f"({len(tick_calls)} call(s)) -- a lenient tick would latch "
+            "`unproven` and this case would no longer be exercising the "
+            "strict path alone"
+        )
+        assert lock.exists(), (
+            "the release removed a lock it could not prove was still ours "
+            "-- a successor holding it loses its critical section out from "
+            "under it"
         )
 
 
