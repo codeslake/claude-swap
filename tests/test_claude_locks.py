@@ -912,7 +912,7 @@ class TestADeadlineCanPassMidIterationForEveryArm:
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5):
                 pass
-        assert reads[:3] == [0.0, 0.0, 0.6], (
+        assert reads == [0.0, 0.0, 0.6, 0.6], (
             f"the dangling-symlink arm's clamp was never entered: {reads}"
         )
 
@@ -938,7 +938,7 @@ class TestADeadlineCanPassMidIterationForEveryArm:
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5, staleness=1.0):
                 pass
-        assert reads[:3] == [0.0, 0.0, 0.6], (
+        assert reads == [0.0, 0.0, 0.6, 0.6], (
             f"the rmdir-failed arm's clamp was never entered: {reads}"
         )
 
@@ -955,7 +955,7 @@ class TestADeadlineCanPassMidIterationForEveryArm:
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5):
                 pass
-        assert reads[:3] == [0.0, 0.0, 0.6], (
+        assert reads == [0.0, 0.0, 0.6, 0.6], (
             f"the jitter arm's clamp was never entered: {reads}"
         )
 
