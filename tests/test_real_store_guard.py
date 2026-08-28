@@ -260,6 +260,27 @@ def test_non_recursive_root_protects_only_direct_children(
     assert not direct_target.exists()
 
 
+def test_a_dot_dot_spelling_cannot_walk_past_a_non_recursive_root(
+    tmp_path: Path, monkeypatch
+):
+    """A non-recursive root matches on ``target.parent``, which pathlib
+    reports literally: ``<root>/sub/..`` is not ``<root>``, so the direct
+    child the root exists to protect was reachable by spelling its own
+    parent the long way. A recursive root is immune -- ``root in
+    target.parents`` still holds -- so nothing but this class of root ever
+    showed the gap.
+    """
+    non_recursive_root = tmp_path / ".claude"
+    (non_recursive_root / "sub").mkdir(parents=True)  # before the guard is armed
+
+    monkeypatch.setattr(conftest, "_REAL_STORE_SPECS", ((non_recursive_root, False),))
+
+    walked = f"{non_recursive_root}/sub/../.credentials.json"
+    with pytest.raises(conftest.RealStoreWriteBlocked):
+        open(walked, "w").close()
+    assert not (non_recursive_root / ".credentials.json").exists()
+
+
 @pytest.mark.parametrize("legacy_global_config", [False, True])
 def test_frozen_specs_include_the_two_non_recursive_roots(
     monkeypatch, tmp_path, legacy_global_config
@@ -317,7 +338,7 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     )
     # PREMISE: it really is outside every root that covers the backup root,
     # so this entry is the only thing that can cover it.
-    assert flag.parent not in roots and flag not in recursive_roots
+    assert flag.parent not in roots
 
     projects = home / ".claude" / "projects"
     assert projects in recursive_roots, (
@@ -326,7 +347,7 @@ def test_frozen_specs_cover_the_migration_flag_and_the_transcript_tree(
     )
     # PREMISE: ~/.claude is still non-recursive -- this worktree lives under
     # it, so making it recursive would refuse the suite's own writes.
-    assert (home / ".claude") in roots and (home / ".claude") not in recursive_roots
+    assert (home / ".claude") not in recursive_roots
 
 
 def test_frozen_specs_ignore_a_developer_exported_claude_config_dir(

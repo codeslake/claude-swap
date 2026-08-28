@@ -407,6 +407,12 @@ def _real_store_audit_hook(event: str, args: tuple) -> None:
         if (event == "os.remove"
                 and os.path.basename(candidate) == _GUARD_PROBE_MARKER):
             continue
+        # A non-recursive root matches on `target.parent`, which pathlib
+        # reports literally -- `<root>/sub/..` is not `<root>`, so a direct
+        # child stayed reachable by spelling its own parent the long way.
+        # Pure string work, no syscall: a symlinked spelling still walks
+        # past, and closing that needs realpath on the roots as well.
+        candidate = os.path.normpath(candidate)
         target = Path(candidate)
         for root, recursive in _REAL_STORE_SPECS:
             hit = (

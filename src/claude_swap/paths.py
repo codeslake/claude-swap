@@ -149,10 +149,9 @@ def migration_flag_for(target: Path) -> Path:
     """The interrupted-migration flag for ``target``.
 
     A SIBLING of the backup root, so no protected root that covers the root
-    itself covers this file. Anything that has to name it -- the test
-    suite's real-store guard among them -- must name it from here: a second
-    spelling drifts, and the flag is what turns the migration's collision
-    refusal into an rmtree of the destination.
+    itself covers this file. Spell it here only: this flag is what turns the
+    collision refusal below into an rmtree of the destination, and a second
+    copy drifts.
     """
     return target.parent / f".{target.name}.migrating"
 
