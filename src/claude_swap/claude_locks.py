@@ -38,6 +38,9 @@ import random
 import threading
 import time
 from contextlib import contextmanager
+
+from claude_swap.exceptions import LockError
+from claude_swap.locking import FileLock
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeCodeLockTimeout
@@ -80,6 +83,40 @@ def config_lock_dir() -> Path:
     """Lock directory guarding the global config file (``~/.claude.json.lock``)."""
     path = get_global_config_path()
     return path.parent / (path.name + ".lock")
+
+
+_TAKEOVER_GUARD_S = 0.5
+
+
+def _take_over_stale(lock_dir, staleness: float) -> bool:
+    """Remove a lock whose holder is gone, but never a successor's.
+
+    `os.stat` decides and `os.rmdir` acts, and between them another waiter
+    can win the same race and create ITS lock at this name -- which the
+    rmdir then removes, putting two processes inside the critical section
+    at once. Measured on this tree: 7 of 320 holds saw a co-holder with a
+    stale lock present, 0 of 320 without one, and widening only that gap in
+    one waiter made it dominant (30 of 160 at 50 ms).
+
+    The window is serialized on an flock -- the one primitive here a peer
+    cannot steal -- and the staleness is re-read while holding it, so a
+    directory a peer already retook is left alone. Claude Code performs the
+    same takeover and takes no lock of ours, so this closes the race
+    between cswap processes and narrows, but cannot close, the
+    cross-implementation one. Returns whether the corpse was removed.
+    """
+    guard = lock_dir.parent / f"{lock_dir.name}.takeover"
+    try:
+        with FileLock(guard, timeout=_TAKEOVER_GUARD_S):
+            try:
+                if time.time() - os.stat(lock_dir).st_mtime <= staleness:
+                    return False  # a peer retook it; it is not ours to remove
+            except FileNotFoundError:
+                return False  # already gone; the mkdir above will race for it
+            os.rmdir(lock_dir)
+            return True
+    except (LockError, OSError):
+        return False
 
 
 @contextmanager
@@ -126,13 +163,10 @@ def proper_lockfile(
             time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
         if time.time() - held_mtime > staleness:
-            # Dead holder per the protocol: remove and retake. Losing the
-            # rmdir/mkdir race to another waiter just means looping again.
-            try:
-                os.rmdir(lock_dir)
-            except OSError:
-                # Can't remove it either; don't spin hot, and don't sleep
-                # past the deadline.
+            # Dead holder per the protocol: remove and retake. Declining --
+            # a peer retook it, or the corpse could not be removed -- must
+            # not spin hot, and must not sleep past the deadline.
+            if not _take_over_stale(lock_dir, staleness):
                 time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
             continue
         # Clamped to the remaining budget, so `timeout` bounds the whole

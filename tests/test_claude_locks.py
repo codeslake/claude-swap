@@ -938,7 +938,10 @@ class TestADeadlineCanPassMidIterationForEveryArm:
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5, staleness=1.0):
                 pass
-        assert reads == [0.0, 0.0, 0.6, 0.6], (
+        # One more read than the other arms: the takeover is serialized on
+        # an flock, and `FileLock.acquire` reads the same `time` module the
+        # scripted clock patches.
+        assert reads == [0.0, 0.0, 0.6, 0.6, 0.6], (
             f"the rmdir-failed arm's clamp was never entered: {reads}"
         )
 
@@ -995,3 +998,35 @@ def test_a_second_freeze_after_a_recovery_is_reported_again(
         "recovered and returned is the one the takeover follows, and the "
         "latch swallowed it"
     )
+
+
+class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
+    """`os.stat` decides and `os.rmdir` acts; a peer can win the same race
+    in between and create ITS lock at this name. Removing that puts two
+    processes in the critical section at once."""
+
+    def test_a_corpse_is_removed_and_a_fresh_lock_is_left_alone(self, tmp_path):
+        lock_dir = tmp_path / "target.lock"
+        staleness = 60.0
+
+        # CONTROL, and the positive arm: a genuine corpse IS taken over, so
+        # a False below cannot be a takeover that never works at all.
+        lock_dir.mkdir()
+        past = time.time() - 10 * staleness
+        os.utime(lock_dir, (past, past))
+        assert claude_locks._take_over_stale(lock_dir, staleness) is True
+        assert not lock_dir.exists()
+
+        # THE ARM UNDER TEST: by the time the removal runs, a peer has
+        # retaken the name. Its directory is fresh, and removing it would
+        # leave that peer holding a lock this process is about to recreate.
+        lock_dir.mkdir()
+        assert claude_locks._take_over_stale(lock_dir, staleness) is False, (
+            "DEFECT: a directory that is no longer stale was removed -- a "
+            "peer that won the takeover race holds it, and taking it away "
+            "puts both processes inside the critical section"
+        )
+        assert lock_dir.exists(), "the successor's lock must survive"
+
+    def test_a_vanished_lock_is_not_an_error(self, tmp_path):
+        assert claude_locks._take_over_stale(tmp_path / "gone.lock", 60.0) is False
