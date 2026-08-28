@@ -3843,9 +3843,20 @@ class TestPerformSwitchPostDisplay:
 
         calls = []
 
-        def busy_replace(src, dst):
-            calls.append(("replace", str(dst)))
-            raise OSError(errno.EBUSY, "device or resource busy")
+        import claude_swap.fsutil as fsutil_mod
+
+        real_replace = fsutil_mod.os.replace
+
+        def busy_replace(src, dst, *a, **k):
+            # AT THE SHARED CALLEE, not at one module's binding. `models`
+            # holds its own `from claude_swap.fsutil import
+            # replace_with_retry`, so patching switcher's name leaves the
+            # RESTORE's rename real -- it succeeds, and this case then
+            # certifies a branch it never entered.
+            if os.path.basename(os.fspath(dst)) == ".claude.json":
+                calls.append(("replace", str(dst)))
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return real_replace(src, dst, *a, **k)
 
         def dies_partway(source, dest, *a, **k):
             # `copyfile` opens the destination 'wb' before the first source
@@ -3857,7 +3868,7 @@ class TestPerformSwitchPostDisplay:
 
         try:
             with patch.object(
-                switcher_mod, "replace_with_retry", side_effect=busy_replace,
+                fsutil_mod.os, "replace", side_effect=busy_replace,
             ), patch.object(
                 switcher_mod.shutil, "copyfile", side_effect=dies_partway,
             ), pytest.raises(SwitchError) as excinfo:
@@ -3869,8 +3880,9 @@ class TestPerformSwitchPostDisplay:
 
         # PREMISES: the write-through really ran, or this case asserts the
         # absence of damage nothing attempted.
-        assert [c[0] for c in calls] == ["replace", "copy"], (
-            f"premise: the EBUSY write-through must run, got {calls}"
+        assert [c[0] for c in calls] == ["replace", "copy", "replace"], (
+            "premise: the write's EBUSY, its write-through, AND the "
+            f"restore's own rename must all run, got {calls}"
         )
         assert "may now be truncated" in str(excinfo.value), (
             "premise: the failure must be the write-through's own"

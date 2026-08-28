@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -175,13 +176,12 @@ def _restore_atomically(path: Path, text: str) -> None:
     for. Name first, publish by rename, so a failed restore leaves the
     destination exactly as it was.
 
-    NEVER falls back to rewriting in place. The only evidence a fallback
-    could weigh is the errno from the TEMP, which is a fact about the
-    parent directory -- and a bind-mounted destination is not even on the
-    same filesystem, so a rewrite authorised that way truncates a file
-    whose own room nothing measured. Refusing leaves the caller holding
-    the state this restore exists to undo, which one switch recovers; a
-    truncated destination is not recoverable at all.
+    A FAILURE TO NAME THE TEMP NEVER FALLS BACK. That errno is a fact
+    about the parent directory, and a bind-mounted destination is not even
+    on the same filesystem, so a rewrite authorised on that reading
+    truncates a file whose own room nothing measured. Only EBUSY on the
+    PUBLISH does, because that errno IS about the destination and says the
+    one thing that makes a rewrite the only option.
     """
     tmp = path.parent / f".{path.name}.restore.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     fd = -1
@@ -199,8 +199,22 @@ def _restore_atomically(path: Path, text: str) -> None:
             handle.write(text)
         if sys.platform != "win32":
             os.chmod(tmp, 0o600)
-        replace_with_retry(tmp, path)
-        tmp = None
+        try:
+            replace_with_retry(tmp, path)
+            tmp = None
+        except OSError as e:
+            if e.errno != errno.EBUSY:
+                raise
+            # A BIND-MOUNTED DESTINATION PINS THE INODE, so no rename can
+            # ever land there and writing through is the only way -- which
+            # is exactly what `_write_json` does at this same destination,
+            # and how it EMPTIED the file whose bytes this restore is
+            # holding. Scoped to the PUBLISH: a temp that could not be
+            # created says nothing about the destination's own room, and
+            # rewriting on that reading is what truncated one.
+            path.write_text(text, encoding="utf-8")
+            if sys.platform != "win32":
+                os.chmod(path, 0o600)
     finally:
         if fd >= 0:
             os.close(fd)
