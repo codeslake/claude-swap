@@ -566,6 +566,80 @@ class TestBootstrap:
                 "account's history into the DEFAULT profile, with no flag."
             )
 
+    def test_a_live_profile_is_not_swept_at_all(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """The sweep deletes the seed and the identity. Under a running
+        claude that is the rewrite every other invalidation site in this
+        file refuses to do."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("seed", encoding="utf-8")
+        make_live(session_dir)
+        assert not session_mod.profile_is_quiescent(session_dir), (
+            "premise: the live record must make the profile non-quiescent"
+        )
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert (session_dir / ".credentials.json").exists(), (
+            "DEFECT: the sweep ran under a live claude, deleting the seed "
+            "and the identity out from under a running instance"
+        )
+
+    def test_a_swept_profile_keeps_its_liveness_ledger(
+        self, manager, seeded_switcher, monkeypatch, refresh_rotates,
+        block_real_keychain
+    ):
+        """`sessions/` is what `scan_sessions` reads, and it reads nothing
+        else. Sweeping it makes `profile_is_quiescent` answer True forever,
+        so every guard that asks whether a claude is running goes blind."""
+        session_dir = session_dir_for(
+            seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text("seed", encoding="utf-8")
+        # A record for a pid that is NOT alive: the ledger exists, and the
+        # profile is quiescent, so the sweep really runs.
+        make_live(session_dir, pid=2**22 + 12345)
+        assert session_mod.profile_is_quiescent(session_dir), (
+            "premise: a dead record leaves the profile quiescent, or the "
+            "sweep is skipped and this case measures nothing"
+        )
+
+        def always_invalid(cmd, env=None, **kwargs):
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"loggedIn": False, "authMethod": "none"}),
+                stderr="",
+            )
+
+        monkeypatch.setattr(session_mod.subprocess, "run", always_invalid)
+        with pytest.raises(SessionError):
+            manager.setup_session(ACCOUNT_NUM, share=False)
+
+        assert not (session_dir / ".credentials.json").exists(), (
+            "premise: the sweep must have run"
+        )
+        assert (session_dir / "sessions").is_dir(), (
+            "DEFECT: the sweep took the liveness ledger. `scan_sessions` "
+            "reads nothing else, so `profile_is_quiescent` now answers True "
+            "for this profile forever and the removal, the swap, the move "
+            "and the purge all stop seeing a live claude"
+        )
+
     def test_a_swept_profile_is_RE_BOOTSTRAPPED_on_the_next_launch(
         self, manager, seeded_switcher, monkeypatch, refresh_rotates,
         block_real_keychain

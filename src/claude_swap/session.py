@@ -830,7 +830,13 @@ class SessionManager:
                     f"`claude` is on PATH, then retry."
                 )
             if verdict != "valid":
-                self._cleanup_failed_session(session_dir)
+                # NEVER UNDER A LIVE CLAUDE, the rule every other
+                # invalidation site in this file already follows. The sweep
+                # deletes the seed and the identity out from under a running
+                # instance, and the marker it leaves makes the next launch
+                # invalidate again.
+                if profile_is_quiescent(session_dir):
+                    self._cleanup_failed_session(session_dir)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
                     f"validation. Log in with that account and re-add it: "
@@ -956,6 +962,14 @@ class SessionManager:
         # and deleting the seed is what stops the profile being reused.
         for child in session_dir.iterdir():
             if child.name in HISTORY_ITEMS and not child.is_symlink():
+                continue
+            # `sessions/` IS THE LIVENESS LEDGER, and `scan_sessions` reads
+            # nothing else. Taking it makes `profile_is_quiescent` answer
+            # True forever for this profile, so every guard that asks "is
+            # anything running against it" -- the removal, the swap, the
+            # move, the purge, and this file's own bootstrap gate -- goes
+            # blind on a profile a claude may still be using.
+            if child.name == "sessions" and not child.is_symlink():
                 continue
             if child.is_dir() and not child.is_symlink():
                 shutil.rmtree(child, ignore_errors=True)
