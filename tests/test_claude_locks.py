@@ -660,14 +660,14 @@ class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
     ITS ELAPSED BOUND IS TIGHT ENOUGH TO SEE A WEAKENED CLAMP, which is the
-    property that matters -- other cases here time themselves too, with bounds
-    far too loose to notice one. Some of this file's clamp cases
+    property that matters. NO CLAIM ABOUT THE OTHER CASES: that half has gone
+    stale three times (ONLY -> ONE OF TWO -> "the others are too loose"), because
+    it is a statement the next case added can falsify. Some of this file's clamp cases
     run the real clock, so being one of them is not what makes this one worth
     keeping. NO COUNT HERE, deliberately: the ratio has been restated three
     times in three commits and went stale inside the very commit that
     corrected it, because the next clamp case moves it again. The claim the
-    sentence carries survives without a number. The others assert a syscall count or a per-sleep remainder,
-    and a clamp WEAKENED rather than deleted moves neither. On the weakening
+    sentence carries survives without a number. On the weakening
     below this case is redundant with the jitter arm's; on the quantity it
     measures it is alone.
 
@@ -987,6 +987,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             # which the premise below checks, because this arithmetic stops
             # working once the cap is small.
             budget = claude_locks._TAKEOVER_GUARD_S + 0.2
+            margin = 0.15
             started = time.monotonic()
             with pytest.raises(ClaudeCodeLockTimeout):
                 with proper_lockfile(target, timeout=budget, staleness=1.0):
@@ -996,12 +997,16 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             release.set()
             t.join(5)
 
-        # THE REGIME, and it is a property of the CAP ALONE -- deliberately
-        # nothing the code under test can move, or the premise would be a
-        # detector wearing a precondition's label. Clamped costs `cap + 0.2`
-        # and unclamped `2*cap + back-off`, so the gap clears the margin below
-        # only past ~0.3; under that this case is blind whatever it measures.
-        assert claude_locks._TAKEOVER_GUARD_S > 0.30, (
+        # THE REGIME, as the INEQUALITY rather than its solved value: clamped
+        # costs `budget`, unclamped `2*cap + the declined-takeover back-off`,
+        # and they must separate by more than `margin`. Writing the solved
+        # `> 0.30` hid that it is a function of all three, so moving the margin
+        # or the budget sizing re-opened the blind band in silence. Everything
+        # here is a constant the code under test cannot move, so this stays a
+        # precondition rather than a detector wearing one's label. A LARGER
+        # back-off than 0.05 is caught by the count below; a smaller one is
+        # where this model stops.
+        assert 2 * claude_locks._TAKEOVER_GUARD_S + 0.05 > budget + margin, (
             "premise: the cap is too small for the clamped and unclamped forms "
             "to separate by more than the margin this case allows"
         )
@@ -1009,7 +1014,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             "premise: only one iteration ran, and on the first one "
             f"`min(cap, remaining)` and `min(cap, timeout)` agree: {budgets}"
         )
-        assert elapsed < budget + 0.15, (
+        assert elapsed < budget + margin, (
             f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
             f"guard is not clamped to the remaining time"
         )

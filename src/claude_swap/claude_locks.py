@@ -86,8 +86,9 @@ def config_lock_dir() -> Path:
 
 
 # A CAP on the guard wait; the caller's remaining budget is the bound, so the
-# product tolerates any value. Its contended-guard test does not -- below ~0.3
-# the clamped and unclamped forms converge, and that test's premise says so.
+# product tolerates any value. Its contended-guard test does not -- small
+# enough, the clamped and unclamped forms stop separating by more than the
+# margin that test allows, and its premise refuses rather than passing blind.
 _TAKEOVER_GUARD_S = 0.5
 
 
