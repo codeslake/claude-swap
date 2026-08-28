@@ -668,8 +668,7 @@ class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     times in three commits and went stale inside the very commit that
     corrected it, because the next clamp case moves it again. The claim the
     sentence carries survives without a number. On the weakening
-    below this case is redundant with the jitter arm's; on the quantity it
-    measures it is alone.
+    below this case is redundant with the jitter arm's.
 
     The jitter is pinned, or the weakened form's overshoot is a random draw
     that can land inside any fixed margin.
@@ -969,25 +968,28 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
 
         monkeypatch.setattr(claude_locks, "_take_over_stale", recording)
 
+        # Past the first iteration, which costs the cap plus the declined-
+        # takeover back-off. Only the SECOND call separates the two forms.
+        budget = claude_locks._TAKEOVER_GUARD_S + 0.2
+        margin = 0.15
+
         held = threading.Event()
         release = threading.Event()
 
         def hold():
+            # OUTLASTS THE BUDGET, which is derived from the cap: a fixed hold
+            # is a second small-side band. Measured, at a 5s hold and a cap of
+            # 5.0 the peer let go mid-run, the takeover succeeded, and the case
+            # reported `DID NOT RAISE` -- the shape of the very defect this
+            # branch fixes, on correct code.
             with claude_locks.FileLock(guard, timeout=5):
                 held.set()
-                release.wait(5)
+                release.wait(budget + 5)
 
         t = threading.Thread(target=hold, daemon=True)
         t.start()
         assert held.wait(5), "premise: the peer must hold the guard"
         try:
-            # Past the first iteration, which costs the cap plus the declined-
-            # takeover back-off. Only the SECOND call separates the two forms,
-            # and only by the amount its remaining budget sits BELOW the cap --
-            # which the premise below checks, because this arithmetic stops
-            # working once the cap is small.
-            budget = claude_locks._TAKEOVER_GUARD_S + 0.2
-            margin = 0.15
             started = time.monotonic()
             with pytest.raises(ClaudeCodeLockTimeout):
                 with proper_lockfile(target, timeout=budget, staleness=1.0):
@@ -1003,10 +1005,12 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         # `> 0.30` hid that it is a function of all three, so moving the margin
         # or the budget sizing re-opened the blind band in silence. Everything
         # here is a constant the code under test cannot move, so this stays a
-        # precondition rather than a detector wearing one's label. A LARGER
-        # back-off than 0.05 is caught by the count below; a smaller one is
-        # where this model stops.
-        assert 2 * claude_locks._TAKEOVER_GUARD_S + 0.05 > budget + margin, (
+        # precondition rather than a detector wearing one's label. The back-off
+        # is READ, not guessed, so no value of it leaves a band.
+        assert (
+            2 * claude_locks._TAKEOVER_GUARD_S + claude_locks._DECLINE_BACKOFF_S
+            > budget + margin
+        ), (
             "premise: the cap is too small for the clamped and unclamped forms "
             "to separate by more than the margin this case allows"
         )

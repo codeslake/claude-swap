@@ -86,10 +86,15 @@ def config_lock_dir() -> Path:
 
 
 # A CAP on the guard wait; the caller's remaining budget is the bound, so the
-# product tolerates any value. Its contended-guard test does not -- small
-# enough, the clamped and unclamped forms stop separating by more than the
-# margin that test allows, and its premise refuses rather than passing blind.
+# product tolerates any value. Its contended-guard test does not, at EITHER
+# end: too small and the clamped and unclamped forms stop separating by more
+# than the margin it allows, too large and it outruns its own peer. Both ends
+# are derived there rather than pinned, so the test refuses or rescales itself
+# instead of lying -- but do not read a green suite at some value as proof the
+# test still watches this one.
 _TAKEOVER_GUARD_S = 0.5
+# A short back-off after an arm declines, so the retry loop cannot spin hot.
+_DECLINE_BACKOFF_S = 0.05
 
 
 def _take_over_stale(
@@ -172,7 +177,7 @@ def proper_lockfile(
             # arm can repeat for the whole budget. No claim here about which
             # OTHER arms sleep: a sibling adds one above, and that sentence
             # goes false on the merged tree.
-            time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
+            time.sleep(max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic())))
             continue
         if time.time() - held_mtime > staleness:
             # Dead holder per the protocol: remove and retake. Declining --
@@ -181,7 +186,7 @@ def proper_lockfile(
             if not _take_over_stale(
                 lock_dir, staleness, budget=deadline - time.monotonic()
             ):
-                time.sleep(max(0.0, min(0.05, deadline - time.monotonic())))
+                time.sleep(max(0.0, min(_DECLINE_BACKOFF_S, deadline - time.monotonic())))
             continue
         # Clamped to the remaining budget, so `timeout` bounds the whole
         # call: the deadline check above cannot fire while a full-length
