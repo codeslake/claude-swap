@@ -613,8 +613,8 @@ class TestCcRefreshLockProtocol:
         times out there and the legacy call is never reached. Measured BEFORE
         this case existed: with the legacy call's staleness dropped to
         CONFIG_STALENESS_S the whole suite stayed green, while the same edit
-        on the primary failed the case above. A 30s-old legacy lock is a live CC's, and stealing it puts a
-        swap inside CC's refresh window.
+        on the primary failed the case above. A 30s-old legacy lock is a live
+        CC's, and stealing it puts a swap inside CC's refresh window.
         """
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         legacy = temp_home / ".claude.lock"
