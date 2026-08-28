@@ -296,6 +296,10 @@ def proper_lockfile(
         try:
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
+            # BACK OFF HERE TOO. A dangling symlink answers FileExistsError
+            # to mkdir and FileNotFoundError to stat, so this arm can repeat
+            # for the whole budget; without a sleep that is a pinned core.
+            time.sleep(max(0.0, min(0.05, timeout - (time.monotonic() - start))))
             continue  # holder released between mkdir and stat
         if time.time() - held_mtime > staleness:
             # Dead holder per the protocol: remove and retake. Losing the

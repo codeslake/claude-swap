@@ -411,6 +411,45 @@ class TestCcRefreshLockProtocol:
         assert not cfg.exists()
 
 
+class TestADanglingSymlinkDoesNotPinACore:
+    """The stat arm's own back-off, which the mkdir arm's sibling has.
+
+    A dangling symlink at the lock path answers `FileExistsError` to `mkdir`
+    and `FileNotFoundError` to `stat`, so this arm can repeat for the whole
+    budget. Without a sleep that is 100% of a core until the deadline, and
+    `claude_credentials_lock` takes two locks -- then the timeout blames
+    Claude Code for a lock nobody holds.
+    """
+
+    def test_a_dangling_symlink_does_not_spin(self, tmp_path, monkeypatch):
+        target = tmp_path / "target.lock"
+        target.symlink_to(tmp_path / "nothing-here")
+        assert not target.exists(), "premise: the symlink must dangle"
+
+        real_mkdir = os.mkdir
+        tries = {"n": 0}
+
+        def counting(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                tries["n"] += 1
+            return real_mkdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(target, timeout=0.3):
+                pass
+
+        assert tries["n"] > 1, "premise: the loop must have retried at all"
+        # A busy spin is ~35,000 attempts in this budget; a back-off is ~7.
+        # Anything under a few hundred separates them without depending on
+        # the exact sleep, which the clamp shortens near the deadline.
+        assert tries["n"] < 500, (
+            f"{tries['n']} mkdir attempts in a 0.3s budget -- the arm that "
+            "retries a swept name never sleeps, so it pins a core for the "
+            "whole budget"
+        )
+
+
 class TestAPermanentENOENTIsNotARetry:
     """Only a SWEPT name wants the fall-through.
 
