@@ -85,8 +85,9 @@ def config_lock_dir() -> Path:
     return path.parent / (path.name + ".lock")
 
 
-# A CAP on the guard wait; the caller's remaining budget is the bound. No
-# requirement is violated at any value here -- it is a tuning knob.
+# A CAP on the guard wait; the caller's remaining budget is the bound, so the
+# product tolerates any value. Its contended-guard test does not -- below ~0.3
+# the clamped and unclamped forms converge, and that test's premise says so.
 _TAKEOVER_GUARD_S = 0.5
 
 

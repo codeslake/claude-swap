@@ -659,8 +659,9 @@ class TestCcRefreshLockProtocol:
 class TestTheClampsSurviveWeakeningNotOnlyDeletion:
     """`min(sleep, timeout)` is a no-op once most of the budget is spent.
 
-    ONE OF TWO CASES THAT MEASURE TOTAL ELAPSED -- the takeover guard's is the
-    other, on a different arm. Some of this file's clamp cases
+    ITS ELAPSED BOUND IS TIGHT ENOUGH TO SEE A WEAKENED CLAMP, which is the
+    property that matters -- other cases here time themselves too, with bounds
+    far too loose to notice one. Some of this file's clamp cases
     run the real clock, so being one of them is not what makes this one worth
     keeping. NO COUNT HERE, deliberately: the ratio has been restated three
     times in three commits and went stale inside the very commit that
@@ -957,15 +958,16 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
 
         # `elapsed` cannot tell the clamped guard from the jitter arm's own
         # clamp beside it, so the number alone does not say which arm produced
-        # it. The count is what ties it to this one.
-        entered = {"n": 0}
+        # it. Recording the budgets ties it to this arm AND to the regime in
+        # which the two forms differ.
+        budgets = []
         real_take_over = claude_locks._take_over_stale
 
-        def counting(*a, **k):
-            entered["n"] += 1
+        def recording(*a, **k):
+            budgets.append(k["budget"])
             return real_take_over(*a, **k)
 
-        monkeypatch.setattr(claude_locks, "_take_over_stale", counting)
+        monkeypatch.setattr(claude_locks, "_take_over_stale", recording)
 
         held = threading.Event()
         release = threading.Event()
@@ -979,10 +981,11 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         t.start()
         assert held.wait(5), "premise: the peer must hold the guard"
         try:
-            # PAST THE FIRST ITERATION: it costs the guard's cap plus the
-            # declined-takeover back-off, and only the SECOND call separates
-            # `min(cap, remaining)` from `min(cap, timeout)`. Derived, so the
-            # cap can move without blinding this case.
+            # Past the first iteration, which costs the cap plus the declined-
+            # takeover back-off. Only the SECOND call separates the two forms,
+            # and only by the amount its remaining budget sits BELOW the cap --
+            # which the premise below checks, because this arithmetic stops
+            # working once the cap is small.
             budget = claude_locks._TAKEOVER_GUARD_S + 0.2
             started = time.monotonic()
             with pytest.raises(ClaudeCodeLockTimeout):
@@ -993,9 +996,18 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             release.set()
             t.join(5)
 
-        assert entered["n"] >= 2, (
+        # THE REGIME, and it is a property of the CAP ALONE -- deliberately
+        # nothing the code under test can move, or the premise would be a
+        # detector wearing a precondition's label. Clamped costs `cap + 0.2`
+        # and unclamped `2*cap + back-off`, so the gap clears the margin below
+        # only past ~0.3; under that this case is blind whatever it measures.
+        assert claude_locks._TAKEOVER_GUARD_S > 0.30, (
+            "premise: the cap is too small for the clamped and unclamped forms "
+            "to separate by more than the margin this case allows"
+        )
+        assert len(budgets) >= 2, (
             "premise: only one iteration ran, and on the first one "
-            "`min(cap, remaining)` and `min(cap, timeout)` are the same number"
+            f"`min(cap, remaining)` and `min(cap, timeout)` agree: {budgets}"
         )
         assert elapsed < budget + 0.15, (
             f"waited {elapsed:.3f}s on a {budget}s budget -- the takeover "
