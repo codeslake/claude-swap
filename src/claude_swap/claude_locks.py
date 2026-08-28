@@ -68,6 +68,7 @@ _CAN_PIN_A_DIRECTORY = sys.platform != "win32"
 # Keyed on the PARENT, which is where the mkdir happens. One probe per
 # directory per process; a stray answer is never cached.
 _PIN_PROBE: dict[str, bool] = {}
+_PIN_TRIALS = 2
 
 
 def _fd_pins_an_inode(parent: Path) -> bool:
@@ -94,6 +95,26 @@ def _fd_pins_an_inode(parent: Path) -> bool:
     cached = _PIN_PROBE.get(key)
     if cached is not None:
         return cached
+    # THE SAFE ANSWER WINS, AND ONE TRIAL CANNOT GIVE IT. A trial reports
+    # "pinned" by NOT seeing the number come back, so any concurrent
+    # allocation in this filesystem during the rmdir/mkdir window reads as
+    # a pin -- the direction that disarms the stamp, the `unproven` latch
+    # and the release mutex, cached for the life of the process. One trial
+    # that DOES see the reuse is proof it does not pin; no number of trials
+    # can prove that it does, so repeat and let a single "reused" decide.
+    for _ in range(_PIN_TRIALS):
+        seen = _one_pin_trial(parent)
+        if seen is None:
+            return False          # cannot run; never cached
+        if not seen:
+            _PIN_PROBE[key] = False
+            return False
+    _PIN_PROBE[key] = True
+    return True
+
+
+def _one_pin_trial(parent: Path) -> bool | None:
+    """One mkdir/open/rmdir/mkdir cycle. ``None`` when it could not run."""
     fd = -1
     probe = None
     try:
@@ -102,9 +123,9 @@ def _fd_pins_an_inode(parent: Path) -> bool:
         fd = os.open(probe, os.O_RDONLY)
         os.rmdir(probe)
         os.mkdir(probe)
-        pins = os.stat(probe).st_ino != first
+        return os.stat(probe).st_ino != first
     except OSError:
-        return False
+        return None
     finally:
         if fd >= 0:
             try:
@@ -116,8 +137,6 @@ def _fd_pins_an_inode(parent: Path) -> bool:
                 os.rmdir(probe)
             except OSError:
                 pass
-    _PIN_PROBE[key] = pins
-    return pins
 
 
 def _quantum_for_heartbeat(directory: Path) -> int:

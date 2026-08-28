@@ -1068,6 +1068,51 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
     already exists; it just has to be armed by the filesystem's answer.
     """
 
+    def test_one_trial_that_sees_the_reuse_decides(self, tmp_path, monkeypatch):
+        """A trial reports "pinned" by NOT seeing the number come back.
+
+        So any concurrent allocation in that filesystem during the
+        rmdir/mkdir window reads as a pin -- the direction that disarms
+        the stamp, the `unproven` latch and the release mutex, cached for
+        the life of the process. Measured on a real NFSv3 mount: 0 of 200
+        wrong with the parent quiet, 2 of 200 at 5 ordinary file creations
+        a second, 6 of 200 at 20. A reuse that IS seen is proof; a reuse
+        that is not seen proves nothing.
+        """
+        import claude_swap.claude_locks as cl
+
+        for answers, expected in (
+            ([True, True], True),
+            ([False, True], False),
+            ([True, False], False),
+            ([False, False], False),
+        ):
+            seq = iter(answers)
+            monkeypatch.setattr(cl, "_one_pin_trial", lambda p: next(seq))
+            cl._PIN_PROBE.clear()
+            got = cl._fd_pins_an_inode(tmp_path)
+            assert got is expected, (
+                f"DEFECT: trials {answers} answered {got}; a single trial "
+                "that saw the inode come back is proof the descriptor pins "
+                "nothing, and only every trial agreeing can say it does"
+            )
+        cl._PIN_PROBE.clear()
+
+    def test_a_probe_that_cannot_run_is_not_cached(self, tmp_path, monkeypatch):
+        """Refusing to trust the pin is the safe direction, but a refusal
+        that cannot be measured must not become a permanent answer."""
+        import claude_swap.claude_locks as cl
+
+        monkeypatch.setattr(cl, "_one_pin_trial", lambda p: None)
+        cl._PIN_PROBE.clear()
+        try:
+            assert cl._fd_pins_an_inode(tmp_path) is False
+            assert str(tmp_path) not in cl._PIN_PROBE, (
+                "an unmeasurable parent must be re-probed, not remembered"
+            )
+        finally:
+            cl._PIN_PROBE.clear()
+
     def test_the_lock_asks_the_filesystem_not_the_platform(
         self, tmp_path, monkeypatch
     ):
