@@ -1431,13 +1431,16 @@ class ClaudeAccountSwitcher:
             if dir_a.exists():
                 # ASSIGNED ONLY ONCE THE PARK LANDS, so `staging is not None`
                 # means "A is under that name" and not merely "that name was
-                # computed". A leftover `.swapping` from an interrupted earlier
-                # swap makes this replace raise ENOTEMPTY with A still at
-                # dir_a; with the name already assigned, the re-apply below
-                # then read the LEFTOVER as A and moved A's stale flag onto it.
+                # computed" -- a leftover `.swapping` raises ENOTEMPTY here
+                # with A still at dir_a. Recorded from a `finally` for the
+                # reason the B move below is: the rename and its record are
+                # two statements and a signal can land between them.
                 parked = dir_a.with_name(dir_a.name + ".swapping")
-                os.replace(dir_a, parked)
-                staging = parked
+                try:
+                    os.replace(dir_a, parked)
+                finally:
+                    if not os.path.exists(dir_a):
+                        staging = parked
             if dir_b.exists() and not new_b.exists():
                 try:
                     os.replace(dir_b, new_b)
