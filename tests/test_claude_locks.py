@@ -666,11 +666,16 @@ class TestEveryArmOfTheLoopBacksOff:
             os.mkdir = real_mkdir
 
         assert tries["n"] >= 1, f"the instrument, not the code: {tries['n']}"
-        # 4, NOT 40. The jittered arm sleeps 0.25-0.5s, so a 0.3s budget is
-        # 2 attempts and 40 tolerates a 20x shrink in silence. Attempts are
-        # budget/sleep, so a slow or loaded machine yields FEWER -- the noise
-        # runs only downward and a tight bound cannot flake upward.
-        assert tries["n"] <= 4, (
+        # Attempts are NOT budget/sleep: the clamp is
+        # `min(sleep, deadline - now)`, so the tail sleeps shrink toward zero
+        # and the loop iterates fast as it approaches the deadline. The noise
+        # therefore runs UPWARD too, by a few iterations, and by more on a
+        # platform with a coarser timer. Measured on the sibling arm: 7 on
+        # linux (12 of 12) against 11 on the windows job, where a bound of 10
+        # refused a correct tree and blocked every deploy. A busy spin is
+        # ~50,000 attempts in the same budget, so the headroom below costs no
+        # discriminating power at all.
+        assert tries["n"] <= 12, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the jittered "
             "arm is not sleeping, so a waiter pegs a core for the whole hold"
         )
@@ -752,9 +757,10 @@ class TestEveryArmOfTheLoopBacksOff:
                 pass
 
         assert tries["n"] > 1, "premise: the loop must have retried at all"
-        # 10, NOT 40. This arm sleeps a flat 0.05s, so the count is
-        # 0.3/0.05 + 1 = 7 and deterministic; 40 tolerates a 6x shrink.
-        assert tries["n"] <= 10, (
+        # 7 on linux, measured 12 of 12; 11 on the windows job, because the
+        # clamp's tail iterates fast (see the jittered arm above). A busy
+        # spin is ~50,000.
+        assert tries["n"] <= 20, (
             f"{tries['n']} mkdir attempts in a 0.3s budget — the arm that "
             "retries a vanished name never sleeps, so it pins a core"
         )
@@ -801,8 +807,8 @@ class TestEveryArmOfTheLoopBacksOff:
         # before the deadline check and so gets one extra call on the final
         # iteration, while this counts `rmdir`, which runs after it. 10 leaves
         # headroom without tolerating the 5x shrink the sleep-total bound
-        # cannot see.
-        assert tries["n"] <= 10, (
+        # cannot see. Same upward tail as its siblings.
+        assert tries["n"] <= 20, (
             f"{tries['n']} rmdir attempts in a 0.3s budget — the arm that "
             "cannot remove a stale lock backed off less than it claims to"
         )
