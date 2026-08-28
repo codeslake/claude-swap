@@ -8407,6 +8407,66 @@ class TestNothingReDerivesTheActiveSlotFromTheIdentityFile:
         )
 
 
+class TestTheSwitchItselfNamesThePin:
+    """The sibling class asserts `identity_for_config`, the HELPER. A switch
+    that stopped calling it would leave that green, and both salvage-branch
+    splices are not reached by any case at all."""
+
+    from tests.test_switcher import (  # noqa: E402
+        TestPerformSwitchPostDisplay as _P,
+        TestProvenanceGuard as _G,
+    )
+
+    _setup_two_accounts = _P._setup_two_accounts
+    _install_store_patches = staticmethod(_P._install_store_patches)
+    _run_switch = _G._run_switch
+
+    @pytest.mark.parametrize("force_activate", [False, True])
+    def test_the_live_config_names_the_pin_after_a_rotation(
+        self, temp_home: pathlib.Path, mock_claude_config: pathlib.Path,
+        sample_sequence_data: dict, monkeypatch, force_activate,
+    ):
+        from unittest.mock import patch
+
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        backup1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-stored-1", "refreshToken": "rt-1"}})
+        creds_store[("1", "test@example.com")] = backup1
+        live_state = {"creds": backup1}
+        # THE PIN IS THE ACCOUNT BEING SWITCHED AWAY FROM. That is what a pin
+        # is for: the rotation moves, the claude.ai side does not.
+        monkeypatch.setattr(
+            "claude_swap.pin._pinned_email_now",
+            lambda s: ("test@example.com", ""))
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            with patch.object(switcher, "list_accounts"), patch(
+                "claude_swap.oauth.fetch_oauth_profile",
+                side_effect=lambda token: None,
+            ):
+                switcher._perform_switch(
+                    "2", emit_output=False, force_activate=force_activate)
+        finally:
+            for handle in patches:
+                handle.stop()
+
+        live_cfg = json.loads(mock_claude_config.read_text(encoding="utf-8"))
+        # PREMISE: the switch really landed on the other slot, or this is
+        # asserting the identity of a rotation that never happened.
+        assert switcher.current_account_number() == "2"
+        assert live_cfg["oauthAccount"]["emailAddress"] == "test@example.com", (
+            "DEFECT: the switch wrote the account it switched TO as the "
+            "bridge owner while a pin was set. Claude Code latches that field "
+            "at bridge creation and compares it against what the validate "
+            "route answers, so every bridge minted after this rotation is "
+            f"torn off at the next one. got {live_cfg['oauthAccount']}"
+        )
+
+
 class TestPinnedIdentityIsWhatTheBridgeOwnerBecomes:
     """The identity file decides a live bridge's OWNER, so while a pin is set
     it has to name the pin.
