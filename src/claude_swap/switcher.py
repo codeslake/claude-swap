@@ -270,6 +270,20 @@ def _label_token_status(source: str, credentials: str) -> str | None:
     return f"{source}: {status}"
 
 
+def _roster_snapshot(path: Path) -> str:
+    """The roster's bytes, for a rollback that cannot re-read them.
+
+    `_write_json`'s write-through recovery EMPTIES its destination when the
+    copy dies part-way, so a rollback that re-reads `sequence.json` restores
+    nothing. An empty roster is not a lost pointer: `_get_sequence_data`
+    reads it strictly and every later invocation refuses to run.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 def _same_directory(left: Path, right: Path) -> bool:
     """Whether two paths name the same directory, symlinks and ``..`` included.
 
@@ -7015,6 +7029,8 @@ class ClaudeAccountSwitcher:
                     # Fresh machine: normalize "" so the stash, composer, and
                     # rollback all see "nothing to preserve".
                     rollback_creds = rollback_creds or None
+                rollback_sequence_text = _roster_snapshot(self.sequence_file)
+                sequence_written = False
                 if config_path.exists():
                     try:
                         rollback_config_text = config_path.read_text(
@@ -7116,10 +7132,23 @@ class ClaudeAccountSwitcher:
                             del salvage
                         self._write_json(config_path, target_config_data)
 
+                    sequence_written = True
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
                 except Exception:
+                    if sequence_written and rollback_sequence_text:
+                        try:
+                            if not self.sequence_file.read_text(
+                                encoding="utf-8"
+                            ).strip():
+                                self.sequence_file.write_text(
+                                    rollback_sequence_text, encoding="utf-8"
+                                )
+                        except Exception as e:
+                            self._logger.error(
+                                f"Failed to rollback the roster: {e}"
+                            )
                     if config_written and rollback_config_text is not None:
                         try:
                             config_path.write_text(
@@ -7193,6 +7222,7 @@ class ClaudeAccountSwitcher:
                 original_account_num=current_account,
                 original_email=current_email,
                 config_path=config_path,
+                original_sequence=_roster_snapshot(self.sequence_file),
             )
 
             try:
@@ -7384,11 +7414,14 @@ class ClaudeAccountSwitcher:
                     self._write_json(config_path, target_config_data)
                 self._logger.info("Updated config file")
 
-                # Step 5: Update sequence state
+                # Step 5: Update sequence state. Armed BEFORE the write, for
+                # the reason the config step is: the write-through recovery
+                # empties the destination and then raises, and the arm below
+                # restores from the snapshot the transaction carries.
+                transaction.record_step("sequence_updated")
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
-                transaction.record_step("sequence_updated")
 
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"

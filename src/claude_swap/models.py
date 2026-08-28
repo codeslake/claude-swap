@@ -170,6 +170,11 @@ class SwitchTransaction:
     original_account_num: str
     original_email: str
     config_path: Path
+    # THE ROSTER'S OWN BYTES. The arm below used to re-read the file, which
+    # answers nothing when the write that failed EMPTIED it -- and an empty
+    # `sequence.json` is not a lost pointer, it is a cswap that refuses to
+    # run, because `_get_sequence_data` reads it strictly.
+    original_sequence: str = ""
     completed_steps: list[str] = field(default_factory=list)
 
     def record_step(self, step: str) -> None:
@@ -194,11 +199,23 @@ class SwitchTransaction:
                     if sys.platform != "win32":
                         os.chmod(self.config_path, 0o600)
                 elif step == "sequence_updated":
-                    data = switcher._get_sequence_data()
-                    if data:
-                        data["activeAccountNumber"] = int(self.original_account_num)
-                        data["lastUpdated"] = get_timestamp()
-                        switcher._write_json(switcher.sequence_file, data)
+                    if self.original_sequence:
+                        # PLAIN WRITE, like the config arm above. Restoring
+                        # through `_write_json` re-enters the very recovery
+                        # that emptied the file, so the restore empties it
+                        # again. The snapshot already carries the original
+                        # `activeAccountNumber`, so it goes back verbatim.
+                        switcher.sequence_file.write_text(
+                            self.original_sequence, encoding="utf-8"
+                        )
+                    else:
+                        data = switcher._get_sequence_data()
+                        if data:
+                            data["activeAccountNumber"] = int(
+                                self.original_account_num
+                            )
+                            data["lastUpdated"] = get_timestamp()
+                            switcher._write_json(switcher.sequence_file, data)
                 switcher._logger.info(f"Rolled back step: {step}")
             except Exception as e:
                 switcher._logger.error(f"Failed to rollback step {step}: {e}")

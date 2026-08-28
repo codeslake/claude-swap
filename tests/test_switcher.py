@@ -3492,6 +3492,104 @@ class TestPerformSwitchPostDisplay:
             "target-token"
         )
 
+    def test_a_write_through_that_empties_the_roster_is_rolled_back(
+        self,
+        temp_home: Path,
+    ):
+        """The roster has the same exposure as the config, one write later.
+
+        `_write_json`'s recovery empties the destination when the copy dies
+        part-way and raises. A zero-byte `sequence.json` is not merely a lost
+        active-account pointer: `_get_sequence_data` reads it strictly, so the
+        next cswap invocation refuses to run at all.
+        """
+        from claude_swap import switcher as switcher_mod
+
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(json.dumps({"oauthAccount": {
+            "emailAddress": "current@example.com", "accountUuid": "",
+            "organizationUuid": "", "organizationName": "",
+        }}))
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        roster = {
+            "activeAccountNumber": 2,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1, 2],
+            "accounts": {
+                "1": {"email": "target@example.com", "uuid": "",
+                      "organizationUuid": "", "organizationName": "",
+                      "added": "2024-01-01T00:00:00Z"},
+                "2": {"email": "current@example.com", "uuid": "",
+                      "organizationUuid": "", "organizationName": "",
+                      "added": "2024-01-01T00:00:00Z"},
+            },
+        }
+        switcher._write_json(switcher.sequence_file, roster)
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "t", "refreshToken": "r"}}),
+            ("2", "current@example.com"): json.dumps({
+                "claudeAiOauth": {"accessToken": "c", "refreshToken": "cr"}}),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({"oauthAccount": {
+                "emailAddress": "target@example.com", "accountUuid": "",
+                "organizationUuid": "", "organizationName": "",
+            }}),
+        }
+        live_state = {"creds": creds_store[("2", "current@example.com")]}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        real_copyfile = switcher_mod.shutil.copyfile
+        calls = []
+
+        def busy_replace(src, dst):
+            if os.path.basename(str(dst)) == "sequence.json":
+                calls.append("replace")
+                raise OSError(errno.EBUSY, "device or resource busy")
+            return switcher_mod.replace_with_retry.__wrapped__(src, dst) \
+                if hasattr(switcher_mod.replace_with_retry, "__wrapped__") \
+                else os.replace(src, dst)
+
+        def dies_partway(source, dest, *a, **k):
+            if os.path.basename(str(dest)) == "sequence.json":
+                calls.append("copy")
+                with open(dest, "wb") as handle:
+                    handle.write(b"{par")
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_copyfile(source, dest, *a, **k)
+
+        try:
+            with patch.object(
+                switcher_mod, "replace_with_retry", side_effect=busy_replace,
+            ), patch.object(
+                switcher_mod.shutil, "copyfile", side_effect=dies_partway,
+            ), pytest.raises(SwitchError):
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+            switcher_mod.shutil.copyfile = real_copyfile
+
+        # PREMISE: the write-through really ran on the ROSTER, or this case
+        # asserts the absence of damage nothing attempted.
+        assert calls == ["replace", "copy"], (
+            f"premise: the roster's write-through must run, got {calls}"
+        )
+
+        text = switcher.sequence_file.read_text(encoding="utf-8")
+        assert text.strip(), (
+            "DEFECT: the roster was emptied and nothing restored it. Every "
+            "slot's email, uuid and org are gone, and `_get_sequence_data` "
+            "reads strictly, so the next cswap invocation refuses to run."
+        )
+        back = json.loads(text)
+        assert back["accounts"] == roster["accounts"], (
+            "the roster survived but its accounts did not"
+        )
+
     def test_a_write_through_that_empties_the_config_is_rolled_back(
         self,
         temp_home: Path,
