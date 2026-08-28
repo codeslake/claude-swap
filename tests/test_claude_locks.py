@@ -413,16 +413,17 @@ class TestCcRefreshLockProtocol:
 
 
 class TestADanglingSymlinkDoesNotPinACore:
-    """The stat arm's own back-off, which the mkdir arm's sibling has.
+    """A name that exists and cannot resolve is not a lock, and never will be.
 
     A dangling symlink at the lock path answers `FileExistsError` to `mkdir`
-    and `FileNotFoundError` to `stat`, so this arm can repeat for the whole
-    budget. Without a sleep that is 100% of a core until the deadline, and
-    `claude_credentials_lock` takes two locks -- then the timeout blames
-    Claude Code for a lock nobody holds.
+    and `FileNotFoundError` to `stat`, so retrying it spends the whole budget
+    and then blames Claude Code for a lock nobody holds. Nothing about the
+    state can change while the symlink is there, so the budget buys nothing.
     """
 
-    def test_a_dangling_symlink_does_not_spin(self, tmp_path, monkeypatch):
+    def test_a_dangling_symlink_is_refused_at_once_and_named(
+        self, tmp_path, monkeypatch
+    ):
         target = tmp_path / "target.lock"
         target.symlink_to(tmp_path / "nothing-here")
         assert not target.exists(), "premise: the symlink must dangle"
@@ -436,18 +437,45 @@ class TestADanglingSymlinkDoesNotPinACore:
             return real_mkdir(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        started = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout) as caught:
+            with proper_lockfile(target, timeout=3.0):
+                pass
+        elapsed = time.monotonic() - started
+
+        assert tries["n"] == 1, (
+            f"{tries['n']} attempts -- a state that cannot change was retried"
+        )
+        assert elapsed < 0.5, f"waited {elapsed:.2f}s of a 3s budget"
+        # AND IT SAYS WHICH STATE. Timing alone would pass for a raise that
+        # still blamed Claude Code, which is the half the user acts on.
+        assert "symlink" in str(caught.value), str(caught.value)
+        assert "Claude Code" not in str(caught.value), str(caught.value)
+
+    def test_control_a_real_directory_still_retries(self, tmp_path, monkeypatch):
+        """CONTROL: the refusal keys on the symlink, not on any ENOENT.
+
+        A directory swept between our mkdir and our stat is a busy handoff and
+        MUST keep retrying -- which is why `lexists` is the wrong test.
+        """
+        target = tmp_path / "busy.lock"
+        target.mkdir()
+        real_stat = os.stat
+        seen = {"n": 0}
+
+        def vanishing(path, *a, **k):
+            if os.fspath(path) == os.fspath(target):
+                seen["n"] += 1
+                raise FileNotFoundError(errno.ENOENT, "swept")
+            return real_stat(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "stat", vanishing)
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.3):
                 pass
-
-        assert tries["n"] > 1, "premise: the loop must have retried at all"
-        # A busy spin is ~35,000 attempts in this budget; a back-off is ~7.
-        # Anything under a few hundred separates them without depending on
-        # the exact sleep, which the clamp shortens near the deadline.
-        assert tries["n"] < 500, (
-            f"{tries['n']} mkdir attempts in a 0.3s budget -- the arm that "
-            "retries a swept name never sleeps, so it pins a core for the "
-            "whole budget"
+        assert seen["n"] > 1, (
+            f"{seen['n']} stat calls -- a swept name stopped retrying, so the "
+            "symlink refusal is catching the handoff case too"
         )
 
 
@@ -1069,7 +1097,7 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
     """
 
     @pytest.mark.skipif(
-        sys.platform == "win32",
+        not claude_locks._CAN_PIN_A_DIRECTORY,
         reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
                "there, so the trial machinery is unreachable by construction",
     )
@@ -1086,11 +1114,12 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         """
         import claude_swap.claude_locks as cl
 
+        n = cl._PIN_TRIALS
         for answers, expected in (
-            ([True, True], True),
-            ([False, True], False),
-            ([True, False], False),
-            ([False, False], False),
+            ([True] * n, True),
+            ([False] + [True] * (n - 1), False),
+            ([True] * (n - 1) + [False], False),
+            ([False] * n, False),
         ):
             seq = iter(answers)
             monkeypatch.setattr(cl, "_one_pin_trial", lambda p: next(seq))
@@ -1104,7 +1133,36 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         cl._PIN_PROBE.clear()
 
     @pytest.mark.skipif(
-        sys.platform == "win32",
+        not claude_locks._CAN_PIN_A_DIRECTORY,
+        reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
+               "there, so the trial machinery is unreachable by construction",
+    )
+    def test_the_trials_are_spaced_not_back_to_back(self, tmp_path, monkeypatch):
+        """Repeats bound the error only if the samples are INDEPENDENT.
+
+        Back-to-back trials sample one contention burst, so under load the
+        second agrees with the first for the same reason the first was wrong.
+        Measured in one continuous noise run: 2 back-to-back 5.6% wrong where
+        independence predicts 0.85%, 8 back-to-back still 4.2%, and 4 spaced
+        by 10ms 0.6%. The gap is the fix; the count is not.
+        """
+        import claude_swap.claude_locks as cl
+
+        naps: list[float] = []
+        monkeypatch.setattr(cl.time, "sleep", naps.append)
+        monkeypatch.setattr(cl, "_one_pin_trial", lambda p: True)
+        cl._PIN_PROBE.clear()
+        assert cl._fd_pins_an_inode(tmp_path) is True
+        cl._PIN_PROBE.clear()
+
+        assert naps == [cl._PIN_TRIAL_GAP_S] * (cl._PIN_TRIALS - 1), (
+            f"DEFECT: {len(naps)} gap(s) between {cl._PIN_TRIALS} trials -- "
+            "trials microseconds apart are one sample repeated"
+        )
+        assert cl._PIN_TRIAL_GAP_S > 0
+
+    @pytest.mark.skipif(
+        not claude_locks._CAN_PIN_A_DIRECTORY,
         reason="`_CAN_PIN_A_DIRECTORY` short-circuits before any trial "
                "there, so the trial machinery is unreachable by construction",
     )
