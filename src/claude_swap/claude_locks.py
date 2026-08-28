@@ -70,8 +70,9 @@ _CAN_PIN_A_DIRECTORY = sys.platform != "win32"
 _PIN_PROBE: dict[tuple[str, int], bool] = {}
 _PIN_TRIALS = 4
 # Repeats bound the error only if the samples are INDEPENDENT. Trials
-# microseconds apart sample one contention burst, so the gap is what pays,
-# not the count -- eight back-to-back measured worse than four spaced.
+# microseconds apart fit inside one contention burst and agree wrongly, and a
+# gap crosses it. Under CONTINUOUS saturation the gap buys nothing and only the
+# count does, so this is not a p**n error bound in either direction.
 _PIN_TRIAL_GAP_S = 0.010
 
 
@@ -374,6 +375,21 @@ def proper_lockfile(
             except OSError:
                 pass
             raise
+        # A SYMLINK HERE IS NEVER A LOCK AND NO RETRY MAKES IT ONE: `mkdir`
+        # cannot create through one and `rmdir` answers ENOTDIR, so not even
+        # the stale branch clears it. Tested where EVERY arm falls through --
+        # under the stat's ENOENT it saw only the dangling case, because the
+        # stat follows the link. `lexists` is the wrong test: it is also True
+        # for a directory swept between our mkdir and our stat, a busy handoff
+        # that must keep retrying.
+        if os.path.islink(lock_dir):
+            _logger.warning(
+                "Lock %s is a symlink, so no lock can be created there", lock_dir
+            )
+            raise ClaudeCodeLockTimeout(
+                f"{lock_dir} is a symlink, so no lock can be created there. "
+                "Remove it."
+            )
         if time.monotonic() - start > timeout:
             raise ClaudeCodeLockTimeout(
                 f"Could not acquire {lock_dir.name} — Claude Code appears "
@@ -382,16 +398,6 @@ def proper_lockfile(
         try:
             held_mtime = os.stat(lock_dir).st_mtime
         except FileNotFoundError:
-            # A NAME THAT EXISTS AND CANNOT RESOLVE WILL NEVER SUCCEED, the
-            # same separation the mkdir arm above makes with one stat.
-            # `lexists` is the wrong test: it also answers True for a directory
-            # recreated between our stat and the check, which is a busy
-            # handoff and must keep retrying.
-            if os.path.islink(lock_dir):
-                raise ClaudeCodeLockTimeout(
-                    f"{lock_dir} is a symlink that points nowhere, so no lock "
-                    "can be created there. Remove it."
-                )
             time.sleep(max(0.0, min(0.05, timeout - (time.monotonic() - start))))
             continue  # holder released between mkdir and stat
         if time.time() - held_mtime > staleness:

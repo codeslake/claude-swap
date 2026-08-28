@@ -458,6 +458,33 @@ class TestADanglingSymlinkDoesNotPinACore:
         assert "symlink" in str(caught.value), str(caught.value)
         assert "Claude Code" not in str(caught.value), str(caught.value)
 
+    def test_a_symlink_to_a_real_directory_is_refused_too(self, tmp_path):
+        """The stat FOLLOWS the link, so it only ever saw the dangling case.
+
+        A symlink pointing at a directory answers a successful `stat` of its
+        target, and `rmdir` answers ENOTDIR, so even the stale branch cannot
+        clear it. It spent the whole budget and blamed Claude Code.
+        """
+        target = tmp_path / "real"
+        target.mkdir()
+        link = tmp_path / "link.lock"
+        link.symlink_to(target)
+
+        started = time.monotonic()
+        with pytest.raises(ClaudeCodeLockTimeout) as caught:
+            with proper_lockfile(link, timeout=2.0, staleness=0.0):
+                pass
+        elapsed = time.monotonic() - started
+
+        assert "symlink" in str(caught.value), str(caught.value)
+        assert "Claude Code" not in str(caught.value), str(caught.value)
+        # STALENESS 0 IS THE DISCRIMINATOR: a real directory is retaken at once
+        # there, so any budget spent here is spent on a state nothing changes.
+        assert elapsed < 0.5, (
+            f"waited {elapsed:.2f}s of a 2s budget on a name whose mkdir and "
+            "rmdir both fail permanently"
+        )
+
     def test_control_a_real_directory_still_retries(self, tmp_path, monkeypatch):
         """CONTROL: the refusal keys on the symlink, not on any ENOENT.
 
@@ -1142,22 +1169,31 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
     def test_the_trials_are_spaced_not_back_to_back(self, tmp_path, monkeypatch):
         """Repeats bound the error only if the samples are INDEPENDENT.
 
-        Back-to-back trials sample one contention burst, so under load the
-        second agrees with the first for the same reason the first was wrong.
-        The gap is the fix; the count is not.
+        Back-to-back trials fit inside one contention burst, so under bursty
+        load the second agrees with the first for the same reason the first was
+        wrong. This asserts the gap EXISTS; it is not a claim that the gap
+        alone suffices, since under continuous saturation only the count helps.
         """
         import claude_swap.claude_locks as cl
 
-        naps: list[float] = []
-        monkeypatch.setattr(cl.time, "sleep", naps.append)
-        monkeypatch.setattr(cl, "_one_pin_trial", lambda p: True)
+        # ONE LIST FOR BOTH EVENTS, so the ORDER is asserted too. Counting
+        # naps alone passes for a mutation that takes every sleep before the
+        # loop, which is back-to-back sampling with the right arithmetic.
+        events: list = []
+        monkeypatch.setattr(cl.time, "sleep", events.append)
+        monkeypatch.setattr(
+            cl, "_one_pin_trial", lambda p: (events.append("trial"), True)[1]
+        )
         cl._PIN_PROBE.clear()
         assert cl._fd_pins_an_inode(tmp_path) is True
         cl._PIN_PROBE.clear()
 
-        assert naps == [cl._PIN_TRIAL_GAP_S] * (cl._PIN_TRIALS - 1), (
-            f"DEFECT: {len(naps)} gap(s) between {cl._PIN_TRIALS} trials -- "
-            "trials microseconds apart are one sample repeated"
+        expected = ["trial"]
+        for _ in range(cl._PIN_TRIALS - 1):
+            expected += [cl._PIN_TRIAL_GAP_S, "trial"]
+        assert events == expected, (
+            f"DEFECT: {events} -- a gap must separate every pair of trials, "
+            "since trials microseconds apart are one sample repeated"
         )
         assert cl._PIN_TRIAL_GAP_S > 0
 
@@ -1171,10 +1207,11 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         cl._PIN_PROBE.clear()
         try:
             assert cl._fd_pins_an_inode(tmp_path) is False
-            # BY KEY SHAPE, NOT BY PATH STRING. The key is `(path, st_dev)`,
-            # so `str(tmp_path) not in _PIN_PROBE` is true by construction and
-            # would pass with the unmeasurable answer cached.
-            assert not any(k[0] == str(tmp_path) for k in cl._PIN_PROBE), (
+            # NOT `str(tmp_path) not in _PIN_PROBE`, which the tuple key
+            # makes true by construction, and not `k[0] == ...` either, which
+            # a bare-string key satisfies with `k[0] == "/"`. The dict was
+            # cleared and exactly one path probed, so emptiness IS the claim.
+            assert not cl._PIN_PROBE, (
                 "an unmeasurable parent must be re-probed, not remembered"
             )
         finally:
@@ -1234,7 +1271,11 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             "is still a descriptor on a filesystem that pins nothing"
         )
 
-    @needs_the_trial_machinery
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows cannot hold a directory open, so the probe is False "
+               "there by construction and has nothing to report",
+    )
     def test_the_probe_reports_a_presence(self, tmp_path):
         """The control: on this filesystem the descriptor DOES pin."""
         import claude_swap.claude_locks as cl
