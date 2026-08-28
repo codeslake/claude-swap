@@ -8302,6 +8302,73 @@ class TestProvenanceGuard:
             "the live bytes must still be preserved when the heal fails"
         )
 
+    def test_the_heal_does_not_swallow_the_real_store_guard(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """The sibling above needs the containment; this one bounds it.
+
+        `RealStoreWriteBlocked` is deliberately not an `OSError` subclass so
+        that no containment in this codebase can hide a write into the real
+        account store, and `_write_account_credentials` says so at its own
+        raise site. The heal wraps that method, so a catch wide enough to
+        swallow it disarms the guard for this whole path -- which is what
+        `except Exception` did here once already.
+        """
+        from claude_swap import oauth
+        from claude_swap.usage_store import FetchRecord
+        from tests import conftest as _conftest
+
+        sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-2"
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = creds_store[("2", "account2@example.com")]
+        ident = {"2": ("account2@example.com", "org-2")}
+        switcher._usage_store.record(
+            {"2": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(a2_backup),
+            )},
+            ident,
+        )
+        assert switcher._slot_token_dead("2", "account2@example.com"), (
+            "premise: the heal would otherwise fire on this slot"
+        )
+        foreign = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-relogin", "refreshToken": "rt-2-relogin",
+        }})
+        live_state = {"creds": foreign}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        real_write = switcher._write_account_credentials
+        refused = []
+
+        def refusing(num, email, creds):
+            if str(num) == "2":
+                refused.append(num)
+                raise _conftest.RealStoreWriteBlocked(
+                    "the heal leaked into the REAL store")
+            return real_write(num, email, creds)
+
+        switcher._write_account_credentials = refusing
+        try:
+            with pytest.raises(_conftest.RealStoreWriteBlocked):
+                self._run_switch(switcher, resolver={
+                    "uuid": "uuid-2", "email": "account2@example.com",
+                    "organizationUuid": "org-2",
+                })
+        finally:
+            switcher._write_account_credentials = real_write
+            for p in patches:
+                p.stop()
+
+        assert refused, (
+            "premise: the heal never attempted the write, so nothing here "
+            "says what the containment does with a guard violation"
+        )
+
     def test_foreign_synced_lineage_warns_without_any_write(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
