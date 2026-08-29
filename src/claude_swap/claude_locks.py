@@ -320,7 +320,9 @@ def proper_lockfile(
             except BaseException:
                 # THE NAME IS OURS AND THE `finally` THAT REMOVES IT IS NOT
                 # REACHED UNTIL THE `yield`. Only `OSError` reaches the arm
-                # below, and the probe sleeps -- where an interrupt lands.
+                # below, and the probe sleeps -- where an interrupt lands. It
+                # never raises `OSError` (every level catches), or both arms
+                # would remove one name with a waiter free to take it between.
                 try:
                     os.rmdir(lock_dir)
                 except OSError:

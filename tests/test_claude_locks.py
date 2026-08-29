@@ -1162,17 +1162,26 @@ class TestADanglingSymlinkDoesNotPinACore:
         above the loop, so a spin bound written against a symlink measures the
         refusal instead of the arm.
 
-        THE BUDGET IS NOT A MULTIPLE OF THE FLAT CAP. At 0.3 the last sleep
-        starts with 0.0497s left and `min(0.05, timeout)` is inside the
-        slack -- measured, the mutant passed. 0.175 leaves 0.024s, which it
-        overshoots by half.
+        A SCRIPTED CLOCK, so which sleep is the clamped one is CHOSEN. Against
+        the wall clock the last sleep is only clamped when the deadline lands
+        inside the flat cap, and per-iteration overhead moves it: measured on
+        correct code with an overshoot injected per sleep, 8ms reaches a
+        clamped tail and 9-12ms ends one iteration earlier with none, so the
+        floor below accuses code that is doing exactly the right thing. The
+        budget is not a multiple of the cap either way -- 0.175 leaves 0.025s
+        for the tail, which `min(0.05, timeout)` overshoots by double.
+
+        The clock also MOVES ON READ, or a mutation that deletes the sleep
+        entirely never advances it and the case hangs instead of failing.
         """
         swept = tmp_path / "busy.lock"
         swept.mkdir()
         budget, seen, slept = 0.175, {"n": 0}, []
-        real_stat = os.stat
-        real_sleep = claude_locks.time.sleep
-        mine, t0 = threading.get_ident(), time.monotonic()
+        # SMALL ENOUGH NOT TO PERTURB, large enough to bound a sleepless loop
+        # at ~100k reads, and the whole error between the code's read and ours.
+        tick, spent = budget / 100000.0, [0.0]
+        real_stat, real_sleep = os.stat, claude_locks.time.sleep
+        mine = threading.get_ident()
 
         def vanishing(path, *a, **k):
             if os.fspath(path) == os.fspath(swept):
@@ -1180,16 +1189,22 @@ class TestADanglingSymlinkDoesNotPinACore:
                 raise FileNotFoundError(errno.ENOENT, "swept")
             return real_stat(path, *a, **k)
 
+        def reading():
+            spent[0] += tick
+            return spent[0]
+
         def recording(seconds):
             # SCOPED TO THIS THREAD. `claude_locks.time` IS the time module,
             # so an unscoped patch records every other thread's sleeps here.
-            if threading.get_ident() == mine:
-                # RAW, not rounded: the subject is a sub-millisecond
-                # difference and `round(_, 3)` is a millisecond of error.
-                slept.append((budget - (time.monotonic() - t0), seconds))
-            return real_sleep(seconds)
+            if threading.get_ident() != mine:
+                return real_sleep(seconds)
+            slept.append((budget - spent[0], seconds))
+            # ONE ITERATION OF WORK on top of the sleep, so a clamped sleep of
+            # 0.0 still moves the deadline the loop is waiting on.
+            spent[0] += seconds + 0.001
 
         monkeypatch.setattr(claude_locks.os, "stat", vanishing)
+        monkeypatch.setattr(claude_locks.time, "monotonic", reading)
         monkeypatch.setattr(claude_locks.time, "sleep", recording)
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(swept, timeout=budget):
@@ -1212,7 +1227,9 @@ class TestADanglingSymlinkDoesNotPinACore:
             f"the run never reached a clamped sleep: {slept}"
         )
         for left, seconds in slept:
-            assert seconds <= max(left, 0.0) + 0.005, (
+            # ONE STEP OF SLACK, and only one: the code sized this sleep from
+            # a read that moved the clock, and we read it after.
+            assert seconds <= max(left, 0.0) + tick, (
                 f"slept {seconds:.4f}s with {left:.4f}s left -- the swept-name "
                 f"clamp used `timeout`, not what remains of it (all: "
                 f"{[(round(l, 4), round(s, 4)) for l, s in slept]})"
