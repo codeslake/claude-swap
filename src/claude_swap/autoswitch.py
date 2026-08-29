@@ -2297,12 +2297,17 @@ class AutoSwitchEngine:
         # account is at/over the threshold, so a single healthy peer still
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
-        # The 5-hour figure per candidate: what each can still take RIGHT NOW,
-        # which is a different question from how close it is to any limit.
+        # The 5-hour figure: what an account can still take RIGHT NOW, which is
+        # a different question from how close it is to any limit. Read once
+        # here — neither value depends on the candidate being ranked.
         servable_by_account = {
             num: oauth.servable_headroom(usage.get(num), self._models)
             for num in oauth_candidates
         }
+        active_servable = oauth.servable_headroom(usage.get(current), self._models)
+        about_to_wall = (
+            active_servable is not None and active_servable <= SPENT_HEADROOM_PCT
+        )
         all_above = _every_account_above_threshold(
             oauth_candidates, headroom, active_headroom, settings.threshold
         )
@@ -2387,17 +2392,20 @@ class AutoSwitchEngine:
             if h is None:
                 continue
             any_known = True          # it EXISTS and is readable either way
+            recovery_ts = (
+                _binding_recovery_ts(usage.get(num), self._models, now)
+                if all_above
+                else 0.0
+            )
             if h <= 0:
                 # SPENT IS NOT DISQUALIFYING WHEN NOTHING CAN SERVE. A session
                 # that reaches a session limit is pinned to the account it was
                 # on -- Claude Code rebuilds its client on 401/403 and socket
                 # errors and never on 429 -- so the banner clears when THAT
                 # account's window returns, whatever the fleet does next. With
-                # every account spent the wall is coming either way, and the
-                # only choice left is which one to be behind. A peer that
-                # lifts sooner than the active is that choice; anything else
-                # is still refused, so this cannot land on a worse place to be
-                # stuck.
+                # nothing left to serve the wall is coming either way, and the
+                # only choice is which one to be behind.
+                #
                 # A PROVABLE RETURN ON BOTH SIDES. `_binding_recovery_ts`
                 # answers `inf` for unknown AND for already past, and those are
                 # opposite facts: an active whose reset has passed can return
@@ -2406,19 +2414,13 @@ class AutoSwitchEngine:
                     all_above
                     and (active_headroom or 0.0) <= 0
                     and active_recovery_ts != float("inf")
-                    and _binding_recovery_ts(usage.get(num), self._models, now)
-                    < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                    and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
                 ):
                     continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
-            )
-            recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
-                if all_above
-                else 0.0
             )
             if by_recovery_axis or trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over the threshold
@@ -2452,35 +2454,20 @@ class AutoSwitchEngine:
                         now,
                     )
                     if by_recovery:
-                        # TAKING THE WALL PINS EVERY SESSION ON IT. A session
-                        # that reaches its limit keeps retrying the account it
-                        # was on -- Claude Code rebuilds its client on 401/403
-                        # and socket errors, never on 429 -- so a switch after
-                        # the fact reaches new requests only. Measured: a
-                        # session bound to a slot resetting at 02:49Z sat idle
-                        # while the active account had 76% headroom.
+                        # TAKING THE WALL PINS EVERY SESSION ON IT (see the
+                        # spent-candidate guard above), so "the active returns
+                        # soonest" is not a reason to ride it to 100% while a
+                        # peer can still serve. The recovery order still
+                        # decides among peers; it does not choose the wall.
                         #
-                        # So "the active returns soonest" is not a reason to
-                        # ride it to 100% while a peer can still serve. The
-                        # recovery order still decides among peers; it does not
-                        # get to choose the wall.
-                        active_servable = oauth.servable_headroom(
-                            usage.get(current), self._models
-                        )
-                        cand_servable = servable_by_account.get(num)
-                        about_to_wall = (
-                            active_servable is not None
-                            and active_servable <= SPENT_HEADROOM_PCT
-                        )
-                        # BOTH AXES, or the wall just moves. A peer with an
-                        # empty 5-hour window but two points of weekly quota
-                        # takes work for minutes and then walls too -- behind a
-                        # reset days out instead of the active's minutes. It
-                        # has to be able to serve now AND to have somewhere to
-                        # serve from.
+                        # `h` is the both-axes test: it is `100 - max(pct)`
+                        # over every relevant window, so a peer with an empty
+                        # 5-hour window but two points of weekly quota -- which
+                        # takes work for minutes and then walls behind a reset
+                        # days out -- is already excluded by it. The 5-hour
+                        # read only has to EXIST; unknown stays refused.
                         peer_can_serve = (
-                            cand_servable is not None
-                            and cand_servable > SPENT_HEADROOM_PCT
+                            servable_by_account.get(num) is not None
                             and h > SPENT_HEADROOM_PCT
                         )
                         if not (about_to_wall and peer_can_serve):
