@@ -736,9 +736,11 @@ class TestDecisionTable:
         """`active_headroom is None` is not `active_headroom == 0`.
 
         On failover there is no measured active to rank a return against, so a
-        spent peer must stay refused. What refuses it is `all_above`, which is
-        False precisely because the active is unreadable -- not the
-        `is not None` spelling, which no test here can separate from it.
+        spent peer must stay refused. This case pins the guard as a WHOLE --
+        delete it and this fails -- not any one conjunct: `all_above`
+        short-circuits first, but with it neutered the margin still refuses,
+        because both recovery values are the 0.0 sentinel outside it. No test
+        here can separate the three.
         """
         h, usage = self._spent_fleet(temp_home, lifts_in=(60, 10))
         usage["1"] = None                      # unreadable, not spent
@@ -748,6 +750,40 @@ class TestDecisionTable:
         assert h.active_number() == 1, (
             "failover took a peer that is itself at its limit: it can serve "
             f"nothing, and nothing measured the active it beat: {outcome}"
+        )
+
+    def test_consume_first_does_not_rank_a_disabled_escape_on_the_weekly(
+        self, temp_home
+    ):
+        """The same inversion, one ranking arm over.
+
+        `consume-first` is a preference about which account to burn NEXT, and
+        it sat ahead of the escape arm for every trigger but `at-limit`. Once
+        the spent guard began admitting candidates on a RECOVERY argument,
+        `disabled-active` -- the one trigger that does so without reaching the
+        tiered key -- landed here instead, ranked on a weekly reset those
+        candidates were never selected for, and took the peer that lifts LAST.
+
+        Its control is `test_a_disabled_active_lands_on_the_peer_that_lifts_first`:
+        the same fleet on the default strategy, which chose correctly all along.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0,
+                          strategy="consume-first")
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        usage = {}
+        for num, mins in enumerate((60, 50, 10), 1):
+            row = _usage7(100.0, 60.0)
+            row["five_hour"]["resets_at"] = _iso_at(now + mins * 60)
+            usage[str(num)] = row
+        h.switcher.set_account_disabled("1", True)
+        outcome = h.tick_with_usage(usage)
+        assert h.active_number() == 3, (
+            f"consume-first landed on {h.active_number()} ({outcome}): slot 3 "
+            "lifts in ten minutes and slot 2 in fifty, and the weekly reset "
+            "is not why either of them was admitted"
         )
 
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):

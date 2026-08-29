@@ -2416,9 +2416,15 @@ class AutoSwitchEngine:
                 # `all_above` FIRST, and it is what makes the rest safe to
                 # read: it is False whenever the active is unmeasured, which is
                 # the state `(active_headroom or 0.0)` cannot tell from a spent
-                # one. This branch IS reached on failover -- nothing blocks
-                # earlier, the exhausted-fleet exit is downstream of the
-                # ranking -- so `all_above` is doing the refusing there.
+                # one. This branch IS reached on failover -- the exhausted-fleet
+                # exit is downstream of the ranking, not before it.
+                #
+                # NO TEST CAN KILL `all_above` ALONE, and that is measured
+                # rather than missing: both recovery values are read as
+                # `... if all_above else 0.0`, so with it gone the margin below
+                # compares 0.0 to 0.0 and refuses anyway. Do not read a green
+                # suite as permission to delete it -- a precondition belongs in
+                # its guard, not in a sentinel two variables away.
                 if not (
                     all_above
                     and (active_headroom or 0.0) <= 0
@@ -2543,18 +2549,25 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first and trigger != "at-limit":
+            elif consume_first and trigger not in ("at-limit", "disabled-active"):
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
-                # NOT for at-limit. `consume_first` is the configured
-                # STRATEGY, and this arm sitting ahead of the escape arm made
-                # the escape rank on the weekly reset for consume-first users
-                # — filtering on one axis while sorting on another, the same
-                # shape the recovery-hysteresis gate above already had to
-                # close. Consume-first is a preference about which account to
-                # burn NEXT; at-limit is a stopped session, and the window
-                # that stopped it is the only axis that can end that.
+                # NEITHER ESCAPE. `consume_first` is the configured STRATEGY,
+                # and this arm sitting ahead of the escape arm made the escape
+                # rank on the weekly reset for consume-first users — filtering
+                # on one axis while sorting on another, the same shape the
+                # recovery-hysteresis gate above already had to close.
+                # Consume-first is a preference about which account to burn
+                # NEXT; both escapes are a stopped session, and the window that
+                # stopped it is the only axis that can end that.
+                #
+                # `disabled-active` joined that list when the spent guard began
+                # admitting candidates on a RECOVERY argument: it is the one
+                # trigger that does so without reaching the tiered key, so
+                # leaving it here ranked those candidates on a weekly reset
+                # they were never selected for and took the peer that lifts
+                # LAST. The escape arm below carries the reset in its key.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
