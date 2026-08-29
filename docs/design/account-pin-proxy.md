@@ -98,10 +98,6 @@ nothing and mints nothing, yet asked as the active account it answers 200 with
 the WRONG account's environments, so the pinned machines are simply absent and
 nothing looks broken.
 
-Pinning only the first family leaves `claude remote-control` on the active
-account, where the machine simply never appears in the pinned account's browser
-while every other check reports the pin as healthy.
-
 Two neighbours stay OUT, and they stay out by DIFFERENT means:
 
 - the `work/` queue the machine polls (`poll`, `ack`, `stop`, `heartbeat`),
@@ -110,9 +106,8 @@ Two neighbours stay OUT, and they stay out by DIFFERENT means:
   answered fine swapped, and the next `work/poll` on that same environment
   answered 401 swapped and 200 with the bearer it arrived with. Ownership is
   still the pin's, because the register is; the queue is not an ownership
-  route. Excluded by the ownership pattern not reaching it, NOT by a guard:
-  `_ENV_WORK` names the decision but nothing calls it, so widening that
-  pattern silently removes the protection.
+  route. Excluded by the ownership pattern not reaching it, NOT by a guard,
+  so widening that pattern silently removes the protection.
 - anything spelled `?beta=true` under `/v1/environments`, which is the
   managed-agents SDK sharing the path space with a different credential.
   This one IS a guard: an explicit clause beside the pattern.
@@ -130,16 +125,15 @@ proxy has two:
 | `CONNECT api.anthropic.com:443` then TLS | MITM, read each request, swap a pinned route |
 | `POST https://api.anthropic.com/... HTTP/1.1` (absolute form) | plain relay, read the request line, swap a pinned route (https to the upstream host only) |
 
-The second is plain-proxy form, and it is what the Remote Control
-bridge client uses -- measured on the wire, the registration leaves as
+The absolute form is what the Remote Control bridge client uses -- measured on
+the wire, the registration leaves as
 `POST https://api.anthropic.com/v1/environments/bridge` with the OAuth bearer
 in the clear. That branch existed for the auto-updater and telemetry and
 relayed verbatim, so adding the routes to the table changed nothing: the
 requests never reached the code that consults it.
 
 Both paths now take the same decision from the same predicate, and both trace
-it -- the MITM for every request, the relay only for the ones it pins. An
-untraced path leaves exactly the evidence a feature that is not running leaves.
+it -- the MITM for every request, the relay only for the ones it pins.
 
 ### Coexistence with other proxies (the three user classes)
 
