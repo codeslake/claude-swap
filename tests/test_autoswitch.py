@@ -390,6 +390,39 @@ class TestDecisionTable:
         assert switch.trigger == "proactive"
         assert harness.active_number() == 2
 
+    def test_the_active_does_not_take_the_wall_while_a_peer_can_serve(
+        self, temp_home
+    ):
+        """Reaching the limit PINS every session on that account.
+
+        A session that hits a session limit keeps retrying the account it was
+        on: Claude Code rebuilds its client on 401/403 and socket errors and
+        never on 429, so a switch afterwards reaches new requests only.
+        Measured on a live fleet — a session bound to a slot whose 5-hour
+        window returned two hours later sat idle while the active account
+        carried 76% headroom.
+
+        So "the active comes back soonest" must not buy riding it to 100% when
+        a peer can still take work. The peer here returns LATER on purpose:
+        under the recovery rule alone the engine would stay.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(99.0, 40.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 5 * 60)
+        peer = _usage7(30.0, 95.0)
+        peer["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        assert outcome is TickOutcome.SWITCHED, (
+            "the active is one point from the wall and the peer can still "
+            "serve; staying pins every in-flight session on the account that "
+            "is about to stop answering"
+        )
+        assert h.active_number() == 2
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold

@@ -2297,6 +2297,12 @@ class AutoSwitchEngine:
         # account is at/over the threshold, so a single healthy peer still
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
+        # The 5-hour figure per candidate: what each can still take RIGHT NOW,
+        # which is a different question from how close it is to any limit.
+        servable_by_account = {
+            num: oauth.servable_headroom(usage.get(num), self._models)
+            for num in oauth_candidates
+        }
         all_above = _every_account_above_threshold(
             oauth_candidates, headroom, active_headroom, settings.threshold
         )
@@ -2425,12 +2431,47 @@ class AutoSwitchEngine:
                         now,
                     )
                     if by_recovery:
-                        # Hysteresis on the axis we actually rank by. It bounds
-                        # the flap RATE rather than making a reverse move
-                        # impossible: the target must come back meaningfully
-                        # sooner than where we are.
-                        if recovery_ts >= active_recovery_ts - RECOVERY_HYSTERESIS_S:
-                            continue
+                        # TAKING THE WALL PINS EVERY SESSION ON IT. A session
+                        # that reaches its limit keeps retrying the account it
+                        # was on -- Claude Code rebuilds its client on 401/403
+                        # and socket errors, never on 429 -- so a switch after
+                        # the fact reaches new requests only. Measured: a
+                        # session bound to a slot resetting at 02:49Z sat idle
+                        # while the active account had 76% headroom.
+                        #
+                        # So "the active returns soonest" is not a reason to
+                        # ride it to 100% while a peer can still serve. The
+                        # recovery order still decides among peers; it does not
+                        # get to choose the wall.
+                        active_servable = oauth.servable_headroom(
+                            usage.get(current), self._models
+                        )
+                        cand_servable = servable_by_account.get(num)
+                        about_to_wall = (
+                            active_servable is not None
+                            and active_servable <= SPENT_HEADROOM_PCT
+                        )
+                        # BOTH AXES, or the wall just moves. A peer with an
+                        # empty 5-hour window but two points of weekly quota
+                        # takes work for minutes and then walls too -- behind a
+                        # reset days out instead of the active's minutes. It
+                        # has to be able to serve now AND to have somewhere to
+                        # serve from.
+                        peer_can_serve = (
+                            cand_servable is not None
+                            and cand_servable > SPENT_HEADROOM_PCT
+                            and h > SPENT_HEADROOM_PCT
+                        )
+                        if not (about_to_wall and peer_can_serve):
+                            # Hysteresis on the axis we actually rank by. It
+                            # bounds the flap RATE rather than making a reverse
+                            # move impossible: the target must come back
+                            # meaningfully sooner than where we are.
+                            if (
+                                recovery_ts
+                                >= active_recovery_ts - RECOVERY_HYSTERESIS_S
+                            ):
+                                continue
                     else:
                         # Headroom axis, with a RATIO margin. Also a rate bound,
                         # not impossibility — headroom moves, so a target that
