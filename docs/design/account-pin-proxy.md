@@ -55,17 +55,24 @@ claude session
      ▼
 cswap-proxy  (NEW, this feature)
   - MITM api.anthropic.com
-  - route match:
-      /v1/code/sessions*    → replace Authorization: Bearer <PIN token>
-      /v1/environments*     → replace Authorization: Bearer <PIN token>
-      /api/frame/*          → replace Authorization: Bearer <PIN token>
-      everything else (esp. /v1/messages) → pass through unchanged
+  - route match — the OWNERSHIP routes, NOT a prefix rule (see below):
+      /v1/code/sessions/… , /v1/sessions/…  → replace Authorization: Bearer <PIN token>
+      /v1/environments , …/bridge[/<env>] ,
+        …/<env>/bridge/reconnect            → replace Authorization: Bearer <PIN token>
+      /api/frame/*                          → replace Authorization: Bearer <PIN token>
+      NOT swapped, though a prefix reaches them: …/worker/* , …/client/presence ,
+        /v1/environments/<env>/work/* , anything ?beta=true
+      everything else (esp. /v1/messages)   → pass through unchanged
   - chain onward to the PREVIOUS HTTPS_PROXY value (a local caching proxy, a
     direct if none)
      │
      ▼
 (previous proxy, if any: local cache → outbound proxy) → api.anthropic.com
 ```
+
+The proxy is generic: it knows about no particular next hop. It reads whatever HTTPS_PROXY
+was set before cswap inserted itself and CONNECT-chains through it. Works for
+users with a local caching proxy, without one, and behind an outbound proxy.
 
 ### Two families, because Remote Control has two front doors
 
@@ -78,15 +85,19 @@ routes:
 | `/remote-control` in the REPL | a bridge on the current session | `POST /v1/code/sessions/<id>/bridge` |
 | `claude remote-control` | an ENVIRONMENT this machine offers | `POST /v1/environments/bridge` |
 
-The second family is the environment's OWNERSHIP routes, and only those: the
-collection read, register (`POST /v1/environments/bridge`), deregister
-(`DELETE .../bridge/<env>`) and `bridge/reconnect`. Each reads the account's
-OAuth bearer from one header builder, so each has to follow the pin. Pinning
-only the first family leaves `claude remote-control` on the active account,
-where the machine simply never appears in the pinned account's browser while
-every other check reports the pin as healthy.
+The second family is the environment's OWNERSHIP routes: register
+(`POST /v1/environments/bridge`), deregister (`DELETE .../bridge/<env>`) and
+`bridge/reconnect`. Each reads the account's OAuth bearer from one header
+builder, so each has to follow the pin. The bare collection read is pinned too
+but for a different reason: it creates nothing and mints nothing, yet asked as
+the active account it answers 200 with the WRONG account's environments, so the
+pinned machines are simply absent and nothing looks broken.
 
-Two neighbours stay OUT, and both exclusions are load-bearing:
+Pinning only the first family leaves `claude remote-control` on the active
+account, where the machine simply never appears in the pinned account's browser
+while every other check reports the pin as healthy.
+
+Two neighbours stay OUT, and they stay out by DIFFERENT means:
 
 - the `work/` queue the machine polls (`poll`, `ack`, `stop`, `heartbeat`),
   whose calls take a token as an ARGUMENT instead of reading the bearer.
@@ -94,9 +105,12 @@ Two neighbours stay OUT, and both exclusions are load-bearing:
   answered fine swapped, and the next `work/poll` on that same environment
   answered 401 swapped and 200 with the bearer it arrived with. Ownership is
   still the pin's, because the register is; the queue is not an ownership
-  route.
+  route. Excluded by the ownership pattern not reaching it, NOT by a guard:
+  `_ENV_WORK` names the decision and nothing calls it, so widening that
+  pattern removes the protection with the named regex still sitting there.
 - anything spelled `?beta=true` under `/v1/environments`, which is the
   managed-agents SDK sharing the path space with a different credential.
+  This one IS a guard: an explicit clause beside the pattern.
 
 The rule both express: swap a bearer only where it has been read, never
 because a prefix happened to reach.
@@ -119,12 +133,8 @@ relayed verbatim, so adding the routes to the table changed nothing: the
 requests never reached the code that consults it.
 
 Both paths now take the same decision from the same predicate, and both trace
-what they decided -- an untraced path leaves exactly the evidence a feature
-that is not running leaves.
-
-The proxy is generic: it knows about no particular next hop. It reads whatever HTTPS_PROXY
-was set before cswap inserted itself and CONNECT-chains through it. Works for
-users with a local caching proxy, without one, and behind an outbound proxy.
+it -- the MITM for every request, the relay only for the ones it pins. An
+untraced path leaves exactly the evidence a feature that is not running leaves.
 
 ### Coexistence with other proxies (the three user classes)
 
