@@ -583,10 +583,12 @@ def headroom_on_window(
 ) -> float | None:
     """Headroom on ONE named window, or ``None`` when it is not reported.
 
-    Deliberately NOT a floor on the others: callers pair it with
-    :func:`account_headroom`, which still decides whether an account is usable
-    at all. This decides only the ORDER among accounts already known usable,
-    so a high number here can never select an account blocked elsewhere.
+    Deliberately NOT a floor on the others, and NOT a usability test: a high
+    number here says only that one window is clear. An account can score 50
+    on it and hold a single point overall. Callers must therefore rank with
+    it and decide usability with :func:`account_headroom` — the engine's
+    escape key tiers on that first, because ordering by this number alone
+    lands on an account that stops answering on the next request.
     """
     for name, pct, _ in relevant_windows(usage, models):
         if name == label:

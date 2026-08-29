@@ -2576,8 +2576,14 @@ class AutoSwitchEngine:
                 # below-threshold peer clears it, and `failover` never
                 # satisfies it), and the tier is inert for the two triggers
                 # whose landing gate already puts every candidate in tier 0.
+                # Servability under it, on the same bar the escape key uses:
+                # inside tier 1 nothing is a healthy landing, and a weekly
+                # perishing in an hour is worth nothing on an account with two
+                # points to spend it with. Inert in tier 0, which the landing
+                # gate already puts above `100 - threshold`.
                 key = (
                     0 if (100.0 - h) < settings.threshold else 1,
+                    0 if h > SPENT_HEADROOM_PCT else 1,
                     reset_ts if reset_ts is not None else float("inf"),
                     -h,
                 )
@@ -2612,7 +2618,14 @@ class AutoSwitchEngine:
                     if escape_label
                     else None
                 )
+                # SERVABILITY TIERS IT, because `escape_h` orders and does not
+                # decide usability: the bar it is paired with is `h > 0`, so a
+                # peer with fifty points on the blocked window and ONE on its
+                # weekly outranks one holding forty on both, walls on the next
+                # request, and the tick after pays a second swap to correct it.
+                # `SPENT_HEADROOM_PCT` is the module's own "can this serve".
                 key = (
+                    0 if h > SPENT_HEADROOM_PCT else 1,
                     -max(escape_h if escape_h is not None else h, 0.0),
                     recovery_ts,
                 )

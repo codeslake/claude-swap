@@ -881,6 +881,91 @@ class TestDecisionTable:
             "perishes soonest"
         )
 
+    def test_the_escape_does_not_land_on_a_peer_that_walls_immediately(
+        self, temp_home
+    ):
+        """The escape axis orders; it does not decide usability.
+
+        `headroom_on_window` is a ranking among accounts "already known
+        usable", and the bar for usable was one point of headroom. A peer with
+        fifty points on the very window that blocked us and ONE point on its
+        weekly outranks a peer holding forty on both -- then walls on the next
+        request, and the following tick pays a second credential swap to
+        correct it.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(100.0, 50.0),   # at-limit on the 5h window
+            "2": _usage7(50.0, 99.0),    # 50 on the escape axis, ONE point real
+            "3": _usage7(60.0, 60.0),    # 40 points on both
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} ({outcome}): slot 2 looks best on "
+            "the blocked window and holds one point of actual headroom, so "
+            "the escape lands somewhere that stops answering immediately"
+        )
+
+    def test_a_peer_exactly_at_the_threshold_is_not_a_healthy_landing(
+        self, temp_home
+    ):
+        """The `<` in the landing tier, which nothing else holds.
+
+        The tier has to be the landing gate's complement, and `<=` would put an
+        account sitting EXACTLY at the threshold — the one the landing gate
+        rejects — in the healthy tier. `pct` is a float straight from the API
+        against a round default, so exact equality is ordinary, not a knife
+        edge, and the whole suite stays green when the two drift apart.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0,
+                          strategy="consume-first")
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        h.switcher.set_account_disabled("1", True)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95.0, 95.0, _iso_at(now + 3 * 86400)),
+            "2": _usage7(90.0, 90.0, _iso_at(now + 1 * 3600)),   # EXACTLY at it
+            "3": _usage7(10.0, 10.0, _iso_at(now + 6 * 86400)),
+        })
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} ({outcome}): slot 2 sits exactly "
+            "at the threshold, which the landing gate calls unhealthy, so its "
+            "sooner weekly must not outrank a peer with ninety points"
+        )
+
+    def test_a_perishing_weekly_does_not_beat_being_able_to_serve(
+        self, temp_home
+    ):
+        """Tier 1 of the weekly key, where the escapes have no admission axis.
+
+        Both peers are over the threshold, so neither is a healthy landing and
+        the tier cannot separate them -- but two points is under two poll
+        intervals of work by this module's own line, and nine "really is
+        somewhere to work". A weekly window perishing in an hour is worth
+        nothing on the account that cannot spend it.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0,
+                          strategy="consume-first")
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        h.switcher.set_account_disabled("1", True)
+        outcome = h.tick_with_usage({
+            "1": _usage7(80.0, 80.0, _iso_at(now + 3 * 86400)),   # 20 pts
+            "2": _usage7(98.0, 98.0, _iso_at(now + 1 * 3600)),    # 2 pts, weekly 1h
+            "3": _usage7(91.0, 91.0, _iso_at(now + 6 * 86400)),   # 9 pts, weekly 6d
+        })
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} ({outcome}): slot 2 holds two "
+            "points, below the bar this module calls spent, and slot 3 nine"
+        )
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
