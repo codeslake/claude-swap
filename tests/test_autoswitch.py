@@ -966,6 +966,36 @@ class TestDecisionTable:
             "points, below the bar this module calls spent, and slot 3 nine"
         )
 
+    def test_a_healthy_landing_still_ranks_purely_on_the_weekly(
+        self, temp_home
+    ):
+        """The servability tier must not reach INSIDE a healthy landing.
+
+        It exists for tier 1, where the escapes arrive with no admission axis.
+        Inside tier 0 the landing gate has already vouched for every
+        candidate, and consume-first's whole job is to burn the most
+        perishable weekly first -- a preference the tier would quietly
+        overrule wherever `100 - threshold` falls below SPENT_HEADROOM_PCT.
+        Threshold 98 puts it there, so a 2.5-point account is a legal landing
+        and must still win on its one-hour weekly.
+        """
+        h = EngineHarness(temp_home, threshold=98.0, hysteresis_pct=1.0,
+                          strategy="consume-first")
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.0, 99.0, _iso_at(now + 5 * 86400)),   # 1 pt, at-limitish
+            "2": _usage7(97.5, 97.5, _iso_at(now + 1 * 3600)),    # 2.5 pts, weekly 1h
+            "3": _usage7(96.0, 96.0, _iso_at(now + 6 * 86400)),   # 4 pts, weekly 6d
+        })
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} ({outcome}): both peers cleared "
+            "the landing gate, so consume-first should take the weekly that "
+            "perishes in an hour over one six days out"
+        )
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold

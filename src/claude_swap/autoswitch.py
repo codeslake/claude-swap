@@ -2571,15 +2571,18 @@ class AutoSwitchEngine:
                 # axis: `disabled-active` and `failover` skip the landing gate
                 # by design, and an untiered weekly key then takes whichever
                 # quota perishes soonest however little that account can serve.
-                # Health first, then servability on the same bar the escape key
-                # uses. `not all_above` cannot stand in for either — one
-                # below-threshold peer clears it, and `failover` never
-                # satisfies it — and both tiers are inert wherever the landing
-                # gate ran, which leaves every candidate above `100 -
-                # threshold`.
+                # Health first, then servability on the same bar the escape
+                # key uses -- but as ONE tier, so servability cannot reach
+                # inside a healthy landing. It would: `100 - threshold` falls
+                # below SPENT_HEADROOM_PCT once the threshold passes 97, and
+                # there a legal landing would lose its perishing weekly to a
+                # peer with a point more. `not all_above` stands in for
+                # neither tier — one below-threshold peer clears it, and
+                # `failover` never satisfies it.
                 key = (
-                    0 if (100.0 - h) < settings.threshold else 1,
-                    0 if h > SPENT_HEADROOM_PCT else 1,
+                    0
+                    if (100.0 - h) < settings.threshold
+                    else (1 if h > SPENT_HEADROOM_PCT else 2),
                     reset_ts if reset_ts is not None else float("inf"),
                     -h,
                 )
