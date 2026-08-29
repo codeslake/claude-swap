@@ -571,6 +571,47 @@ class TestDecisionTable:
         assert outcome is TickOutcome.SWITCHED, outcome
         assert h.active_number() == 2
 
+    def test_a_pinned_models_own_wall_is_a_wall(self, temp_home):
+        """The `--models` half of the same blind spot, through `tick()`.
+
+        With a model pinned, that model's weekly window gates the work as hard
+        as the five-hour one. `account_headroom` folds it in; a five-hour-only
+        read of the same row reports 100.0 points free.
+
+        The scoped window sits at 98, NOT at 100, on purpose. At 100 the active
+        is at-limit and the ordinary escape moves the engine whatever this rule
+        says -- a version of this case written that way passed with the
+        pre-fix axis restored, proving nothing. Two points short, the trigger
+        is `proactive`, the peer's own reset is ten days out, and the recovery
+        ordering says stay: this rule is the only thing that can move it.
+        """
+        h = EngineHarness(
+            temp_home, threshold=90.0, hysteresis_pct=5.0, model="Fable"
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 98.0,
+                        "resets_at": _iso_at(now + 3 * 3600)}],
+        }
+        peer = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 92.0,
+                        "resets_at": _iso_at(now + 9 * 86400)}],
+        }
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        assert outcome is TickOutcome.SWITCHED, (
+            "the active is two points from its pinned model's weekly wall "
+            "and the peer holds eight -- a five-hour-only read calls the "
+            f"active healthy and rides it into the wall: {outcome}"
+        )
+        assert h.active_number() == 2
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
