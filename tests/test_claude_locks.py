@@ -1535,15 +1535,21 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
     ):
         """The SAME window, one statement later, and it had the other policy.
 
-        `os.open`/`os.fstat` sit between the same `mkdir` and the same
-        `finally`. An `OSError` out of them is removed by the arm below;
+        `os.open`/`os.fstat`/`os.stat` sit between the same `mkdir` and the
+        same `finally`. An `OSError` out of them is removed by the arm below;
         anything else reached NO arm, so the guard three lines above stated an
         invariant its own neighbour did not keep.
 
-        The raise is injected on OUR fd and nothing else's -- an `os.fstat`
-        patched process-wide takes the worker's own reads with it, and a
-        `KeyboardInterrupt` is claimed by xdist before `pytest.raises` sees
-        it. Any non-`OSError` exercises the branch; `Boom` is one.
+        WHICHEVER READ-BACK THIS PLATFORM USES. Forcing the pinned branch on
+        is what this class is named against: where a directory cannot be
+        opened, the forced `os.open` raises the platform's own refusal and the
+        case reports it as the defect. So both reads are injected and the
+        first one reached fires.
+
+        The raise is scoped to our fd and our path: `os.fstat` patched
+        process-wide takes the test worker's own reads with it. It is a plain
+        exception, because a `KeyboardInterrupt` is claimed by xdist before
+        `pytest.raises` sees it -- any non-`OSError` exercises the branch.
         """
         import claude_swap.claude_locks as cl
 
@@ -1551,7 +1557,8 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             pass
 
         target = tmp_path / "b.lock"
-        ours, real_open, real_fstat = set(), cl.os.open, cl.os.fstat
+        ours, fired = set(), []
+        real_open, real_fstat, real_stat = cl.os.open, cl.os.fstat, cl.os.stat
 
         def watching_open(path, *a, **k):
             fd = real_open(path, *a, **k)
@@ -1560,18 +1567,25 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
             return fd
 
         def boom_fstat(fd, *a, **k):
-            if fd in ours:
+            if fd in ours and not fired:
+                fired.append("fstat")
                 raise Boom
             return real_fstat(fd, *a, **k)
 
-        monkeypatch.setattr(cl, "_fd_pins_an_inode", lambda parent: True)
+        def boom_stat(path, *a, **k):
+            if os.fspath(path) == os.fspath(target) and not fired:
+                fired.append("stat")
+                raise Boom
+            return real_stat(path, *a, **k)
+
         monkeypatch.setattr(cl.os, "open", watching_open)
         monkeypatch.setattr(cl.os, "fstat", boom_fstat)
+        monkeypatch.setattr(cl.os, "stat", boom_stat)
         with pytest.raises(Boom):
             with proper_lockfile(target, timeout=2.0):
                 pass
         monkeypatch.undo()
-        assert ours, "the pinned branch never opened the name -- test is inert"
+        assert fired, "the read-back was never reached -- the case is inert"
         assert not target.exists(), (
             f"{sorted(p.name for p in tmp_path.iterdir())} -- read-back "
             "raised something that is not an OSError and no arm removed the "
