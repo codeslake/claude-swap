@@ -341,21 +341,32 @@ def proper_lockfile(
             # directory we just made. Outside the loop that raises
             # FileNotFoundError out of a call documented to raise only
             # ClaudeCodeLockTimeout.
-            if can_pin:
-                held_fd = os.open(lock_dir, os.O_RDONLY)
-                try:
+            try:
+                if can_pin:
+                    held_fd = os.open(lock_dir, os.O_RDONLY)
                     st = os.fstat(held_fd)
-                except BaseException:
-                    # THE DESCRIPTOR IS OURS THE INSTANT `open` RETURNS, and
-                    # the `finally` that closes it is not reached until the
-                    # `yield` below. A raise here strands it on an inode the
-                    # arm further down then unlinks, so it stays pinned for
-                    # the life of the process.
+                else:
+                    st = os.stat(lock_dir)
+            except BaseException as exc:
+                # THE DESCRIPTOR IS OURS THE INSTANT `open` RETURNS, and the
+                # `finally` that closes it is not reached until the `yield`
+                # below. A raise here strands it on an inode the arm further
+                # down then unlinks, so it stays pinned for the life of the
+                # process.
+                if held_fd >= 0:
                     os.close(held_fd)
                     held_fd = -1
-                    raise
-            else:
-                st = os.stat(lock_dir)
+                # AND THE NAME IS OURS TOO. An `OSError` is removed by the arm
+                # below and must not be removed twice -- the second `rmdir`
+                # takes a successor's directory. Anything else reaches no arm
+                # at all, so this is the only place that can free it, which is
+                # the same window the probe guard above covers.
+                if not isinstance(exc, OSError):
+                    try:
+                        os.rmdir(lock_dir)
+                    except OSError:
+                        pass
+                raise
             ident = (st.st_dev, st.st_ino)
             last_stamp = st.st_mtime_ns
             break

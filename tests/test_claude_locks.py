@@ -1181,6 +1181,7 @@ class TestADanglingSymlinkDoesNotPinACore:
         # at ~100k reads, and the whole error between the code's read and ours.
         tick, spent = budget / 100000.0, [0.0]
         real_stat, real_sleep = os.stat, claude_locks.time.sleep
+        real_monotonic = claude_locks.time.monotonic
         mine = threading.get_ident()
 
         def vanishing(path, *a, **k):
@@ -1190,6 +1191,12 @@ class TestADanglingSymlinkDoesNotPinACore:
             return real_stat(path, *a, **k)
 
         def reading():
+            # SCOPED LIKE `recording` BELOW, and for a sharper reason: this one
+            # MUTATES the clock on every read, so one call from another thread
+            # jumps the deadline and ends the loop early -- an empty `slept`,
+            # or a clamp assertion that accuses the source.
+            if threading.get_ident() != mine:
+                return real_monotonic()
             spent[0] += tick
             return spent[0]
 
@@ -1227,9 +1234,15 @@ class TestADanglingSymlinkDoesNotPinACore:
             f"the run never reached a clamped sleep: {slept}"
         )
         for left, seconds in slept:
-            # ONE STEP OF SLACK, and only one: the code sized this sleep from
-            # a read that moved the clock, and we read it after.
-            assert seconds <= max(left, 0.0) + tick, (
+            # TWO STEPS OF SLACK. The code sized this sleep from a read that
+            # moved the clock and we read it after, so one step is the true
+            # error -- but the two sides reach the same quantity down
+            # different expression trees, and the tail row cleared a one-step
+            # bound by 3.5e-18, which is one ULP. A re-association of that
+            # line then reddens correct code, which is the accusation the
+            # scripted clock exists to remove. Two steps is still 1.75e-6
+            # against a flat-cap mutant that overshoots by 28ms.
+            assert seconds <= max(left, 0.0) + 2 * tick, (
                 f"slept {seconds:.4f}s with {left:.4f}s left -- the swept-name "
                 f"clamp used `timeout`, not what remains of it (all: "
                 f"{[(round(l, 4), round(s, 4)) for l, s in slept]})"
@@ -1515,6 +1528,54 @@ class TestThePinIsAFilesystemFactNotAPlatformOne:
         assert not target.exists(), (
             f"{sorted(p.name for p in tmp_path.iterdir())} -- the name was "
             "taken and then abandoned, so every waiter blocks on nobody"
+        )
+
+    def test_a_raise_reading_the_name_back_does_not_strand_it_either(
+        self, tmp_path, monkeypatch
+    ):
+        """The SAME window, one statement later, and it had the other policy.
+
+        `os.open`/`os.fstat` sit between the same `mkdir` and the same
+        `finally`. An `OSError` out of them is removed by the arm below;
+        anything else reached NO arm, so the guard three lines above stated an
+        invariant its own neighbour did not keep.
+
+        The raise is injected on OUR fd and nothing else's -- an `os.fstat`
+        patched process-wide takes the worker's own reads with it, and a
+        `KeyboardInterrupt` is claimed by xdist before `pytest.raises` sees
+        it. Any non-`OSError` exercises the branch; `Boom` is one.
+        """
+        import claude_swap.claude_locks as cl
+
+        class Boom(Exception):
+            pass
+
+        target = tmp_path / "b.lock"
+        ours, real_open, real_fstat = set(), cl.os.open, cl.os.fstat
+
+        def watching_open(path, *a, **k):
+            fd = real_open(path, *a, **k)
+            if os.fspath(path) == os.fspath(target):
+                ours.add(fd)
+            return fd
+
+        def boom_fstat(fd, *a, **k):
+            if fd in ours:
+                raise Boom
+            return real_fstat(fd, *a, **k)
+
+        monkeypatch.setattr(cl, "_fd_pins_an_inode", lambda parent: True)
+        monkeypatch.setattr(cl.os, "open", watching_open)
+        monkeypatch.setattr(cl.os, "fstat", boom_fstat)
+        with pytest.raises(Boom):
+            with proper_lockfile(target, timeout=2.0):
+                pass
+        monkeypatch.undo()
+        assert ours, "the pinned branch never opened the name -- test is inert"
+        assert not target.exists(), (
+            f"{sorted(p.name for p in tmp_path.iterdir())} -- read-back "
+            "raised something that is not an OSError and no arm removed the "
+            "name, so every waiter blocks on nobody for the staleness window"
         )
 
 
