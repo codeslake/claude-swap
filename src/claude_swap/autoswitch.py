@@ -2411,22 +2411,17 @@ class AutoSwitchEngine:
                 # BOTH RETURNS MUST BE PROVABLE. `_binding_recovery_ts` answers
                 # `inf` for unknown AND for already past, which are opposite
                 # facts: an active whose reset has passed can return at any
-                # moment and must not lose to a peer hours out. `is not None`
-                # for the same reason -- `or 0.0` would read an UNREADABLE
-                # active as a spent one. No test pins that half and none can:
-                # failover with every peer spent is an exhausted fleet, which
-                # returns BLOCKED before the ranking runs, and failover with a
-                # healthy peer never consults this branch. Defensive, not dead.
+                # moment and must not lose to a peer hours out.
                 #
-                # `all_above` cannot be killed by a test on its own, and that
-                # is measured rather than missing: both recovery values are
-                # read as `... if all_above else 0.0`, so the margin below
-                # compares 0.0 to 0.0 and refuses anyway. Keep it — a
-                # precondition belongs in its guard, not in a sentinel.
+                # `all_above` FIRST, and it is what makes the rest safe to
+                # read: it is False whenever the active is unmeasured, which is
+                # the state `(active_headroom or 0.0)` cannot tell from a spent
+                # one. This branch IS reached on failover -- nothing blocks
+                # earlier, the exhausted-fleet exit is downstream of the
+                # ranking -- so `all_above` is doing the refusing there.
                 if not (
                     all_above
-                    and active_headroom is not None
-                    and active_headroom <= 0
+                    and (active_headroom or 0.0) <= 0
                     and best_candidate_headroom <= SPENT_HEADROOM_PCT
                     and active_recovery_ts != float("inf")
                     and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
@@ -2566,17 +2561,25 @@ class AutoSwitchEngine:
                 # back to `-h` when the label is unknown (usage without window
                 # data) or the candidate does not report that window, so an
                 # account we cannot compare on the escape axis is ordered by
-                # the binding number rather than dropped. Usability is decided
-                # above -- `h > 0`, or the spent guard's demand for a sooner
-                # provable return -- so a good number here still cannot select
-                # an account blocked elsewhere.
+                # the binding number rather than dropped.
                 #
-                # THE RESET BREAKS THE TIE, and it is load-bearing here rather
-                # than decoration: `disabled-active` admits a SPENT candidate
-                # on a recovery argument and never reaches the tiered key, so
-                # every candidate scores `-h == 0` and slot order would decide,
-                # inverting the rule that admitted them. Outside `all_above`
-                # `recovery_ts` is the 0.0 sentinel and no order moves.
+                # A GOOD NUMBER HERE STILL CANNOT SELECT AN ACCOUNT BLOCKED
+                # ELSEWHERE, but not because `h > 0` decides usability -- the
+                # spent guard relaxed that. The coupling is: on `at-limit` the
+                # guard's conjuncts are a SUPERSET of `by_recovery_axis`'s, so
+                # a spent candidate it admits always takes the tiered key above
+                # and never arrives here; and every other trigger leaves
+                # `escape_label` None, so `escape_h` is not read at all. Widen
+                # `escape_label` past at-limit and that argument is gone.
+                #
+                # SPENT CANDIDATES TIE, then the reset decides. `pct` is copied
+                # through unclamped, so a peer 0.5 points OVER its limit scores
+                # above one at exactly 100 -- a difference this file calls
+                # noise, deciding against a return time it calls the only real
+                # question. Clamping at 0 can touch nothing else: a negative
+                # score needs a window past 100, which is what makes `h <= 0`.
+                # Outside `all_above` `recovery_ts` is the 0.0 sentinel, so no
+                # existing order moves.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, self._models
@@ -2584,7 +2587,10 @@ class AutoSwitchEngine:
                     if escape_label
                     else None
                 )
-                key = (-(escape_h if escape_h is not None else h), recovery_ts)
+                key = (
+                    -max(escape_h if escape_h is not None else h, 0.0),
+                    recovery_ts,
+                )
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback

@@ -700,6 +700,56 @@ class TestDecisionTable:
         )
         assert h.active_number() == 1
 
+    def test_being_further_over_a_limit_does_not_outrank_lifting_first(
+        self, temp_home
+    ):
+        """A tie the API is not obliged to give us.
+
+        `utilization` is copied through unclamped, so a spent account can read
+        100.5 and score BELOW one at exactly 100.0 on the escape key -- half a
+        point, which this module calls noise, deciding against the return time
+        it calls the only real question. Ranking spent candidates by reset
+        only works if they actually tie, so the score is clamped.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+
+        def row(pct5, mins):
+            r = _usage7(pct5, 60.0)
+            r["five_hour"]["resets_at"] = _iso_at(now + mins * 60)
+            return r
+
+        h.switcher.set_account_disabled("1", True)
+        outcome = h.tick_with_usage(
+            {"1": row(100.0, 60), "2": row(100.0, 50), "3": row(100.5, 10)}
+        )
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} ({outcome}): slot 3 is half a "
+            "point further over its limit and lifts in ten minutes, slot 2 in "
+            "fifty -- the half point is not a reason to wait forty more"
+        )
+
+    def test_an_unreadable_active_never_admits_a_spent_peer(self, temp_home):
+        """`active_headroom is None` is not `active_headroom == 0`.
+
+        On failover there is no measured active to rank a return against, so a
+        spent peer must stay refused. What refuses it is `all_above`, which is
+        False precisely because the active is unreadable -- not the
+        `is not None` spelling, which no test here can separate from it.
+        """
+        h, usage = self._spent_fleet(temp_home, lifts_in=(60, 10))
+        usage["1"] = None                      # unreadable, not spent
+        for _ in range(2):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        outcome = h.tick_with_usage(usage)
+        assert h.active_number() == 1, (
+            "failover took a peer that is itself at its limit: it can serve "
+            f"nothing, and nothing measured the active it beat: {outcome}"
+        )
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
