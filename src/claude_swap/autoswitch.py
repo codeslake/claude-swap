@@ -2562,16 +2562,15 @@ class AutoSwitchEngine:
                 # session, and the window that stopped it is the only axis
                 # that can end that.
                 #
-                # AND NOT UNDER `all_above`, which is the STATE the spent guard
-                # admits under -- the only way a candidate reaches a ranking on
-                # an axis it was not selected for. Measured on `disabled-active`
-                # with three spent slots: ranked here, it took the peer that
-                # lifts LAST. Keyed on the state rather than on that trigger
-                # because with nothing below the threshold the strategy
-                # question is already moot (the gate above says so in those
-                # words), while below it a disabled active's peers are healthy
-                # and burning the most perishable weekly first is exactly what
-                # the user asked for.
+                # AND NOT UNDER `all_above`. That is the state the spent guard
+                # admits in, so it is the only way a candidate reaches a
+                # ranking on an axis it was not selected for -- measured on
+                # `disabled-active` with three spent slots, this arm took the
+                # peer that lifts LAST. The STATE and not that trigger: above
+                # the threshold the strategy question is already moot (the
+                # gate above says so in those words), below it a disabled
+                # active's peers are healthy and burning the most perishable
+                # weekly first is what consume-first is.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
