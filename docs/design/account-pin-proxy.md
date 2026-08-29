@@ -57,7 +57,7 @@ cswap-proxy  (NEW, this feature)
   - MITM api.anthropic.com
   - route match:
       /v1/code/sessions*    → replace Authorization: Bearer <PIN token>
-      /v1/environments/...  → replace Authorization: Bearer <PIN token>
+      /v1/environments*     → replace Authorization: Bearer <PIN token>
       /api/frame/*          → replace Authorization: Bearer <PIN token>
       everything else (esp. /v1/messages) → pass through unchanged
   - chain onward to the PREVIOUS HTTPS_PROXY value (a local caching proxy, a
@@ -78,17 +78,23 @@ routes:
 | `/remote-control` in the REPL | a bridge on the current session | `POST /v1/code/sessions/<id>/bridge` |
 | `claude remote-control` | an ENVIRONMENT this machine offers | `POST /v1/environments/bridge` |
 
-The second family covers the whole environment lifecycle -- register,
-deregister, `bridge/reconnect`, and the `work/` queue the machine polls -- and
-all of it carries the plain OAuth bearer, so all of it has to follow the pin.
-Pinning only the first leaves `claude remote-control` on the active account,
+The second family is the environment's OWNERSHIP routes, and only those: the
+collection read, register (`POST /v1/environments/bridge`), deregister
+(`DELETE .../bridge/<env>`) and `bridge/reconnect`. Each reads the account's
+OAuth bearer from one header builder, so each has to follow the pin. Pinning
+only the first family leaves `claude remote-control` on the active account,
 where the machine simply never appears in the pinned account's browser while
 every other check reports the pin as healthy.
 
 Two neighbours stay OUT, and both exclusions are load-bearing:
 
-- the `worker/` subtree, which authenticates with a per-session JWT rather
-  than the OAuth bearer -- swapping it is a 403 storm, not a pin;
+- the `work/` queue the machine polls (`poll`, `ack`, `stop`, `heartbeat`),
+  whose calls take a token as an ARGUMENT instead of reading the bearer.
+  Measured against an environment this pin had just registered: the register
+  answered fine swapped, and the next `work/poll` on that same environment
+  answered 401 swapped and 200 with the bearer it arrived with. Ownership is
+  still the pin's, because the register is; the queue is not an ownership
+  route.
 - anything spelled `?beta=true` under `/v1/environments`, which is the
   managed-agents SDK sharing the path space with a different credential.
 
@@ -103,19 +109,18 @@ proxy has two:
 | how the client speaks | what the proxy does |
 |---|---|
 | `CONNECT api.anthropic.com:443` then TLS | MITM, read each request, swap a pinned route |
-| `POST https://api.anthropic.com/... HTTP/1.1` (absolute form) | forward through the chain |
+| `POST https://api.anthropic.com/... HTTP/1.1` (absolute form) | plain relay, read the request line, swap a pinned route (https to the upstream host only) |
 
-The second is plain-proxy form, and the second is what the Remote Control
+The second is plain-proxy form, and it is what the Remote Control
 bridge client uses -- measured on the wire, the registration leaves as
 `POST https://api.anthropic.com/v1/environments/bridge` with the OAuth bearer
 in the clear. That branch existed for the auto-updater and telemetry and
 relayed verbatim, so adding the routes to the table changed nothing: the
 requests never reached the code that consults it.
 
-Both paths now take the same decision from the same predicate, and both write
-a line naming what they decided. An untraced path is half of what this cost:
-a feature travelling on it left exactly the evidence a feature that was not
-running leaves.
+Both paths now take the same decision from the same predicate, and both trace
+what they decided -- an untraced path leaves exactly the evidence a feature
+that is not running leaves.
 
 The proxy is generic: it knows about no particular next hop. It reads whatever HTTPS_PROXY
 was set before cswap inserted itself and CONNECT-chains through it. Works for
