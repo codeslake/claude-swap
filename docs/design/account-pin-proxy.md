@@ -56,8 +56,9 @@ claude session
 cswap-proxy  (NEW, this feature)
   - MITM api.anthropic.com
   - route match:
-      /v1/code/sessions*  → replace Authorization: Bearer <PIN token>
-      /api/frame/*        → replace Authorization: Bearer <PIN token>
+      /v1/code/sessions*    → replace Authorization: Bearer <PIN token>
+      /v1/environments/...  → replace Authorization: Bearer <PIN token>
+      /api/frame/*          → replace Authorization: Bearer <PIN token>
       everything else (esp. /v1/messages) → pass through unchanged
   - chain onward to the PREVIOUS HTTPS_PROXY value (a local caching proxy, a
     direct if none)
@@ -65,6 +66,34 @@ cswap-proxy  (NEW, this feature)
      ▼
 (previous proxy, if any: local cache → outbound proxy) → api.anthropic.com
 ```
+
+### Two families, because Remote Control has two front doors
+
+`/remote-control` inside the REPL and `claude remote-control` on the command
+line are different code paths, and they own their sessions through different
+routes:
+
+| entry point | it creates | ownership route |
+|---|---|---|
+| `/remote-control` in the REPL | a bridge on the current session | `POST /v1/code/sessions/<id>/bridge` |
+| `claude remote-control` | an ENVIRONMENT this machine offers | `POST /v1/environments/bridge` |
+
+The second family covers the whole environment lifecycle -- register,
+deregister, `bridge/reconnect`, and the `work/` queue the machine polls -- and
+all of it carries the plain OAuth bearer, so all of it has to follow the pin.
+Pinning only the first leaves `claude remote-control` on the active account,
+where the machine simply never appears in the pinned account's browser while
+every other check reports the pin as healthy.
+
+Two neighbours stay OUT, and both exclusions are load-bearing:
+
+- the `worker/` subtree, which authenticates with a per-session JWT rather
+  than the OAuth bearer -- swapping it is a 403 storm, not a pin;
+- anything spelled `?beta=true` under `/v1/environments`, which is the
+  managed-agents SDK sharing the path space with a different credential.
+
+The rule both express: swap a bearer only where it has been read, never
+because a prefix happened to reach.
 
 The proxy is generic: it knows about no particular next hop. It reads whatever HTTPS_PROXY
 was set before cswap inserted itself and CONNECT-chains through it. Works for
