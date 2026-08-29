@@ -423,6 +423,53 @@ class TestDecisionTable:
         )
         assert h.active_number() == 2
 
+    def test_the_wall_is_taken_on_the_account_that_lifts_first(self, temp_home):
+        """When nothing can serve, choose WHERE to be stuck.
+
+        A session that reaches a session limit is pinned to the account it was
+        on — Claude Code rebuilds its client on 401/403 and socket errors and
+        never on 429 — so the banner clears when THAT account's window returns,
+        whatever the fleet does afterwards. With every account spent the wall
+        is unavoidable; being behind the one that lifts first is the whole
+        difference between minutes and hours.
+
+        The peer here is itself at its limit, which the ordinary rule excludes
+        as a target outright. It is still the right place to be: it returns in
+        ten minutes and the active does not return for three hours.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        soonest = _usage7(100.0, 60.0)
+        soonest["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        outcome = h.tick_with_usage({"1": active, "2": soonest})
+        assert outcome is TickOutcome.SWITCHED, (
+            "both accounts are spent, so the wall is coming either way; the "
+            "peer lifts in ten minutes and the active in three hours, and the "
+            "session is pinned to whichever it is on when the limit lands"
+        )
+        assert h.active_number() == 2
+
+    def test_a_spent_peer_that_lifts_later_is_still_refused(self, temp_home):
+        """THE CONTROL. Landing on a spent account is only ever justified by a
+        SOONER return; without that it is a strictly worse place to be stuck."""
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(100.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        later = _usage7(100.0, 60.0)
+        later["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        outcome = h.tick_with_usage({"1": active, "2": later})
+        assert outcome is not TickOutcome.SWITCHED
+        assert h.active_number() == 1
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
@@ -633,9 +680,14 @@ class TestDecisionTable:
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
     def test_all_exhausted_carries_earliest_reset(self, harness):
+        # THE ACTIVE ALREADY HOLDS THE EARLIEST RESET, which is what keeps this
+        # case about the ANNOUNCEMENT. With a peer lifting sooner the engine now
+        # moves there first — the wall is taken on whichever account returns
+        # first, because a limited session is pinned to the account it was on —
+        # and that move is covered by its own case.
         outcome = harness.tick_with_usage({
-            "1": _usage(100, "2026-07-03T12:00:00Z"),
-            "2": _usage(100, "2026-07-03T10:30:00Z"),
+            "1": _usage(100, "2026-07-03T10:30:00Z"),
+            "2": _usage(100, "2026-07-03T12:00:00Z"),
             "3": _usage(100, "2026-07-03T11:00:00Z"),
         })
         assert outcome is TickOutcome.BLOCKED
@@ -10729,13 +10781,18 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
         """
         harness.seed(4, "d@example.com")
         now = harness.clock.now
+        # THE ACTIVE HOLDS THE EARLIEST PROVABLE RESET, which is what keeps this
+        # case about the announcement. A peer that returns sooner is now moved
+        # to instead — the wall is taken on whichever account lifts first,
+        # because a limited session is pinned to the one it was on — and that
+        # move has its own case.
         active = _usage7(100.0, 40.0)
-        active["five_hour"]["resets_at"] = _iso_at(now + 100 * 60)
+        active["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
         unprovable = _usage7(100.0, 100.0)
         unprovable["five_hour"]["resets_at"] = None
         unprovable["seven_day"]["resets_at"] = None
         sooner = _usage7(100.0, 40.0)
-        sooner["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        sooner["five_hour"]["resets_at"] = _iso_at(now + 100 * 60)
         outcome = harness.tick_with_usage({
             "1": active,
             "2": _usage7(1.0, 98.0, _iso_at(now + 4 * 86400)),

@@ -2388,7 +2388,28 @@ class AutoSwitchEngine:
                 continue
             any_known = True          # it EXISTS and is readable either way
             if h <= 0:
-                continue  # itself at its limit — never a target
+                # SPENT IS NOT DISQUALIFYING WHEN NOTHING CAN SERVE. A session
+                # that reaches a session limit is pinned to the account it was
+                # on -- Claude Code rebuilds its client on 401/403 and socket
+                # errors and never on 429 -- so the banner clears when THAT
+                # account's window returns, whatever the fleet does next. With
+                # every account spent the wall is coming either way, and the
+                # only choice left is which one to be behind. A peer that
+                # lifts sooner than the active is that choice; anything else
+                # is still refused, so this cannot land on a worse place to be
+                # stuck.
+                # A PROVABLE RETURN ON BOTH SIDES. `_binding_recovery_ts`
+                # answers `inf` for unknown AND for already past, and those are
+                # opposite facts: an active whose reset has passed can return
+                # at any moment, so it must not lose to a peer hours out.
+                if not (
+                    all_above
+                    and (active_headroom or 0.0) <= 0
+                    and active_recovery_ts != float("inf")
+                    and _binding_recovery_ts(usage.get(num), self._models, now)
+                    < active_recovery_ts - RECOVERY_HYSTERESIS_S
+                ):
+                    continue  # itself at its limit — never a target
             if num == no_return:
                 continue  # the account we just left; see _no_return_account
             reset_ts = (
