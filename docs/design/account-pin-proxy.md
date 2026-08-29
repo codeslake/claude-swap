@@ -62,7 +62,7 @@ cswap-proxy  (NEW, this feature)
       /api/frame/*                             → replace Authorization: Bearer <PIN token>
       NOT swapped, reached by a pattern and refused by a guard: …/worker/* ,
         …/client/presence , ?beta=true UNDER /v1/environments
-      NOT swapped, reached by nothing at all (no guard, see below):
+      NOT swapped, reached by nothing (no guard, see below):
         /v1/environments/<env>/work/*
       everything else (esp. /v1/messages)      → pass through unchanged
     (a summary, not the list — `is_pinned_route` owns a few more, e.g.
@@ -93,15 +93,15 @@ The second family is the environment's OWNERSHIP routes: register
 (`POST /v1/environments/bridge`), deregister (`DELETE .../bridge/<env>`) and
 `bridge/reconnect`. Each goes through the one auth wrapper that reads
 `getAccessToken()`, so each has to follow the pin -- unpinned, the machine
-registers under the active account and never appears in the pinned account's
-browser. The header builder is NOT the discriminator -- the `work/` calls
-below share it.
+registers under the active account, and a registration is a CREATE the server
+will not transfer afterwards. The header builder is NOT the discriminator --
+the `work/` calls below share it.
 
 The bare collection read is pinned too but for a different reason: it creates
 nothing and mints nothing, yet asked as the active account it answers 200 with
 the WRONG account's environments, so the pinned machines are simply absent and
-nothing looks broken. Reasoned by analogy, not measured here: the
-200-with-the-wrong-contents was traced on `/v1/sessions`.
+nothing looks broken. Reasoned by analogy: the 200-with-the-wrong-contents
+was traced on `/v1/sessions`, not here.
 
 Two neighbours stay OUT, and they stay out by DIFFERENT means:
 
