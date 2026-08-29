@@ -2553,21 +2553,19 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
-                # NEITHER ESCAPE. `consume_first` is the configured STRATEGY,
-                # and this arm sitting ahead of the escape arm made the escape
-                # rank on the weekly reset for consume-first users — filtering
-                # on one axis while sorting on another, the same shape the
-                # recovery-hysteresis gate above already had to close.
-                # Consume-first is a preference about which account to burn
-                # NEXT; both escapes are a stopped session, and the window that
-                # stopped it is the only axis that can end that.
+                # NOT FOR A STOPPED SESSION. `consume_first` is the configured
+                # STRATEGY, and this arm sitting ahead of the escape arm made
+                # the escape rank on the weekly reset — filtering on one axis
+                # while sorting on another, the shape the recovery-hysteresis
+                # gate above already had to close. Consume-first is a
+                # preference about which account to burn NEXT.
                 #
-                # `disabled-active` joined that list when the spent guard began
-                # admitting candidates on a RECOVERY argument: it is the one
-                # trigger that does so without reaching the tiered key, so
-                # leaving it here ranked those candidates on a weekly reset
-                # they were never selected for and took the peer that lifts
-                # LAST. The escape arm below carries the reset in its key.
+                # `disabled-active` joined `at-limit` here when the spent guard
+                # began admitting on a RECOVERY argument: it is the only
+                # trigger that does so without reaching the tiered key, so it
+                # ranked those candidates on a weekly reset they were never
+                # selected for and took the peer that lifts LAST. It already
+                # sits on the escape side of every other gate in this file.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
