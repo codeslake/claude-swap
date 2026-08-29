@@ -470,6 +470,107 @@ class TestDecisionTable:
         assert outcome is not TickOutcome.SWITCHED
         assert h.active_number() == 1
 
+    def test_a_spent_peer_never_beats_a_peer_that_can_still_serve(
+        self, temp_home
+    ):
+        """THE OTHER CONTROL, and the one the relaxation's own gate misses.
+
+        Landing on a spent account is justified only when NOTHING can serve --
+        then the wall is coming either way and the choice is where to be stuck.
+        `all_above` does not say that: every account being at/over the
+        THRESHOLD leaves room for a peer holding real quota, and one that can
+        still take work is strictly better than one that answers nothing for
+        the next ten minutes.
+
+        The two are separated on the escape ranking, where the spent peer wins
+        on a window that is not the one blocking it: `headroom_on_window` ranks
+        order only, and its contract says a high number there "can never select
+        an account blocked elsewhere" because `h > 0` decides usability first.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        # Blocked on the WEEKLY window, days out: the escape ranks on "7d".
+        active = _usage7(50.0, 100.0, _iso_at(now + 3 * 86400))
+        # Spent on its 5-hour window and back in ten minutes -- sooner than the
+        # active, so the spent relaxation admits it -- but holding half a week
+        # of quota, so the "7d" escape key scores it far above the peer.
+        spent = _usage7(100.0, 50.0)
+        spent["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        # Five points on both windows: over the threshold, so `all_above`
+        # still holds, and able to answer a request right now.
+        servable = _usage7(95.0, 95.0)
+        outcome = h.tick_with_usage(
+            {"1": active, "2": spent, "3": servable}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "the engine took an account whose five-hour window is at 100% "
+            "over one with five points of real headroom -- the session is "
+            "pinned to whatever it lands on, so this buys ten minutes of "
+            "answering nothing in exchange for a peer that could serve now"
+        )
+
+    def test_two_spent_accounts_do_not_alternate_across_ticks(self, temp_home):
+        """The wall move is one-way, and it is the only rule here that ticks.
+
+        `at-limit` skips the no-return bar by design, so nothing but the
+        recovery hysteresis stands between "move to whoever lifts first" and a
+        pair trading places every poll. Ticking is the whole point: every other
+        case in this group observes the outbound leg only, which is exactly how
+        an oscillation gets certified as a move.
+
+        The guard is doubled, which this test is what showed: removing the
+        spent guard's own margin alone leaves the ranking loop's margin, and
+        the pair still holds. Removing BOTH makes this flap back on tick 2 --
+        that is the control that gives the seven quiet ticks below any meaning.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        one = _usage7(100.0, 60.0)
+        one["five_hour"]["resets_at"] = _iso_at(now + 3 * 3600)
+        two = _usage7(100.0, 60.0)
+        two["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        assert h.tick_with_usage({"1": one, "2": two}) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        for i in range(6):
+            h.clock.advance(60)
+            out = h.tick_with_usage({"1": one, "2": two})
+            assert h.active_number() == 2, f"flapped back on tick {i + 2}: {out}"
+
+    def test_the_wall_that_is_coming_is_not_only_the_five_hour_one(
+        self, temp_home
+    ):
+        """"About to stop answering" is the BINDING window, not the 5-hour one.
+
+        The active here is two points from its WEEKLY limit and wide open on
+        its five-hour one, so a five-hour-only read calls it healthy and the
+        engine sits until the wall lands -- pinning every session on it for the
+        rest of that window. The peer holds eight points and its own weekly
+        reset is ten days out, so there is somewhere to go.
+
+        The same blind spot under `--models`: a pinned model's scoped weekly
+        window reads 0.0 headroom on `account_headroom` while the five-hour
+        figure still reports 100.0. `h` sees both; a five-hour read sees
+        neither.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(0.0, 98.0, _iso_at(now + 3 * 3600))
+        peer = _usage7(5.0, 92.0, _iso_at(now + 10 * 86400))
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
@@ -680,19 +781,20 @@ class TestDecisionTable:
         assert (temp_home / ".claude" / ".credentials.json").read_text() == live_before
 
     def test_all_exhausted_carries_earliest_reset(self, harness):
-        # THE ACTIVE ALREADY HOLDS THE EARLIEST RESET, which is what keeps this
-        # case about the ANNOUNCEMENT. With a peer lifting sooner the engine now
-        # moves there first — the wall is taken on whichever account returns
-        # first, because a limited session is pinned to the account it was on —
-        # and that move is covered by its own case.
+        # A PEER HOLDS THE EARLIEST, or this cannot tell the announcement from
+        # the active's own reset. It stays BLOCKED because that peer is only
+        # three minutes sooner: taking the wall on the account that lifts first
+        # needs RECOVERY_HYSTERESIS_S of daylight, and three minutes is inside
+        # it. Both facts are load-bearing — with the active earliest, a mutant
+        # announcing "the first blocked account" survives.
         outcome = harness.tick_with_usage({
-            "1": _usage(100, "2026-07-03T10:30:00Z"),
-            "2": _usage(100, "2026-07-03T12:00:00Z"),
-            "3": _usage(100, "2026-07-03T11:00:00Z"),
+            "1": _usage(100, "2026-07-03T11:00:00Z"),
+            "2": _usage(100, "2026-07-03T10:57:00Z"),
+            "3": _usage(100, "2026-07-03T12:00:00Z"),
         })
         assert outcome is TickOutcome.BLOCKED
         event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
-        assert event.earliest_reset_at == "2026-07-03T10:30:00Z"
+        assert event.earliest_reset_at == "2026-07-03T10:57:00Z"
         assert harness.engine._sleep_until_ts is not None
         # The other arm of `deliberate_wait`. Every peer here is at its limit,
         # so this IS the exhausted fleet -- and nothing else in the suite reads
@@ -10781,18 +10883,18 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
         """
         harness.seed(4, "d@example.com")
         now = harness.clock.now
-        # THE ACTIVE HOLDS THE EARLIEST PROVABLE RESET, which is what keeps this
-        # case about the announcement. A peer that returns sooner is now moved
-        # to instead — the wall is taken on whichever account lifts first,
-        # because a limited session is pinned to the one it was on — and that
-        # move has its own case.
+        # THE PEER HOLDS THE EARLIEST, or this cannot tell the announcement
+        # apart from the active's own recovery — which is the fallback the
+        # docstring says must lose. It is four minutes sooner, inside
+        # RECOVERY_HYSTERESIS_S, so taking the wall on the account that lifts
+        # first does not fire and the tick still ends BLOCKED.
         active = _usage7(100.0, 40.0)
-        active["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        active["five_hour"]["resets_at"] = _iso_at(now + 14 * 60)
         unprovable = _usage7(100.0, 100.0)
         unprovable["five_hour"]["resets_at"] = None
         unprovable["seven_day"]["resets_at"] = None
         sooner = _usage7(100.0, 40.0)
-        sooner["five_hour"]["resets_at"] = _iso_at(now + 100 * 60)
+        sooner["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
         outcome = harness.tick_with_usage({
             "1": active,
             "2": _usage7(1.0, 98.0, _iso_at(now + 4 * 86400)),

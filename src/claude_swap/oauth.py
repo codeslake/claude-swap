@@ -561,26 +561,6 @@ def account_headroom(
     return 100.0 - max(pcts)
 
 
-def servable_headroom(
-    usage: dict | None, models: Sequence[str] = ()
-) -> float | None:
-    """Headroom of the window that gates work RIGHT NOW — the 5-hour one.
-
-    ``account_headroom`` answers "how close is this account to any limit",
-    which is what deciding to LEAVE one needs. Deciding whether an account can
-    still take work is a different question: a weekly window at 95% serves
-    every request until it reaches 100, while a 5-hour window at 100% serves
-    none and pins every session that reaches it.
-
-    ``None`` when no 5-hour window is reported, which callers treat as unknown
-    rather than as empty.
-    """
-    for label, pct, _ in relevant_windows(usage, models):
-        if label == "5h":
-            return 100.0 - pct
-    return None
-
-
 def binding_window_label(
     usage: dict | None, models: Sequence[str] = ()
 ) -> str | None:

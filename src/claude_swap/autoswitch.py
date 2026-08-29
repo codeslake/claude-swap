@@ -2297,17 +2297,14 @@ class AutoSwitchEngine:
         # account is at/over the threshold, so a single healthy peer still
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
-        # The 5-hour figure: what an account can still take RIGHT NOW, which is
-        # a different question from how close it is to any limit. Read once
-        # here — neither value depends on the candidate being ranked.
-        servable_by_account = {
-            num: oauth.servable_headroom(usage.get(num), self._models)
-            for num in oauth_candidates
-        }
-        active_servable = oauth.servable_headroom(usage.get(current), self._models)
-        about_to_wall = (
-            active_servable is not None and active_servable <= SPENT_HEADROOM_PCT
-        )
+        # THE BINDING WINDOW, not the five-hour one. "About to stop answering"
+        # is distance to the NEAREST wall, which is what `account_headroom`
+        # already measures: an active two points from its WEEKLY limit walls
+        # for a week, and under `--models` a pinned model's scoped window can
+        # sit at 100 while the five-hour read still says 100 points free. Both
+        # cases are invisible to a five-hour-only axis, and the candidate side
+        # of this rule has always used `h`, so the two now ask one question.
+        about_to_wall = (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
         all_above = _every_account_above_threshold(
             oauth_candidates, headroom, active_headroom, settings.threshold
         )
@@ -2406,6 +2403,18 @@ class AutoSwitchEngine:
                 # nothing left to serve the wall is coming either way, and the
                 # only choice is which one to be behind.
                 #
+                # NOTHING LEFT TO SERVE IS `best_candidate_headroom`, NOT
+                # `all_above`. Every account being over the THRESHOLD still
+                # leaves a peer holding real quota, and one that can answer now
+                # beats one that answers nothing for the next ten minutes. The
+                # gap is not theoretical: below, `at-limit` ranks on the window
+                # that blocked the ACTIVE, and `headroom_on_window`'s contract
+                # ("can never select an account blocked elsewhere") rests on
+                # `h > 0` having already decided usability. Relaxing `h` while
+                # a usable peer exists is what breaks it -- so the same spent
+                # bar `by_recovery_axis` uses is required here, which also
+                # confines a spent candidate to the recovery-ranked key.
+                #
                 # A PROVABLE RETURN ON BOTH SIDES. `_binding_recovery_ts`
                 # answers `inf` for unknown AND for already past, and those are
                 # opposite facts: an active whose reset has passed can return
@@ -2413,6 +2422,7 @@ class AutoSwitchEngine:
                 if not (
                     all_above
                     and (active_headroom or 0.0) <= 0
+                    and best_candidate_headroom <= SPENT_HEADROOM_PCT
                     and active_recovery_ts != float("inf")
                     and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
                 ):
@@ -2460,16 +2470,12 @@ class AutoSwitchEngine:
                         # peer can still serve. The recovery order still
                         # decides among peers; it does not choose the wall.
                         #
-                        # `h` is the both-axes test: it is `100 - max(pct)`
-                        # over every relevant window, so a peer with an empty
-                        # 5-hour window but two points of weekly quota -- which
-                        # takes work for minutes and then walls behind a reset
-                        # days out -- is already excluded by it. The 5-hour
-                        # read only has to EXIST; unknown stays refused.
-                        peer_can_serve = (
-                            servable_by_account.get(num) is not None
-                            and h > SPENT_HEADROOM_PCT
-                        )
+                        # `h` alone is the both-axes test: `100 - max(pct)` over
+                        # every relevant window, so a peer with an empty 5-hour
+                        # window but two points of weekly quota -- which takes
+                        # work for minutes and then walls behind a reset days
+                        # out -- is already excluded by it.
+                        peer_can_serve = h > SPENT_HEADROOM_PCT
                         if not (about_to_wall and peer_can_serve):
                             # Hysteresis on the axis we actually rank by. It
                             # bounds the flap RATE rather than making a reverse
