@@ -106,8 +106,8 @@ Two neighbours stay OUT, and they stay out by DIFFERENT means:
   answered 401 swapped and 200 with the bearer it arrived with. Ownership is
   still the pin's, because the register is; the queue is not an ownership
   route. Excluded by the ownership pattern not reaching it, NOT by a guard:
-  `_ENV_WORK` names the decision and nothing calls it, so widening that
-  pattern removes the protection with the named regex still sitting there.
+  `_ENV_WORK` names the decision but nothing calls it, so widening that
+  pattern silently removes the protection.
 - anything spelled `?beta=true` under `/v1/environments`, which is the
   managed-agents SDK sharing the path space with a different credential.
   This one IS a guard: an explicit clause beside the pattern.
