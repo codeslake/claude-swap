@@ -2563,24 +2563,20 @@ class AutoSwitchEngine:
                 # that can end that.
                 #
                 # AND NOT UNDER `all_above`, the state the spent guard admits
-                # in: ranked here, a candidate it took on a RECOVERY argument
-                # would be ordered by a weekly reset instead. Above the
-                # threshold the strategy question is moot anyway — the gate
-                # above says so in those words.
+                # in: a candidate it took on a RECOVERY argument would be
+                # ordered by a weekly reset instead. Above the threshold the
+                # strategy question is moot anyway — the gate above says so.
                 #
-                # LANDING HEALTH TIERS THE KEY, because both escapes reach this
-                # arm with NO admission axis — `disabled-active` and `failover`
-                # skip the landing gate by design — and an untiered weekly key
-                # then takes whichever quota perishes soonest however little
-                # that account can serve. `not all_above` cannot cover it (one
+                # TIERED, because both escapes reach this arm with NO admission
+                # axis: `disabled-active` and `failover` skip the landing gate
+                # by design, and an untiered weekly key then takes whichever
+                # quota perishes soonest however little that account can serve.
+                # Health first, then servability on the same bar the escape key
+                # uses. `not all_above` cannot stand in for either — one
                 # below-threshold peer clears it, and `failover` never
-                # satisfies it), and the tier is inert for the two triggers
-                # whose landing gate already puts every candidate in tier 0.
-                # Servability under it, on the same bar the escape key uses:
-                # inside tier 1 nothing is a healthy landing, and a weekly
-                # perishing in an hour is worth nothing on an account with two
-                # points to spend it with. Inert in tier 0, which the landing
-                # gate already puts above `100 - threshold`.
+                # satisfies it — and both tiers are inert wherever the landing
+                # gate ran, which leaves every candidate above `100 -
+                # threshold`.
                 key = (
                     0 if (100.0 - h) < settings.threshold else 1,
                     0 if h > SPENT_HEADROOM_PCT else 1,
@@ -2594,23 +2590,23 @@ class AutoSwitchEngine:
                 # account we cannot compare on the escape axis is ordered by
                 # the binding number rather than dropped.
                 #
-                # A GOOD NUMBER HERE CANNOT SELECT AN ACCOUNT BLOCKED
-                # ELSEWHERE -- but no longer because `h > 0` decides
-                # usability, which the spent guard relaxed. It holds because
-                # the guard's conjuncts are a SUPERSET of `by_recovery_axis`'s
-                # at-limit ones, so an admitted spent candidate takes the
-                # tiered key above, and no other trigger sets `escape_label`.
-                # WIDENING `escape_label` PAST AT-LIMIT REMOVES THAT ARGUMENT.
+                # THIS NUMBER ORDERS; IT DOES NOT DECIDE USABILITY. One clear
+                # window says nothing about the rest, so the servability tier
+                # goes first -- without it a peer with fifty points here and
+                # one overall wins, walls on the next request, and the tick
+                # after pays a second swap. A spent candidate cannot reach this
+                # arm at all: the guard's conjuncts are a SUPERSET of
+                # `by_recovery_axis`'s at-limit ones, so it takes the tiered
+                # key above, and no other trigger sets `escape_label` --
+                # WIDENING `escape_label` PAST AT-LIMIT REMOVES THAT.
                 #
-                # CLAMPED SO SPENT CANDIDATES TIE and the reset decides:
-                # `pct` is copied through unclamped, so 100.5 outranks 100.0 on
-                # half a point this module calls noise. Only they are touched
-                # -- a negative score needs a window past 100, which is what
-                # makes `h <= 0`.
-                #
+                # Clamped so equally-spent candidates tie and the reset
+                # decides: `pct` is copied through unclamped, so 100.5 would
+                # outrank 100.0 on half a point this module calls noise. Only
+                # they are touched -- a negative score needs a window past 100.
                 # `recovery_ts` is the 0.0 sentinel outside `all_above`, so
-                # nothing outside it moves; INSIDE it the reset now breaks ties
-                # that used to fall to slot order, which is the point.
+                # nothing outside it moves; inside it the reset breaks ties
+                # that fell to slot order.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, self._models
