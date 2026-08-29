@@ -1111,15 +1111,34 @@ class UsageStore:
                     # machines quarantined, not one line about any of them.
                     if int(row["authDeadStrikes"]) >= AUTH_DEAD_STRIKES:
                         _ident = identities.get(num) if identities else None
+                        # WHAT LIFTS IT DEPENDS ON WHETHER IT BOUND TO BYTES.
+                        # A strike carrying a fingerprint condemns the
+                        # GENERATION that was POSTed, and `token_dead` drops it
+                        # against any stored credential that differs — which
+                        # every writer produces, a rotation the live client
+                        # performs on its own included. Naming a re-login there
+                        # is a wrong instruction: the usual cause is a
+                        # collector POSTing a snapshot that was already spent,
+                        # and the account is fine. A strike with no fingerprint
+                        # binds unconditionally, and then the re-login really
+                        # is the only exit.
+                        _lifted_by = (
+                            "any credential rotation clears it, so this may "
+                            "already be stale; a re-login is needed only if it "
+                            "persists"
+                            if rec.struck_fp
+                            else "only a re-login replacing the stored "
+                                 "credential clears it"
+                        )
                         _logger.warning(
                             "Account %s (%s) is quarantined: the token "
-                            "endpoint answered %s, so its refresh lineage is "
-                            "treated as dead and it will report "
-                            "\"re-login needed\" until a re-login replaces "
-                            "the stored credential. Strike %s of %s.",
+                            "endpoint answered %s for the credential this "
+                            "fetch POSTed, so it is not fetched and reads "
+                            "\"re-login needed\" — %s. Strike %s of %s.",
                             num,
                             (_ident[0] if _ident else "unknown"),
                             rec.error,
+                            _lifted_by,
                             row["authDeadStrikes"],
                             AUTH_DEAD_STRIKES,
                         )
@@ -1218,6 +1237,22 @@ class UsageStore:
                 and row.get("struckFingerprint") != expected_fingerprints.get(num)
             ):
                 return  # the row moved since the caller's lock-free read
+            # BOTH DIRECTIONS OR NEITHER. The strike is a WARNING and the
+            # heal was silent, so a recovery was indistinguishable from a
+            # quarantine that never ended — and after the fact there was no
+            # second timestamp to measure the freeze against. Only a row that
+            # actually carried a quarantine speaks: this method is called on
+            # unstruck rows as a matter of course by every re-login and add,
+            # and a line per call would bury the transitions.
+            if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+                _ident = identities.get(num) if identities else None
+                _logger.info(
+                    "Account %s (%s) is out of quarantine: its stored "
+                    "credential no longer matches the generation the strike "
+                    "condemned, so it is fetched again.",
+                    num,
+                    (_ident[0] if _ident else "unknown"),
+                )
             if revoke_claim:
                 row["claimId"] = None
                 row["claimUntil"] = 0.0

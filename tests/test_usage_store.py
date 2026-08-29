@@ -1274,6 +1274,84 @@ class TestDeadTokenQuarantine:
             f"a transient failure produced the quarantine line: {said!r}"
         )
 
+    def test_a_bound_quarantine_does_not_demand_a_re_login(self, store, caplog):
+        """The line promised a re-login that was not needed, three times in a day.
+
+        A strike condemns the GENERATION that was POSTed, not the slot:
+        ``token_dead(stored_fp=...)`` drops it the moment the stored
+        credential differs from ``struckFingerprint``, and ANY writer does
+        that -- a switch, a rotation Claude Code performs on its own. So the
+        usual cause of an ``invalid_grant`` here is a collector POSTing a
+        snapshot the live client already spent, and the account is fine.
+
+        Measured on one host in ~24h: slots 6, 5 and 3 each took "Strike 1 of
+        1", no re-login appears anywhere in the log, and all three read
+        ``authDeadStrikes=0`` afterwards. Slot 3 was the ACTIVE account at the
+        time and was switched to and used minutes later.
+
+        Telling a person to re-login when a rotation will lift it is a wrong
+        instruction, not a pessimistic one.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="invalid_grant",
+                                           struck_fp="fp-of-the-spent-one")},
+                         IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "until a re-login replaces" not in said, (
+            "a fingerprint-bound strike still demands a re-login: " + repr(said)
+        )
+        assert "quarantin" in said, (
+            f"the quarantine stopped announcing itself at all: {said!r}"
+        )
+
+    def test_an_unbound_quarantine_still_demands_a_re_login(self, store, caplog):
+        """THE CONTROL, and it is the half that keeps the message honest.
+
+        A row struck with no fingerprint binds unconditionally -- nothing
+        short of a re-login lifts it -- so softening the sentence there would
+        make the log tell a person to wait for a heal that cannot arrive.
+        The two cases must read differently.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "re-login" in said, (
+            f"an unbound strike stopped naming the only thing that lifts it: {said!r}"
+        )
+
+    def test_lifting_a_quarantine_says_so(self, store, caplog):
+        """A transition log that speaks in ONE direction reports a permanent fault.
+
+        The quarantine is a WARNING; the heal was silent, so every recovery
+        looked like a quarantine that never ended. That is why the freeze
+        duration could not be measured after the fact -- there was no second
+        timestamp to measure to.
+        """
+        store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
+        assert store.entries(IDENT)["1"].token_dead()
+        # DROP THE SETUP'S OWN RECORDS. `caplog.records` accumulates over the
+        # whole test, not over the `with` block, so without this the assertion
+        # below is satisfied by the QUARANTINE line the strike just wrote --
+        # it passed against the un-fixed code for exactly that reason.
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(["1"], IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "1" in said and "a@x.com" in said, (
+            f"the heal names neither the slot nor the account: {said!r}"
+        )
+
+    def test_clearing_an_unstruck_row_stays_quiet(self, store, caplog):
+        """THE CONTROL. `clear_dead_token` is called on rows with no strike as
+        a matter of course -- every re-login and every add runs it -- so a line
+        per call would bury the transitions it exists to show."""
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(["1"], IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert said.strip() == "", (
+            f"a no-op clear announced itself: {said!r}"
+        )
+
     def test_transient_error_does_not_advance_or_reset(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         store.record({"1": FetchRecord(error="http-429")}, IDENT)  # transient
