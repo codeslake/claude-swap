@@ -700,24 +700,6 @@ class TestDecisionTable:
         )
         assert h.active_number() == 1
 
-    def test_an_unreadable_active_never_admits_a_spent_peer(self, temp_home):
-        """`active_headroom is None` is not `active_headroom == 0`.
-
-        `(active_headroom or 0.0) <= 0` reads True for BOTH, and on failover
-        there is no measured active to rank a recovery against -- so a spent
-        peer must stay refused. `all_above` happens to be False there too,
-        which is why this went unnoticed; the guard should say so itself.
-        """
-        h, usage = self._spent_fleet(temp_home, lifts_in=(60, 10))
-        usage["1"] = None                      # unreadable, not spent
-        for _ in range(2):
-            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
-        outcome = h.tick_with_usage(usage)
-        assert h.active_number() == 1, (
-            "failover took a peer that is itself at its limit: it can serve "
-            f"nothing, and nothing measured the active it was preferred over: {outcome}"
-        )
-
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold

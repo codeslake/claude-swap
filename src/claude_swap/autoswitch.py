@@ -2395,42 +2395,34 @@ class AutoSwitchEngine:
                 else 0.0
             )
             if h <= 0:
-                # SPENT IS NOT DISQUALIFYING WHEN NOTHING CAN SERVE. A session
-                # that reaches a session limit is pinned to the account it was
-                # on -- Claude Code rebuilds its client on 401/403 and socket
-                # errors and never on 429 -- so the banner clears when THAT
-                # account's window returns, whatever the fleet does next. With
-                # nothing left to serve the wall is coming either way, and the
-                # only choice is which one to be behind.
+                # SPENT IS NOT DISQUALIFYING WHEN NOTHING CAN SERVE. A limited
+                # session is pinned to the account it was on -- Claude Code
+                # rebuilds its client on 401/403 and socket errors, never on
+                # 429 -- so the wall is coming either way and the only choice
+                # left is which account to be behind.
                 #
-                # NOTHING LEFT TO SERVE IS `best_candidate_headroom`, NOT
-                # `all_above`. Every account being over the THRESHOLD still
-                # leaves a peer holding real quota, and one that can answer now
-                # beats one that answers nothing for the next ten minutes. The
-                # gap is not theoretical: below, `at-limit` ranks on the window
-                # that blocked the ACTIVE, and `headroom_on_window`'s contract
-                # ("can never select an account blocked elsewhere") rests on
-                # `h > 0` having already decided usability. Relaxing `h` while
-                # a usable peer exists is what breaks it -- so the same spent
-                # bar `by_recovery_axis` uses is required here, which also
-                # confines a spent candidate to the recovery-ranked key.
+                # "NOTHING CAN SERVE" IS `best_candidate_headroom`, never
+                # `all_above`: over the THRESHOLD still leaves a peer holding
+                # real quota. The escape key below ranks on the window that
+                # blocked the ACTIVE, and `headroom_on_window` is only safe
+                # there because usability was already decided -- so admitting a
+                # spent candidate while a usable peer exists is what breaks it.
                 #
-                # A PROVABLE RETURN ON BOTH SIDES. `_binding_recovery_ts`
-                # answers `inf` for unknown AND for already past, and those are
-                # opposite facts: an active whose reset has passed can return
-                # at any moment, so it must not lose to a peer hours out.
-                # `is not None` SPELLED OUT: `(active_headroom or 0.0) <= 0`
-                # reads True for an UNREADABLE active too, and failover is
-                # exactly the state with no measured active to rank a return
-                # against. It is refused today only because `active_recovery_ts`
-                # holds its 0.0 sentinel there, which is protection by accident.
+                # BOTH RETURNS MUST BE PROVABLE. `_binding_recovery_ts` answers
+                # `inf` for unknown AND for already past, which are opposite
+                # facts: an active whose reset has passed can return at any
+                # moment and must not lose to a peer hours out. `is not None`
+                # for the same reason -- `or 0.0` would read an UNREADABLE
+                # active as a spent one. No test pins that half and none can:
+                # failover with every peer spent is an exhausted fleet, which
+                # returns BLOCKED before the ranking runs, and failover with a
+                # healthy peer never consults this branch. Defensive, not dead.
                 #
-                # AND NO TEST CAN KILL `all_above` ALONE — that is measured,
-                # not an omission. Both recovery values are read as `... if
-                # all_above else 0.0`, so without it the margin below compares
-                # 0.0 against 0.0 and refuses anyway. It stays because this
-                # guard's precondition belongs in the guard, not three
-                # variables away in a sentinel; do not delete it as dead.
+                # `all_above` cannot be killed by a test on its own, and that
+                # is measured rather than missing: both recovery values are
+                # read as `... if all_above else 0.0`, so the margin below
+                # compares 0.0 to 0.0 and refuses anyway. Keep it — a
+                # precondition belongs in its guard, not in a sentinel.
                 if not (
                     all_above
                     and active_headroom is not None
@@ -2575,19 +2567,16 @@ class AutoSwitchEngine:
                 # data) or the candidate does not report that window, so an
                 # account we cannot compare on the escape axis is ordered by
                 # the binding number rather than dropped. Usability is decided
-                # above: `h > 0`, or the spent guard's demand for a sooner
-                # provable return, so a good number here can still never select
+                # above -- `h > 0`, or the spent guard's demand for a sooner
+                # provable return -- so a good number here still cannot select
                 # an account blocked elsewhere.
                 #
-                # THE RESET BREAKS THE TIE, for the same reason it does in the
-                # tiered key above: sooner is plainly better than lower slot
-                # number. It is not decoration here. `disabled-active` is the
-                # one trigger that admits a SPENT candidate — on a recovery
-                # argument — and never reaches that tiered key, so every
-                # candidate scores `-h == 0` and the whole ranking would fall
-                # to sequence order, inverting the rule that admitted them.
-                # `recovery_ts` is the 0.0 sentinel unless `all_above`, so
-                # outside that state this changes no order.
+                # THE RESET BREAKS THE TIE, and it is load-bearing here rather
+                # than decoration: `disabled-active` admits a SPENT candidate
+                # on a recovery argument and never reaches the tiered key, so
+                # every candidate scores `-h == 0` and slot order would decide,
+                # inverting the rule that admitted them. Outside `all_above`
+                # `recovery_ts` is the 0.0 sentinel and no order moves.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, self._models
