@@ -2553,41 +2553,27 @@ class AutoSwitchEngine:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
-                # NOT FOR at-limit. `consume_first` is the configured STRATEGY,
-                # and this arm sitting ahead of the escape arm made the escape
-                # rank on the weekly reset — filtering on one axis while
-                # sorting on another, the shape the recovery-hysteresis gate
-                # above already had to close. Consume-first is a preference
-                # about which account to burn NEXT; at-limit is a stopped
-                # session, and the window that stopped it is the only axis
-                # that can end that.
+                # A PREFERENCE ABOUT WHICH ACCOUNT TO BURN NEXT, so neither
+                # escape belongs: `at-limit` is a stopped session, and under
+                # `all_above` the spent guard has admitted candidates on a
+                # RECOVERY argument that this key would re-order by a weekly
+                # reset. `not all_above` covers only the second — one
+                # below-threshold peer clears it, and `failover` never
+                # satisfies it at all.
                 #
-                # AND NOT UNDER `all_above`, the state the spent guard admits
-                # in: a candidate it took on a RECOVERY argument would be
-                # ordered by a weekly reset instead. Above the threshold the
-                # strategy question is moot anyway — the gate above says so.
+                # TIERED, because `disabled-active` and `failover` reach this
+                # arm with NO admission axis (both skip the landing gate), and
+                # an untiered weekly key takes whichever quota perishes
+                # soonest however little that account can serve.
                 #
-                # TIERED, because both escapes reach this arm with NO admission
-                # axis: `disabled-active` and `failover` skip the landing gate
-                # by design, and an untiered weekly key then takes whichever
-                # quota perishes soonest however little that account can serve.
-                # TWO TIERS, NOT ONE THREE-LEVEL TIER. Servability and landing
-                # health are different bars — `h > SPENT_HEADROOM_PCT` against
-                # `h > 100 - threshold`, the second of which the user sets —
-                # and above threshold 97 the landing gate calls a spent
-                # account a legal landing. Folded into one tier, health hides
-                # servability inside its top level and the weekly went to an
-                # account with 2.9 points over one with 69.
-                #
-                # Their ORDER is immaterial, so do not write a test for it:
-                # servable-but-unhealthy needs threshold < 97 and
-                # spent-but-healthy needs > 97, so one fleet can never hold
-                # both and no pair is ordered differently. Swept 809,504
-                # deciding pairs, zero disagreements, with both shapes present
-                # in the population.
-                #
-                # `not all_above` stands in for neither: one below-threshold
-                # peer clears it, and `failover` never satisfies it.
+                # TWO TIERS AND NOT ONE. Servability and landing health are
+                # different bars — `h > SPENT_HEADROOM_PCT` against
+                # `h > 100 - threshold`, which the user sets — and above 97
+                # the landing gate calls a spent account a legal landing.
+                # Folded together, health hides servability inside its own top
+                # level. Their order is immaterial and needs no test:
+                # servable-but-unhealthy requires a threshold under 97 and
+                # spent-but-healthy over it, so one fleet holds neither pair.
                 key = (
                     0 if h > SPENT_HEADROOM_PCT else 1,
                     0 if (100.0 - h) < settings.threshold else 1,
