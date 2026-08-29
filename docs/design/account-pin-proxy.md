@@ -56,13 +56,15 @@ claude session
 cswap-proxy  (NEW, this feature)
   - MITM api.anthropic.com
   - route match — the OWNERSHIP routes, NOT a prefix rule (see below):
-      /v1/code/sessions/… , /v1/sessions/…  → replace Authorization: Bearer <PIN token>
+      /v1/code/sessions[/…] , /v1/sessions[/…]  → replace Authorization: Bearer <PIN token>
       /v1/environments , …/bridge[/<env>] ,
-        …/<env>/bridge/reconnect            → replace Authorization: Bearer <PIN token>
-      /api/frame/*                          → replace Authorization: Bearer <PIN token>
+        …/<env>/bridge/reconnect               → replace Authorization: Bearer <PIN token>
+      /api/frame/*                             → replace Authorization: Bearer <PIN token>
       NOT swapped, though a prefix reaches them: …/worker/* , …/client/presence ,
-        /v1/environments/<env>/work/* , anything ?beta=true
-      everything else (esp. /v1/messages)   → pass through unchanged
+        /v1/environments/<env>/work/* , ?beta=true UNDER /v1/environments
+      everything else (esp. /v1/messages)      → pass through unchanged
+    (a summary, not the list — `is_pinned_route` owns a few more, e.g.
+     /api/oauth/validate and /v1/ultrareview/…)
   - chain onward to the PREVIOUS HTTPS_PROXY value (a local caching proxy, a
     direct if none)
      │
@@ -87,11 +89,15 @@ routes:
 
 The second family is the environment's OWNERSHIP routes: register
 (`POST /v1/environments/bridge`), deregister (`DELETE .../bridge/<env>`) and
-`bridge/reconnect`. Each reads the account's OAuth bearer from one header
-builder, so each has to follow the pin. The bare collection read is pinned too
-but for a different reason: it creates nothing and mints nothing, yet asked as
-the active account it answers 200 with the WRONG account's environments, so the
-pinned machines are simply absent and nothing looks broken.
+`bridge/reconnect`. Each goes through the one auth wrapper that reads
+`getAccessToken()`, so each has to follow the pin. The header builder is NOT
+the discriminator -- it is shared with the `work/` calls below, which hand it a
+token they were passed.
+
+The bare collection read is pinned too but for a different reason: it creates
+nothing and mints nothing, yet asked as the active account it answers 200 with
+the WRONG account's environments, so the pinned machines are simply absent and
+nothing looks broken.
 
 Pinning only the first family leaves `claude remote-control` on the active
 account, where the machine simply never appears in the pinned account's browser
