@@ -91,8 +91,7 @@ The second family is the environment's OWNERSHIP routes: register
 (`POST /v1/environments/bridge`), deregister (`DELETE .../bridge/<env>`) and
 `bridge/reconnect`. Each goes through the one auth wrapper that reads
 `getAccessToken()`, so each has to follow the pin. The header builder is NOT
-the discriminator -- it is shared with the `work/` calls below, which hand it a
-token they were passed.
+the discriminator -- the `work/` calls below share it.
 
 The bare collection read is pinned too but for a different reason: it creates
 nothing and mints nothing, yet asked as the active account it answers 200 with
