@@ -2562,16 +2562,29 @@ class AutoSwitchEngine:
                 # session, and the window that stopped it is the only axis
                 # that can end that.
                 #
-                # AND NOT UNDER `all_above`. That is the state the spent guard
-                # admits in, so it is the only way a candidate reaches a
-                # ranking on an axis it was not selected for -- measured on
-                # `disabled-active` with three spent slots, this arm took the
-                # peer that lifts LAST. The STATE and not that trigger: above
-                # the threshold the strategy question is already moot (the
-                # gate above says so in those words), below it a disabled
-                # active's peers are healthy and burning the most perishable
-                # weekly first is what consume-first is.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
+                # AND NOT UNDER `all_above`, the state the spent guard admits
+                # in: ranked here, a candidate it took on a RECOVERY argument
+                # is ordered by a weekly reset instead, and on `disabled-active`
+                # with three spent slots that took the peer that lifts LAST.
+                # Above the threshold the strategy question is moot anyway --
+                # the gate above says so in those words.
+                #
+                # LANDING HEALTH TIERS THE KEY, because the escapes reach this
+                # arm with NO admission axis: `disabled-active` and `failover`
+                # skip the landing gate by design, so an untiered weekly key
+                # hands the tick to whichever account's quota perishes soonest
+                # however little it can serve. Measured: a two-point peer whose
+                # weekly ends in an hour taken over a ninety-point one. One
+                # below-threshold candidate is enough to make `all_above`
+                # False, so the state condition above cannot cover this and
+                # `failover` never satisfies it at all. Inert for
+                # proactive/consume-first, whose landing gate already put every
+                # candidate that reaches here in tier 0.
+                key = (
+                    0 if (100.0 - h) < settings.threshold else 1,
+                    reset_ts if reset_ts is not None else float("inf"),
+                    -h,
+                )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
                 # back to `-h` when the label is unknown (usage without window

@@ -827,6 +827,60 @@ class TestDecisionTable:
             "70 with six days left -- consume-first exists to burn the first"
         )
 
+    def test_a_near_limit_peer_does_not_win_the_weekly_arm(self, temp_home):
+        """A soonest weekly reset is not a reason to land somewhere unusable.
+
+        `disabled-active` skips the landing-health gate -- every escape does --
+        so this arm is the one place a candidate reaches a ranking with no
+        admission axis at all. One below-threshold peer is enough to make
+        `all_above` False, and the weekly key then hands the tick to whichever
+        account's weekly perishes soonest, however little it can serve.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0,
+                          strategy="consume-first")
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        h.switcher.set_account_disabled("1", True)
+        outcome = h.tick_with_usage({
+            "1": _usage7(95.0, 95.0, _iso_at(now + 3 * 86400)),   # 5 pts
+            "2": _usage7(98.0, 98.0, _iso_at(now + 1 * 3600)),    # 2 pts, weekly in 1h
+            "3": _usage7(10.0, 10.0, _iso_at(now + 6 * 86400)),   # 90 pts, weekly in 6d
+        })
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} ({outcome}): slot 2 holds two "
+            "points and slot 3 ninety -- a weekly window perishing in an hour "
+            "is worth nothing on an account that cannot serve the tick"
+        )
+
+    def test_failover_does_not_escape_onto_a_near_limit_peer(self, temp_home):
+        """The same arm, the other trigger that skips every gate.
+
+        `all_above` is always False under failover -- the active is unreadable,
+        so `_every_account_above_threshold` refuses -- which is why the state
+        condition above cannot reach this. The landing tier can.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0,
+                          strategy="consume-first")
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        usage = {
+            "1": None,                                            # unreadable
+            "2": _usage7(98.0, 98.0, _iso_at(now + 1 * 3600)),     # 2 pts
+            "3": _usage7(10.0, 10.0, _iso_at(now + 6 * 86400)),    # 90 pts
+        }
+        for _ in range(2):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        outcome = h.tick_with_usage(usage)
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} ({outcome}): the active is dead "
+            "and this escape took the two-point account because its weekly "
+            "perishes soonest"
+        )
+
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points
         # better than the active 90%, but it already sits over the threshold
