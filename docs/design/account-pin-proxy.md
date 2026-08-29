@@ -95,6 +95,28 @@ Two neighbours stay OUT, and both exclusions are load-bearing:
 The rule both express: swap a bearer only where it has been read, never
 because a prefix happened to reach.
 
+### The route table is not the whole answer: there are two ways in
+
+A pinned route only gets swapped on a path that reads the bearer, and the
+proxy has two:
+
+| how the client speaks | what the proxy does |
+|---|---|
+| `CONNECT api.anthropic.com:443` then TLS | MITM, read each request, swap a pinned route |
+| `POST https://api.anthropic.com/... HTTP/1.1` (absolute form) | forward through the chain |
+
+The second is plain-proxy form, and the second is what the Remote Control
+bridge client uses -- measured on the wire, the registration leaves as
+`POST https://api.anthropic.com/v1/environments/bridge` with the OAuth bearer
+in the clear. That branch existed for the auto-updater and telemetry and
+relayed verbatim, so adding the routes to the table changed nothing: the
+requests never reached the code that consults it.
+
+Both paths now take the same decision from the same predicate, and both write
+a line naming what they decided. An untraced path is half of what this cost:
+a feature travelling on it left exactly the evidence a feature that was not
+running leaves.
+
 The proxy is generic: it knows about no particular next hop. It reads whatever HTTPS_PROXY
 was set before cswap inserted itself and CONNECT-chains through it. Works for
 users with a local caching proxy, without one, and behind an outbound proxy.
