@@ -2564,22 +2564,18 @@ class AutoSwitchEngine:
                 #
                 # AND NOT UNDER `all_above`, the state the spent guard admits
                 # in: ranked here, a candidate it took on a RECOVERY argument
-                # is ordered by a weekly reset instead, and on `disabled-active`
-                # with three spent slots that took the peer that lifts LAST.
-                # Above the threshold the strategy question is moot anyway --
-                # the gate above says so in those words.
+                # would be ordered by a weekly reset instead. Above the
+                # threshold the strategy question is moot anyway — the gate
+                # above says so in those words.
                 #
-                # LANDING HEALTH TIERS THE KEY, because the escapes reach this
-                # arm with NO admission axis: `disabled-active` and `failover`
-                # skip the landing gate by design, so an untiered weekly key
-                # hands the tick to whichever account's quota perishes soonest
-                # however little it can serve. Measured: a two-point peer whose
-                # weekly ends in an hour taken over a ninety-point one. One
-                # below-threshold candidate is enough to make `all_above`
-                # False, so the state condition above cannot cover this and
-                # `failover` never satisfies it at all. Inert for
-                # proactive/consume-first, whose landing gate already put every
-                # candidate that reaches here in tier 0.
+                # LANDING HEALTH TIERS THE KEY, because both escapes reach this
+                # arm with NO admission axis — `disabled-active` and `failover`
+                # skip the landing gate by design — and an untiered weekly key
+                # then takes whichever quota perishes soonest however little
+                # that account can serve. `not all_above` cannot cover it (one
+                # below-threshold peer clears it, and `failover` never
+                # satisfies it), and the tier is inert for the two triggers
+                # whose landing gate already puts every candidate in tier 0.
                 key = (
                     0 if (100.0 - h) < settings.threshold else 1,
                     reset_ts if reset_ts is not None else float("inf"),
