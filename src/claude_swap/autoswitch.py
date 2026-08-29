@@ -2563,23 +2563,20 @@ class AutoSwitchEngine:
                 # account we cannot compare on the escape axis is ordered by
                 # the binding number rather than dropped.
                 #
-                # A GOOD NUMBER HERE STILL CANNOT SELECT AN ACCOUNT BLOCKED
-                # ELSEWHERE, but not because `h > 0` decides usability -- the
-                # spent guard relaxed that. The coupling is: on `at-limit` the
-                # guard's conjuncts are a SUPERSET of `by_recovery_axis`'s, so
-                # a spent candidate it admits always takes the tiered key above
-                # and never arrives here; and every other trigger leaves
-                # `escape_label` None, so `escape_h` is not read at all. Widen
-                # `escape_label` past at-limit and that argument is gone.
+                # A GOOD NUMBER HERE CANNOT SELECT AN ACCOUNT BLOCKED
+                # ELSEWHERE -- but no longer because `h > 0` decides
+                # usability, which the spent guard relaxed. It holds because
+                # the guard's conjuncts are a SUPERSET of `by_recovery_axis`'s
+                # at-limit ones, so an admitted spent candidate takes the
+                # tiered key above, and no other trigger sets `escape_label`.
+                # WIDENING `escape_label` PAST AT-LIMIT REMOVES THAT ARGUMENT.
                 #
-                # SPENT CANDIDATES TIE, then the reset decides. `pct` is copied
-                # through unclamped, so a peer 0.5 points OVER its limit scores
-                # above one at exactly 100 -- a difference this file calls
-                # noise, deciding against a return time it calls the only real
-                # question. Clamping at 0 can touch nothing else: a negative
-                # score needs a window past 100, which is what makes `h <= 0`.
-                # Outside `all_above` `recovery_ts` is the 0.0 sentinel, so no
-                # existing order moves.
+                # CLAMPED SO SPENT CANDIDATES TIE and the reset decides:
+                # `pct` is copied through unclamped, so 100.5 outranks 100.0 on
+                # half a point this module calls noise. Only they are touched
+                # -- a negative score needs a window past 100, which is what
+                # makes `h <= 0` -- and `recovery_ts` is the 0.0 sentinel
+                # outside `all_above`, so no existing order moves.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, self._models
