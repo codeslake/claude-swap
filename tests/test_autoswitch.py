@@ -1029,6 +1029,11 @@ class TestDecisionTable:
         outcome = h.tick_with_usage(
             {"1": active, "2": spent, "3": servable}
         )
+        assert outcome is TickOutcome.ERROR, (
+            f"expected the tail to be reached and refused, got {outcome}: "
+            "staying put also happens when the ranking is EMPTY, and an empty "
+            "ranking never exercises the bar this case exists for"
+        )
         assert h.active_number() == 1, (
             f"landed on {h.active_number()} ({outcome}): slot 3 could not be "
             "freshened this tick, and the engine fell through to slot 2, "
