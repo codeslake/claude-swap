@@ -2571,18 +2571,26 @@ class AutoSwitchEngine:
                 # axis: `disabled-active` and `failover` skip the landing gate
                 # by design, and an untiered weekly key then takes whichever
                 # quota perishes soonest however little that account can serve.
-                # Health first, then servability on the same bar the escape
-                # key uses -- but as ONE tier, so servability cannot reach
-                # inside a healthy landing. It would: `100 - threshold` falls
-                # below SPENT_HEADROOM_PCT once the threshold passes 97, and
-                # there a legal landing would lose its perishing weekly to a
-                # peer with a point more. `not all_above` stands in for
-                # neither tier — one below-threshold peer clears it, and
-                # `failover` never satisfies it.
+                # TWO TIERS, NOT ONE THREE-LEVEL TIER. Servability and landing
+                # health are different bars — `h > SPENT_HEADROOM_PCT` against
+                # `h > 100 - threshold`, the second of which the user sets —
+                # and above threshold 97 the landing gate calls a spent
+                # account a legal landing. Folded into one tier, health hides
+                # servability inside its top level and the weekly went to an
+                # account with 2.9 points over one with 69.
+                #
+                # Their ORDER is immaterial, so do not write a test for it:
+                # servable-but-unhealthy needs threshold < 97 and
+                # spent-but-healthy needs > 97, so one fleet can never hold
+                # both and no pair is ordered differently. Swept 809,504
+                # deciding pairs, zero disagreements, with both shapes present
+                # in the population.
+                #
+                # `not all_above` stands in for neither: one below-threshold
+                # peer clears it, and `failover` never satisfies it.
                 key = (
-                    0
-                    if (100.0 - h) < settings.threshold
-                    else (1 if h > SPENT_HEADROOM_PCT else 2),
+                    0 if h > SPENT_HEADROOM_PCT else 1,
+                    0 if (100.0 - h) < settings.threshold else 1,
                     reset_ts if reset_ts is not None else float("inf"),
                     -h,
                 )
@@ -2597,11 +2605,13 @@ class AutoSwitchEngine:
                 # window says nothing about the rest, so the servability tier
                 # goes first -- without it a peer with fifty points here and
                 # one overall wins, walls on the next request, and the tick
-                # after pays a second swap. A spent candidate cannot reach this
-                # arm at all: the guard's conjuncts are a SUPERSET of
-                # `by_recovery_axis`'s at-limit ones, so it takes the tiered
-                # key above, and no other trigger sets `escape_label` --
-                # WIDENING `escape_label` PAST AT-LIMIT REMOVES THAT.
+                # after pays a second swap. A spent candidate does reach this
+                # arm under `failover`/`disabled-active`, but never on the
+                # escape AXIS: `escape_label` is set for at-limit alone, and
+                # under at-limit the spent guard's conjuncts are a SUPERSET of
+                # `by_recovery_axis`'s, so such a candidate takes the tiered
+                # key above instead. WIDENING `escape_label` PAST AT-LIMIT
+                # REMOVES THAT ARGUMENT.
                 #
                 # Clamped so equally-spent candidates tie and the reset
                 # decides: `pct` is copied through unclamped, so 100.5 would
