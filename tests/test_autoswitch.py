@@ -455,8 +455,16 @@ class TestDecisionTable:
         assert h.active_number() == 2
 
     def test_a_spent_peer_that_lifts_later_is_still_refused(self, temp_home):
-        """THE CONTROL. Landing on a spent account is only ever justified by a
-        SOONER return; without that it is a strictly worse place to be stuck."""
+        """Landing on a spent account is only ever justified by a SOONER
+        return; without that it is a strictly worse place to be stuck.
+
+        NOT the control for the spent guard, though it was labelled one: on
+        `at-limit` the ranking loop applies the same margin a few lines below,
+        so this case passes with the guard deleted outright, and passes on the
+        commit before the guard existed. What actually pins the guard is
+        `test_a_disabled_active_keeps_the_recovery_margin`, on the one trigger
+        that skips that second check.
+        """
         h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
@@ -611,6 +619,104 @@ class TestDecisionTable:
             f"active healthy and rides it into the wall: {outcome}"
         )
         assert h.active_number() == 2
+
+    def _spent_fleet(self, temp_home, *, lifts_in):
+        """Four slots, every one at its 5-hour limit, each lifting when told."""
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        for num, email in enumerate(("a", "b", "c", "d")[: len(lifts_in)], 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        usage = {}
+        for num, mins in enumerate(lifts_in, 1):
+            row = _usage7(100.0, 60.0)
+            row["five_hour"]["resets_at"] = _iso_at(now + mins * 60)
+            usage[str(num)] = row
+        return h, usage
+
+    def test_a_disabled_active_lands_on_the_peer_that_lifts_first(
+        self, temp_home
+    ):
+        """`disabled-active` admits a spent peer on a RECOVERY argument, so it
+        has to rank on one too.
+
+        That trigger is not in `by_recovery_axis`, so the tiered recovery key
+        is not used and the escape key is reached with no `escape_label` --
+        `-h`, which is 0 for every spent account, leaving sequence order to
+        pick. The engine then takes the lowest slot number, which is the exact
+        inversion of the rule that admitted it.
+        """
+        h, usage = self._spent_fleet(temp_home, lifts_in=(60, 50, 10))
+        h.switcher.set_account_disabled("1", True)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            "slot 3 lifts in ten minutes and slot 2 in fifty; landing on 2 "
+            "means the tie fell to slot order on the one trigger whose whole "
+            "argument for moving was the return time"
+        )
+
+    def test_a_disabled_active_keeps_the_recovery_margin(self, temp_home):
+        """THE MARGIN'S ONLY LOAD-BEARING PATH.
+
+        On `at-limit` the ranking loop re-applies the same
+        RECOVERY_HYSTERESIS_S test a few lines below, so deleting it from the
+        spent guard changes nothing there. `disabled-active` skips that whole
+        block, so here the guard's own margin is the only thing standing
+        between "lifts first" and a peer four minutes sooner.
+        """
+        h, usage = self._spent_fleet(temp_home, lifts_in=(60, 56))
+        h.switcher.set_account_disabled("1", True)
+        assert h.tick_with_usage(usage) is not TickOutcome.SWITCHED, (
+            "four minutes is inside RECOVERY_HYSTERESIS_S; taking it trades a "
+            "credential rewrite for nothing and re-opens the flap the margin "
+            "exists to bound"
+        )
+        assert h.active_number() == 1
+
+    def test_an_active_that_is_not_about_to_wall_keeps_the_work(
+        self, temp_home
+    ):
+        """THE SCOPING OF THE WALL RULE, which nothing else pins.
+
+        Rule 1 bypasses the recovery hysteresis, so without `about_to_wall`
+        it would fire whenever ANY peer can serve -- abandoning an active that
+        is back in ten minutes for one that is back in four hours. Deleting
+        `about_to_wall` alone passes the rest of this file.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(94.0, 60.0)
+        active["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        peer = _usage7(92.0, 60.0)
+        peer["five_hour"]["resets_at"] = _iso_at(now + 4 * 3600)
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        assert outcome is not TickOutcome.SWITCHED, (
+            "the active holds six points and is back in ten minutes; the peer "
+            f"holds eight and is back in four hours: {outcome}"
+        )
+        assert h.active_number() == 1
+
+    def test_an_unreadable_active_never_admits_a_spent_peer(self, temp_home):
+        """`active_headroom is None` is not `active_headroom == 0`.
+
+        `(active_headroom or 0.0) <= 0` reads True for BOTH, and on failover
+        there is no measured active to rank a recovery against -- so a spent
+        peer must stay refused. `all_above` happens to be False there too,
+        which is why this went unnoticed; the guard should say so itself.
+        """
+        h, usage = self._spent_fleet(temp_home, lifts_in=(60, 10))
+        usage["1"] = None                      # unreadable, not spent
+        for _ in range(2):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        outcome = h.tick_with_usage(usage)
+        assert h.active_number() == 1, (
+            "failover took a peer that is itself at its limit: it can serve "
+            f"nothing, and nothing measured the active it was preferred over: {outcome}"
+        )
 
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
         # threshold 80, hysteresis 5: the candidate at 85% is five points

@@ -2297,6 +2297,9 @@ class AutoSwitchEngine:
         # account is at/over the threshold, so a single healthy peer still
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
+        all_above = _every_account_above_threshold(
+            oauth_candidates, headroom, active_headroom, settings.threshold
+        )
         # THE BINDING WINDOW, not the five-hour one. "About to stop answering"
         # is distance to the NEAREST wall, which is what `account_headroom`
         # already measures: an active two points from its WEEKLY limit walls
@@ -2305,9 +2308,6 @@ class AutoSwitchEngine:
         # cases are invisible to a five-hour-only axis, and the candidate side
         # of this rule has always used `h`, so the two now ask one question.
         about_to_wall = (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
-        all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
-        )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
         #
@@ -2419,9 +2419,22 @@ class AutoSwitchEngine:
                 # answers `inf` for unknown AND for already past, and those are
                 # opposite facts: an active whose reset has passed can return
                 # at any moment, so it must not lose to a peer hours out.
+                # `is not None` SPELLED OUT: `(active_headroom or 0.0) <= 0`
+                # reads True for an UNREADABLE active too, and failover is
+                # exactly the state with no measured active to rank a return
+                # against. It is refused today only because `active_recovery_ts`
+                # holds its 0.0 sentinel there, which is protection by accident.
+                #
+                # AND NO TEST CAN KILL `all_above` ALONE — that is measured,
+                # not an omission. Both recovery values are read as `... if
+                # all_above else 0.0`, so without it the margin below compares
+                # 0.0 against 0.0 and refuses anyway. It stays because this
+                # guard's precondition belongs in the guard, not three
+                # variables away in a sentinel; do not delete it as dead.
                 if not (
                     all_above
-                    and (active_headroom or 0.0) <= 0
+                    and active_headroom is not None
+                    and active_headroom <= 0
                     and best_candidate_headroom <= SPENT_HEADROOM_PCT
                     and active_recovery_ts != float("inf")
                     and recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
@@ -2561,9 +2574,20 @@ class AutoSwitchEngine:
                 # back to `-h` when the label is unknown (usage without window
                 # data) or the candidate does not report that window, so an
                 # account we cannot compare on the escape axis is ordered by
-                # the binding number rather than dropped. `h > 0` above still
-                # decides USABILITY, so a candidate blocked on some other
-                # window can never be selected by a good number here.
+                # the binding number rather than dropped. Usability is decided
+                # above: `h > 0`, or the spent guard's demand for a sooner
+                # provable return, so a good number here can still never select
+                # an account blocked elsewhere.
+                #
+                # THE RESET BREAKS THE TIE, for the same reason it does in the
+                # tiered key above: sooner is plainly better than lower slot
+                # number. It is not decoration here. `disabled-active` is the
+                # one trigger that admits a SPENT candidate — on a recovery
+                # argument — and never reaches that tiered key, so every
+                # candidate scores `-h == 0` and the whole ranking would fall
+                # to sequence order, inverting the rule that admitted them.
+                # `recovery_ts` is the 0.0 sentinel unless `all_above`, so
+                # outside that state this changes no order.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, self._models
@@ -2571,7 +2595,7 @@ class AutoSwitchEngine:
                     if escape_label
                     else None
                 )
-                key = (-(escape_h if escape_h is not None else h),)
+                key = (-(escape_h if escape_h is not None else h), recovery_ts)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
