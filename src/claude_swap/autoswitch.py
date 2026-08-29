@@ -2549,23 +2549,29 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
-            elif consume_first and trigger not in ("at-limit", "disabled-active"):
+            elif consume_first and trigger != "at-limit" and not all_above:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
                 #
-                # NOT FOR A STOPPED SESSION. `consume_first` is the configured
-                # STRATEGY, and this arm sitting ahead of the escape arm made
-                # the escape rank on the weekly reset — filtering on one axis
-                # while sorting on another, the shape the recovery-hysteresis
-                # gate above already had to close. Consume-first is a
-                # preference about which account to burn NEXT.
+                # NOT FOR at-limit. `consume_first` is the configured STRATEGY,
+                # and this arm sitting ahead of the escape arm made the escape
+                # rank on the weekly reset — filtering on one axis while
+                # sorting on another, the shape the recovery-hysteresis gate
+                # above already had to close. Consume-first is a preference
+                # about which account to burn NEXT; at-limit is a stopped
+                # session, and the window that stopped it is the only axis
+                # that can end that.
                 #
-                # `disabled-active` joined `at-limit` here when the spent guard
-                # began admitting on a RECOVERY argument: it is the only
-                # trigger that does so without reaching the tiered key, so it
-                # ranked those candidates on a weekly reset they were never
-                # selected for and took the peer that lifts LAST. It already
-                # sits on the escape side of every other gate in this file.
+                # AND NOT UNDER `all_above`, which is the STATE the spent guard
+                # admits under -- the only way a candidate reaches a ranking on
+                # an axis it was not selected for. Measured on `disabled-active`
+                # with three spent slots: ranked here, it took the peer that
+                # lifts LAST. Keyed on the state rather than on that trigger
+                # because with nothing below the threshold the strategy
+                # question is already moot (the gate above says so in those
+                # words), while below it a disabled active's peers are healthy
+                # and burning the most perishable weekly first is exactly what
+                # the user asked for.
                 key = (reset_ts if reset_ts is not None else float("inf"), -h)
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -2586,8 +2592,11 @@ class AutoSwitchEngine:
                 # `pct` is copied through unclamped, so 100.5 outranks 100.0 on
                 # half a point this module calls noise. Only they are touched
                 # -- a negative score needs a window past 100, which is what
-                # makes `h <= 0` -- and `recovery_ts` is the 0.0 sentinel
-                # outside `all_above`, so no existing order moves.
+                # makes `h <= 0`.
+                #
+                # `recovery_ts` is the 0.0 sentinel outside `all_above`, so
+                # nothing outside it moves; INSIDE it the reset now breaks ties
+                # that used to fall to slot order, which is the point.
                 escape_h = (
                     oauth.headroom_on_window(
                         usage.get(num), escape_label, self._models

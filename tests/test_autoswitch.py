@@ -773,9 +773,17 @@ class TestDecisionTable:
             h.seed(num, f"{email}@example.com")
         h.make_live("a@example.com", 1)
         now = h.clock.now
+        # THE WEEKLY RESETS ARE THE POINT. Without them `reset_ts` is None for
+        # every slot, the old key degenerates to `(inf, -0.0)`, and the wrong
+        # answer comes from slot order rather than from the weekly axis -- a
+        # fixture that a "add a recovery tiebreak to the weekly key" fix would
+        # satisfy with the defect fully intact. Slot 2 holds the soonest
+        # weekly, so the old code picks it ON THAT AXIS while it is the peer
+        # that lifts last.
+        weeklies = {1: 3 * 86400, 2: 1 * 3600, 3: 6 * 86400}
         usage = {}
         for num, mins in enumerate((60, 50, 10), 1):
-            row = _usage7(100.0, 60.0)
+            row = _usage7(100.0, 60.0, _iso_at(now + weeklies[num]))
             row["five_hour"]["resets_at"] = _iso_at(now + mins * 60)
             usage[str(num)] = row
         h.switcher.set_account_disabled("1", True)
@@ -784,6 +792,39 @@ class TestDecisionTable:
             f"consume-first landed on {h.active_number()} ({outcome}): slot 3 "
             "lifts in ten minutes and slot 2 in fifty, and the weekly reset "
             "is not why either of them was admitted"
+        )
+
+    def test_a_disabled_active_still_honours_consume_first_when_peers_are_healthy(
+        self, temp_home
+    ):
+        """THE OTHER HALF, and the one an over-broad fix quietly costs.
+
+        The spent guard admits on a recovery argument only under `all_above`,
+        so that is the state where a candidate can be ranked on an axis it was
+        not selected for. Below the threshold a disabled active's peers are
+        just healthy accounts, and burning the most perishable weekly quota
+        first is exactly what `--strategy consume-first` asks for.
+
+        Excluding the TRIGGER rather than the STATE passes every other test in
+        this file while silently dropping that.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0,
+                          strategy="consume-first")
+        for num, email in enumerate(("a", "b", "c"), 1):
+            h.seed(num, f"{email}@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        h.switcher.set_account_disabled("1", True)
+        usage = {
+            "1": _usage7(50.0, 50.0, _iso_at(now + 3 * 86400)),
+            "2": _usage7(60.0, 60.0, _iso_at(now + 1 * 3600)),   # 40 pts, weekly in 1h
+            "3": _usage7(30.0, 30.0, _iso_at(now + 6 * 86400)),  # 70 pts, weekly in 6d
+        }
+        outcome = h.tick_with_usage(usage)
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} ({outcome}): slot 2 holds 40 "
+            "points whose weekly window perishes in an hour and slot 3 holds "
+            "70 with six days left -- consume-first exists to burn the first"
         )
 
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
