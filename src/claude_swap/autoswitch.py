@@ -2573,7 +2573,8 @@ class AutoSwitchEngine:
                 # Folded together, health hides servability inside its own top
                 # level. Their order is immaterial and needs no test:
                 # servable-but-unhealthy requires a threshold under 97 and
-                # spent-but-healthy over it, so one fleet holds neither pair.
+                # spent-but-healthy over it, so no ONE fleet can hold both --
+                # and it takes both to order a pair differently.
                 key = (
                     0 if h > SPENT_HEADROOM_PCT else 1,
                     0 if (100.0 - h) < settings.threshold else 1,

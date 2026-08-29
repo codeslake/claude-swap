@@ -492,8 +492,9 @@ class TestDecisionTable:
 
         The two are separated on the escape ranking, where the spent peer wins
         on a window that is not the one blocking it: `headroom_on_window` ranks
-        order only, and its contract says a high number there "can never select
-        an account blocked elsewhere" because `h > 0` decides usability first.
+        order only, and says so -- one clear window is not a usability test,
+        so the caller has to decide that separately. Admission is where this
+        case decides it.
         """
         h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
         h.seed(1, "a@example.com")
@@ -995,6 +996,43 @@ class TestDecisionTable:
             "threshold of 99 with 2.9 points, which is under the bar this "
             "module calls spent -- it cannot spend the weekly it is being "
             "chosen for, while slot 3 holds sixty-nine points"
+        )
+
+    def test_a_spent_peer_is_refused_even_when_the_servable_one_fails(
+        self, temp_home
+    ):
+        """The spent bar decides ADMISSION, and the ranking cannot stand in.
+
+        Its sibling above pins the same conjunct only through the head of the
+        list: the escape key's servability tier sorts the spent peer last, so
+        the winner is the same with the bar deleted and the case stops
+        discriminating. `_tick_inner` iterates the WHOLE list, so a candidate
+        the bar should have excluded is reachable the moment the peer ahead of
+        it cannot be freshened -- and it is at 100% on its five-hour window.
+
+        This is what a later fix subsuming an earlier one's mechanism looks
+        like from the outside: a green suite and a guard nothing kills.
+        """
+        h = EngineHarness(temp_home, threshold=90.0, hysteresis_pct=5.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        now = h.clock.now
+        active = _usage7(50.0, 100.0, _iso_at(now + 3 * 86400))
+        spent = _usage7(100.0, 50.0)
+        spent["five_hour"]["resets_at"] = _iso_at(now + 10 * 60)
+        servable = _usage7(95.0, 95.0)
+        h.engine._freshen_target = (
+            lambda num, email: "transient" if num == "3" else "ok"
+        )
+        outcome = h.tick_with_usage(
+            {"1": active, "2": spent, "3": servable}
+        )
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} ({outcome}): slot 3 could not be "
+            "freshened this tick, and the engine fell through to slot 2, "
+            "whose five-hour window is at 100% and can answer nothing"
         )
 
     def test_proactive_never_lands_at_or_over_threshold(self, temp_home):
