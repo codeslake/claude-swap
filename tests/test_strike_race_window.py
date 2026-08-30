@@ -1,19 +1,10 @@
-"""One `invalid_grant` is permanent, and the consume gate can manufacture it.
+"""A quarantine with no exit, enterable by a race.
 
 `_row_eligible` refuses a struck row and `record` clears the strike only on a
 success, so a quarantined slot can never reach the fetch that would prove it
-alive. The only exits are an explicit re-login and the collector's heal, which
-needs the stored fingerprint to MOVE — and nothing rewrites an idle slot's
-backup. So the quarantine is terminal.
-
-It is also enterable by accident. The gate holds the slot lock to read, POSTs
-OUTSIDE it, then CASes, and a second path can POST the same one-time grant;
-the loser is told `invalid_grant` about an account that is fine. The row keeps
-the evidence: `lastAttemptAt - fetchedAt` is the time from the last SUCCESS to
-the attempt that struck it.
-
-The dead direction is pinned first and deliberately: this guard trades a false
-alarm for a silent failure if it is one line too wide.
+alive. The consume gate POSTs outside the slot lock, so the strike can be a
+race artifact. The dead direction is pinned first and deliberately: this guard
+trades a false alarm for a silent failure if it is one line too wide.
 """
 from __future__ import annotations
 
@@ -137,6 +128,7 @@ def test_a_suspected_race_does_not_render_re_login_needed(
     import json
     from unittest.mock import patch
 
+    from claude_swap import oauth
     from claude_swap.credentials import ActiveCredentials
     from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -155,8 +147,7 @@ def test_a_suspected_race_does_not_render_re_login_needed(
     row = s._usage_store._read_rows()["2"]
     row["lastAttemptAt"] = row["fetchedAt"] + 310
     row["authDeadStrikes"] = AUTH_DEAD_STRIKES
-    row["struckFingerprint"] = __import__(
-        "claude_swap.oauth", fromlist=["x"]).credential_fingerprint(creds)
+    row["struckFingerprint"] = oauth.credential_fingerprint(creds)
     s._usage_store._write_rows({"2": row})
 
     s._write_account_credentials("2", "b@example.com", creds)

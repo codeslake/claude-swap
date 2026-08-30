@@ -232,12 +232,10 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
 
-#: A strike is only trustworthy if nothing says the lineage was answering. The
-#: consume gate holds the slot lock to READ, POSTs outside it, then CASes, so a
-#: second path can POST the same one-time grant and the loser is told
-#: `invalid_grant` about an account that is fine. `lastAttemptAt - fetchedAt` is
-#: the row's own evidence: `fetchedAt` advances only on a success, so a small
-#: gap means the token answered moments before it was condemned.
+#: The consume gate POSTs outside the slot lock, so two paths can POST one
+#: single-use grant and the loser is told `invalid_grant` about a healthy
+#: account. `fetchedAt` advances only on a success, so `lastAttemptAt -
+#: fetchedAt` is how long before the strike the lineage last answered.
 RACE_WINDOW_S = 600.0
 
 
@@ -246,14 +244,13 @@ def _strike_is_suspected_race(
 ) -> bool:
     """Whether this row's strike landed close enough to a SUCCESS to doubt it.
 
-    Both timestamps absent is the honest default of "no evidence", which keeps
-    every row written before this existed reading exactly as it did. A negative
-    gap (an attempt stamped before the success) is not a race either -- the
-    success is the LATER event there, and it already zeroed the strike.
+    Missing either timestamp is "no evidence", not "a race", so rows written
+    before this read exactly as they did. A negative gap is not one either:
+    there the success is the LATER event and already zeroed the strike.
 
-    This cannot excuse a strike forever: the retry it permits stamps
-    ``lastAttemptAt`` and leaves ``fetchedAt`` alone, so a lineage that keeps
-    failing widens its own gap past the window and is quarantined for good.
+    It cannot excuse a strike forever -- the retry it permits stamps
+    ``lastAttemptAt`` and never ``fetchedAt``, so a lineage that keeps failing
+    widens its own gap past the window.
     """
     if fetched_at is None or last_attempt_at is None:
         return False
