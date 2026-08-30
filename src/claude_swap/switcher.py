@@ -6492,7 +6492,75 @@ class ClaudeAccountSwitcher:
                 reason,
                 entry_id,
             )
+        try:
+            self._sweep_unclaimed_stash()
+        except Exception:
+            # Housekeeping, and this method's contract is the opposite: a
+            # raise here would read as a failed stash, and every caller aborts
+            # the switch on one. Drops already made stand; the rest waits for
+            # the next stash.
+            self._logger.warning(
+                "Could not finish sweeping the unclaimed stash; entries it had "
+                "not reached yet are still there.",
+                exc_info=True,
+            )
         return entry_id
+
+    def _sweep_unclaimed_stash(self) -> None:
+        """Drop stash entries no login can revive, and report what is kept.
+
+        Only two POSITIVE verdicts drop an entry: a refresh token past its own
+        expiry, and one a managed slot already stores. Everything else is
+        KEPT — the entry bytes carry no owner field, so a guess destroys the
+        only copy of some account's login.
+
+        Age is deliberately not a third rule. An entry old enough to be
+        worthless is one whose refresh token has expired, which is the first
+        rule already; whatever survives that is revivable however old it is.
+
+        The kept count is reported because a pile nobody knows about is the
+        state this sweep exists to end, not a quiet success.
+        """
+        entries = self._store._list_unclaimed_credentials()
+        if not entries:
+            return
+        stored: dict[str, str] = {}
+        for num, account in (self._get_sequence_data() or {}).get(
+            "accounts", {}
+        ).items():
+            fp = oauth.credential_fingerprint(
+                self._read_account_credentials(num, account.get("email", ""))
+            )
+            if fp:
+                stored.setdefault(fp, num)
+        kept = 0
+        for entry_id in sorted(entries):
+            creds, _unreadable = self._store._read_unclaimed_credential(entry_id)
+            # Unreadable, absent and corrupt all arrive here with no verdict
+            # to act on, and no verdict is KEEP.
+            data = oauth.extract_oauth_data(creds) if creds else None
+            fp = oauth.credential_fingerprint(creds)
+            if data is not None and oauth.is_oauth_token_expired(
+                data.get("refreshTokenExpiresAt")
+            ):
+                # ponytail: reuses the access-token predicate, so an entry is
+                # dropped up to OAUTH_EXPIRY_BUFFER_MS early. Give the refresh
+                # token its own predicate if that window ever matters.
+                why = "its refresh token has expired"
+            elif fp is not None and fp in stored:
+                why = f"Account-{stored[fp]} already stores that credential"
+            else:
+                kept += 1
+                continue
+            self._store._remove_unclaimed_credential(entry_id)
+            self._logger.info("Dropped unclaimed credential %s: %s.", entry_id, why)
+        if kept:
+            self._logger.warning(
+                "%d unclaimed credential(s) kept: nothing in them names an "
+                "owner, so each may be the only copy of some account's login "
+                "(`cswap unclaimed` lists them, `--purge ID` drops one).",
+                kept,
+            )
 
     def _switch_to_empty_slot(
         self,

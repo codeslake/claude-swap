@@ -9212,6 +9212,133 @@ class TestStashAndRetentionStore:
         assert enc.exists() and enc.stat().st_size > 0, (
             "premise: the no-op'd unlink left material behind"
         )
+class TestUnclaimedStashSweep:
+    """Nothing ever dropped a stash entry, so the pile only grew.
+
+    ``cswap unclaimed --purge`` takes one id at a time and nobody runs it.
+    """
+
+    def _switcher(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.platform = Platform.LINUX
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        return switcher
+
+    def _ms(self, days):
+        return int((time.time() + days * 86400) * 1000)
+
+    def _creds(self, refresh_token, refresh_expires_at=None, access="sk-a"):
+        payload = {"accessToken": access, "refreshToken": refresh_token}
+        if refresh_expires_at is not None:
+            payload["refreshTokenExpiresAt"] = refresh_expires_at
+        return json.dumps({"claudeAiOauth": payload})
+
+    def _add_slot(self, switcher, num, email, creds):
+        data = switcher._get_sequence_data()
+        data.setdefault("accounts", {})[num] = {
+            "email": email, "organizationUuid": "",
+        }
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._store._write_account_credentials(num, email, creds)
+
+    def test_sweep_drops_an_expired_refresh_token(self, temp_home, caplog):
+        """Arm 1: no login can revive it, so keeping it protects nothing."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash()
+        assert entry_id not in switcher.list_unclaimed_credentials()
+        assert any(
+            entry_id in r.getMessage() and "expired" in r.getMessage()
+            for r in caplog.records
+        ), "a drop must say which entry and why"
+
+    def test_sweep_drops_a_credential_a_slot_already_stores(
+        self, temp_home, caplog,
+    ):
+        """Arm 2: a duplicate. The fingerprint is the refresh-token hash, so a
+        rotated access token on the same lineage still reads as the same
+        credential — byte equality would miss it."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "3", "a@b.c",
+            self._creds("shared-rt", self._ms(20), access="sk-stored"),
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("shared-rt", self._ms(20), access="sk-stashed"),
+            {"reason": "foreign"},
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash()
+        assert entry_id not in switcher.list_unclaimed_credentials()
+        assert any(
+            entry_id in r.getMessage() and "Account-3" in r.getMessage()
+            for r in caplog.records
+        ), "a drop must name the slot that made it redundant"
+
+    def test_sweep_keeps_an_unattributable_credential_and_says_so(
+        self, temp_home, caplog,
+    ):
+        """Arm 3, the one that matters. The bytes name no owner, so a guess
+        destroys the only copy of some account's login — and keeping silently
+        rebuilds the state this sweep exists to end."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "1", "a@b.c", self._creds("slot-1-rt", self._ms(20)),
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("nobody-knows-rt", self._ms(20)), {"reason": "foreign"},
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash()
+        assert entry_id in switcher.list_unclaimed_credentials()
+        assert any(
+            "1 unclaimed credential" in r.getMessage()
+            for r in caplog.records
+        ), "a kept pile nobody knows about is the state we are in now"
+
+    def test_sweep_keeps_a_credential_with_no_refresh_expiry(self, temp_home):
+        """An API key or setup token carries no ``refreshTokenExpiresAt``. It
+        never expires, so arm 1 has no verdict — and no verdict is KEEP."""
+        switcher = self._switcher(temp_home)
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("no-expiry-rt"), {"reason": "displaced-live-login"},
+        )
+        switcher._sweep_unclaimed_stash()
+        assert entry_id in switcher.list_unclaimed_credentials()
+
+    def test_stashing_a_credential_sweeps_the_pile(self, temp_home):
+        """WHERE it runs: the pile grows here and only here, so this is the
+        seam that bounds it without costing every tick a scan."""
+        switcher = self._switcher(temp_home)
+        stale = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+        )
+        switcher._stash_live_credential(
+            self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
+        )
+        assert stale not in switcher.list_unclaimed_credentials()
+
+    def test_a_failed_sweep_never_fails_the_stash(self, temp_home):
+        """A successful stash is the licence to overwrite the live store, so
+        housekeeping raising here would abort the switch it just protected."""
+        switcher = self._switcher(temp_home)
+        with patch.object(
+            switcher, "_sweep_unclaimed_stash", side_effect=OSError("disk full"),
+        ):
+            entry_id = switcher._stash_live_credential(
+                self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
+            )
+        assert entry_id in switcher.list_unclaimed_credentials()
 
 
 class TestActiveRefreshProvenance:
