@@ -5316,10 +5316,8 @@ class ClaudeAccountSwitcher:
             ident = {num: (email, record.get("organizationUuid") or "")}
             entry = self._usage_store.entries(ident).get(num)
             struck_fp = getattr(entry, "struck_fingerprint", None)
-            # `unreadable` needs no branch here: `_slot_token_dead` above
-            # already refuses on it, for both the idle and the active slot —
-            # a read that FAILED is not an empty slot, and it never reaches
-            # this far.
+            # No `unreadable` branch: `_slot_token_dead` above already
+            # refuses on it, idle slot and active slot alike.
             stored, _ = self._read_account_credentials_ex(num, email)
             stored_fp = oauth.credential_fingerprint(stored)
 
@@ -5364,12 +5362,9 @@ class ClaudeAccountSwitcher:
                 # would clear the very strike that describes it.
                 if creds_fp == struck_fp:
                     continue
-                # BYTES THE SLOT ALREADY HOLDS, which `_adopt_login_into_slot`
-                # refuses for its own reason: rewriting them only shifts
-                # `.prev`. Here it also spends a stash entry, and an UNBOUND
-                # strike (a row written before fingerprints were recorded)
-                # binds unconditionally — so the comparison above cannot
-                # exclude them and clearing it would erase an accurate verdict.
+                # Bytes the slot already holds heal nothing, and an UNBOUND
+                # strike binds to them anyway — so clearing it here would
+                # erase an accurate verdict and spend a stash entry.
                 if stored_fp is not None and creds_fp == stored_fp:
                     continue
                 try:
