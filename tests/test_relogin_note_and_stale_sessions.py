@@ -56,6 +56,14 @@ def test_the_relogin_note_does_not_condemn_a_live_credential_that_moved_on(
         f"{note!r} must name the STORED copy: here the live credential "
         "authenticates and only a stored one was rejected"
     )
+    # The strike supports "these bytes were rejected" and nothing more. A
+    # rotation clears it with no human, which `usage_store` already says in
+    # its quarantine log ("a re-login is needed only if it persists") and
+    # this note asserted over.
+    assert "may clear it" in note, (
+        f"{note!r} presents the re-login as required; one invalid_grant on a "
+        "single-use grant does not establish that"
+    )
 
 
 @pytest.mark.parametrize("backend", ["keychain", "file"])

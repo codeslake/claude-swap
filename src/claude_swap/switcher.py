@@ -201,8 +201,11 @@ SENTINEL_NOTES = {
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     # NOT the ACCOUNT's: `_entry_token_dead` holds the strike while ANY stored
-    # source matches, so an active slot is condemned on its backup alone.
-    USAGE_RELOGIN_REQUIRED: "re-login needed — a stored refresh token was rejected; log in with Claude Code, then run: cswap add",
+    # source matches, so a slot is condemned on a backup the live client may
+    # already have rotated past. One invalid_grant on a single-use grant does
+    # not establish that a human must act, so the remedy stays conditional —
+    # the same hedge `UsageStore.record` logs when it imposes the quarantine.
+    USAGE_RELOGIN_REQUIRED: "re-login needed — a stored refresh token was rejected; a rotation may clear it, else log in with Claude Code and run: cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
     # `/login` writes to whichever account is active, so switching first is
