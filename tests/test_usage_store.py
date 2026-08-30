@@ -1336,6 +1336,13 @@ class TestDeadTokenQuarantine:
         assert "rotation clears it" not in said, (
             f"a credential with no refresh token was promised a rotation: {said!r}"
         )
+        # ARG SLOTS, not prose. Hardcoding `rec.error` renders a wrong cause
+        # forever and the sentence still reads fine; only the slot catches it.
+        slot, ident, err, remedy = caplog.records[-1].args[:4]
+        assert (slot, ident, err) == ("1", "a@x.com", "no_refresh_token"), (
+            f"the quarantine reported the wrong slot/identity/cause: "
+            f"{(slot, ident, err)!r}"
+        )
 
     def test_lifting_a_quarantine_says_so(self, store, caplog):
         """A transition log that speaks in ONE direction reports every
@@ -1356,8 +1363,12 @@ class TestDeadTokenQuarantine:
         )
         assert "no longer matches" not in said, (
             "the heal claims a fingerprint comparison it never made -- this "
-            "row was struck with NO fingerprint, and six of the seven callers "
-            f"hand this method no credential at all: {said!r}"
+            "method never reads a credential, and only the collector path "
+            f"passes a fingerprint at all: {said!r}"
+        )
+        assert caplog.records[-1].args[:2] == ("1", "a@x.com"), (
+            f"the heal swapped its slot and identity args: "
+            f"{caplog.records[-1].args[:2]!r}"
         )
 
     def test_clearing_an_unstruck_row_stays_quiet(self, store, caplog):
@@ -1402,6 +1413,35 @@ class TestDeadTokenQuarantine:
         assert entries["1"].token_dead()
         # A dead token is never nominated as the alternate to poll.
         assert due_candidate(["1"], entries, clock.now) is None
+
+    def test_due_candidate_refuses_a_struck_row_whose_fingerprint_moved(
+        self, store, clock
+    ):
+        """DELIBERATE. A future reader will see that `due_candidate` asks the
+        UNBOUND question and take it for the bug this PR fixed elsewhere. It is
+        not: the bound verdict ranges over the live credential AND the slot
+        backup, neither of which the store can read, and the only caller has
+        already healed every case it could determine. What reaches this line is
+        the "could not determine" case, where refusing is what the switcher's
+        heal scan relies on to keep the row out of a fetch.
+
+        Passing a fingerprint in here would delete that guard, so this test
+        fails if anyone does.
+        """
+        store.record({"1": FetchRecord(error="invalid_grant",
+                                       struck_fp="sha256:the-condemned-one")},
+                     IDENT)
+        clock.advance(10_000)  # past any backoff
+        entry = store.entries(IDENT)["1"]
+        # The BOUND question says healed -- and is the wrong one to ask here.
+        assert not entry.token_dead(stored_fp="sha256:a-rotated-one"), (
+            "premise: a moved fingerprint would lift the bound verdict"
+        )
+        assert due_candidate(["1"], {"1": entry}, clock.now) is None, (
+            "due_candidate stopped refusing a struck row, deleting the guard "
+            "switcher._collect_usage_entries leans on for its "
+            "could-not-determine case"
+        )
 
     def test_clear_dead_token_lifts_quarantine(self, store):
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
@@ -1930,7 +1970,7 @@ class TestStrikeOnlyHeal:
         assert entry.last_error is None
         assert entry.consecutive_failures == 0
 
-    def test_expected_fingerprint_mismatch_is_a_no_op(self, store):
+    def test_expected_fingerprint_mismatch_is_a_no_op(self, store, caplog):
         """The TOCTOU re-check: a row whose struckFingerprint moved since
         the caller's lock-free read (a fresh strike, or a different
         collector's own heal, landed in the gap) must be left untouched."""
@@ -1947,14 +1987,24 @@ class TestStrikeOnlyHeal:
             ident,
         )
         row_before = dict(store._read_rows()["1"])
-        store.clear_dead_token(
-            ["1"], ident, revoke_claim=False, strike_only=True,
-            expected_fingerprints={"1": "sha256:old"},  # the STALE read
-        )
+        caplog.clear()
+        # at_level(INFO) or this asserts NOTHING: bare caplog captures nothing
+        # below WARNING, so the absence below would hold however loud the heal.
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            store.clear_dead_token(
+                ["1"], ident, revoke_claim=False, strike_only=True,
+                expected_fingerprints={"1": "sha256:old"},  # the STALE read
+            )
         row_after = store._read_rows()["1"]
         assert row_after == row_before, (
             "a stale-read heal must not overwrite a row that changed under it"
         )
+        # THE THIRD OUTCOME. Struck-but-REFUSED is neither of the two the heal
+        # line splits on, and a line here claims a transition that did not
+        # happen -- the exact defect class this wording change exists to remove.
+        assert "out of quarantine" not in " ".join(
+            r.getMessage() for r in caplog.records
+        ), "a refused heal announced a heal that did not happen"
 
     def test_expected_fingerprint_match_still_heals(self, store):
         ident = {"1": ("a@b.c", "")}

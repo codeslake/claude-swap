@@ -219,13 +219,14 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
 # though the ACCOUNT can, without a human, once the live client rotates to a
-# generation the strike did not condemn. One such answer is already definitive: the server
-# explicitly rejected the grant, which no transient 429/timeout/network blip
-# does, so there is nothing to gain by retrying (and each retry with a dead
-# token just draws a fresh 401/429). At this many strikes the account is
-# quarantined: no more fetches, and the collector surfaces "re-login needed".
-# A single success — or a credential refresh via login/add — resets the count
-# and lifts the quarantine. Raise to 2 if a buffer against a one-off
+# generation the strike did not condemn. One such answer is already
+# definitive: the server explicitly rejected the grant, which no transient
+# 429/timeout/network blip does, so there is nothing to gain by retrying (and
+# each retry with a dead token just draws a fresh 401/429). At this many
+# strikes the account is quarantined: no more fetches, and the collector
+# surfaces "re-login needed". A single success, a credential refresh via
+# login/add, or a rotation that moves the stored fingerprint off the condemned
+# generation resets the count and lifts the quarantine. Raise to 2 if a buffer against a one-off
 # misclassification is ever wanted; the trade-off is a ~10-min-slower verdict
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
@@ -439,6 +440,17 @@ def due_candidate(
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
     every surface inherits the same adaptive cadence.
+
+    THE STRIKE CHECK IS DELIBERATELY UNBOUND. ``token_dead()`` is called with
+    no ``stored_fp``, so a strike condemning a generation the slot no longer
+    holds still refuses it here. That is the conservative answer, not an
+    oversight: the bound verdict ranges over BOTH stored sources — the live
+    credential and the slot backup (``switcher._entry_token_dead``) — and this
+    function can read neither. The only caller passes entries from
+    ``_collect_usage_entries``, which has already healed every case it could
+    determine and set a sentinel for every confirmed-dead one; what reaches
+    this line is the third case, "could not determine", where that scan
+    explicitly relies on this refusal to keep the row out of a fetch.
     """
     due: list[tuple[int, float, str]] = []
     for num in candidates:
@@ -449,7 +461,7 @@ def due_candidate(
         if entry.sentinel is not None:
             continue
         if entry.token_dead():
-            continue  # dead refresh-token: quarantined, needs a re-login
+            continue  # quarantined; what lifts it is the docstring's business
         if entry.in_backoff(now):
             continue
         if (
@@ -1117,7 +1129,10 @@ class UsageStore:
                         # (oauth.credential_fingerprint), and only such a
                         # credential is replaced without a human. A
                         # `sha256-full:` content hash (no_refresh_token) and an
-                        # unbound strike both need an explicit write.
+                        # unbound strike both need an explicit write. Routing on
+                        # the fingerprint rather than on `rec.error` is why this
+                        # looks indirect: a future PERMANENT_AUTH_ERRORS member
+                        # is then classified correctly with no edit here.
                         _lifted_by = (
                             "any credential rotation clears it, so this may "
                             "already be stale; a re-login is needed only if it "
@@ -1240,10 +1255,11 @@ class UsageStore:
             # a struck row speaks — every re-login and add calls this on
             # unstruck rows, and a line per call would bury the transitions.
             if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
-                # STORE-FACT WORDING (transfer.py's own rule): six of the
-                # seven callers pass no credential, so a comparison claim is
-                # one this never made — and false outright for a forced import
-                # of the byte-identical generation (`same_generation`).
+                # STORE-FACT WORDING (transfer.py's own rule): this method
+                # never reads a credential and only the collector path passes a
+                # fingerprint, so a comparison claim is one it did not make —
+                # and false outright for a forced import of the byte-identical
+                # generation (`same_generation`).
                 _logger.info(
                     "Account %s (%s) is out of quarantine: its dead-token "
                     "strike was cleared, so it is fetched again.",
