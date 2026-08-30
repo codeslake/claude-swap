@@ -5141,6 +5141,39 @@ class ClaudeAccountSwitcher:
             self._entry_token_dead(entry, num, email, stored, is_active)
         )
 
+    @staticmethod
+    def _live_is_a_newer_login(stored: str, backup: str,
+                               active_read_degraded: bool) -> bool:
+        """Whether the live bytes are a NEW LOGIN rather than a rotation.
+
+        The active slot POSTs its LIVE credential, not its backup, so a backup
+        still holding the struck generation should not keep the slot
+        quarantined once a re-login has replaced what will actually be sent —
+        and the only thing that resyncs that backup runs inside the fetch the
+        strike refuses, so the loop cannot open itself.
+
+        BUT LIVE MOVING IS NOT ENOUGH, and an earlier cut that used it alone
+        released an ordinary rotation of a still-dead lineage. A refresh does
+        not extend ``refreshTokenExpiresAt``; only a fresh login mints a new
+        one. So a live refresh lifetime that ends LATER than the backup's is
+        the signature of a login, and nothing else produces it.
+
+        Undated on either side is no evidence, and a degraded read never
+        examined the live bytes at all — both answer False, leaving the
+        existing ambiguity rules in charge.
+        """
+        if active_read_degraded or not stored or not backup:
+            return False
+
+        def _refresh_expiry(blob: str) -> "int | None":
+            data = oauth.extract_oauth_data(blob) or {}
+            v = data.get("refreshTokenExpiresAt")
+            return v if isinstance(v, (int, float)) else None
+
+        live_at, backup_at = _refresh_expiry(stored), _refresh_expiry(backup)
+        return (live_at is not None and backup_at is not None
+                and live_at > backup_at)
+
     def _entry_token_dead(
         self,
         entry: UsageEntry,
@@ -5224,7 +5257,8 @@ class ClaudeAccountSwitcher:
         # test_a_matching_backup_still_confirms_dead.
         if backup and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
-        ):
+        ) and not self._live_is_a_newer_login(stored, backup,
+                                               active_read_degraded):
             return True
         if active_read_degraded:
             # Nothing CONFIRMED the strike, and the live bytes were never

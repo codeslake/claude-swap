@@ -492,3 +492,97 @@ class TestTheCollectorHoldsTheStrikeOnADivergentBackup:
             "strike, so the re-login prompt can never appear and a dead "
             "pinned account renders healthy forever"
         )
+
+
+class TestALoginMovedTheLiveBytesTheActiveSlotWillPOST:
+    """The ACTIVE slot POSTs its LIVE credential; the backup is not what goes
+    on the wire. So a backup still holding the struck generation must not
+    re-confirm a strike the live bytes have already moved past.
+
+    MEASURED, and it is the loop the owner spent a night inside: slot active,
+    struck on `invalid_grant`, re-login replaces the live bytes (fingerprints
+    differ, confirmed on the host). The backup still matches the struck
+    fingerprint because the only thing that resyncs it is
+    `_resync_rotated_backup`, which runs inside `_fetch_active_usage` — the
+    fetch this very strike refuses. Quarantine holds, usage reads UNKNOWN, the
+    engine fails the account over, and the TUI asks for a re-login that has
+    already happened.
+
+    The strike is not lost: if the live bytes fail too, the next strike binds
+    to THEM, so this costs one POST per generation and cannot loop.
+    """
+
+    # A REFRESH DOES NOT EXTEND `refreshTokenExpiresAt`; only a login mints a
+    # new one. So these two differ in exactly the field that separates a
+    # re-login from an ordinary rotation, and `ROTATED` below is the control.
+    STRUCK = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-struck", "refreshToken": "rt-struck",
+        "expiresAt": 1, "refreshTokenExpiresAt": 1_000}})
+    RELOGIN = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-relogin", "refreshToken": "rt-relogin",
+        "expiresAt": 9_999_999_999_000, "refreshTokenExpiresAt": 9_000}})
+    ROTATED = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-rotated", "refreshToken": "rt-rotated",
+        "expiresAt": 9_999_999_999_000, "refreshTokenExpiresAt": 1_000}})
+
+    def _verdict(self, stored, backup, is_active=True, degraded=False,
+                 struck=None):
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._read_account_credentials_ex = lambda n, e: (backup, False)
+        entry = UsageEntry(
+            auth_dead_strikes=1,
+            struck_fingerprint=oauth.credential_fingerprint(
+                struck if struck is not None else OLD))
+        return ClaudeAccountSwitcher._entry_token_dead(
+            s, entry, "2", "b@example.com", stored, is_active, degraded,
+        )
+
+    def test_a_relogin_releases_the_slot_even_with_a_stale_backup(self):
+        v = self._verdict(self.RELOGIN, self.STRUCK, struck=self.STRUCK)
+        assert v is False, (
+            f"got {v!r}: the live bytes moved past the struck generation and "
+            "the slot is still quarantined on a backup nothing will POST — "
+            "and the fetch that would resync that backup is the one this "
+            "verdict refuses"
+        )
+
+    def test_CONTROL_an_idle_slot_still_confirms_on_its_backup(self):
+        """The backup IS what an idle slot POSTs, so there the confirm stands.
+        Without this the change would empty the quarantine for every slot.
+
+        An idle slot has ONE source and the caller passes it as `stored` —
+        the method's own docstring says so, and feeding it the two-source
+        shape tests nothing this code can see."""
+        assert self._verdict(self.STRUCK, None, is_active=False,
+                             struck=self.STRUCK) is True
+
+    def test_CONTROL_live_bytes_that_still_match_are_still_dead(self):
+        """The release is keyed on the live bytes having MOVED, not on the
+        slot being active."""
+        assert self._verdict(self.STRUCK, self.STRUCK,
+                             struck=self.STRUCK) is True
+
+    def test_CONTROL_an_ordinary_rotation_does_not_release_it(self):
+        """THE CONTROL THAT NARROWED THIS FIX. A first cut released on the
+        live bytes merely DIFFERING, which is true of every routine rotation
+        of a still-dead lineage — it broke four existing cases that exist to
+        stop exactly that. A rotation carries the SAME refresh lifetime."""
+        assert self._verdict(self.ROTATED, self.STRUCK,
+                             struck=self.STRUCK) is True
+
+    def test_CONTROL_an_OLDER_login_in_the_live_slot_does_not_release_it(self):
+        """DIRECTION IS THE WHOLE TEST. An earlier generation restored into the
+        live store — a rolled-back copy, a stale plaintext fallback — differs
+        from the struck bytes just as a re-login does, and releasing on
+        "differs" would hand the fetch a credential older than the one already
+        condemned. Only a LATER refresh lifetime is a login."""
+        older = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-older", "refreshToken": "rt-older",
+            "expiresAt": 9_999_999_999_000, "refreshTokenExpiresAt": 500}})
+        assert self._verdict(older, self.STRUCK, struck=self.STRUCK) is True
+
+    def test_CONTROL_a_degraded_read_cannot_release_it(self):
+        """Degraded means the live bytes were never examined, so 'they moved'
+        is a claim nothing made — the existing ambiguity rules still own it."""
+        assert self._verdict(self.RELOGIN, self.STRUCK, degraded=True,
+                             struck=self.STRUCK) is True
