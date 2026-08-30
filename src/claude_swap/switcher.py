@@ -200,7 +200,10 @@ SENTINEL_NOTES = {
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
+    # NOT the ACCOUNT's: the strike holds while ANY stored source matches the
+    # struck generation, so an active slot is condemned on its backup alone
+    # even after the live credential rotated past it (`_entry_token_dead`).
+    USAGE_RELOGIN_REQUIRED: "re-login needed — a stored credential's refresh token was rejected; log in with Claude Code, then run: cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
     # `/login` writes to whichever account is active, so switching first is
@@ -7346,12 +7349,20 @@ class ClaudeAccountSwitcher:
         """Print the note after a successful switch, keyed to where the active
         credential write actually landed.
 
-        A restart is never required: Claude Code clears its cached OAuth token when
-        ``.credentials.json`` changes (file storage — effective on the next message)
-        or when the macOS Keychain cache TTL (~30s) expires. Both lines are dim
-        hints, not warnings; the Keychain line adds that a restart skips the wait.
-        The file line also covers macOS when the Keychain was unavailable and the
-        switch fell back to the file.
+        Claude Code usually needs no restart: it clears its cached OAuth token
+        when ``.credentials.json`` changes (file storage — effective on the next
+        message) or when the macOS Keychain cache TTL (~30s) expires. Both lines
+        are dim hints, not warnings; the Keychain line adds that a restart skips
+        the wait. The file line also covers macOS when the Keychain was
+        unavailable and the switch fell back to the file.
+
+        "Usually", not "never", which is why already-running sessions get
+        named. A session holding a credential the runtime rejects renders
+        "Not logged in · Please run /login" from
+        ``InvalidRequestHeaderValueError`` — raised while BUILDING the request,
+        before it is sent. With no HTTP status, none of the paths that rebuild
+        the client on 401/403/socket errors fire and nothing cswap writes
+        afterwards is re-read; only a restart clears it.
         """
         backend = self._last_active_credentials_backend
         if backend is None:
@@ -7364,6 +7375,20 @@ class ClaudeAccountSwitcher:
             ))
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
+        # Every live session predates a switch that has already committed, so
+        # this needs no timestamp — only whether any exist. Best-effort like
+        # the sibling call in `list_accounts`: the switch is done, and a
+        # detection failure must not surface as a switch failure.
+        try:
+            running = len(get_running_instances()[0])
+        except Exception:
+            self._logger.debug("Failed to detect running instances", exc_info=True)
+            running = 0
+        if running:
+            print(dimmed(
+                f"  {running} Claude session(s) were already running — restart "
+                'any that keep saying "Not logged in · Please run /login".'
+            ))
 
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
