@@ -4482,6 +4482,35 @@ class ClaudeAccountSwitcher:
                             else "; the rotated credential was NOT persisted "
                                  "anywhere — re-login may be required",
                         )
+                    if not backup_ok:
+                        # A REFRESH TOKEN IS ONE-TIME-USE, so the bytes still
+                        # in the slot are spent the instant the POST returns.
+                        # `backup_ok` used to have no consequence: with the
+                        # live write succeeding the fetch reported success and
+                        # the slot kept a token the server had already retired.
+                        # Nothing surfaced it until that account went inactive,
+                        # when every refresh answered `invalid_grant` and the
+                        # slot read "re-login needed" for a login nobody had
+                        # done anything wrong to.
+                        #
+                        # Retry once, still under the same locks. A second
+                        # failure is not recoverable here, so say so at ERROR
+                        # with the consequence named rather than leaving it for
+                        # someone to discover days later.
+                        try:
+                            self._write_account_credentials(
+                                account_num, email, working
+                            )
+                            backup_ok = True
+                        except Exception:
+                            self._logger.error(
+                                "Account-%s kept a SPENT refresh token: the "
+                                "rotated credential reached the active store "
+                                "but not the slot backup, twice. This slot "
+                                "will report re-login needed once it is no "
+                                "longer active; a re-login repairs it.",
+                                account_num,
+                            )
                     if not live_ok:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
