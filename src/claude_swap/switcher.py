@@ -316,6 +316,18 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
+def _refresh_expiry(blob: str) -> "float | None":
+    """A credential's ``refreshTokenExpiresAt``, or None when it carries none.
+
+    A refresh does NOT extend this field — only a fresh login mints a new one —
+    so it separates two LOGINS and never two generations of one. Both readers
+    depend on that: the adopt refuses an older login, and the quarantine
+    release recognises a newer one.
+    """
+    v = (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
+    return v if isinstance(v, (int, float)) else None
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -3091,10 +3103,6 @@ class ClaudeAccountSwitcher:
         the profile in place for the same reason.
         """
 
-        def _refresh_expiry(blob: str) -> "float | None":
-            v = (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
-            return v if isinstance(v, (int, float)) else None
-
         # Slot mutations hold this lock, so identity, verdict and write are one
         # transaction: a switch persisting a rotated refresh token in the gap
         # would otherwise be overwritten by a guard that had already passed.
@@ -3133,14 +3141,13 @@ class ClaudeAccountSwitcher:
             # strike the slot has outlived authorizes nothing.
             if stored and not self._slot_token_dead(owner, owner_email):
                 return False  # its own credential may yet be condemned
-            # RECENCY DECIDES, IN ONE DIRECTION ONLY, AND ONLY BETWEEN TWO
-            # LOGINS. A refresh token cannot be re-derived, so a live
-            # credential whose refresh lifetime ends EARLIER than the stored
-            # one is the older /login and must not replace it. It cannot
-            # separate two GENERATIONS of one login — a refresh does not
-            # extend the field — so `_slot_token_dead` above carries that
-            # weight. An undated stored credential is not evidence of
-            # freshness and does not block the adopt.
+            # RECENCY DECIDES, IN ONE DIRECTION ONLY. A refresh token cannot
+            # be re-derived, so a live credential whose refresh lifetime ends
+            # EARLIER than the stored one is the older login and must not
+            # replace it. Generations of ONE login are indistinguishable here
+            # (see `_refresh_expiry`); `_slot_token_dead` above carries that.
+            # An undated stored credential is not evidence of freshness and
+            # does not block the adopt.
             stored_at, live_at = _refresh_expiry(stored), _refresh_expiry(creds)
             if stored_at is not None and live_at is not None and live_at < stored_at:
                 self._logger.info(
@@ -5172,11 +5179,6 @@ class ClaudeAccountSwitcher:
         """
         if active_read_degraded or not stored or not backup:
             return False
-
-        def _refresh_expiry(blob: str) -> "int | None":
-            data = oauth.extract_oauth_data(blob) or {}
-            v = data.get("refreshTokenExpiresAt")
-            return v if isinstance(v, (int, float)) else None
 
         live_at, backup_at = _refresh_expiry(stored), _refresh_expiry(backup)
         return (live_at is not None and backup_at is not None
