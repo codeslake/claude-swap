@@ -9500,6 +9500,32 @@ class TestUnclaimedStashSweep:
             "the sweep did not reach the expired entry"
         )
 
+    def test_a_malformed_row_does_not_abandon_the_rest_of_the_roster(
+        self, temp_home,
+    ):
+        """The shape guard SKIPS a bad row; it must not stop reading. Every
+        other malformed-roster case here has one row, so `continue` and
+        `break` are indistinguishable in them — and a `break` would silently
+        disable the duplicate arm for every slot ordered after the bad row,
+        leaving real duplicates in the stash forever."""
+        switcher = self._switcher(temp_home)
+        creds = self._creds("shared-rt", self._ms(20), access="sk-stored")
+        data = switcher._get_sequence_data()
+        data.setdefault("accounts", {})["1"] = None          # skipped
+        data["accounts"]["2"] = {"email": "a@b.c", "organizationUuid": ""}
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._store._write_account_credentials("2", "a@b.c", creds)
+
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("shared-rt", self._ms(20), access="sk-stashed"),
+            {"reason": "foreign"},
+        )
+        switcher._sweep_unclaimed_stash()
+        assert entry_id not in switcher.list_unclaimed_credentials(), (
+            "the roster read stopped at the malformed row, so slot 2's "
+            "fingerprint never entered the map and its duplicate was kept"
+        )
+
     def test_the_sweep_reads_no_slot_when_nothing_can_be_dropped(
         self, temp_home,
     ):

@@ -13,6 +13,7 @@ import pytest
 
 from claude_swap.usage_store import (
     AUTH_DEAD_STRIKES,
+    BACKOFF_BASE_S,
     RACE_WINDOW_S,
     FetchRecord,
     UsageEntry,
@@ -222,11 +223,11 @@ def test_a_transient_retry_does_not_erase_the_doubt(store, clock):
     )
     # PACED, not free. Surviving a transient is only safe because the failure
     # backoff still holds the row off; without it a doubted row would be
-    # re-POSTed every collect pass forever. Measured a FULL base interval out,
-    # not at `now`: any backoff at all passes at `now`, so that alone would
-    # miss a one-second one.
-    from claude_swap.usage_store import BACKOFF_BASE_S
-
+    # re-POSTed every collect pass forever. Measured just UNDER a base
+    # interval rather than at `now`, where any backoff at all passes and a
+    # one-second one would slip through. Under, not on: `_row_eligible` uses
+    # a strict `now < backoff_until`, so landing exactly on the boundary
+    # would read as eligible.
     assert not _row_eligible(store._read_rows()["1"],
                              now=clock.now + BACKOFF_BASE_S - 1,
                              respect_plans=False), (
