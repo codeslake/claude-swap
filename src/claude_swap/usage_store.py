@@ -232,26 +232,38 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
 
-#: The consume gate POSTs outside the slot lock, so two paths can POST one
-#: single-use grant and the loser is told `invalid_grant` about a healthy
-#: account. `fetchedAt` advances only on a success, so `lastAttemptAt -
-#: fetchedAt` is how long before the strike the lineage last answered.
+#: NOT the consume gate: both sites that POST a backup grant now hold
+#: `.consume-N.lock` across read -> POST -> CAS, and a loser gets
+#: `consume-busy`, which never strikes. The racer that remains is outside every
+#: lock cswap holds -- a concurrent Claude Code, or a sibling machine rotating
+#: a synced lineage (`_fetch_active_usage` records the measured field incident:
+#: POSTing the superseded token yields "a false dead-token strike on a live
+#: account"). `fetchedAt` advances only on a success, so `lastAttemptAt -
+#: fetchedAt` is how long before the strike the lineage last answered. The
+#: width is deliberately loose -- see `_strike_is_suspected_race`, which bounds
+#: the cost by the strike COUNT rather than by this number.
 RACE_WINDOW_S = 600.0
 
 
 def _strike_is_suspected_race(
-    fetched_at: float | None, last_attempt_at: float | None
+    strikes: int, fetched_at: float | None, last_attempt_at: float | None
 ) -> bool:
-    """Whether this row's strike landed close enough to a SUCCESS to doubt it.
+    """Whether to doubt this row's FIRST strike because a success preceded it.
+
+    Two independent bounds, and the count is the load-bearing one. Only the
+    first strike is ever doubted, so this permits exactly ONE extra POST of a
+    possibly-dead grant -- the retry either succeeds (`record` zeroes the
+    count) or lands a second strike that no window can excuse. That is what
+    keeps the endless-401 loop the strike exists to stop from returning, and
+    it makes the window's exact width non-critical: erring either way at the
+    boundary costs one fetch.
 
     Missing either timestamp is "no evidence", not "a race", so rows written
     before this read exactly as they did. A negative gap is not one either:
     there the success is the LATER event and already zeroed the strike.
-
-    It cannot excuse a strike forever -- the retry it permits stamps
-    ``lastAttemptAt`` and never ``fetchedAt``, so a lineage that keeps failing
-    widens its own gap past the window.
     """
+    if strikes > AUTH_DEAD_STRIKES:
+        return False
     if fetched_at is None or last_attempt_at is None:
         return False
     return 0 <= last_attempt_at - fetched_at <= RACE_WINDOW_S
@@ -396,7 +408,9 @@ class UsageEntry:
         """
         if self.auth_dead_strikes < threshold:
             return False
-        if _strike_is_suspected_race(self.fetched_at, self.last_attempt_at):
+        if _strike_is_suspected_race(
+            self.auth_dead_strikes, self.fetched_at, self.last_attempt_at
+        ):
             return False
         if (
             stored_fp is not None
@@ -1324,15 +1338,16 @@ def _row_eligible(
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
+    # A suspected race stays eligible ON PURPOSE: the strike blocks the fetch,
+    # and only a fetch can succeed, so vetoing here is what made one
+    # `invalid_grant` permanent. Backoff below still paces the single retry.
     if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES and not (
         _strike_is_suspected_race(
+            int(row.get("authDeadStrikes") or 0),
             _num_or_none(row.get("fetchedAt")),
             _num_or_none(row.get("lastAttemptAt")),
         )
     ):
-        # A suspected race stays eligible ON PURPOSE: the strike blocks the
-        # fetch, and only a fetch can succeed, so vetoing here is what makes
-        # one `invalid_grant` permanent. Backoff below still paces the retry.
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
