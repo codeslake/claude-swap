@@ -9307,8 +9307,9 @@ class TestUnclaimedStashSweep:
         ), "a kept pile nobody knows about is the state we are in now"
 
     def test_sweep_keeps_a_credential_with_no_refresh_expiry(self, temp_home):
-        """An API key or setup token carries no ``refreshTokenExpiresAt``. It
-        never expires, so arm 1 has no verdict — and no verdict is KEEP."""
+        """An OAuth blob whose ``refreshTokenExpiresAt`` is absent — the shape
+        every undated vintage and every setup token shares. Arm 1 reaches no
+        verdict on it, and no verdict is KEEP."""
         switcher = self._switcher(temp_home)
         entry_id = switcher._store._write_unclaimed_credential(
             self._creds("no-expiry-rt"), {"reason": "displaced-live-login"},
@@ -9323,10 +9324,14 @@ class TestUnclaimedStashSweep:
         stale = switcher._store._write_unclaimed_credential(
             self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
         )
-        switcher._stash_live_credential(
+        fresh = switcher._stash_live_credential(
             self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
         )
         assert stale not in switcher.list_unclaimed_credentials()
+        assert fresh in switcher.list_unclaimed_credentials(), (
+            "the stash swept away the entry it had just created — that entry "
+            "is the licence the caller overwrites the live store on"
+        )
 
     def test_a_failed_sweep_never_fails_the_stash(self, temp_home):
         """A successful stash is the licence to overwrite the live store, so
@@ -9339,6 +9344,63 @@ class TestUnclaimedStashSweep:
                 self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
             )
         assert entry_id in switcher.list_unclaimed_credentials()
+
+    def test_the_containment_does_not_swallow_the_real_store_guard(
+        self, temp_home,
+    ):
+        """`RealStoreWriteBlocked` is deliberately not an OSError so that no
+        `except OSError` in the source can absorb it (conftest states this).
+        A bare `except Exception` around a method that UNLINKS credential
+        files and rewrites the stash manifest re-opens exactly that hole, and
+        an OSError-raising test cannot tell the two handlers apart."""
+        switcher = self._switcher(temp_home)
+
+        class NotAnOSError(Exception):
+            pass
+
+        with patch.object(
+            switcher, "_sweep_unclaimed_stash", side_effect=NotAnOSError("guard"),
+        ), pytest.raises(NotAnOSError):
+            switcher._stash_live_credential(
+                self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
+            )
+
+    def test_a_consume_gate_entry_is_not_called_ownerless(self, temp_home, caplog):
+        """The stash namespace is shared: the consume gate stores a minted
+        successor here with `configSlot` and `consumedFp`, and
+        `_adopt_stashed_successor` writes it back. Counting those in the
+        "nothing in them names an owner" warning is false, and the `--purge`
+        it recommends destroys the sole copy of a consumed generation."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        switcher._store._write_unclaimed_credential(
+            self._creds("successor-rt", self._ms(20)),
+            {"configSlot": "1", "consumedFp": "sha256:abc"},
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash()
+        assert not any(
+            "names an owner" in r.getMessage() for r in caplog.records
+        ), "a row carrying configSlot and consumedFp was called ownerless"
+
+    def test_the_sweep_reads_no_slot_when_nothing_can_be_dropped(
+        self, temp_home,
+    ):
+        """It runs inside `_perform_switch`'s three-lock block, whose comment
+        forbids anything slow. Only the duplicate arm needs the roster's
+        fingerprints, and on macOS each one is a `security` subprocess — so a
+        sweep with nothing to compare must not pay for them."""
+        switcher = self._switcher(temp_home)
+        self._add_slot(switcher, "1", "a@b.c", self._creds("s1", self._ms(20)))
+        switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+        )
+        with patch.object(
+            switcher, "_read_account_credentials",
+            side_effect=AssertionError("read a slot backup with nothing to compare"),
+        ):
+            switcher._sweep_unclaimed_stash()
 
 
 class TestActiveRefreshProvenance:
@@ -15277,6 +15339,7 @@ class TestALoginLandsInItsOwnSlot:
         that slot computes differently — stored, reported as adopted, and
         unreachable."""
         s = self._owner_slot_fixture(sample_sequence_data)
+        s.platform = Platform.LINUX   # .enc is the served backend everywhere
         data = s._get_sequence_data()
         data["accounts"]["1"]["email"] = ""
         s._write_json(s.sequence_file, data)
@@ -15328,12 +15391,11 @@ class TestALoginLandsInItsOwnSlot:
             data, {"uuid": "u-1", "email": "u@x",
                    "organizationUuid": "o-b"}) == "2"
 
-    def test_a_uuid_shared_across_orgs_is_ambiguous_without_one(
+    def test_a_uuid_without_an_org_claims_no_org_carrying_slot(
         self, temp_home,
     ):
-        """No org in the profile leaves both slots equally plausible, and the
-        credential is the one thing that cannot be re-derived. Ambiguity is
-        not a tiebreak."""
+        """No org in the profile is no evidence for either record, and the
+        credential is the one thing that cannot be re-derived."""
         sw = ClaudeAccountSwitcher()
         data = {"accounts": {
             "1": {"email": "u@x", "organizationUuid": "o-a", "uuid": "u-1"},
@@ -15357,6 +15419,150 @@ class TestALoginLandsInItsOwnSlot:
              patch.object(s, "_adopt_login_into_slot") as adopt:
             self._resync_as_slot_2(s, self._blob("rt-live"))
         adopt.assert_not_called()
+
+    def test_a_field_shaped_quarantine_reaches_the_adopt(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """THE SHAPE EVERY OTHER TEST HERE MISSES. A slot that has ever polled
+        successfully carries `fetchedAt`, so its FIRST invalid_grant lands
+        inside RACE_WINDOW_S and `token_dead` doubts it — correctly, the
+        credential may still be alive. The adopt must refuse on that pass and
+        then RUN once the retry confirms the death, instead of spending its
+        one attempt while the verdict was still in doubt.
+
+        Rows built by `record` on a fresh row have `fetchedAt=None`, which is
+        never doubted — that is why the other tests never reach this."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_account_credentials("1", "c@example.com", self._blob("rt-dead"))
+        ids = {"1": ("c@example.com", "o-1")}
+        clock = [1_000_000.0]
+        s._usage_store.clock = lambda: clock[0]
+        s._usage_store.record({"1": FetchRecord(usage={"five_hour": {}})}, ids)
+        clock[0] += 310
+        s._usage_store.record({"1": FetchRecord(error="invalid_grant")}, ids)
+        assert not s._slot_token_dead("1", "c@example.com"), (
+            "PREMISE: a first strike 310s after a success must be doubted"
+        )
+
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-dead", (
+            "a credential whose death was still in doubt was overwritten")
+
+        # The retry confirms it. The adopt must still be reachable.
+        clock[0] += 310
+        s._usage_store.record({"1": FetchRecord(error="invalid_grant")}, ids)
+        assert s._slot_token_dead("1", "c@example.com"), "PREMISE: now dead"
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            "the memo spent the adopt's only attempt on a pass where the "
+            "verdict was still in doubt, so the login is lost for the life "
+            "of the process")
+
+    def test_two_records_of_one_account_and_org_are_ambiguous(self, temp_home):
+        """THE BRANCH `len(hits) == 1` EXISTS FOR. Once the org is compared
+        outright, two slots differing by org no longer both hit — so the only
+        way to reach ambiguity is a duplicate record, same uuid AND same org.
+        Nothing distinguishes them, and an arbitrary first hit writes an
+        unre-derivable credential into a slot on iteration order."""
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {
+            "1": {"email": "u@x", "organizationUuid": "o-a", "uuid": "u-1"},
+            "4": {"email": "u@x", "organizationUuid": "o-a", "uuid": "u-1"},
+        }}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-1", "email": "u@x",
+                   "organizationUuid": "o-a"}) is None
+
+    def test_a_slot_re_pointed_under_the_adopt_is_not_written(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A remove-and-re-add, or `move_account`, re-points a slot NUMBER at
+        a different account while the lock is waited out. The address check
+        cannot see it — the new occupant has an address of its own — so the
+        identity the server resolved has to be re-checked against the roster
+        the lock holder actually sees."""
+        from claude_swap.locking import FileLock as _RealFileLock
+
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s.platform = Platform.LINUX
+
+        class RePointWhileWeWait(_RealFileLock):
+            def __enter__(self):
+                data = s._get_sequence_data()
+                data["accounts"]["1"] = {
+                    "email": "someone-else@example.com",
+                    "organizationUuid": "o-9", "uuid": "u-9",
+                }
+                s._write_json(s.sequence_file, data)
+                return super().__enter__()
+
+        with patch("claude_swap.switcher.FileLock", RePointWhileWeWait):
+            self._resync_as_slot_2(s, self._blob("rt-live"))
+        assert not list(s.credentials_dir.glob(".creds-1-*.enc")), (
+            "another account's slot was handed a login the server attributed "
+            "to the account that slot number used to hold"
+        )
+
+    def test_a_personal_login_is_not_written_into_an_org_slot(self, temp_home):
+        """`fetch_oauth_profile` returns organizationUuid None for a personal
+        account, so a blank resolved org is the COMMON case, not a corner. A
+        tolerance that waives the comparison when either side is blank turns
+        the org from corroboration into nothing at all — and here the org is
+        the only evidence separating two records of one uuid."""
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {
+            "5": {"email": "u@x", "organizationUuid": "ORG-A", "uuid": "u-1"},
+        }}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-1", "email": "u@x",
+                   "organizationUuid": None}) is None
+
+    def test_an_org_login_is_not_written_into_a_slot_with_no_org(self, temp_home):
+        """The mirror. A blank stored org cannot absorb another org's login."""
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {
+            "5": {"email": "u@x", "organizationUuid": "", "uuid": "u-1"},
+        }}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-1", "email": "u@x",
+                   "organizationUuid": "ORG-B"}) is None
+
+    def test_a_slot_removed_under_the_adopt_is_not_resurrected(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The owner is resolved from a roster snapshot read BEFORE the lock,
+        and `remove_account` holds no lock at all. A removal landing in the
+        gap leaves an absent backup — which bypasses both remaining guards,
+        because they are conditional on `stored` — and the write puts a live
+        refresh token back on disk for a slot the user deleted."""
+        from claude_swap.locking import FileLock as _RealFileLock
+
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s.platform = Platform.LINUX   # .enc is the served backend everywhere
+
+        class RemoveWhileWeWait(_RealFileLock):
+            """The removal lands in the window the adopt waits out: after the
+            owner was resolved, before the lock is held."""
+
+            def __enter__(self):
+                data = s._get_sequence_data()
+                data["accounts"].pop("1", None)
+                s._write_json(s.sequence_file, data)
+                return super().__enter__()
+
+        with patch("claude_swap.switcher.FileLock", RemoveWhileWeWait):
+            self._resync_as_slot_2(s, self._blob("rt-live"))
+        assert "1" not in (s._get_sequence_data() or {}).get("accounts", {}), (
+            "PREMISE: the probe must actually have removed the slot"
+        )
+        assert not list(s.credentials_dir.glob(".creds-1-*.enc")), (
+            "a removed slot was resurrected with a live refresh token"
+        )
 
     @pytest.mark.parametrize("bind_strike", [False, True],
                              ids=["unbound-strike", "bound-strike"])

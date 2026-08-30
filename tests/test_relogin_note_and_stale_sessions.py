@@ -94,8 +94,8 @@ def test_switch_followup_names_only_the_sessions_that_can_read_it(
                       kind=k, entrypoint="cli")
         for k in kinds
     ]
-    monkeypatch.setattr("claude_swap.switcher.get_running_instances",
-                        lambda: (sessions, []))
+    monkeypatch.setattr("claude_swap.switcher.scan_sessions",
+                        lambda: (sessions, 0))
 
     s._print_switch_followup()
     out = capsys.readouterr().out
@@ -129,4 +129,23 @@ def test_a_failed_session_scan_does_not_undo_a_committed_switch(monkeypatch, cap
     out = capsys.readouterr().out
     assert "no restart needed" in out and "already running" not in out, (
         f"a failed scan must leave the switch reported as done: {out!r}"
+    )
+
+
+def test_an_unreadable_session_record_still_counts(monkeypatch, capsys):
+    """`list_sessions` says of itself that it cannot tell "no live sessions"
+    from "no readable records", and the caveat's own comment rejects a silent
+    zero. A record that could not be parsed is a session that may be showing
+    the symptom, so it counts."""
+    s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+    monkeypatch.setattr(
+        ClaudeAccountSwitcher, "_last_active_credentials_backend", "file",
+    )
+    monkeypatch.setattr("claude_swap.switcher.scan_sessions", lambda: ([], 2))
+
+    s._print_switch_followup()
+    out = capsys.readouterr().out
+
+    assert "2 Claude sessions" in out, (
+        f"two unreadable session records rendered as nobody running: {out!r}"
     )

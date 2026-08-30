@@ -234,14 +234,13 @@ AUTH_DEAD_STRIKES = 1
 
 #: The racer is outside every lock cswap holds -- a concurrent Claude Code or
 #: a sibling machine rotating the same lineage. `fetchedAt` advances only on a
-#: success, so `lastAttemptAt - fetchedAt` is how long before the strike the
-#: lineage last answered. Loose on purpose: the COUNT bounds the cost, not
-#: this width.
+#: success, so `struckAt - fetchedAt` is how long before the strike the lineage
+#: last answered. Loose on purpose: the COUNT bounds the cost, not this width.
 RACE_WINDOW_S = 600.0
 
 
 def _strike_is_suspected_race(
-    strikes: int, fetched_at: float | None, last_attempt_at: float | None
+    strikes: int, fetched_at: float | None, struck_at: float | None
 ) -> bool:
     """Whether to doubt this row's FIRST strike because a success preceded it.
 
@@ -250,15 +249,22 @@ def _strike_is_suspected_race(
     strike no window can excuse. That keeps the endless-401 loop away and
     makes the width non-critical -- erring either way costs one fetch.
 
-    Missing either timestamp is "no evidence", not "a race", so older rows read
-    as they did. A negative gap is not one either: there the success is the
-    LATER event and already zeroed the strike.
+    THE STRIKE'S OWN TIME, not `lastAttemptAt`. That field advances on every
+    attempt -- `reserve` stamps it before the fetch and `record` stamps it for
+    any outcome -- so a timeout, or a collector killed mid-fetch, would widen
+    a doubted strike out of its window having learned nothing about the token.
+    One `invalid_grant` plus one network blip then quarantines a healthy
+    account permanently, which is the state this guard exists to prevent.
+
+    Missing either timestamp is "no evidence", not "a race", so rows struck
+    before `struckAt` existed read as they did. A negative gap is not one
+    either: there the success is the LATER event and already zeroed the strike.
     """
     if strikes > AUTH_DEAD_STRIKES:
         return False
-    if fetched_at is None or last_attempt_at is None:
+    if fetched_at is None or struck_at is None:
         return False
-    return 0 <= last_attempt_at - fetched_at <= RACE_WINDOW_S
+    return 0 <= struck_at - fetched_at <= RACE_WINDOW_S
 
 
 # Fetch errors that prove the stored credential is permanently unusable (vs.
@@ -329,6 +335,9 @@ class UsageEntry:
     # Fingerprint of the generation the strikes condemned (absent on legacy
     # rows → strikes bind unconditionally). See ``token_dead``.
     struck_fingerprint: str | None = None
+    # When the FIRST strike landed. Absent on rows struck before this field
+    # existed → no race doubt, which is how they already read.
+    struck_at: float | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
     # scheduler itself chose the cadence (within nextPollAt). Capped at
@@ -401,7 +410,7 @@ class UsageEntry:
         if self.auth_dead_strikes < threshold:
             return False
         if _strike_is_suspected_race(
-            self.auth_dead_strikes, self.fetched_at, self.last_attempt_at
+            self.auth_dead_strikes, self.fetched_at, self.struck_at
         ):
             return False
         if (
@@ -988,6 +997,7 @@ class UsageStore:
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),
+                struck_at=_num_or_none(row.get("struckAt")),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
             )
@@ -1132,6 +1142,7 @@ class UsageStore:
                 row["lastError"] = None
                 row["backoffUntil"] = None
                 row["authDeadStrikes"] = 0  # a success proves the token is alive
+                row["struckAt"] = None
             else:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
@@ -1150,6 +1161,9 @@ class UsageStore:
                 # evidence either way and must not reset a real dead-token tally.
                 if rec.error in PERMANENT_AUTH_ERRORS:
                     row["authDeadStrikes"] = int(row.get("authDeadStrikes") or 0) + 1
+                    # The strike's own time. `lastAttemptAt` moves on every
+                    # attempt, so only this can bound the race doubt.
+                    row["struckAt"] = now
                     # SAY SO. This is the only place that knows the slot, the
                     # identity and the verdict at the moment it binds, and at
                     # AUTH_DEAD_STRIKES=1 one line here is the whole
@@ -1307,6 +1321,7 @@ class UsageStore:
                 row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
             row["struckFingerprint"] = None
+            row["struckAt"] = None
             if not strike_only:
                 # A strike heal is evidence the FINGERPRINT no longer matches,
                 # not evidence the server's own 429 throttle lifted:
@@ -1337,7 +1352,7 @@ def _row_eligible(
         _strike_is_suspected_race(
             int(row.get("authDeadStrikes") or 0),
             _num_or_none(row.get("fetchedAt")),
-            _num_or_none(row.get("lastAttemptAt")),
+            _num_or_none(row.get("struckAt")),
         )
     ):
         return False

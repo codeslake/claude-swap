@@ -44,26 +44,28 @@ def store(tmp_path, clock):
     return UsageStore(tmp_path / "cache", clock=clock)
 
 
-def _row(fetched_at, last_attempt_at, strikes=AUTH_DEAD_STRIKES):
+def _row(fetched_at, struck_at, strikes=AUTH_DEAD_STRIKES):
+    # `lastAttemptAt` rides along at the same value: it is what a real row
+    # looks like right after the strike, and it must NOT be what decides.
     return {"authDeadStrikes": strikes, "fetchedAt": fetched_at,
-            "lastAttemptAt": last_attempt_at}
+            "lastAttemptAt": struck_at, "struckAt": struck_at}
 
 
 # --- the dead direction: a real quarantine must survive all of this ---
 
-@pytest.mark.parametrize("fetched,attempt,why", [
+@pytest.mark.parametrize("fetched,struck,why", [
     (None, 2_000.0, "never succeeded, so nothing says it was ever alive"),
-    (2_000.0, None, "no attempt recorded, so no gap can be computed"),
+    (2_000.0, None, "no strike time recorded (legacy row), so no gap exists"),
     (1_000.0, 1_000.0 + RACE_WINDOW_S + 1, "the success is outside the window"),
     (1_000.0, 1_000.0 + 900, "a full poll interval later is not a race"),
-    (2_000.0, 1_000.0, "attempt BEFORE the success: a negative gap is not a race"),
+    (2_000.0, 1_000.0, "struck BEFORE the success: a negative gap is not a race"),
 ])
-def test_a_genuine_quarantine_is_not_released(fetched, attempt, why):
+def test_a_genuine_quarantine_is_not_released(fetched, struck, why):
     """No success inside the window means no evidence the lineage answered."""
     entry = UsageEntry(auth_dead_strikes=AUTH_DEAD_STRIKES,
-                       fetched_at=fetched, last_attempt_at=attempt)
+                       fetched_at=fetched, struck_at=struck)
     assert entry.token_dead(), f"a dead token was released: {why}"
-    assert not _row_eligible(_row(fetched, attempt), now=9_999.0,
+    assert not _row_eligible(_row(fetched, struck), now=9_999.0,
                              respect_plans=False), (
         f"a dead token was let back onto the fetch path: {why}"
     )
@@ -72,7 +74,7 @@ def test_a_genuine_quarantine_is_not_released(fetched, attempt, why):
 def test_an_unstruck_row_is_unaffected_by_the_window():
     """CONTROL: the guard must not be what makes a healthy row healthy."""
     entry = UsageEntry(auth_dead_strikes=0, fetched_at=1_000.0,
-                       last_attempt_at=1_310.0)
+                       struck_at=1_310.0)
     assert not entry.token_dead()
     # `token_dead` returns before the guard when unstruck, so that assert
     # alone survives every mutation of it. This call does traverse it.
@@ -85,7 +87,7 @@ def test_an_unstruck_row_is_unaffected_by_the_window():
 def test_a_strike_moments_after_a_success_is_not_read_as_dead():
     """310 s inside a 600 s window, the gap seen in the field."""
     entry = UsageEntry(auth_dead_strikes=AUTH_DEAD_STRIKES,
-                       fetched_at=1_000.0, last_attempt_at=1_310.0)
+                       fetched_at=1_000.0, struck_at=1_310.0)
     assert not entry.token_dead(), (
         "a lineage that answered 310s before it was struck was condemned"
     )
@@ -120,7 +122,7 @@ def test_the_retry_that_fails_again_makes_the_strike_stick(store, clock):
     assert entry.token_dead(), (
         f"a lineage that failed twice, the second time {RACE_WINDOW_S + 311:.0f}s "
         f"after its last success, was still excused as a race: "
-        f"fetched_at={entry.fetched_at} last_attempt_at={entry.last_attempt_at}"
+        f"fetched_at={entry.fetched_at} struck_at={entry.struck_at}"
     )
 
 
@@ -152,7 +154,7 @@ def test_the_sentinel_tracks_the_window(
     s._usage_store.record({"2": FetchRecord(usage={"five_hour": {"utilization": 5}})},
                           idents)
     row = s._usage_store._read_rows()["2"]
-    row["lastAttemptAt"] = row["fetchedAt"] + gap
+    row["lastAttemptAt"] = row["struckAt"] = row["fetchedAt"] + gap
     row["authDeadStrikes"] = AUTH_DEAD_STRIKES
     row["struckFingerprint"] = oauth.credential_fingerprint(creds)
     s._usage_store._write_rows({"2": row})
@@ -183,11 +185,61 @@ def test_only_the_FIRST_strike_is_ever_doubted(store, clock):
         store.record({"1": FetchRecord(error="invalid_grant", struck_fp="sha256:a")},
                      IDENT)
     entry = store.entries(IDENT)["1"]
-    gap = entry.last_attempt_at - entry.fetched_at
+    gap = entry.struck_at - entry.fetched_at
     assert gap <= RACE_WINDOW_S, (
         f"PREMISE: the success must still be inside the window (gap {gap:.0f}s)"
     )
     assert entry.token_dead(), (
         "a second rejection was excused, so a dead grant keeps being POSTed "
         "for as long as the window lasts"
+    )
+
+
+# --- the doubt must survive an attempt that carries no new evidence ---
+
+def test_a_transient_retry_does_not_erase_the_doubt(store, clock):
+    """The bound that makes the guard worth having. `lastAttemptAt` advances
+    on EVERY attempt while `fetchedAt` moves only on a success, so measuring
+    the gap between them lets a timeout — which is no evidence about the
+    token — widen a doubted strike out of its own window. One invalid_grant
+    plus one network blip would then quarantine a healthy account for good,
+    which is the state this guard exists to prevent."""
+    store.record({"1": FetchRecord(usage={"five_hour": {"utilization": 1}})}, IDENT)
+    clock.advance(310)
+    store.record({"1": FetchRecord(error="invalid_grant", struck_fp="sha256:a")},
+                 IDENT)
+    assert not store.entries(IDENT)["1"].token_dead(), "PREMISE: doubted"
+
+    clock.advance(RACE_WINDOW_S + 1)
+    store.record({"1": FetchRecord(error="http-429")}, IDENT)
+    entry = store.entries(IDENT)["1"]
+    assert entry.auth_dead_strikes == AUTH_DEAD_STRIKES, (
+        "PREMISE: a transient error must not advance the strike count"
+    )
+    assert not entry.token_dead(), (
+        "a timeout carried no evidence about the token and still turned a "
+        "doubted strike into a permanent quarantine"
+    )
+    # DISPLAY IS THE LESSER HALF. Only a fetch can land the success that
+    # clears the strike, so the row must stay ELIGIBLE — `now` is past the
+    # failure backoff so the strike guard is the only thing that can veto.
+    assert _row_eligible(store._read_rows()["1"], now=clock.now + 100_000,
+                         respect_plans=False), (
+        "a doubted row was locked out of the fetch that would clear it"
+    )
+
+
+def test_a_lease_taken_and_never_recorded_does_not_erase_the_doubt(store, clock):
+    """`reserve` stamps `lastAttemptAt` BEFORE the fetch, so a collector that
+    is killed mid-fetch widens the gap having learned nothing at all."""
+    store.record({"1": FetchRecord(usage={"five_hour": {"utilization": 1}})}, IDENT)
+    clock.advance(310)
+    store.record({"1": FetchRecord(error="invalid_grant", struck_fp="sha256:a")},
+                 IDENT)
+    clock.advance(RACE_WINDOW_S + 1)
+    assert store.reserve(["1"], IDENT, respect_plans=False), (
+        "PREMISE: a doubted row must still be eligible to retry"
+    )
+    assert not store.entries(IDENT)["1"].token_dead(), (
+        "a lease nobody ever recorded a result for condemned the token"
     )
