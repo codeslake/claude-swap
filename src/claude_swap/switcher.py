@@ -332,7 +332,9 @@ def _refresh_expiry(blob: str) -> "float | None":
 
 
 #: How long a collect pass waits for the slot lock before leaving a stash
-#: adopt to the next one. A read path may not stall on a switch.
+#: adopt to the next one. `_collect_usage_entries` runs on every list, status
+#: and TUI refresh and asks once per dead slot, so the lock's own 10s default
+#: would freeze the display for 10s PER SLOT against a concurrent switch.
 _ADOPT_LOCK_WAIT_S = 0.5
 
 
@@ -5300,12 +5302,8 @@ class ClaudeAccountSwitcher:
             # A slot mutation in flight is a reason to wait a pass — writing
             # beside it can overwrite a refresh token that switch just
             # persisted, and a refresh token cannot be re-derived.
-            #
-            # AND BRIEFLY. `_collect_usage_entries` calls this once per dead
-            # slot on every list, status and TUI refresh; the lock's default
-            # 10s wait would freeze the display for 10s PER SLOT against any
-            # concurrent switch. The heal is never urgent — the next pass
-            # takes it.
+            # Briefly: this runs once per dead slot on every refresh, and
+            # the heal is never urgent (see _ADOPT_LOCK_WAIT_S).
             if not lock.acquire(timeout=_ADOPT_LOCK_WAIT_S):
                 return False
         except OSError:
