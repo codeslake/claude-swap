@@ -16,6 +16,7 @@ import json
 import pytest
 
 from claude_swap import oauth
+from claude_swap.locking import FileLock
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.usage_store import AUTH_DEAD_STRIKES, FetchRecord as FR
@@ -141,6 +142,116 @@ class TestAdoptStashedLoginForSlot:
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(DEAD)
         assert entry_id in switcher._store._list_unclaimed_credentials()
+
+
+class TestTheAdoptIsASlotMutation:
+    """Every other path that writes a slot credential holds the slot lock, and
+    `_adopt_login_into_slot` says why in its own words: identity, verdict and
+    write must be one transaction, or a switch persisting a rotated refresh
+    token in the gap is overwritten by a guard that had already passed.
+
+    This adopt is reached from `_collect_usage_entries`, a READ path that holds
+    no lock — so it has to take one itself.
+    """
+
+    @pytest.fixture
+    def switcher(self, temp_home, mock_claude_config, sample_sequence_data):
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
+        sample_sequence_data["accounts"]["2"]["uuid"] = "uuid-owner"
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        sw._write_account_credentials("2", "owner@example.com", DEAD)
+        sw._usage_store.record(
+            {"2": FR(error="invalid_grant",
+                     struck_fp=oauth.credential_fingerprint(DEAD))},
+            {"2": ("owner@example.com", "")},
+        )
+        sw._store._write_unclaimed_credential(FRESH, {
+            "reason": "foreign",
+            "configSlot": "1",
+            "fingerprint": oauth.credential_fingerprint(FRESH),
+            "resolvedIdentity": {"uuid": "uuid-owner",
+                                 "email": "owner@example.com",
+                                 "organizationUuid": None},
+        })
+        return sw
+
+    def test_it_does_not_write_while_another_holder_has_the_slot_lock(
+            self, switcher):
+        """A held lock means a slot mutation is in flight. The adopt must
+        stand down for this pass, not write beside it, and not raise into a
+        display refresh."""
+        held = FileLock(switcher.lock_file)
+        assert held.acquire(timeout=5), "premise: the test could take the lock"
+        try:
+            assert switcher._adopt_stashed_login_for_slot(
+                "2", "owner@example.com") is False
+            stored, _ = switcher._read_account_credentials_ex(
+                "2", "owner@example.com")
+            assert oauth.credential_fingerprint(stored) == \
+                oauth.credential_fingerprint(DEAD), "wrote past a held lock"
+        finally:
+            held.release()
+
+    def test_it_adopts_once_the_lock_is_free(self, switcher):
+        """THE CONTROL. Without it the assertion above passes for a build whose
+        adopt never writes at all."""
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is True
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(FRESH)
+
+
+    def test_a_slot_that_heals_while_the_lock_is_waited_out_is_left_alone(
+            self, switcher, monkeypatch):
+        """The pre-check is lock-free, so its answer can be stale by the time
+        the lock is granted. A slot that healed in the gap must not be written
+        over: the credential it now holds is newer than anything in the stash.
+        """
+        calls = []
+
+        def dead(num, email):
+            calls.append(num)
+            return len(calls) == 1        # true for the pre-check, false under the lock
+
+        monkeypatch.setattr(switcher, "_slot_token_dead", dead)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert len(calls) == 2, (
+            "the verdict was not re-derived under the lock", calls)
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD)
+
+    def test_a_slot_the_roster_moved_under_is_left_alone(
+            self, switcher, monkeypatch):
+        """`remove_account` holds no lock and the swap/move paths hold this
+        one, so the roster can change while the lock is waited out. A stale
+        (slot, address) pair would write a live credential into a slot that is
+        now somebody else's."""
+        real = switcher._get_sequence_data
+        seen = {"n": 0}
+
+        def moved():
+            seen["n"] += 1
+            data = real()
+            if seen["n"] > 1:             # the read under the lock
+                data["accounts"]["2"]["email"] = "someone@else.example"
+            return data
+
+        monkeypatch.setattr(switcher, "_get_sequence_data", moved)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD)
 
 
 class TestTheCollectPassReachesTheStash:

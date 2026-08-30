@@ -5150,7 +5150,7 @@ class ClaudeAccountSwitcher:
                 # is the moment its condition became true, so re-read the row
                 # the adopt just healed rather than announcing a re-login the
                 # user already performed.
-                entry = entries[num] = store.entries(
+                entries[num] = store.entries(
                     {num: identities[num]}, models
                 )[num]
             elif dead:
@@ -5283,83 +5283,108 @@ class ClaudeAccountSwitcher:
 
         Returns whether a credential was adopted.
         """
+        # CHEAP PRE-CHECK, LOCK-FREE. This runs on every collect pass for
+        # every slot; taking the lock to answer "nothing to do" would put a
+        # display refresh behind every switch.
         if not email or not self._slot_token_dead(num, email):
             return False
-        data = self._get_sequence_data() or {}
-        record = (data.get("accounts") or {}).get(str(num)) or {}
-        uuid = (record.get("uuid") or "").strip()
-        want_email = email.strip().lower()
-        ident = {num: (email, record.get("organizationUuid") or "")}
-        entry = self._usage_store.entries(ident).get(num)
-        struck_fp = getattr(entry, "struck_fingerprint", None)
-
         try:
-            stash = self._store._list_unclaimed_credentials()
-        except OSError as e:
-            self._logger.warning(
-                "Could not read the stash while healing Account-%s: %s", num, e,
-            )
-            return False
-
-        # NEWEST FIRST. `createdAt` orders the manifest and a later login
-        # supersedes an earlier one; ids embed the same timestamp, so they
-        # break a tie deterministically without a second field.
-        for entry_id, meta in sorted(
-            stash.items(),
-            key=lambda kv: ((kv[1] or {}).get("createdAt") or "", kv[0]),
-            reverse=True,
-        ):
-            meta = meta or {}
-            resolved = meta.get("resolvedIdentity") or {}
-            # IDENTITY AUTHORIZES THE WRITE, not the slot being dead. uuid is
-            # the positive key; the address only decides when the stash
-            # predates uuid capture, and never against a DIFFERENT uuid.
-            r_uuid = (resolved.get("uuid") or "").strip()
-            r_email = (resolved.get("email") or "").strip().lower()
-            if uuid and r_uuid:
-                if r_uuid != uuid:
-                    continue
-            elif not r_email or r_email != want_email:
-                continue
-            # The condemned generation heals nothing, and adopting it would
-            # clear the very strike that describes it.
-            if struck_fp and meta.get("fingerprint") == struck_fp:
-                continue
-            creds, unreadable = self._store._read_unclaimed_credential(entry_id)
-            if unreadable or not creds:
-                continue
-            if oauth.credential_fingerprint(creds) == struck_fp:
-                continue
-            try:
-                self._write_account_credentials(num, email, creds)
-                self._usage_store.clear_dead_token(
-                    [num],
-                    {num: (email, record.get("organizationUuid") or "")},
-                )
-            except (OSError, LockError) as e:
-                self._logger.warning(
-                    "Could not adopt the stashed login into Account-%s: %s. "
-                    "It stays in the stash.", num, e,
-                )
+            lock = FileLock(self.lock_file)
+            if not lock.acquire():
+                # A slot mutation is in flight. Standing down costs one pass;
+                # writing beside it can overwrite a refresh token that switch
+                # just persisted, and a refresh token cannot be re-derived.
                 return False
-            # DROPPED ONLY AFTER THE WRITE LANDED. A stash row outliving its
-            # adoption is listed forever; one dropped before it would lose the
-            # only copy.
+        except (OSError, LockError):
+            return False
+        try:
+            # RE-DERIVED UNDER THE LOCK, never trusted from the pre-check.
+            # The roster moves (`swap_accounts`, `move_account`,
+            # `remove_account`) and a slot can heal while the lock is waited
+            # out — a stale pair writes a live credential into a slot the user
+            # deleted, or over one that no longer needs it.
+            data = self._get_sequence_data() or {}
+            record = (data.get("accounts") or {}).get(str(num)) or {}
+            if (record.get("email") or "").strip() != email.strip():
+                return False
+            if not self._slot_token_dead(num, email):
+                return False
+            uuid = (record.get("uuid") or "").strip()
+            want_email = email.strip().lower()
+            ident = {num: (email, record.get("organizationUuid") or "")}
+            entry = self._usage_store.entries(ident).get(num)
+            struck_fp = getattr(entry, "struck_fingerprint", None)
+
             try:
-                self._store._remove_unclaimed_credential(entry_id)
+                stash = self._store._list_unclaimed_credentials()
             except OSError as e:
                 self._logger.warning(
-                    "Adopted the stashed login into Account-%s but could not "
-                    "drop stash entry %s (%s); `cswap unclaimed --purge` "
-                    "removes it.", num, entry_id, e,
+                    "Could not read the stash while healing Account-%s: %s", num, e,
                 )
-            self._logger.info(
-                "Account-%s (%s): adopted a login that was set aside while "
-                "this slot was still healthy; its quarantine was lifted.",
-                num, email,
-            )
-            return True
-        return False
+                return False
+
+            # NEWEST FIRST. `createdAt` orders the manifest and a later login
+            # supersedes an earlier one; ids embed the same timestamp, so they
+            # break a tie deterministically without a second field.
+            for entry_id, meta in sorted(
+                stash.items(),
+                key=lambda kv: ((kv[1] or {}).get("createdAt") or "", kv[0]),
+                reverse=True,
+            ):
+                meta = meta or {}
+                resolved = meta.get("resolvedIdentity") or {}
+                # IDENTITY AUTHORIZES THE WRITE, not the slot being dead. uuid is
+                # the positive key; the address only decides when the stash
+                # predates uuid capture, and never against a DIFFERENT uuid.
+                r_uuid = (resolved.get("uuid") or "").strip()
+                r_email = (resolved.get("email") or "").strip().lower()
+                if uuid and r_uuid:
+                    if r_uuid != uuid:
+                        continue
+                elif not r_email or r_email != want_email:
+                    continue
+                creds, unreadable = self._store._read_unclaimed_credential(entry_id)
+                if unreadable or not creds:
+                    continue
+                # The condemned generation heals nothing, and adopting it would
+                # clear the very strike that describes it. Judged on the BYTES:
+                # the manifest's own `fingerprint` is a second source of truth
+                # that can only differ by being wrong, and a stale one there
+                # would skip an entry that is fine.
+                if oauth.credential_fingerprint(creds) == struck_fp:
+                    continue
+                try:
+                    self._write_account_credentials(num, email, creds)
+                    self._usage_store.clear_dead_token(
+                        [num],
+                        {num: (email, record.get("organizationUuid") or "")},
+                    )
+                except (OSError, LockError) as e:
+                    self._logger.warning(
+                        "Could not adopt the stashed login into Account-%s: %s. "
+                        "It stays in the stash.", num, e,
+                    )
+                    return False
+                # DROPPED ONLY AFTER THE WRITE LANDED. A stash row outliving its
+                # adoption is listed forever; one dropped before it would lose the
+                # only copy.
+                try:
+                    self._store._remove_unclaimed_credential(entry_id)
+                except OSError as e:
+                    self._logger.warning(
+                        "Adopted the stashed login into Account-%s but could not "
+                        "drop stash entry %s (%s); `cswap unclaimed --purge` "
+                        "removes it.", num, entry_id, e,
+                    )
+                self._logger.info(
+                    "Account-%s (%s): adopted a login that was set aside while "
+                    "this slot was still healthy; its quarantine was lifted.",
+                    num, email,
+                )
+                return True
+            return False
+        finally:
+            lock.release()
 
     def _adopt_into_dead_slot(
         self, foreign_slot: str | None, credentials: str, data: dict
