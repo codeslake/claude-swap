@@ -265,3 +265,17 @@ def test_a_row_struck_before_the_field_existed_keeps_its_doubt(store, clock):
                          respect_plans=False), (
         "upgrading locked a doubted row out of the fetch that would clear it"
     )
+
+    # AND IT MUST SURVIVE TAKING THAT RETRY. `reserve` stamps `lastAttemptAt`
+    # before the fetch, so a fallback that keeps reading that field un-dooubts
+    # the row exactly once and then re-condemns it on a timeout that carried
+    # no evidence — the one-shot migration this pins shut.
+    clock.advance(700)
+    assert store.reserve(["1"], IDENT, respect_plans=False)
+    store.record({"1": FetchRecord(error="timeout")}, IDENT)
+    entry = store.entries(IDENT)["1"]
+    assert entry.auth_dead_strikes == AUTH_DEAD_STRIKES, "PREMISE: still one strike"
+    assert not entry.token_dead(), (
+        "a legacy row lost its doubt to a timeout, which is evidence of "
+        "nothing, so the quarantine became permanent after one retry"
+    )

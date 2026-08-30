@@ -3039,7 +3039,7 @@ class ClaudeAccountSwitcher:
         seen_email = (resolved.get("email") or "").strip()
         seen_org = (resolved.get("organizationUuid") or "").strip()
         if seen_uuid:
-            hits = []
+            hits, exact = [], []
             for num, acc in (data.get("accounts") or {}).items():
                 org = (acc.get("organizationUuid") or "").strip()
                 # A blank org on either side corroborates nothing, so it
@@ -3053,6 +3053,12 @@ class ClaudeAccountSwitcher:
                     not seen_org or not org or org == seen_org
                 ):
                     hits.append(num)
+                    if org == seen_org:
+                        exact.append(num)
+            # An exact org match beats a blank-org tolerance: a half-migrated
+            # roster carrying one org-less record must not make an otherwise
+            # unambiguous match read as a tie.
+            hits = exact or hits
             # ONE UUID CAN NAME TWO SLOTS: an account in two orgs is two
             # records under the same account uuid. The org separates them, and
             # with none to separate them the answer is ambiguous — a first-hit
@@ -3078,9 +3084,11 @@ class ClaudeAccountSwitcher:
         """Store a credential in the slot the server says owns it.
 
         Returns whether the question is SETTLED for this lineage. False means
-        "could not decide" — an unreadable backup, lock contention, an owner
-        whose own credential is still good — and the caller keeps the resolved
-        profile so a later pass can retry without a second network probe.
+        "could not decide" — an unreadable backup, or an owner whose own
+        credential is still good — and the caller keeps the resolved profile
+        so a later pass retries without a second network probe. Lock
+        contention does not return: it raises, and the caller's handler leaves
+        the profile in place for the same reason.
         """
 
         def _refresh_expiry(blob: str) -> "float | None":
@@ -4519,8 +4527,8 @@ class ClaudeAccountSwitcher:
                                 "Account-%s kept a SPENT refresh token: the "
                                 "rotated credential reached the active store "
                                 "but not the slot backup, twice. This slot "
-                                "will report re-login needed once it is no "
-                                "longer active; a re-login repairs it.",
+                                "reads \"re-login may be needed\" once it is "
+                                "no longer active; a re-login repairs it.",
                                 account_num,
                             )
                     if not live_ok:
@@ -6790,11 +6798,13 @@ class ClaudeAccountSwitcher:
             # subprocess — a cost no sweep should pay when the expiry arm
             # already condemned everything it looked at.
             out: dict[str, str] = {}
-            for num, account in (self._get_sequence_data() or {}).get(
-                "accounts", {}
+            for num, account in (
+                (self._get_sequence_data() or {}).get("accounts") or {}
             ).items():
                 fp = oauth.credential_fingerprint(
-                    self._read_account_credentials(num, account.get("email", ""))
+                    self._read_account_credentials(
+                        num, (account or {}).get("email") or ""
+                    )
                 )
                 if fp:
                     out.setdefault(fp, num)
@@ -6814,14 +6824,10 @@ class ClaudeAccountSwitcher:
                 # dropped up to OAUTH_EXPIRY_BUFFER_MS early. Give the refresh
                 # token its own predicate if that window ever matters.
                 why = "its refresh token has expired"
-            elif fp is None:
-                # No fingerprint can match the map, so do not pay to build it.
-                kept += 1
-                continue
             else:
                 if stored is None:
                     stored = _slot_fingerprints()
-                if fp in stored:
+                if fp is not None and fp in stored:
                     why = f"Account-{stored[fp]} already stores that credential"
                 else:
                     # A consume-gate row names its owner (`configSlot`) and the

@@ -242,12 +242,15 @@ RACE_WINDOW_S = 600.0
 def _strike_time(row: dict) -> float | None:
     """When this row's strike landed.
 
-    Falls back to `lastAttemptAt` for rows written before `struckAt` existed.
-    A struck row is frozen out of fetches, so that field has not moved since
-    the strike and is the strike time for such a row — and without the
-    fallback an upgrade re-condemns every row the previous release was
-    doubting, which no later fetch can undo because the strike blocks the
-    fetch that would clear it.
+    Falls back to `lastAttemptAt` for a struck row written before `struckAt`
+    existed: that is the field the previous release measured, so this
+    reproduces its reading rather than re-condemning every row it was
+    doubting — which no later fetch could undo, the strike being what blocks
+    the fetch that would clear it.
+
+    The fallback only ever has to answer once. `reserve` migrates such a row
+    before it overwrites `lastAttemptAt`, so the value read here has not been
+    moved by an attempt.
     """
     at = _num_or_none(row.get("struckAt"))
     return at if at is not None else _num_or_none(row.get("lastAttemptAt"))
@@ -1106,6 +1109,15 @@ class UsageStore:
                     ):
                         continue
                 claim_id = uuid.uuid4().hex
+                # A row struck before `struckAt` existed carries its strike
+                # time in `lastAttemptAt`, and the stamp below is about to
+                # overwrite it. Migrate here, once, or the doubt such a row is
+                # owed survives exactly one retry and a timeout then condemns
+                # it forever.
+                if row.get("struckAt") is None and int(
+                    row.get("authDeadStrikes") or 0
+                ):
+                    row["struckAt"] = row.get("lastAttemptAt")
                 row["lastAttemptAt"] = now
                 row["claimId"] = claim_id
                 row["claimUntil"] = now + CLAIM_TTL_S

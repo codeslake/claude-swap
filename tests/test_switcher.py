@@ -9365,7 +9365,7 @@ class TestUnclaimedStashSweep:
             )
 
     def test_a_torn_roster_during_the_sweep_never_fails_the_stash(
-        self, temp_home,
+        self, temp_home, caplog,
     ):
         """The sweep reads the roster to build its fingerprint map, and
         `_get_sequence_data` is `strict=True` — a torn or unreadable
@@ -9379,12 +9379,21 @@ class TestUnclaimedStashSweep:
         )
         switcher.sequence_file.write_text("{ this is not json")
 
-        entry_id = switcher._stash_live_credential(
-            self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
-        )
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            entry_id = switcher._stash_live_credential(
+                self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
+            )
         assert entry_id in switcher.list_unclaimed_credentials(), (
             "a torn roster turned a successful stash into a failed one"
         )
+        # Pins that the SWEEP ran and its containment fired. Without this,
+        # deleting the sweep call entirely leaves this test green.
+        assert any(
+            "sweeping the unclaimed stash" in r.getMessage()
+            for r in caplog.records
+        ), "the containment arm was never reached"
 
     def test_a_consume_gate_entry_is_not_called_ownerless(self, temp_home, caplog):
         """The stash namespace is shared: the consume gate stores a minted
@@ -9414,6 +9423,52 @@ class TestUnclaimedStashSweep:
             f"the consume-gate row was counted as ownerless: {owner_lines}"
         )
         assert ownerless in switcher.list_unclaimed_credentials()
+
+    def test_a_consume_gate_entry_with_unreadable_bytes_is_still_owned(
+        self, temp_home, caplog,
+    ):
+        """`_read_unclaimed_credential` returns "" for a locked volume, a
+        mid-unmount, or a manifest row whose bytes the previous unlink already
+        took — so a consume-gate row can reach the sweep with no fingerprint.
+        Its MANIFEST still names `configSlot` and `consumedFp`, so calling it
+        ownerless is false and the `--purge` that warning suggests destroys
+        the only copy of a spent grant's successor."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("successor-rt", self._ms(20)),
+            {"configSlot": "1", "consumedFp": "sha256:abc"},
+        )
+        switcher._store._stash_entry_path(entry_id).unlink()
+        assert switcher._store._read_unclaimed_credential(entry_id) == ("", False), (
+            "premise: the bytes must be gone while the manifest row remains"
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash()
+        assert not any(
+            "names an owner" in r.getMessage() for r in caplog.records
+        ), "a row naming configSlot was counted as ownerless"
+
+    def test_a_null_accounts_roster_never_fails_the_stash(self, temp_home):
+        """`{"accounts": null}` is valid JSON and a dict, so it sails past
+        `_read_json`'s type check and only blows up at `.items()` — an
+        `AttributeError`, which is outside the containment and so aborts a
+        switch whose stash already landed. Same harm as the torn file, one
+        type away, and the `or {}` idiom the rest of the file uses is what
+        closes it."""
+        switcher = self._switcher(temp_home)
+        switcher._store._write_unclaimed_credential(
+            self._creds("keep-me-rt", self._ms(20)), {"reason": "foreign"},
+        )
+        switcher._write_json(switcher.sequence_file, {"accounts": None})
+
+        entry_id = switcher._stash_live_credential(
+            self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
+        )
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "a null accounts map turned a successful stash into a failed one"
+        )
 
     def test_the_sweep_reads_no_slot_when_nothing_can_be_dropped(
         self, temp_home,
@@ -15493,6 +15548,19 @@ class TestALoginLandsInItsOwnSlot:
             "verdict was still in doubt, so the login is lost for the life "
             "of the process")
 
+    def test_an_exact_org_match_beats_a_blank_org_sibling(self, temp_home):
+        """A half-migrated roster carries org-less records beside real ones.
+        Treating the blank as a peer makes an otherwise unambiguous match read
+        as a tie, and the login goes back to the stash instead of home."""
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {
+            "1": {"email": "u@x", "organizationUuid": "ORG-A", "uuid": "u-1"},
+            "2": {"email": "u@x", "organizationUuid": "", "uuid": "u-1"},
+        }}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-1", "email": "u@x",
+                   "organizationUuid": "ORG-A"}) == "1"
+
     def test_two_records_of_one_account_and_org_are_ambiguous(self, temp_home):
         """THE BRANCH `len(hits) == 1` EXISTS FOR. Once the org is compared
         outright, two slots differing by org no longer both hit — so the only
@@ -15539,6 +15607,42 @@ class TestALoginLandsInItsOwnSlot:
             "to the account that slot number used to hold"
         )
 
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="chmod(0o000) does not deny root or Windows",
+    )
+    def test_an_unreadable_pass_does_not_spend_the_only_attempt(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """THE OTHER HALF OF THE CONTRACT. Refusing on an unreadable backup is
+        only half a fix: the memo short-circuits the next pass, so if that
+        refusal is reported as SETTLED the login is dropped for the life of
+        the process — the same one-shot failure the field-shaped quarantine
+        had. A locked Keychain clears; the answer must be retried."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s.platform = Platform.LINUX
+        s._write_account_credentials("1", "c@example.com", self._blob("rt-dead"))
+        s._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant")},
+            {"1": ("c@example.com", "o-1")},
+        )
+        enc = s._store._backup_enc_path("1", "c@example.com")
+        enc.chmod(0o000)
+        try:
+            self._resync_as_slot_2(s, self._blob("rt-live"))
+        finally:
+            enc.chmod(0o600)
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-dead", (
+            "PREMISE: the unreadable pass must refuse to write")
+
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            "the unreadable pass was reported settled, so the retry never "
+            "ran and the owner's login is lost until the process restarts")
+
     def test_a_settled_adopt_stops_being_retried(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
@@ -15559,6 +15663,9 @@ class TestALoginLandsInItsOwnSlot:
         with patch.object(s, "_adopt_login_into_slot") as again:
             self._resync_as_slot_2(s, live)
         again.assert_not_called()
+        # States the property directly, so an unrelated early return upstream
+        # cannot make the absence above pass for free.
+        assert not s._resolved_owners
 
     def test_an_account_that_moved_slots_is_still_adopted(
         self, temp_home: Path, mock_claude_config: Path,
