@@ -3,6 +3,8 @@ the ACCOUNT's refresh token dead, and the post-switch "no restart needed".
 Evidence is in the commit; each test states the state it drives.
 """
 import json
+import logging
+import re
 
 import pytest
 
@@ -52,12 +54,19 @@ def test_the_relogin_note_does_not_condemn_a_live_credential_that_moved_on(
         "no longer measures the state the note is wrong about"
     )
     note = SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
-    assert "refresh token dead" not in note and "a stored refresh token" in note, (
+    assert "refresh token dead" not in note and "stored" in note, (
         f"{note!r} must name the STORED copy: here the live credential "
-        "authenticates and only a stored one was rejected"
+        "authenticates and only a stored one failed"
     )
-    # The strike supports "these bytes were rejected" and nothing more.
-    assert "may clear it" in note, (
+    # One sentinel, two errors: `no_refresh_token` strikes too
+    # (PERMANENT_AUTH_ERRORS) and is decided before any request is built, so
+    # nothing was sent and nothing rotates. `UsageStore.record` routes its LOG
+    # on the fingerprint; a static note cannot, so it must be true of both.
+    assert "rotation" not in note and "rejected" not in note, (
+        f"{note!r} is false for the no_refresh_token half of this sentinel"
+    )
+    # The strike supports "the refresh failed" and nothing more.
+    assert re.search(r"\bif it persists\b|\bmay\b", note), (
         f"{note!r} presents the re-login as required; one invalid_grant on a "
         "single-use grant does not establish that"
     )
@@ -100,4 +109,28 @@ def test_switch_followup_names_only_the_sessions_that_can_read_it(
     )
     assert ("Not logged in" in out) is bool(named), (
         f"the caveat must name the symptom it clears: {out!r}"
+    )
+
+
+def test_a_failed_session_scan_does_not_undo_a_committed_switch(monkeypatch, capsys):
+    """The scan runs after the switch has committed, so a raise here would
+    surface as a switch failure for work that already succeeded. `Path.home()`
+    raises when HOME is unset, and both directory globs are lazy enough to
+    raise mid-iteration past their per-file handlers."""
+    s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+    s._logger = logging.getLogger("test-switch-followup")
+    monkeypatch.setattr(
+        ClaudeAccountSwitcher, "_last_active_credentials_backend", "file",
+    )
+
+    def boom():
+        raise OSError("sessions directory vanished mid-scan")
+
+    monkeypatch.setattr("claude_swap.switcher.get_running_instances", boom)
+
+    s._print_switch_followup()   # must not raise
+
+    out = capsys.readouterr().out
+    assert "no restart needed" in out and "already running" not in out, (
+        f"a failed scan must leave the switch reported as done: {out!r}"
     )

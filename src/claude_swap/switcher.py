@@ -200,11 +200,12 @@ SENTINEL_NOTES = {
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    # NOT the ACCOUNT's: the strike binds to the bytes that were POSTed, and a
-    # single-use grant the live client rotated past fails without anyone being
-    # at fault. So the remedy stays conditional — `UsageStore.record` hedges
-    # the same way in the line that imposes the quarantine.
-    USAGE_RELOGIN_REQUIRED: "re-login needed — a stored refresh token was rejected; a rotation may clear it, else log in with Claude Code and run: cswap add",
+    # NOT the ACCOUNT's, and true of BOTH PERMANENT_AUTH_ERRORS: `invalid_grant`
+    # on a single-use grant the live client rotated past fails with nobody at
+    # fault, while `no_refresh_token` never reaches the endpoint at all. A
+    # static note cannot route on the fingerprint the way `UsageStore.record`
+    # routes its log, so it names the condition and keeps the remedy conditional.
+    USAGE_RELOGIN_REQUIRED: "re-login needed — a stored credential's refresh failed; if it persists, log in with Claude Code and run: cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
     # `/login` writes to whichever account is active, so switching first is
@@ -7359,8 +7360,7 @@ class ClaudeAccountSwitcher:
 
         "Usually", not "never", which is why already-running sessions get
         named: a rejected credential surfaces as ``InvalidRequestHeaderValueError``
-        (measured in 2.1.251)
-        while BUILDING the request. No HTTP status means none of the paths that
+        while BUILDING the request (measured in 2.1.251). No HTTP status means none of the paths that
         rebuild the client on 401/403/socket errors fire, so nothing cswap
         writes afterwards is re-read and only a restart clears it.
         """
@@ -7376,10 +7376,12 @@ class ClaudeAccountSwitcher:
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
         # Every live session predates a switch that has committed, so this needs
-        # no timestamp — only which of them a human could act on; a bg/daemon
-        # session has no banner and nothing to restart. EXCLUDE rather than
+        # no timestamp — only which of them can SHOW the symptom named below; a
+        # bg/daemon session has no banner to render it. EXCLUDE rather than
         # match "interactive", so an unknown kind still counts: an overcount is
-        # visible, a silent zero is not. Best-effort like `list_accounts`.
+        # visible, a silent zero is not. (`list_accounts`' own "Running
+        # instances" block counts every kind — a different question, same scan.)
+        # Best-effort: the switch has committed and must not fail on a scan.
         try:
             running = sum(
                 1 for s in get_running_instances()[0]
@@ -7391,7 +7393,7 @@ class ClaudeAccountSwitcher:
         if running:
             print(dimmed(
                 f"  {running} Claude session{'s' if running > 1 else ''} "
-                "already running — restart any that keeps saying "
+                "already running — restart any still saying "
                 '"Not logged in · Please run /login".'
             ))
 
