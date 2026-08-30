@@ -18,6 +18,7 @@ from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     LockError,
@@ -388,10 +389,10 @@ class ClaudeAccountSwitcher:
         self._probe_verdicts: dict[
             tuple[str, str, str, str, str, str], bool
         ] = {}
-        # The owner a False verdict named, with the profile that named it, so
-        # a later pass can retry the adopt without re-probing the endpoint.
+        # The profile a False verdict resolved, kept only while an adopt is
+        # still unsettled, so a later pass can retry it with no second probe.
         self._resolved_owners: dict[
-            tuple[str, str, str, str, str, str], tuple[str, dict]
+            tuple[str, str, str, str, str, str], dict
         ] = {}
 
         # Run any pending one-time data migrations (e.g. relocating Windows
@@ -3038,19 +3039,20 @@ class ClaudeAccountSwitcher:
         seen_email = (resolved.get("email") or "").strip()
         seen_org = (resolved.get("organizationUuid") or "").strip()
         if seen_uuid:
-            hits = [
-                num
-                for num, acc in (data.get("accounts") or {}).items()
-                if (acc.get("uuid") or "").strip() == seen_uuid
-                and (acc.get("organizationUuid") or "").strip() == seen_org
-            ]
-            # COMPARED OUTRIGHT, unlike `_resolved_matches_slot_identity`,
-            # which waives a blank org on either side. That function
-            # corroborates a slot the caller already named; this one SELECTS
-            # one out of the whole roster, where a blank org is the entire
-            # evidence — and `fetch_oauth_profile` returns no org at all for a
-            # personal login, so waiving it would be the common case, not a
-            # corner. Both sides are already normalised to "".
+            hits = []
+            for num, acc in (data.get("accounts") or {}).items():
+                org = (acc.get("organizationUuid") or "").strip()
+                # A blank org on either side corroborates nothing, so it
+                # cannot condemn — the tolerance the uuid path of
+                # `_resolved_matches_slot_identity` applies. It does not need
+                # to condemn: the uuid names the ACCOUNT, so a lone hit is
+                # that account's slot whatever the org says, and the only case
+                # a blank could get wrong is two records for one uuid, which
+                # the count below already refuses.
+                if (acc.get("uuid") or "").strip() == seen_uuid and (
+                    not seen_org or not org or org == seen_org
+                ):
+                    hits.append(num)
             # ONE UUID CAN NAME TWO SLOTS: an account in two orgs is two
             # records under the same account uuid. The org separates them, and
             # with none to separate them the answer is ambiguous — a first-hit
@@ -3071,9 +3073,15 @@ class ClaudeAccountSwitcher:
         return None
 
     def _adopt_login_into_slot(
-        self, owner: str, creds: str, resolved: dict
-    ) -> None:
-        """Store a credential in the slot the server says owns it."""
+        self, account_num: str, creds: str, resolved: dict
+    ) -> bool:
+        """Store a credential in the slot the server says owns it.
+
+        Returns whether the question is SETTLED for this lineage. False means
+        "could not decide" — an unreadable backup, lock contention, an owner
+        whose own credential is still good — and the caller keeps the resolved
+        profile so a later pass can retry without a second network probe.
+        """
 
         def _refresh_expiry(blob: str) -> "float | None":
             v = (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
@@ -3082,6 +3090,8 @@ class ClaudeAccountSwitcher:
         # Slot mutations hold this lock, so identity, verdict and write are one
         # transaction: a switch persisting a rotated refresh token in the gap
         # would otherwise be overwritten by a guard that had already passed.
+        # A LockError from the acquire propagates to `_resync_rotated_backup`,
+        # which returns without popping the memo — so contention retries.
         with FileLock(self.lock_file):
             # RE-DERIVED HERE, not trusted from the caller's pre-lock scan.
             # `swap_accounts` and `move_account` hold this lock and
@@ -3090,22 +3100,23 @@ class ClaudeAccountSwitcher:
             # refresh token back for a slot the user deleted, or an orphan
             # .enc under an address no reader of the slot recomputes.
             data = self._get_sequence_data() or {}
-            if self._slot_owning_resolved_identity(data, resolved) != owner:
-                return
+            owner = self._slot_owning_resolved_identity(data, resolved)
+            if not owner or owner == account_num:
+                return True  # nobody here to adopt into
             acc = (data.get("accounts") or {}).get(owner) or {}
             owner_email = (acc.get("email") or "").strip()
             if not owner_email:
-                return
+                return True  # nothing keys the write; a retry changes nothing
             stored, unreadable = self._read_account_credentials_ex(
                 owner, owner_email
             )
             if unreadable:
-                return  # a read that FAILED is not an empty slot
+                return False  # a read that FAILED is not an empty slot
             if stored and (
                 oauth.credential_fingerprint(stored)
                 == oauth.credential_fingerprint(creds)
             ):
-                return  # already there — re-writing it only shifts .prev
+                return True  # already there — re-writing only shifts .prev
             # ONLY A SLOT WITH NOWHERE TO PUT A LOGIN. An identity mismatch
             # alone is transient during an ordinary switch, and adopting on it
             # overwrites the rotated refresh token that switch just persisted.
@@ -3113,7 +3124,7 @@ class ClaudeAccountSwitcher:
             # heal already run on: it binds to the struck generation, so a
             # strike the slot has outlived authorizes nothing.
             if stored and not self._slot_token_dead(owner, owner_email):
-                return
+                return False  # its own credential may yet be condemned
             # RECENCY DECIDES, IN ONE DIRECTION ONLY, AND ONLY BETWEEN TWO
             # LOGINS. A refresh token cannot be re-derived, so a live
             # credential whose refresh lifetime ends EARLIER than the stored
@@ -3130,7 +3141,7 @@ class ClaudeAccountSwitcher:
                     "stored one, so the stored credential was kept.",
                     owner, owner_email,
                 )
-                return
+                return True
             self._write_account_credentials(owner, owner_email, creds)
             # The strike condemned the generation this write just replaced.
             # `_row_eligible` gates the fetch on the RAW count, so a strike
@@ -3156,6 +3167,7 @@ class ClaudeAccountSwitcher:
             "set aside.",
             owner, owner_email,
         )
+        return True
 
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
@@ -4600,9 +4612,11 @@ class ClaudeAccountSwitcher:
                 # change, and the memo is here to skip the network probe, not
                 # to make one attempt the only one. The owner is memoized with
                 # the verdict so this costs no probe.
-                named = self._resolved_owners.get(lineage)
-                if named:
-                    self._adopt_login_into_slot(named[0], creds, named[1])
+                profile = self._resolved_owners.get(lineage)
+                if profile and self._adopt_login_into_slot(
+                    account_num, creds, profile
+                ):
+                    self._resolved_owners.pop(lineage, None)
                 return
             if verdict is not True:
                 resolved = oauth.fetch_oauth_profile(
@@ -4639,8 +4653,11 @@ class ClaudeAccountSwitcher:
                         self._get_sequence_data() or {}, resolved
                     )
                     if owner and owner != account_num:
-                        self._resolved_owners[lineage] = (owner, resolved)
-                        self._adopt_login_into_slot(owner, creds, resolved)
+                        self._resolved_owners[lineage] = resolved
+                        if self._adopt_login_into_slot(
+                            account_num, creds, resolved
+                        ):
+                            self._resolved_owners.pop(lineage, None)
                         return
                     key = (account_num, email, "resync")
                     if key not in self._provenance_warned:
@@ -6694,16 +6711,18 @@ class ClaudeAccountSwitcher:
             )
         try:
             self._sweep_unclaimed_stash()
-        except (OSError, LockError, CredentialReadError):
+        except (ClaudeSwitchError, OSError):
             # Housekeeping, and this method's contract is the opposite: a
             # raise here would read as a failed stash, and every caller aborts
             # the switch on one. Drops already made stand; the rest waits for
             # the next stash.
             #
-            # NAMED, not `Exception`. The suite's real-store guard is
-            # deliberately not an OSError subclass so no containment can hide
-            # a write into the REAL store, and this contains a method that
-            # unlinks credential files and rewrites the stash manifest.
+            # cswap's OWN error family plus I/O, not `Exception`. The suite's
+            # real-store guard sits outside that family on purpose, so no
+            # containment can hide a write into the REAL store — while the
+            # roster read below is `strict=True`, and a torn sequence.json
+            # raising `ConfigError` must stay contained rather than report a
+            # stash that in fact landed.
             self._logger.warning(
                 "Could not finish sweeping the unclaimed stash; entries it had "
                 "not reached yet are still there.",
@@ -6761,10 +6780,14 @@ class ClaudeAccountSwitcher:
                 # dropped up to OAUTH_EXPIRY_BUFFER_MS early. Give the refresh
                 # token its own predicate if that window ever matters.
                 why = "its refresh token has expired"
+            elif fp is None:
+                # No fingerprint can match the map, so do not pay to build it.
+                kept += 1
+                continue
             else:
                 if stored is None:
                     stored = _slot_fingerprints()
-                if fp is not None and fp in stored:
+                if fp in stored:
                     why = f"Account-{stored[fp]} already stores that credential"
                 else:
                     # A consume-gate row names its owner (`configSlot`) and the

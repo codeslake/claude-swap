@@ -243,3 +243,25 @@ def test_a_lease_taken_and_never_recorded_does_not_erase_the_doubt(store, clock)
     assert not store.entries(IDENT)["1"].token_dead(), (
         "a lease nobody ever recorded a result for condemned the token"
     )
+
+
+def test_a_row_struck_before_the_field_existed_keeps_its_doubt(store, clock):
+    """THE UPGRADE. The deployed release recorded `lastAttemptAt` and no
+    `struckAt`, so reading the absence as "no evidence" re-condemns every row
+    it had doubted — and only a fetch can clear a strike, so that quarantine
+    is permanent. A struck legacy row is frozen out of fetches, which is
+    exactly why `lastAttemptAt` has not moved since the strike and can stand
+    in for it."""
+    store._write_rows({"1": {
+        "email": "a@x.com", "organizationUuid": "",
+        "authDeadStrikes": AUTH_DEAD_STRIKES,
+        "struckFingerprint": "sha256:a",
+        "fetchedAt": clock.now, "lastAttemptAt": clock.now + 310,
+    }})
+    assert not store.entries(IDENT)["1"].token_dead(), (
+        "upgrading condemned a row the previous release was doubting"
+    )
+    assert _row_eligible(store._read_rows()["1"], now=clock.now + 100_000,
+                         respect_plans=False), (
+        "upgrading locked a doubted row out of the fetch that would clear it"
+    )

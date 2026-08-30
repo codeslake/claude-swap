@@ -239,6 +239,20 @@ AUTH_DEAD_STRIKES = 1
 RACE_WINDOW_S = 600.0
 
 
+def _strike_time(row: dict) -> float | None:
+    """When this row's strike landed.
+
+    Falls back to `lastAttemptAt` for rows written before `struckAt` existed.
+    A struck row is frozen out of fetches, so that field has not moved since
+    the strike and is the strike time for such a row — and without the
+    fallback an upgrade re-condemns every row the previous release was
+    doubting, which no later fetch can undo because the strike blocks the
+    fetch that would clear it.
+    """
+    at = _num_or_none(row.get("struckAt"))
+    return at if at is not None else _num_or_none(row.get("lastAttemptAt"))
+
+
 def _strike_is_suspected_race(
     strikes: int, fetched_at: float | None, struck_at: float | None
 ) -> bool:
@@ -335,8 +349,9 @@ class UsageEntry:
     # Fingerprint of the generation the strikes condemned (absent on legacy
     # rows → strikes bind unconditionally). See ``token_dead``.
     struck_fingerprint: str | None = None
-    # When the FIRST strike landed. Absent on rows struck before this field
-    # existed → no race doubt, which is how they already read.
+    # When the most recent strike landed (at AUTH_DEAD_STRIKES = 1, the only
+    # one). Populated by `entries`, which falls back to `lastAttemptAt` for
+    # rows written before this field existed — see `_strike_time`.
     struck_at: float | None = None
     # Staleness past STALE_OK_S is still decision-trusted when it is
     # *deliberate*: the server is refusing fresher data (failure state), or the
@@ -997,7 +1012,7 @@ class UsageStore:
                 last_429_at=_num_or_none(row.get("last429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),
-                struck_at=_num_or_none(row.get("struckAt")),
+                struck_at=_strike_time(row),
                 trust_extended=trust_extended,
                 claim_until=claim_until,
             )
@@ -1197,7 +1212,7 @@ class UsageStore:
                             "Account %s (%s) is quarantined: its stored "
                             "credential's refresh failed with %s, so it is "
                             "not fetched and reads "
-                            "\"re-login needed\" — %s. Strike %s of %s.",
+                            "\"re-login may be needed\" — %s. Strike %s of %s.",
                             num,
                             (_ident[0] if _ident else "unknown"),
                             rec.error,
@@ -1352,7 +1367,7 @@ def _row_eligible(
         _strike_is_suspected_race(
             int(row.get("authDeadStrikes") or 0),
             _num_or_none(row.get("fetchedAt")),
-            _num_or_none(row.get("struckAt")),
+            _strike_time(row),
         )
     ):
         return False
