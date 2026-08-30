@@ -1302,6 +1302,11 @@ class TestDeadTokenQuarantine:
             "a strike the message itself calls possibly-stale escalated to "
             f"{caplog.records[-1].levelname}"
         )
+        # SCOPE. Two of the three struck_fp mint sites are idle-only, where no
+        # live client rotates anything -- an unscoped promise is wrong there.
+        assert "only on the active slot" in said, (
+            f"the rotation promise lost its scope: {said!r}"
+        )
 
     def test_an_unbound_quarantine_still_demands_a_re_login(self, store, caplog):
         """THE CONTROL. A row struck with no fingerprint binds
@@ -1373,6 +1378,11 @@ class TestDeadTokenQuarantine:
         assert caplog.records[-1].args[:2] == ("1", "a@x.com"), (
             f"the heal swapped its slot and identity args: "
             f"{caplog.records[-1].args[:2]!r}"
+        )
+        # DIRECTION. Position, level, args and guard are each pinned; without
+        # this the line could announce the opposite and still pass them all.
+        assert "out of quarantine" in said, (
+            f"the heal announces the wrong direction: {said!r}"
         )
 
     def test_clearing_an_unstruck_row_stays_quiet(self, store, caplog):
