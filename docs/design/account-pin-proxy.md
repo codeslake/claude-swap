@@ -94,14 +94,17 @@ The second family is the environment's OWNERSHIP routes: register
 `bridge/reconnect`. Each goes through the one auth wrapper that reads
 `getAccessToken()`, so each has to follow the pin -- unpinned, the machine
 registers under the active account, and ownership is fixed at creation.
-Inherited from the code-session case live-tested above, not measured here. The
-header builder is NOT the discriminator -- the `work/` calls below share it.
+No longer inherited: the collection read below shows the registered machine
+under the pinned account and not under the active one, so the register did
+follow the pin. The header builder is NOT the discriminator -- the `work/`
+calls below share it.
 
 The bare collection read is pinned too but for a different reason: it creates
 nothing and mints nothing, yet asked as the active account it answers 200 with
 the WRONG account's environments, so the pinned machines are simply absent and
-nothing looks broken. Reasoned by analogy: the 200-with-the-wrong-contents
-was traced on `/v1/sessions`, not here.
+nothing looks broken. Traced here, not by analogy: the same request with the
+active bearer and with the pinned one returns 200 both times, with disjoint
+contents.
 
 Two neighbours stay OUT, and they stay out by DIFFERENT means:
 
