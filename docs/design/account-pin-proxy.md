@@ -20,9 +20,9 @@ credential and therefore also follow the swap, which the user does NOT want:
   worker-JWT refresh. So a swap moves RC to the new account: the phone/web loses
   the session (it now lives under a different account) and stale "ghost"
   sessions pile up.
-- **Artifacts** ("frames") — published via `POST /api/frame/deploy/init`,
-  owned by the creating bearer. A swap makes republish fail (403/404) and the
-  artifact "disappears" from the account you're logged into on the web.
+- **Artifacts** ("frames") — published under `/api/frame/*`, owned by the
+  creating bearer. A swap makes republish fail (403/404) and the artifact
+  "disappears" from the account you're logged into on the web.
 
 Goal: **inference follows the swap; RC and artifacts stay pinned to one chosen
 account** — within any session, without changing how the user runs cswap.
@@ -61,8 +61,7 @@ cswap-proxy  (NEW, this feature)
         …/<env>/bridge/reconnect               → replace Authorization: Bearer <PIN token>
       /api/frame/*                             → replace Authorization: Bearer <PIN token>
       NOT swapped, reached by a pattern and refused by a guard:
-        /v1/(code/)?sessions/<id>/worker/* and …/client/presence ,
-        ?beta=true UNDER /v1/environments
+        /v1/(code/)?sessions/<id>/{worker/*,client/presence} , ?beta=true UNDER /v1/environments
       NOT swapped, reached by nothing (no guard, see below):
         /v1/environments/<env>/work/*
       everything else (esp. /v1/messages)      → pass through unchanged
@@ -95,9 +94,8 @@ The second family is the environment's OWNERSHIP routes: register
 `bridge/reconnect`. Each goes through the one auth wrapper that reads
 `getAccessToken()`, so each has to follow the pin -- unpinned, the machine
 registers under the active account, and ownership is fixed at creation --
-inherited from the code-session case live-tested above, not measured here.
-The header builder is NOT the discriminator -- the `work/` calls below share
-it.
+inherited from the code-session case live-tested above, not measured here. The
+header builder is NOT the discriminator -- the `work/` calls below share it.
 
 The bare collection read is pinned too but for a different reason: it creates
 nothing and mints nothing, yet asked as the active account it answers 200 with
