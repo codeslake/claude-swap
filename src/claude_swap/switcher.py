@@ -203,7 +203,11 @@ SENTINEL_NOTES = {
     # One sentinel, both PERMANENT_AUTH_ERRORS: `no_refresh_token` sends nothing
     # and rotates nothing, so the note can promise neither. A static dict cannot
     # route on the fingerprint the way `UsageStore.record` routes its log.
-    USAGE_RELOGIN_REQUIRED: "re-login may be needed — a stored credential's refresh failed; if it persists, log in with Claude Code and run: cswap add",
+    # NAMES THE SWITCH FIRST, as `USAGE_NO_CREDENTIALS` always has.
+    # `cswap add` captures the ACTIVE credential and refuses when the live
+    # one resolves to another account — which is the normal state for a
+    # quarantined slot, so the remedy without this word cannot run.
+    USAGE_RELOGIN_REQUIRED: "re-login may be needed — a stored credential's refresh failed; if it persists: cswap switch here, log in with Claude Code, then run cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
     # `/login` writes to whichever account is active, so switching first is
