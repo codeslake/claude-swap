@@ -232,16 +232,13 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
 
-#: NOT the consume gate: both sites that POST a backup grant now hold
-#: `.consume-N.lock` across read -> POST -> CAS, and a loser gets
-#: `consume-busy`, which never strikes. The racer that remains is outside every
-#: lock cswap holds -- a concurrent Claude Code, or a sibling machine rotating
-#: a synced lineage (`_fetch_active_usage` records the measured field incident:
-#: POSTing the superseded token yields "a false dead-token strike on a live
-#: account"). `fetchedAt` advances only on a success, so `lastAttemptAt -
-#: fetchedAt` is how long before the strike the lineage last answered. The
-#: width is deliberately loose -- see `_strike_is_suspected_race`, which bounds
-#: the cost by the strike COUNT rather than by this number.
+#: NOT the consume gate -- both its POST sites hold `.consume-N.lock` now, and
+#: a loser gets `consume-busy`, which never strikes. The open racer is outside
+#: every lock cswap holds: a concurrent Claude Code or a sibling machine
+#: rotating the same lineage (see `_fetch_active_usage`). `fetchedAt` advances
+#: only on a success, so `lastAttemptAt - fetchedAt` is how long before the
+#: strike the lineage last answered. Loose on purpose: the COUNT bounds the
+#: cost, not this number.
 RACE_WINDOW_S = 600.0
 
 
@@ -250,17 +247,14 @@ def _strike_is_suspected_race(
 ) -> bool:
     """Whether to doubt this row's FIRST strike because a success preceded it.
 
-    Two independent bounds, and the count is the load-bearing one. Only the
-    first strike is ever doubted, so this permits exactly ONE extra POST of a
-    possibly-dead grant -- the retry either succeeds (`record` zeroes the
-    count) or lands a second strike that no window can excuse. That is what
-    keeps the endless-401 loop the strike exists to stop from returning, and
-    it makes the window's exact width non-critical: erring either way at the
-    boundary costs one fetch.
+    Only the FIRST strike is doubted, so this permits exactly one extra POST:
+    the retry either succeeds (`record` zeroes the count) or lands a second
+    strike no window can excuse. That keeps the endless-401 loop away and
+    makes the width non-critical -- erring either way costs one fetch.
 
-    Missing either timestamp is "no evidence", not "a race", so rows written
-    before this read exactly as they did. A negative gap is not one either:
-    there the success is the LATER event and already zeroed the strike.
+    Missing either timestamp is "no evidence", not "a race", so older rows read
+    as they did. A negative gap is not one either: there the success is the
+    LATER event and already zeroed the strike.
     """
     if strikes > AUTH_DEAD_STRIKES:
         return False
