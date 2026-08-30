@@ -15166,6 +15166,227 @@ class TestALoginLandsInItsOwnSlot:
         assert got["claudeAiOauth"]["refreshToken"] == "rt-live", (
             "a quarantined slot did not receive its owner's fresh login")
 
+    def _owner_slot_fixture(self, sample_sequence_data):
+        """Slots 1 and 2 as the adopt path sees them: the resync runs for 2,
+        the server says the live credential is 1's."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        return s
+
+    @staticmethod
+    def _blob(refresh, refresh_expires_at=99_999_999_999_999, access="sk-x"):
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": access, "refreshToken": refresh,
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": refresh_expires_at}})
+
+    def _resync_as_slot_2(self, s, live):
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="chmod(0o000) does not deny root or Windows",
+    )
+    def test_an_unreadable_owner_backup_is_not_overwritten(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A read that FAILED is not an empty slot. ``_read_account_credentials``
+        flattens a locked Keychain / denied ``.enc`` to ``""``, which the
+        emptiness arm reads as "nowhere to put a login" — so the one state
+        where the slot's only refresh token cannot be seen is the state that
+        authorizes overwriting it."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        # Pin the file backend so the probe denies the served copy on macOS
+        # too, where a Keychain write would leave the .enc absent.
+        s.platform = Platform.LINUX
+        s._write_account_credentials("1", "c@example.com", self._blob("rt-hidden"))
+        enc = s._store._backup_enc_path("1", "c@example.com")
+        assert enc.exists(), "premise: slot 1 has a backup on disk"
+        before = enc.read_bytes()
+        enc.chmod(0o000)
+        try:
+            self._resync_as_slot_2(s, self._blob("rt-live"))
+        finally:
+            enc.chmod(0o600)
+        assert enc.read_bytes() == before, (
+            "an unreadable backup was overwritten — the slot's only refresh "
+            "token is gone and .prev could not be written either"
+        )
+
+    def test_a_strike_the_slot_has_already_outlived_is_not_deadness(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A strike condemns the GENERATION it POSTed, not the slot. Once the
+        slot stores a different credential the verdict no longer applies —
+        ``token_dead(stored_fp=...)`` is where the whole codebase asks this.
+        Reading the raw count instead overwrites a healthy credential on a
+        quarantine the collector has not yet swept."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_account_credentials("1", "c@example.com", self._blob("rt-current"))
+        s._usage_store.record(
+            {"1": FetchRecord(
+                error="invalid_grant",
+                struck_fp=oauth.credential_fingerprint(self._blob("rt-gone")),
+            )},
+            {"1": ("c@example.com", "o-1")},
+        )
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-current", (
+            "a strike bound to a generation the slot no longer stores "
+            "authorized an overwrite"
+        )
+
+    def test_a_strike_this_pr_itself_doubts_is_not_deadness(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """``_strike_is_suspected_race`` says a first strike right after a
+        success is probably a concurrent rotation, not a dead token — the
+        fetch gate honours it. The adopt gate must agree, or the same row is
+        "retry it" to one reader and "overwrite its refresh token" to the
+        other."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_account_credentials("1", "c@example.com", self._blob("rt-current"))
+        ids = {"1": ("c@example.com", "o-1")}
+        s._usage_store.record({"1": FetchRecord(usage={"five_hour": {}})}, ids)
+        s._usage_store.record({"1": FetchRecord(error="invalid_grant")}, ids)
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-current", (
+            "a strike the fetch gate keeps eligible was read as a verdict"
+        )
+
+    def test_a_slot_with_no_recorded_address_is_not_written(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The backup is keyed by the roster's email. Falling back to the
+        profile's address writes the credential to a path every reader of
+        that slot computes differently — stored, reported as adopted, and
+        unreachable."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        data = s._get_sequence_data()
+        data["accounts"]["1"]["email"] = ""
+        s._write_json(s.sequence_file, data)
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        # Any address at all, not just the profile's: the slot carries none,
+        # so every path the write could pick is one no reader recomputes.
+        assert not list(s.credentials_dir.glob(".creds-1-*.enc")), (
+            "the login was written under an address the slot does not carry"
+        )
+
+    def test_the_adopt_holds_the_account_lock_across_its_write(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The guards above decide whether a refresh token may be replaced.
+        Outside the lock every slot mutation holds they are advisory only: a
+        switch persisting a rotated token between the verdict and the write is
+        overwritten by a decision taken before it existed.
+
+        flock binds to the open file description, so a second ``open`` of the
+        same path contends even in this process — that is the probe."""
+        from claude_swap.locking import FileLock
+
+        s = self._owner_slot_fixture(sample_sequence_data)
+        seen = []
+
+        def _probe(*a, **kw):
+            seen.append(FileLock(s.lock_file, timeout=0).acquire())
+
+        with patch.object(s, "_write_account_credentials", side_effect=_probe):
+            self._resync_as_slot_2(s, self._blob("rt-live"))
+        assert seen == [False], (
+            f"the account lock was free during the adopt's write ({seen})"
+        )
+
+    def test_a_uuid_shared_across_orgs_resolves_to_the_matching_org(
+        self, temp_home,
+    ):
+        """One account in two orgs is two slots carrying the SAME account uuid
+        (``sample_sequence_data_with_org`` is exactly that shape). Matching on
+        the uuid alone returns whichever slot iterates first, so the login is
+        written into the wrong org's slot half the time."""
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {
+            "1": {"email": "u@x", "organizationUuid": "o-a", "uuid": "u-1"},
+            "2": {"email": "u@x", "organizationUuid": "o-b", "uuid": "u-1"},
+        }}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-1", "email": "u@x",
+                   "organizationUuid": "o-b"}) == "2"
+
+    def test_a_uuid_shared_across_orgs_is_ambiguous_without_one(
+        self, temp_home,
+    ):
+        """No org in the profile leaves both slots equally plausible, and the
+        credential is the one thing that cannot be re-derived. Ambiguity is
+        not a tiebreak."""
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {
+            "1": {"email": "u@x", "organizationUuid": "o-a", "uuid": "u-1"},
+            "2": {"email": "u@x", "organizationUuid": "o-b", "uuid": "u-1"},
+        }}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-1", "email": "u@x"}) is None
+
+    def test_the_slot_that_just_disowned_the_credential_is_not_written(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The adopt branch runs only after the per-slot verdict said these
+        bytes are NOT this slot's. Whatever the roster scan answers, writing
+        them into that same slot contradicts the verdict that got us here."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        with patch.object(s, "_resolved_matches_slot_identity",
+                          return_value=False), \
+             patch.object(s, "_slot_owning_resolved_identity",
+                          return_value="2"), \
+             patch.object(s, "_adopt_login_into_slot") as adopt:
+            self._resync_as_slot_2(s, self._blob("rt-live"))
+        adopt.assert_not_called()
+
+    @pytest.mark.parametrize("bind_strike", [False, True],
+                             ids=["unbound-strike", "bound-strike"])
+    def test_the_adopt_lifts_the_quarantine_it_wrote_over(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, bind_strike,
+    ):
+        """The strike condemned the generation this write just replaced.
+        ``_row_eligible`` gates the fetch on the RAW count, so a strike left
+        standing keeps a slot that now holds a working login out of every
+        collect pass — and an unbound strike (no ``struckFingerprint``) never
+        heals itself, because the collector's heal branch needs a fingerprint
+        to disagree with. The switch-time foreign-credential heal pairs its
+        write with ``clear_dead_token`` for exactly this reason."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_account_credentials("1", "c@example.com", self._blob("rt-dead"))
+        ids = {"1": ("c@example.com", "o-1")}
+        s._usage_store.record({"1": FetchRecord(
+            error="invalid_grant",
+            struck_fp=oauth.credential_fingerprint(self._blob("rt-dead"))
+            if bind_strike else None,
+        )}, ids)
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-live", "premise"
+        assert s._usage_store.entries(ids)["1"].auth_dead_strikes == 0, (
+            "the slot holds a fresh login and is still quarantined: "
+            "_row_eligible refuses to fetch it"
+        )
+
 class TestCurrentAtLimitOverridesTheFrozenPct:
     """`current_at_limit=True` — a caller measured the limit off the poll.
 

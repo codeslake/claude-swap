@@ -232,13 +232,11 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
 
-#: NOT the consume gate -- both its POST sites hold `.consume-N.lock` now, and
-#: a loser gets `consume-busy`, which never strikes. The open racer is outside
-#: every lock cswap holds: a concurrent Claude Code or a sibling machine
-#: rotating the same lineage (see `_fetch_active_usage`). `fetchedAt` advances
-#: only on a success, so `lastAttemptAt - fetchedAt` is how long before the
-#: strike the lineage last answered. Loose on purpose: the COUNT bounds the
-#: cost, not this number.
+#: The racer is outside every lock cswap holds -- a concurrent Claude Code or
+#: a sibling machine rotating the same lineage. `fetchedAt` advances only on a
+#: success, so `lastAttemptAt - fetchedAt` is how long before the strike the
+#: lineage last answered. Loose on purpose: the COUNT bounds the cost, not
+#: this width.
 RACE_WINDOW_S = 600.0
 
 

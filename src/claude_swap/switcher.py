@@ -87,7 +87,6 @@ from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
-    Identity,
     UsageEntry,
     UsageStore,
     with_sentinel,
@@ -3012,9 +3011,9 @@ class ClaudeAccountSwitcher:
     ) -> "str | None":
         """The slot an oracle-resolved identity belongs to, or None.
 
-        `_resolved_matches_slot_identity` answers "is this ONE slot's?" and
-        every caller threw the identity away when the answer was no. The
-        server had just said whose it was.
+        The whole-roster counterpart to `_resolved_matches_slot_identity`,
+        which answers "is this ONE slot's?" and leaves a caller with nothing
+        to do when the answer is no.
 
         UUID FIRST, and a stored uuid that disagrees is decisive: addresses
         are recycled across accounts, uuids are not. Only a slot with NO
@@ -3030,13 +3029,25 @@ class ClaudeAccountSwitcher:
         seen_email = (resolved.get("email") or "").strip()
         seen_org = (resolved.get("organizationUuid") or "").strip()
         if seen_uuid:
+            hits = []
             for num, acc in (data.get("accounts") or {}).items():
-                if (acc.get("uuid") or "").strip() == seen_uuid:
-                    return num
-            # A uuid that matches no slot is not this fleet's account. Falling
-            # through to the address here would let a recycled address claim
+                org = (acc.get("organizationUuid") or "").strip()
+                # A missing org on either side corroborates nothing, so it
+                # cannot condemn — the tolerance the uuid path of
+                # `_resolved_matches_slot_identity` applies.
+                if (acc.get("uuid") or "").strip() == seen_uuid and (
+                    not seen_org or not org or org == seen_org
+                ):
+                    hits.append(num)
+            # ONE UUID CAN NAME TWO SLOTS: an account in two orgs is two
+            # records under the same account uuid. The org separates them, and
+            # with none to separate them the answer is ambiguous — a first-hit
+            # tiebreak writes the login into the other org's slot.
+            #
+            # No hit at all means the account is not this fleet's, and falling
+            # through to the address below would let a recycled address claim
             # a slot the uuid already said it is not.
-            return None
+            return hits[0] if len(hits) == 1 else None
         if not seen_email or not seen_org:
             return None
         for num, acc in (data.get("accounts") or {}).items():
@@ -3047,69 +3058,69 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
-    def _slot_credential_is_dead(self, account_num: str) -> bool:
-        """Whether the collector has condemned this slot's stored credential.
-
-        `authDeadStrikes` is set only by a token endpoint answering
-        `invalid_grant`, which no transient error produces — so it is the one
-        durable statement that a slot's stored login cannot be used.
-        """
-        try:
-            data = self._get_sequence_data() or {}
-            acc = (data.get("accounts") or {}).get(str(account_num)) or {}
-            email = (acc.get("email") or "").strip()
-            if not email:
-                return False
-            ident = {str(account_num): Identity(
-                (email, (acc.get("organizationUuid") or "").strip()))}
-            entry = self._usage_store.entries(ident).get(str(account_num))
-        except (OSError, ValueError, KeyError):
-            # A store that cannot be READ is not a verdict. Narrow on purpose:
-            # a broad except here hides this function being wrong (a missing
-            # attribute, an unimported name) as a calm False.
-            return False
-        return bool(entry) and int(getattr(entry, "auth_dead_strikes", 0) or 0) >= 1
-
-    def _adopt_login_into_slot(
-        self, owner: str, creds: str, resolved: dict
-    ) -> None:
+    def _adopt_login_into_slot(self, owner: str, creds: str) -> None:
         """Store a credential in the slot the server says owns it."""
-        data = self._get_sequence_data() or {}
-        acc = (data.get("accounts") or {}).get(owner) or {}
-        owner_email = (acc.get("email") or resolved.get("email") or "").strip()
+        acc = (self._get_sequence_data() or {}).get("accounts", {}).get(owner) or {}
+        owner_email = (acc.get("email") or "").strip()
         if not owner_email:
+            # The backup is keyed by the roster's address. Without one the
+            # write lands where no reader of this slot ever looks.
             return
-        # RECENCY DECIDES, IN ONE DIRECTION ONLY. A refresh token cannot be
-        # re-derived, so a live credential whose refresh lifetime ends EARLIER
-        # than the stored one is the older generation and must not replace it.
-        # An undated or unreadable stored credential is not evidence of
-        # freshness and does not block the adopt.
-        def _refresh_expiry(blob: "str | None") -> "int | None":
-            try:
-                o = json.loads(blob or "")
-            except (TypeError, ValueError):
-                return None
-            o = o.get("claudeAiOauth") or o
-            v = o.get("refreshTokenExpiresAt")
+
+        def _refresh_expiry(blob: str) -> "float | None":
+            v = (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
             return v if isinstance(v, (int, float)) else None
 
-        stored = self._read_account_credentials(owner, owner_email)
-        # ONLY A SLOT WITH NOWHERE TO PUT A LOGIN. An identity mismatch alone
-        # is transient during an ordinary switch, and adopting on it
-        # overwrites the rotated refresh token that switch just persisted.
-        if stored and not self._slot_credential_is_dead(owner):
-            return
-        stored_at = _refresh_expiry(stored)
-        live_at = _refresh_expiry(creds)
-        if stored_at is not None and live_at is not None and live_at < stored_at:
-            self._logger.info(
-                "Account-%s (%s): the live credential resolves to this "
-                "account but its refresh lifetime ends earlier than the "
-                "stored one, so the stored credential was kept.",
-                owner, owner_email,
+        # Slot mutations hold this lock, so read, verdict and write are one
+        # transaction: a switch persisting a rotated refresh token in the gap
+        # would otherwise be overwritten by a guard that had already passed.
+        with FileLock(self.lock_file):
+            stored, unreadable = self._read_account_credentials_ex(
+                owner, owner_email
             )
-            return
-        self._write_account_credentials(owner, owner_email, creds)
+            if unreadable:
+                return  # a read that FAILED is not an empty slot
+            # ONLY A SLOT WITH NOWHERE TO PUT A LOGIN. An identity mismatch
+            # alone is transient during an ordinary switch, and adopting on it
+            # overwrites the rotated refresh token that switch just persisted.
+            # `_slot_token_dead` is the verdict the collectors and the import
+            # heal already run on: it binds to the struck generation, so a
+            # strike the slot has outlived authorizes nothing.
+            if stored and not self._slot_token_dead(owner, owner_email):
+                return
+            # RECENCY DECIDES, IN ONE DIRECTION ONLY. A refresh token cannot
+            # be re-derived, so a live credential whose refresh lifetime ends
+            # EARLIER than the stored one is the older login and must not
+            # replace it. An undated stored credential is not evidence of
+            # freshness and does not block the adopt.
+            stored_at, live_at = _refresh_expiry(stored), _refresh_expiry(creds)
+            if stored_at is not None and live_at is not None and live_at < stored_at:
+                self._logger.info(
+                    "Account-%s (%s): the live credential resolves to this "
+                    "account but its refresh lifetime ends earlier than the "
+                    "stored one, so the stored credential was kept.",
+                    owner, owner_email,
+                )
+                return
+            self._write_account_credentials(owner, owner_email, creds)
+            # The strike condemned the generation this write just replaced.
+            # `_row_eligible` gates the fetch on the RAW count, so a strike
+            # left standing keeps a slot that now holds a working login out of
+            # every collect pass, and an unbound one (no `struckFingerprint`)
+            # never heals itself. Same pairing as the switch-time
+            # foreign-credential heal.
+            try:
+                self._usage_store.clear_dead_token(
+                    [owner],
+                    {owner: (owner_email,
+                             acc.get("organizationUuid") or "")},
+                )
+            except (OSError, LockError) as e:
+                self._logger.warning(
+                    "Adopted a login into Account-%s but could not lift its "
+                    "quarantine (%s); it stays out of collect passes until "
+                    "one observes the new credential.", owner, e,
+                )
         self._logger.info(
             "Adopted a login into Account-%s (%s): the live credential "
             "resolves to that account, so it was stored there rather than "
@@ -4563,7 +4574,7 @@ class ClaudeAccountSwitcher:
                         self._get_sequence_data() or {}, resolved
                     )
                     if owner and owner != account_num:
-                        self._adopt_login_into_slot(owner, creds, resolved)
+                        self._adopt_login_into_slot(owner, creds)
                         return
                     key = (account_num, email, "resync")
                     if key not in self._provenance_warned:
@@ -6655,7 +6666,7 @@ class ClaudeAccountSwitcher:
                 stored.setdefault(fp, num)
         kept = 0
         for entry_id in sorted(entries):
-            creds, _unreadable = self._store._read_unclaimed_credential(entry_id)
+            creds, _ = self._store._read_unclaimed_credential(entry_id)
             # Unreadable, absent and corrupt all arrive here with no verdict
             # to act on, and no verdict is KEEP.
             data = oauth.extract_oauth_data(creds) if creds else None
@@ -7545,10 +7556,11 @@ class ClaudeAccountSwitcher:
         unavailable and the switch fell back to the file.
 
         "Usually", not "never", which is why already-running sessions get
-        named: a rejected credential surfaces as ``InvalidRequestHeaderValueError``
-        while BUILDING the request (measured in 2.1.251). No HTTP status means none of the paths that
-        rebuild the client on 401/403/socket errors fire, so nothing cswap
-        writes afterwards is re-read and only a restart clears it.
+        named: a rejected credential surfaces as
+        ``InvalidRequestHeaderValueError`` while BUILDING the request. With no
+        HTTP status, none of the paths that rebuild the client on 401/403/
+        socket errors fire, so nothing cswap writes afterwards is re-read and
+        only a restart clears it.
         """
         backend = self._last_active_credentials_backend
         if backend is None:
