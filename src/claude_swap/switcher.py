@@ -200,11 +200,9 @@ SENTINEL_NOTES = {
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    # NOT the ACCOUNT's, and true of BOTH PERMANENT_AUTH_ERRORS: `invalid_grant`
-    # on a single-use grant the live client rotated past fails with nobody at
-    # fault, while `no_refresh_token` never reaches the endpoint at all. A
-    # static note cannot route on the fingerprint the way `UsageStore.record`
-    # routes its log, so it names the condition and keeps the remedy conditional.
+    # One sentinel, both PERMANENT_AUTH_ERRORS: `no_refresh_token` sends nothing
+    # and rotates nothing, so the note can promise neither. A static dict cannot
+    # route on the fingerprint the way `UsageStore.record` routes its log.
     USAGE_RELOGIN_REQUIRED: "re-login needed — a stored credential's refresh failed; if it persists, log in with Claude Code and run: cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
@@ -7375,12 +7373,11 @@ class ClaudeAccountSwitcher:
             ))
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
-        # Every live session predates a switch that has committed, so this needs
-        # no timestamp — only which of them can SHOW the symptom named below; a
-        # bg/daemon session has no banner to render it. EXCLUDE rather than
-        # match "interactive", so an unknown kind still counts: an overcount is
-        # visible, a silent zero is not. (`list_accounts`' own "Running
-        # instances" block counts every kind — a different question, same scan.)
+        # Every live session predates a committed switch, so no timestamp is
+        # needed — only which can SHOW the symptom below; a bg/daemon has no
+        # banner. EXCLUDE rather than match "interactive" so an unknown kind
+        # still counts: an overcount is visible, a silent zero is not.
+        # (`list_accounts`' "Running instances" counts every kind on purpose.)
         # Best-effort: the switch has committed and must not fail on a scan.
         try:
             running = sum(

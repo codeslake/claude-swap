@@ -58,10 +58,8 @@ def test_the_relogin_note_does_not_condemn_a_live_credential_that_moved_on(
         f"{note!r} must name the STORED copy: here the live credential "
         "authenticates and only a stored one failed"
     )
-    # One sentinel, two errors: `no_refresh_token` strikes too
-    # (PERMANENT_AUTH_ERRORS) and is decided before any request is built, so
-    # nothing was sent and nothing rotates. `UsageStore.record` routes its LOG
-    # on the fingerprint; a static note cannot, so it must be true of both.
+    # `no_refresh_token` strikes onto this same sentinel, sends nothing and
+    # rotates nothing, so one static note must be true of both errors.
     assert "rotation" not in note and "rejected" not in note, (
         f"{note!r} is false for the no_refresh_token half of this sentinel"
     )
@@ -113,10 +111,9 @@ def test_switch_followup_names_only_the_sessions_that_can_read_it(
 
 
 def test_a_failed_session_scan_does_not_undo_a_committed_switch(monkeypatch, capsys):
-    """The scan runs after the switch has committed, so a raise here would
-    surface as a switch failure for work that already succeeded. `Path.home()`
-    raises when HOME is unset, and both directory globs are lazy enough to
-    raise mid-iteration past their per-file handlers."""
+    """A raise here would report work that already succeeded as failed.
+    Reachable: `Path.home()` with no HOME, and a lazy glob past the per-file
+    handlers."""
     s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
     s._logger = logging.getLogger("test-switch-followup")
     monkeypatch.setattr(
