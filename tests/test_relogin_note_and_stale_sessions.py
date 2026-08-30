@@ -56,10 +56,7 @@ def test_the_relogin_note_does_not_condemn_a_live_credential_that_moved_on(
         f"{note!r} must name the STORED copy: here the live credential "
         "authenticates and only a stored one was rejected"
     )
-    # The strike supports "these bytes were rejected" and nothing more. A
-    # rotation clears it with no human, which `usage_store` already says in
-    # its quarantine log ("a re-login is needed only if it persists") and
-    # this note asserted over.
+    # The strike supports "these bytes were rejected" and nothing more.
     assert "may clear it" in note, (
         f"{note!r} presents the re-login as required; one invalid_grant on a "
         "single-use grant does not establish that"
@@ -87,9 +84,9 @@ def test_switch_followup_names_only_the_sessions_that_can_read_it(
         ClaudeAccountSwitcher, "_last_active_credentials_backend", backend,
     )
     sessions = [
-        ClaudeSession(pid=100 + i, session_id="", cwd="", started_at=0,
+        ClaudeSession(pid=0, session_id="", cwd="", started_at=0,
                       kind=k, entrypoint="cli")
-        for i, k in enumerate(kinds)
+        for k in kinds
     ]
     monkeypatch.setattr("claude_swap.switcher.get_running_instances",
                         lambda: (sessions, []))

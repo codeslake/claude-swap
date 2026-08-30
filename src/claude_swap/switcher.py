@@ -200,11 +200,10 @@ SENTINEL_NOTES = {
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    # NOT the ACCOUNT's: `_entry_token_dead` holds the strike while ANY stored
-    # source matches, so a slot is condemned on a backup the live client may
-    # already have rotated past. One invalid_grant on a single-use grant does
-    # not establish that a human must act, so the remedy stays conditional —
-    # the same hedge `UsageStore.record` logs when it imposes the quarantine.
+    # NOT the ACCOUNT's: the strike binds to the bytes that were POSTed, and a
+    # single-use grant the live client rotated past fails without anyone being
+    # at fault. So the remedy stays conditional — `UsageStore.record` hedges
+    # the same way in the line that imposes the quarantine.
     USAGE_RELOGIN_REQUIRED: "re-login needed — a stored refresh token was rejected; a rotation may clear it, else log in with Claude Code and run: cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
@@ -7376,13 +7375,11 @@ class ClaudeAccountSwitcher:
             ))
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
-        # Every live session predates a switch that has already committed, so
-        # this needs no timestamp — only which of them a human could act on: a
-        # bg/daemon session has no banner to show the symptom and nothing to
-        # restart. EXCLUDING those rather than matching "interactive" keeps an
-        # unknown or renamed kind counted, because an overcount is visible and
-        # a silent zero is not. Best-effort, like the sibling call in
-        # `list_accounts`: the switch is done and must not fail on a scan.
+        # Every live session predates a switch that has committed, so this needs
+        # no timestamp — only which of them a human could act on; a bg/daemon
+        # session has no banner and nothing to restart. EXCLUDE rather than
+        # match "interactive", so an unknown kind still counts: an overcount is
+        # visible, a silent zero is not. Best-effort like `list_accounts`.
         try:
             running = sum(
                 1 for s in get_running_instances()[0]
