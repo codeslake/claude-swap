@@ -127,6 +127,57 @@ class TestAdoptStashedLoginForSlot:
             "2", "owner@example.com") is False
         assert entry_id in switcher._store._list_unclaimed_credentials()
 
+    def test_bytes_the_slot_already_holds_are_not_written_back(self, switcher):
+        """`_adopt_login_into_slot` refuses this for its own reason — rewriting
+        the identical credential only shifts `.prev`. Here it is worse: an
+        UNBOUND strike (a row written before fingerprints were recorded) binds
+        unconditionally, so the comparison against the struck generation
+        cannot exclude these bytes, and adopting would clear a verdict that is
+        accurate about what the slot still holds."""
+        entry_id = self._stash(switcher, creds=DEAD)
+        path = switcher._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "2": {
+                    "email": "owner@example.com",
+                    "organizationUuid": "",
+                    "authDeadStrikes": AUTH_DEAD_STRIKES,   # no struckFingerprint
+                    "consecutiveFailures": 2,
+                    "lastError": "invalid_grant",
+                    "lastGood": {"five_hour": {"pct": 10.0}},
+                }
+            },
+        }))
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert entry_id in switcher._store._list_unclaimed_credentials(), (
+            "a stash entry was spent on bytes the slot already held")
+        ident = {"2": ("owner@example.com", "")}
+        assert switcher._usage_store.entries(ident)["2"].token_dead() is True, (
+            "an accurate strike was cleared by rewriting the same credential")
+
+    def test_a_slot_whose_own_credential_cannot_be_READ_is_left_alone(
+            self, switcher, monkeypatch):
+        """An unreadable stored credential is not an empty slot: on a Mac a
+        locked Keychain reads as a failure, and adopting on that answer would
+        overwrite a credential nobody could see.
+
+        `_slot_token_dead` is what refuses — it returns False on an unreadable
+        read for both the idle and the active slot, so the adopt stops at its
+        pre-check. This pins the BEHAVIOUR, not that check: a later refactor
+        that moves the refusal must keep the answer."""
+        entry_id = self._stash(switcher)
+        self._strike(switcher)
+        monkeypatch.setattr(switcher, "_read_account_credentials_ex",
+                            lambda num, email: ("", True))
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
     def test_another_account_s_login_is_left_alone(self, switcher):
         """Identity is what authorizes the write; a dead slot is not a
         licence to absorb whatever is in the stash."""
@@ -252,6 +303,7 @@ class TestTheAdoptIsASlotMutation:
             "2", "owner@example.com")
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(DEAD)
+
 
 
 class TestTheCollectPassReachesTheStash:

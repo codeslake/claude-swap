@@ -5316,6 +5316,12 @@ class ClaudeAccountSwitcher:
             ident = {num: (email, record.get("organizationUuid") or "")}
             entry = self._usage_store.entries(ident).get(num)
             struck_fp = getattr(entry, "struck_fingerprint", None)
+            # `unreadable` needs no branch here: `_slot_token_dead` above
+            # already refuses on it, for both the idle and the active slot —
+            # a read that FAILED is not an empty slot, and it never reaches
+            # this far.
+            stored, _ = self._read_account_credentials_ex(num, email)
+            stored_fp = oauth.credential_fingerprint(stored)
 
             try:
                 stash = self._store._list_unclaimed_credentials()
@@ -5353,7 +5359,18 @@ class ClaudeAccountSwitcher:
                 # the manifest's own `fingerprint` is a second source of truth
                 # that can only differ by being wrong, and a stale one there
                 # would skip an entry that is fine.
-                if oauth.credential_fingerprint(creds) == struck_fp:
+                creds_fp = oauth.credential_fingerprint(creds)
+                # The condemned generation heals nothing, and adopting it
+                # would clear the very strike that describes it.
+                if creds_fp == struck_fp:
+                    continue
+                # BYTES THE SLOT ALREADY HOLDS, which `_adopt_login_into_slot`
+                # refuses for its own reason: rewriting them only shifts
+                # `.prev`. Here it also spends a stash entry, and an UNBOUND
+                # strike (a row written before fingerprints were recorded)
+                # binds unconditionally — so the comparison above cannot
+                # exclude them and clearing it would erase an accurate verdict.
+                if stored_fp is not None and creds_fp == stored_fp:
                     continue
                 try:
                     self._write_account_credentials(num, email, creds)
