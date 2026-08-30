@@ -323,6 +323,10 @@ def _refresh_expiry(blob: str) -> "float | None":
     so it separates two LOGINS and never two generations of one. Both readers
     depend on that: the adopt refuses an older login, and the quarantine
     release recognises a newer one.
+
+    `credentials.py` keeps its own reader on purpose: it takes an already
+    unwrapped oauth object, and that module is a leaf importing only
+    `macos_keychain` and `paths`.
     """
     v = (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
     return v if isinstance(v, (int, float)) else None
@@ -3069,7 +3073,9 @@ class ClaudeAccountSwitcher:
                         exact.append(num)
             # An exact org match beats a blank-org tolerance: a half-migrated
             # roster carrying one org-less record must not make an otherwise
-            # unambiguous match read as a tie.
+            # unambiguous match read as a tie. `seen_org and` because two
+            # ABSENCES are not a match — promoting that to evidence would
+            # contradict the tolerance above and pick by iteration order.
             hits = exact or hits
             # ONE UUID CAN NAME TWO SLOTS: an account in two orgs is two
             # records under the same account uuid. The org separates them, and
@@ -6755,18 +6761,21 @@ class ClaudeAccountSwitcher:
             )
         try:
             self._sweep_unclaimed_stash()
-        except (ClaudeSwitchError, OSError):
+        except (ClaudeSwitchError, OSError, TypeError, AttributeError):
             # Housekeeping, and this method's contract is the opposite: a
             # raise here would read as a failed stash, and every caller aborts
             # the switch on one. Drops already made stand; the rest waits for
             # the next stash.
             #
-            # cswap's OWN error family plus I/O, not `Exception`. The suite's
-            # real-store guard sits outside that family on purpose, so no
-            # containment can hide a write into the REAL store — while the
-            # roster read below is `strict=True`, and a torn sequence.json
-            # raising `ConfigError` must stay contained rather than report a
-            # stash that in fact landed.
+            # cswap's OWN error family, I/O, and the shapes malformed JSON
+            # takes — not `Exception`. The suite's real-store guard sits
+            # outside all of these on purpose, so no containment can hide a
+            # write into the REAL store. `ConfigError` is here because the
+            # roster read is `strict=True`; `TypeError`/`AttributeError`
+            # because a file can parse as valid JSON and still be the wrong
+            # SHAPE (`{"accounts": "x"}`), and enumerating those one at a time
+            # is how the previous two rounds each found the next one. The
+            # `exc_info` below keeps a genuine coding error visible.
             self._logger.warning(
                 "Could not finish sweeping the unclaimed stash; entries it had "
                 "not reached yet are still there.",

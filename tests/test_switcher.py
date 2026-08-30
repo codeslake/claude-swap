@@ -9438,7 +9438,8 @@ class TestUnclaimedStashSweep:
         switcher = self._switcher(temp_home)
         entry_id = switcher._store._write_unclaimed_credential(
             self._creds("successor-rt", self._ms(20)),
-            {"configSlot": "1", "consumedFp": "sha256:abc"},
+            {"reason": "consume-gate-successor", "configSlot": "1",
+             "consumedFp": "sha256:abc", "fingerprint": "sha256:def"},
         )
         switcher._store._stash_entry_path(entry_id).unlink()
         assert switcher._store._read_unclaimed_credential(entry_id) == ("", False), (
@@ -9449,6 +9450,11 @@ class TestUnclaimedStashSweep:
         assert not any(
             "names an owner" in r.getMessage() for r in caplog.records
         ), "a row naming configSlot was counted as ownerless"
+        # The absence above is satisfied just as well by DROPPING the row, so
+        # it cannot stand alone: this is the requirement the test is named for.
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "the sweep dropped a row it could not positively condemn"
+        )
 
     def test_a_null_accounts_roster_never_fails_the_stash(self, temp_home):
         """`{"accounts": null}` is valid JSON and a dict, so it sails past
@@ -9461,7 +9467,9 @@ class TestUnclaimedStashSweep:
         switcher._store._write_unclaimed_credential(
             self._creds("keep-me-rt", self._ms(20)), {"reason": "foreign"},
         )
-        switcher._write_json(switcher.sequence_file, {"accounts": None})
+        switcher._write_json(
+            switcher.sequence_file, {"accounts": {"1": None, "2": "not-a-dict"}}
+        )
 
         entry_id = switcher._stash_live_credential(
             self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
@@ -15551,15 +15559,27 @@ class TestALoginLandsInItsOwnSlot:
     def test_an_exact_org_match_beats_a_blank_org_sibling(self, temp_home):
         """A half-migrated roster carries org-less records beside real ones.
         Treating the blank as a peer makes an otherwise unambiguous match read
-        as a tie, and the login goes back to the stash instead of home."""
+        as a tie, and the login goes back to the stash instead of home.
+
+        The last case is the one the preference must NOT swallow: two blanks
+        are not an exact match, they are two absences. Promoting that to
+        evidence contradicts the tolerance it sits beside and turns an honest
+        tie into a pick made by iteration order — and the adopt settles, so
+        the wrong record keeps it for the life of the process."""
         sw = ClaudeAccountSwitcher()
         data = {"accounts": {
             "1": {"email": "u@x", "organizationUuid": "ORG-A", "uuid": "u-1"},
             "2": {"email": "u@x", "organizationUuid": "", "uuid": "u-1"},
+            "3": {"email": "v@x", "organizationUuid": "ORG-A", "uuid": "u-OTHER"},
         }}
         assert sw._slot_owning_resolved_identity(
             data, {"uuid": "u-1", "email": "u@x",
-                   "organizationUuid": "ORG-A"}) == "1"
+                   "organizationUuid": "ORG-A"}) == "1", "exact org wins"
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-1", "email": "u@x",
+                   "organizationUuid": None}) is None, (
+            "a blank profile org matched a blank roster org as if the two "
+            "absences corroborated each other")
 
     def test_two_records_of_one_account_and_org_are_ambiguous(self, temp_home):
         """THE BRANCH `len(hits) == 1` EXISTS FOR. Once the org is compared
@@ -15637,11 +15657,18 @@ class TestALoginLandsInItsOwnSlot:
             "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-dead", (
             "PREMISE: the unreadable pass must refuse to write")
 
-        self._resync_as_slot_2(s, self._blob("rt-live"))
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}) as probe:
+            s._resync_rotated_backup("2", "b@example.com", "o-2",
+                                     self._blob("rt-live"))
         assert json.loads(s._read_account_credentials(
             "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
             "the unreadable pass was reported settled, so the retry never "
             "ran and the owner's login is lost until the process restarts")
+        assert probe.call_count == 0, (
+            "the retry re-probed the endpoint; the memo exists to carry the "
+            "resolved owner so it does not have to")
 
     def test_a_settled_adopt_stops_being_retried(
         self, temp_home: Path, mock_claude_config: Path,
