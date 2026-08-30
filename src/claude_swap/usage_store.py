@@ -218,7 +218,8 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 
 # A dead refresh-token lineage (the token endpoint answered ``invalid_grant``,
 # e.g. "Refresh token not found or invalid") can never recover on its own —
-# only a re-login helps. One such answer is already definitive: the server
+# though the ACCOUNT can, without a human, once the live client rotates to a
+# generation the strike did not condemn. One such answer is already definitive: the server
 # explicitly rejected the grant, which no transient 429/timeout/network blip
 # does, so there is nothing to gain by retrying (and each retry with a dead
 # token just draws a fresh 401/429). At this many strikes the account is
@@ -1111,29 +1112,26 @@ class UsageStore:
                     # machines quarantined, not one line about any of them.
                     if int(row["authDeadStrikes"]) >= AUTH_DEAD_STRIKES:
                         _ident = identities.get(num) if identities else None
-                        # WHAT LIFTS IT DEPENDS ON WHETHER IT BOUND TO BYTES.
-                        # A strike carrying a fingerprint condemns the
-                        # GENERATION that was POSTed, and `token_dead` drops it
-                        # against any stored credential that differs — which
-                        # every writer produces, a rotation the live client
-                        # performs on its own included. Naming a re-login there
-                        # is a wrong instruction: the usual cause is a
-                        # collector POSTing a snapshot that was already spent,
-                        # and the account is fine. A strike with no fingerprint
-                        # binds unconditionally, and then the re-login really
-                        # is the only exit.
+                        # WHAT LIFTS IT IS WHETHER THESE BYTES CAN ROTATE.
+                        # `sha256:` is minted only when a refresh token existed
+                        # (oauth.credential_fingerprint), and only such a
+                        # credential is replaced without a human. A
+                        # `sha256-full:` content hash (no_refresh_token) and an
+                        # unbound strike both need an explicit write.
                         _lifted_by = (
                             "any credential rotation clears it, so this may "
                             "already be stale; a re-login is needed only if it "
                             "persists"
-                            if rec.struck_fp
+                            if (rec.struck_fp or "").startswith("sha256:")
                             else "only a re-login replacing the stored "
                                  "credential clears it"
                         )
+                        # NOT "the token endpoint answered": no_refresh_token
+                        # is decided before any request is built.
                         _logger.warning(
-                            "Account %s (%s) is quarantined: the token "
-                            "endpoint answered %s for the credential this "
-                            "fetch POSTed, so it is not fetched and reads "
+                            "Account %s (%s) is quarantined: its stored "
+                            "credential's refresh failed with %s, so it is "
+                            "not fetched and reads "
                             "\"re-login needed\" — %s. Strike %s of %s.",
                             num,
                             (_ident[0] if _ident else "unknown"),
@@ -1237,21 +1235,20 @@ class UsageStore:
                 and row.get("struckFingerprint") != expected_fingerprints.get(num)
             ):
                 return  # the row moved since the caller's lock-free read
-            # BOTH DIRECTIONS OR NEITHER. The strike is a WARNING and the
-            # heal was silent, so a recovery was indistinguishable from a
-            # quarantine that never ended — and after the fact there was no
-            # second timestamp to measure the freeze against. Only a row that
-            # actually carried a quarantine speaks: this method is called on
-            # unstruck rows as a matter of course by every re-login and add,
-            # and a line per call would bury the transitions.
+            # BOTH DIRECTIONS OR NEITHER: a transition log that speaks only
+            # on the way in reports every recovery as a permanent fault. Only
+            # a struck row speaks — every re-login and add calls this on
+            # unstruck rows, and a line per call would bury the transitions.
             if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
-                _ident = identities.get(num) if identities else None
+                # STORE-FACT WORDING (transfer.py's own rule): six of the
+                # seven callers pass no credential, so a comparison claim is
+                # one this never made — and false outright for a forced import
+                # of the byte-identical generation (`same_generation`).
                 _logger.info(
-                    "Account %s (%s) is out of quarantine: its stored "
-                    "credential no longer matches the generation the strike "
-                    "condemned, so it is fetched again.",
+                    "Account %s (%s) is out of quarantine: its dead-token "
+                    "strike was cleared, so it is fetched again.",
                     num,
-                    (_ident[0] if _ident else "unknown"),
+                    identities[num][0],  # _mutate already indexed it
                 )
             if revoke_claim:
                 row["claimId"] = None

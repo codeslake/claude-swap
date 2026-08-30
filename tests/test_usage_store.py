@@ -1274,71 +1274,90 @@ class TestDeadTokenQuarantine:
             f"a transient failure produced the quarantine line: {said!r}"
         )
 
-    def test_a_bound_quarantine_does_not_demand_a_re_login(self, store, caplog):
-        """The line promised a re-login that was not needed, three times in a day.
-
-        A strike condemns the GENERATION that was POSTed, not the slot:
-        ``token_dead(stored_fp=...)`` drops it the moment the stored
-        credential differs from ``struckFingerprint``, and ANY writer does
-        that -- a switch, a rotation Claude Code performs on its own. So the
-        usual cause of an ``invalid_grant`` here is a collector POSTing a
-        snapshot the live client already spent, and the account is fine.
-
-        Measured on one host in ~24h: slots 6, 5 and 3 each took "Strike 1 of
-        1", no re-login appears anywhere in the log, and all three read
-        ``authDeadStrikes=0`` afterwards. Slot 3 was the ACTIVE account at the
-        time and was switched to and used minutes later.
-
-        Telling a person to re-login when a rotation will lift it is a wrong
-        instruction, not a pessimistic one.
+    def test_a_rotatable_quarantine_does_not_demand_a_re_login(self, store, caplog):
+        """A strike on a credential something REPLACES without a human -- a
+        `sha256:` refresh lineage -- condemns the generation, not the slot,
+        and the live client's own rotation lifts it. Telling a person to
+        re-login there is a wrong instruction, not a pessimistic one.
         """
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            # `sha256:` == the credential HAS a refresh token to rotate.
             store.record({"1": FetchRecord(error="invalid_grant",
-                                           struck_fp="fp-of-the-spent-one")},
+                                           struck_fp="sha256:the-spent-one")},
                          IDENT)
         said = " ".join(r.getMessage() for r in caplog.records)
-        assert "until a re-login replaces" not in said, (
-            "a fingerprint-bound strike still demands a re-login: " + repr(said)
+        assert "rotation clears it" in said, (
+            f"a rotatable strike does not name the rotation that lifts it: {said!r}"
         )
-        assert "quarantin" in said, (
-            f"the quarantine stopped announcing itself at all: {said!r}"
+        assert "only a re-login" not in said, (
+            f"a rotatable strike still presents re-login as the remedy: {said!r}"
+        )
+        # THE HEDGE IS THE REQUIREMENT, so assert it directly. The line above
+        # only rules out the SIBLING branch's wording; "re-login now to restore
+        # it" clears it while violating the very thing this test is named for.
+        assert "only if it persists" in said, (
+            f"a rotatable strike hardened its re-login into a demand: {said!r}"
         )
 
     def test_an_unbound_quarantine_still_demands_a_re_login(self, store, caplog):
-        """THE CONTROL, and it is the half that keeps the message honest.
-
-        A row struck with no fingerprint binds unconditionally -- nothing
-        short of a re-login lifts it -- so softening the sentence there would
-        make the log tell a person to wait for a heal that cannot arrive.
-        The two cases must read differently.
+        """THE CONTROL. A row struck with no fingerprint binds
+        unconditionally, so softening the sentence there would tell a person
+        to wait for a heal that cannot arrive.
         """
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         said = " ".join(r.getMessage() for r in caplog.records)
-        assert "re-login" in said, (
+        # Both halves, or neither discriminates: the ROTATION wording also
+        # contains "re-login", so a bare `"re-login" in said` passes on both.
+        assert "only a re-login" in said, (
             f"an unbound strike stopped naming the only thing that lifts it: {said!r}"
+        )
+        assert "rotation clears it" not in said, (
+            f"an unbound strike promises a rotation that cannot lift it: {said!r}"
+        )
+
+    def test_a_credential_with_no_refresh_token_demands_a_re_login(
+        self, store, caplog
+    ):
+        """A BOUND strike that no rotation can lift, so the binding is not the
+        question -- rotatability is. ``no_refresh_token`` strikes too
+        (PERMANENT_AUTH_ERRORS), and ``credential_fingerprint`` falls back to a
+        full-CONTENT hash for a blob with no refresh token, which is truthy.
+        Nothing rotates those bytes: only an explicit write replaces them.
+        """
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store.record({"1": FetchRecord(error="no_refresh_token",
+                                           struck_fp="sha256-full:deadbeef")},
+                         IDENT)
+        said = " ".join(r.getMessage() for r in caplog.records)
+        assert "only a re-login" in said, (
+            f"a content-hash strike was told a rotation may lift it: {said!r}"
+        )
+        assert "rotation clears it" not in said, (
+            f"a credential with no refresh token was promised a rotation: {said!r}"
         )
 
     def test_lifting_a_quarantine_says_so(self, store, caplog):
-        """A transition log that speaks in ONE direction reports a permanent fault.
-
-        The quarantine is a WARNING; the heal was silent, so every recovery
-        looked like a quarantine that never ended. That is why the freeze
-        duration could not be measured after the fact -- there was no second
-        timestamp to measure to.
+        """A transition log that speaks in ONE direction reports every
+        recovery as a permanent fault: the quarantine is a WARNING and the
+        heal was silent.
         """
         store.record({"1": FetchRecord(error="invalid_grant")}, IDENT)
         assert store.entries(IDENT)["1"].token_dead()
         # DROP THE SETUP'S OWN RECORDS. `caplog.records` accumulates over the
-        # whole test, not over the `with` block, so without this the assertion
-        # below is satisfied by the QUARANTINE line the strike just wrote --
-        # it passed against the un-fixed code for exactly that reason.
+        # whole test, not over the `with` block, so without this the strike's
+        # own QUARANTINE line satisfies the assertion below.
         caplog.clear()
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             store.clear_dead_token(["1"], IDENT)
         said = " ".join(r.getMessage() for r in caplog.records)
         assert "1" in said and "a@x.com" in said, (
             f"the heal names neither the slot nor the account: {said!r}"
+        )
+        assert "no longer matches" not in said, (
+            "the heal claims a fingerprint comparison it never made -- this "
+            "row was struck with NO fingerprint, and six of the seven callers "
+            f"hand this method no credential at all: {said!r}"
         )
 
     def test_clearing_an_unstruck_row_stays_quiet(self, store, caplog):
