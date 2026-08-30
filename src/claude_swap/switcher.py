@@ -7029,8 +7029,12 @@ class ClaudeAccountSwitcher:
             # subprocess — a cost no sweep should pay when the expiry arm
             # already condemned everything it looked at.
             out: dict[str, str] = {}
+            accounts = (self._get_sequence_data() or {}).get("accounts")
+            # THE MAP'S TYPE TOO, not just each row's: `or {}` covers null
+            # and empty but hands a truthy non-mapping (`{"accounts": "x"}`)
+            # straight to `.items()`.
             for num, account in (
-                (self._get_sequence_data() or {}).get("accounts") or {}
+                accounts if isinstance(accounts, dict) else {}
             ).items():
                 if not isinstance(account, dict):
                     continue  # a roster row of the wrong SHAPE owns nothing

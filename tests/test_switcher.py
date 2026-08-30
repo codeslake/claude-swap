@@ -9451,7 +9451,7 @@ class TestUnclaimedStashSweep:
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             switcher._sweep_unclaimed_stash()
         assert doomed not in switcher.list_unclaimed_credentials(), (
-            "PREMISE: the sweep must have run to completion, not aborted"
+            "PREMISE: the sweep reaches and drops an expired entry here"
         )
         assert not any(
             "names an owner" in r.getMessage() for r in caplog.records
@@ -9463,29 +9463,41 @@ class TestUnclaimedStashSweep:
         )
 
     @pytest.mark.parametrize("accounts", [
-        None, {"1": None}, {"2": "not-a-dict"},
-    ], ids=["null-map", "null-row", "wrong-type-row"])
-    def test_a_malformed_roster_never_fails_the_stash(self, temp_home, accounts):
-        """Each of these is valid JSON AND a dict, so it sails past
-        `_read_json`'s type check and only blows up down at `.items()` or
-        `.get()`. The containment catches that, but being CAUGHT is not the
-        same as being HANDLED: the expired sibling below must still be swept,
-        which it can only be if the roster read finished."""
+        None, "not-a-map", ["1"], {"1": None}, {"2": "not-a-dict"},
+    ], ids=["null-map", "str-map", "list-map", "null-row", "wrong-type-row"])
+    def test_a_malformed_roster_never_fails_the_stash(
+        self, temp_home, caplog, accounts,
+    ):
+        """Each of these is valid JSON AND the top level is a dict, so it
+        sails past `_read_json`'s type check and only blows up further down.
+        The containment catches that, but being CAUGHT is not being HANDLED:
+        a sweep that dies on entry one leaves every later entry unswept while
+        the stash still reports success."""
+        import logging
+
         switcher = self._switcher(temp_home)
         doomed = switcher._store._write_unclaimed_credential(
             self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
         )
         switcher._write_json(switcher.sequence_file, {"accounts": accounts})
 
-        entry_id = switcher._stash_live_credential(
-            self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
-        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            entry_id = switcher._stash_live_credential(
+                self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
+            )
         assert entry_id in switcher.list_unclaimed_credentials(), (
             "a malformed roster turned a successful stash into a failed one"
         )
+        # ORDER-INDEPENDENT. Entry ids sort by a sha256 of their own bytes, so
+        # "the expired sibling was dropped" only proves the sweep finished on
+        # the ~half of runs where that sibling sorts second. The containment
+        # is silent exactly when nothing aborted, whatever the order.
+        assert not any(
+            "sweeping the unclaimed stash" in r.getMessage()
+            for r in caplog.records
+        ), "the sweep aborted and was merely contained"
         assert doomed not in switcher.list_unclaimed_credentials(), (
-            "the sweep aborted and was merely contained — the roster shape "
-            "has to be HANDLED, or every later entry goes unswept"
+            "the sweep did not reach the expired entry"
         )
 
     def test_the_sweep_reads_no_slot_when_nothing_can_be_dropped(

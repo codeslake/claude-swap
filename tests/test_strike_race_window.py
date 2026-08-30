@@ -222,8 +222,13 @@ def test_a_transient_retry_does_not_erase_the_doubt(store, clock):
     )
     # PACED, not free. Surviving a transient is only safe because the failure
     # backoff still holds the row off; without it a doubted row would be
-    # re-POSTed every collect pass forever.
-    assert not _row_eligible(store._read_rows()["1"], now=clock.now,
+    # re-POSTed every collect pass forever. Measured a FULL base interval out,
+    # not at `now`: any backoff at all passes at `now`, so that alone would
+    # miss a one-second one.
+    from claude_swap.usage_store import BACKOFF_BASE_S
+
+    assert not _row_eligible(store._read_rows()["1"],
+                             now=clock.now + BACKOFF_BASE_S - 1,
                              respect_plans=False), (
         "the doubt survived the transient AND the pacing that bounds it"
     )
