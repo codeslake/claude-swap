@@ -5,10 +5,10 @@ Evidence is in the commit; each test states the state it drives.
 import json
 
 import pytest
-from unittest.mock import patch
 
 from claude_swap import oauth
 from claude_swap.credentials import ActiveCredentials
+from claude_swap.process_detection import ClaudeSession
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.switcher import SENTINEL_NOTES, ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
@@ -45,40 +45,54 @@ def test_the_relogin_note_does_not_condemn_a_live_credential_that_moved_on(
                         lambda: ActiveCredentials(NEW, False, False))
     monkeypatch.setattr(s, "_get_current_account", lambda: ("b@example.com", ""))
 
-    with patch.object(s, "current_account_number", return_value="2"):
-        entries = s._collect_usage_entries(s._build_accounts_info(), fetch=set())
+    entries = s._collect_usage_entries(s._build_accounts_info(), fetch=set())
 
     assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED, (
         "PREMISE BROKEN: the backup-confirms branch did not fire, so this test "
         "no longer measures the state the note is wrong about"
     )
     note = SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
-    assert "refresh token dead" not in note, (
-        f"{note!r} states the account's refresh token is dead; here the live "
-        "credential authenticates and only a stored copy was rejected"
+    assert "refresh token dead" not in note and "a stored refresh token" in note, (
+        f"{note!r} must name the STORED copy: here the live credential "
+        "authenticates and only a stored one was rejected"
     )
 
 
 @pytest.mark.parametrize("backend", ["keychain", "file"])
-@pytest.mark.parametrize("running", [0, 2])
-def test_switch_followup_names_the_sessions_that_predate_the_swap(
-    backend, running, monkeypatch, capsys,
+@pytest.mark.parametrize("kinds,named", [
+    ([], 0),
+    (["bg", "daemon", "daemon-worker"], 0),
+    (["interactive", "bg", "bg"], 1),
+    (["interactive", ""], 2),
+])
+def test_switch_followup_names_only_the_sessions_that_can_read_it(
+    backend, kinds, named, monkeypatch, capsys,
 ):
     """Every live session predates a switch that has just committed, so the
-    caveat needs no timestamp — only whether any exist."""
+    caveat needs no timestamp — only which of them a human could act on. A
+    bg/daemon session has no banner to show the symptom and nothing to
+    restart, and counting one names a population the remedy does not reach.
+    The last row is the reason the filter EXCLUDES rather than matches
+    "interactive": an unknown kind must still count."""
     s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
     monkeypatch.setattr(
         ClaudeAccountSwitcher, "_last_active_credentials_backend", backend,
     )
+    sessions = [
+        ClaudeSession(pid=100 + i, session_id="", cwd="", started_at=0,
+                      kind=k, entrypoint="cli")
+        for i, k in enumerate(kinds)
+    ]
     monkeypatch.setattr("claude_swap.switcher.get_running_instances",
-                        lambda: ([object()] * running, []))
+                        lambda: (sessions, []))
 
     s._print_switch_followup()
     out = capsys.readouterr().out
 
-    assert (f"{running} Claude session(s)" in out) is bool(running), (
-        f"backend={backend} running={running}: got {out!r}"
+    plural = "" if named == 1 else "s"
+    assert (f"{named} Claude session{plural}" in out) is bool(named), (
+        f"backend={backend} kinds={kinds}: got {out!r}"
     )
-    assert ("Not logged in" in out) is bool(running), (
+    assert ("Not logged in" in out) is bool(named), (
         f"the caveat must name the symptom it clears: {out!r}"
     )

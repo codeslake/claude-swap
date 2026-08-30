@@ -202,7 +202,7 @@ SENTINEL_NOTES = {
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
     # NOT the ACCOUNT's: `_entry_token_dead` holds the strike while ANY stored
     # source matches, so an active slot is condemned on its backup alone.
-    USAGE_RELOGIN_REQUIRED: "re-login needed — a stored credential's refresh token was rejected; log in with Claude Code, then run: cswap add",
+    USAGE_RELOGIN_REQUIRED: "re-login needed — a stored refresh token was rejected; log in with Claude Code, then run: cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
     # `/login` writes to whichever account is active, so switching first is
@@ -7357,6 +7357,7 @@ class ClaudeAccountSwitcher:
 
         "Usually", not "never", which is why already-running sessions get
         named: a rejected credential surfaces as ``InvalidRequestHeaderValueError``
+        (measured in 2.1.251)
         while BUILDING the request. No HTTP status means none of the paths that
         rebuild the client on 401/403/socket errors fire, so nothing cswap
         writes afterwards is re-read and only a restart clears it.
@@ -7373,17 +7374,25 @@ class ClaudeAccountSwitcher:
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
         # Every live session predates a switch that has already committed, so
-        # this needs no timestamp. Best-effort, like the sibling call in
+        # this needs no timestamp — only which of them a human could act on: a
+        # bg/daemon session has no banner to show the symptom and nothing to
+        # restart. EXCLUDING those rather than matching "interactive" keeps an
+        # unknown or renamed kind counted, because an overcount is visible and
+        # a silent zero is not. Best-effort, like the sibling call in
         # `list_accounts`: the switch is done and must not fail on a scan.
         try:
-            running = len(get_running_instances()[0])
+            running = sum(
+                1 for s in get_running_instances()[0]
+                if s.kind not in ("bg", "daemon", "daemon-worker")
+            )
         except Exception:
             self._logger.debug("Failed to detect running instances", exc_info=True)
             running = 0
         if running:
             print(dimmed(
-                f"  {running} Claude session(s) were already running — restart "
-                'any that keep saying "Not logged in · Please run /login".'
+                f"  {running} Claude session{'s' if running > 1 else ''} "
+                "already running — restart any that keeps saying "
+                '"Not logged in · Please run /login".'
             ))
 
     def purge(self) -> None:
