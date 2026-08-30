@@ -14954,6 +14954,218 @@ class TestSessionShellGuardCoversEveryMutator:
             s.unset_alias("2")
 
 
+
+class TestALoginLandsInItsOwnSlot:
+    """A login for a MANAGED account must reach that account's slot.
+
+    `_resync_rotated_backup` asks the server whose the live credential is,
+    gets the answer, compares it to ONE slot, and when it does not match it
+    logs "foreign credential under a stale config" and DISCARDS the answer.
+
+    Measured on the personal mac: the owner ran `/login` and signed in as
+    slot 5 while slot 1 was active. A switch to slot 5 then stashed that
+    credential as foreign and installed slot 5's stored one — which was dead
+    — one log line later. The stash was proven to be slot 5's own credential
+    by asking the server with its access token. The owner's recovery path,
+    `cswap add --slot 5`, then refused because the live credential had been
+    replaced by a third account's.
+
+    The identity is already in hand at the moment it is thrown away. Nothing
+    else needs to be built: no new command, no stash to adopt, no --slot for
+    the owner to type.
+    """
+
+    def test_the_resolver_names_the_owning_slot(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {
+            "1": {"email": "a@x", "organizationUuid": "o1", "uuid": "u-1"},
+            "5": {"email": "b@y", "organizationUuid": "o5", "uuid": "u-5"},
+        }}
+        got = sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-5", "email": "b@y", "organizationUuid": "o5"})
+        assert got == "5", got
+
+    def test_an_identity_no_slot_owns_is_None(self, temp_home):
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {"1": {"email": "a@x", "organizationUuid": "o1",
+                                   "uuid": "u-1"}}}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-9", "email": "z@z", "organizationUuid": "o9"}) is None
+
+    def test_a_partial_profile_owns_nothing(self, temp_home):
+        """No uuid and no (email, org) pair is not an identity. Guessing an
+        owner here would write a credential into a slot on a coincidence."""
+        sw = ClaudeAccountSwitcher()
+        data = {"accounts": {"1": {"email": "a@x", "organizationUuid": "o1",
+                                   "uuid": "u-1"}}}
+        assert sw._slot_owning_resolved_identity(data, {}) is None
+        assert sw._slot_owning_resolved_identity(
+            data, {"email": "a@x"}) is None
+
+    def test_uuid_beats_a_recycled_address(self, temp_home):
+        """Addresses are recycled across accounts; uuids are not. A stored
+        uuid that disagrees must lose to nothing — the row is not that slot's
+        even when the address matches."""
+        sw = ClaudeAccountSwitcher()
+        # SLOT 2 CARRIES NO UUID, so the address fallback is live and would
+        # claim the row on the recycled address alone. Without it the early
+        # `return None` is unreachable and the mutation survives.
+        data = {"accounts": {
+            "1": {"email": "same@x", "organizationUuid": "o1", "uuid": "u-1"},
+            "2": {"email": "same@x", "organizationUuid": "o1"},
+        }}
+        assert sw._slot_owning_resolved_identity(
+            data, {"uuid": "u-OTHER", "email": "same@x",
+                   "organizationUuid": "o1"}) is None
+
+    def test_a_login_for_another_managed_slot_lands_in_that_slot(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """THE SLICE. The live credential belongs to slot 1, the resync runs
+        for slot 2, and slot 1's backup is empty. Today it logs "foreign
+        credential under a stale config" and returns, so the owner's login is
+        lost. It must land in slot 1."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        s._write_account_credentials("2", "b@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
+                               "expiresAt": 99_999_999_999_999}}))
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+        got = s._read_account_credentials("1", "c@example.com")
+        assert got, "slot 1 has no credential — the login was discarded"
+        assert json.loads(got)["claudeAiOauth"]["refreshToken"] == "rt-live"
+
+    def test_an_older_login_does_not_overwrite_a_fresher_stored_one(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """THE RISK THIS FIX CARRIES. Adopting writes over whatever the slot
+        holds. On the measured incident the stored one was dead and the live
+        one fresh, but a stale live credential must not clobber a fresher
+        backup — the refresh token is the one thing that cannot be re-derived.
+        Same lineage is not the question; RECENCY is."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        fresher = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-keep", "refreshToken": "rt-keep",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": 99_999_999_999_999}})
+        s._write_account_credentials("1", "c@example.com", fresher)
+        # THE SLOT MUST BE DEAD OR THIS NEVER REACHES THE RECENCY GUARD: the
+        # deadness check returns first for a healthy slot, so without this the
+        # case passes on a DIFFERENT guard and the mutation survives.
+        from claude_swap.usage_store import FetchRecord, Identity
+        s._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant")},
+            {"1": Identity(("c@example.com", "o-1"))})
+        older = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": 1_000}})
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", older)
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-keep", (
+            "an older login overwrote a fresher stored credential")
+
+    def test_a_healthy_owner_slot_is_left_alone(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """THE REGRESSION THE FIRST SLICE CAUSED. An ordinary switch leaves a
+        transient identity mismatch behind, and adopting on that alone
+        overwrote a rotated refresh token the switch had just persisted —
+        `test_switch_persists_rotated_refresh_token_to_backup` went red.
+
+        The measured incident is narrower than "the identity differs": the
+        owner slot's stored credential was DEAD, so its login had nowhere to
+        live. A slot holding a working credential is not that case and must
+        not be written."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        healthy = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-healthy", "refreshToken": "rt-healthy",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": 99_999_999_999_999}})
+        s._write_account_credentials("1", "c@example.com", healthy)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": 99_999_999_999_999}})
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-healthy", (
+            "a slot with a working credential was overwritten")
+
+    def test_a_dead_owner_slot_receives_the_login(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, monkeypatch
+    ):
+        """THE MEASURED CASE ITSELF, and the branch an empty slot cannot
+        reach. Slot 1 HOLDS a credential and the collector has condemned it
+        on invalid_grant; the owner's fresh login must replace it.
+
+        This is also the control on the deadness probe: the first slice
+        passed with an EMPTY slot, so `_slot_credential_is_dead` was never
+        consulted and could return False forever without a test noticing."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        dead = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-dead", "refreshToken": "rt-dead",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": 99_999_999_999_999}})
+        s._write_account_credentials("1", "c@example.com", dead)
+        from claude_swap.usage_store import FetchRecord, Identity
+        ids = {"1": Identity(("c@example.com", "o-1"))}
+        s._usage_store.record({"1": FetchRecord(error="invalid_grant")}, ids)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": 99_999_999_999_999}})
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            "a quarantined slot did not receive its owner's fresh login")
+
 class TestCurrentAtLimitOverridesTheFrozenPct:
     """`current_at_limit=True` — a caller measured the limit off the poll.
 
