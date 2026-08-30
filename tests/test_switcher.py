@@ -9445,8 +9445,14 @@ class TestUnclaimedStashSweep:
         assert switcher._store._read_unclaimed_credential(entry_id) == ("", False), (
             "premise: the bytes must be gone while the manifest row remains"
         )
+        doomed = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+        )
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             switcher._sweep_unclaimed_stash()
+        assert doomed not in switcher.list_unclaimed_credentials(), (
+            "PREMISE: the sweep must have run to completion, not aborted"
+        )
         assert not any(
             "names an owner" in r.getMessage() for r in caplog.records
         ), "a row naming configSlot was counted as ownerless"
@@ -9456,26 +9462,30 @@ class TestUnclaimedStashSweep:
             "the sweep dropped a row it could not positively condemn"
         )
 
-    def test_a_null_accounts_roster_never_fails_the_stash(self, temp_home):
-        """`{"accounts": null}` is valid JSON and a dict, so it sails past
-        `_read_json`'s type check and only blows up at `.items()` — an
-        `AttributeError`, which is outside the containment and so aborts a
-        switch whose stash already landed. Same harm as the torn file, one
-        type away, and the `or {}` idiom the rest of the file uses is what
-        closes it."""
+    @pytest.mark.parametrize("accounts", [
+        None, {"1": None}, {"2": "not-a-dict"},
+    ], ids=["null-map", "null-row", "wrong-type-row"])
+    def test_a_malformed_roster_never_fails_the_stash(self, temp_home, accounts):
+        """Each of these is valid JSON AND a dict, so it sails past
+        `_read_json`'s type check and only blows up down at `.items()` or
+        `.get()`. The containment catches that, but being CAUGHT is not the
+        same as being HANDLED: the expired sibling below must still be swept,
+        which it can only be if the roster read finished."""
         switcher = self._switcher(temp_home)
-        switcher._store._write_unclaimed_credential(
-            self._creds("keep-me-rt", self._ms(20)), {"reason": "foreign"},
+        doomed = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
         )
-        switcher._write_json(
-            switcher.sequence_file, {"accounts": {"1": None, "2": "not-a-dict"}}
-        )
+        switcher._write_json(switcher.sequence_file, {"accounts": accounts})
 
         entry_id = switcher._stash_live_credential(
             self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
         )
         assert entry_id in switcher.list_unclaimed_credentials(), (
-            "a null accounts map turned a successful stash into a failed one"
+            "a malformed roster turned a successful stash into a failed one"
+        )
+        assert doomed not in switcher.list_unclaimed_credentials(), (
+            "the sweep aborted and was merely contained — the roster shape "
+            "has to be HANDLED, or every later entry goes unswept"
         )
 
     def test_the_sweep_reads_no_slot_when_nothing_can_be_dropped(

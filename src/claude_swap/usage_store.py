@@ -261,7 +261,7 @@ def _strike_is_suspected_race(
 ) -> bool:
     """Whether to doubt this row's FIRST strike because a success preceded it.
 
-    Only the FIRST strike is doubted, so this permits exactly one extra POST
+    Only a row at or below the threshold is doubted, so this permits one POST
     THAT RETURNS A VERDICT: the retry either succeeds (`record` zeroes the
     count) or lands a second strike no window can excuse. That keeps the
     endless-401 loop away and makes the width non-critical -- erring either
@@ -270,8 +270,9 @@ def _strike_is_suspected_race(
     A TRANSIENT failure returns no verdict, and since it advances neither
     `struckAt` nor the strike count the doubt survives it. That is deliberate:
     a timeout is no evidence about the token, so a possibly-live one should
-    keep being retried -- paced by `backoffUntil`, which a failure always
-    sets.
+    keep being retried -- paced by `backoffUntil`, which every RECORDED
+    failure sets (an outcome fenced out by a stale claim records nothing at
+    all, so it neither strikes nor paces).
 
     THE STRIKE'S OWN TIME, not `lastAttemptAt`. That field advances on every
     attempt -- `reserve` stamps it before the fetch and `record` stamps it for

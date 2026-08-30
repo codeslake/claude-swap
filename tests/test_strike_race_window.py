@@ -220,6 +220,13 @@ def test_a_transient_retry_does_not_erase_the_doubt(store, clock):
         "a timeout carried no evidence about the token and still turned a "
         "doubted strike into a permanent quarantine"
     )
+    # PACED, not free. Surviving a transient is only safe because the failure
+    # backoff still holds the row off; without it a doubted row would be
+    # re-POSTed every collect pass forever.
+    assert not _row_eligible(store._read_rows()["1"], now=clock.now,
+                             respect_plans=False), (
+        "the doubt survived the transient AND the pacing that bounds it"
+    )
     # DISPLAY IS THE LESSER HALF. Only a fetch can land the success that
     # clears the strike, so the row must stay ELIGIBLE — `now` is past the
     # failure backoff so the strike guard is the only thing that can veto.

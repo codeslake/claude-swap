@@ -324,9 +324,8 @@ def _refresh_expiry(blob: str) -> "float | None":
     depend on that: the adopt refuses an older login, and the quarantine
     release recognises a newer one.
 
-    `credentials.py` keeps its own reader on purpose: it takes an already
-    unwrapped oauth object, and that module is a leaf importing only
-    `macos_keychain` and `paths`.
+    `credentials.py` keeps its own reader because that one also accepts an
+    UNWRAPPED payload, which `oauth.extract_oauth_data` returns None for.
     """
     v = (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
     return v if isinstance(v, (int, float)) else None
@@ -7033,10 +7032,10 @@ class ClaudeAccountSwitcher:
             for num, account in (
                 (self._get_sequence_data() or {}).get("accounts") or {}
             ).items():
+                if not isinstance(account, dict):
+                    continue  # a roster row of the wrong SHAPE owns nothing
                 fp = oauth.credential_fingerprint(
-                    self._read_account_credentials(
-                        num, (account or {}).get("email") or ""
-                    )
+                    self._read_account_credentials(num, account.get("email") or "")
                 )
                 if fp:
                     out.setdefault(fp, num)
