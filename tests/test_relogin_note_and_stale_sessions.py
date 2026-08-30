@@ -4,7 +4,6 @@ Evidence is in the commit; each test states the state it drives.
 """
 import json
 import logging
-import re
 
 import pytest
 
@@ -64,9 +63,9 @@ def test_the_relogin_note_does_not_condemn_a_live_credential_that_moved_on(
         f"{note!r} is false for the no_refresh_token half of this sentinel"
     )
     # The strike supports "the refresh failed" and nothing more.
-    assert re.search(r"\bif it persists\b|\bmay\b", note), (
-        f"{note!r} presents the re-login as required; one invalid_grant on a "
-        "single-use grant does not establish that"
+    assert "if it persists" in note and "cswap add" in note, (
+        f"{note!r} must keep the remedy AND keep it conditional: one "
+        "invalid_grant on a single-use grant does not require a re-login"
     )
 
 
@@ -82,8 +81,8 @@ def test_switch_followup_names_only_the_sessions_that_can_read_it(
 ):
     """Every live session predates a switch that has just committed, so the
     caveat needs no timestamp — only which of them a human could act on. A
-    bg/daemon session has no banner to show the symptom and nothing to
-    restart, and counting one names a population the remedy does not reach.
+    bg/daemon session has no banner to show the symptom, so counting one
+    names a population the remedy does not reach.
     The last row is the reason the filter EXCLUDES rather than matches
     "interactive": an unknown kind must still count."""
     s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)

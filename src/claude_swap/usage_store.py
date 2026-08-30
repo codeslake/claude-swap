@@ -232,6 +232,34 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
 
+#: A strike is only trustworthy if nothing says the lineage was answering. The
+#: consume gate holds the slot lock to READ, POSTs outside it, then CASes, so a
+#: second path can POST the same one-time grant and the loser is told
+#: `invalid_grant` about an account that is fine. `lastAttemptAt - fetchedAt` is
+#: the row's own evidence: `fetchedAt` advances only on a success, so a small
+#: gap means the token answered moments before it was condemned.
+RACE_WINDOW_S = 600.0
+
+
+def _strike_is_suspected_race(
+    fetched_at: float | None, last_attempt_at: float | None
+) -> bool:
+    """Whether this row's strike landed close enough to a SUCCESS to doubt it.
+
+    Both timestamps absent is the honest default of "no evidence", which keeps
+    every row written before this existed reading exactly as it did. A negative
+    gap (an attempt stamped before the success) is not a race either -- the
+    success is the LATER event there, and it already zeroed the strike.
+
+    This cannot excuse a strike forever: the retry it permits stamps
+    ``lastAttemptAt`` and leaves ``fetchedAt`` alone, so a lineage that keeps
+    failing widens its own gap past the window and is quarantined for good.
+    """
+    if fetched_at is None or last_attempt_at is None:
+        return False
+    return 0 <= last_attempt_at - fetched_at <= RACE_WINDOW_S
+
+
 # Fetch errors that prove the stored credential is permanently unusable (vs.
 # transient 429/timeout/network). Only these advance the dead-token strike
 # count; everything else leaves it untouched (a transient error is no evidence
@@ -370,6 +398,8 @@ class UsageEntry:
         before fingerprints were recorded binds unconditionally.
         """
         if self.auth_dead_strikes < threshold:
+            return False
+        if _strike_is_suspected_race(self.fetched_at, self.last_attempt_at):
             return False
         if (
             stored_fp is not None
@@ -1297,7 +1327,15 @@ def _row_eligible(
 ) -> bool:
     """Fetch eligibility of a stored row, evaluated under the write lock
     (see :meth:`UsageStore.reserve` for the two caller modes)."""
-    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+    if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES and not (
+        _strike_is_suspected_race(
+            _num_or_none(row.get("fetchedAt")),
+            _num_or_none(row.get("lastAttemptAt")),
+        )
+    ):
+        # A suspected race stays eligible ON PURPOSE: the strike blocks the
+        # fetch, and only a fetch can succeed, so vetoing here is what makes
+        # one `invalid_grant` permanent. Backoff below still paces the retry.
         return False
     backoff_until = _num_or_none(row.get("backoffUntil"))
     if backoff_until is not None and now < backoff_until:
