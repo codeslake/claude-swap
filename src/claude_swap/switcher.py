@@ -5288,15 +5288,17 @@ class ClaudeAccountSwitcher:
         # display refresh behind every switch.
         if not email or not self._slot_token_dead(num, email):
             return False
+        lock = FileLock(self.lock_file)
         try:
-            lock = FileLock(self.lock_file)
+            # `.acquire()` and not `with`: the context manager raises on
+            # contention, and a display refresh must stand down, not fail.
+            # A slot mutation in flight is a reason to wait a pass — writing
+            # beside it can overwrite a refresh token that switch just
+            # persisted, and a refresh token cannot be re-derived.
             if not lock.acquire():
-                # A slot mutation is in flight. Standing down costs one pass;
-                # writing beside it can overwrite a refresh token that switch
-                # just persisted, and a refresh token cannot be re-derived.
                 return False
-        except (OSError, LockError):
-            return False
+        except OSError:
+            return False        # the lock file itself is unusable
         try:
             # RE-DERIVED UNDER THE LOCK, never trusted from the pre-check.
             # The roster moves (`swap_accounts`, `move_account`,
