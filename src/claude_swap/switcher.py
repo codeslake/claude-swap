@@ -3055,11 +3055,6 @@ class ClaudeAccountSwitcher:
             # No hit at all means the account is not this fleet's, and falling
             # through to the address below would let a recycled address claim
             # a slot the uuid already said it is not.
-            # AMBIGUOUS IS NOT A TIEBREAK. The comment above says the org
-            # separates two records of one uuid and that with nothing to
-            # separate them the answer is ambiguous; the code then took the
-            # first hit anyway, so a duplicate record wrote the login into a
-            # slot chosen by dict iteration order.
             return hits[0] if len(hits) == 1 else None
         if not seen_email or not seen_org:
             return None
