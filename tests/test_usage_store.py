@@ -1379,10 +1379,8 @@ class TestDeadTokenQuarantine:
         """THE CONTROL. `clear_dead_token` is called on rows with no strike as
         a matter of course -- every re-login and every add runs it -- so a line
         per call would bury the transitions it exists to show."""
-        # A FAILURE HISTORY WITH NO STRIKE, which is what separates the two
-        # counters: a transient error bumps consecutiveFailures and leaves
-        # authDeadStrikes at 0. On a virgin row both are 0, so the guard could
-        # read either field and this control would still pass.
+        # A FAILURE HISTORY WITH NO STRIKE separates the two counters: on a
+        # virgin row both are 0 and the guard could read either field.
         store.record({"1": FetchRecord(error="http-429")}, IDENT)
         caplog.clear()
         with caplog.at_level(logging.INFO, logger="claude-swap"):
