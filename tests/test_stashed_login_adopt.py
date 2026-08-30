@@ -179,6 +179,46 @@ class TestAdoptStashedLoginForSlot:
             "2", "owner@example.com") is False
         assert entry_id in switcher._store._list_unclaimed_credentials()
 
+    def test_a_write_that_landed_is_an_adopt_even_if_the_strike_cannot_lift(
+            self, switcher, monkeypatch):
+        """The write ADVANCES the slot. Reporting "could not adopt" after it
+        lands makes the caller announce a re-login for a slot that now holds a
+        working credential, and leaves a stash row pointing at bytes the slot
+        already has — which the identical-bytes guard then refuses forever.
+        The sibling adopt gets this right: it logs the unlifted quarantine and
+        carries on."""
+        entry_id = self._stash(switcher)
+        self._strike(switcher)
+
+        def boom(*a, **k):
+            raise OSError("usage store is unwritable")
+
+        monkeypatch.setattr(switcher._usage_store, "clear_dead_token", boom)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is True
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(FRESH), "the write did not land"
+        assert entry_id not in switcher._store._list_unclaimed_credentials(), (
+            "the adopted entry stayed in the stash")
+
+    def test_a_write_that_FAILED_is_not_an_adopt(self, switcher, monkeypatch):
+        """THE CONTROL. Without it the assertion above passes for a build that
+        calls every failure an adopt."""
+        entry_id = self._stash(switcher)
+        self._strike(switcher)
+
+        def boom(*a, **k):
+            raise OSError("backup is unwritable")
+
+        monkeypatch.setattr(switcher, "_write_account_credentials", boom)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
     def test_another_account_s_login_is_left_alone(self, switcher):
         """Identity is what authorizes the write; a dead slot is not a
         licence to absorb whatever is in the stash."""

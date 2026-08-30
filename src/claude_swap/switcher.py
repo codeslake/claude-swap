@@ -5380,16 +5380,29 @@ class ClaudeAccountSwitcher:
                     continue
                 try:
                     self._write_account_credentials(num, email, creds)
+                except (OSError, LockError) as e:
+                    self._logger.warning(
+                        "Could not adopt the stashed login into Account-%s: "
+                        "%s. It stays in the stash.", num, e,
+                    )
+                    return False
+                # PAST THE WRITE, THE ADOPT HAPPENED. The slot now holds this
+                # credential, so a failure below is a quarantine left standing
+                # over a working login — never a reason to report no adopt,
+                # which would announce a re-login and strand the stash row
+                # against the identical-bytes guard.
+                try:
                     self._usage_store.clear_dead_token(
                         [num],
                         {num: (email, record.get("organizationUuid") or "")},
                     )
                 except (OSError, LockError) as e:
                     self._logger.warning(
-                        "Could not adopt the stashed login into Account-%s: %s. "
-                        "It stays in the stash.", num, e,
+                        "Adopted a stashed login into Account-%s but could "
+                        "not lift its quarantine (%s); it stays out of "
+                        "collect passes until one observes the new "
+                        "credential.", num, e,
                     )
-                    return False
                 # DROPPED ONLY AFTER THE WRITE LANDED. A stash row outliving its
                 # adoption is listed forever; one dropped before it would lose the
                 # only copy.
