@@ -576,6 +576,37 @@ class CredentialStore:
         )
         return None, True
 
+    def _fresher_plaintext_login(self, keychain_value: str) -> "str | None":
+        """The plaintext file's credential when it is a NEWER login, else None.
+
+        Compared on ``refreshTokenExpiresAt``, which only a fresh login moves.
+        Any read or parse failure answers None: this decides which of two
+        readable credentials to serve, and an unreadable one is not a claim.
+        """
+        try:
+            cred_file = get_credentials_path()
+            if not cred_file.exists():
+                return None
+            text = cred_file.read_text(encoding="utf-8")
+        except Exception:      # noqa: BLE001 — the Keychain value still stands
+            return None
+        if not text.strip():
+            return None
+
+        def _refresh_expiry(blob: str) -> "int | None":
+            try:
+                obj = json.loads(blob)
+            except (TypeError, ValueError):
+                return None
+            obj = obj.get("claudeAiOauth") or obj
+            v = obj.get("refreshTokenExpiresAt")
+            return v if isinstance(v, (int, float)) else None
+
+        kc_at, file_at = _refresh_expiry(keychain_value), _refresh_expiry(text)
+        if kc_at is None or file_at is None or file_at <= kc_at:
+            return None
+        return text
+
     def _read_active_credentials(self) -> ActiveCredentials:
         """Read Claude Code's active credential, classifying the outcome.
 
@@ -624,6 +655,24 @@ class CredentialStore:
             # which is what makes it self-heal without being erasable.
             self._active_read_failed = keychain_failed
             if val:
+                # EITHER STORE CAN BE THE NEWER ONE. Taking the Keychain and
+                # stopping is right only while the two agree, and they come
+                # apart: one failed Keychain WRITE sends Claude Code to the
+                # plaintext file while later Keychain READS keep succeeding
+                # with the older item. Measured on a host where every login
+                # appeared to vanish — file 09-26, Keychain 09-06, and the
+                # read took the Keychain, after which cswap wrote what it had
+                # read back over both stores.
+                #
+                # `refreshTokenExpiresAt` and NOT `expiresAt`: a refresh moves
+                # the access token every poll without extending the refresh
+                # lifetime, so comparing access expiry would flip backends on
+                # ordinary rotation. Only a fresh login mints a later one, so
+                # "strictly later" is the login signature and nothing else
+                # produces it. Undated is no evidence and keeps the Keychain.
+                fresher = self._fresher_plaintext_login(val)
+                if fresher is not None:
+                    return ActiveCredentials(fresher, False)
                 return ActiveCredentials(val, False)
         elif self._residual_verdict is False or (
             self._active_read_failed or self._keychain_unreadable

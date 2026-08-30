@@ -366,3 +366,88 @@ class TestTheClearReachesEveryStoreTheReadDoes:
             "survivor in a store the read would have found keeps "
             "authenticating under the new slot's name"
         )
+
+
+class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
+    """macOS has two live stores and they DO come apart.
+
+    MEASURED on a host where every login appeared to vanish:
+
+        plaintext file   refreshTokenExpiresAt 09-26 18:01   (the login just made)
+        Keychain         refreshTokenExpiresAt 09-06 15:28   (weeks older)
+        what cswap read  the Keychain
+
+    The read took the Keychain and stopped, so the login was never seen — and
+    cswap then wrote what it had read back over both stores, destroying it.
+    The plaintext file is not merely a fallback for an EMPTY Keychain; either
+    side can be the newer one, because a Keychain write that fails once sends
+    Claude Code to the file while later Keychain READS keep succeeding with the
+    older item.
+
+    `refreshTokenExpiresAt` IS the comparison, and `expiresAt` is not: a
+    refresh moves the access token on every poll and does not extend the
+    refresh lifetime, so comparing access expiry would flip backends on
+    ordinary rotation. Only a fresh login mints a later refresh lifetime.
+    """
+
+    @staticmethod
+    def _creds(tag: str, refresh_exp: int) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-" + tag, "refreshToken": "rt-" + tag,
+            "expiresAt": 9999999999000, "refreshTokenExpiresAt": refresh_exp}})
+
+    def _store(self, tmp_path, monkeypatch, kc: str, fl: str):
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr(
+            "claude_swap.macos_keychain.get_password",
+            _keychain({CLAUDE_CODE_KEYCHAIN_SERVICE: kc} if kc else {}, []),
+        )
+        d = tmp_path / ".claude"
+        d.mkdir(parents=True, exist_ok=True)
+        if fl:
+            (d / ".credentials.json").write_text(fl, encoding="utf-8")
+        return CredentialStore(_Host(tmp_path / "backups"))
+
+    def test_a_newer_login_in_the_FILE_wins(self, tmp_path, monkeypatch):
+        """THE MEASURED CASE."""
+        kc = self._creds("keychain-old", 1_000)
+        fl = self._creds("file-login", 9_000)
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == fl, (
+            "the Keychain's older item won and the login in the file was never "
+            "read — which is how a login disappears without a trace"
+        )
+
+    def test_CONTROL_a_newer_KEYCHAIN_still_wins(self, tmp_path, monkeypatch):
+        """The other direction, and the ordinary one: CC writes rotations to
+        the Keychain on macOS, so a stale file must not win."""
+        kc = self._creds("keychain-login", 9_000)
+        fl = self._creds("file-old", 1_000)
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == kc
+
+    def test_CONTROL_equal_lifetimes_keep_the_keychain(self, tmp_path, monkeypatch):
+        """Same generation in both — the steady state on a healthy host. No
+        reason to change which backend answers, and changing it would churn."""
+        same = self._creds("same", 5_000)
+        got = self._store(tmp_path, monkeypatch, same, same)._read_active_credentials()
+        assert got.value == same
+
+    def test_CONTROL_an_undated_file_cannot_win(self, tmp_path, monkeypatch):
+        """No `refreshTokenExpiresAt` is no evidence of a newer login. A row
+        that could win on absence would hand the older bytes the decision."""
+        kc = self._creds("keychain", 1_000)
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-undated", "refreshToken": "rt-undated",
+            "expiresAt": 9999999999000}})
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == kc
+
+    def test_CONTROL_an_empty_keychain_still_falls_back(self, tmp_path, monkeypatch):
+        """The original fallback must survive: nothing in the Keychain means
+        the file is the only source, dated or not."""
+        fl = self._creds("file-only", 1_000)
+        got = self._store(tmp_path, monkeypatch, "", fl)._read_active_credentials()
+        assert got.value == fl
