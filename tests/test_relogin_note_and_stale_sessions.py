@@ -1,18 +1,6 @@
-"""Two user-facing claims this PR measured false.
-
-1. ``SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]`` said "refresh token dead" of the
-   ACCOUNT. ``_entry_token_dead`` confirms dead off whichever stored source
-   still matches the struck generation, so an active slot whose LIVE
-   credential has already rotated past it is condemned on its BACKUP alone —
-   deliberately (the strike must survive a live-only compare), but the account
-   authenticates fine and the note said otherwise.
-
-2. ``_print_switch_followup``'s "no restart needed". A session already running
-   when the credential is replaced can end up rendering "Not logged in ·
-   Please run /login", which 2.1.251 raises as ``InvalidRequestHeaderValueError``
-   ("request header value rejected before send") — no HTTP status, so none of
-   the retry paths that rebuild the client fire, and no rewrite cswap makes can
-   reach it. A restart is the only thing that clears it.
+"""Two claims the code could not support: the "re-login needed" note calling
+the ACCOUNT's refresh token dead, and the post-switch "no restart needed".
+Evidence is in the commit; each test states the state it drives.
 """
 import json
 
@@ -88,10 +76,9 @@ def test_switch_followup_names_the_sessions_that_predate_the_swap(
     s._print_switch_followup()
     out = capsys.readouterr().out
 
-    assert ("already running" in out) is bool(running), (
+    assert (f"{running} Claude session(s)" in out) is bool(running), (
         f"backend={backend} running={running}: got {out!r}"
     )
-    if running:
-        assert "Not logged in" in out and str(running) in out, (
-            f"the caveat must name the count and the symptom: {out!r}"
-        )
+    assert ("Not logged in" in out) is bool(running), (
+        f"the caveat must name the symptom it clears: {out!r}"
+    )

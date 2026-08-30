@@ -200,9 +200,8 @@ SENTINEL_NOTES = {
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    # NOT the ACCOUNT's: the strike holds while ANY stored source matches the
-    # struck generation, so an active slot is condemned on its backup alone
-    # even after the live credential rotated past it (`_entry_token_dead`).
+    # NOT the ACCOUNT's: `_entry_token_dead` holds the strike while ANY stored
+    # source matches, so an active slot is condemned on its backup alone.
     USAGE_RELOGIN_REQUIRED: "re-login needed — a stored credential's refresh token was rejected; log in with Claude Code, then run: cswap add",
     # This one used to render as the bare words "no credentials", which state
     # the problem and omit the fix. The fix is: BE on the slot, then log in —
@@ -7357,12 +7356,10 @@ class ClaudeAccountSwitcher:
         unavailable and the switch fell back to the file.
 
         "Usually", not "never", which is why already-running sessions get
-        named. A session holding a credential the runtime rejects renders
-        "Not logged in · Please run /login" from
-        ``InvalidRequestHeaderValueError`` — raised while BUILDING the request,
-        before it is sent. With no HTTP status, none of the paths that rebuild
-        the client on 401/403/socket errors fire and nothing cswap writes
-        afterwards is re-read; only a restart clears it.
+        named: a rejected credential surfaces as ``InvalidRequestHeaderValueError``
+        while BUILDING the request. No HTTP status means none of the paths that
+        rebuild the client on 401/403/socket errors fire, so nothing cswap
+        writes afterwards is re-read and only a restart clears it.
         """
         backend = self._last_active_credentials_backend
         if backend is None:
@@ -7376,9 +7373,8 @@ class ClaudeAccountSwitcher:
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
         # Every live session predates a switch that has already committed, so
-        # this needs no timestamp — only whether any exist. Best-effort like
-        # the sibling call in `list_accounts`: the switch is done, and a
-        # detection failure must not surface as a switch failure.
+        # this needs no timestamp. Best-effort, like the sibling call in
+        # `list_accounts`: the switch is done and must not fail on a scan.
         try:
             running = len(get_running_instances()[0])
         except Exception:
