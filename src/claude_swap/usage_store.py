@@ -436,8 +436,8 @@ def due_candidate(
     perpetually failing account can't monopolize the slot: its backoff
     removes it from the due set between attempts.
 
-    Shared by the auto engine and the TUI watch view so both pick the same
-    single alternate to poll per pass. Poll plans
+    Used by the auto engine to pick the single alternate to poll per pass.
+    Poll plans
     (``nextPollAt``/``pollIntervalS``) are written by whichever collector
     fetched (see the plan persistence in ``_collect_usage_entries``), so
     every surface inherits the same adaptive cadence.
@@ -1137,9 +1137,9 @@ class UsageStore:
                         # keeps a future PERMANENT_AUTH_ERRORS member correct
                         # with no edit here.
                         _lifted_by = (
-                            "the live client's own rotation clears it, so "
-                            "this may already be stale; a re-login is needed "
-                            "only if it persists"
+                            "a credential rotation clears it — automatic "
+                            "only on the active slot — so this may already be "
+                            "stale; a re-login is needed only if it persists"
                             if (rec.struck_fp or "").startswith("sha256:")
                             else "only a re-login replacing the stored "
                                  "credential clears it"

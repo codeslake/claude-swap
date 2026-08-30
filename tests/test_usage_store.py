@@ -1379,11 +1379,17 @@ class TestDeadTokenQuarantine:
         """THE CONTROL. `clear_dead_token` is called on rows with no strike as
         a matter of course -- every re-login and every add runs it -- so a line
         per call would bury the transitions it exists to show."""
+        # A FAILURE HISTORY WITH NO STRIKE, which is what separates the two
+        # counters: a transient error bumps consecutiveFailures and leaves
+        # authDeadStrikes at 0. On a virgin row both are 0, so the guard could
+        # read either field and this control would still pass.
+        store.record({"1": FetchRecord(error="http-429")}, IDENT)
+        caplog.clear()
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             store.clear_dead_token(["1"], IDENT)
-        said = " ".join(r.getMessage() for r in caplog.records)
-        assert said.strip() == "", (
-            f"a no-op clear announced itself: {said!r}"
+        ours = [r for r in caplog.records if r.name == "claude-swap"]
+        assert ours == [], (
+            f"a no-op clear announced itself: {[r.getMessage() for r in ours]!r}"
         )
 
     def test_transient_error_does_not_advance_or_reset(self, store):
@@ -2006,9 +2012,10 @@ class TestStrikeOnlyHeal:
         # THE THIRD OUTCOME. Struck-but-REFUSED is neither of the two the heal
         # line splits on, and a line here claims a transition that did not
         # happen -- the exact defect class this wording change exists to remove.
-        assert caplog.records == [], (
+        ours = [r for r in caplog.records if r.name == "claude-swap"]
+        assert ours == [], (
             "a refused heal announced a heal that did not happen: "
-            f"{[r.getMessage() for r in caplog.records]!r}"
+            f"{[r.getMessage() for r in ours]!r}"
         )
 
     def test_expected_fingerprint_match_still_heals(self, store):
