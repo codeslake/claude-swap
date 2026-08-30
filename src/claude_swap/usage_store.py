@@ -1226,20 +1226,49 @@ class UsageStore:
                             else "only a re-login replacing the stored "
                                  "credential clears it"
                         )
-                        # NOT "the token endpoint answered": no_refresh_token
-                        # is decided before any request is built.
-                        _logger.warning(
-                            "Account %s (%s) is quarantined: its stored "
-                            "credential's refresh failed with %s, so it is "
-                            "not fetched and reads "
-                            "\"re-login may be needed\" — %s. Strike %s of %s.",
-                            num,
-                            (_ident[0] if _ident else "unknown"),
-                            rec.error,
-                            _lifted_by,
-                            row["authDeadStrikes"],
-                            AUTH_DEAD_STRIKES,
+                        # THE LINE MUST SAY WHAT THE VERDICT SAYS. It fired
+                        # on the RAW count while `token_dead` doubted the same
+                        # strike, so a slot that keeps being fetched was
+                        # announced as quarantined and the remedy named a
+                        # re-login nobody needed — the consume-gate race reads
+                        # exactly like an expired token in the one place a
+                        # person looks.
+                        _doubted = _strike_is_suspected_race(
+                            int(row["authDeadStrikes"]),
+                            _num_or_none(row.get("fetchedAt")),
+                            now,
                         )
+                        if _doubted:
+                            _logger.info(
+                                "Account %s (%s): a refresh answered %s, but a "
+                                "success preceded it by under %.0fs, so this "
+                                "first strike is DOUBTED as a race — the slot "
+                                "keeps being fetched and one retry settles it. "
+                                "No re-login is implied. Strike %s of %s.",
+                                num,
+                                (_ident[0] if _ident else "unknown"),
+                                rec.error,
+                                RACE_WINDOW_S,
+                                row["authDeadStrikes"],
+                                AUTH_DEAD_STRIKES,
+                            )
+                        else:
+                            # NOT "the token endpoint answered":
+                            # no_refresh_token is decided before any request
+                            # is built.
+                            _logger.warning(
+                                "Account %s (%s) is quarantined: its stored "
+                                "credential's refresh failed with %s, so it is "
+                                "not fetched and reads "
+                                "\"re-login may be needed\" — %s. Strike %s of "
+                                "%s.",
+                                num,
+                                (_ident[0] if _ident else "unknown"),
+                                rec.error,
+                                _lifted_by,
+                                row["authDeadStrikes"],
+                                AUTH_DEAD_STRIKES,
+                            )
                     # Additive field (absent/None = legacy unconditional
                     # binding). Always overwrite: a legacy writer's strike
                     # must bind unconditionally, not inherit a stale
