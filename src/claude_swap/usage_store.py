@@ -226,8 +226,9 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # strikes the account is quarantined: no more fetches, and the collector
 # surfaces "re-login needed". A single success, a credential refresh via
 # login/add, or a rotation that moves the stored fingerprint off the condemned
-# generation resets the count and lifts the quarantine. Raise to 2 if a buffer against a one-off
-# misclassification is ever wanted; the trade-off is a ~10-min-slower verdict
+# generation resets the count and lifts the quarantine. Raise to 2 if a
+# buffer against a one-off misclassification is ever wanted; the trade-off
+# is a ~10-min-slower verdict
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
 
@@ -441,16 +442,13 @@ def due_candidate(
     fetched (see the plan persistence in ``_collect_usage_entries``), so
     every surface inherits the same adaptive cadence.
 
-    THE STRIKE CHECK IS DELIBERATELY UNBOUND. ``token_dead()`` is called with
-    no ``stored_fp``, so a strike condemning a generation the slot no longer
-    holds still refuses it here. That is the conservative answer, not an
-    oversight: the bound verdict ranges over BOTH stored sources — the live
-    credential and the slot backup (``switcher._entry_token_dead``) — and this
-    function can read neither. The only caller passes entries from
-    ``_collect_usage_entries``, which has already healed every case it could
-    determine and set a sentinel for every confirmed-dead one; what reaches
-    this line is the third case, "could not determine", where that scan
-    explicitly relies on this refusal to keep the row out of a fetch.
+    THE STRIKE CHECK IS DELIBERATELY UNBOUND — it asks ``token_dead()`` with no
+    ``stored_fp``, so a strike condemning a generation the slot no longer holds
+    still refuses it. The bound verdict ranges over BOTH stored sources (see
+    ``switcher._entry_token_dead``) and this function can read neither. The
+    caller has already healed every case it could decide and sentinelled every
+    confirmed-dead one; what reaches here is "could not determine", where that
+    scan relies on this refusal to keep the row out of a fetch.
     """
     due: list[tuple[int, float, str]] = []
     for num in candidates:
