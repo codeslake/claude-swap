@@ -446,9 +446,13 @@ def due_candidate(
     ``stored_fp``, so a strike condemning a generation the slot no longer holds
     still refuses it. The bound verdict ranges over BOTH stored sources (see
     ``switcher._entry_token_dead``) and this function can read neither. The
-    caller has already healed every case it could decide and sentinelled every
-    confirmed-dead one; what reaches here is "could not determine", where that
-    scan relies on this refusal to keep the row out of a fetch.
+    entries come from ``_collect_usage_entries``, which has already healed
+    every case it could decide and sentinelled every confirmed-dead one; what
+    reaches here is "could not determine", where that scan relies on this
+    refusal to keep the row out of a fetch. Binding it would not merely drop a
+    guard, it would WASTE the pass: ``_row_eligible`` refuses a struck row
+    under the write lock regardless, so ``reserve`` returns nothing and the one
+    alternate poll is spent on a row that cannot be fetched.
     """
     due: list[tuple[int, float, str]] = []
     for num in candidates:
@@ -1132,9 +1136,9 @@ class UsageStore:
                         # looks indirect: a future PERMANENT_AUTH_ERRORS member
                         # is then classified correctly with no edit here.
                         _lifted_by = (
-                            "any credential rotation clears it, so this may "
-                            "already be stale; a re-login is needed only if it "
-                            "persists"
+                            "the live client's own rotation clears it, so "
+                            "this may already be stale; a re-login is needed "
+                            "only if it persists"
                             if (rec.struck_fp or "").startswith("sha256:")
                             else "only a re-login replacing the stored "
                                  "credential clears it"

@@ -1298,6 +1298,10 @@ class TestDeadTokenQuarantine:
         assert "only if it persists" in said, (
             f"a rotatable strike hardened its re-login into a demand: {said!r}"
         )
+        assert caplog.records[-1].levelno == logging.WARNING, (
+            "a strike the message itself calls possibly-stale escalated to "
+            f"{caplog.records[-1].levelname}"
+        )
 
     def test_an_unbound_quarantine_still_demands_a_re_login(self, store, caplog):
         """THE CONTROL. A row struck with no fingerprint binds
@@ -2002,9 +2006,10 @@ class TestStrikeOnlyHeal:
         # THE THIRD OUTCOME. Struck-but-REFUSED is neither of the two the heal
         # line splits on, and a line here claims a transition that did not
         # happen -- the exact defect class this wording change exists to remove.
-        assert "out of quarantine" not in " ".join(
-            r.getMessage() for r in caplog.records
-        ), "a refused heal announced a heal that did not happen"
+        assert caplog.records == [], (
+            "a refused heal announced a heal that did not happen: "
+            f"{[r.getMessage() for r in caplog.records]!r}"
+        )
 
     def test_expected_fingerprint_match_still_heals(self, store):
         ident = {"1": ("a@b.c", "")}
