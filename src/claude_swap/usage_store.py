@@ -1128,13 +1128,14 @@ class UsageStore:
                         _ident = identities.get(num) if identities else None
                         # WHAT LIFTS IT IS WHETHER THESE BYTES CAN ROTATE.
                         # `sha256:` is minted only when a refresh token existed
-                        # (oauth.credential_fingerprint), and only such a
-                        # credential is replaced without a human. A
-                        # `sha256-full:` content hash (no_refresh_token) and an
-                        # unbound strike both need an explicit write. Routing on
-                        # the fingerprint rather than on `rec.error` is why this
-                        # looks indirect: a future PERMANENT_AUTH_ERRORS member
-                        # is then classified correctly with no edit here.
+                        # (oauth.credential_fingerprint), and on the ACTIVE slot
+                        # the live client rotates it with no human — which is
+                        # why the line hedges rather than promises: an IDLE slot
+                        # needs an explicit write too, as do a `sha256-full:`
+                        # content hash (no_refresh_token) and an unbound strike.
+                        # Routing on the fingerprint rather than on `rec.error`
+                        # keeps a future PERMANENT_AUTH_ERRORS member correct
+                        # with no edit here.
                         _lifted_by = (
                             "the live client's own rotation clears it, so "
                             "this may already be stale; a re-login is needed "
