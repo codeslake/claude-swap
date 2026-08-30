@@ -12,6 +12,7 @@ of a day later -- all of it time in which the remedy was already on disk.
 """
 
 import json
+import time
 
 import pytest
 
@@ -232,12 +233,22 @@ class TestTheAdoptIsASlotMutation:
             self, switcher):
         """A held lock means a slot mutation is in flight. The adopt must
         stand down for this pass, not write beside it, and not raise into a
-        display refresh."""
+        display refresh.
+
+        AND IT MUST STAND DOWN QUICKLY. `_collect_usage_entries` runs on every
+        list, status and TUI refresh and calls this once per dead slot, so the
+        lock's default 10s wait would freeze the display for 10s PER SLOT
+        against any concurrent switch. Measured on a held lock: the default
+        acquire returns False after 10.01s."""
         held = FileLock(switcher.lock_file)
         assert held.acquire(timeout=5), "premise: the test could take the lock"
         try:
+            start = time.monotonic()
             assert switcher._adopt_stashed_login_for_slot(
                 "2", "owner@example.com") is False
+            waited = time.monotonic() - start
+            assert waited < 2.0, (
+                "a display refresh waited %.1fs on a held lock" % waited)
             stored, _ = switcher._read_account_credentials_ex(
                 "2", "owner@example.com")
             assert oauth.credential_fingerprint(stored) == \
