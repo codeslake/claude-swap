@@ -3069,7 +3069,7 @@ class ClaudeAccountSwitcher:
                     not seen_org or not org or org == seen_org
                 ):
                     hits.append(num)
-                    if org == seen_org:
+                    if seen_org and org == seen_org:
                         exact.append(num)
             # An exact org match beats a blank-org tolerance: a half-migrated
             # roster carrying one org-less record must not make an otherwise
