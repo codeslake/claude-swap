@@ -599,9 +599,7 @@ class TestALaterLoginDoesNotWaitForTheSlotToDie:
         """The spent guard's LIVE-door half, which nothing else reaches.
 
         A refresh token can be spent with no strike against the slot, so a
-        healthy slot can be offered later-dated bytes that mint nothing.
-        Narrowing the guard to the dead-slot door leaves the whole suite
-        green, so without this the door writes dead grants over live ones."""
+        healthy slot can be offered later-dated bytes that mint nothing."""
         stored = _dated("rt-stored-spent", _NOW_MS - 2 * _DAY_MS)
         incoming = _dated("rt-incoming-spent", _NOW_MS - _DAY_MS)
         switcher._write_account_credentials("2", "owner@example.com", stored)
