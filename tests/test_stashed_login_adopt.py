@@ -39,10 +39,17 @@ def _dated(refresh: str, expires_at_ms: int) -> str:
     return json.dumps(blob)
 
 
+# OFFSETS FROM NOW, not epoch constants. 1970 and the year 5138 sit either
+# side of every plausible bug, so both verdicts come out right even when the
+# guard compares milliseconds against seconds — measured, that mutation left
+# the whole suite green.
+_DAY_MS = 86_400_000
+
 DEAD = _creds("rt-dead")
 FRESH = _creds("rt-fresh-login")           # no refreshTokenExpiresAt at all
-EXPIRED = _dated("rt-expired", 1000)
-LIVE_DATED = _dated("rt-live-dated", 99999999999000)
+EXPIRED = _dated("rt-expired", int(time.time() * 1000) - _DAY_MS)
+LIVE_DATED = _dated("rt-live-dated", int(time.time() * 1000) + 30 * _DAY_MS)
+NEARLY_SPENT = _dated("rt-nearly-spent", int(time.time() * 1000) + 60_000)
 
 
 class TestAdoptStashedLoginForSlot:
@@ -246,6 +253,38 @@ class TestAdoptStashedLoginForSlot:
             "a credential that mints nothing lifted an accurate quarantine")
         assert entry_id in switcher._store._list_unclaimed_credentials()
 
+    def test_an_UNREADABLE_stash_entry_is_not_adopted(
+            self, switcher, monkeypatch):
+        """Unreadable WITH BYTES. `("", True)` is caught by `not creds`, so
+        the flag itself never runs and deleting it leaves such a test green;
+        this returns a payload that would otherwise adopt, so only the flag
+        can refuse it."""
+        entry_id = self._stash(switcher, creds=FRESH)
+        self._strike(switcher)
+        monkeypatch.setattr(switcher._store, "_read_unclaimed_credential",
+                            lambda *a, **k: (FRESH, True))
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD)
+
+    def test_a_refresh_token_inside_the_expiry_buffer_is_refused(
+            self, switcher):
+        """`_sweep_unclaimed_stash` asks `oauth.is_oauth_token_expired`, which
+        subtracts a 5-minute buffer, so it would DROP this row. Adopting it
+        lifts the quarantine for bytes the sweep is about to delete and the
+        slot re-strikes next pass. Both sides ask the same predicate."""
+        entry_id = self._stash(switcher, creds=NEARLY_SPENT)
+        self._strike(switcher)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
     def test_CONTROL_an_unexpired_refreshTokenExpiresAt_is_adopted(
             self, switcher):
         """Without this the refusal above passes for a build that refuses
@@ -446,3 +485,69 @@ class TestTheCollectPassReachesTheStash:
                                             fetch=set())
 
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+
+class TestTheWriteSideTwinRefusesTheSameBytes:
+    """`_adopt_into_dead_slot` is handed the SAME string `_stash_live_credential`
+    parked one line earlier, and on that path it decides alone: the sweep
+    inside the stash drops an expired row before any reader reaches it, so the
+    reader-side guard never sees those bytes. The refusal has to live here too,
+    or the codebase answers one question two ways.
+    """
+
+    @pytest.fixture
+    def switcher(self, temp_home, mock_claude_config, sample_sequence_data):
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        sw._write_account_credentials("2", "owner@example.com", DEAD)
+        path = sw._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "2": {
+                    "email": "owner@example.com",
+                    "organizationUuid": "",
+                    "authDeadStrikes": AUTH_DEAD_STRIKES,
+                    "struckFingerprint": oauth.credential_fingerprint(DEAD),
+                    "consecutiveFailures": 2,
+                    "lastError": "invalid_grant",
+                    "lastGood": {"five_hour": {"pct": 10.0}},
+                }
+            },
+        }))
+        return sw
+
+    def _dead(self, sw):
+        ident = {"2": ("owner@example.com", "")}
+        return sw._usage_store.entries(ident)["2"].token_dead()
+
+    def test_an_EXPIRED_foreign_credential_does_not_heal_a_dead_slot(
+            self, switcher):
+        """Spent bytes written into the slot AND the accurate quarantine
+        lifted — the exact pair the reader-side guard forbids."""
+        assert switcher._adopt_into_dead_slot(
+            "2", EXPIRED, switcher._get_sequence_data() or {}) is False
+
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD), "a spent grant was written in"
+        assert self._dead(switcher) is True, (
+            "a credential that mints nothing lifted an accurate quarantine")
+
+    def test_CONTROL_an_unexpired_foreign_credential_still_heals(
+            self, switcher):
+        """Without this the refusal passes for a build that heals nothing.
+        This is issue #136's whole point: a dead slot has no freshness left to
+        protect, so resolved bytes that can still mint are strictly better."""
+        assert switcher._adopt_into_dead_slot(
+            "2", LIVE_DATED, switcher._get_sequence_data() or {}) is True
+
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(LIVE_DATED)
+        assert self._dead(switcher) is False, "the quarantine was not lifted"

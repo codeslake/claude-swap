@@ -331,6 +331,19 @@ def _refresh_expiry(blob: str) -> "float | None":
     return v if isinstance(v, (int, float)) else None
 
 
+def _refresh_token_spent(blob: str) -> bool:
+    """Has this credential's own refresh token provably expired?
+
+    Unknown is not expired: no field, or a non-numeric one, answers False —
+    the direction every guard around the stash fails in. This is
+    `_sweep_unclaimed_stash`'s own predicate, so a row the sweep is about to
+    drop is never one an adopt just wrote into a slot.
+    """
+    return oauth.is_oauth_token_expired(
+        (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
+    )
+
+
 #: How long a collect pass waits for the slot lock before leaving a stash
 #: adopt to the next one. `_collect_usage_entries` runs on every list, status
 #: and TUI refresh and asks once per dead slot, so the lock's own 10s default
@@ -5361,12 +5374,10 @@ class ClaudeAccountSwitcher:
                 creds, unreadable = self._store._read_unclaimed_credential(entry_id)
                 if unreadable or not creds:
                     continue
-                # A refresh token past its own expiry mints nothing: adopting
-                # it writes a spent grant into the dead slot and lifts the
-                # quarantine that is accurate about it. No expiry field is not
-                # expired, and still adopts.
-                exp = _refresh_expiry(creds)
-                if exp is not None and exp <= time.time() * 1000:
+                # A spent refresh token mints nothing: adopting it writes a
+                # dead grant into the dead slot and lifts the quarantine that
+                # is accurate about it.
+                if _refresh_token_spent(creds):
                     continue
                 # The condemned generation heals nothing, and adopting it would
                 # clear the very strike that describes it. Judged on the BYTES:
@@ -5451,6 +5462,12 @@ class ClaudeAccountSwitcher:
         record = (data.get("accounts") or {}).get(str(foreign_slot)) or {}
         email = record.get("email") or ""
         if not email or not self._slot_token_dead(str(foreign_slot), email):
+            return False
+        if _refresh_token_spent(credentials):
+            # THE SAME BYTES the reader-side adopt refuses, and on this path
+            # only this check sees them: the stash above sweeps its own expired
+            # row, so no later pass reaches these. Healing with them writes a
+            # spent grant and clears an accurate quarantine.
             return False
         # CONTAINED. The stash above already preserved the live bytes and is
         # the license to proceed, so the switch is safe to complete whether or
