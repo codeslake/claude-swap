@@ -5151,6 +5151,11 @@ class ClaudeAccountSwitcher:
             dead = self._entry_token_dead(
                 entry, num, _i[1], _i[5], _i[4], self._active_read_degraded
             )
+            if not dead:
+                # A HEALTHY SLOT IS THE ONE THAT CAN SAY a stash is spent:
+                # it is authenticating with something newer, so the parked
+                # bytes can only move it backwards. See the method.
+                self._retire_superseded_stash_for_slot(num, _i[1])
             if dead and self._adopt_stashed_login_for_slot(num, _i[1]):
                 # A login for this slot was set aside while the slot was
                 # still healthy, and nothing looked again once it died. This
@@ -5272,6 +5277,70 @@ class ClaudeAccountSwitcher:
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    def _retire_superseded_stash_for_slot(self, num: str, email: str) -> int:
+        """Drop stashes this slot has already moved past. Returns how many.
+
+        THE MIRROR OF `_adopt_stashed_login_for_slot`, and the half that was
+        missing. A `foreign` stash is a safety copy: the outgoing bytes were
+        positively another slot's, so writing them into the switching slot
+        would destroy that slot's refresh token (issue #117). Correct — but
+        nothing ever dropped one. `_adopt_stashed_successor` matches on
+        `consumedFp`, which a `foreign` row does not carry, so it can never
+        adopt these and they accrue for the life of the machine. Measured
+        across this fleet: 17 entries, every one a DISTINCT credential, about
+        one a day, oldest five days old and still holding a live refresh
+        token.
+
+        The criterion is SUPERSESSION, not age and not expiry. Age is
+        arbitrary and can drop something still needed; expiry reclaimed 2 of
+        17 because a refresh token outlives the stash by weeks. But a stash
+        whose owner now holds DIFFERENT bytes is one nobody can want: that
+        slot is authenticating with its own newer credential, and adopting
+        the old one could only move it backwards.
+
+        Refuses on an unreadable slot, so a store that cannot be read deletes
+        nothing — the same direction `_adopt_stashed_login_for_slot` fails in.
+        """
+        if not email:
+            return 0
+        current, unreadable = self._store._read_account_credentials_ex(num, email)
+        if unreadable or not current:
+            return 0
+        current_fp = oauth.credential_fingerprint(current)
+        if not current_fp:
+            return 0
+        want_email = email.strip().lower()
+        # THE SAME SOURCE THE ADOPT READS, so the two agree about who a slot
+        # is. Inventing a second lookup is how they drift.
+        data = self._get_sequence_data() or {}
+        record = (data.get("accounts") or {}).get(str(num)) or {}
+        uuid = (record.get("uuid") or "").strip()
+        dropped = 0
+        for entry_id, meta in list(self._store._list_unclaimed_credentials().items()):
+            meta = meta or {}
+            # ONLY AN OWNERSHIP VERDICT. A successor stash is keyed by
+            # `consumedFp` and its adopter still needs it; never touch one.
+            if meta.get("reason") not in ("foreign", "alien", "known-foreign"):
+                continue
+            resolved = meta.get("resolvedIdentity") or {}
+            r_uuid = (resolved.get("uuid") or "").strip()
+            r_email = (resolved.get("email") or "").strip().lower()
+            if uuid and r_uuid:
+                if r_uuid != uuid:
+                    continue
+            elif not r_email or r_email != want_email:
+                continue
+            if meta.get("fingerprint") == current_fp:
+                continue        # the slot still holds exactly these bytes
+            self._retire_stash_entry(entry_id, num)
+            dropped += 1
+        if dropped:
+            self._logger.info(
+                "dropped %d superseded stash entr%s resolved to account %s",
+                dropped, "y" if dropped == 1 else "ies", num,
+            )
+        return dropped
 
     def _adopt_stashed_login_for_slot(self, num: str, email: str) -> bool:
         """Adopt a login parked for this slot back when the slot was healthy.
