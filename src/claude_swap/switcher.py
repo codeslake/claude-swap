@@ -5454,17 +5454,13 @@ class ClaudeAccountSwitcher:
         if not email:
             return False
         if not self._slot_token_dead(str(foreign_slot), email):
-            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. Older bytes
-            # must never displace a live slot's newer refresh token, and what
-            # the comparison rests on is that `refreshTokenExpiresAt` is
-            # MONOTONIC within one refresh-token chain: it never moves
-            # backwards for a lineage, so a value larger than the slot's
-            # cannot belong to an earlier login. Should that stop holding,
-            # this guard admits an OLDER credential -- the single outcome it
-            # exists to prevent. Equal values order nothing, hence `<=`; None
-            # on either side is no evidence either and refuses (absent field,
-            # or a read that FAILED -- `_ex` answers "" for both, so no
-            # separate unreadable branch can fire).
+            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. This rests on
+            # `refreshTokenExpiresAt` being MONOTONIC within one refresh-token
+            # chain -- never moving backwards, so a value larger than the
+            # slot's cannot belong to an earlier login. If that stops holding
+            # the guard admits an OLDER credential, the one outcome it exists
+            # to prevent. Equal values order nothing, hence `<=`; None is no
+            # evidence either (absent, or a failed read -- `_ex` gives "").
             stored, _ = self._read_account_credentials_ex(
                 str(foreign_slot), email)
             incoming_at = _refresh_expiry(credentials)
