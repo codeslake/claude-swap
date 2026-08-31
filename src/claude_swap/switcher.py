@@ -7226,14 +7226,12 @@ class ClaudeAccountSwitcher:
             creds, _ = self._store._read_unclaimed_credential(entry_id)
             # Unreadable, absent and corrupt all arrive here with no verdict
             # to act on, and no verdict is KEEP.
-            data = oauth.extract_oauth_data(creds) if creds else None
             fp = oauth.credential_fingerprint(creds)
-            if data is not None and oauth.is_oauth_token_expired(
-                data.get("refreshTokenExpiresAt")
-            ):
-                # ponytail: reuses the access-token predicate, so an entry is
-                # dropped up to OAUTH_EXPIRY_BUFFER_MS early. Give the refresh
-                # token its own predicate if that window ever matters.
+            if creds and oauth.refresh_token_spent(creds):
+                # ponytail: `refresh_token_spent` reuses the access-token
+                # predicate, so an entry is dropped up to
+                # OAUTH_EXPIRY_BUFFER_MS early. That window has not mattered:
+                # a grant with minutes left mints one more and then dies.
                 why = "its refresh token has expired"
             else:
                 if stored is None:
@@ -7897,9 +7895,10 @@ class ClaudeAccountSwitcher:
                             f"into Account-{current_account}."
                         )
                     elif kind == "foreign":
-                        # NOT "was preserved": the stash sweeps this row when
-                        # the credential is spent, which is when the adopt
-                        # above declines it. Ownership holds in every case.
+                        # NOT "was preserved": when the credential is spent
+                        # the stash sweeps this row, so the claim is false in
+                        # at least one case the adopt declines. Ownership is
+                        # what holds in all of them.
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             f"credential belongs to Account-{foreign_slot} and "

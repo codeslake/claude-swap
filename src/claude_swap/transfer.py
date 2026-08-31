@@ -511,8 +511,19 @@ def import_accounts(
                 # accurate quarantine. It falls to the skip; --force overrides.
                 outcome = "replaced"
             else:
+                # `--force` is the documented escape, but for a SPENT bundle
+                # it stores bytes that mint nothing and lifts an accurate
+                # quarantine. Say which half is stale, or the skip sends the
+                # user straight back into the defect the guard above refused.
+                spent = (
+                    " — its own refresh token has expired, so --force would "
+                    "store a credential that mints nothing; re-export where "
+                    "that account is still logged in"
+                    if refresh_token_spent(entry["creds_text"]) else ""
+                )
                 _eprint(
-                    f"Skipped {entry['email']} (already exists, use --force)"
+                    f"Skipped {entry['email']} (already exists, use "
+                    f"--force){spent}"
                 )
                 skipped += 1
                 # Even when skipped, the envelope's active account exists

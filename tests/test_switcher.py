@@ -8119,9 +8119,10 @@ class TestProvenanceGuard:
         assert _read_safety_copy(switcher, entry_id) == foreign
         assert entries[entry_id]["resolvedIdentity"]["uuid"] == "uuid-2"
         assert any(
-            "ownership mismatch" in w and "Account-2" in w
+            "ownership mismatch" in w and "belongs to Account-2" in w
+            and "cswap add --slot 2" in w
             for w in op["warnings"]
-        )
+        ), op["warnings"]
         # The switch itself proceeded, onto the stored backup.
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 

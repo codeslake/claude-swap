@@ -534,3 +534,47 @@ class TestTheWriteSideTwinRefusesTheSameBytes:
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(LIVE_DATED)
         assert self._dead(switcher) is False, "the quarantine was not lifted"
+
+
+class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
+    """The fourth writer into a dead slot, and the one that must NOT refuse a
+    spent refresh token.
+
+    Its only caller reaches it past `outcome.usage is not None` AND a
+    non-expired `expiresAt`, so the usage endpoint accepted these bytes on
+    this pass. Live access token + spent refresh token is strictly better
+    than what a quarantined slot holds, and refusing would forfeit the access
+    token's remaining life to avoid a quarantine that re-forms on its own.
+
+    Two reviews split on this. The caller's precondition settles it, so the
+    asymmetry is pinned rather than left to be "fixed" into a regression.
+    """
+
+    @pytest.fixture
+    def switcher(self, temp_home, mock_claude_config, sample_sequence_data):
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
+        sample_sequence_data["accounts"]["2"]["uuid"] = "uuid-owner"
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        sw._write_account_credentials("2", "owner@example.com", DEAD)
+        _strike(sw)
+        return sw
+
+    def test_a_spent_refresh_token_with_a_live_access_token_is_adopted(
+            self, switcher):
+        """`EXPIRED` is exactly that shape: `expiresAt` far future,
+        `refreshTokenExpiresAt` a day past."""
+        assert switcher._adopt_login_into_slot(
+            "1", EXPIRED,
+            {"uuid": "uuid-owner", "email": "owner@example.com",
+             "organizationUuid": ""},
+        ) is True
+
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(EXPIRED), (
+                "the resync adopt grew a spent-token guard; its caller has "
+                "already proven the access token works, so this forfeits it")
+

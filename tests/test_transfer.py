@@ -1682,6 +1682,9 @@ class TestImportClearsDeadTokenQuarantine:
 
         err = capsys.readouterr().err
         assert "already exists, use --force" in err, err
+        assert "refresh token has expired" in err, (
+            "the skip named the wrong objection and pointed at --force, "
+            f"which stores the spent bytes and reproduces the defect: {err}")
         ident = {"2": ("bob@example.com", "")}
         assert s._usage_store.entries(ident)["2"].token_dead() is True, (
             "a credential that mints nothing lifted an accurate quarantine")
