@@ -39,17 +39,36 @@ def _dated(refresh: str, expires_at_ms: int) -> str:
     return json.dumps(blob)
 
 
-# OFFSETS FROM NOW, not epoch constants. 1970 and the year 5138 sit either
-# side of every plausible bug, so both verdicts come out right even when the
-# guard compares milliseconds against seconds — measured, that mutation left
-# the whole suite green.
+# OFFSETS FROM NOW. Epoch constants (1970, the year 5138) sit either side of
+# every plausible bug, so a guard comparing ms against seconds still passes.
 _DAY_MS = 86_400_000
+_NOW_MS = int(time.time() * 1000)
 
 DEAD = _creds("rt-dead")
 FRESH = _creds("rt-fresh-login")           # no refreshTokenExpiresAt at all
-EXPIRED = _dated("rt-expired", int(time.time() * 1000) - _DAY_MS)
-LIVE_DATED = _dated("rt-live-dated", int(time.time() * 1000) + 30 * _DAY_MS)
-NEARLY_SPENT = _dated("rt-nearly-spent", int(time.time() * 1000) + 60_000)
+EXPIRED = _dated("rt-expired", _NOW_MS - _DAY_MS)
+LIVE_DATED = _dated("rt-live-dated", _NOW_MS + 30 * _DAY_MS)
+NEARLY_SPENT = _dated("rt-nearly-spent", _NOW_MS + 60_000)
+
+
+def _strike(sw, creds=DEAD):
+    """Quarantine slot 2 against ``creds``' generation."""
+    path = sw._usage_store.path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schemaVersion": 2,
+        "accounts": {
+            "2": {
+                "email": "owner@example.com",
+                "organizationUuid": "",
+                "authDeadStrikes": AUTH_DEAD_STRIKES,
+                "struckFingerprint": oauth.credential_fingerprint(creds),
+                "consecutiveFailures": 2,
+                "lastError": "invalid_grant",
+                "lastGood": {"five_hour": {"pct": 10.0}},
+            }
+        },
+    }))
 
 
 class TestAdoptStashedLoginForSlot:
@@ -65,24 +84,6 @@ class TestAdoptStashedLoginForSlot:
         sw._write_account_credentials("2", "owner@example.com", DEAD)
         return sw
 
-    def _strike(self, sw, creds=DEAD):
-        """Quarantine slot 2 against ``creds``' generation."""
-        path = sw._usage_store.path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "schemaVersion": 2,
-            "accounts": {
-                "2": {
-                    "email": "owner@example.com",
-                    "organizationUuid": "",
-                    "authDeadStrikes": AUTH_DEAD_STRIKES,
-                    "struckFingerprint": oauth.credential_fingerprint(creds),
-                    "consecutiveFailures": 2,
-                    "lastError": "invalid_grant",
-                    "lastGood": {"five_hour": {"pct": 10.0}},
-                }
-            },
-        }))
 
     def _stash(self, sw, creds=FRESH, email="owner@example.com",
                uuid="uuid-owner"):
@@ -97,7 +98,7 @@ class TestAdoptStashedLoginForSlot:
     def test_a_dead_slot_adopts_the_login_stashed_for_it(self, switcher):
         """The whole point: the slot holds the stashed login afterwards."""
         entry_id = self._stash(switcher)
-        self._strike(switcher)
+        _strike(switcher)
 
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is True
@@ -112,7 +113,7 @@ class TestAdoptStashedLoginForSlot:
     def test_the_adopt_lifts_the_quarantine_it_wrote_over(self, switcher):
         """A strike left standing keeps the healed slot out of every pass."""
         self._stash(switcher)
-        self._strike(switcher)
+        _strike(switcher)
 
         switcher._adopt_stashed_login_for_slot("2", "owner@example.com")
 
@@ -137,7 +138,7 @@ class TestAdoptStashedLoginForSlot:
         """A stash of the very bytes the endpoint condemned heals nothing, and
         adopting it would clear the strike that describes it."""
         entry_id = self._stash(switcher, creds=DEAD)
-        self._strike(switcher)
+        _strike(switcher)
 
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is False
@@ -186,7 +187,7 @@ class TestAdoptStashedLoginForSlot:
         pre-check. This pins the BEHAVIOUR, not that check: a later refactor
         that moves the refusal must keep the answer."""
         entry_id = self._stash(switcher)
-        self._strike(switcher)
+        _strike(switcher)
         monkeypatch.setattr(switcher, "_read_account_credentials_ex",
                             lambda num, email: ("", True))
 
@@ -203,7 +204,7 @@ class TestAdoptStashedLoginForSlot:
         The sibling adopt gets this right: it logs the unlifted quarantine and
         carries on."""
         entry_id = self._stash(switcher)
-        self._strike(switcher)
+        _strike(switcher)
 
         def boom(*a, **k):
             raise OSError("usage store is unwritable")
@@ -223,7 +224,7 @@ class TestAdoptStashedLoginForSlot:
         """THE CONTROL. Without it the assertion above passes for a build that
         calls every failure an adopt."""
         entry_id = self._stash(switcher)
-        self._strike(switcher)
+        _strike(switcher)
 
         def boom(*a, **k):
             raise OSError("backup is unwritable")
@@ -239,7 +240,7 @@ class TestAdoptStashedLoginForSlot:
         adopting it writes a dead credential into a dead slot AND lifts the
         quarantine that was accurate about the slot."""
         entry_id = self._stash(switcher, creds=EXPIRED)
-        self._strike(switcher)
+        _strike(switcher)
 
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is False
@@ -260,7 +261,7 @@ class TestAdoptStashedLoginForSlot:
         this returns a payload that would otherwise adopt, so only the flag
         can refuse it."""
         entry_id = self._stash(switcher, creds=FRESH)
-        self._strike(switcher)
+        _strike(switcher)
         monkeypatch.setattr(switcher._store, "_read_unclaimed_credential",
                             lambda *a, **k: (FRESH, True))
 
@@ -279,7 +280,7 @@ class TestAdoptStashedLoginForSlot:
         lifts the quarantine for bytes the sweep is about to delete and the
         slot re-strikes next pass. Both sides ask the same predicate."""
         entry_id = self._stash(switcher, creds=NEARLY_SPENT)
-        self._strike(switcher)
+        _strike(switcher)
 
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is False
@@ -291,7 +292,7 @@ class TestAdoptStashedLoginForSlot:
         every entry carrying the field. The no-field case is what `FRESH` is,
         so every other test in this class already covers it."""
         entry_id = self._stash(switcher, creds=LIVE_DATED)
-        self._strike(switcher)
+        _strike(switcher)
 
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is True
@@ -302,7 +303,7 @@ class TestAdoptStashedLoginForSlot:
         licence to absorb whatever is in the stash."""
         entry_id = self._stash(switcher, email="someone@else.example",
                                uuid="uuid-else")
-        self._strike(switcher)
+        _strike(switcher)
 
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is False
@@ -488,12 +489,9 @@ class TestTheCollectPassReachesTheStash:
 
 
 class TestTheWriteSideTwinRefusesTheSameBytes:
-    """`_adopt_into_dead_slot` is handed the SAME string `_stash_live_credential`
-    parked one line earlier, and on that path it decides alone: the sweep
-    inside the stash drops an expired row before any reader reaches it, so the
-    reader-side guard never sees those bytes. The refusal has to live here too,
-    or the codebase answers one question two ways.
-    """
+    """`_adopt_into_dead_slot` gets the SAME string `_stash_live_credential`
+    parked one line earlier, and decides alone: that stash sweeps its own
+    expired row, so no reader ever reaches those bytes."""
 
     @pytest.fixture
     def switcher(self, temp_home, mock_claude_config, sample_sequence_data):
@@ -502,22 +500,7 @@ class TestTheWriteSideTwinRefusesTheSameBytes:
         sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
         sw._write_json(sw.sequence_file, sample_sequence_data)
         sw._write_account_credentials("2", "owner@example.com", DEAD)
-        path = sw._usage_store.path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "schemaVersion": 2,
-            "accounts": {
-                "2": {
-                    "email": "owner@example.com",
-                    "organizationUuid": "",
-                    "authDeadStrikes": AUTH_DEAD_STRIKES,
-                    "struckFingerprint": oauth.credential_fingerprint(DEAD),
-                    "consecutiveFailures": 2,
-                    "lastError": "invalid_grant",
-                    "lastGood": {"five_hour": {"pct": 10.0}},
-                }
-            },
-        }))
+        _strike(sw)
         return sw
 
     def _dead(self, sw):
