@@ -33,8 +33,16 @@ def _creds(refresh: str) -> str:
     })
 
 
+def _dated(refresh: str, expires_at_ms: int) -> str:
+    blob = json.loads(_creds(refresh))
+    blob["claudeAiOauth"]["refreshTokenExpiresAt"] = expires_at_ms
+    return json.dumps(blob)
+
+
 DEAD = _creds("rt-dead")
-FRESH = _creds("rt-fresh-login")
+FRESH = _creds("rt-fresh-login")           # no refreshTokenExpiresAt at all
+EXPIRED = _dated("rt-expired", 1000)
+LIVE_DATED = _dated("rt-live-dated", 99999999999000)
 
 
 class TestAdoptStashedLoginForSlot:
@@ -218,6 +226,37 @@ class TestAdoptStashedLoginForSlot:
         assert switcher._adopt_stashed_login_for_slot(
             "2", "owner@example.com") is False
         assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_an_EXPIRED_stash_is_not_adopted(self, switcher):
+        """A refresh token already past its own expiry mints nothing, so
+        adopting it writes a dead credential into a dead slot AND lifts the
+        quarantine that was accurate about the slot."""
+        entry_id = self._stash(switcher, creds=EXPIRED)
+        self._strike(switcher)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+
+        stored, _ = switcher._read_account_credentials_ex(
+            "2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD), "a spent grant was written in"
+        ident = {"2": ("owner@example.com", "")}
+        assert switcher._usage_store.entries(ident)["2"].token_dead() is True, (
+            "a credential that mints nothing lifted an accurate quarantine")
+        assert entry_id in switcher._store._list_unclaimed_credentials()
+
+    def test_CONTROL_an_unexpired_refreshTokenExpiresAt_is_adopted(
+            self, switcher):
+        """Without this the refusal above passes for a build that refuses
+        every entry carrying the field. The no-field case is what `FRESH` is,
+        so every other test in this class already covers it."""
+        entry_id = self._stash(switcher, creds=LIVE_DATED)
+        self._strike(switcher)
+
+        assert switcher._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is True
+        assert entry_id not in switcher._store._list_unclaimed_credentials()
 
     def test_another_account_s_login_is_left_alone(self, switcher):
         """Identity is what authorizes the write; a dead slot is not a
@@ -407,91 +446,3 @@ class TestTheCollectPassReachesTheStash:
                                             fetch=set())
 
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
-
-
-class TestAnExpiredStashCanHealNothing:
-    """The one set the adopt provably cannot want.
-
-    `_adopt_stashed_login_for_slot` exists to heal a slot whose refresh token
-    is dead, by writing a stashed login that can still mint. A stash whose OWN
-    `refreshTokenExpiresAt` has passed mints nothing, so adopting it writes a
-    dead credential into a dead slot and the slot stays dead.
-
-    THIS IS THE CRITERION, and the two that were rejected say why. Age is
-    arbitrary. "The owner slot now holds different bytes" was tried and
-    reverted: it deleted exactly the rows the adopt consumes, because
-    inequality does not establish which side is newer and the healthy-slot
-    window is the whole window the adopt covers. Expiry is the only test that
-    removes nothing any reader could use.
-
-    It also makes the pile BOUNDED rather than unbounded, which was the actual
-    complaint: measured, entries arrive about one a day and a refresh token
-    lasts three to four weeks, so the steady state is roughly a month's worth
-    instead of growing without limit.
-    """
-
-    def _switcher(self, sample_sequence_data):
-        sw = ClaudeAccountSwitcher()
-        sw._setup_directories()
-        sw._write_json(sw.sequence_file, sample_sequence_data)
-        return sw
-
-    def _stash(self, sw, creds, **over):
-        meta = {"reason": "foreign", "configSlot": "1",
-                "fingerprint": oauth.credential_fingerprint(creds),
-                "resolvedIdentity": {"uuid": "uuid-owner",
-                                     "email": "owner@example.com"}}
-        meta.update(over)
-        return sw._store._write_unclaimed_credential(creds, meta)
-
-    def test_CONTROL_a_stash_that_can_still_mint_is_kept(
-        self, temp_home, mock_claude_config, sample_sequence_data
-    ):
-        """THE ONE THAT MATTERS. This is the adopt's inventory; the previous
-        attempt at this feature deleted it and had to be reverted."""
-        sw = self._switcher(sample_sequence_data)
-        eid = self._stash(sw, FRESH)
-        assert sw._retire_expired_stash_entries() == 0
-        assert eid in sw._store._list_unclaimed_credentials()
-
-    def test_CONTROL_a_stash_with_no_expiry_field_is_kept(
-        self, temp_home, mock_claude_config, sample_sequence_data
-    ):
-        """`_refresh_expiry` returns None for a payload carrying none, and
-        unknown is not expired — the same direction every other guard here
-        fails in."""
-        sw = self._switcher(sample_sequence_data)
-        eid = self._stash(sw, json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-x", "refreshToken": "x", "expiresAt": 9999999999000}}))
-        assert sw._retire_expired_stash_entries() == 0
-        assert eid in sw._store._list_unclaimed_credentials()
-
-    def test_CONTROL_an_unreadable_entry_is_kept(
-        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
-    ):
-        """An entry we cannot read is not an entry we know is expired."""
-        sw = self._switcher(sample_sequence_data)
-        eid = self._stash(sw, FRESH)
-        # EXPIRED BYTES *AND* THE FLAG. `("", True)` is caught by `not creds`,
-        # so the flag is never exercised and removing it leaves this green —
-        # measured, three times in one session on guards of this shape.
-        monkeypatch.setattr(sw._store, "_read_unclaimed_credential",
-                            lambda *a, **k: (json.dumps({"claudeAiOauth": {
-                                "accessToken": "sk-old", "refreshToken": "old",
-                                "expiresAt": 1000,
-                                "refreshTokenExpiresAt": 1000}}), True))
-        assert sw._retire_expired_stash_entries() == 0
-        assert eid in sw._store._list_unclaimed_credentials()
-
-    def test_an_expired_stash_is_dropped(
-        self, temp_home, mock_claude_config, sample_sequence_data
-    ):
-        """The population: its refresh token is past, so no slot it could be
-        adopted into would come back."""
-        sw = self._switcher(sample_sequence_data)
-        expired = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-old", "refreshToken": "old",
-            "expiresAt": 1000, "refreshTokenExpiresAt": 1000}})
-        eid = self._stash(sw, expired)
-        assert sw._retire_expired_stash_entries() == 1
-        assert eid not in sw._store._list_unclaimed_credentials()

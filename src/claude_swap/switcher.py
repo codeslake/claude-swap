@@ -5140,15 +5140,6 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
-        # ONCE PER PASS, NOT PER SLOT. Expiry is a property of the ROW, so it
-        # needs no slot and must not be gated on one — the previous attempt at
-        # retention ran inside the per-slot loop and its verdict depended on
-        # whether that slot was alive, which is how it deleted the adopt's
-        # inventory.
-        try:
-            self._retire_expired_stash_entries()
-        except Exception:  # noqa: BLE001 — housekeeping never fails a refresh
-            pass
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
@@ -5282,48 +5273,6 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
         }
 
-    def _retire_expired_stash_entries(self) -> int:
-        """Drop stashes whose own refresh token has passed. Returns how many.
-
-        THE ONLY SET NO READER CAN WANT. `_adopt_stashed_login_for_slot` heals
-        a dead slot by writing a stash that can still MINT; one whose
-        `refreshTokenExpiresAt` is past mints nothing, so adopting it writes a
-        dead credential into a dead slot and the slot stays dead.
-
-        WHY NOT THE OTHER TWO. Age is arbitrary. "The owner slot now holds
-        different bytes" was written and reverted: inequality does not
-        establish which side is newer, and the healthy-slot window it ran in
-        is exactly the window the adopt covers, so it deleted the adopt's only
-        inventory. Expiry is decidable from the row alone and removes nothing
-        any reader could use.
-
-        This BOUNDS the pile rather than emptying it, which is the honest
-        claim: entries arrive about one a day and a refresh token lasts three
-        to four weeks, so the steady state is roughly a month's worth instead
-        of growing without limit.
-
-        Unknown is not expired — an unreadable entry and a payload carrying no
-        expiry are both kept, the direction every guard around the stash fails
-        in.
-        """
-        now_ms = time.time() * 1000
-        dropped = 0
-        for entry_id in list(self._store._list_unclaimed_credentials()):
-            creds, unreadable = self._store._read_unclaimed_credential(entry_id)
-            if unreadable or not creds:
-                continue
-            exp = _refresh_expiry(creds)
-            if exp is None or exp > now_ms:
-                continue
-            self._retire_stash_entry(entry_id, "-")
-            dropped += 1
-        if dropped:
-            self._logger.info(
-                "dropped %d stash entr%s whose refresh token had expired",
-                dropped, "y" if dropped == 1 else "ies",
-            )
-        return dropped
-
     def _adopt_stashed_login_for_slot(self, num: str, email: str) -> bool:
         """Adopt a login parked for this slot back when the slot was healthy.
 
@@ -5411,6 +5360,13 @@ class ClaudeAccountSwitcher:
                     continue
                 creds, unreadable = self._store._read_unclaimed_credential(entry_id)
                 if unreadable or not creds:
+                    continue
+                # A refresh token past its own expiry mints nothing: adopting
+                # it writes a spent grant into the dead slot and lifts the
+                # quarantine that is accurate about it. No expiry field is not
+                # expired, and still adopts.
+                exp = _refresh_expiry(creds)
+                if exp is not None and exp <= time.time() * 1000:
                     continue
                 # The condemned generation heals nothing, and adopting it would
                 # clear the very strike that describes it. Judged on the BYTES:
