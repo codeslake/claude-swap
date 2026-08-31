@@ -4383,7 +4383,8 @@ class ClaudeAccountSwitcher:
         # outright: attributable live → refresh it; unattributable live but
         # usable backup → restore the backup (the slot's own credential —
         # the stranded-live and stale-sync shapes both heal here).
-        backup = self._read_account_credentials(account_num, email)
+        backup, backup_unreadable = self._read_account_credentials_ex(
+            account_num, email)
         backup_fp = oauth.credential_fingerprint(backup)
         backup_oauth = oauth.extract_oauth_data(backup)
         backup_usable = bool(
@@ -4396,9 +4397,14 @@ class ClaudeAccountSwitcher:
         )
         if not attributable and not backup_usable:
             # Nothing safe to consume and nothing to restore from. Warn once
-            # per condition, not per collect pass.
-            if (account_num, email, "unattributable") not in self._provenance_warned:
-                self._provenance_warned.add((account_num, email, "unattributable"))
+            # per condition, not per collect pass -- and only for a backup we
+            # actually READ. A failed read compared nothing, so the sentence
+            # would name a mismatch and an unusable backup that nobody
+            # observed (on macOS rc=36 is contention, not denial). The defer
+            # is the same either way; only the claim is narrowed.
+            warned = (account_num, email, "unattributable")
+            if not backup_unreadable and warned not in self._provenance_warned:
+                self._provenance_warned.add(warned)
                 self._logger.warning(
                     "Active credential does not match Account-%s's stored "
                     "backup and the backup is unusable; cannot refresh "

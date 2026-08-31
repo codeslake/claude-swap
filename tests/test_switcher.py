@@ -1586,12 +1586,36 @@ class TestUsageFetchStamps:
         assert stamps["2"] is None
 
 
+@pytest.fixture
+def _ex_reads_what_the_plain_reader_returns(monkeypatch):
+    """Keep the two backup-read seams agreeing for tests that patch one.
+
+    `_fetch_active_usage` reads the slot backup through
+    `_read_account_credentials_ex`, for the unreadable verdict the plain
+    reader throws away. These classes stage a backup by patching the PLAIN
+    reader, so without this their staging is bypassed and they exercise an
+    empty store while still passing. `(value, False)` is what each already
+    assumes by supplying concrete bytes; a test about the UNREADABLE verdict
+    patches `_ex` on the instance, which wins.
+    """
+    monkeypatch.setattr(
+        ClaudeAccountSwitcher,
+        "_read_account_credentials_ex",
+        lambda self, num, email: (self._read_account_credentials(num, email), False),
+    )
+
+
 class TestActiveAccountRefresh:
     """`_fetch_active_usage`: an expired active token is refreshed under
     Claude Code's own lock protocol — owner or no owner. CC 2.1.218 adopts an
     externally rotated credential (race-resolved re-read, 401 store recovery),
     so the locks make the rotation safe; what is never safe is discarding a
     consumed generation, so a successful grant persists unconditionally."""
+
+    @pytest.fixture(autouse=True)
+    def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
+        """See the fixture: these tests stage the backup via the plain reader."""
+
 
     # Active credential with an already-expired access token (expiresAt in 1970).
     _EXPIRED = json.dumps({
@@ -1957,6 +1981,72 @@ class TestActiveAccountRefresh:
         assert result.sentinel == USAGE_TOKEN_EXPIRED
         mock_refresh.assert_not_called()
         mock_fetch.assert_not_called()
+
+    def test_an_UNREADABLE_backup_defers_without_claiming_a_mismatch(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        caplog,
+    ):
+        """A read that FAILED compared nothing. The warning on this arm names
+        a mismatch AND an unusable backup; with the backup unread neither was
+        observed, and on macOS rc=36 is Keychain contention, not denial -- a
+        slot that is perfectly healthy one second later. The defer is right
+        either way; only the sentence is wrong."""
+        switcher = self._switcher(sample_sequence_data)
+        foreign_live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-x", "refreshToken": "rt-foreign",
+                "expiresAt": 1000,
+            },
+        })
+        with patch.object(switcher, "_read_credentials", return_value=foreign_live), \
+             patch.object(
+                 switcher, "_read_account_credentials_ex", return_value=("", True)
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch, \
+             caplog.at_level("WARNING", logger="claude-swap"):
+            result = switcher._fetch_active_usage("1", "test@example.com", foreign_live)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        mock_refresh.assert_not_called()
+        mock_fetch.assert_not_called()
+        assert "does not match" not in caplog.text, (
+            "an unreadable backup was reported as a provenance mismatch: "
+            f"{caplog.text}"
+        )
+
+    def test_CONTROL_a_READ_but_unusable_backup_still_warns(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        caplog,
+    ):
+        """THE CONTROL THAT STOPS THIS BEING A DELETION. A backup that was
+        genuinely read and genuinely carries no grant is a real provenance
+        dead end, and must still say so -- narrowing the warning must not
+        silence it."""
+        switcher = self._switcher(sample_sequence_data)
+        dead_backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "", "refreshToken": ""},
+        })
+        foreign_live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-x", "refreshToken": "rt-foreign",
+                "expiresAt": 1000,
+            },
+        })
+        with patch.object(switcher, "_read_credentials", return_value=foreign_live), \
+             patch.object(
+                 switcher, "_read_account_credentials_ex",
+                 return_value=(dead_backup, False),
+             ), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials"), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account"), \
+             caplog.at_level("WARNING", logger="claude-swap"):
+            result = switcher._fetch_active_usage("1", "test@example.com", foreign_live)
+
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
+        assert "does not match" in caplog.text, (
+            "the real provenance dead end stopped warning: " + caplog.text
+        )
 
     def test_live_read_error_defers_instead_of_consuming(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -9617,6 +9707,11 @@ class TestActiveRefreshProvenance:
     """_fetch_active_usage must not rotate-and-persist an unattributed
     credential — same hazard class as the switch-time blind backup."""
 
+    @pytest.fixture(autouse=True)
+    def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
+        """See the fixture: these tests stage the backup via the plain reader."""
+
+
     _LIVE = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-live", "refreshToken": "rt-live", "expiresAt": 1000,
     }})
@@ -14466,6 +14561,11 @@ class TestUltraReviewCoverageGaps:
     """Ultra-review test-coverage findings: demotion re-read branch,
     degraded+force_refresh, active-path struck_fp stamping, add-path
     session-shell guards, gate-writes-live regression guard."""
+
+    @pytest.fixture(autouse=True)
+    def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
+        """See the fixture: these tests stage the backup via the plain reader."""
+
 
     _EXPIRED = json.dumps({
         "claudeAiOauth": {"accessToken": "sk-active",
