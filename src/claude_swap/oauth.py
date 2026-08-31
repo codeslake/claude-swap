@@ -71,14 +71,15 @@ def is_oauth_token_expired(expires_at: object) -> bool:
 def refresh_token_spent(credentials: str) -> bool:
     """Has this credential's own refresh token expired?
 
-    Unknown is not expired — no field, a non-numeric one, or JSON carrying no
-    ``claudeAiOauth`` all answer False. The one predicate for "these bytes can
-    mint nothing", so no caller can disagree about the same credential.
+    Unknown is not expired — no field, a non-numeric one, JSON carrying no
+    ``claudeAiOauth``, and non-JSON all answer False. The one predicate for
+    "these bytes can mint nothing", so no caller can disagree about a
+    credential.
 
-    Non-JSON answers False, but JSON that is not an object raises
-    ``AttributeError`` and ``None`` raises ``TypeError``, both out of
-    ``extract_oauth_data``. Callers that cannot afford a raise must reach it
-    behind something that has already parsed the same bytes.
+    It RAISES on JSON that is not an object (``AttributeError``) and on
+    ``None`` (``TypeError``), both out of ``extract_oauth_data``, so a caller
+    that cannot afford a raise must sit behind one that already parsed these
+    bytes.
     """
     return is_oauth_token_expired(
         (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt")

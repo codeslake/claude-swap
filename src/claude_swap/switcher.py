@@ -7917,7 +7917,7 @@ class ClaudeAccountSwitcher:
                     else:
                         msg = (
                             "The live login does not match a managed "
-                            f"account and was not written into "
+                            "account and was not written into "
                             f"Account-{current_account}. If you need that "
                             "account, log in as it and run: cswap add"
                         )
