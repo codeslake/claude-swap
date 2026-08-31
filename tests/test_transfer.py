@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1641,6 +1642,69 @@ class TestImportClearsDeadTokenQuarantine:
         assert entry.auth_dead_strikes == 0
         creds = s._read_account_credentials("2", "bob@example.com")
         assert json.loads(creds)["_marker"] == "BOB_HEALED"
+
+    def _spent_env(self, out: Path, refresh_expiry_ms: int) -> None:
+        """Rewrite the exported credential to a WRAPPED payload dated
+        ``refresh_expiry_ms``. `SAMPLE_CREDS` is unwrapped, which
+        `extract_oauth_data` reads as None — no expiry, so never spent."""
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"] = {
+            "claudeAiOauth": {
+                "accessToken": "tok-x", "refreshToken": "rtok-x",
+                "expiresAt": int(time.time() * 1000) + 86_400_000,
+                "refreshTokenExpiresAt": refresh_expiry_ms,
+            },
+            "_marker": "FROM_BUNDLE",
+        }
+        out.write_text(json.dumps(env))
+
+    def _quarantined_export(self, s, temp_home: Path) -> Path:
+        _seed_account(s, 2, "bob@example.com")
+        ident = {"2": ("bob@example.com", "")}
+        s._usage_store.record({"2": FetchRecord(error="invalid_grant")}, ident)
+        assert s._usage_store.entries(ident)["2"].token_dead(), "premise"
+        out = temp_home / "bob.cswap"
+        export_accounts(s, str(out), account="2")
+        return out
+
+    def test_a_plain_import_does_not_heal_with_a_spent_refresh_token(
+        self, temp_home: Path, capsys
+    ):
+        """A bundle whose own refresh token expired before the import mints
+        nothing, so writing it replaces spent bytes with spent bytes and
+        clears an accurate quarantine. The slot re-strikes next pass, and the
+        user was told the import fixed it."""
+        s = _linux_switcher(temp_home)
+        out = self._quarantined_export(s, temp_home)
+        self._spent_env(out, int(time.time() * 1000) - 86_400_000)
+
+        import_accounts(s, str(out), force=False)
+
+        err = capsys.readouterr().err
+        assert "already exists, use --force" in err, err
+        ident = {"2": ("bob@example.com", "")}
+        assert s._usage_store.entries(ident)["2"].token_dead() is True, (
+            "a credential that mints nothing lifted an accurate quarantine")
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds).get("_marker") != "FROM_BUNDLE", (
+            "spent bundle bytes were written into the slot")
+
+    def test_CONTROL_a_plain_import_heals_with_a_live_dated_token(
+        self, temp_home: Path, capsys
+    ):
+        """Without this the refusal above passes for a build that never heals.
+        Issue #136's auto-heal must still fire for a bundle that can mint."""
+        s = _linux_switcher(temp_home)
+        out = self._quarantined_export(s, temp_home)
+        self._spent_env(out, int(time.time() * 1000) + 30 * 86_400_000)
+
+        import_accounts(s, str(out), force=False)
+
+        assert "was quarantined: refresh token dead" in capsys.readouterr().err
+        ident = {"2": ("bob@example.com", "")}
+        assert s._usage_store.entries(ident)["2"].token_dead() is False
+        creds = s._read_account_credentials("2", "bob@example.com")
+        assert json.loads(creds)["_marker"] == "FROM_BUNDLE"
 
     def test_a_healed_strike_does_not_license_a_plain_import_to_replace(
         self, temp_home: Path, capsys

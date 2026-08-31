@@ -23,7 +23,7 @@ from claude_swap.exceptions import (
 )
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform, get_timestamp, normalize_alias
-from claude_swap.oauth import credential_fingerprint
+from claude_swap.oauth import credential_fingerprint, refresh_token_spent
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -492,7 +492,9 @@ def import_accounts(
                     and credential_fingerprint(entry["creds_text"])
                     == row.struck_fingerprint
                 )
-            elif switcher._slot_token_dead(existing_slot, entry["email"]):
+            elif switcher._slot_token_dead(existing_slot, entry["email"]) and (
+                not refresh_token_spent(entry["creds_text"])
+            ):
                 # Narrow auto-heal (issue #136): a plain import replaces a
                 # slot iff its identity-matched usage row is quarantined as
                 # refresh-token-dead. The verdict normally postdates the
@@ -504,6 +506,11 @@ def import_accounts(
                 # empty live store alone does not trigger it either, not being
                 # attributable to the backup; on a slot with NO stored source
                 # at all a STRUCK row does, and nothing is there to overwrite.
+                # A bundle whose OWN refresh token has expired is refused: it
+                # replaces spent bytes with spent bytes and the clear below
+                # lifts a quarantine that was accurate, so the slot re-strikes
+                # having told the user the import fixed it. Falling through to
+                # the skip is the honest answer — `--force` still overrides.
                 outcome = "replaced"
             else:
                 _eprint(

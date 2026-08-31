@@ -68,6 +68,20 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
+def refresh_token_spent(credentials: str) -> bool:
+    """Has this credential's own refresh token expired?
+
+    Unknown is not expired: no ``refreshTokenExpiresAt``, a non-numeric one,
+    or an unparseable blob all answer False — the direction every guard around
+    the stash fails in. The single predicate for "these bytes can mint
+    nothing", asked by both adopt paths, the import auto-heal and the stash
+    sweep, so none of them can disagree about the same credential.
+    """
+    return is_oauth_token_expired(
+        (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt")
+    )
+
+
 @dataclass(frozen=True)
 class RefreshOutcome:
     """Result of a refresh-token grant attempt.

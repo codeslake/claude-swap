@@ -331,19 +331,6 @@ def _refresh_expiry(blob: str) -> "float | None":
     return v if isinstance(v, (int, float)) else None
 
 
-def _refresh_token_spent(blob: str) -> bool:
-    """Has this credential's own refresh token provably expired?
-
-    Unknown is not expired: no field, or a non-numeric one, answers False —
-    the direction every guard around the stash fails in. This is
-    `_sweep_unclaimed_stash`'s own predicate, so a row the sweep is about to
-    drop is never one an adopt just wrote into a slot.
-    """
-    return oauth.is_oauth_token_expired(
-        (oauth.extract_oauth_data(blob) or {}).get("refreshTokenExpiresAt")
-    )
-
-
 #: How long a collect pass waits for the slot lock before leaving a stash
 #: adopt to the next one. `_collect_usage_entries` runs on every list, status
 #: and TUI refresh and asks once per dead slot, so the lock's own 10s default
@@ -5377,7 +5364,7 @@ class ClaudeAccountSwitcher:
                 # A spent refresh token mints nothing: adopting it writes a
                 # dead grant into the dead slot and lifts the quarantine that
                 # is accurate about it.
-                if _refresh_token_spent(creds):
+                if oauth.refresh_token_spent(creds):
                     continue
                 # The condemned generation heals nothing, and adopting it would
                 # clear the very strike that describes it. Judged on the BYTES:
@@ -5463,7 +5450,7 @@ class ClaudeAccountSwitcher:
         email = record.get("email") or ""
         if not email or not self._slot_token_dead(str(foreign_slot), email):
             return False
-        if _refresh_token_spent(credentials):
+        if oauth.refresh_token_spent(credentials):
             # THE SAME BYTES the reader-side adopt refuses, and on this path
             # only this check sees them: the stash above sweeps its own expired
             # row, so no later pass reaches these. Healing with them writes a
@@ -7910,13 +7897,17 @@ class ClaudeAccountSwitcher:
                             f"into Account-{current_account}."
                         )
                     elif kind == "foreign":
+                        # NOT "was preserved": the stash sweeps its own row
+                        # when that credential's refresh token has expired,
+                        # which is exactly when the adopt above declines it.
+                        # Ownership is what holds in every case here.
                         msg = (
                             "Credential ownership mismatch detected. The live "
-                            "credential was preserved and was not written "
-                            f"into Account-{current_account}. If Account-"
-                            f"{foreign_slot} later cannot authenticate, log "
-                            "in as it and run: cswap add --slot "
-                            f"{foreign_slot}"
+                            f"credential belongs to Account-{foreign_slot} and "
+                            f"was not written into Account-{current_account}. "
+                            f"If Account-{foreign_slot} later cannot "
+                            "authenticate, log in as it and run: cswap add "
+                            f"--slot {foreign_slot}"
                         )
                     elif kind == "known-foreign":
                         msg = (
