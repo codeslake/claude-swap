@@ -1631,6 +1631,15 @@ class TestActiveAccountRefresh:
         }
     })
 
+    # Live bytes belonging to no managed slot: unattributable on every path
+    # that reads them, which is the precondition all four users share.
+    _FOREIGN_LIVE = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "sk-x", "refreshToken": "rt-foreign",
+            "expiresAt": 1000,
+        },
+    })
+
     # What the profile oracle resolves for slot 1's own credential
     # (sequence uuid "uuid-1", no org).
     _PROFILE_SELF = {
@@ -1961,20 +1970,14 @@ class TestActiveAccountRefresh:
         dead_backup = json.dumps({
             "claudeAiOauth": {"accessToken": "", "refreshToken": ""},
         })
-        foreign_live = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-x", "refreshToken": "rt-foreign",
-                "expiresAt": 1000,
-            },
-        })
 
-        with patch.object(switcher, "_read_credentials", return_value=foreign_live), \
+        with patch.object(switcher, "_read_credentials", return_value=self._FOREIGN_LIVE), \
              patch.object(
                  switcher, "_read_account_credentials", return_value=dead_backup
              ), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
              patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
-            result = switcher._fetch_active_usage("1", "test@example.com", foreign_live)
+            result = switcher._fetch_active_usage("1", "test@example.com", self._FOREIGN_LIVE)
 
         assert result.sentinel == USAGE_TOKEN_EXPIRED
         mock_refresh.assert_not_called()
@@ -1990,20 +1993,14 @@ class TestActiveAccountRefresh:
         slot that is perfectly healthy one second later. The defer is right
         either way; only the sentence is wrong."""
         switcher = self._switcher(sample_sequence_data)
-        foreign_live = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-x", "refreshToken": "rt-foreign",
-                "expiresAt": 1000,
-            },
-        })
-        with patch.object(switcher, "_read_credentials", return_value=foreign_live), \
+        with patch.object(switcher, "_read_credentials", return_value=self._FOREIGN_LIVE), \
              patch.object(
                  switcher, "_read_account_credentials_ex", return_value=("", True)
              ), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
              patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch, \
              caplog.at_level("WARNING", logger="claude-swap"):
-            result = switcher._fetch_active_usage("1", "test@example.com", foreign_live)
+            result = switcher._fetch_active_usage("1", "test@example.com", self._FOREIGN_LIVE)
 
         assert result.sentinel == USAGE_TOKEN_EXPIRED
         mock_refresh.assert_not_called()
@@ -2023,12 +2020,6 @@ class TestActiveAccountRefresh:
         silent forever, because the slot has already "been warned" about a
         condition nobody ever observed."""
         switcher = self._switcher(sample_sequence_data)
-        foreign_live = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-x", "refreshToken": "rt-foreign",
-                "expiresAt": 1000,
-            },
-        })
         dead_backup = json.dumps({
             "claudeAiOauth": {"accessToken": "", "refreshToken": ""},
         })
@@ -2036,7 +2027,7 @@ class TestActiveAccountRefresh:
         def _pass(ex_value):
             caplog.clear()
             with patch.object(
-                     switcher, "_read_credentials", return_value=foreign_live
+                     switcher, "_read_credentials", return_value=self._FOREIGN_LIVE
                  ), \
                  patch.object(
                      switcher, "_read_account_credentials_ex", return_value=ex_value
@@ -2044,7 +2035,7 @@ class TestActiveAccountRefresh:
                  patch("claude_swap.oauth.try_refresh_oauth_credentials"), \
                  patch("claude_swap.oauth.try_fetch_usage_for_account"), \
                  caplog.at_level("WARNING", logger="claude-swap"):
-                switcher._fetch_active_usage("1", "test@example.com", foreign_live)
+                switcher._fetch_active_usage("1", "test@example.com", self._FOREIGN_LIVE)
             return caplog.text
 
         assert "does not match" not in _pass(("", True)), "the failed read spoke"
@@ -2065,13 +2056,7 @@ class TestActiveAccountRefresh:
         dead_backup = json.dumps({
             "claudeAiOauth": {"accessToken": "", "refreshToken": ""},
         })
-        foreign_live = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-x", "refreshToken": "rt-foreign",
-                "expiresAt": 1000,
-            },
-        })
-        with patch.object(switcher, "_read_credentials", return_value=foreign_live), \
+        with patch.object(switcher, "_read_credentials", return_value=self._FOREIGN_LIVE), \
              patch.object(
                  switcher, "_read_account_credentials_ex",
                  return_value=(dead_backup, False),
@@ -2079,7 +2064,7 @@ class TestActiveAccountRefresh:
              patch("claude_swap.oauth.try_refresh_oauth_credentials"), \
              patch("claude_swap.oauth.try_fetch_usage_for_account"), \
              caplog.at_level("WARNING", logger="claude-swap"):
-            result = switcher._fetch_active_usage("1", "test@example.com", foreign_live)
+            result = switcher._fetch_active_usage("1", "test@example.com", self._FOREIGN_LIVE)
 
         assert result.sentinel == USAGE_TOKEN_EXPIRED
         assert "does not match" in caplog.text, (
