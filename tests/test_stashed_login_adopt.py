@@ -536,6 +536,103 @@ class TestTheWriteSideTwinRefusesTheSameBytes:
         assert self._dead(switcher) is False, "the quarantine was not lifted"
 
 
+class TestALaterLoginDoesNotWaitForTheSlotToDie:
+    """A login is never older than what the slot already holds.
+
+    MEASURED on a Mac. The owner logged in for a slot that was still healthy,
+    so `_adopt_into_dead_slot` refused it -- correctly by its own rule, "a
+    slot quarantined as refresh-token-dead has no freshness left to protect"
+    -- and the login went to the stash. Hours later the slot's OWN credential
+    was rejected (the login had revoked that family server-side), the slot was
+    quarantined, and only then did the adopt write the stashed login in. By
+    then those bytes were themselves dead, so the slot was struck again 44
+    seconds later and asked for a re-login the owner had already performed.
+
+    The expiry guard does not reach this: the stashed login was REVOKED, not
+    expired, and its `refreshTokenExpiresAt` was still weeks out.
+
+    What separates the two cases is already in this module and used at two
+    other sites -- `_refresh_expiry`, which ONLY a login moves. A credential
+    dated LATER than the slot's is proof of a later login, and waiting for the
+    slot to die before accepting it is what lets it rot.
+    """
+
+    @pytest.fixture
+    def switcher(self, temp_home, mock_claude_config, sample_sequence_data):
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        return sw
+
+    def _stored(self, sw):
+        stored, _ = sw._read_account_credentials_ex("2", "owner@example.com")
+        return oauth.credential_fingerprint(stored)
+
+    def test_CONTROL_an_OLDER_credential_never_displaces_a_live_slot(
+            self, switcher):
+        """The rule this must not break. Identity proves ownership, not
+        freshness: bytes dated EARLIER than the slot's are an older
+        generation and writing them would destroy the newer refresh token."""
+        switcher._write_account_credentials("2", "owner@example.com",
+                                            LIVE_DATED)
+        assert switcher._adopt_into_dead_slot(
+            "2", EXPIRED, switcher._get_sequence_data() or {}) is False
+        assert self._stored(switcher) == \
+            oauth.credential_fingerprint(LIVE_DATED)
+
+    def test_CONTROL_an_undated_credential_never_displaces_a_live_slot(
+            self, switcher):
+        """No date is no evidence. `FRESH` carries no
+        `refreshTokenExpiresAt`, so nothing proves it is the later login and
+        the healthy slot keeps what it has."""
+        switcher._write_account_credentials("2", "owner@example.com",
+                                            LIVE_DATED)
+        assert switcher._adopt_into_dead_slot(
+            "2", FRESH, switcher._get_sequence_data() or {}) is False
+        assert self._stored(switcher) == \
+            oauth.credential_fingerprint(LIVE_DATED)
+
+    def test_CONTROL_an_older_but_UNEXPIRED_credential_is_still_refused(
+            self, switcher, monkeypatch):
+        """THE CONTROL THAT ACTUALLY TESTS THE COMPARISON. The first draft
+        used `EXPIRED` here, which the spent guard already refuses -- so it
+        passed a build with the recency check deleted. Both sides must be
+        live-dated for the comparison to be the only thing deciding."""
+        older = _dated("rt-older-live", _NOW_MS + 10 * _DAY_MS)
+        newer = _dated("rt-newer-live", _NOW_MS + 40 * _DAY_MS)
+        switcher._write_account_credentials("2", "owner@example.com", newer)
+        assert switcher._adopt_into_dead_slot(
+            "2", older, switcher._get_sequence_data() or {}) is False
+        assert self._stored(switcher) == oauth.credential_fingerprint(newer)
+
+    def test_CONTROL_an_unreadable_slot_is_never_overwritten(
+            self, switcher, monkeypatch):
+        """A read that FAILED is not a read that found older bytes. The
+        keychain on a Mac loses individual reads to contention -- measured, 12
+        failures inside 300ms with successful fetches one second later -- and
+        writing during one of those would destroy the newer token this whole
+        method exists to protect."""
+        switcher._write_account_credentials("2", "owner@example.com",
+                                            _dated("rt-held", _NOW_MS + _DAY_MS))
+        monkeypatch.setattr(
+            switcher, "_read_account_credentials_ex",
+            lambda *a, **k: ("", True))
+        assert switcher._adopt_into_dead_slot(
+            "2", LIVE_DATED, switcher._get_sequence_data() or {}) is False
+
+    def test_a_LATER_login_lands_in_its_slot_while_that_slot_is_healthy(
+            self, switcher):
+        """THE CASE. The slot is alive and its credential is older; the
+        incoming one is dated later, which only a login can do. It must land
+        now rather than wait in the stash for the slot to die."""
+        switcher._write_account_credentials("2", "owner@example.com", EXPIRED)
+        assert switcher._adopt_into_dead_slot(
+            "2", LIVE_DATED, switcher._get_sequence_data() or {}) is True
+        assert self._stored(switcher) == \
+            oauth.credential_fingerprint(LIVE_DATED)
+
+
 class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
     """The fifth writer into a dead slot, and the one that must NOT refuse a
     spent refresh token.

@@ -5448,8 +5448,43 @@ class ClaudeAccountSwitcher:
             return False
         record = (data.get("accounts") or {}).get(str(foreign_slot)) or {}
         email = record.get("email") or ""
-        if not email or not self._slot_token_dead(str(foreign_slot), email):
+        if not email:
             return False
+        if not self._slot_token_dead(str(foreign_slot), email):
+            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. The rule above
+            # is right in general -- identity proves ownership, not generation
+            # freshness, so older bytes must never displace a live slot's
+            # newer refresh token. But `refreshTokenExpiresAt` moves ONLY on a
+            # login, so a credential dated later than the slot's IS the later
+            # login, and holding it back is what lets it rot: measured, a
+            # login for a healthy slot sat in the stash until that slot's own
+            # token was rejected hours later (the login had revoked that
+            # family), and by then the stashed bytes were dead too -- the slot
+            # was struck again 44s after adopting them and asked for a
+            # re-login the owner had already performed. The expiry guards do
+            # not reach that case: those bytes were REVOKED, not expired.
+            #
+            # Both sides must carry a date. `_refresh_expiry` answers None for
+            # a credential without the field, and None is no evidence of being
+            # later -- never a licence to overwrite.
+            # `_ex`, not the plain reader: it answers "" for a read that
+            # FAILED as well as for one that found nothing, and a contention
+            # loss on the Mac keychain must not read as "no date, so refuse"
+            # for the wrong reason. Both collapse into `stored_at is None`
+            # below, which refuses either way -- no separate unreadable branch,
+            # because a failed read always yields "" and a separate check for
+            # it cannot fire.
+            stored, _unreadable = self._read_account_credentials_ex(
+                str(foreign_slot), email)
+            incoming_at = _refresh_expiry(credentials)
+            stored_at = _refresh_expiry(stored)
+            # None is NOT "earlier". A credential with no date proves nothing
+            # about which login is later, and neither does a slot we could not
+            # read -- neither is a licence to overwrite a live token.
+            if incoming_at is None or stored_at is None:
+                return False
+            if incoming_at <= stored_at:
+                return False
         if oauth.refresh_token_spent(credentials):
             # THE SAME BYTES the reader-side adopt refuses, and on this path
             # only this check sees them: the stash above sweeps its own expired
