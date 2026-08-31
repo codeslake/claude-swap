@@ -492,8 +492,9 @@ def import_accounts(
                     and credential_fingerprint(entry["creds_text"])
                     == row.struck_fingerprint
                 )
-            elif switcher._slot_token_dead(existing_slot, entry["email"]) and (
-                not refresh_token_spent(entry["creds_text"])
+            elif (
+                switcher._slot_token_dead(existing_slot, entry["email"])
+                and not refresh_token_spent(entry["creds_text"])
             ):
                 # Narrow auto-heal (issue #136): a plain import replaces a
                 # slot iff its identity-matched usage row is quarantined as
@@ -506,11 +507,8 @@ def import_accounts(
                 # empty live store alone does not trigger it either, not being
                 # attributable to the backup; on a slot with NO stored source
                 # at all a STRUCK row does, and nothing is there to overwrite.
-                # A bundle whose OWN refresh token has expired is refused: it
-                # replaces spent bytes with spent bytes and the clear below
-                # lifts a quarantine that was accurate, so the slot re-strikes
-                # having told the user the import fixed it. Falling through to
-                # the skip is the honest answer — `--force` still overrides.
+                # A spent bundle is refused: the clear below would lift an
+                # accurate quarantine. It falls to the skip; --force overrides.
                 outcome = "replaced"
             else:
                 _eprint(

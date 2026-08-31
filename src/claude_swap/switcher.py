@@ -7897,10 +7897,9 @@ class ClaudeAccountSwitcher:
                             f"into Account-{current_account}."
                         )
                     elif kind == "foreign":
-                        # NOT "was preserved": the stash sweeps its own row
-                        # when that credential's refresh token has expired,
-                        # which is exactly when the adopt above declines it.
-                        # Ownership is what holds in every case here.
+                        # NOT "was preserved": the stash sweeps this row when
+                        # the credential is spent, which is when the adopt
+                        # above declines it. Ownership holds in every case.
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             f"credential belongs to Account-{foreign_slot} and "
