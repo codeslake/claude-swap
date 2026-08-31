@@ -5451,13 +5451,14 @@ class ClaudeAccountSwitcher:
         proves ownership, not generation freshness. Two things override that.
         A slot QUARANTINED as refresh-token-dead has no freshness left to
         protect -- its stored token can mint nothing -- so bytes the oracle
-        resolved to it are strictly better than what it holds. And a
+        resolved to it are strictly better than what it holds -- the trade-off
+        `cswap import` already takes (issue #136). The second door goes
+        FURTHER than import, which still demands --force for a healthy slot: a
         credential whose refresh lifetime ends LATER than the slot's own is a
         later login, which even a live slot has no newer token to lose to.
-        Same trade-off `cswap import` already takes (issue #136); without it
-        the safety copy only pays off once `_adopt_stashed_login_for_slot`
-        notices, which is a pass later at the earliest and never while the
-        slot stays healthy.
+        Without it the safety copy only pays off once
+        `_adopt_stashed_login_for_slot` notices, a pass later at the earliest
+        and never while the slot stays healthy.
 
         Returns whether the adoption happened, so the caller can say which of
         the two things it did.

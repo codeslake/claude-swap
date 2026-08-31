@@ -594,13 +594,32 @@ class TestALaterLoginDoesNotWaitForTheSlotToDie:
             "2", other, switcher._get_sequence_data() or {}) is False
         assert self._stored(switcher) == oauth.credential_fingerprint(held)
 
+    def test_CONTROL_a_SPENT_incoming_credential_is_refused_by_a_live_slot(
+            self, switcher):
+        """The spent guard's LIVE-door half, which nothing else reaches.
+
+        A refresh token can be spent with no strike against the slot, so a
+        healthy slot can be offered later-dated bytes that mint nothing.
+        Narrowing the guard to the dead-slot door leaves the whole suite
+        green, so without this the door writes dead grants over live ones."""
+        stored = _dated("rt-stored-spent", _NOW_MS - 2 * _DAY_MS)
+        incoming = _dated("rt-incoming-spent", _NOW_MS - _DAY_MS)
+        switcher._write_account_credentials("2", "owner@example.com", stored)
+        assert not switcher._slot_token_dead("2", "owner@example.com"), (
+            "premise: no strike -- spent is not the same as quarantined"
+        )
+        assert switcher._adopt_into_dead_slot(
+            "2", incoming, switcher._get_sequence_data() or {}) is False
+        assert self._stored(switcher) == oauth.credential_fingerprint(stored)
+
     def test_CONTROL_an_unreadable_slot_is_never_overwritten(
             self, switcher, monkeypatch):
         """A read that FAILED is not a read that found older bytes. The
         keychain on a Mac loses individual reads to contention -- measured, 12
-        failures inside 300ms with successful fetches one second later -- and
-        writing during one of those would destroy the newer token this whole
-        method exists to protect."""
+        failures inside 300ms with successful fetches one second later. The
+        plain reader answers "" for that too, so the refusal holds either way;
+        what this pins is that a failed read stays a refusal rather than
+        becoming evidence of an older slot."""
         switcher._write_account_credentials("2", "owner@example.com",
                                             _dated("rt-held", _NOW_MS + _DAY_MS))
         monkeypatch.setattr(

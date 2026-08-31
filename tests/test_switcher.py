@@ -1593,10 +1593,10 @@ def _ex_reads_what_the_plain_reader_returns(monkeypatch):
     `_fetch_active_usage` reads the slot backup through
     `_read_account_credentials_ex`, for the unreadable verdict the plain
     reader throws away. These classes stage a backup by patching the PLAIN
-    reader, so without this their staging is bypassed and they exercise an
-    empty store while still passing. `(value, False)` is what each already
-    assumes by supplying concrete bytes; a test about the UNREADABLE verdict
-    patches `_ex` on the instance, which wins.
+    reader, so without this their staging is bypassed: measured, 21 of them
+    fail outright and 17 pass vacuously against an empty store. `(value,
+    False)` is what each already assumes by supplying concrete bytes; a test
+    about the UNREADABLE verdict patches `_ex` on the instance, which wins.
     """
     monkeypatch.setattr(
         ClaudeAccountSwitcher,
@@ -1605,6 +1605,7 @@ def _ex_reads_what_the_plain_reader_returns(monkeypatch):
     )
 
 
+@pytest.mark.usefixtures("_ex_reads_what_the_plain_reader_returns")
 class TestActiveAccountRefresh:
     """`_fetch_active_usage`: an expired active token is refreshed under
     Claude Code's own lock protocol — owner or no owner. CC 2.1.218 adopts an
@@ -1612,9 +1613,6 @@ class TestActiveAccountRefresh:
     so the locks make the rotation safe; what is never safe is discarding a
     consumed generation, so a successful grant persists unconditionally."""
 
-    @pytest.fixture(autouse=True)
-    def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
-        pass
 
 
     # Active credential with an already-expired access token (expiresAt in 1970).
@@ -9703,13 +9701,11 @@ class TestUnclaimedStashSweep:
             switcher._sweep_unclaimed_stash()
 
 
+@pytest.mark.usefixtures("_ex_reads_what_the_plain_reader_returns")
 class TestActiveRefreshProvenance:
     """_fetch_active_usage must not rotate-and-persist an unattributed
     credential — same hazard class as the switch-time blind backup."""
 
-    @pytest.fixture(autouse=True)
-    def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
-        pass
 
 
     _LIVE = json.dumps({"claudeAiOauth": {
@@ -14557,14 +14553,12 @@ class TestActiveSlotStrikeParity:
             "control: a matching backup must still confirm dead"
         )
 
+@pytest.mark.usefixtures("_ex_reads_what_the_plain_reader_returns")
 class TestUltraReviewCoverageGaps:
     """Ultra-review test-coverage findings: demotion re-read branch,
     degraded+force_refresh, active-path struck_fp stamping, add-path
     session-shell guards, gate-writes-live regression guard."""
 
-    @pytest.fixture(autouse=True)
-    def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
-        pass
 
 
     _EXPIRED = json.dumps({
