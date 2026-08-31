@@ -324,7 +324,11 @@ def _refresh_expiry(blob: str) -> "float | None":
     on that: both adopts refuse an older login (the reader-side one and the
     switch-time one), and the quarantine release recognises a newer one. Were
     the field to slide on refresh, every one of them would admit an older
-    credential, because an older chain could then outrank a newer login.
+    credential, because an older chain could then outrank a newer login. The
+    compare also assumes the minted lifetime does not SHRINK between logins:
+    were it shortened server-side, a login old enough to predate the change
+    would outrank today's. Neither assumption is ours to enforce, and the blob
+    carries no login timestamp to check them against.
 
     `credentials.py` keeps its own reader because that one also accepts an
     UNWRAPPED payload, which `oauth.extract_oauth_data` returns None for.
@@ -5285,11 +5289,14 @@ class ClaudeAccountSwitcher:
         """Adopt a login parked for this slot back when the slot was healthy.
 
         ``_adopt_into_dead_slot`` decides at STASH time, and a live slot takes
-        only a credential dated later than its own. Refusing the rest is
-        right: the slot's stored refresh token is the newer one. But nothing
-        looked again, so a slot that died hours later never reached the login
-        already sitting on disk and asked for a re-login it did not need. Measured: the login was stashed five minutes after the
-        slot's last good fetch, and the strike landed most of a day later.
+        only a credential dated later than its own. The rest is refused
+        because a live slot's own refresh token must not be overwritten --
+        for equal or undated dates which login is newer is simply unknown,
+        and unknown is not a licence. But nothing looked again, so a slot
+        that died hours later never reached the login already sitting on disk
+        and asked for a re-login it did not need. Measured: the login was
+        stashed five minutes after the slot's last good fetch, and the strike
+        landed most of a day later.
 
         Same trade-off as that method, evaluated at the moment the condition
         becomes true instead of only once: a slot whose token can mint nothing
@@ -5448,8 +5455,9 @@ class ClaudeAccountSwitcher:
         credential whose refresh lifetime ends LATER than the slot's own is a
         later login, which even a live slot has no newer token to lose to.
         Same trade-off `cswap import` already takes (issue #136); without it
-        the safety copy is a dead end, because nothing adopts a stash and the
-        slot asks for a re-login again on the next pass.
+        the safety copy only pays off once `_adopt_stashed_login_for_slot`
+        notices, which is a pass later at the earliest and never while the
+        slot stays healthy.
 
         Returns whether the adoption happened, so the caller can say which of
         the two things it did.
@@ -5476,9 +5484,11 @@ class ClaudeAccountSwitcher:
                 return False
         if oauth.refresh_token_spent(credentials):
             # THE SAME BYTES the reader-side adopt refuses, and on this path
-            # only this check sees them: the stash above sweeps its own expired
-            # row, so no later pass reaches these. Healing with them writes a
-            # spent grant and clears an accurate quarantine.
+            # only this check sees them: the stash above sweeps its own
+            # expired row, so no later pass reaches these. Both doors need it
+            # -- a spent grant heals a dead slot no better than it replaces a
+            # live one, and on the dead-slot door it would also clear an
+            # accurate quarantine.
             return False
         # CONTAINED. The stash above already preserved the live bytes and is
         # the license to proceed, so the switch is safe to complete whether or

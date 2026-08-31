@@ -614,7 +614,9 @@ class TestALaterLoginDoesNotWaitForTheSlotToDie:
         """THE CASE. The slot is alive and its credential is older; the
         incoming one is dated later, which only a login can do. It must land
         now rather than wait in the stash for the slot to die."""
-        switcher._write_account_credentials("2", "owner@example.com", EXPIRED)
+        switcher._write_account_credentials(
+            "2", "owner@example.com",
+            _dated("rt-older-live", _NOW_MS + 10 * _DAY_MS))
         assert not switcher._slot_token_dead("2", "owner@example.com"), (
             "premise: the slot is HEALTHY, so this is the later-login door "
             "and not the quarantine one"
