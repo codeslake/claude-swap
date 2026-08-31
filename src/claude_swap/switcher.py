@@ -5276,9 +5276,10 @@ class ClaudeAccountSwitcher:
     def _adopt_stashed_login_for_slot(self, num: str, email: str) -> bool:
         """Adopt a login parked for this slot back when the slot was healthy.
 
-        ``_adopt_into_dead_slot`` decides at STASH time and refuses a slot that
-        is still alive, which is right: its stored refresh token is the newer
-        one. Nothing looked again, so a slot that died hours later never
+        ``_adopt_into_dead_slot`` decides at STASH time, and a live slot takes
+        only a credential dated later than its own. Refusing the rest is
+        right: the slot's stored refresh token is the newer one. But nothing
+        looked again, so a slot that died hours later never
         reached the login already sitting on disk and asked for a re-login it
         did not need. Measured: the login was stashed five minutes after the
         slot's last good fetch, and the strike landed most of a day later.
@@ -5430,16 +5431,18 @@ class ClaudeAccountSwitcher:
     def _adopt_into_dead_slot(
         self, foreign_slot: str | None, credentials: str, data: dict
     ) -> bool:
-        """Write foreign live bytes into their own slot iff that slot is dead.
+        """Write foreign live bytes into their own slot, through two doors.
 
         A foreign credential is normally refused every slot because identity
-        proves ownership, not generation freshness. A slot quarantined as
-        refresh-token-dead has no freshness left to protect -- its stored
-        token can mint nothing -- so bytes the oracle resolved to it are
-        strictly better than what it holds. Same trade-off `cswap import`
-        already takes (issue #136); without it the safety copy is a dead end,
-        because nothing adopts a stash and the slot asks for a re-login again
-        on the next pass.
+        proves ownership, not generation freshness. Two things override that.
+        A slot QUARANTINED as refresh-token-dead has no freshness left to
+        protect -- its stored token can mint nothing -- so bytes the oracle
+        resolved to it are strictly better than what it holds. And a
+        credential whose refresh lifetime ends LATER than the slot's own is a
+        later login, which even a live slot has no newer token to lose to.
+        Same trade-off `cswap import` already takes (issue #136); without it
+        the safety copy is a dead end, because nothing adopts a stash and the
+        slot asks for a re-login again on the next pass.
 
         Returns whether the adoption happened, so the caller can say which of
         the two things it did.
@@ -5451,14 +5454,17 @@ class ClaudeAccountSwitcher:
         if not email:
             return False
         if not self._slot_token_dead(str(foreign_slot), email):
-            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. Older bytes must
-            # never displace a live slot's newer refresh token -- but
-            # `refreshTokenExpiresAt` moves ONLY on a login, so a credential
-            # dated later than the slot's IS the later login. Equal dates are
-            # one login, hence `<=`. None on either side proves nothing about
-            # which is later and refuses: no field, or a read that FAILED --
-            # `_ex` answers "" for both, so no separate unreadable branch can
-            # fire.
+            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. Older bytes
+            # must never displace a live slot's newer refresh token, and what
+            # the comparison rests on is that `refreshTokenExpiresAt` is
+            # MONOTONIC within one refresh-token chain: it never moves
+            # backwards for a lineage, so a value larger than the slot's
+            # cannot belong to an earlier login. Should that stop holding,
+            # this guard admits an OLDER credential -- the single outcome it
+            # exists to prevent. Equal values order nothing, hence `<=`; None
+            # on either side is no evidence either and refuses (absent field,
+            # or a read that FAILED -- `_ex` answers "" for both, so no
+            # separate unreadable branch can fire).
             stored, _ = self._read_account_credentials_ex(
                 str(foreign_slot), email)
             incoming_at = _refresh_expiry(credentials)
@@ -7904,10 +7910,9 @@ class ClaudeAccountSwitcher:
                     ):
                         msg = (
                             "Credential ownership mismatch detected. The live "
-                            f"credential belongs to Account-{foreign_slot}, "
-                            "whose stored token the endpoint had already "
-                            "condemned, so it was adopted there instead of "
-                            f"into Account-{current_account}."
+                            f"credential belongs to Account-{foreign_slot} and "
+                            "was adopted there instead of into "
+                            f"Account-{current_account}."
                         )
                     elif kind == "foreign":
                         # NOT "was preserved", here or in the two branches

@@ -8126,6 +8126,56 @@ class TestProvenanceGuard:
         # The switch itself proceeded, onto the stored backup.
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
+    def test_the_adopt_warning_does_not_claim_a_quarantine_that_never_happened(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """ONE MESSAGE SERVES BOTH ADOPT DOORS, so it must be true on both.
+        The later-login door fires on a HEALTHY slot, where the endpoint
+        condemned nothing -- saying it did sends the reader hunting a strike
+        that was never recorded."""
+        _DAY = 86_400_000
+        now_ms = int(time.time() * 1000)
+        sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-2"
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        creds_store[("2", "account2@example.com")] = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-2-old", "refreshToken": "rt-2-old",
+                "refreshTokenExpiresAt": now_ms + 5 * _DAY,
+            }
+        })
+        assert not switcher._slot_token_dead("2", "account2@example.com"), (
+            "premise: slot 2 is HEALTHY -- the later-login door, not the "
+            "quarantine one"
+        )
+        foreign = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-relogin", "refreshToken": "rt-2-relogin",
+            "refreshTokenExpiresAt": now_ms + 30 * _DAY,
+        }})
+        live_state = {"creds": foreign}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver={
+                "uuid": "uuid-2", "email": "account2@example.com",
+                "organizationUuid": "org-2",
+            })
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("2", "account2@example.com")] == foreign, (
+            "premise: the later login was adopted, so the warning branch ran"
+        )
+        joined = " ".join(op.get("warnings", []))
+        assert "belongs to Account-2" in joined, joined
+        assert "condemn" not in joined, (
+            "the warning says the endpoint had already condemned slot 2's "
+            f"stored token, but slot 2 was healthy: {joined}"
+        )
+
     def test_a_foreign_credential_heals_a_slot_whose_stored_token_is_dead(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):

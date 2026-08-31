@@ -1,8 +1,9 @@
 """A foreign login parked while its own slot was still healthy.
 
-``_adopt_into_dead_slot`` decides at STASH time, and a slot that is alive then
-is refused — correctly, because a live slot's own refresh token must not be
-overwritten. Nothing looked at the stash again, so when that slot's token died
+``_adopt_into_dead_slot`` decides at STASH time, and a live slot takes only a
+credential dated later than its own; the rest is refused, because a live
+slot's own refresh token must not be overwritten. Nothing looked at the stash
+again, so when that slot's token died
 hours later the login sitting in the stash was never reached and the slot asked
 for a re-login it did not need.
 
