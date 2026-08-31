@@ -537,17 +537,22 @@ class TestTheWriteSideTwinRefusesTheSameBytes:
 
 
 class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
-    """The fourth writer into a dead slot, and the one that must NOT refuse a
+    """The fifth writer into a dead slot, and the one that must NOT refuse a
     spent refresh token.
 
-    Its only caller reaches it past `outcome.usage is not None` AND a
-    non-expired `expiresAt`, so the usage endpoint accepted these bytes on
-    this pass. Live access token + spent refresh token is strictly better
-    than what a quarantined slot holds, and refusing would forfeit the access
-    token's remaining life to avoid a quarantine that re-forms on its own.
+    THE DISTINGUISHER IS THE RECENCY GUARD, not the live access token. Both
+    this path and `_adopt_into_dead_slot` reach their slot having had an
+    Anthropic endpoint accept the access token, so "the server just accepted
+    these bytes" argues equally for dropping the guard its sibling carries.
+    What only this one has is the `_refresh_expiry` comparison that refuses a
+    credential whose refresh lifetime ends earlier than the stored one: the
+    spent guard is recency work, and here it is already done.
 
-    Two reviews split on this. The caller's precondition settles it, so the
-    asymmetry is pinned rather than left to be "fixed" into a regression.
+    On top of that its caller reaches it only past `outcome.usage is not
+    None`, so refusing would forfeit a working access token's remaining life
+    to avoid a quarantine that re-forms on its own. Two reviews split on this,
+    so both halves are pinned rather than left to be "fixed" into a
+    regression.
     """
 
     @pytest.fixture
@@ -575,6 +580,37 @@ class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
             "2", "owner@example.com")
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(EXPIRED), (
-                "the resync adopt grew a spent-token guard; its caller has "
-                "already proven the access token works, so this forfeits it")
+                "the resync adopt grew a spent-token guard. Its own recency "
+                "compare already does that work, and its caller has proven "
+                "the access token still fetches — so this forfeits it")
 
+    def _resync_reached(self, sw, monkeypatch, usage):
+        """Drive `_fetch_active_usage`'s fast path; report whether the resync
+        (and so the adopt below it) was reached."""
+        reached = []
+        monkeypatch.setattr(
+            oauth, "try_fetch_usage_for_account",
+            lambda *a, **k: oauth.UsageOutcome(usage=usage, error=None))
+        monkeypatch.setattr(oauth, "build_usage_result", lambda *a, **k: None)
+        monkeypatch.setattr(sw, "_resync_rotated_backup",
+                            lambda *a, **k: reached.append(1))
+        sw._fetch_active_usage("2", "owner@example.com", LIVE_DATED)
+        return bool(reached)
+
+    def test_the_server_accepted_these_bytes_is_what_gates_the_resync(
+            self, switcher, monkeypatch):
+        """THE PREMISE, PINNED SEPARATELY FROM THE CONCLUSION. Widen this gate
+        and a credential the endpoint never accepted reaches the adopt, and
+        the exception above quietly becomes the defect the other four paths
+        were fixed for — while its own test goes on passing and defending it.
+        Measured before this test existed: `if outcome.usage is not None` to
+        `if True` left the whole suite green."""
+        assert self._resync_reached(
+            switcher, monkeypatch, usage=None) is False
+
+    def test_CONTROL_a_usage_dict_does_reach_the_resync(
+            self, switcher, monkeypatch):
+        """Without this the assertion above passes for a build where the
+        resync is unreachable altogether."""
+        assert self._resync_reached(
+            switcher, monkeypatch, usage={"five_hour": {"pct": 1.0}}) is True

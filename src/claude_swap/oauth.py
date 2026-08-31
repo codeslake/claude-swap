@@ -74,8 +74,11 @@ def refresh_token_spent(credentials: str) -> bool:
     Unknown is not expired — no field, a non-numeric one, or JSON carrying no
     ``claudeAiOauth`` all answer False. The one predicate for "these bytes can
     mint nothing", so no caller can disagree about the same credential.
-    Non-JSON raises out of ``extract_oauth_data``, as
-    ``credential_fingerprint`` does.
+
+    Non-JSON answers False, but JSON that is not an object raises
+    ``AttributeError`` and ``None`` raises ``TypeError``, both out of
+    ``extract_oauth_data``. Callers that cannot afford a raise must reach it
+    behind something that has already parsed the same bytes.
     """
     return is_oauth_token_expired(
         (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt")

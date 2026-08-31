@@ -8427,8 +8427,12 @@ class TestProvenanceGuard:
         (entry_id,) = entries
         assert _read_safety_copy(switcher, entry_id) == alien
         assert any(
-            "does not match a managed account" in w for w in op["warnings"]
-        )
+            "does not match a managed account and was not written into" in w
+            and "preserved" not in w
+            for w in op["warnings"]
+        ), (
+            "same false 'preserved' claim as its two sibling branches: all "
+            f"three route through the sweeping stash: {op['warnings']}")
 
     def test_blank_stored_uuid_email_match_is_alien_not_foreign(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -8646,7 +8650,13 @@ class TestProvenanceGuard:
         stash = switcher.list_unclaimed_credentials()
         assert len(stash) == 1
         assert next(iter(stash.values()))["reason"] == "known-foreign"
-        assert any("previously identified" in w for w in op["warnings"])
+        assert any(
+            "previously identified" in w and "was not written into" in w
+            and "preserved" not in w
+            for w in op["warnings"]
+        ), (
+            "the stash sweeps this row when the credential is spent, so a "
+            f"'preserved' claim here is false in that case: {op['warnings']}")
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
     def test_profile_exception_falls_back_to_pre_fix_backup(

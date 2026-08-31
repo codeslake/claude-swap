@@ -7894,10 +7894,10 @@ class ClaudeAccountSwitcher:
                             f"into Account-{current_account}."
                         )
                     elif kind == "foreign":
-                        # NOT "was preserved": when the credential is spent
-                        # the stash sweeps this row, so the claim is false in
-                        # at least one case the adopt declines. Ownership is
-                        # what holds in all of them.
+                        # NOT "was preserved", here or in the two branches
+                        # below: all three route through the same stash, which
+                        # sweeps the row when the credential is spent. What is
+                        # written and what is not is true in every case.
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             f"credential belongs to Account-{foreign_slot} and "
@@ -7909,7 +7909,7 @@ class ClaudeAccountSwitcher:
                     elif kind == "known-foreign":
                         msg = (
                             "The live credential was previously identified "
-                            "as another account's. It was preserved and not "
+                            "as another account's, and was not "
                             f"written into Account-{current_account}. If the "
                             "owning account later cannot authenticate, log "
                             "in as it and run: cswap add"
@@ -7917,7 +7917,7 @@ class ClaudeAccountSwitcher:
                     else:
                         msg = (
                             "The live login does not match a managed "
-                            "account. It was preserved and not written into "
+                            f"account and was not written into "
                             f"Account-{current_account}. If you need that "
                             "account, log in as it and run: cswap add"
                         )
