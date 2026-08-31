@@ -320,9 +320,11 @@ def _refresh_expiry(blob: str) -> "float | None":
     """A credential's ``refreshTokenExpiresAt``, or None when it carries none.
 
     A refresh does NOT extend this field — only a fresh login mints a new one —
-    so it separates two LOGINS and never two generations of one. Both readers
-    depend on that: the adopt refuses an older login, and the quarantine
-    release recognises a newer one.
+    so it ORDERS LOGINS and never two generations of one. Three readers depend
+    on that: both adopts refuse an older login (the reader-side one and the
+    switch-time one), and the quarantine release recognises a newer one. Were
+    the field to slide on refresh, every one of them would admit an older
+    credential, because an older chain could then outrank a newer login.
 
     `credentials.py` keeps its own reader because that one also accepts an
     UNWRAPPED payload, which `oauth.extract_oauth_data` returns None for.
@@ -5279,9 +5281,8 @@ class ClaudeAccountSwitcher:
         ``_adopt_into_dead_slot`` decides at STASH time, and a live slot takes
         only a credential dated later than its own. Refusing the rest is
         right: the slot's stored refresh token is the newer one. But nothing
-        looked again, so a slot that died hours later never
-        reached the login already sitting on disk and asked for a re-login it
-        did not need. Measured: the login was stashed five minutes after the
+        looked again, so a slot that died hours later never reached the login
+        already sitting on disk and asked for a re-login it did not need. Measured: the login was stashed five minutes after the
         slot's last good fetch, and the strike landed most of a day later.
 
         Same trade-off as that method, evaluated at the moment the condition
@@ -5455,16 +5456,18 @@ class ClaudeAccountSwitcher:
             return False
         if not self._slot_token_dead(str(foreign_slot), email):
             # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. This rests on
-            # `refreshTokenExpiresAt` being MONOTONIC within one refresh-token
-            # chain -- never moving backwards, so a value larger than the
-            # slot's cannot belong to an earlier login. If that stops holding
-            # the guard admits an OLDER credential, the one outcome it exists
-            # to prevent. Equal values order nothing, hence `<=`; None is no
-            # evidence either (absent, or a failed read -- `_ex` gives "").
+            # `refreshTokenExpiresAt` ORDERING LOGINS (see `_refresh_expiry`):
+            # minted at login and moved by nothing else, so a value above the
+            # slot's is a later login and not a refreshed older one. Were it
+            # to slide on refresh instead, an older chain could overtake a
+            # newer one and this guard would admit it, the one thing it
+            # exists to prevent.
             stored, _ = self._read_account_credentials_ex(
                 str(foreign_slot), email)
             incoming_at = _refresh_expiry(credentials)
             stored_at = _refresh_expiry(stored)
+            # Equal values order nothing, hence `<=`. None is no evidence
+            # either -- absent field, or a failed read (`_ex` gives "" for both).
             if (incoming_at is None or stored_at is None
                     or incoming_at <= stored_at):
                 return False

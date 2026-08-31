@@ -3,9 +3,8 @@
 ``_adopt_into_dead_slot`` decides at STASH time, and a live slot takes only a
 credential dated later than its own; the rest is refused, because a live
 slot's own refresh token must not be overwritten. Nothing looked at the stash
-again, so when that slot's token died
-hours later the login sitting in the stash was never reached and the slot asked
-for a re-login it did not need.
+again, so when that slot's token died hours later the login sitting in the
+stash was never reached and the slot asked for a re-login it did not need.
 
 Measured on a real machine: the login was stashed as ``foreign`` five minutes
 after the slot's last good fetch, and the ``invalid_grant`` strike landed most
@@ -616,6 +615,10 @@ class TestALaterLoginDoesNotWaitForTheSlotToDie:
         incoming one is dated later, which only a login can do. It must land
         now rather than wait in the stash for the slot to die."""
         switcher._write_account_credentials("2", "owner@example.com", EXPIRED)
+        assert not switcher._slot_token_dead("2", "owner@example.com"), (
+            "premise: the slot is HEALTHY, so this is the later-login door "
+            "and not the quarantine one"
+        )
         assert switcher._adopt_into_dead_slot(
             "2", LIVE_DATED, switcher._get_sequence_data() or {}) is True
         assert self._stored(switcher) == \
