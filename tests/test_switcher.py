@@ -1614,7 +1614,7 @@ class TestActiveAccountRefresh:
 
     @pytest.fixture(autouse=True)
     def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
-        """See the fixture: these tests stage the backup via the plain reader."""
+        pass
 
 
     # Active credential with an already-expired access token (expiresAt in 1970).
@@ -9709,7 +9709,7 @@ class TestActiveRefreshProvenance:
 
     @pytest.fixture(autouse=True)
     def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
-        """See the fixture: these tests stage the backup via the plain reader."""
+        pass
 
 
     _LIVE = json.dumps({"claudeAiOauth": {
@@ -14564,7 +14564,7 @@ class TestUltraReviewCoverageGaps:
 
     @pytest.fixture(autouse=True)
     def _backup_seam(self, _ex_reads_what_the_plain_reader_returns):
-        """See the fixture: these tests stage the backup via the plain reader."""
+        pass
 
 
     _EXPIRED = json.dumps({
