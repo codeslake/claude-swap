@@ -540,19 +540,23 @@ class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
     """The fifth writer into a dead slot, and the one that must NOT refuse a
     spent refresh token.
 
-    THE DISTINGUISHER IS THE RECENCY GUARD, not the live access token. Both
-    this path and `_adopt_into_dead_slot` reach their slot having had an
-    Anthropic endpoint accept the access token, so "the server just accepted
-    these bytes" argues equally for dropping the guard its sibling carries.
-    What only this one has is the `_refresh_expiry` comparison that refuses a
-    credential whose refresh lifetime ends earlier than the stored one: the
-    spent guard is recency work, and here it is already done.
+    IT RESTS ON ONE LEG. Its caller reaches it only past `outcome.usage is
+    not None`, so the usage endpoint served from these exact bytes on this
+    pass; refusing would forfeit that access token's remaining life to avoid a
+    quarantine that re-forms by itself. That leg is pinned below, separately
+    from this conclusion, because widening the gate would quietly turn the
+    exception into the defect the four guarded paths were fixed for.
 
-    On top of that its caller reaches it only past `outcome.usage is not
-    None`, so refusing would forfeit a working access token's remaining life
-    to avoid a quarantine that re-forms on its own. Two reviews split on this,
-    so both halves are pinned rather than left to be "fixed" into a
-    regression.
+    NOT the `_refresh_expiry` recency compare, which was given as the reason
+    here and is false. It orders two LOGINS: it short-circuits whenever the
+    stored side is undated, and with both sides dated and the STORED one more
+    spent it still adopts. Measured both ways -- it never asks whether either
+    credential can mint, so it cannot be doing the spent guard's work.
+
+    What `_adopt_into_dead_slot` has that this does not is a decision already
+    taken in the same call: `_stash_live_credential` parks those bytes and its
+    sweep deletes the row when they are spent, so adopting them there would
+    write what that very call discarded. Nothing here discards anything.
     """
 
     @pytest.fixture
@@ -580,9 +584,10 @@ class TestTheResyncAdoptDeliberatelyHasNoSpentGuard:
             "2", "owner@example.com")
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(EXPIRED), (
-                "the resync adopt grew a spent-token guard. Its own recency "
-                "compare already does that work, and its caller has proven "
-                "the access token still fetches — so this forfeits it")
+                "the resync adopt grew a spent-token guard. Its caller has "
+                "already served usage from these bytes, so this forfeits a "
+                "working access token; see the class docstring for why the "
+                "recency compare is NOT a reason either way")
 
     def _resync_reached(self, sw, monkeypatch, usage):
         """Drive `_fetch_active_usage`'s fast path; report whether the resync
