@@ -515,7 +515,7 @@ def import_accounts(
                 # it stores bytes that mint nothing and lifts an accurate
                 # quarantine. Say which half is stale, or the skip sends the
                 # user straight back into the defect the guard above refused.
-                spent = (
+                expired_note = (
                     " — its own refresh token has expired, so --force would "
                     "store a credential that mints nothing; re-export where "
                     "that account is still logged in"
@@ -523,7 +523,7 @@ def import_accounts(
                 )
                 _eprint(
                     f"Skipped {entry['email']} (already exists, use "
-                    f"--force){spent}"
+                    f"--force){expired_note}"
                 )
                 skipped += 1
                 # Even when skipped, the envelope's active account exists

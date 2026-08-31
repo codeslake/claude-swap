@@ -72,10 +72,10 @@ def refresh_token_spent(credentials: str) -> bool:
     """Has this credential's own refresh token expired?
 
     Unknown is not expired — no field, a non-numeric one, or JSON carrying no
-    ``claudeAiOauth`` all answer False. One predicate for "these bytes can
-    mint nothing", so the adopt paths, the import heal and the stash sweep
-    cannot disagree about the same credential. Non-JSON raises out of
-    ``extract_oauth_data``, exactly as ``credential_fingerprint`` does.
+    ``claudeAiOauth`` all answer False. The one predicate for "these bytes can
+    mint nothing", so no caller can disagree about the same credential.
+    Non-JSON raises out of ``extract_oauth_data``, as
+    ``credential_fingerprint`` does.
     """
     return is_oauth_token_expired(
         (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt")

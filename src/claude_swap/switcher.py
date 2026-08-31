@@ -7228,10 +7228,9 @@ class ClaudeAccountSwitcher:
             # to act on, and no verdict is KEEP.
             fp = oauth.credential_fingerprint(creds)
             if creds and oauth.refresh_token_spent(creds):
-                # ponytail: `refresh_token_spent` reuses the access-token
-                # predicate, so an entry is dropped up to
-                # OAUTH_EXPIRY_BUFFER_MS early. That window has not mattered:
-                # a grant with minutes left mints one more and then dies.
+                # ponytail: the shared predicate carries the access-token
+                # buffer, so a row is dropped up to OAUTH_EXPIRY_BUFFER_MS
+                # early. A grant with minutes left mints one more, then dies.
                 why = "its refresh token has expired"
             else:
                 if stored is None:
