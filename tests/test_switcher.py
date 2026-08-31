@@ -8169,10 +8169,8 @@ class TestProvenanceGuard:
         assert creds_store[("2", "account2@example.com")] == foreign, (
             "premise: the later login was adopted, so the warning branch ran"
         )
-        # THE ADOPT MUST PRECEDE THE TARGET READ. Adopting into the backup and
-        # then activating the pre-adopt bytes restores the whole reported
-        # symptom: the switch hands Claude the credential this login already
-        # revoked, while the good one sits in the backup one step away.
+        # THE ADOPT MUST PRECEDE THE TARGET READ. Activating the pre-adopt
+        # bytes hands Claude the credential this login already revoked.
         assert json.loads(live_state["creds"])["claudeAiOauth"][
             "refreshToken"] == "rt-2-relogin", (
             "the switch activated something other than the login it just "

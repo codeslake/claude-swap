@@ -5455,13 +5455,10 @@ class ClaudeAccountSwitcher:
         if not email:
             return False
         if not self._slot_token_dead(str(foreign_slot), email):
-            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. This rests on
-            # `refreshTokenExpiresAt` ORDERING LOGINS (see `_refresh_expiry`):
-            # minted at login and moved by nothing else, so a value above the
-            # slot's is a later login and not a refreshed older one. Were it
-            # to slide on refresh instead, an older chain could overtake a
-            # newer one and this guard would admit it, the one thing it
-            # exists to prevent.
+            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE. `_refresh_expiry`
+            # orders LOGINS -- its docstring carries the property and what
+            # breaks without it -- so a value above the slot's is a later
+            # login and not a refreshed older one.
             stored, _ = self._read_account_credentials_ex(
                 str(foreign_slot), email)
             incoming_at = _refresh_expiry(credentials)
