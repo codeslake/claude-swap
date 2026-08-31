@@ -1593,8 +1593,8 @@ def _ex_reads_what_the_plain_reader_returns(monkeypatch):
     `_fetch_active_usage` reads the slot backup through
     `_read_account_credentials_ex`, for the unreadable verdict the plain
     reader throws away. These classes stage a backup by patching the PLAIN
-    reader, so without this their staging is bypassed: measured, 21 of them
-    fail outright and 17 pass vacuously against an empty store. `(value,
+    reader, so without this their staging is bypassed: measured, 24 of them
+    fail outright and 34 pass, some vacuously against an empty store. `(value,
     False)` is what each already assumes by supplying concrete bytes; a test
     about the UNREADABLE verdict patches `_ex` on the instance, which wins.
     """
@@ -2011,6 +2011,46 @@ class TestActiveAccountRefresh:
         assert "does not match" not in caplog.text, (
             "an unreadable backup was reported as a provenance mismatch: "
             f"{caplog.text}"
+        )
+
+    def test_a_SILENT_pass_does_not_spend_the_one_shot_warning(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        caplog,
+    ):
+        """The marker is set INSIDE the readable branch, and that placement is
+        the whole of requirement 6 across passes. Consume it on a failed read
+        -- one hoisted line -- and the real provenance dead end that follows is
+        silent forever, because the slot has already "been warned" about a
+        condition nobody ever observed."""
+        switcher = self._switcher(sample_sequence_data)
+        foreign_live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-x", "refreshToken": "rt-foreign",
+                "expiresAt": 1000,
+            },
+        })
+        dead_backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "", "refreshToken": ""},
+        })
+
+        def _pass(ex_value):
+            caplog.clear()
+            with patch.object(
+                     switcher, "_read_credentials", return_value=foreign_live
+                 ), \
+                 patch.object(
+                     switcher, "_read_account_credentials_ex", return_value=ex_value
+                 ), \
+                 patch("claude_swap.oauth.try_refresh_oauth_credentials"), \
+                 patch("claude_swap.oauth.try_fetch_usage_for_account"), \
+                 caplog.at_level("WARNING", logger="claude-swap"):
+                switcher._fetch_active_usage("1", "test@example.com", foreign_live)
+            return caplog.text
+
+        assert "does not match" not in _pass(("", True)), "the failed read spoke"
+        assert "does not match" in _pass((dead_backup, False)), (
+            "the failed read spent the one-shot marker, so the REAL dead end "
+            "that followed it stayed silent"
         )
 
     def test_CONTROL_a_READ_but_unusable_backup_still_warns(
@@ -5495,8 +5535,6 @@ class TestSwitchSkipsBrokenSlots:
         # Active account unchanged.
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 1
-
-
 
     def test_fresh_machine_skips_broken_preferred_target(self, temp_home: Path, capsys):
         """No live session — picks first switchable slot if the recorded
@@ -9706,8 +9744,6 @@ class TestActiveRefreshProvenance:
     """_fetch_active_usage must not rotate-and-persist an unattributed
     credential — same hazard class as the switch-time blind backup."""
 
-
-
     _LIVE = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-live", "refreshToken": "rt-live", "expiresAt": 1000,
     }})
@@ -11043,8 +11079,6 @@ class TestDegradedReadProvenance:
         mock_refresh.assert_not_called()   # the rt is never consumed
         assert result.sentinel == USAGE_KEYCHAIN_UNAVAILABLE
         assert result.error is None        # no strike-advancing error
-
-
 
     def test_status_path_sets_the_degraded_flag_too(
         self, temp_home: Path, mock_claude_config: Path,
@@ -14559,8 +14593,6 @@ class TestUltraReviewCoverageGaps:
     degraded+force_refresh, active-path struck_fp stamping, add-path
     session-shell guards, gate-writes-live regression guard."""
 
-
-
     _EXPIRED = json.dumps({
         "claudeAiOauth": {"accessToken": "sk-active",
                           "refreshToken": "rt-orig", "expiresAt": 1000}})
@@ -15318,8 +15350,6 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
-
-
 
 class TestALoginLandsInItsOwnSlot:
     """A login for a MANAGED account must reach that account's slot.

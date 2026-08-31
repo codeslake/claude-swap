@@ -326,8 +326,8 @@ def _refresh_expiry(blob: str) -> "float | None":
     the field to slide on refresh, every one of them would admit an older
     credential, because an older chain could then outrank a newer login. The
     compare also assumes the minted lifetime does not SHRINK between logins:
-    were it shortened server-side, a login old enough to predate the change
-    would outrank today's. Neither assumption is ours to enforce, and the blob
+    were it shortened server-side, a login made before the change could
+    outrank today's. Neither assumption is ours to enforce, and the blob
     carries no login timestamp to check them against.
 
     `credentials.py` keeps its own reader because that one also accepts an

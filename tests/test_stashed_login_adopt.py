@@ -617,7 +617,8 @@ class TestALaterLoginDoesNotWaitForTheSlotToDie:
         failures inside 300ms with successful fetches one second later. The
         plain reader answers "" for that too, so the refusal holds either way;
         what this pins is that a failed read stays a refusal rather than
-        becoming evidence of an older slot."""
+        becoming evidence of an older slot. Staged through `_ex` because that
+        is the seam the door reads."""
         switcher._write_account_credentials("2", "owner@example.com",
                                             _dated("rt-held", _NOW_MS + _DAY_MS))
         monkeypatch.setattr(
