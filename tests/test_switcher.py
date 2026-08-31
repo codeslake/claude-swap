@@ -1594,7 +1594,7 @@ def _ex_reads_what_the_plain_reader_returns(monkeypatch):
     `_read_account_credentials_ex`, for the unreadable verdict the plain
     reader throws away. These classes stage a backup by patching the PLAIN
     reader, so without this their staging is bypassed: measured, 24 of them
-    fail outright and 34 pass, some vacuously against an empty store. `(value,
+    fail outright and 35 pass, some vacuously against an empty store. `(value,
     False)` is what each already assumes by supplying concrete bytes; a test
     about the UNREADABLE verdict patches `_ex` on the instance, which wins.
     """
@@ -1612,8 +1612,6 @@ class TestActiveAccountRefresh:
     externally rotated credential (race-resolved re-read, 401 store recovery),
     so the locks make the rotation safe; what is never safe is discarding a
     consumed generation, so a successful grant persists unconditionally."""
-
-
 
     # Active credential with an already-expired access token (expiresAt in 1970).
     _EXPIRED = json.dumps({
@@ -1989,9 +1987,9 @@ class TestActiveAccountRefresh:
     ):
         """A read that FAILED compared nothing. The warning on this arm names
         a mismatch AND an unusable backup; with the backup unread neither was
-        observed, and on macOS rc=36 is Keychain contention, not denial -- a
-        slot that is perfectly healthy one second later. The defer is right
-        either way; only the sentence is wrong."""
+        observed -- a backup cswap could not read says nothing about whether
+        the slot is healthy. The defer is right either way; only the sentence
+        is wrong."""
         switcher = self._switcher(sample_sequence_data)
         with patch.object(switcher, "_read_credentials", return_value=self._FOREIGN_LIVE), \
              patch.object(

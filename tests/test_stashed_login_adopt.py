@@ -610,6 +610,32 @@ class TestALaterLoginDoesNotWaitForTheSlotToDie:
             "2", incoming, switcher._get_sequence_data() or {}) is False
         assert self._stored(switcher) == oauth.credential_fingerprint(stored)
 
+    def test_CONTROL_an_empty_slot_email_is_never_written_to(self, switcher):
+        """No address, no slot to write into. `_slot_token_dead` answers True
+        for a struck row whose identity is the empty pair, so the door would
+        otherwise write a live credential into a backup keyed on no email."""
+        data = switcher._get_sequence_data() or {}
+        data["accounts"]["2"]["email"] = ""
+        switcher._write_json(switcher.sequence_file, data)
+        path = switcher._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {"2": {
+                "email": "", "organizationUuid": "",
+                "authDeadStrikes": AUTH_DEAD_STRIKES,
+                "struckFingerprint": None,
+            }},
+        }))
+        assert switcher._slot_token_dead("2", "") is True, (
+            "premise: the struck empty-identity row does read as dead, so "
+            "only the email guard stands between it and a write"
+        )
+        assert switcher._adopt_into_dead_slot(
+            "2", LIVE_DATED, switcher._get_sequence_data() or {}) is False
+        stored, _ = switcher._read_account_credentials_ex("2", "")
+        assert stored == "", "a credential was written to an empty-email slot"
+
     def test_CONTROL_an_unreadable_slot_is_never_overwritten(
             self, switcher, monkeypatch):
         """A read that FAILED is not a read that found older bytes. The

@@ -4404,8 +4404,8 @@ class ClaudeAccountSwitcher:
             # per condition, not per collect pass -- and only for a backup we
             # actually READ. A failed read compared nothing, so the sentence
             # would name a mismatch and an unusable backup that nobody
-            # observed (on macOS rc=36 is contention, not denial). The defer
-            # is the same either way; only the claim is narrowed.
+            # observed. The defer is the same either way; only the claim is
+            # narrowed.
             warned = (account_num, email, "unattributable")
             if not backup_unreadable and warned not in self._provenance_warned:
                 self._provenance_warned.add(warned)
