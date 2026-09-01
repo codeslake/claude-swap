@@ -131,6 +131,7 @@ Examples:
   cswap run user@example.com
   cswap run 2 --no-share
   cswap run 2 --share-history
+  cswap run 2 --require-session
   cswap run 2 -- --resume
         """,
     )
@@ -163,6 +164,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--require-session",
+        action="store_true",
+        help=(
+            "Refuse to launch when the account is already the active default "
+            "login, instead of running plain claude on that login (which a "
+            "later switch could pull out from under the session)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -183,6 +193,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -194,6 +205,7 @@ Examples:
                 tail,
                 share=not args.no_share,
                 share_history=args.share_history,
+                require_session=args.require_session,
             )
             return  # only reachable in tests
         if email is not None:
