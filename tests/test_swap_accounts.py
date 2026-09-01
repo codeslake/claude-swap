@@ -1631,6 +1631,15 @@ def _raise_config_error(*_a, **_k):
 class TestTheRollbackDecidesPerKey:
     """Which SLOT is still crossed, and which report the summary owes."""
 
+    @pytest.fixture(autouse=True)
+    def _file_mode(self, monkeypatch):
+        """Force the FILE store: these cases read the file backend, and on
+        macOS a usable Keychain takes the write instead -- no `.enc` written,
+        so the retained `.enc.prev` these cases purge or preserve never
+        exists. Class-wide and autouse, so membership alone grants it.
+        """
+        monkeypatch.setattr(CredentialStore, "_use_keychain", lambda self: False)
+
     def _write(self, switcher, data):
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, data)
