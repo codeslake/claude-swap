@@ -1322,6 +1322,29 @@ class TestRun:
         assert "CLAUDE_CONFIG_DIR" not in exc.value.env
         assert "already the active default login" in capsys.readouterr().out
 
+    def test_require_session_refuses_fast_path(
+        self, manager, capture_exec, monkeypatch
+    ):
+        monkeypatch.setattr(
+            manager.switcher,
+            "_get_current_account",
+            lambda: (ACCOUNT_EMAIL, ORG_UUID),
+        )
+        # SessionError, not _ExecCalled: nothing may launch.
+        with pytest.raises(SessionError, match="active default login"):
+            manager.run("2", [], require_session=True)
+
+    def test_require_session_is_inert_off_the_active_account(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates
+    ):
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("2", [], require_session=True)
+
+        session_dir = session_dir_for(
+            manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
+        )
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
+
     def test_preset_config_dir_disables_fast_path(
         self,
         manager,
