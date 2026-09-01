@@ -26,8 +26,8 @@ FP = oauth.credential_fingerprint(CREDS)
 IDENT = {"1": ("a@example.com", "")}
 
 
-def _struck(tmp_path, gap, caplog):
-    """Land one strike `gap` seconds after a success; return (entry, lines)."""
+def _struck(tmp_path, gap, caplog, strikes=1):
+    """Land `strikes` strikes `gap` seconds after a success; return (entry, lines)."""
     store = UsageStore(tmp_path)
     now = time.time()
     store.path.write_text(json.dumps({"schemaVersion": 2, "accounts": {"1": {
@@ -36,7 +36,8 @@ def _struck(tmp_path, gap, caplog):
         "lastGood": {"five_hour": {"pct": 5.0}},
     }}}))
     with caplog.at_level(logging.INFO, logger="claude-swap"):
-        store.record({"1": FR(error="invalid_grant", struck_fp=FP)}, IDENT)
+        for _ in range(strikes):
+            store.record({"1": FR(error="invalid_grant", struck_fp=FP)}, IDENT)
     return store.entries(IDENT)["1"], [r.getMessage() for r in caplog.records]
 
 
@@ -52,12 +53,12 @@ def test_a_doubted_strike_is_not_reported_as_a_quarantine(tmp_path, caplog):
         "the line must say the strike is doubted and a retry is permitted")
 
 
-def test_a_strike_outside_the_window_still_reports_a_quarantine(
-        tmp_path, caplog):
+def test_a_second_strike_still_reports_a_quarantine(tmp_path, caplog):
     """THE CONTROL. Without it the assertion above passes for a build that
-    stopped logging strikes at all."""
-    entry, lines = _struck(tmp_path, RACE_WINDOW_S + 60, caplog)
+    stopped logging strikes at all. A wide gap used to reach it; the doubt is
+    unbounded now, so the COUNT is what carries a row out of it."""
+    entry, lines = _struck(tmp_path, RACE_WINDOW_S + 60, caplog, strikes=2)
 
-    assert entry.token_dead() is True, "premise: no doubt out here"
+    assert entry.token_dead() is True, "premise: no doubt after two strikes"
     assert any("is quarantined" in m for m in lines), lines
     assert any("re-login may be needed" in m for m in lines), lines

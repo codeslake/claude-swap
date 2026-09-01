@@ -52,13 +52,51 @@ def _row(fetched_at, struck_at, strikes=AUTH_DEAD_STRIKES):
             "lastAttemptAt": struck_at, "struckAt": struck_at}
 
 
+def test_a_sibling_machines_rotation_is_doubted_however_long_ago_it_was():
+    """MEASURED on a three-machine fleet: one host quarantined a HEALTHY
+    account and stayed there.
+
+        fetchedAt  19:36     the last time this host's copy answered
+        struckAt   21:26     one invalid_grant, 6600s later
+        strikes    1
+        the other two hosts polled the same account successfully all night
+
+    The credential was not dead — a sibling had rotated the lineage, so this
+    host's copy was simply the spent predecessor. That is the racer this
+    window's own comment names, and a sibling rotates on ITS schedule: hours,
+    not minutes. A 600s width therefore fails in exactly the case it was
+    written for.
+
+    THE COUNT IS WHAT BOUNDS THE COST, as the constant's comment already says.
+    Doubt permits one POST that returns a verdict: it succeeds and `record`
+    zeroes the count, or it lands a second strike no window excuses. One extra
+    request, once, and the fleet's own answer decides which.
+    """
+    hours = 6_600.0
+    entry = UsageEntry(auth_dead_strikes=AUTH_DEAD_STRIKES,
+                       fetched_at=1_000.0, struck_at=1_000.0 + hours)
+    assert not entry.token_dead(), (
+        "a first strike %.0fs after a success stayed quarantined; on a shared "
+        "account that gap is a sibling's rotation, not a dead lineage" % hours)
+    # PAST THE CLAIM WINDOW, or this asserts about `_live_claim` instead: the
+    # helper stamps `lastAttemptAt` with the strike, and a `now` one second
+    # later reads as another collector's lease still running.
+    assert _row_eligible(_row(1_000.0, 1_000.0 + hours),
+                         now=1_000.0 + hours + 3_600,
+                         respect_plans=False), (
+        "the doubted row never reaches the fetch that would settle it")
+
+
 # --- the dead direction: a real quarantine must survive all of this ---
 
 @pytest.mark.parametrize("fetched,struck,why", [
     (None, 2_000.0, "never succeeded, so nothing says it was ever alive"),
     (2_000.0, None, "no strike time recorded (legacy row), so no gap exists"),
-    (1_000.0, 1_000.0 + RACE_WINDOW_S + 1, "the success is outside the window"),
-    (1_000.0, 1_000.0 + 900, "a full poll interval later is not a race"),
+    # THE TWO GAP CASES MOVED TO THE OTHER SIDE, and that is the change: a
+    # first strike after ANY prior success is doubted now, because the racer
+    # this guard names is a sibling machine and a sibling rotates on its own
+    # schedule. What still bounds the cost is the COUNT — see the two-strike
+    # cases below, which no gap excuses.
     (2_000.0, 1_000.0, "struck BEFORE the success: a negative gap is not a race"),
 ])
 def test_a_genuine_quarantine_is_not_released(fetched, struck, why):
@@ -104,16 +142,16 @@ def test_a_suspected_race_is_fetched_again():
 
 
 def test_the_retry_that_fails_again_makes_the_strike_stick(store, clock):
-    """The guard must not loop. `fetchedAt` only advances on a success and
-    `lastAttemptAt` on every attempt, so a second failure widens the gap past
-    the window on its own — end to end through the store, not by hand."""
+    """The guard must not loop. Nothing about the SECOND strike's gap excuses
+    it: what ends the doubt is that a strike already stands, so the count
+    reaches two — end to end through the store, not by hand."""
     store.record({"1": FetchRecord(usage={"five_hour": {"utilization": 1}})},
                  IDENT)
     clock.advance(310)
     store.record({"1": FetchRecord(error="invalid_grant", struck_fp="sha256:a")},
                  IDENT)
     assert not store.entries(IDENT)["1"].token_dead(), (
-        "PREMISE: the first strike must land inside the window"
+        "PREMISE: the first strike must be doubted"
     )
 
     clock.advance(RACE_WINDOW_S + 1)
@@ -121,15 +159,22 @@ def test_the_retry_that_fails_again_makes_the_strike_stick(store, clock):
                  IDENT)
     entry = store.entries(IDENT)["1"]
     assert entry.token_dead(), (
-        f"a lineage that failed twice, the second time {RACE_WINDOW_S + 311:.0f}s "
-        f"after its last success, was still excused as a race: "
+        f"a lineage that failed TWICE was still excused as a race "
+        f"(second strike {RACE_WINDOW_S + 311:.0f}s after its last success): "
         f"fetched_at={entry.fetched_at} struck_at={entry.struck_at}"
     )
 
 
-@pytest.mark.parametrize("gap,relogin", [(310, False), (RACE_WINDOW_S + 1, True)])
+@pytest.mark.parametrize("gap,strikes,relogin", [
+    (310, AUTH_DEAD_STRIKES, False),
+    # THE CASE THAT FLIPPED. A wide gap used to render the relogin banner; a
+    # sibling machine rotates on its own schedule, so it no longer does.
+    (RACE_WINDOW_S + 1, AUTH_DEAD_STRIKES, False),
+    # The positive control, and what still ends the doubt: a SECOND strike.
+    (310, AUTH_DEAD_STRIKES + 1, True),
+])
 def test_the_sentinel_tracks_the_window(
-    gap, relogin, temp_home, mock_claude_config, sample_sequence_data, monkeypatch,
+    gap, strikes, relogin, temp_home, mock_claude_config, sample_sequence_data, monkeypatch,
 ):
     """What the owner actually sees. The guard sits before `token_dead`'s
     fingerprint compare, so `_entry_token_dead` answers False and the collector
@@ -156,7 +201,7 @@ def test_the_sentinel_tracks_the_window(
                           idents)
     row = s._usage_store._read_rows()["2"]
     row["lastAttemptAt"] = row["struckAt"] = row["fetchedAt"] + gap
-    row["authDeadStrikes"] = AUTH_DEAD_STRIKES
+    row["authDeadStrikes"] = strikes
     row["struckFingerprint"] = oauth.credential_fingerprint(creds)
     s._usage_store._write_rows({"2": row})
 
@@ -177,9 +222,9 @@ def test_the_sentinel_tracks_the_window(
 
 
 def test_only_the_FIRST_strike_is_ever_doubted(store, clock):
-    """The bound that caps the cost at one extra POST. A second rejection is
-    dead even with a success still inside the window -- otherwise a dead grant
-    could be re-POSTed for as long as the window allowed."""
+    """The COUNT is the whole bound now, so it carries the cost cap alone: a
+    second rejection is dead however recent the last success was, or a dead
+    grant would be re-POSTed forever."""
     store.record({"1": FetchRecord(usage={"five_hour": {"utilization": 1}})}, IDENT)
     clock.advance(10)
     for _ in range(2):
@@ -188,11 +233,11 @@ def test_only_the_FIRST_strike_is_ever_doubted(store, clock):
     entry = store.entries(IDENT)["1"]
     gap = entry.struck_at - entry.fetched_at
     assert gap <= RACE_WINDOW_S, (
-        f"PREMISE: the success must still be inside the window (gap {gap:.0f}s)"
+        f"PREMISE: the success is recent, so only the count can be killing it "
+        f"(gap {gap:.0f}s)"
     )
     assert entry.token_dead(), (
-        "a second rejection was excused, so a dead grant keeps being POSTed "
-        "for as long as the window lasts"
+        "a second rejection was excused, so a dead grant keeps being POSTed"
     )
 
 

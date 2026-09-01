@@ -235,7 +235,21 @@ AUTH_DEAD_STRIKES = 1
 #: The racer is outside every lock cswap holds -- a concurrent Claude Code or
 #: a sibling machine rotating the same lineage. `fetchedAt` advances only on a
 #: success, so `struckAt - fetchedAt` is how long before the strike the lineage
-#: last answered. Loose on purpose: the COUNT bounds the cost, not this width.
+#: last answered.
+#:
+#: NO LONGER A BOUND ON THE DOUBT, only the width the log quotes. It was one,
+#: and it failed in exactly the case the paragraph above names: a sibling
+#: rotates on ITS schedule, not ours. Measured on a three-machine fleet -- one
+#: host's copy went spent 6600s after its last success, took one
+#: `invalid_grant`, and sat quarantined all night while the other two polled
+#: the same account fine. 600s called that a dead lineage and asked for a
+#: re-login that fixes nothing durable: the next sibling rotation puts the host
+#: straight back.
+#:
+#: The COUNT bounds the cost, as this comment always claimed. Doubt permits one
+#: POST that RETURNS A VERDICT, and that POST either succeeds (`record` zeroes
+#: the count) or lands a second strike no doubt survives. One extra request,
+#: once, and the server settles which it was.
 RACE_WINDOW_S = 600.0
 
 
@@ -289,7 +303,9 @@ def _strike_is_suspected_race(
         return False
     if fetched_at is None or struck_at is None:
         return False
-    return 0 <= struck_at - fetched_at <= RACE_WINDOW_S
+    # NO UPPER BOUND -- see RACE_WINDOW_S. A negative gap is still not a race:
+    # there the success is the LATER event and has already zeroed the strike.
+    return struck_at >= fetched_at
 
 
 # Fetch errors that prove the stored credential is permanently unusable (vs.
@@ -1240,11 +1256,13 @@ class UsageStore:
                         )
                         if _doubted:
                             _logger.info(
-                                "Account %s (%s): a refresh answered %s, but a "
-                                "success preceded it by under %.0fs, so this "
-                                "first strike is DOUBTED as a race — the slot "
-                                "keeps being fetched and one retry settles it. "
-                                "No re-login is implied. Strike %s of %s.",
+                                "Account %s (%s): a refresh answered %s, but "
+                                "this lineage has succeeded before (%.0fs is "
+                                "the width the log quotes, not a bound), so "
+                                "this first strike is DOUBTED as a race — the "
+                                "slot keeps being fetched and one retry "
+                                "settles it. No re-login is implied. "
+                                "Strike %s of %s.",
                                 num,
                                 (_ident[0] if _ident else "unknown"),
                                 rec.error,
