@@ -9804,6 +9804,94 @@ class TestIdentityForConfigCanBeAskedAboutAnySlot:
         assert pin.identity_for_config(sw) == {
             "emailAddress": "pinned@example.com"}
 
+    def test_the_roster_synthesis_carries_the_org_name_it_holds(
+            self, monkeypatch):
+        """The fallback dropped a field the roster does have.
+
+        `splice_config_identity` REPLACES `oauthAccount`, so every key missing
+        from this dict is stripped out of the live config -- and Claude Code
+        answers a stripped `organizationName` with an unguarded profile fetch.
+        The three-key synthesis therefore paid for a field it was holding:
+        measured, every slot on every machine of a three-host fleet carries
+        `organizationName`, against a comment here saying the roster never
+        holds one.
+
+        `displayName` and `organizationRole` genuinely are not in the roster
+        and stay absent; the merge on the package side is what keeps those.
+        """
+        from claude_swap import pin
+
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("pinned@example.com", "org-1"))
+        sw = self._sw(monkeypatch, '{"oauthAccount": {}}')
+        sw._get_sequence_data = lambda: {"accounts": {"2": {
+            "email": "pinned@example.com", "uuid": "uuid-cloud",
+            "organizationUuid": "org-1", "organizationName": "Acme Inc"}}}
+
+        got = pin.identity_for_config(sw)
+        assert got == {"emailAddress": "pinned@example.com",
+                       "organizationUuid": "org-1",
+                       "accountUuid": "uuid-cloud",
+                       "organizationName": "Acme Inc"}, got
+
+    def test_a_roster_with_no_org_name_omits_the_key(self, monkeypatch):
+        """THE CONTROL. An empty string is not a name, and writing one is how
+        a stripped field becomes a wrong field: the config would then read as
+        "this account belongs to an organization called nothing" instead of
+        letting Claude Code fill it in."""
+        from claude_swap import pin
+
+        monkeypatch.setattr("claude_swap.pin._pinned_email_now",
+                            lambda s: ("pinned@example.com", "org-1"))
+        sw = self._sw(monkeypatch, '{"oauthAccount": {}}')
+        sw._get_sequence_data = lambda: {"accounts": {"2": {
+            "email": "pinned@example.com", "uuid": "uuid-cloud",
+            "organizationUuid": "org-1", "organizationName": "  "}}}
+
+        assert "organizationName" not in pin.identity_for_config(sw)
+
+    def test_a_switch_carries_the_pointers_itself(self, monkeypatch):
+        """The daemon is not the only thing that may run the carry.
+
+        Claude Code compares a session's persisted bridge owner against
+        `~/.claude.json`'s `oauthAccount`; on a mismatch it refuses to
+        reattach and mints instead. The only trigger today is the daemon
+        noticing that file move, so while the daemon is down no carry happens
+        at all and every live session stays vetoed until it returns.
+
+        `cswap` is the process that just wrote that file, so it can do it
+        itself. Best-effort by construction: an optional extra must never be
+        able to fail a switch that already succeeded.
+        """
+        from claude_swap import pin
+
+        seen = []
+
+        class _Impl:
+            def carry_live_pointers(self, *a):
+                seen.append(a)
+                return 3
+
+        monkeypatch.setattr("claude_swap.pin._live_impl", lambda: _Impl())
+        assert pin.carry_live_pointers() == 3
+        assert seen == [()], seen
+
+    def test_a_carry_that_raises_does_not_reach_the_caller(self, monkeypatch):
+        """THE CONTROL, and the reason this goes through `_ask`: the call sits
+        after a switch has already written both files, so anything it raises
+        would turn a completed switch into a reported failure."""
+        from claude_swap import pin
+
+        class _Boom:
+            def carry_live_pointers(self, *a):
+                raise RuntimeError("no daemon state")
+
+        monkeypatch.setattr("claude_swap.pin._live_impl", lambda: _Boom())
+        assert pin.carry_live_pointers() is None
+
+        monkeypatch.setattr("claude_swap.pin._live_impl", lambda: None)
+        assert pin.carry_live_pointers() is None
+
     def test_no_pin_and_no_email_is_still_None(self, monkeypatch):
         from claude_swap import pin
 

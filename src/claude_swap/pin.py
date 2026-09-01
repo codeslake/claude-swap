@@ -1052,8 +1052,8 @@ def identity_for_config(switcher, email: str | None = None,
         # stored config to copy, and None here makes `_perform_switch` fall
         # back to the account being switched TO. The roster answers: its
         # `uuid` IS what a stored config calls `accountUuid`. A stored config
-        # still wins when it has one -- it also carries displayName and
-        # organizationName, which the roster has never held.
+        # still wins when it has one -- it also carries displayName, which the
+        # roster does not.
         row = ((switcher._get_sequence_data() or {})
                .get("accounts", {}).get(str(num)) or {})
         uuid = (row.get("uuid") or "").strip()
@@ -1062,9 +1062,18 @@ def identity_for_config(switcher, email: str | None = None,
             # identity without one is no better than None — and None at least
             # means "leave the field alone".
             return oauth if isinstance(oauth, dict) and oauth else None
-        return {"emailAddress": row.get("email") or email,
-                "organizationUuid": row.get("organizationUuid") or "",
-                "accountUuid": uuid}
+        out = {"emailAddress": row.get("email") or email,
+               "organizationUuid": row.get("organizationUuid") or "",
+               "accountUuid": uuid}
+        # EVERY KEY MISSING HERE IS STRIPPED, because the splice replaces
+        # `oauthAccount` whole -- and Claude Code answers a stripped
+        # `organizationName` with an unguarded profile fetch. Omitted rather
+        # than blanked when the roster has none: an empty string is a wrong
+        # name, where absence lets CC fill it in.
+        org_name = (row.get("organizationName") or "").strip()
+        if org_name:
+            out["organizationName"] = org_name
+        return out
     except Exception:  # noqa: BLE001 — never block a switch
         return None
 
@@ -1105,6 +1114,21 @@ def ca_path_for_trust():
 def live_bridge_names() -> "dict[str, str] | None":
     """Bridge id -> the name its session wants, or None when unavailable."""
     return _ask("live_bridge_names")
+
+
+def carry_live_pointers():
+    """Point every live session's bridge record at the account now signed in.
+
+    Called right after a switch writes `~/.claude.json`. The package's daemon
+    does this too, on noticing that file move -- but only while it is running,
+    so a switch made with the daemon down left every live session vetoed until
+    it came back. The process that wrote the file can do it without waiting.
+
+    None when the extra is absent or the call raised: the switch has already
+    written both files by then, and an optional feature must not turn a
+    completed switch into a reported failure.
+    """
+    return _ask("carry_live_pointers")
 
 
 def titles_to_restore(sessions, names) -> "list | None":

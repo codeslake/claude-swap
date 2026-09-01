@@ -7440,6 +7440,13 @@ class ClaudeAccountSwitcher:
                             )
                     raise
 
+                # AFTER the rollback block, so a carry can never undo a
+                # switch that succeeded. Claude Code refuses to reattach a
+                # session whose persisted bridge owner no longer matches the
+                # config just written; the package's daemon carries those
+                # pointers on noticing the move, but only while it is running.
+                _pin.carry_live_pointers()
+
                 if force_activate and current_identity is not None:
                     self._logger.info(
                         f"Activated account {target_account} "
