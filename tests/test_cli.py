@@ -582,8 +582,18 @@ class TestRunCommand:
             def __init__(self, switcher):
                 calls.append(("init", switcher))
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
-                calls.append(("run", identifier, claude_args, share, share_history))
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
+                calls.append((
+                    "run", identifier, claude_args, share, share_history,
+                    require_session,
+                ))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
              patch("claude_swap.cli.ClaudeAccountSwitcher"), \
@@ -594,32 +604,36 @@ class TestRunCommand:
 
     def test_run_dispatches_with_defaults(self):
         calls = self._dispatch(["run", "2"])
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
 
     def test_run_by_email(self):
         calls = self._dispatch(["run", "user@example.com"])
-        assert ("run", "user@example.com", [], True, False) in calls
+        assert ("run", "user@example.com", [], True, False, False) in calls
 
     def test_no_share_flag(self):
         calls = self._dispatch(["run", "2", "--no-share"])
-        assert ("run", "2", [], False, False) in calls
+        assert ("run", "2", [], False, False, False) in calls
 
     def test_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--share-history"])
-        assert ("run", "2", [], True, True) in calls
+        assert ("run", "2", [], True, True, False) in calls
 
     def test_no_share_history_flag(self):
         calls = self._dispatch(["run", "2", "--no-share-history"])
-        assert ("run", "2", [], True, False) in calls
+        assert ("run", "2", [], True, False, False) in calls
+
+    def test_require_session_flag(self):
+        calls = self._dispatch(["run", "2", "--require-session"])
+        assert ("run", "2", [], True, False, True) in calls
 
     def test_tail_forwarded_verbatim(self):
         calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
-        assert ("run", "2", ["--resume", "--model", "x"], True, False) in calls
+        assert ("run", "2", ["--resume", "--model", "x"], True, False, False) in calls
 
     def test_tail_may_contain_run_flags(self):
         """Args after `--` are NOT parsed by cswap, even if they look like ours."""
         calls = self._dispatch(["run", "2", "--", "--no-share"])
-        assert ("run", "2", ["--no-share"], True, False) in calls
+        assert ("run", "2", ["--no-share"], True, False, False) in calls
 
     def test_run_unknown_flag_errors(self, capsys):
         with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
@@ -659,7 +673,14 @@ class TestRunCommand:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
                 from claude_swap.exceptions import SessionError
 
                 raise SessionError("boom")
@@ -761,7 +782,14 @@ class TestSubcommandAliases:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
                 calls.append((identifier, claude_args, share))
 
         with patch("claude_swap.session.SessionManager", FakeSessionManager), \
@@ -1351,7 +1379,14 @@ class TestRunAutoResolve:
             def __init__(self, switcher):
                 pass
 
-            def run(self, identifier, claude_args, share=True, share_history=False):
+            def run(
+                self,
+                identifier,
+                claude_args,
+                share=True,
+                share_history=False,
+                require_session=False,
+            ):
                 calls.append(("run", identifier, claude_args, share, share_history))
 
             def exec_default(self, claude_args):
