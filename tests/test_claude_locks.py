@@ -199,30 +199,41 @@ class TestProperLockfile:
         it, the gate compares against acquisition time and the cries-wolf
         warning comes straight back.
         """
+        staleness = 0.15
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
         real = os.utime
-        state = {"n": 0}
+        state = {"n": 0, "t0": None, "hiccuped": False}
 
-        def fail_the_tenth(path, *a, **k):
+        def fail_once_past_the_window(path, *a, **k):
             if os.fspath(path) == os.fspath(lock_dir):
                 state["n"] += 1
-                if state["n"] == 10:
+                if state["t0"] is None:
+                    state["t0"] = time.time()
+                # BOUND TO THE WINDOW, NOT TO A COUNT. Keyed on the tenth
+                # touch this needed the toucher to reach ten inside the hold,
+                # which is a claim about the RUNNER: a loaded one ran eight,
+                # the injection never fired, and the case failed on its own
+                # premise while the behaviour was never exercised.
+                elif not state["hiccuped"] and (
+                        time.time() - state["t0"] > staleness):
+                    state["hiccuped"] = True
                     raise PermissionError("injected: one hiccup")
             return real(path, *a, **k)
 
-        monkeypatch.setattr(claude_locks.os, "utime", fail_the_tenth)
+        monkeypatch.setattr(claude_locks.os, "utime", fail_once_past_the_window)
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             # Below the hold, so the gate is genuinely reached -- but not so
             # close to TOUCH_INTERVAL_S that one scheduler stall reads as a
             # frozen `last_ok`. At 0.05 a single 30ms hiccup between two ticks
             # cries wolf on correct code; 0.15 leaves 130ms and still catches
             # the `last_ok` deletion, because the hold is 0.4s either way.
-            with proper_lockfile(lock_dir, staleness=0.15):
+            with proper_lockfile(lock_dir, staleness=staleness):
                 time.sleep(0.4)
 
-        assert state["n"] > 10, (
-            f"premise: only {state['n']} touch(es) ran, so the hiccup never "
-            "landed inside a hold longer than the staleness window"
+        assert state["hiccuped"], (
+            f"premise: the injected hiccup never fired ({state['n']} touch(es) "
+            "ran), so nothing was held past the staleness window and the "
+            "silence below would be correct for the wrong reason"
         )
         said = [r.getMessage() for r in caplog.records if "refresh" in r.getMessage()]
         assert said == [], (
