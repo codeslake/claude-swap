@@ -39,10 +39,11 @@ no wiring — they only change which account is active.
 | B3 | Pinned account's refresh lineage is dead (`invalid_grant`, or the ~4-week refresh-token expiry) | Refresh fails → provider returns None → original bearer, silently | Yes — re-login + `cswap add`; next request picks it up |
 | B4 | Pin points at a removed/renamed account (**dangling pin**) | `ensure_proxy` resolves the account and returns None when it is gone, so no proxy starts at all | Yes — re-pin |
 
-`remove_account` does **not** clear the pin, so B4 is reachable. It is
-handled safely (no proxy rather than a wrong one), but the stale pin stays
-in `settings.json` and reads as "pinned" in the UI. Clearing it on removal
-is a small fix worth making.
+`remove_account` clears the pin when the account it names is the one going
+away (`_clear_pin_if_removed`), so B4 is no longer reachable from a removal.
+It stays in the table because the record can still be orphaned another way —
+an account renamed in the cloud, or a settings file restored from a machine
+whose roster differs.
 
 | # | Case | Behaviour | Recover without restart? |
 |---|---|---|---|
