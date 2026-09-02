@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, oauth
 from claude_swap.exceptions import (
     CredentialError,
     CredentialReadError,
@@ -1172,6 +1172,39 @@ class CredentialStore:
             self._host._logger.warning(
                 f"Could not refresh .credentials.json after Keychain write ({e}); "
                 "a running session may not hot-reload until restart"
+            )
+
+    def _sync_active_credentials_file_to_adopted_login(self, credentials: str) -> None:
+        """After an adopt, bring an existing plaintext file to the adopted generation.
+
+        macOS only: an adopt (``add_account`` capturing the current login,
+        ``_adopt_login_into_slot`` capturing the server-resolved owner's) reads
+        the credential from the Keychain and stores it into a slot backup —
+        never into ``.credentials.json``. A file left behind by a PREVIOUS
+        login then keeps naming that superseded account until an unrelated
+        switch happens to write both stores, and a reader that falls back to
+        the file (no GUI Keychain access) serves it.
+
+        Rewrite-when-present / never-create, like ``_refresh_stale_credentials_file``:
+        a fileless Keychain-only user gains no plaintext credential, and an
+        absent or unreadable file is left alone rather than guessed at.
+        Skipped when the file already carries these bytes, so a routine adopt
+        of an unchanged login causes no rewrite.
+        """
+        if self._host.platform != Platform.MACOS:
+            return
+        cred_file = get_credentials_path()
+        try:
+            current = cred_file.read_text(encoding="utf-8")
+        except OSError:
+            return
+        if oauth.extract_oauth_data(current) == oauth.extract_oauth_data(credentials):
+            return
+        try:
+            self._write_active_credentials_file(credentials)
+        except Exception as e:
+            self._host._logger.warning(
+                f"Could not sync .credentials.json to the adopted login ({e})"
             )
 
     def _uses_file_backup_backend(self) -> bool:

@@ -3874,6 +3874,7 @@ class ClaudeAccountSwitcher:
             self._reject_identity_drift_since_verify(identity)
 
             self._write_account_credentials(account_num, current_email, current_creds)
+            self._store._sync_active_credentials_file_to_adopted_login(current_creds)
             self._write_account_config(account_num, current_email, current_config)
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (current_email, current_org_uuid)}
@@ -4017,6 +4018,7 @@ class ClaudeAccountSwitcher:
 
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
+        self._store._sync_active_credentials_file_to_adopted_login(current_creds)
         self._write_account_config(account_num, current_email, current_config)
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (current_email, organization_uuid)}

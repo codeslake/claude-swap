@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.exceptions import ConfigError, ValidationError
 
@@ -717,4 +718,40 @@ def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
         "the guard was handed a REBUILT tuple; it must receive the object "
         "_get_current_identity_triple returned, or a sibling change that "
         "overwrites one of the unpacked names silently poisons it"
+    )
+
+
+def test_adopting_a_keychain_login_syncs_the_stale_plaintext_file(
+    temp_home: Path, mock_claude_config: Path,
+):
+    """On macOS, ``add_account`` reads the identity/credential the way claude
+    resolves them for capture -- the Keychain, not ``.credentials.json`` --
+    and stores that into the slot. It never touches the plaintext file, so a
+    file left behind by a PREVIOUS login stays on disk holding that older
+    account until an unrelated refresh happens to write both stores. An
+    ssh-born reader that falls back to the file (no GUI Keychain access)
+    would then serve the superseded login.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s.platform = Platform.MACOS
+
+    login_a = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-LOGIN-A", "refreshToken": "rt-login-a",
+        "expiresAt": 99999999999000}})
+    login_b = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-LOGIN-B", "refreshToken": "rt-login-b",
+        "expiresAt": 99999999999000}})
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(login_a, encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=login_b), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=3, assume_yes=True)
+
+    assert cred_file.read_text(encoding="utf-8") == login_b, (
+        "DEFECT: the plaintext file still held login A's tokens after login "
+        "B was adopted from the Keychain into the slot"
     )
