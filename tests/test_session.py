@@ -4200,12 +4200,11 @@ def _notices_before_exec(src: str) -> tuple[list[int], int]:
     """Print-only calls in the statements that lead straight into an exec.
 
     For every `<x>.exec_default(...)` statement, EVERY statement before it in
-    the same block is the notice's whole life on screen. Deliberately wider
-    than the paths that reach the exec: a branch that returns first is walked
-    too, because the terminator that would skip it cannot see one. A `return`
-    nested in an `if` is not a statement of this block, and a `return` that IS
-    one makes the exec below it unreachable -- so the narrower scan is a
-    promise no shape can keep, and the false alarm it costs names its line.
+    the same block is the notice's whole life on screen -- a branch that
+    returns first included. Narrowing to the paths that reach the exec has no
+    shape to key on: a `return` marking one is either nested in an `if`, and
+    so not a statement of this block, or a statement of it, and so makes the
+    exec below unreachable.
     """
     import ast
 
@@ -4311,11 +4310,9 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         src = pathlib.Path(cli_mod.__file__).read_text(encoding="utf-8")
         offenders, execs = _notices_before_exec(src)
         assert execs, "no `exec_default` call found in cli.py — the matcher is blind"
-        # AND THE OTHER HALF. `execs` is the denominator for finding the exec,
-        # which leaves the half that does the work with none: stubbing
-        # `_print_only_offenders` to `([], 0)` left this case green ON THE
-        # PRE-FIX SOURCE. This is the set the narrowing intersects, so a
-        # populated one says an empty result above is a clean block.
+        # AND THE OTHER HALF. `execs` covers finding the exec; this covers
+        # finding the notices. It is the exact set the narrowing intersects, so
+        # populated, an empty result above is a clean block, not a blind walk.
         printed_anywhere, _ = _print_only_offenders(src)
         assert printed_anywhere, (
             "the print-only matcher reported nothing anywhere in cli.py, so an "
