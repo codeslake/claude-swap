@@ -12290,10 +12290,6 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
             sw.add_account()
         assert seen == [], "add_account wrote past a login nobody could name"
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="the cloud pin needs POSIX file locks and FIFOs",
-    )
     def test_a_login_lands_in_its_slot_and_becomes_active(
         self, temp_home, mock_claude_config, sample_sequence_data
     ):
@@ -12301,7 +12297,6 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
         roster's active slot is 1, the live store holds a /login as slot 2.
         `cswap add` must update slot 2 with it and make slot 2 active."""
         import json as _json
-        from claude_swap import pin as _pin
         from claude_swap.switcher import ClaudeAccountSwitcher
 
         accs = sample_sequence_data["accounts"]
@@ -12316,11 +12311,14 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
             {"claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-old",
                                "expiresAt": 99_999_999_999_999}}))
         org1 = accs["1"].get("organizationUuid", "") or ""
-        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value={
-                "uuid": "test-uuid-1234", "email": "test@example.com",
-                "organizationUuid": org1}):
-            ok, msg = _pin.set_pin(sw, "test@example.com", org1 or None, num="1")
-        assert ok, msg
+        # The pin RECORD alone; set_pin would also spawn a daemon under this
+        # temp home, and the record is all the splice reads.
+        from claude_swap import settings as _s
+        sp = _s.settings_path(sw.backup_dir)
+        cur = _s._read_raw(sp) if sp.exists() else {}
+        cur["remoteControl"] = {"pinnedEmail": "test@example.com",
+                                "pinnedOrganizationUuid": org1}
+        sp.write_text(_json.dumps(cur))
         assert sw._config_names_the_pin("test@example.com", org1), "premise: the config names the pin"
         live = _json.dumps({"claudeAiOauth": {
             "accessToken": "sk-live", "refreshToken": "rt-live",
