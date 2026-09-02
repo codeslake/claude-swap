@@ -16197,9 +16197,8 @@ class TestALoginLandsInItsOwnSlot:
         assert data["activeAccountNumber"] == 3
         assert json.loads(s._read_account_credentials(
             "3", "z@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-new"
-        assert not s._read_account_config("3", "z@example.com"), (
-            "the live config is not this slot's; the switch rebuilds one from "
-            "the roster row instead -- see the case below")
+        assert s._read_account_config("3", "z@example.com"), (
+            "the new slot has no config backup")
 
     def test_a_registered_slot_never_carries_another_accounts_config(
         self, temp_home: Path, mock_claude_config: Path,
@@ -16238,6 +16237,38 @@ class TestALoginLandsInItsOwnSlot:
             "the next switch to this slot restores another account's identity "
             f"alongside its credential: {restored}")
         assert restored["oauthAccount"]["accountUuid"] == "u-9", restored
+
+    def test_a_registered_slot_exports_under_its_own_identity(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, tmp_path: Path,
+    ):
+        """`export` reads the slot's STORED config and treats a slot without
+        one as broken -- a named account raises, a bulk export skips it -- so
+        a registered slot needs one even though a switch could rebuild it.
+
+        And it must be built from the resolved profile, never copied from the
+        live `~/.claude.json`: this path is reached BECAUSE the live
+        credential does not resolve to the slot the roster names, so that file
+        may still describe a different account, and `_slim_config` carries
+        whatever it finds straight into the transfer bundle.
+        """
+        from claude_swap import transfer
+
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        live = self._blob("rt-new")
+        s._write_credentials(live)
+        self._resync_as_slot_2_with(s, live, {
+            "uuid": "u-9", "email": "z@example.com", "organizationUuid": "o-9"})
+
+        dest = tmp_path / "bundle-199.json"
+        transfer.export_accounts(s, str(dest), account="z@example.com")
+
+        exported = json.loads(dest.read_text(encoding="utf-8"))["accounts"]
+        assert [e["email"] for e in exported] == ["z@example.com"], exported
+        assert exported[0]["config"]["oauthAccount"]["emailAddress"] == (
+            "z@example.com"), exported[0]["config"]
+        assert exported[0]["config"]["oauthAccount"]["accountUuid"] == "u-9"
 
     def test_a_login_the_live_store_no_longer_holds_registers_nothing(
         self, temp_home: Path, mock_claude_config: Path,
