@@ -3223,7 +3223,15 @@ class ClaudeAccountSwitcher:
         # leaves the pin's own slot holding the dead one -- and
         # `_repin_if_pin_slot_refreshed` then sees the wrong slot and skips.
         if self._live_credential_is(str(recorded), slot["email"]) is False:
-            return identity
+            # Not the recorded slot's credential, and not thereby the pin's:
+            # a newer generation of the same account and a login as any other
+            # account look identical from here. The server says whose it is.
+            # When it cannot, the recorded slot stands: resolving to the pin
+            # sends the usage path to restore the pin's grant over a login it
+            # never attributed, which is a switch nobody asked for.
+            resolved = self._login_identity_from_the_oracle()
+            if resolved is not None:
+                return (resolved[0], resolved[1])
         return (slot["email"], slot.get("organizationUuid", "") or "")
 
     def _live_credential_is(self, num: str, email: str) -> "bool | None":
@@ -3878,16 +3886,32 @@ class ClaudeAccountSwitcher:
         try:
             creds = self._read_capture_credentials()
             token = oauth.extract_access_token(creds) if creds else None
-            resolved = oauth.fetch_oauth_profile(token) if token else None
-        except Exception:  # noqa: BLE001 -- unreadable or unreachable resolves nothing
+        except Exception:  # noqa: BLE001 -- unreadable resolves nothing
+            return None
+        if not token:
+            return None
+        # One answer per credential: the resolver asks on every call and the
+        # same bytes always have the same owner. A failure is not remembered.
+        answers = self.__dict__.setdefault("_oracle_answers", {})
+        key = oauth.credential_fingerprint(creds)
+        if key in answers:
+            return answers[key]
+        try:
+            resolved = oauth.fetch_oauth_profile(token)
+        except Exception:  # noqa: BLE001 -- unreachable resolves nothing
             return None
         if not resolved or not resolved.get("uuid") or not resolved.get("email"):
             return None
-        return (
+        answer = (
             resolved["email"],
             resolved.get("organizationUuid") or "",
             resolved["uuid"],
         )
+        if key:
+            if len(answers) > 32:
+                answers.clear()
+            answers[key] = answer
+        return answer
 
     def add_account(
         self,
@@ -4632,6 +4656,29 @@ class ClaudeAccountSwitcher:
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
 
+    def _recovery_may_write_live(
+        self, account_num: str, refresh_input: str, live: str
+    ) -> bool:
+        """The live store is the roster's active slot's. A grant refreshed
+        from the live credential goes back where it came from; another
+        slot's backup may not, or the machine changes login with no switch
+        recorded and the roster still naming the old slot."""
+        if refresh_input == live:
+            return True
+        data = self._get_sequence_data() or {}
+        recorded = data.get("activeAccountNumber")
+        if recorded is None or str(recorded) == str(account_num):
+            return True
+        key = (account_num, "", "not-the-active-slot")
+        if key not in self._provenance_warned:
+            self._provenance_warned.add(key)
+            self._logger.warning(
+                "Account-%s's credential was refreshed for its backup only: "
+                "the roster's active slot is %s, and the live store is that "
+                "slot's to keep.", account_num, recorded,
+            )
+        return False
+
     def _fetch_active_usage(
         self, account_num: str, email: str, creds: str, org_uuid: str = ""
     ) -> FetchRecord:
@@ -5143,7 +5190,10 @@ class ClaudeAccountSwitcher:
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
                         with claude_config_lock():
-                            self._write_credentials(working)  # active store — CC reads this
+                            if self._recovery_may_write_live(
+                                account_num, refresh_input, live
+                            ):
+                                self._write_credentials(working)  # active store — CC reads this
                     except Exception:
                         live_ok = False
                         self._logger.warning(

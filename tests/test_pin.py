@@ -11629,6 +11629,9 @@ class TestALoginAsThePinnedAccountIsNotASplice:
             def _read(num, email):
                 return json.dumps({"claudeAiOauth": stored_tokens})
         s.read_account_credentials = _read
+        # The server is the only witness left once the credential is not the
+        # recorded slot's; each test says what it answers.
+        s._login_identity_from_the_oracle = lambda: None
         return s
 
     def test_a_fresh_login_as_the_pin_is_reported_as_the_pin(
@@ -11637,10 +11640,63 @@ class TestALoginAsThePinnedAccountIsNotASplice:
             tmp_path, monkeypatch,
             live_tokens={"accessToken": "pin-new", "refreshToken": "pin-new-r"},
             stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+        s._login_identity_from_the_oracle = lambda: (*self.PIN, "u-pin")
         assert s._live_login_identity() == self.PIN, (
-            "the credential now live is the PIN's, so this is a login and not "
-            "a splice -- un-splicing it stores that credential under the "
-            "active slot and skips the repin the login was run to trigger")
+            "the server says the credential now live is the PIN's, so this is "
+            "a login and not a splice -- un-splicing it stores that credential "
+            "under the active slot and skips the repin the login was run to "
+            "trigger")
+
+    def test_a_login_as_another_account_is_reported_as_that_account(
+            self, tmp_path, monkeypatch):
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "other-a", "refreshToken": "other-r"},
+            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+        s._login_identity_from_the_oracle = lambda: (
+            "other@example.com", "org-other", "u-other")
+        assert s._live_login_identity() == ("other@example.com", "org-other")
+
+    def test_an_unattributed_credential_is_the_recorded_slot_never_the_pin(
+            self, tmp_path, monkeypatch):
+        """MEASURED on a Mac: the recorded slot's backup had been replaced by
+        an older generation, the live token had expired so the server could
+        not say whose it was, and this answered the PIN. The usage path then
+        restored the pin's grant into the live store: a silent switch from
+        the login the owner chose, with the roster still naming the old slot.
+        """
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "newer-gen", "refreshToken": "newer-r"},
+            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+        assert s._live_login_identity() == ("login@example.com", "org-login")
+        assert s._live_login_identity() != self.PIN
+
+    def test_the_server_is_asked_once_per_credential(
+            self, tmp_path, monkeypatch):
+        from claude_swap import switcher as _sw
+        s = self._switcher(
+            tmp_path, monkeypatch,
+            live_tokens={"accessToken": "other-a", "refreshToken": "other-r"},
+            stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
+        del s._login_identity_from_the_oracle          # the real one
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "other-a", "refreshToken": "other-r"}})
+        s._read_capture_credentials = lambda: creds
+        asked = []
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
+            asked.append(tok) or {"email": "other@example.com", "uuid": "u-o",
+                                  "organizationUuid": "org-other"}))
+        assert s._live_login_identity() == ("other@example.com", "org-other")
+        assert s._live_login_identity() == ("other@example.com", "org-other")
+        assert asked == ["other-a"], asked
+        # THE CONTROL: a server that cannot say is asked again next time.
+        s._oracle_answers.clear()
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile",
+                            lambda tok: asked.append(tok))
+        s._live_login_identity()
+        s._live_login_identity()
+        assert asked == ["other-a", "other-a", "other-a"], asked
 
     def test_CONTROL_a_real_splice_is_still_un_spliced(
             self, tmp_path, monkeypatch):
