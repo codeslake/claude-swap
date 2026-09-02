@@ -232,6 +232,7 @@ RETRY_AFTER_FLOOR_CAP_S = 4500.0
 # (the failure backoff between the two strikes).
 AUTH_DEAD_STRIKES = 1
 
+
 def _strike_time(row: dict) -> float | None:
     """When this row's strike landed.
 

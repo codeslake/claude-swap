@@ -210,10 +210,8 @@ Examples:
             return  # only reachable in tests
         # BOTH FALLBACKS BELOW REACH `exec_default`, which runs plain claude
         # on the default login with no session profile and no auth-override
-        # scrubbing -- the outcome --require-session exists to refuse. Refused
-        # here rather than in `run`, because no account was resolved to refuse
-        # for, and before the messages below so nothing announces a launch
-        # that will not happen.
+        # scrubbing -- the outcome --require-session exists to refuse. Here
+        # rather than in `run`, which is never called: no account resolved.
         if args.require_session:
             raise SessionError(
                 f"--require-session was given but {os.getcwd()} maps to no "

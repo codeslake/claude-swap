@@ -3187,13 +3187,11 @@ class ClaudeAccountSwitcher:
         data["activeAccountNumber"] = int(num)
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
-        # NO CONFIG BACKUP. `_target_config` rebuilds a missing one from the
-        # roster row this just wrote, and the live `~/.claude.json` is the one
-        # thing this path cannot trust: it is reached because the live
-        # credential does not resolve to the slot the roster names, so the
-        # config may still describe another account. A stored config is
-        # restored verbatim, so copying it would pair this account's token
-        # with another's `oauthAccount` at the next switch.
+        # NO CONFIG BACKUP, deliberately: `_target_config` rebuilds a missing
+        # one from the roster row above, and a STORED one is restored verbatim.
+        # The live config may name another account here -- that disagreement is
+        # what put this code path on -- so a copy of it is the only way this
+        # slot's token can reach a switch under another identity.
         self._logger.info(
             "Registered a login as Account-%s (%s): no slot owned it, so it "
             "was given one and made the active account.", num, email,
