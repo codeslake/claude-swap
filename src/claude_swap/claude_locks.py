@@ -38,10 +38,12 @@ import random
 import threading
 import time
 from contextlib import contextmanager
+
+from claude_swap.exceptions import LockError
+from claude_swap.locking import FileLock
 from pathlib import Path
 
-from claude_swap.exceptions import ClaudeCodeLockTimeout, LockError
-from claude_swap.locking import FileLock
+from claude_swap.exceptions import ClaudeCodeLockTimeout
 from claude_swap.paths import get_claude_config_home, get_global_config_path
 
 # Claude Code's credential-refresh locks run ``stale: 60000, update: 5000``
