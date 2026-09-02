@@ -16087,6 +16087,39 @@ class TestALoginLandsInItsOwnSlot:
         assert json.loads(s._read_account_credentials(
             "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live"
 
+    def test_a_live_store_holding_a_slots_own_credential_moves_the_roster_to_it(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """MEASURED: a recovery had restored slot 1's stored grant into the
+        live store while the roster named another slot. Every pass read
+        "same lineage, nothing drifted" and returned, so the roster never
+        followed and row 12 of the gate stayed red on a machine whose login
+        was exactly what the engine reported."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        live = self._blob("rt-own")
+        s._write_account_credentials("1", "c@example.com", live)
+        s._write_credentials(live)
+        with patch("claude_swap.oauth.fetch_oauth_profile") as oracle:
+            s._resync_rotated_backup("1", "c@example.com", "o-1", live)
+        oracle.assert_not_called()          # same lineage: nothing to attribute
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_CONTROL_the_roster_does_not_follow_bytes_the_live_store_no_longer_holds(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        own = self._blob("rt-own")
+        s._write_account_credentials("1", "c@example.com", own)
+        s._write_credentials(self._blob("rt-elsewhere"))
+        with patch("claude_swap.oauth.fetch_oauth_profile") as oracle:
+            s._resync_rotated_backup("1", "c@example.com", "o-1", own)
+        oracle.assert_not_called()
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
     def test_the_roster_stays_when_the_live_store_moved_on(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,

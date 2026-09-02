@@ -4946,7 +4946,16 @@ class ClaudeAccountSwitcher:
                 oauth.credential_fingerprint(creds)
                 == oauth.credential_fingerprint(backup)
             ):
-                return  # same lineage — nothing drifted
+                # The live store holding this slot's own credential makes it
+                # the active slot; a roster naming another one answers every
+                # reader wrong, and the next switch writes a stale backup
+                # over this login. Nothing drifted otherwise.
+                data = self._get_sequence_data() or {}
+                if str(data.get("activeAccountNumber")) != str(account_num):
+                    with FileLock(self.lock_file):
+                        data = self._get_sequence_data() or {}
+                        self._make_active_if_live(data, account_num, email, creds)
+                return
             fp = oauth.credential_fingerprint(creds) or ""
             lineage = self._lineage_key(account_num, email, fp)
             verdict = self._probe_verdicts.get(lineage)
