@@ -16060,6 +16060,81 @@ class TestALoginLandsInItsOwnSlot:
             "_row_eligible refuses to fetch it"
         )
 
+    def test_an_adopted_login_becomes_the_active_slot(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """THE ROSTER FOLLOWS THE LOGIN. The live store holds slot 1's
+        credential, so slot 1 is the active account. Until the roster says
+        so, `_live_login_identity` falls back to the config's account the
+        moment the pin splice returns the config to the pin.
+
+        Measured on both Macs 2026-09-02 06:15-06:24Z after a /login as
+        slot 2 with slot 3 recorded: nine minutes of "Account-1: usage
+        unknown", the old stored token struck again, and the login reached
+        its slot only through the failover's stash."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        live = self._blob("rt-live")
+        s._write_credentials(live)
+        self._resync_as_slot_2(s, live)
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live"
+
+    def test_the_roster_stays_when_the_live_store_moved_on(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """CONTROL for the move: the oracle was asked about a credential a
+        switch has since replaced. That switch moved the roster to its own
+        target; naming slot 1 active now would point the roster at a slot
+        whose credential is not in the live store."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_credentials(self._blob("rt-other"))
+        self._resync_as_slot_2(s, self._blob("rt-live"))
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_a_later_login_replaces_a_healthy_stored_credential(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule the
+        switch-time heal (`_adopt_into_dead_slot`) already applies.
+
+        Measured 2026-09-02 06:15Z on the work Mac: the /login's first pass
+        cleared slot 2's strike because the live credential was fresh, which
+        made the slot look healthy, which made this refuse, which let the old
+        stored token strike again two minutes later."""
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_account_credentials(
+            "1", "c@example.com", self._blob("rt-old", refresh_expires_at=1_000))
+        live = self._blob("rt-new", refresh_expires_at=2_000)
+        s._write_credentials(live)
+        self._resync_as_slot_2(s, live)
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-new"
+
+    def test_an_older_login_leaves_a_healthy_stored_credential(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """CONTROL: the ordering is one-directional. A live credential from an
+        EARLIER login (a stale cross-machine copy) must not replace a healthy
+        later one, and the roster must not move to it either."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_account_credentials(
+            "1", "c@example.com", self._blob("rt-cur", refresh_expires_at=2_000))
+        live = self._blob("rt-old", refresh_expires_at=1_000)
+        s._write_credentials(live)
+        self._resync_as_slot_2(s, live)
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-cur"
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+
 class TestCurrentAtLimitOverridesTheFrozenPct:
     """`current_at_limit=True` — a caller measured the limit off the poll.
 

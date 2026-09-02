@@ -3162,23 +3162,18 @@ class ClaudeAccountSwitcher:
                 == oauth.credential_fingerprint(creds)
             ):
                 return True  # already there — re-writing only shifts .prev
-            # ONLY A SLOT WITH NOWHERE TO PUT A LOGIN. An identity mismatch
-            # alone is transient during an ordinary switch, and adopting on it
-            # overwrites the rotated refresh token that switch just persisted.
-            # `_slot_token_dead` is the verdict the collectors and the import
-            # heal already run on: it binds to the struck generation, so a
-            # strike the slot has outlived authorizes nothing.
-            if stored and not self._slot_token_dead(owner, owner_email):
-                return False  # its own credential may yet be condemned
-            # RECENCY DECIDES, IN ONE DIRECTION ONLY. A refresh token cannot
-            # be re-derived, so a live credential whose refresh lifetime ends
-            # EARLIER than the stored one is the older login and must not
-            # replace it. Generations of ONE login are indistinguishable here
-            # (see `_refresh_expiry`); `_slot_token_dead` above carries that.
-            # An undated stored credential is not evidence of freshness and
-            # does not block the adopt.
+            # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule
+            # `_adopt_into_dead_slot` applies at a switch: `_refresh_expiry`
+            # orders logins, so a live value above the stored one is a newer
+            # login and replaces a healthy credential. Equal or undated orders
+            # nothing, and a mismatch alone is transient during an ordinary
+            # switch, so a healthy slot then keeps its own. A dead slot
+            # refuses only a live credential that is the OLDER login.
             stored_at, live_at = _refresh_expiry(stored), _refresh_expiry(creds)
-            if stored_at is not None and live_at is not None and live_at < stored_at:
+            if stored and not self._slot_token_dead(owner, owner_email):
+                if stored_at is None or live_at is None or live_at <= stored_at:
+                    return False  # its own credential may yet be condemned
+            elif stored_at is not None and live_at is not None and live_at < stored_at:
                 self._logger.info(
                     "Account-%s (%s): the live credential resolves to this "
                     "account but its refresh lifetime ends earlier than the "
@@ -3204,6 +3199,22 @@ class ClaudeAccountSwitcher:
                     "Adopted a login into Account-%s but could not lift its "
                     "quarantine (%s); it stays out of collect passes until "
                     "one observes the new credential.", owner, e,
+                )
+            # THE LIVE STORE HOLDS THIS ACCOUNT, so it is the active slot. A
+            # switch moves the roster in the transaction that writes the
+            # config; a /login writes neither, so the roster follows the login
+            # here. Re-read under the lock: a switch that landed while the
+            # server was asked has moved the roster to its own target, and the
+            # live store says so.
+            live = self._read_credentials()
+            if live and oauth.credential_fingerprint(live) == \
+                    oauth.credential_fingerprint(creds):
+                data["activeAccountNumber"] = int(owner)
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                self._logger.info(
+                    "Account-%s (%s) is now the active slot: the live store "
+                    "holds the login it just adopted.", owner, owner_email,
                 )
         self._logger.info(
             "Adopted a login into Account-%s (%s): the live credential "
