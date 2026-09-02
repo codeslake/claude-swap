@@ -3188,11 +3188,8 @@ class ClaudeAccountSwitcher:
         unchanged, so an UNMANAGED login still resolves to nothing — which is
         the guarantee `current_account_number`'s docstring exists to keep.
 
-        `ask_server=False` FOR A CALLER INSIDE THE LOCKS. Resolving a /login
-        under the pin needs the server, and `fetch_oauth_profile` may not be
-        called while a credential or config lock is held -- so those callers
-        take the memo when it is warm and the recorded slot when it is not,
-        which is what this answered before the fetch existed.
+        `ask_server=False` for a caller inside the locks: the memo when it is
+        warm, the recorded slot when it is not. See the resolver it forwards to.
         """
         identity = self._get_current_account()
         if identity is None:
@@ -3899,8 +3896,11 @@ class ClaudeAccountSwitcher:
         or resolved. Asked when the config names the pin, which is the one
         state where the config cannot answer for a /login.
 
-        ``ask_server=False`` answers from the memo and never from the
-        network, for the callers that run inside Claude Code's locks.
+        ``ask_server=False`` answers from the memo and never from the network:
+        `fetch_oauth_profile` may not be called while a credential or config
+        lock is held, and both under-lock callers reach here through
+        `_live_login_identity`. A cold memo then falls back to the recorded
+        slot, which is what those callers read before this fetch existed.
         """
         try:
             creds = self._read_capture_credentials()
@@ -5211,13 +5211,9 @@ class ClaudeAccountSwitcher:
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
                         with claude_config_lock():
-                            # A REFUSAL IS A DEFERRAL, so it clears `live_ok`
-                            # like a failure does. The refusal leaves the live
-                            # store on the bytes this pass judged unusable —
-                            # the state the guard below names — and `live_ok`
-                            # is otherwise only cleared by an exception, so a
-                            # skip walked past it and the ACTIVE account
-                            # reported a healthy usage number.
+                            # A REFUSAL IS A DEFERRAL: it leaves the live
+                            # store on bytes this pass judged unusable, which
+                            # is the state the guard below reports.
                             live_ok = self._recovery_may_write_live(
                                 account_num, refresh_input, live
                             )
@@ -7386,10 +7382,8 @@ class ClaudeAccountSwitcher:
             # the pin never touches, so it belongs to the roster's active
             # account — not to whoever the identity file names.
             #
-            # Memo-only, per the no-network rule above: the prefetch already
-            # resolved this outside the locks, and `force_activate` — which
-            # substitutes an empty provenance for that prefetch — is the one
-            # path that would otherwise ask from in here.
+            # Memo-only, per the no-network rule above: the prefetch resolved
+            # this outside the locks, and `force_activate` skips that prefetch.
             current_identity = self._live_login_identity(ask_server=False)
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity

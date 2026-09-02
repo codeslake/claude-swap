@@ -39,7 +39,11 @@ menubar = ["rumps>=0.4.0"]
 # error the old version actually raises. `heal(identity=...)` is deliberately
 # NOT covered -- the caller probes the installed signature and falls back to
 # the positional form -- so do not raise the floor for it and do not delete
-# that probe as redundant.
+# that probe as redundant. `carry_live_pointers` and `remembered_pin_identity`
+# are not covered either: absent below 0.1.223 and 0.1.215, `_ask` answers None
+# there, and both callers read None as the behaviour they had before the seam
+# existed. Degraded, not a TypeError -- which is what keeps this floor a
+# correctness one.
 #
 # NO `; sys_platform != 'win32'` MARKER (proposed twice): the dev group
 # installs this so the seam test runs on Windows too, and a marker makes that
