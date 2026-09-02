@@ -2509,11 +2509,12 @@ class TestActiveAccountRefresh:
         caplog,
     ):
         """A drifted lineage the oracle resolves to a DIFFERENT account is
-        never written into the slot backup (foreign credential under a stale
-        config — the write would destroy the slot's only refresh token), and
-        its usage is suppressed with the foreign sentinel instead of being
-        recorded as this slot's (#117's mis-keying shape). The verdict is
-        cached so the same foreign bytes neither re-probe nor re-warn."""
+        never written into THIS slot's backup (foreign credential under a
+        stale config — the write would destroy the slot's only refresh
+        token): it is given a slot of its own, once, and this slot's usage is
+        suppressed with the foreign sentinel instead of being recorded as its
+        (#117's mis-keying shape). The verdict is cached so the same bytes
+        neither re-probe nor re-register."""
         import logging
 
         switcher = self._switcher(sample_sequence_data)
@@ -2522,7 +2523,7 @@ class TestActiveAccountRefresh:
             "organizationUuid": None,
         }
 
-        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
             first, write_backup, mock_probe = self._fresh_drift_pass(
                 switcher, foreign
             )
@@ -2533,15 +2534,17 @@ class TestActiveAccountRefresh:
         assert first.sentinel == USAGE_FOREIGN_CREDENTIAL
         assert first.usage is None
         assert second.sentinel == USAGE_FOREIGN_CREDENTIAL
-        write_backup.assert_not_called()
+        write_backup.assert_called_once()
+        assert write_backup.call_args[0][0] != "1", "written into THIS slot"
+        assert write_backup.call_args[0][1] == "other@example.com"
         write_backup2.assert_not_called()
         mock_probe.assert_called_once()
         mock_probe2.assert_not_called()   # verdict cached, no re-probe
-        warnings = [
+        registered = [
             r for r in caplog.records
-            if "resolves to a different account" in r.getMessage()
+            if "Registered a login as Account-" in r.getMessage()
         ]
-        assert len(warnings) == 1
+        assert len(registered) == 1, [r.getMessage() for r in caplog.records]
 
     def test_fresh_probe_failure_skips_resync_and_retries_next_pass(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -2618,8 +2621,9 @@ class TestActiveAccountRefresh:
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
         """The same email under a DIFFERENT org is a sibling account, not
-        this slot: definitive foreign — no write, no backfill, verdict
-        cached, usage suppressed."""
+        this slot: definitive foreign — nothing written into THIS slot, no
+        backfill, verdict cached, usage suppressed. The sibling gets a slot
+        of its own, once."""
         sample_sequence_data["accounts"]["1"].pop("uuid")
         switcher = self._switcher(sample_sequence_data)
         sibling = {
@@ -2634,7 +2638,8 @@ class TestActiveAccountRefresh:
             switcher, sibling
         )
 
-        write_backup.assert_not_called()
+        write_backup.assert_called_once()
+        assert write_backup.call_args[0][0] != "1", "written into THIS slot"
         write_backup2.assert_not_called()
         assert first.sentinel == USAGE_FOREIGN_CREDENTIAL
         mock_probe2.assert_not_called()   # False cached
@@ -15764,9 +15769,9 @@ class TestALoginLandsInItsOwnSlot:
                           return_value=False), \
              patch.object(s, "_slot_owning_resolved_identity",
                           return_value="2"), \
-             patch.object(s, "_adopt_login_into_slot") as adopt:
+             patch.object(s, "_write_account_credentials") as write:
             self._resync_as_slot_2(s, self._blob("rt-live"))
-        adopt.assert_not_called()
+        write.assert_not_called()
 
     def test_a_field_shaped_quarantine_reaches_the_adopt(
         self, temp_home: Path, mock_claude_config: Path,
@@ -16133,6 +16138,65 @@ class TestALoginLandsInItsOwnSlot:
         assert json.loads(s._read_account_credentials(
             "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-cur"
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def _resync_as_slot_2_with(self, s, live, profile):
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value=profile):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+
+    def test_a_login_for_an_unmanaged_account_gets_a_slot_and_becomes_active(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A /login is the whole registration. An account no slot owns used
+        to be logged as "no managed slot owns it; backup left untouched" and
+        the login survived only until the next switch replaced it."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        live = self._blob("rt-new")
+        s._write_credentials(live)
+        self._resync_as_slot_2_with(s, live, {
+            "uuid": "u-9", "email": "z@example.com", "organizationUuid": "o-9"})
+        data = s._get_sequence_data()
+        row = data["accounts"].get("3")
+        assert row and row["email"] == "z@example.com" and row["uuid"] == "u-9", data
+        assert 3 in data["sequence"]
+        assert data["activeAccountNumber"] == 3
+        assert json.loads(s._read_account_credentials(
+            "3", "z@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-new"
+        assert s._read_account_config("3", "z@example.com"), (
+            "the new slot has no config backup")
+
+    def test_a_login_the_live_store_no_longer_holds_registers_nothing(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """CONTROL: the server was asked about bytes a switch has since
+        replaced. A slot for them would be a phantom."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        s._write_credentials(self._blob("rt-other"))
+        self._resync_as_slot_2_with(s, self._blob("rt-new"), {
+            "uuid": "u-9", "email": "z@example.com", "organizationUuid": "o-9"})
+        data = s._get_sequence_data()
+        assert "3" not in data["accounts"], data["accounts"].keys()
+        assert data["activeAccountNumber"] == 2
+
+    def test_a_partial_profile_registers_nothing(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """CONTROL: a uuid with no address names no account the roster can
+        show, and a row nobody can read is worse than no row."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        live = self._blob("rt-new")
+        s._write_credentials(live)
+        self._resync_as_slot_2_with(s, live, {"uuid": "u-9"})
+        data = s._get_sequence_data()
+        assert "3" not in data["accounts"], data["accounts"].keys()
+        assert data["activeAccountNumber"] == 2
+
 
 
 class TestCurrentAtLimitOverridesTheFrozenPct:

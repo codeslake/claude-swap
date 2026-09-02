@@ -3119,6 +3119,60 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
+    def _register_login_as_new_slot(
+        self, data: dict, creds: str, resolved: dict
+    ) -> bool:
+        """Give a /login for an account no slot owns a slot of its own, and
+        make it the active account. Called under ``lock_file`` with the
+        roster in hand, from the adopt path.
+
+        The credential must still be the live one: a switch that landed
+        while the server was asked has moved the live store on, and a slot
+        holding bytes nothing serves is a phantom. A partial profile names
+        no account, so it registers nothing either; both answer True, since
+        a later pass with the same profile would decide the same.
+        """
+        email = (resolved.get("email") or "").strip()
+        uuid = resolved.get("uuid") or ""
+        if not email or not uuid:
+            return True
+        live = self._read_credentials()
+        if not live or (
+            oauth.credential_fingerprint(live)
+            != oauth.credential_fingerprint(creds)
+        ):
+            return True
+        num = str(self._get_next_account_number())
+        self._write_account_credentials(num, email, creds)
+        data.setdefault("accounts", {})[num] = {
+            "email": email,
+            "uuid": uuid,
+            "organizationUuid": resolved.get("organizationUuid") or "",
+            "organizationName": "",
+            "added": get_timestamp(),
+        }
+        order = data.setdefault("sequence", [])
+        if int(num) not in order:
+            order.append(int(num))
+            order.sort()
+        data["activeAccountNumber"] = int(num)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        # The live config, as `add_account` stores it; a switch rebuilds a
+        # missing one from the roster row, so this is a copy, not a need.
+        try:
+            config = self._get_claude_config_path().read_text(encoding="utf-8")
+            self._write_account_config(num, email, config)
+        except OSError as e:
+            self._logger.warning(
+                "Registered Account-%s without a config backup: %s", num, e,
+            )
+        self._logger.info(
+            "Registered a login as Account-%s (%s): no slot owned it, so it "
+            "was given one and made the active account.", num, email,
+        )
+        return True
+
     def _adopt_login_into_slot(
         self, account_num: str, creds: str, resolved: dict
     ) -> bool:
@@ -3146,7 +3200,9 @@ class ClaudeAccountSwitcher:
             # .enc under an address no reader of the slot recomputes.
             data = self._get_sequence_data() or {}
             owner = self._slot_owning_resolved_identity(data, resolved)
-            if not owner or owner == account_num:
+            if not owner:
+                return self._register_login_as_new_slot(data, creds, resolved)
+            if owner == account_num:
                 return True  # nobody here to adopt into
             acc = (data.get("accounts") or {}).get(owner) or {}
             owner_email = (acc.get("email") or "").strip()
@@ -4918,29 +4974,14 @@ class ClaudeAccountSwitcher:
                 self._probe_verdicts[lineage] = match
                 if not match:
                     # `resolved` names the account the server says owns these
-                    # bytes. A slot this installation manages is not a foreign
-                    # owner: those are that slot's credentials.
-                    owner = self._slot_owning_resolved_identity(
-                        self._get_sequence_data() or {}, resolved
-                    )
-                    if owner and owner != account_num:
-                        self._resolved_owners[lineage] = resolved
-                        if self._adopt_login_into_slot(
-                            account_num, creds, resolved
-                        ):
-                            self._resolved_owners.pop(lineage, None)
-                        return
-                    key = (account_num, email, "resync")
-                    if key not in self._provenance_warned:
-                        self._provenance_warned.add(key)
-                        self._logger.warning(
-                            "Live credential resolves to a different "
-                            "account than Account-%s's identity, and no "
-                            "managed slot owns it; backup left untouched.",
-                            account_num,
-                        )
+                    # bytes; the adopt stores them in that account's slot, or
+                    # gives the account a slot when none owns it.
+                    self._resolved_owners[lineage] = resolved
+                    if self._adopt_login_into_slot(
+                        account_num, creds, resolved
+                    ):
+                        self._resolved_owners.pop(lineage, None)
                     return
-                self._provenance_warned.discard((account_num, email, "resync"))
             with (
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
