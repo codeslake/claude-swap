@@ -12596,3 +12596,52 @@ class TestTheDegradedCauseOutranksThePinOne:
         with pytest.raises(ConfigError) as exc:
             sw.add_account()
         assert "pin --clear" in str(exc.value), exc.value
+
+
+class TestTheSwitchSplicesTheDaemonsFresherIdentity:
+    """The stored backup's profile stamp is as old as that slot's last login.
+    Splicing it re-opens Claude Code's profile fetch, which answers as the
+    active account and moves the field off the pin; the daemon's remembered
+    copy is refreshed from the server and wins when it is newer."""
+
+    def _sw(self, stored):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        sw = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        sw.backup_dir = "/nonexistent"
+        sw._get_sequence_data = lambda: {"accounts": {
+            "5": {"email": "a@example.com", "uuid": "PIN"}}}
+        sw._read_account_config = lambda num, email: json.dumps(
+            {"oauthAccount": stored})
+        return sw
+
+    def test_a_newer_remembered_copy_wins(self, monkeypatch):
+        from claude_swap import pin
+
+        stored = {"accountUuid": "PIN", "emailAddress": "a@example.com",
+                  "profileFetchedAt": 1000}
+        fresh = {**stored, "profileFetchedAt": 2000, "billingType": "stripe"}
+        monkeypatch.setattr(pin, "pinned_identity", lambda sw: None)
+        monkeypatch.setattr(
+            pin, "_ask",
+            lambda name, *a: fresh if name == "remembered_pin_identity" else None)
+        got = pin.identity_for_config(self._sw(stored), email="a@example.com",
+                                      num="5")
+        assert got == fresh, got
+
+    def test_CONTROL_an_older_foreign_or_absent_copy_changes_nothing(
+            self, monkeypatch):
+        from claude_swap import pin
+
+        stored = {"accountUuid": "PIN", "emailAddress": "a@example.com",
+                  "profileFetchedAt": 1000}
+        monkeypatch.setattr(pin, "pinned_identity", lambda sw: None)
+        for kept in ({**stored, "profileFetchedAt": 500},
+                     {**stored, "accountUuid": "OTHER", "profileFetchedAt": 9000},
+                     None):
+            monkeypatch.setattr(
+                pin, "_ask",
+                lambda name, *a, _k=kept: _k if name == "remembered_pin_identity" else None)
+            got = pin.identity_for_config(self._sw(stored),
+                                          email="a@example.com", num="5")
+            assert got == stored, (kept, got)

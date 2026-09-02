@@ -1047,7 +1047,7 @@ def identity_for_config(switcher, email: str | None = None,
         raw = switcher._read_account_config(str(num), email)
         oauth = json.loads(raw).get("oauthAccount") if raw else None
         if isinstance(oauth, dict) and oauth.get("accountUuid"):
-            return oauth
+            return _fresher_remembered(switcher, oauth) or oauth
         # A machine that has never switched INTO the pinned account has no
         # stored config to copy, and None here makes `_perform_switch` fall
         # back to the account being switched TO. The roster answers: its
@@ -1076,6 +1076,27 @@ def identity_for_config(switcher, email: str | None = None,
         return out
     except Exception:  # noqa: BLE001 — never block a switch
         return None
+
+
+def _fresher_remembered(switcher, oauth: dict) -> "dict | None":
+    """The daemon's copy of this identity when it is newer than the backup's.
+
+    The stored backup's `profileFetchedAt` is as old as that slot's last
+    login; the daemon refreshes what it remembers from the server. Splicing
+    the older stamp re-opens Claude Code's profile fetch, which answers as
+    the ACTIVE account and moves the field off the pin. Same account only,
+    and None whenever the package cannot be asked.
+    """
+    kept = _ask("remembered_pin_identity", _certdir(switcher))
+    if not isinstance(kept, dict) or \
+            kept.get("accountUuid") != oauth.get("accountUuid"):
+        return None
+
+    def stamp(d):
+        v = d.get("profileFetchedAt")
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    return kept if stamp(kept) > stamp(oauth) else None
 
 
 def _ask(name: str, *args):
