@@ -526,3 +526,21 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "a year-older login in the file won because its expiresAt was "
             "later, even though it is nowhere near the same-lineage jitter"
         )
+
+
+class TestTheLineageJitterToleranceIsPublic:
+    """A second reader outside the package (the requirements gate, on the
+    tool's interpreter) must import this package's jitter decision instead
+    of carrying its own copy — so the constant must be importable by name,
+    not underscore-private."""
+
+    def test_the_constant_is_importable_under_its_public_name(self):
+        from claude_swap.credentials import LINEAGE_STAMP_JITTER_MS
+
+        assert LINEAGE_STAMP_JITTER_MS == 5_000
+
+    def test_newer_login_treats_the_public_constant_as_the_boundary(self):
+        from claude_swap.credentials import LINEAGE_STAMP_JITTER_MS, newer_login
+
+        assert not newer_login(LINEAGE_STAMP_JITTER_MS, 0)
+        assert newer_login(LINEAGE_STAMP_JITTER_MS + 1, 0)

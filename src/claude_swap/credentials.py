@@ -136,7 +136,7 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 # The server re-mints refreshTokenExpiresAt on every refresh of the SAME
 # lineage, with sub-second jitter — a stamp later by less than this is a
 # rotation, not a newer login.
-_LINEAGE_STAMP_JITTER_MS = 5_000
+LINEAGE_STAMP_JITTER_MS = 5_000
 
 
 def newer_login(a_at: "int | float | None", b_at: "int | float | None") -> bool:
@@ -144,13 +144,13 @@ def newer_login(a_at: "int | float | None", b_at: "int | float | None") -> bool:
 
     Both are ``refreshTokenExpiresAt`` stamps. The server re-mints this field on
     every refresh of the same lineage, with sub-second jitter (sign arbitrary),
-    so a stamp later by no more than ``_LINEAGE_STAMP_JITTER_MS`` is that jitter,
+    so a stamp later by no more than ``LINEAGE_STAMP_JITTER_MS`` is that jitter,
     not a later login. Undated on either side is no evidence.
     """
     return (
         a_at is not None
         and b_at is not None
-        and a_at - b_at > _LINEAGE_STAMP_JITTER_MS
+        and a_at - b_at > LINEAGE_STAMP_JITTER_MS
     )
 
 # After a Keychain failure the store drops to file mode so one CLI invocation
@@ -632,7 +632,7 @@ class CredentialStore:
         if (
             kc_at is not None
             and file_at is not None
-            and abs(file_at - kc_at) <= _LINEAGE_STAMP_JITTER_MS
+            and abs(file_at - kc_at) <= LINEAGE_STAMP_JITTER_MS
         ):
             kc_exp = _stamp(keychain_value, "expiresAt")
             file_exp = _stamp(text, "expiresAt")
