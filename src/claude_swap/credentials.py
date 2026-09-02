@@ -1191,8 +1191,21 @@ class CredentialStore:
         file belongs to a different one — the cross-profile write
         ``_read_capture_credentials`` itself refuses to make.
 
+        Skipped when the file is already the FRESHER login
+        (:meth:`_fresher_plaintext_login`): ``_read_capture_credentials``
+        routes through ``session.read_config_dir_credentials`` when either
+        env var is defined, which is Keychain-first with no freshness
+        arbitration — unlike :meth:`_read_active_credentials`, which does
+        call ``_fresher_plaintext_login``. Without this, an older Keychain
+        generation (one failed Keychain write, later reads still serving the
+        stale item) would overwrite a newer file generation's live refresh
+        token with a spent one, and the write has no backup.
+
         Skipped when the file already carries these bytes, so a routine
-        adopt of an unchanged login causes no rewrite. The write itself is
+        adopt of an unchanged login causes no rewrite. An unreadable file
+        answers "cannot compare" the same way; an unparseable one (valid
+        JSON that is not the expected shape) falls through to the write
+        rather than raising out of ``add_account``. The write itself is
         :meth:`_refresh_stale_credentials_file`: rewrite-when-present /
         never-create, same writer, same warning on failure.
         """
@@ -1203,14 +1216,17 @@ class CredentialStore:
             secure_dir = Path(secure_env) if secure_env else get_default_claude_config_home()
             if secure_dir.resolve() != get_claude_config_home().resolve():
                 return
-        from claude_swap import oauth
-        cred_file = get_credentials_path()
         try:
-            current = cred_file.read_text(encoding="utf-8")
+            if self._fresher_plaintext_login(credentials) is not None:
+                return
+            from claude_swap import oauth
+            current = get_credentials_path().read_text(encoding="utf-8")
+            if oauth.extract_oauth_data(current) == oauth.extract_oauth_data(credentials):
+                return
         except OSError:
-            return
-        if oauth.extract_oauth_data(current) == oauth.extract_oauth_data(credentials):
-            return
+            return  # absent or unreadable: never-create posture, nothing to sync
+        except Exception:
+            pass  # unparseable content: cannot compare, write through below
         self._refresh_stale_credentials_file(credentials)
 
     def _uses_file_backup_backend(self) -> bool:
