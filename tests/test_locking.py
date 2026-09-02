@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import multiprocessing
 import threading
 import time
@@ -14,6 +15,22 @@ from tests.conftest import _advancing_clock, _thread_scoped_sleep, _crossing_clo
 from claude_swap import locking
 from claude_swap.exceptions import LockError
 from claude_swap.locking import FileLock
+
+
+@contextlib.contextmanager
+def _scripted_time(monotonic, sleep):
+    """Swap `locking.time`'s clock and sleep for the duration of the block.
+
+    `locking.time` IS the `time` module, so this patch is process-global;
+    restoring it HERE rather than at teardown keeps the assertions that follow
+    -- and pytest's own bookkeeping -- on the real clock.
+    """
+    real = locking.time.monotonic, locking.time.sleep
+    locking.time.monotonic, locking.time.sleep = monotonic, sleep
+    try:
+        yield
+    finally:
+        locking.time.monotonic, locking.time.sleep = real
 
 
 class TestFileLock:
@@ -256,24 +273,13 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
         assert holder.acquire(), "premise: the lock must be held to contend"
         try:
             budget, clock, slept = 0.01, [0.0], []
-            real_sleep = locking.time.sleep
-            real_monotonic = locking.time.monotonic
-
-            fake_sleep = _thread_scoped_sleep(locking, clock, slept, step=0.001)
-
             # THE SHARED CLOCK, not a copy of its arithmetic. Advancing only
             # inside `fake_sleep` freezes it the moment a sleep is deleted, so
             # the run hangs instead of going red.
-            fake_monotonic = _advancing_clock(clock, budget)
-
-            locking.time.monotonic = fake_monotonic
-            locking.time.sleep = fake_sleep
-            try:
+            with _scripted_time(_advancing_clock(clock, budget),
+                                _thread_scoped_sleep(locking, clock, slept, step=0.001)):
                 waiter = FileLock(target, timeout=budget)
                 assert not waiter.acquire(), "the held lock was handed over"
-            finally:
-                locking.time.sleep = real_sleep
-                locking.time.monotonic = real_monotonic
 
             assert slept, f"the instrument, not the code: {slept}"
             assert sum(slept) <= budget, (
@@ -315,20 +321,12 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
             # visible when it exceeds that. 0.45 left 0.046 and a flat 0.005
             # was invisible; 0.407 leaves 0.003.
             budget, clock, slept = 0.407, [0.0], []
-            real_sleep = locking.time.sleep
-            real_monotonic = locking.time.monotonic
-
-
-            fake_sleep = _thread_scoped_sleep(locking, clock, slept, budget, step=0.001)
-
-            locking.time.monotonic = _advancing_clock(clock, budget)
-            locking.time.sleep = fake_sleep
-            try:
+            with _scripted_time(
+                _advancing_clock(clock, budget),
+                _thread_scoped_sleep(locking, clock, slept, budget, step=0.001),
+            ):
                 waiter = FileLock(target, timeout=budget)
                 assert not waiter.acquire(), "the held lock was handed over"
-            finally:
-                locking.time.sleep = real_sleep
-                locking.time.monotonic = real_monotonic
 
             assert len(slept) >= 2, f"the instrument, not the code: {slept}"
             for left, seconds in slept:

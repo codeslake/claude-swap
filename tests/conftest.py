@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
 from pathlib import Path
 from unittest.mock import patch
@@ -898,15 +899,11 @@ def _advancing_clock(clock, budget):
     # every measured remainder unchanged.
     step = budget / 100000.0
     # NOT THREAD-SCOPED, and it cannot be: the heartbeat under test runs on
-    # its own thread and must see the clock move. That leaves one asymmetry
-    # with the `fake_sleep` beside it -- a read from an UNRELATED thread would
-    # advance this clock too, and the remainder assert in
-    # `test_no_retry_sleep_outlives_the_budget_it_was_given` would then
-    # accuse pristine code with a negative `left`. Measured: zero foreign
-    # readers exist in this suite (no threaded timeout plugin), so it is a
-    # witness in one direction only, not a live failure. Scoping it to the
-    # installing thread was tried and fails 6 cases, because the subject IS
-    # a thread.
+    # its own thread and must see the clock move (scoping it fails 6 cases,
+    # because the subject IS a thread). The asymmetry with the `fake_sleep`
+    # beside it: a read from an unrelated thread advances this clock too, and
+    # the remainder assert in `test_no_retry_sleep_outlives_the_budget_it_was_
+    # given` would then accuse pristine code. This suite has no such reader.
 
     def monotonic():
         clock[0] += step
@@ -925,8 +922,6 @@ def _thread_scoped_sleep(module, clock, slept, budget=None, step=0.0):
     iteration of work, so a clamped 0.0 cannot park a scripted clock on the
     deadline.
     """
-    import threading
-
     mine = threading.get_ident()
     real = module.time.sleep
 
@@ -945,15 +940,11 @@ def _thread_scoped_sleep(module, clock, slept, budget=None, step=0.0):
 def _crossing_clock(reads):
     """0.0 twice (start, deadline check), then 0.6 forever: the clamp's own
     read lands past a 0.5 deadline. Every read is appended to ``reads``."""
-    ticks = iter([0.0, 0.0, 0.6, 0.6, 0.6, 0.6])
-    last = [0.6]
+    ticks = iter([0.0, 0.0])
 
     def clock():
-        try:
-            last[0] = next(ticks)
-        except StopIteration:
-            pass
-        reads.append(last[0])
-        return last[0]
+        tick = next(ticks, 0.6)
+        reads.append(tick)
+        return tick
 
     return clock

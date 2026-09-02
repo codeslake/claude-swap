@@ -51,6 +51,18 @@ def _assert_backed_off(slept, budget, *, least=3, remainder=0.05, what="clamp"):
     )
 
 
+def _raising(real, path, exc):
+    """`real`, but raising `exc` for `path`. Scoped to the path on purpose:
+    the module does `import os`, so patching `claude_locks.os.<fn>` patches
+    the global one and an unscoped stub feeds the injection to every other
+    caller in the process."""
+    def stub(p, *a, **k):
+        if not isinstance(p, int) and os.fspath(p) == os.fspath(path):
+            raise exc
+        return real(p, *a, **k)
+    return stub
+
+
 @pytest.fixture
 def lock_dir(tmp_path: Path) -> Path:
     return tmp_path / "target.lock"
@@ -486,7 +498,7 @@ class TestEveryArmOfTheLoopBacksOff:
     to bound, and reached with no race at all.
     """
 
-    def test_a_held_fresh_lock_does_not_spin(self, tmp_path):
+    def test_a_held_fresh_lock_does_not_spin(self, tmp_path, monkeypatch):
         """THE ORDINARY CONTENDED PATH, and the arm this class is named for.
 
         The symlink case below covers the stat-FNF arm. The JITTER arm -- the
@@ -511,13 +523,10 @@ class TestEveryArmOfTheLoopBacksOff:
                 tries["n"] += 1
             return real_mkdir(path, *a, **k)
 
-        os.mkdir = counting
-        try:
-            with pytest.raises(ClaudeCodeLockTimeout):
-                with proper_lockfile(lock, timeout=0.3):
-                    pass
-        finally:
-            os.mkdir = real_mkdir
+        monkeypatch.setattr(claude_locks.os, "mkdir", counting)
+        with pytest.raises(ClaudeCodeLockTimeout):
+            with proper_lockfile(lock, timeout=0.3):
+                pass
 
         assert tries["n"] >= 1, f"the instrument, not the code: {tries['n']}"
         # Attempts are NOT budget/sleep: the clamp is
@@ -596,13 +605,9 @@ class TestEveryArmOfTheLoopBacksOff:
                 tries["n"] += 1
             return real_mkdir(path, *a, **k)
 
-        def swept(path, *a, **k):
-            if os.fspath(path) == os.fspath(target):
-                raise FileNotFoundError(errno.ENOENT, "swept")
-            return real_stat(path, *a, **k)
-
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
-        monkeypatch.setattr(claude_locks.os, "stat", swept)
+        monkeypatch.setattr(claude_locks.os, "stat",
+                            _raising(real_stat, target, FileNotFoundError(errno.ENOENT, "swept")))
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.3):
                 pass
@@ -695,15 +700,11 @@ class TestEveryArmOfTheLoopBacksOff:
                 clock[0] += 0.001                     # one iteration of work
             return real_mkdir(path, *a, **k)
 
-        def swept(path, *a, **k):
-            if os.fspath(path) == os.fspath(target):
-                raise FileNotFoundError(errno.ENOENT, "swept")
-            return real_stat(path, *a, **k)
-
         fake_sleep = _thread_scoped_sleep(claude_locks, clock, slept, budget)
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
-        monkeypatch.setattr(claude_locks.os, "stat", swept)
+        monkeypatch.setattr(claude_locks.os, "stat",
+                            _raising(real_stat, target, FileNotFoundError(errno.ENOENT, "swept")))
         monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
 
@@ -841,13 +842,9 @@ class TestADeadlineCanPassMidIterationForEveryArm:
 
         real_stat = os.stat
 
-        def swept(path, *a, **k):
-            if os.fspath(path) == os.fspath(target):
-                raise FileNotFoundError(errno.ENOENT, "swept")
-            return real_stat(path, *a, **k)
-
         reads = []
-        monkeypatch.setattr(claude_locks.os, "stat", swept)
+        monkeypatch.setattr(claude_locks.os, "stat",
+                            _raising(real_stat, target, FileNotFoundError(errno.ENOENT, "swept")))
         monkeypatch.setattr(claude_locks.time, "monotonic", _crossing_clock(reads))
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5):
@@ -1009,6 +1006,35 @@ class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
         """The caller's next mkdir decides; a False here cost it a back-off
         before a mkdir that would have succeeded."""
         assert claude_locks._take_over_stale(tmp_path / "gone.lock", 60.0, budget=60.0) is True
+
+    def test_a_lock_that_vanishes_at_the_rmdir_is_free_too(self, tmp_path, monkeypatch):
+        """Absence is absence whichever syscall meets it.
+
+        The stat arm above says so; the rmdir arm is the same fact one
+        `except` later, and it answered False -- so a corpse that Claude Code
+        (which takes no lock of ours) swept between our stat and our rmdir
+        cost a back-off before a mkdir that would have succeeded, and handed
+        the name to whoever was not backing off.
+        """
+        lock_dir = tmp_path / "target.lock"
+        lock_dir.mkdir()
+        past = time.time() - 600
+        os.utime(lock_dir, (past, past))
+        real_rmdir = os.rmdir
+
+        def swept_first(path, *a, **k):
+            if os.fspath(path) == os.fspath(lock_dir):
+                real_rmdir(path)  # it really does go: the name IS free after
+                raise FileNotFoundError(errno.ENOENT, "swept before our rmdir")
+            return real_rmdir(path, *a, **k)
+
+        monkeypatch.setattr(claude_locks.os, "rmdir", swept_first)
+        got = claude_locks._take_over_stale(lock_dir, 60.0, budget=60.0)
+        assert not lock_dir.exists(), "premise: the name must actually be free"
+        assert got is True, (
+            "the rmdir arm reported a free name as taken; the caller backs "
+            "off before a mkdir that would have succeeded"
+        )
 
 
 class TestCcRefreshLockProtocol:
