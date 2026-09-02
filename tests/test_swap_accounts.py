@@ -755,7 +755,14 @@ class TestSwapAccounts:
 
         switcher.swap_accounts("1", "2")
 
-        assert not list(switcher.credentials_dir.glob("*.enc.prev"))
+        # Through the STORE, not a `credentials_dir` glob: on macOS a usable
+        # Keychain takes the write, so no `.enc.prev` file exists and the glob
+        # is empty whether or not the purge ran.
+        for num in ("1", "2"):
+            assert switcher._store._read_previous_backup(num, email) == "", (
+                f"the swap left the displaced credential as key {num}'s .prev "
+                "-- recovery would resurrect it onto the slot's new owner"
+            )
 
     def test_swap_clears_the_prev_under_the_DESTINATION_key(
         self, temp_home: Path, sample_sequence_data: dict
