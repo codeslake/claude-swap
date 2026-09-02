@@ -1660,6 +1660,41 @@ class TestRunAutoResolve:
         assert ("exec_default", []) in calls
         assert "No account mapped" in capsys.readouterr().out
 
+    @pytest.mark.parametrize("mapping", [None, "ghost@co.com"])
+    def test_require_session_refuses_the_default_login_fallback(
+        self, tmp_path, monkeypatch, capsys, mapping
+    ):
+        """`exec_default` runs plain claude on the default login with no
+        session profile and no auth-override scrubbing -- the one outcome
+        `--require-session` exists to refuse. Both fallbacks reach it: an
+        unmapped directory, and a mapping whose account is gone.
+
+        A script passing the flag cannot see either coming, so falling
+        through returned exit 0 having launched exactly what was forbidden.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        backup = tmp_path / "backup"
+        backup.mkdir()
+        if mapping is not None:
+            from claude_swap.mappings import MappingStore
+
+            MappingStore(backup).set(repo, mapping, "")
+        calls = []
+        monkeypatch.chdir(repo)
+        with patch("claude_swap.session.SessionManager", self._fake_manager(calls)), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher",
+                   return_value=self._fake_switcher(
+                       backup, {"accounts": {}, "sequence": []})), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv",
+                          ["claude-swap", "run", "--require-session"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 1
+        assert calls == [], calls
+        assert "--require-session" in capsys.readouterr().err
+
     def test_removed_account_falls_back_with_warning(self, tmp_path, monkeypatch, capsys):
         from claude_swap.mappings import MappingStore
 

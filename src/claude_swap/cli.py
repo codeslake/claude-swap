@@ -8,7 +8,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, SessionError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -208,6 +208,20 @@ Examples:
                 require_session=args.require_session,
             )
             return  # only reachable in tests
+        # BOTH FALLBACKS BELOW REACH `exec_default`, which runs plain claude
+        # on the default login with no session profile and no auth-override
+        # scrubbing -- the outcome --require-session exists to refuse. Refused
+        # here rather than in `run`, because no account was resolved to refuse
+        # for, and before the messages below so nothing announces a launch
+        # that will not happen.
+        if args.require_session:
+            raise SessionError(
+                f"--require-session was given but {os.getcwd()} maps to no "
+                "usable account, so this launch would run plain claude on the "
+                "default login rather than in a session profile. Name an "
+                "account (`cswap run <n>`) or map this directory "
+                "(`cswap map <n>`)."
+            )
         if email is not None:
             warning(
                 f"Mapped account {email} no longer exists — "

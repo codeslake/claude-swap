@@ -16197,8 +16197,47 @@ class TestALoginLandsInItsOwnSlot:
         assert data["activeAccountNumber"] == 3
         assert json.loads(s._read_account_credentials(
             "3", "z@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-new"
-        assert s._read_account_config("3", "z@example.com"), (
-            "the new slot has no config backup")
+        assert not s._read_account_config("3", "z@example.com"), (
+            "the live config is not this slot's; the switch rebuilds one from "
+            "the roster row instead -- see the case below")
+
+    def test_a_registered_slot_never_carries_another_accounts_config(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """THE LIVE CONFIG IS THE ONE THING THIS PATH CANNOT TRUST.
+
+        Registration is reached precisely because the live credential does
+        not resolve to the slot the roster names -- `/login` writing the
+        credential before the config is the window `_resync_rotated_backup`'s
+        own docstring names -- so `~/.claude.json` may still describe another
+        account. `_target_config` restores a stored config VERBATIM and
+        rebuilds an absent one from the roster row, so a copy taken here is
+        the only way the new slot can end up pairing this account's token
+        with another's `oauthAccount` on the next switch.
+        """
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        # `_target_config` probes the Keychain when no config is stored; pin
+        # the platform so this reads the same on the macOS job.
+        s.platform = Platform.LINUX
+        live = self._blob("rt-new")
+        s._write_credentials(live)
+        # PREMISE: the live config names neither the account being registered
+        # nor the slot the resync ran for, so a copy of it is visibly foreign.
+        assert json.loads(mock_claude_config.read_text(encoding="utf-8"))[
+            "oauthAccount"]["emailAddress"] == "test@example.com"
+
+        self._resync_as_slot_2_with(s, live, {
+            "uuid": "u-9", "email": "z@example.com", "organizationUuid": "o-9"})
+
+        data = s._get_sequence_data()
+        assert "3" in data["accounts"], data["accounts"].keys()
+        restored = json.loads(s._target_config(data, "3", "z@example.com"))
+        assert restored["oauthAccount"]["emailAddress"] == "z@example.com", (
+            "the next switch to this slot restores another account's identity "
+            f"alongside its credential: {restored}")
+        assert restored["oauthAccount"]["accountUuid"] == "u-9", restored
 
     def test_a_login_the_live_store_no_longer_holds_registers_nothing(
         self, temp_home: Path, mock_claude_config: Path,
