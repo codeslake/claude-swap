@@ -133,6 +133,11 @@ CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE = "Claude Code"
 _ACTIVE_READ_ATTEMPTS = 2
 _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 
+# The server re-mints refreshTokenExpiresAt on every refresh of the SAME
+# lineage, with sub-second jitter — a stamp later by less than this is a
+# rotation, not a newer login.
+_LINEAGE_STAMP_JITTER_MS = 5_000
+
 # After a Keychain failure the store drops to file mode so one CLI invocation
 # can't split-brain between backends. A long-running daemon (menu bar / TUI)
 # instead re-probes this long after the last failure: far longer than any CLI
@@ -603,7 +608,11 @@ class CredentialStore:
             return v if isinstance(v, (int, float)) else None
 
         kc_at, file_at = _refresh_expiry(keychain_value), _refresh_expiry(text)
-        if kc_at is None or file_at is None or file_at <= kc_at:
+        if (
+            kc_at is None
+            or file_at is None
+            or file_at - kc_at <= _LINEAGE_STAMP_JITTER_MS
+        ):
             return None
         return text
 
@@ -667,9 +676,10 @@ class CredentialStore:
                 # `refreshTokenExpiresAt` and NOT `expiresAt`: a refresh moves
                 # the access token every poll without extending the refresh
                 # lifetime, so comparing access expiry would flip backends on
-                # ordinary rotation. Only a fresh login mints a later one, so
-                # "strictly later" is the login signature and nothing else
-                # produces it. Undated is no evidence and keeps the Keychain.
+                # ordinary rotation. The server re-mints this stamp on every
+                # refresh of the SAME lineage, to within seconds of jitter, so
+                # only a stamp later by more than that jitter is a newer
+                # login. Undated is no evidence and keeps the Keychain.
                 fresher = self._fresher_plaintext_login(val)
                 if fresher is not None:
                     return ActiveCredentials(fresher, False)

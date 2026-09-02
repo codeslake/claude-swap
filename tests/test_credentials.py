@@ -451,3 +451,28 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
         fl = self._creds("file-only", 1_000)
         got = self._store(tmp_path, monkeypatch, "", fl)._read_active_credentials()
         assert got.value == fl
+
+    def test_a_same_lineage_rotation_jittered_by_ms_keeps_the_keychain(
+        self, tmp_path, monkeypatch
+    ):
+        """One login, two generations of the SAME lineage: the server
+        re-mints `refreshTokenExpiresAt` on every refresh with sub-second
+        jitter, so a file stamp a few hundred ms later than the Keychain's is
+        not a newer login. The Keychain here also carries the fresher access
+        token (later `expiresAt`); the file's is already expired — the
+        opposite of what a real newer login would show."""
+        kc_refresh = 1_790_380_487_015
+        fl_refresh = kc_refresh + 427
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-keychain", "refreshToken": "rt-keychain",
+            "expiresAt": 1_788_399_592_015,
+            "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-file", "refreshToken": "rt-file",
+            "expiresAt": 1_788_371_089_449,
+            "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == kc, (
+            "a 427ms-later file stamp from the same rotation lineage won "
+            "over the Keychain's current generation"
+        )
