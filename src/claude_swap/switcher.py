@@ -3119,6 +3119,35 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
+    def _make_active_if_live(
+        self, data: dict, owner: str, owner_email: str, creds: str
+    ) -> bool:
+        """Move the roster to ``owner`` when the live store holds ``creds``.
+
+        The live store holding an account's credential is what makes it the
+        active slot. A switch moves the roster in the transaction that writes
+        the config; a /login writes neither, so the roster follows the login
+        here. Re-read under ``lock_file``: a switch that landed while the
+        server was asked has moved the roster to its own target, and the live
+        store says so.
+        """
+        if str(data.get("activeAccountNumber")) == str(owner):
+            return False
+        live = self._read_credentials()
+        if not live or (
+            oauth.credential_fingerprint(live)
+            != oauth.credential_fingerprint(creds)
+        ):
+            return False
+        data["activeAccountNumber"] = int(owner)
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(
+            "Account-%s (%s) is now the active slot: the live store holds "
+            "its credential.", owner, owner_email,
+        )
+        return True
+
     def _register_login_as_new_slot(
         self, data: dict, creds: str, resolved: dict
     ) -> bool:
@@ -3217,7 +3246,11 @@ class ClaudeAccountSwitcher:
                 oauth.credential_fingerprint(stored)
                 == oauth.credential_fingerprint(creds)
             ):
-                return True  # already there — re-writing only shifts .prev
+                # Already there; re-writing only shifts .prev. The roster may
+                # still lag it: a restore of the slot's own credential that
+                # moved nothing else is a login for this purpose.
+                self._make_active_if_live(data, owner, owner_email, creds)
+                return True
             # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule
             # `_adopt_into_dead_slot` applies at a switch: `_refresh_expiry`
             # orders logins, so a live value above the stored one is a newer
@@ -3256,22 +3289,7 @@ class ClaudeAccountSwitcher:
                     "quarantine (%s); it stays out of collect passes until "
                     "one observes the new credential.", owner, e,
                 )
-            # THE LIVE STORE HOLDS THIS ACCOUNT, so it is the active slot. A
-            # switch moves the roster in the transaction that writes the
-            # config; a /login writes neither, so the roster follows the login
-            # here. Re-read under the lock: a switch that landed while the
-            # server was asked has moved the roster to its own target, and the
-            # live store says so.
-            live = self._read_credentials()
-            if live and oauth.credential_fingerprint(live) == \
-                    oauth.credential_fingerprint(creds):
-                data["activeAccountNumber"] = int(owner)
-                data["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, data)
-                self._logger.info(
-                    "Account-%s (%s) is now the active slot: the live store "
-                    "holds the login it just adopted.", owner, owner_email,
-                )
+            self._make_active_if_live(data, owner, owner_email, creds)
         self._logger.info(
             "Adopted a login into Account-%s (%s): the live credential "
             "resolves to that account, so it was stored there rather than "

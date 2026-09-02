@@ -16197,6 +16197,24 @@ class TestALoginLandsInItsOwnSlot:
         assert "3" not in data["accounts"], data["accounts"].keys()
         assert data["activeAccountNumber"] == 2
 
+    def test_a_restored_credential_the_slot_already_holds_still_becomes_active(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The slot already holds this exact lineage, so nothing is written,
+        but the live store holds it and the roster does not say so. A restore
+        that moved nothing else is a login for this purpose."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = self._owner_slot_fixture(sample_sequence_data)
+        same = self._blob("rt-same")
+        s._write_account_credentials("1", "c@example.com", same)
+        s._write_credentials(same)
+        with patch.object(s, "_write_account_credentials") as write:
+            self._resync_as_slot_2(s, same)
+        write.assert_not_called()
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+
 
 
 class TestCurrentAtLimitOverridesTheFrozenPct:
