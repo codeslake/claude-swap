@@ -15642,40 +15642,6 @@ class TestALoginLandsInItsOwnSlot:
             "the previous generation"
         )
 
-    def test_CONTROL_a_stamp_8s_later_overwrites_the_slot(
-        self, temp_home: Path, mock_claude_config: Path,
-        sample_sequence_data: dict
-    ):
-        """8s is well past the lineage jitter — a real newer login must still
-        overwrite the slot's stored credential."""
-        accs = sample_sequence_data["accounts"]
-        accs["2"].update(email="b@example.com", uuid="u-2",
-                         organizationUuid="o-2")
-        accs["1"].update(email="c@example.com", uuid="u-1",
-                         organizationUuid="o-1")
-        s = ClaudeAccountSwitcher()
-        s._setup_directories()
-        s._write_json(s.sequence_file, sample_sequence_data)
-        base = 99_999_999_999_000
-        current = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-current", "refreshToken": "rt-current",
-            "expiresAt": 99_999_999_999_999,
-            "refreshTokenExpiresAt": base}})
-        s._write_account_credentials("1", "c@example.com", current)
-        live = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-new", "refreshToken": "rt-new",
-            "expiresAt": 99_999_999_999_999,
-            "refreshTokenExpiresAt": base + 8_000}})
-        with patch("claude_swap.oauth.fetch_oauth_profile",
-                   return_value={"uuid": "u-1", "email": "c@example.com",
-                                 "organizationUuid": "o-1"}):
-            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
-        got = json.loads(s._read_account_credentials("1", "c@example.com"))
-        assert got["claudeAiOauth"]["refreshToken"] == "rt-new", (
-            "a real newer login (8s later) must overwrite the slot's stored "
-            "credential"
-        )
-
     def test_a_dead_owner_slot_receives_the_login(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, monkeypatch
@@ -15714,6 +15680,94 @@ class TestALoginLandsInItsOwnSlot:
         got = json.loads(s._read_account_credentials("1", "c@example.com"))
         assert got["claudeAiOauth"]["refreshToken"] == "rt-live", (
             "a quarantined slot did not receive its owner's fresh login")
+
+    @pytest.mark.parametrize("delta_ms", [427, -427])
+    def test_a_dead_slot_heals_through_stamp_jitter_either_sign(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict, delta_ms: int
+    ):
+        """THE MEASURED INCIDENT: a same-lineage rotation whose re-minted
+        stamp lands within the jitter window of the dead stored generation's
+        must still heal the slot and clear its strike, regardless of which
+        way the jitter fell. The -427ms case is red on 9e702934 — that sign
+        read as an OLDER login and the dead slot's own cure was refused."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        base = 99_999_999_999_000
+        dead = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-dead", "refreshToken": "rt-dead",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": base}})
+        s._write_account_credentials("1", "c@example.com", dead)
+        from claude_swap.usage_store import Identity
+        ids = {"1": Identity(("c@example.com", "o-1"))}
+        s._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant",
+                               struck_fp=oauth.credential_fingerprint(dead))},
+            ids)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": base + delta_ms}})
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            f"a dead slot refused its own cure at a {delta_ms}ms stamp "
+            "jitter")
+        assert not s._slot_token_dead("1", "c@example.com"), (
+            f"a dead slot's strike was not cleared by its own cure at a "
+            f"{delta_ms}ms stamp jitter")
+
+    def test_CONTROL_a_dead_slot_keeps_a_genuinely_older_login(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict
+    ):
+        """CONTROL for the jitter cases above: 8s past the jitter window is
+        an unambiguous older login (not a re-mint), so a dead slot's own
+        stored credential and strike must both survive it."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        base = 99_999_999_999_000
+        dead = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-dead", "refreshToken": "rt-dead",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": base}})
+        s._write_account_credentials("1", "c@example.com", dead)
+        from claude_swap.usage_store import Identity
+        ids = {"1": Identity(("c@example.com", "o-1"))}
+        s._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant",
+                               struck_fp=oauth.credential_fingerprint(dead))},
+            ids)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-old",
+            "expiresAt": 99_999_999_999_999,
+            "refreshTokenExpiresAt": base - 8_000}})
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+        got = json.loads(s._read_account_credentials("1", "c@example.com"))
+        assert got["claudeAiOauth"]["refreshToken"] == "rt-dead", (
+            "a genuinely older login overwrote a dead slot's stored "
+            "credential")
+        assert s._slot_token_dead("1", "c@example.com"), (
+            "a genuinely older login cleared a dead slot's strike")
 
     def _owner_slot_fixture(self, sample_sequence_data):
         """Slots 1 and 2 as the adopt path sees them: the resync runs for 2,

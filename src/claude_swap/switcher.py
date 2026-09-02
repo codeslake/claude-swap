@@ -3277,7 +3277,7 @@ class ClaudeAccountSwitcher:
             if stored and not self._slot_token_dead(owner, owner_email):
                 if not newer_login(live_at, stored_at):
                     return False  # its own credential may yet be condemned
-            elif stored_at is not None and live_at is not None and live_at < stored_at:
+            elif newer_login(stored_at, live_at):
                 self._logger.info(
                     "Account-%s (%s): the live credential resolves to this "
                     "account but its refresh lifetime ends earlier than the "
