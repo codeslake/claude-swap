@@ -1087,7 +1087,10 @@ def _fresher_remembered(switcher, oauth: dict) -> "dict | None":
     the ACTIVE account and moves the field off the pin. Same account only,
     and None whenever the package cannot be asked.
     """
-    kept = _ask("remembered_pin_identity", _certdir(switcher))
+    try:
+        kept = _ask("remembered_pin_identity", _certdir(switcher))
+    except Exception:  # noqa: BLE001 — a switcher with no backup dir: no daemon copy
+        return None
     if not isinstance(kept, dict) or \
             kept.get("accountUuid") != oauth.get("accountUuid"):
         return None
