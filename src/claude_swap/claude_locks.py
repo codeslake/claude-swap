@@ -221,10 +221,9 @@ def _take_over_stale(lock_dir: Path, staleness: float, budget: float) -> bool:
     already gone. False means back off and retry: a peer retook it, the rmdir
     was refused, or the budget is spent.
     """
-    # THE GUARD FILE IS NEVER UNLINKED, and tidying it away breaks the
-    # exclusion: an flock belongs to the open file description, so unlink +
-    # recreate leaves two waiters holding flocks on different inodes and both
-    # inside the window this serializes. It stays as one empty file per lock.
+    # NEVER UNLINK THIS. An flock belongs to the open file description, so
+    # unlink-and-recreate leaves two waiters holding flocks on different
+    # inodes, both inside the window this serializes.
     guard = lock_dir.parent / f"{lock_dir.name}.takeover"
     try:
         with FileLock(guard, timeout=max(0.0, min(_TAKEOVER_GUARD_S, budget))):
