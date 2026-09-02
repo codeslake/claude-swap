@@ -500,3 +500,29 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "the Keychain's superseded generation won even though the file "
             "held the later generation of the same login"
         )
+
+    def test_a_year_older_file_login_cannot_win_on_a_later_expiresAt(
+        self, tmp_path, monkeypatch
+    ):
+        """The file's stamp is not a few hundred ms off — it is a YEAR
+        older, far outside the same-lineage jitter, so it must never reach
+        the ``expiresAt`` tiebreak at all. A later ``expiresAt`` on that
+        stale login (e.g. a long-lived token minted at the time) must not
+        let it win over the Keychain's current login."""
+        kc_refresh = 1_790_380_487_015
+        kc_exp = 1_788_399_592_015
+        fl_refresh = kc_refresh - 31_536_000_000  # 365 days earlier
+        fl_exp = kc_exp + 3_600_000  # 1 hour later than the Keychain's
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-keychain", "refreshToken": "rt-keychain",
+            "expiresAt": kc_exp,
+            "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-file", "refreshToken": "rt-file",
+            "expiresAt": fl_exp,
+            "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == kc, (
+            "a year-older login in the file won because its expiresAt was "
+            "later, even though it is nowhere near the same-lineage jitter"
+        )
