@@ -619,10 +619,10 @@ class CredentialStore:
         def _stamp(blob: str, field: str) -> "int | float | None":
             try:
                 obj = json.loads(blob)
-            except (TypeError, ValueError):
+                obj = obj.get("claudeAiOauth") or obj
+                v = obj.get(field)
+            except (TypeError, ValueError, AttributeError):
                 return None
-            obj = obj.get("claudeAiOauth") or obj
-            v = obj.get(field)
             return v if isinstance(v, (int, float)) else None
 
         kc_at = _stamp(keychain_value, "refreshTokenExpiresAt")

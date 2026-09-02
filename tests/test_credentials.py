@@ -527,6 +527,22 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "later, even though it is nowhere near the same-lineage jitter"
         )
 
+    def test_a_corrupt_plaintext_file_does_not_crash_the_read(
+        self, tmp_path, monkeypatch
+    ):
+        """``_stamp``'s docstring promises "any read or parse failure answers
+        None", but ``except (TypeError, ValueError)`` misses the
+        ``AttributeError`` a non-dict JSON scalar (``42``) raises on
+        ``.get`` -- so a corrupt plaintext file crashed ``_read_active_credentials``
+        itself, the ordinary read path every consumer of the active
+        credential goes through, not only the later credentials-sync helper."""
+        kc = self._creds("keychain-only", 1_000)
+        got = self._store(tmp_path, monkeypatch, kc, "42")._read_active_credentials()
+        assert got.value == kc, (
+            "DEFECT: a corrupt plaintext file crashed the read instead of "
+            "just losing the freshness comparison"
+        )
+
 
 class TestTheLineageJitterToleranceIsPublic:
     """A second reader outside the package (the requirements gate, on the

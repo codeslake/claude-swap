@@ -816,15 +816,15 @@ def test_sync_never_overwrites_a_fresher_plaintext_login_with_an_older_keychain_
     s.platform = Platform.MACOS
     monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
 
-    kc_refresh = 1_790_380_487_015
+    kc_refresh = 88_888_888_888_000  # arbitrary, not a wall-clock epoch
     file_refresh = kc_refresh + 427  # same lineage, inside the 5s jitter
     kc_old = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-ant-oat01-OLD", "refreshToken": "rt-OLD-spent",
-        "expiresAt": 1_788_399_592_015,
+        "expiresAt": 99999999999000,
         "refreshTokenExpiresAt": kc_refresh}})
     file_new = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-ant-oat01-NEW", "refreshToken": "rt-NEW-live",
-        "expiresAt": 1_788_399_592_015 + 3_600_000,
+        "expiresAt": 99999999999000 + 3_600_000,
         "refreshTokenExpiresAt": file_refresh}})
 
     cred_file = temp_home / ".claude" / ".credentials.json"
