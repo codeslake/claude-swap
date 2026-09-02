@@ -12560,6 +12560,79 @@ class TestTheLiveCredentialIsReadThroughTheStore:
             f"asks on a machine with no plaintext file: {seen}"
         )
 
+    def test_a_rotated_pair_of_the_same_lineage_is_still_this_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """Claude Code's refresh rotates BOTH tokens. Before this, the
+        rotated pair matched neither stored token, `_live_credential_is`
+        answered False, and `_live_login_identity` fell back to the config
+        identity: the pin's splice, slot 1. Every reader then believed the
+        login had moved to the pinned account, the resync refused to save
+        the rotation into its slot, the collector POSTed the slot's stale
+        refresh token and the endpoint answered invalid_grant for a lineage
+        that was alive in the live store. The refresh-token lifetime is the
+        stamp a rotation keeps."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790000000000}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is True
+
+    def test_a_fresh_login_has_a_new_lineage_stamp_and_is_not_this_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL: the case the fallback exists for. A login AS the
+        pinned account writes the same config the splice wrote, and only the
+        credential tells them apart: new tokens AND a new lifetime."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-new", "accessToken": "at-new",
+            "refreshTokenExpiresAt": 1791111111111}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is False
+
+    def test_the_resolver_keeps_the_recorded_slot_across_a_rotation(
+        self, temp_home: Path, monkeypatch
+    ):
+        """End to end through `_live_login_identity`: config names the pin,
+        the roster records slot 2, the live pair has rotated. The answer is
+        slot 2, not the pin."""
+        from claude_swap import pin as _pin
+        s = self._switcher(temp_home)
+        pinned = ("pin@example.com", "org-pin")
+        monkeypatch.setattr(s, "_get_current_account", lambda: pinned)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda sw: pinned)
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: {
+            "activeAccountNumber": 2,
+            "accounts": {
+                "1": {"email": "pin@example.com", "organizationUuid": "org-pin"},
+                "2": {"email": "b@example.com", "organizationUuid": "org-b"},
+            }})
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790000000000}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_login_identity() == ("b@example.com", "org-b")
+        assert s.current_account_number() == "2"
 
 class TestThePolicyFetchIsBudgeted:
     """A switch must not spend ten seconds asking about policy.

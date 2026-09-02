@@ -3284,6 +3284,11 @@ class ClaudeAccountSwitcher:
         for key in ("refreshToken", "accessToken"):
             if live.get(key) and live.get(key) == mine.get(key):
                 return True
+        # A refresh rotates BOTH tokens; the lineage stamp survives it. A
+        # fresh login mints a new one, so it still tells the two apart.
+        stamp = live.get("refreshTokenExpiresAt")
+        if stamp and stamp == mine.get("refreshTokenExpiresAt"):
+            return True
         return False
 
     def _live_identity_matches(self, email: str, org_uuid: str) -> bool:
