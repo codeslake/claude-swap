@@ -42,7 +42,7 @@ def _assert_backed_off(slept, budget, *, least=3, remainder=0.05, what="clamp"):
             f"slept {seconds}s with {left}s left — the {what} used `timeout`, "
             f"not what remains of it (all sleeps: {slept})"
         )
-    assert min(l for l, _ in slept) < remainder, (
+    assert min(left for left, _ in slept) < remainder, (
         f"the run must reach a remainder under {remainder}: {slept}"
     )
     assert sum(s for _, s in slept) >= budget * 0.9, (
