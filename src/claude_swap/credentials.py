@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain, oauth
+from claude_swap import macos_keychain
 from claude_swap.exceptions import (
     CredentialError,
     CredentialReadError,
@@ -1175,24 +1175,35 @@ class CredentialStore:
             )
 
     def _sync_active_credentials_file_to_adopted_login(self, credentials: str) -> None:
-        """After an adopt, bring an existing plaintext file to the adopted generation.
+        """After an ``add_account`` adopt, bring an existing plaintext file to
+        the adopted generation.
 
-        macOS only: an adopt (``add_account`` capturing the current login,
-        ``_adopt_login_into_slot`` capturing the server-resolved owner's) reads
-        the credential from the Keychain and stores it into a slot backup —
-        never into ``.credentials.json``. A file left behind by a PREVIOUS
-        login then keeps naming that superseded account until an unrelated
-        switch happens to write both stores, and a reader that falls back to
-        the file (no GUI Keychain access) serves it.
+        macOS only: ``add_account`` reads the credential from the Keychain
+        and stores it into a slot backup — never into ``.credentials.json``.
+        A file left behind by a PREVIOUS login then keeps naming that
+        superseded account until an unrelated switch happens to write both
+        stores, and a reader that falls back to the file (no GUI Keychain
+        access) serves it.
 
-        Rewrite-when-present / never-create, like ``_refresh_stale_credentials_file``:
-        a fileless Keychain-only user gains no plaintext credential, and an
-        absent or unreadable file is left alone rather than guessed at.
-        Skipped when the file already carries these bytes, so a routine adopt
-        of an unchanged login causes no rewrite.
+        Skipped when ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` names a profile
+        other than ``get_claude_config_home()``'s: ``credentials`` was
+        captured from THAT profile (``_read_capture_credentials``), and this
+        file belongs to a different one — the cross-profile write
+        ``_read_capture_credentials`` itself refuses to make.
+
+        Skipped when the file already carries these bytes, so a routine
+        adopt of an unchanged login causes no rewrite. The write itself is
+        :meth:`_refresh_stale_credentials_file`: rewrite-when-present /
+        never-create, same writer, same warning on failure.
         """
         if self._host.platform != Platform.MACOS:
             return
+        secure_env = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        if secure_env is not None:
+            secure_dir = Path(secure_env) if secure_env else get_default_claude_config_home()
+            if secure_dir.resolve() != get_claude_config_home().resolve():
+                return
+        from claude_swap import oauth
         cred_file = get_credentials_path()
         try:
             current = cred_file.read_text(encoding="utf-8")
@@ -1200,12 +1211,7 @@ class CredentialStore:
             return
         if oauth.extract_oauth_data(current) == oauth.extract_oauth_data(credentials):
             return
-        try:
-            self._write_active_credentials_file(credentials)
-        except Exception as e:
-            self._host._logger.warning(
-                f"Could not sync .credentials.json to the adopted login ({e})"
-            )
+        self._refresh_stale_credentials_file(credentials)
 
     def _uses_file_backup_backend(self) -> bool:
         """Whether per-account backup *writes* go to files vs. the Keychain.

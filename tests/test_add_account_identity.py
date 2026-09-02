@@ -755,3 +755,43 @@ def test_adopting_a_keychain_login_syncs_the_stale_plaintext_file(
         "DEFECT: the plaintext file still held login A's tokens after login "
         "B was adopted from the Keychain into the slot"
     )
+
+
+def test_sync_skips_when_secure_storage_profile_diverges_from_config_dir(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """``_read_capture_credentials`` reads the credential from the profile
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` names when that var is set -- never
+    from ``get_claude_config_home()``'s file. With the two diverged, syncing
+    that file to the captured credential is the cross-profile write
+    ``_read_capture_credentials``'s own docstring refuses: it would write
+    one profile's login over a DIFFERENT profile's file.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s.platform = Platform.MACOS
+
+    other_profile = temp_home / "other-profile"
+    other_profile.mkdir()
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(other_profile))
+
+    login_a = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-LOGIN-A", "refreshToken": "rt-login-a",
+        "expiresAt": 99999999999000}})
+    login_b = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-LOGIN-B", "refreshToken": "rt-login-b",
+        "expiresAt": 99999999999000}})
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(login_a, encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=login_b), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=3, assume_yes=True)
+
+    assert cred_file.read_text(encoding="utf-8") == login_a, (
+        "DEFECT: the config-dir profile's file was overwritten with a "
+        "credential captured from a DIFFERENT profile named by "
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+    )
