@@ -12290,6 +12290,10 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
             sw.add_account()
         assert seen == [], "add_account wrote past a login nobody could name"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="the cloud pin needs POSIX file locks and FIFOs",
+    )
     def test_a_login_lands_in_its_slot_and_becomes_active(
         self, temp_home, mock_claude_config, sample_sequence_data
     ):
