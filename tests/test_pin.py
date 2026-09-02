@@ -12217,6 +12217,120 @@ class TestAddAccountRefusesASplicedIdentity:
             sw.add_account()
 
 
+from unittest.mock import patch as _patch
+
+
+class TestAddAccountUnderASpliceRegistersTheLogin:
+    """`cswap add` after a bare /login under the pin.
+
+    The config names the pin and the roster names the last switch's slot, so
+    nothing on this machine can name the login except the server. Measured
+    2026-09-02 on both Macs: `cswap add` refused as "does not belong to
+    <pin account>", and the login reached its slot only through a failover.
+    """
+
+    def _sw(self, oracle, live='{"claudeAiOauth": {"accessToken": "sk-live", '
+                              '"refreshToken": "rt-live"}}'):
+        from claude_swap import switcher as _sw
+        from claude_swap.credentials import ActiveCredentials
+
+        sw = _sw.ClaudeAccountSwitcher.__new__(_sw.ClaudeAccountSwitcher)
+        sw._read_active_credentials = lambda: ActiveCredentials(live, False, False)
+        sw._read_capture_credentials = lambda: live
+        sw._refuse_session_shell = lambda: None
+        sw._setup_directories = lambda: None
+        sw._init_sequence_file = lambda: None
+        sw._migrate_org_fields = lambda: None
+        sw._get_current_identity_triple = lambda: (
+            "pinned@example.com", "org-PIN", "uuid-PIN")
+        sw._config_names_the_pin = lambda e, o: (e, o) == (
+            "pinned@example.com", "org-PIN")
+        sw._live_login_identity = lambda: ("pinned@example.com", "org-PIN")
+        seen = []
+
+        class _Past(Exception):
+            pass
+
+        def _exists(email, org):
+            seen.append((email, org))
+            raise _Past
+
+        sw._account_exists = _exists
+        return sw, seen, _Past, oracle
+
+    def test_the_login_is_the_account_the_server_names(self):
+        """THE SLICE: past the guard as the token's owner, not as the pin."""
+        import pytest
+        sw, seen, past, oracle = self._sw(
+            {"uuid": "u-2", "email": "b@example.com", "organizationUuid": "o-2"})
+        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
+                pytest.raises(past):
+            sw.add_account()
+        assert seen == [("b@example.com", "o-2")], seen
+
+    def test_the_pin_account_itself_is_still_added_as_itself(self):
+        """CONTROL: the server naming the pin's own account is not a splice."""
+        import pytest
+        sw, seen, past, oracle = self._sw(
+            {"uuid": "uuid-PIN", "email": "pinned@example.com",
+             "organizationUuid": "org-PIN"})
+        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=oracle), \
+                pytest.raises(past):
+            sw.add_account()
+        assert seen == [("pinned@example.com", "org-PIN")], seen
+
+    def test_a_server_that_cannot_say_still_refuses(self):
+        """CONTROL: no answer is not the pin's account, and it is not a login
+        either. Refuse, and say which of the two the reader is missing."""
+        import pytest
+        from claude_swap.exceptions import ConfigError
+        sw, seen, past, _ = self._sw(None)
+        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=None), \
+                pytest.raises(ConfigError, match="could not say whose"):
+            sw.add_account()
+        assert seen == [], "add_account wrote past a login nobody could name"
+
+    def test_a_login_lands_in_its_slot_and_becomes_active(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """END TO END on a real store: the config names the pin (slot 1), the
+        roster's active slot is 1, the live store holds a /login as slot 2.
+        `cswap add` must update slot 2 with it and make slot 2 active."""
+        import json as _json
+        from claude_swap import pin as _pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        accs = sample_sequence_data["accounts"]
+        accs["1"].update(email="test@example.com", uuid="test-uuid-1234",
+                         organizationUuid=accs["1"].get("organizationUuid", ""))
+        accs["2"].update(email="b@example.com", uuid="u-2", organizationUuid="o-2")
+        sample_sequence_data["activeAccountNumber"] = 1
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        sw._write_account_credentials("2", "b@example.com", _json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-old",
+                               "expiresAt": 99_999_999_999_999}}))
+        org1 = accs["1"].get("organizationUuid", "") or ""
+        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value={
+                "uuid": "test-uuid-1234", "email": "test@example.com",
+                "organizationUuid": org1}):
+            ok, msg = _pin.set_pin(sw, "test@example.com", org1 or None, num="1")
+        assert ok, msg
+        assert sw._config_names_the_pin("test@example.com", org1), "premise: the config names the pin"
+        live = _json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        sw._write_credentials(live)
+        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value={
+                "uuid": "u-2", "email": "b@example.com", "organizationUuid": "o-2"}):
+            sw.add_account()
+        assert _json.loads(sw._read_account_credentials(
+            "2", "b@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live"
+        assert sw._get_sequence_data()["activeAccountNumber"] == 2
+
+
+
 class TestAPinSwingIsNotALoginInFlight:
     """`_reject_identity_drift_since_verify` samples `oauthAccount` twice and
     refuses on any difference. Under a pin that field has a SECOND writer.

@@ -355,6 +355,11 @@ def fetch_policy_limits(
     return oauth.fetch_policy_limits(token, timeout_s=timeout_s)
 
 
+#: How far apart two `refreshTokenExpiresAt` values may sit and still be one
+#: login. See `_live_credential_is`.
+_LINEAGE_STAMP_JITTER_MS = 5_000
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -3284,10 +3289,19 @@ class ClaudeAccountSwitcher:
         for key in ("refreshToken", "accessToken"):
             if live.get(key) and live.get(key) == mine.get(key):
                 return True
-        # A refresh rotates BOTH tokens; the lineage stamp survives it. A
-        # fresh login mints a new one, so it still tells the two apart.
-        stamp = live.get("refreshTokenExpiresAt")
-        if stamp and stamp == mine.get("refreshTokenExpiresAt"):
+        # A refresh rotates BOTH tokens; the lineage stamp survives it, to
+        # within a second: Claude Code writes it back as now + the server's
+        # refresh_token_expires_in, so it jitters by the seconds the server
+        # truncated and the milliseconds the client added. Measured on one
+        # host, three slots' backups against their previous generation: 105,
+        # 377 and 819 ms apart; equality read all three as a different login
+        # and flipped the resolver. A fresh login is minutes to weeks away.
+        try:
+            live_at = float(live.get("refreshTokenExpiresAt") or 0)
+            mine_at = float(mine.get("refreshTokenExpiresAt") or 0)
+        except (TypeError, ValueError):
+            return False
+        if live_at and mine_at and abs(live_at - mine_at) <= _LINEAGE_STAMP_JITTER_MS:
             return True
         return False
 
@@ -3847,6 +3861,34 @@ class ClaudeAccountSwitcher:
         except Exception:  # noqa: BLE001 — the add already succeeded
             self._logger.debug("post-add re-pin skipped", exc_info=True)
 
+    def _config_names_the_pin(self, email: str, org_uuid: str) -> bool:
+        """Whether ``.claude.json`` names the pinned account right now."""
+        try:
+            from claude_swap import pin as _pin
+            pinned = _pin.pinned_identity(self)
+        except Exception:  # noqa: BLE001 -- an optional extra cannot decide this
+            return False
+        return bool(pinned) and (email, org_uuid or "") == pinned
+
+    def _login_identity_from_the_oracle(self) -> "tuple[str, str, str] | None":
+        """``(email, org_uuid, account_uuid)`` of the account that owns the
+        live credential, from the server, or ``None`` when it cannot be read
+        or resolved. Asked when the config names the pin, which is the one
+        state where the config cannot answer for a /login."""
+        try:
+            creds = self._read_capture_credentials()
+            token = oauth.extract_access_token(creds) if creds else None
+            resolved = oauth.fetch_oauth_profile(token) if token else None
+        except Exception:  # noqa: BLE001 -- unreadable or unreachable resolves nothing
+            return None
+        if not resolved or not resolved.get("uuid") or not resolved.get("email"):
+            return None
+        return (
+            resolved["email"],
+            resolved.get("organizationUuid") or "",
+            resolved["uuid"],
+        )
+
     def add_account(
         self,
         slot: int | None = None,
@@ -3901,21 +3943,38 @@ class ClaudeAccountSwitcher:
         # those are recoverable, but `accountUuid` exists nowhere else. There is
         # no correct value to write, and a row nobody can find is worse than a
         # command that stops and says why.
-        live_login = self._live_login_identity()
+        spliced = False
+        # THE CONFIG CANNOT NAME A /login WHILE IT NAMES THE PIN. The splice
+        # writes the pinned account there and the daemon's carry keeps it
+        # there, so after a bare /login the file still says the pin and the
+        # roster still says the slot the last switch chose; every name below
+        # would then be the pin's, and the live credential another account's.
+        # The server knows whose the credential is, and the profile the token
+        # resolves to carries the email, the org and the uuid the roster keys
+        # on -- the same uuid `_reject_foreign_credential_capture` checks the
+        # token against below. Measured 2026-09-02 on both Macs: a /login as
+        # slot 2 under the pin, `cswap add` refused as "does not belong to
+        # <pin>", and the login reached its slot only through a failover.
+        if self._config_names_the_pin(current_email, current_org_uuid):
+            self._refuse_degraded_capture()
+            resolved = self._login_identity_from_the_oracle()
+            if resolved is None:
+                raise ConfigError(
+                    "The cloud pin is rewriting this machine's account "
+                    "identity, and the server could not say whose the live "
+                    "credential is, so the account you are adding cannot be "
+                    "read correctly. Run `cswap pin --clear`, add the "
+                    "account, then re-pin."
+                )
+            if resolved != identity:
+                identity = resolved
+                current_email, current_org_uuid, current_account_uuid = identity
+                spliced = True
+        # Resolved above, the triple IS the live login; the guard below then
+        # compares it with itself and stays quiet, as it must.
+        live_login = (current_email, current_org_uuid) if spliced \
+            else self._live_login_identity()
         if live_login is not None and live_login != (current_email, current_org_uuid):
-            # THE UNREADABLE CAUSE OUTRANKS THE PIN ONE, because only one of
-            # them has a remedy the user can act on. `_live_login_identity`
-            # answers with the roster's slot whenever it could not PROVE the
-            # live credential is that slot's, and a Keychain that declines
-            # this process is one of those -- so the sentence below names the
-            # pin for a machine whose pin is fine, and `pin --clear` leaves
-            # the next attempt stopped at the same read with the pin gone too.
-            # It DOES cost a second read: reaching here means the pin
-            # splice was found, which took `_live_credential_is` through
-            # `_read_active_credentials` already, and neither wrapper
-            # memoizes. Accepted because both arms of this branch raise,
-            # so the second read cannot disagree with a use-read that
-            # never happens.
             self._refuse_degraded_capture()
             raise ConfigError(
                 "The cloud pin is rewriting this machine's account identity, "
@@ -3968,7 +4027,8 @@ class ClaudeAccountSwitcher:
             # describes no real account -- so the guard would compare it against
             # a fresh read, never match, and refuse every time instead of only
             # on a race.
-            self._reject_identity_drift_since_verify(identity)
+            if not spliced:
+                self._reject_identity_drift_since_verify(identity)
 
             self._write_account_credentials(account_num, current_email, current_creds)
             # UN-SPLICE IT, like the archive in `_perform_switch`. This
@@ -4098,8 +4158,13 @@ class ClaudeAccountSwitcher:
         account_uuid = oauth_data.get("accountUuid", "") or ""
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
         organization_name = oauth_data.get("organizationName", "") or ""
+        if spliced:
+            # Under a splice those three name the pin; the login is the triple.
+            account_uuid, organization_uuid = current_account_uuid, current_org_uuid
+            organization_name = ""
 
-        self._reject_identity_drift_since_verify(identity)
+        if not spliced:
+            self._reject_identity_drift_since_verify(identity)
 
         # Now safe to perform destructive cleanup (new account data is in memory)
         if displace_slot:

@@ -12604,6 +12604,47 @@ class TestTheLiveCredentialIsReadThroughTheStore:
                             lambda num, email: stored)
         assert s._live_credential_is("2", "b@example.com") is False
 
+    def test_a_rotation_re_stamps_within_a_second_and_is_still_this_slot(
+        self, temp_home: Path, monkeypatch
+    ):
+        """Claude Code writes the stamp back on every refresh as now plus the
+        server's refresh_token_expires_in, so it moves by under a second per
+        rotation. Measured on lambda-docker 2026-09-02, three slots' backups
+        against their previous generation: 105, 377 and 819 ms. Equality
+        read each as a different login; the resolver flipped to the pin, the
+        resync was refused, and the slot's stale grant struck invalid_grant
+        eleven minutes later on the code that carried the equality."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790294523113}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790294522294}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is True
+
+    def test_a_login_a_minute_later_is_a_different_lineage(
+        self, temp_home: Path, monkeypatch
+    ):
+        """CONTROL for the tolerance: a stamp a minute apart is a second
+        login, not jitter, and must still fall through to the config."""
+        s = self._switcher(temp_home)
+        live = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-2", "accessToken": "at-2",
+            "refreshTokenExpiresAt": 1790000060000}})
+        stored = json.dumps({"claudeAiOauth": {
+            "refreshToken": "rt-1", "accessToken": "at-1",
+            "refreshTokenExpiresAt": 1790000000000}})
+        monkeypatch.setattr(s, "_read_active_credentials",
+                            lambda: ActiveCredentials(live, False))
+        monkeypatch.setattr(s, "read_account_credentials",
+                            lambda num, email: stored)
+        assert s._live_credential_is("2", "b@example.com") is False
+
     def test_the_resolver_keeps_the_recorded_slot_across_a_rotation(
         self, temp_home: Path, monkeypatch
     ):
