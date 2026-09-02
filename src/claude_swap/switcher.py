@@ -3161,7 +3161,9 @@ class ClaudeAccountSwitcher:
             oauth_account.get("accountUuid", "") or "",
         )
 
-    def _live_login_identity(self) -> "tuple[str, str] | None":
+    def _live_login_identity(
+        self, *, ask_server: bool = True
+    ) -> "tuple[str, str] | None":
         """(email, org) of the LIVE LOGIN, which is not always what the file says.
 
         `~/.claude.json`'s oauthAccount carries two facts now. Claude Code
@@ -3185,6 +3187,12 @@ class ClaudeAccountSwitcher:
         writes the config, so it cannot lag. Anything else is returned
         unchanged, so an UNMANAGED login still resolves to nothing — which is
         the guarantee `current_account_number`'s docstring exists to keep.
+
+        `ask_server=False` FOR A CALLER INSIDE THE LOCKS. Resolving a /login
+        under the pin needs the server, and `fetch_oauth_profile` may not be
+        called while a credential or config lock is held -- so those callers
+        take the memo when it is warm and the recorded slot when it is not,
+        which is what this answered before the fetch existed.
         """
         identity = self._get_current_account()
         if identity is None:
@@ -3229,7 +3237,9 @@ class ClaudeAccountSwitcher:
             # When it cannot, the recorded slot stands: resolving to the pin
             # sends the usage path to restore the pin's grant over a login it
             # never attributed, which is a switch nobody asked for.
-            resolved = self._login_identity_from_the_oracle()
+            resolved = self._login_identity_from_the_oracle(
+                ask_server=ask_server
+            )
             if resolved is not None:
                 return (resolved[0], resolved[1])
         return (slot["email"], slot.get("organizationUuid", "") or "")
@@ -3330,8 +3340,11 @@ class ClaudeAccountSwitcher:
         usage fetch to USAGE_TOKEN_EXPIRED. It still detects a switch or a
         /login landing in the gap, because both move the roster inside the
         same critical section.
+
+        NO NETWORK: every caller holds Claude Code's credential lock, so the
+        resolver is asked memo-only.
         """
-        identity = self._live_login_identity()
+        identity = self._live_login_identity(ask_server=False)
         return identity is not None and identity == (email, org_uuid or "")
 
     def _resolved_matches_slot_identity(
@@ -3878,11 +3891,17 @@ class ClaudeAccountSwitcher:
             return False
         return bool(pinned) and (email, org_uuid or "") == pinned
 
-    def _login_identity_from_the_oracle(self) -> "tuple[str, str, str] | None":
+    def _login_identity_from_the_oracle(
+        self, *, ask_server: bool = True
+    ) -> "tuple[str, str, str] | None":
         """``(email, org_uuid, account_uuid)`` of the account that owns the
         live credential, from the server, or ``None`` when it cannot be read
         or resolved. Asked when the config names the pin, which is the one
-        state where the config cannot answer for a /login."""
+        state where the config cannot answer for a /login.
+
+        ``ask_server=False`` answers from the memo and never from the
+        network, for the callers that run inside Claude Code's locks.
+        """
         try:
             creds = self._read_capture_credentials()
             token = oauth.extract_access_token(creds) if creds else None
@@ -3896,6 +3915,8 @@ class ClaudeAccountSwitcher:
         key = oauth.credential_fingerprint(creds)
         if key in answers:
             return answers[key]
+        if not ask_server:
+            return None
         try:
             resolved = oauth.fetch_oauth_profile(token)
         except Exception:  # noqa: BLE001 -- unreachable resolves nothing
@@ -3963,10 +3984,10 @@ class ClaudeAccountSwitcher:
         # above returns long before reaching it — carrying the same forged
         # names into `_write_account_credentials`.
         #
-        # REFUSING, NOT REPAIRING: the roster records the email and the org, so
-        # those are recoverable, but `accountUuid` exists nowhere else. There is
-        # no correct value to write, and a row nobody can find is worse than a
-        # command that stops and says why.
+        # REFUSING WHEN NOBODY CAN NAME THE LOGIN: the roster records the email
+        # and the org, but on this machine `accountUuid` is only in the config
+        # the pin overwrote. The server is asked for it first, below; a row
+        # nobody can find is worse than a command that stops and says why.
         spliced = False
         # THE CONFIG CANNOT NAME A /login WHILE IT NAMES THE PIN. The splice
         # writes the pinned account there and the daemon's carry keeps it
@@ -5190,9 +5211,17 @@ class ClaudeAccountSwitcher:
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
                         with claude_config_lock():
-                            if self._recovery_may_write_live(
+                            # A REFUSAL IS A DEFERRAL, so it clears `live_ok`
+                            # like a failure does. The refusal leaves the live
+                            # store on the bytes this pass judged unusable —
+                            # the state the guard below names — and `live_ok`
+                            # is otherwise only cleared by an exception, so a
+                            # skip walked past it and the ACTIVE account
+                            # reported a healthy usage number.
+                            live_ok = self._recovery_may_write_live(
                                 account_num, refresh_input, live
-                            ):
+                            )
+                            if live_ok:
                                 self._write_credentials(working)  # active store — CC reads this
                     except Exception:
                         live_ok = False
@@ -7356,7 +7385,12 @@ class ClaudeAccountSwitcher:
             # The outgoing credential lives in `.credentials.json`, which
             # the pin never touches, so it belongs to the roster's active
             # account — not to whoever the identity file names.
-            current_identity = self._live_login_identity()
+            #
+            # Memo-only, per the no-network rule above: the prefetch already
+            # resolved this outside the locks, and `force_activate` — which
+            # substitutes an empty provenance for that prefetch — is the one
+            # path that would otherwise ask from in here.
+            current_identity = self._live_login_identity(ask_server=False)
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
                 current_account = self._find_account_slot(

@@ -2004,7 +2004,12 @@ class TestActiveAccountRefresh:
         """MEASURED: the resolver named slot 1 while the roster named 5, and
         this restore put slot 1's grant into the live store -- the machine
         changed login with no switch recorded. The backup restore is fine;
-        the live store belongs to the slot the roster names."""
+        the live store belongs to the slot the roster names.
+
+        The pass DEFERS rather than reporting: it is leaving the live store
+        on a credential it just judged unusable, which is what the sentinel
+        means. See `test_a_skipped_live_write_is_reported_as_a_deferral...`
+        for why a usage number here is the wrong answer."""
         sample_sequence_data["activeAccountNumber"] = 2
         switcher = self._switcher(sample_sequence_data)
         successor = json.dumps({
@@ -2025,11 +2030,52 @@ class TestActiveAccountRefresh:
                    return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
-        assert result.sentinel is None
+        assert result.sentinel == USAGE_TOKEN_EXPIRED
         mock_refresh.assert_not_called()
         write_live.assert_not_called()             # not this slot's store
         write_backup.assert_not_called()
-        assert mock_fetch.call_args[0][2] == successor
+        mock_fetch.assert_not_called()             # nothing to report on
+
+    def test_a_skipped_live_write_is_reported_as_a_deferral_not_as_health(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """A refusal to write the live store is a DEFERRAL, and the record
+        has to say so.
+
+        The refusal leaves the live store holding bytes this pass judged
+        unusable -- exactly the state `if not live_ok` exists to catch ("Live
+        still holds the dead token -- don't serve usage for a credential CC
+        can't currently use"). `live_ok` is only ever cleared by an
+        exception, so a deliberate skip walks past that guard and the ACTIVE
+        account reports a healthy usage number: `cswap list` shows
+        percentages, and autoswitch reads a usage dict instead of
+        `USAGE_TOKEN_EXPIRED`, so it neither idle-holds nor fails over while
+        Claude Code cannot use the credential in front of it.
+        """
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher = self._switcher(sample_sequence_data)
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor", "refreshToken": "rt-successor",
+                "expiresAt": 9999999999000,
+            },
+        })
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=successor
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        write_live.assert_not_called()             # premise: the write was skipped
+        assert result.sentinel == USAGE_TOKEN_EXPIRED, (
+            "the live store was left on an unusable credential and the pass "
+            f"reported usage anyway: {result}"
+        )
+        assert result.usage is None
 
     def test_a_refresh_of_the_live_lineage_lands_in_the_live_store_whatever_the_roster_says(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -7955,6 +8001,40 @@ class TestDirectActivationPreservation:
         live = (temp_home / ".claude" / ".credentials.json").read_text()
         assert json.loads(live)["claudeAiOauth"]["accessToken"] == "sk-one"
 
+    def test_a_forced_switch_under_a_pin_reaches_no_network_in_the_locks(
+        self, temp_home, monkeypatch
+    ):
+        """`force_activate` substitutes an empty provenance for the pre-lock
+        prefetch, so it is the one path where nothing warms the resolver's
+        memo before the locks close. The identity read inside them then asks
+        the server -- three locks held, including the config lock the usage
+        path refuses to hold across a POST for this exact reason.
+
+        Any call the probe sees here is necessarily the under-lock one.
+        """
+        from claude_swap import pin as _pin
+
+        switcher, _ = self._setup(temp_home, live_identity_email="pinned@example.com")
+        switcher._write_json(switcher.sequence_file, {
+            **switcher._get_sequence_data(), "activeAccountNumber": 1})
+        pin_identity = ("pinned@example.com", "")
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: pin_identity)
+        assert switcher._live_credential_is("1", "one@example.com") is False, (
+            "premise: the live credential must not be the recorded slot's, "
+            "or nothing asks the server at all"
+        )
+        asked = []
+        monkeypatch.setattr(
+            oauth, "fetch_oauth_profile",
+            lambda tok: asked.append(tok) or None,
+        )
+        with patch.object(switcher, "list_accounts"):
+            switcher._perform_switch("1", emit_output=False, force_activate=True)
+        assert asked == [], (
+            "the switch asked the profile endpoint while holding cswap's "
+            f"lock, Claude Code's credential lock and its config lock: {asked}"
+        )
+
     def test_orphaned_live_login_without_config_identity_is_stashed(
         self, temp_home
     ):
@@ -12681,11 +12761,10 @@ class TestTheLiveCredentialIsReadThroughTheStore:
     ):
         """Claude Code writes the stamp back on every refresh as now plus the
         server's refresh_token_expires_in, so it moves by under a second per
-        rotation. Measured on lambda-docker 2026-09-02, three slots' backups
-        against their previous generation: 105, 377 and 819 ms. Equality
-        read each as a different login; the resolver flipped to the pin, the
-        resync was refused, and the slot's stale grant struck invalid_grant
-        eleven minutes later on the code that carried the equality."""
+        rotation. Measured against three slots' previous generations: 105,
+        377 and 819 ms. Equality read each as a different login; the resolver
+        flipped to the pin, the resync was refused, and the slot's stale
+        grant struck invalid_grant on the code that carried the equality."""
         s = self._switcher(temp_home)
         live = json.dumps({"claudeAiOauth": {
             "refreshToken": "rt-2", "accessToken": "at-2",
@@ -12746,6 +12825,83 @@ class TestTheLiveCredentialIsReadThroughTheStore:
                             lambda num, email: stored)
         assert s._live_login_identity() == ("b@example.com", "org-b")
         assert s.current_account_number() == "2"
+
+
+class TestTheResolverAsksTheServerOnlyOutsideTheLocks:
+    """The resolver may reach the network; its under-lock callers may not.
+
+    Three places state the rule: `fetch_oauth_profile`'s own docstring
+    ("Must not be called while any credential/config lock is held"),
+    `_resync_rotated_backup` ("probed here, before any lock"), and the line
+    directly above `_perform_switch_locked`'s `with` ("Everything under here
+    is local I/O -- no network while locks are held").
+
+    Both under-lock callers ask `_live_login_identity`, so the fetch it
+    gained lands inside Claude Code's credential lock -- and under
+    `force_activate`, which skips the pre-lock prefetch entirely, that is the
+    only place it can be asked from. A failure is never memoized, so an
+    unreachable server pays the full 5s timeout there on every pass.
+    """
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def _drifted(self, monkeypatch, asked):
+        """The one state that reaches the oracle: the config names the pin
+        and the live credential is not the recorded slot's."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._get_current_account = lambda: self.PIN
+        s._get_sequence_data = lambda: {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"email": "login@example.com",
+                               "organizationUuid": "org-login"}}}
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-live", "refreshToken": "rt-live"}})
+        s._read_active_credentials = lambda: ActiveCredentials(live, False)
+        s.read_account_credentials = lambda num, email: json.dumps(
+            {"claudeAiOauth": {"accessToken": "at-slot2",
+                               "refreshToken": "rt-slot2"}})
+        s._read_capture_credentials = lambda: live
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
+            asked.append(tok) or {"email": "other@example.com", "uuid": "u-o",
+                                  "organizationUuid": "org-other"}))
+        return s
+
+    def test_CONTROL_the_unlocked_resolver_does_ask(self, monkeypatch):
+        """The probe can see a call. Without this the two below are
+        arithmetic: a resolver that never asks anyone passes them too."""
+        asked = []
+        s = self._drifted(monkeypatch, asked)
+        assert s._live_login_identity() == ("other@example.com", "org-other")
+        assert asked == ["at-live"], asked
+
+    def test_the_under_lock_re_check_asks_nobody(self, monkeypatch):
+        """`_live_identity_matches` runs inside `FileLock`, `FileLock` and
+        `claude_credentials_lock`. With a cold memo it must fall back to the
+        recorded slot, which is what it answered before the fetch existed."""
+        asked = []
+        s = self._drifted(monkeypatch, asked)
+        matched = s._live_identity_matches("login@example.com", "org-login")
+        assert asked == [], (
+            "the under-lock identity re-check reached the profile endpoint "
+            f"while Claude Code's credential lock is held: {asked}")
+        assert matched is True
+
+    def test_a_warm_memo_still_answers_under_the_lock(self, monkeypatch):
+        """CONTROL for the fix's reach: refusing the NETWORK is not refusing
+        the answer. A verdict already resolved outside the locks is a dict
+        lookup, so the check keeps the precision the fetch bought it."""
+        asked = []
+        s = self._drifted(monkeypatch, asked)
+        s._live_login_identity()                      # pre-lock, memoizes
+        assert asked == ["at-live"], asked
+        assert s._live_identity_matches("other@example.com", "org-other")
+        assert not s._live_identity_matches("login@example.com", "org-login")
+        assert asked == ["at-live"], "asked again with the memo warm"
+
 
 class TestThePolicyFetchIsBudgeted:
     """A switch must not spend ten seconds asking about policy.

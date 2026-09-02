@@ -11631,7 +11631,7 @@ class TestALoginAsThePinnedAccountIsNotASplice:
         s.read_account_credentials = _read
         # The server is the only witness left once the credential is not the
         # recorded slot's; each test says what it answers.
-        s._login_identity_from_the_oracle = lambda: None
+        s._login_identity_from_the_oracle = lambda **kw: None
         return s
 
     def test_a_fresh_login_as_the_pin_is_reported_as_the_pin(
@@ -11640,7 +11640,7 @@ class TestALoginAsThePinnedAccountIsNotASplice:
             tmp_path, monkeypatch,
             live_tokens={"accessToken": "pin-new", "refreshToken": "pin-new-r"},
             stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
-        s._login_identity_from_the_oracle = lambda: (*self.PIN, "u-pin")
+        s._login_identity_from_the_oracle = lambda **kw: (*self.PIN, "u-pin")
         assert s._live_login_identity() == self.PIN, (
             "the server says the credential now live is the PIN's, so this is "
             "a login and not a splice -- un-splicing it stores that credential "
@@ -11653,7 +11653,7 @@ class TestALoginAsThePinnedAccountIsNotASplice:
             tmp_path, monkeypatch,
             live_tokens={"accessToken": "other-a", "refreshToken": "other-r"},
             stored_tokens={"accessToken": "login-a", "refreshToken": "login-r"})
-        s._login_identity_from_the_oracle = lambda: (
+        s._login_identity_from_the_oracle = lambda **kw: (
             "other@example.com", "org-other", "u-other")
         assert s._live_login_identity() == ("other@example.com", "org-other")
 
@@ -12386,7 +12386,6 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
         assert _json.loads(sw._read_account_credentials(
             "2", "b@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live"
         assert sw._get_sequence_data()["activeAccountNumber"] == 2
-
 
 
 class TestAPinSwingIsNotALoginInFlight:
