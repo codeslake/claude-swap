@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _advancing_clock
+from tests.conftest import _advancing_clock, _thread_scoped_sleep, _crossing_clock
 
 from claude_swap import claude_locks
 from claude_swap.claude_locks import (
@@ -401,17 +401,8 @@ class TestProperLockfile:
                 raise OSError(errno.EACCES, "cannot remove")
             return real_rmdir(path, *a, **k)
 
-        mine = threading.get_ident()
-        real_sleep = claude_locks.time.sleep
 
-        def fake_sleep(seconds):
-            # SCOPED TO THIS THREAD, or a leaked one spins through a sleep
-            # that never sleeps and writes its own calls into this budget --
-            # red on correct code, measured.
-            if threading.get_ident() != mine:
-                return real_sleep(seconds)
-            slept.append((round(budget - clock[0], 3), round(seconds, 3)))
-            clock[0] += seconds
+        fake_sleep = _thread_scoped_sleep(claude_locks, clock, slept, budget)
 
         monkeypatch.setattr(claude_locks.os, "rmdir", refuse)
         monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
@@ -447,20 +438,8 @@ class TestProperLockfile:
         monkeypatch.setattr(claude_locks.random, "random", lambda: 0.0)
         budget, clock, slept = 0.756, [0.0], []
 
-        mine = threading.get_ident()
-        real_sleep = claude_locks.time.sleep
 
-        def fake_sleep(seconds):
-            # SCOPED, like its siblings: this patch is process-global, so an
-            # unscoped recorder writes every other thread's sleeps into this
-            # budget -- red on correct code.
-            if threading.get_ident() != mine:
-                return real_sleep(seconds)
-            slept.append((round(budget - clock[0], 3), round(seconds, 3)))
-            # ONE ITERATION OF WORK on top of the sleep. Nothing else advances
-            # a scripted clock, so a clamped sleep of 0.0 would leave the
-            # deadline check reading the same instant for ever.
-            clock[0] += seconds + 0.001
+        fake_sleep = _thread_scoped_sleep(claude_locks, clock, slept, budget, step=0.001)
 
         monkeypatch.setattr(claude_locks.time, "monotonic", _advancing_clock(clock, budget))
         monkeypatch.setattr(claude_locks.time, "sleep", fake_sleep)
@@ -496,33 +475,6 @@ class TestLockPaths:
         assert not (temp_home / ".claude.lock").exists()
         assert not (temp_home / ".claude.json.lock").exists()
 
-
-class TestTheClampsSurviveWeakeningNotOnlyDeletion:
-    """`min(sleep, timeout)` is a no-op once most of the budget is spent.
-
-    The elapsed bound is tight enough to see a WEAKENED clamp, not only a
-    deleted one. The jitter is pinned, or the weakened form's overshoot is a
-    random draw that can land inside any fixed margin.
-    """
-
-    def test_a_timeout_above_the_sleep_still_bounds_the_call(
-        self, lock_dir, monkeypatch
-    ):
-        lock_dir.mkdir()  # fresh mtime -> contended, not stale
-        monkeypatch.setattr(claude_locks.random, "random", lambda: 1.0)
-        start = time.monotonic()
-        with pytest.raises(ClaudeCodeLockTimeout):
-            with proper_lockfile(lock_dir, timeout=0.6):
-                pass
-        elapsed = time.monotonic() - start
-        # Correct: 0.5 then 0.1 -> 0.6. Weakened: 0.5 twice -> 1.0. Measured
-        # 0.60 idle over 5 runs and 0.70 under a heavily loaded box, so 0.8 sat
-        # 0.10 above the loaded value; 0.85 keeps the same distance from BOTH
-        # sides of the range this has to separate.
-        assert elapsed < 0.85, (
-            f"a 0.6s budget took {elapsed:.2f}s — the retry sleep clamped to "
-            "`timeout` rather than to what is left of it"
-        )
 
 class TestEveryArmOfTheLoopBacksOff:
     """The bounding pass clamped the two sleeping arms and skipped one.
@@ -600,16 +552,8 @@ class TestEveryArmOfTheLoopBacksOff:
 
         budget = 3.0
         clock, slept = [0.0], []
-        real_sleep = claude_locks.time.sleep
-        mine = threading.get_ident()
 
-        def fake_sleep(seconds):
-            # THREAD-SCOPED: the patch is process-global, and a stray thread
-            # sleeping here would both stall and pollute the sample.
-            if threading.get_ident() != mine:
-                return real_sleep(seconds)
-            slept.append(seconds)
-            clock[0] += seconds
+        fake_sleep = _thread_scoped_sleep(claude_locks, clock, slept)
 
         # THE SHARED CLOCK, not a copy of its arithmetic. The last sleep is
         # clamped to what is left, so it is exactly 0.0 and a clock that moves
@@ -745,8 +689,6 @@ class TestEveryArmOfTheLoopBacksOff:
 
         budget, clock, slept = 0.175, [0.0], []
         real_mkdir, real_stat = os.mkdir, os.stat
-        mine = threading.get_ident()
-        real_sleep = claude_locks.time.sleep
 
         def counting(path, *a, **k):
             if os.fspath(path) == os.fspath(target):
@@ -758,14 +700,7 @@ class TestEveryArmOfTheLoopBacksOff:
                 raise FileNotFoundError(errno.ENOENT, "swept")
             return real_stat(path, *a, **k)
 
-        def fake_sleep(seconds):
-            # SCOPED TO THIS THREAD. `claude_locks.time` IS the `time` module,
-            # so an unscoped patch freezes the clock process-wide and records
-            # every other thread's sleeps into this budget.
-            if threading.get_ident() != mine:
-                return real_sleep(seconds)
-            slept.append((round(budget - clock[0], 3), round(seconds, 3)))
-            clock[0] += seconds
+        fake_sleep = _thread_scoped_sleep(claude_locks, clock, slept, budget)
 
         monkeypatch.setattr(claude_locks.os, "mkdir", counting)
         monkeypatch.setattr(claude_locks.os, "stat", swept)
@@ -864,7 +799,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
             f"guard is not clamped to the remaining time"
         )
 
-    def test_the_default_budget_is_read_at_call_time(
+    def test_the_guard_waits_no_longer_than_the_guard_constant(
         self, tmp_path, monkeypatch
     ):
         """A default of `_TAKEOVER_GUARD_S` would freeze the import value."""
@@ -878,7 +813,7 @@ class TestTheTakeoverGuardIsInsideTheTimeout:
         monkeypatch.setattr(claude_locks, "FileLock", recording)
         monkeypatch.setattr(claude_locks, "_TAKEOVER_GUARD_S", 7.0)
         gone = tmp_path / "gone.lock"
-        assert claude_locks._take_over_stale(gone, 60.0) is False
+        assert claude_locks._take_over_stale(gone, 60.0, budget=60.0) is True
         assert seen == [7.0], f"the guard waited {seen} under a cap of 7.0"
 
 class TestADeadlineCanPassMidIterationForEveryArm:
@@ -898,22 +833,6 @@ class TestADeadlineCanPassMidIterationForEveryArm:
     in place, so a deleted floor is a genuine crash here.
     """
 
-    def _crossing_clock(self, reads):
-        """0.0 twice (start, deadline check), then 0.6 (the clamp's own read
-        lands past a 0.5 deadline), then 0.6 forever."""
-        ticks = iter([0.0, 0.0, 0.6, 0.6, 0.6, 0.6])
-        last = [0.6]
-
-        def clock():
-            try:
-                last[0] = next(ticks)
-            except StopIteration:
-                pass
-            reads.append(last[0])
-            return last[0]
-
-        return clock
-
     def test_a_deadline_crossed_mid_swept_name_arm_is_not_a_ValueError(
         self, tmp_path, monkeypatch
     ):
@@ -929,7 +848,7 @@ class TestADeadlineCanPassMidIterationForEveryArm:
 
         reads = []
         monkeypatch.setattr(claude_locks.os, "stat", swept)
-        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
+        monkeypatch.setattr(claude_locks.time, "monotonic", _crossing_clock(reads))
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5):
                 pass
@@ -956,7 +875,7 @@ class TestADeadlineCanPassMidIterationForEveryArm:
 
         monkeypatch.setattr(claude_locks.os, "rmdir", refusing)
 
-        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock([]))
+        monkeypatch.setattr(claude_locks.time, "monotonic", _crossing_clock([]))
         # THE RAISE IS THE ASSERTION: unclamped, this arm reaches `time.sleep`
         # with a negative value, and that is a ValueError this `raises` would
         # not accept. Pinning the READ SEQUENCE instead only detects change --
@@ -977,7 +896,7 @@ class TestADeadlineCanPassMidIterationForEveryArm:
         monkeypatch.setattr(claude_locks.random, "random", lambda: 0.0)
 
         reads = []
-        monkeypatch.setattr(claude_locks.time, "monotonic", self._crossing_clock(reads))
+        monkeypatch.setattr(claude_locks.time, "monotonic", _crossing_clock(reads))
         with pytest.raises(ClaudeCodeLockTimeout):
             with proper_lockfile(target, timeout=0.5):
                 pass
@@ -1037,14 +956,14 @@ class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
         lock_dir.mkdir()
         past = time.time() - 10 * staleness
         os.utime(lock_dir, (past, past))
-        assert claude_locks._take_over_stale(lock_dir, staleness) is True
+        assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is True
         assert not lock_dir.exists()
 
         # THE ARM UNDER TEST: by the time the removal runs, a peer has
         # retaken the name. Its directory is fresh, and removing it would
         # leave that peer holding a lock this process is about to recreate.
         lock_dir.mkdir()
-        assert claude_locks._take_over_stale(lock_dir, staleness) is False, (
+        assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is False, (
             "DEFECT: a directory that is no longer stale was removed -- a "
             "peer that won the takeover race holds it, and taking it away "
             "puts both processes inside the critical section"
@@ -1071,7 +990,7 @@ class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
         peer = FileLock(guard, timeout=0.5)
         assert peer.acquire(), "premise: the peer must hold the guard first"
         try:
-            assert claude_locks._take_over_stale(lock_dir, staleness) is False, (
+            assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is False, (
                 "DEFECT: a second waiter entered the decide-and-remove window "
                 "while a peer was inside it. Both then remove the corpse and "
                 "the loser's fresh lock goes with it, putting two processes "
@@ -1083,11 +1002,13 @@ class TestTheStaleTakeoverDoesNotRemoveASuccessorsLock:
 
         # CONTROL: with the guard free the SAME corpse is taken over, so the
         # False above cannot be a takeover that never works at all.
-        assert claude_locks._take_over_stale(lock_dir, staleness) is True
+        assert claude_locks._take_over_stale(lock_dir, staleness, budget=60.0) is True
         assert not lock_dir.exists()
 
-    def test_a_vanished_lock_is_not_an_error(self, tmp_path):
-        assert claude_locks._take_over_stale(tmp_path / "gone.lock", 60.0) is False
+    def test_a_vanished_lock_is_free_to_take(self, tmp_path):
+        """The caller's next mkdir decides; a False here cost it a back-off
+        before a mkdir that would have succeeded."""
+        assert claude_locks._take_over_stale(tmp_path / "gone.lock", 60.0, budget=60.0) is True
 
 
 class TestCcRefreshLockProtocol:

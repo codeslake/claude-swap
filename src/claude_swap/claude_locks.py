@@ -168,7 +168,6 @@ def proper_lockfile(
                 # outlives `staleness` is a new fact and the takeover it
                 # precedes would otherwise arrive unexplained.
                 last_ok, warned = time.time(), False
-                continue
             except FileNotFoundError:
                 return  # gone; nothing left to keep alive
             except OSError as e:
@@ -213,17 +212,13 @@ _TAKEOVER_GUARD_S = 0.5
 _DECLINE_BACKOFF_S = 0.05
 
 
-def _take_over_stale(
-    lock_dir, staleness: float, budget: float = float("inf")
-) -> bool:
+def _take_over_stale(lock_dir, staleness: float, budget: float) -> bool:
     """Remove a lock whose holder is gone, but never a successor's.
 
     `os.stat` decides and `os.rmdir` acts, and between them another waiter
     can win the same race and create ITS lock at this name -- which the
     rmdir then removes, putting two processes inside the critical section
-    at once. Measured on this tree: 7 of 320 holds saw a co-holder with a
-    stale lock present, 0 of 320 without one, and widening only that gap in
-    one waiter made it dominant (30 of 160 at 50 ms).
+    at once.
 
     The window is serialized on an flock -- the one primitive here a peer
     cannot steal -- and the staleness is re-read while holding it, so a
@@ -234,9 +229,10 @@ def _take_over_stale(
 
     `budget` is the caller's remaining time; the guard waits the smaller of it
     and `_TAKEOVER_GUARD_S`, so a contended guard cannot push the caller past
-    its own deadline. Returns whether the corpse was removed -- False also
-    covers a peer having retaken it, a refused rmdir, and an exhausted budget,
-    which mean the same thing here: back off and retry.
+    its own deadline. Returns whether the name is free to take: the corpse
+    removed, or already gone. False covers a peer having retaken it, a
+    refused rmdir, and an exhausted budget, which mean the same thing here:
+    back off and retry.
     """
     guard = lock_dir.parent / f"{lock_dir.name}.takeover"
     try:
@@ -245,7 +241,7 @@ def _take_over_stale(
                 if time.time() - os.stat(lock_dir).st_mtime <= staleness:
                     return False  # a peer retook it; it is not ours to remove
             except FileNotFoundError:
-                return False  # already gone; the mkdir above will race for it
+                return True  # already gone: the name is free, mkdir decides
             os.rmdir(lock_dir)
             return True
     except (LockError, OSError):

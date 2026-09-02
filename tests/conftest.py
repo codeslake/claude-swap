@@ -913,3 +913,47 @@ def _advancing_clock(clock, budget):
         return clock[0]
 
     return monotonic
+
+
+def _thread_scoped_sleep(module, clock, slept, budget=None, step=0.0):
+    """A recorder for ``module.time.sleep`` bound to the calling thread.
+
+    The patch is process-global, so an unscoped recorder writes every other
+    thread's sleeps into the sample and spins them through a sleep that never
+    sleeps. Records ``(remaining, seconds)`` when ``budget`` is given, else
+    ``seconds``, and advances ``clock`` by the sleep plus ``step`` -- one
+    iteration of work, so a clamped 0.0 cannot park a scripted clock on the
+    deadline.
+    """
+    import threading
+
+    mine = threading.get_ident()
+    real = module.time.sleep
+
+    def fake_sleep(seconds):
+        if threading.get_ident() != mine:
+            return real(seconds)
+        if budget is None:
+            slept.append(seconds)
+        else:
+            slept.append((round(budget - clock[0], 3), round(seconds, 3)))
+        clock[0] += seconds + step
+
+    return fake_sleep
+
+
+def _crossing_clock(reads):
+    """0.0 twice (start, deadline check), then 0.6 forever: the clamp's own
+    read lands past a 0.5 deadline. Every read is appended to ``reads``."""
+    ticks = iter([0.0, 0.0, 0.6, 0.6, 0.6, 0.6])
+    last = [0.6]
+
+    def clock():
+        try:
+            last[0] = next(ticks)
+        except StopIteration:
+            pass
+        reads.append(last[0])
+        return last[0]
+
+    return clock

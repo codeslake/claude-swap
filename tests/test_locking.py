@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _advancing_clock
+from tests.conftest import _advancing_clock, _thread_scoped_sleep, _crossing_clock
 
 from claude_swap import locking
 from claude_swap.exceptions import LockError
@@ -192,16 +192,7 @@ class TestTheDeadlineCanPassBetweenTheCheckAndTheClamp:
             # The 3rd read is the clamp's, and it lands PAST the deadline the
             # 2nd read was measured against.
             reads = []
-            ticks = iter([0.0, 0.0, 0.6, 0.6, 0.6, 0.6])
-            last = [0.6]
-
-            def clock():
-                try:
-                    last[0] = next(ticks)
-                except StopIteration:
-                    pass
-                reads.append(last[0])
-                return last[0]
+            clock = _crossing_clock(reads)
 
             monkeypatch.setattr(locking.time, "monotonic", clock)
             waiter = FileLock(target, timeout=0.5)
@@ -267,13 +258,8 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
             budget, clock, slept = 0.01, [0.0], []
             real_sleep = locking.time.sleep
             real_monotonic = locking.time.monotonic
-            mine = threading.get_ident()
 
-            def fake_sleep(seconds):
-                if threading.get_ident() != mine:
-                    return real_sleep(seconds)
-                slept.append(seconds)
-                clock[0] += seconds + 0.001
+            fake_sleep = _thread_scoped_sleep(locking, clock, slept, step=0.001)
 
             # THE SHARED CLOCK, not a copy of its arithmetic. Advancing only
             # inside `fake_sleep` freezes it the moment a sleep is deleted, so
@@ -332,20 +318,8 @@ class TestTheClampSurvivesWeakeningNotOnlyDeletion:
             real_sleep = locking.time.sleep
             real_monotonic = locking.time.monotonic
 
-            mine = threading.get_ident()
 
-            def fake_sleep(seconds):
-                # SCOPED, like its sibling above: this patch is process-global,
-                # so an unscoped recorder writes every other thread's sleeps
-                # into this budget and spins them through a sleep that never
-                # sleeps.
-                if threading.get_ident() != mine:
-                    return real_sleep(seconds)
-                slept.append((round(budget - clock[0], 3), round(seconds, 3)))
-                # ONE ITERATION OF WORK on top of the sleep: nothing else
-                # advances a scripted clock, so a clamped 0.0 would leave the
-                # deadline check reading the same instant for ever.
-                clock[0] += seconds + 0.001
+            fake_sleep = _thread_scoped_sleep(locking, clock, slept, budget, step=0.001)
 
             locking.time.monotonic = _advancing_clock(clock, budget)
             locking.time.sleep = fake_sleep
