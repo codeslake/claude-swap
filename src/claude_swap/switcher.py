@@ -49,6 +49,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     CredentialStore,
     looks_like_api_key,
     merge_shared_credential_fields,
+    newer_login,
     shared_credential_fields,
 )
 from claude_swap.fsutil import read_text_with_retry
@@ -3274,7 +3275,7 @@ class ClaudeAccountSwitcher:
             # refuses only a live credential that is the OLDER login.
             stored_at, live_at = _refresh_expiry(stored), _refresh_expiry(creds)
             if stored and not self._slot_token_dead(owner, owner_email):
-                if stored_at is None or live_at is None or live_at <= stored_at:
+                if not newer_login(live_at, stored_at):
                     return False  # its own credential may yet be condemned
             elif stored_at is not None and live_at is not None and live_at < stored_at:
                 self._logger.info(
@@ -5571,10 +5572,10 @@ class ClaudeAccountSwitcher:
                 str(foreign_slot), email)
             incoming_at = _refresh_expiry(credentials)
             stored_at = _refresh_expiry(stored)
-            # Equal values order nothing, hence `<=`. None is no evidence
-            # either -- absent field, or a failed read (`_ex` gives "" for both).
-            if (incoming_at is None or stored_at is None
-                    or incoming_at <= stored_at):
+            # `newer_login` also absorbs same-lineage stamp jitter. Equal or
+            # undated orders nothing either -- absent field, or a failed read
+            # (`_ex` gives "" for both).
+            if not newer_login(incoming_at, stored_at):
                 return False
         if oauth.refresh_token_spent(credentials):
             # THE SAME BYTES the reader-side adopt refuses, and on this path
@@ -5711,8 +5712,7 @@ class ClaudeAccountSwitcher:
             return False
 
         live_at, backup_at = _refresh_expiry(stored), _refresh_expiry(backup)
-        return (live_at is not None and backup_at is not None
-                and live_at > backup_at)
+        return newer_login(live_at, backup_at)
 
     def _entry_token_dead(
         self,

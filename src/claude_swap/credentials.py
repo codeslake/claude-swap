@@ -138,6 +138,21 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 # rotation, not a newer login.
 _LINEAGE_STAMP_JITTER_MS = 5_000
 
+
+def newer_login(a_at: "int | float | None", b_at: "int | float | None") -> bool:
+    """Whether ``a_at`` is a NEWER LOGIN than ``b_at``, not a same-lineage rotation.
+
+    Both are ``refreshTokenExpiresAt`` stamps. The server re-mints this field on
+    every refresh of the same lineage, with sub-second jitter (sign arbitrary),
+    so a stamp later by no more than ``_LINEAGE_STAMP_JITTER_MS`` is that jitter,
+    not a later login. Undated on either side is no evidence.
+    """
+    return (
+        a_at is not None
+        and b_at is not None
+        and a_at - b_at > _LINEAGE_STAMP_JITTER_MS
+    )
+
 # After a Keychain failure the store drops to file mode so one CLI invocation
 # can't split-brain between backends. A long-running daemon (menu bar / TUI)
 # instead re-probes this long after the last failure: far longer than any CLI
@@ -585,7 +600,10 @@ class CredentialStore:
         """The plaintext file's credential when it is a NEWER login, else None.
 
         Compared on ``refreshTokenExpiresAt``, which only a fresh login moves.
-        Any read or parse failure answers None: this decides which of two
+        A stamp later by more than the lineage jitter is a newer login. Within
+        that jitter the two stamps name the SAME login, and ``expiresAt`` (which
+        moves forward on every rotation) tells which is the newer generation of
+        it. Any read or parse failure answers None: this decides which of two
         readable credentials to serve, and an unreadable one is not a claim.
         """
         try:
@@ -598,23 +616,29 @@ class CredentialStore:
         if not text.strip():
             return None
 
-        def _refresh_expiry(blob: str) -> "int | None":
+        def _stamp(blob: str, field: str) -> "int | float | None":
             try:
                 obj = json.loads(blob)
             except (TypeError, ValueError):
                 return None
             obj = obj.get("claudeAiOauth") or obj
-            v = obj.get("refreshTokenExpiresAt")
+            v = obj.get(field)
             return v if isinstance(v, (int, float)) else None
 
-        kc_at, file_at = _refresh_expiry(keychain_value), _refresh_expiry(text)
+        kc_at = _stamp(keychain_value, "refreshTokenExpiresAt")
+        file_at = _stamp(text, "refreshTokenExpiresAt")
+        if newer_login(file_at, kc_at):
+            return text
         if (
-            kc_at is None
-            or file_at is None
-            or file_at - kc_at <= _LINEAGE_STAMP_JITTER_MS
+            kc_at is not None
+            and file_at is not None
+            and abs(file_at - kc_at) <= _LINEAGE_STAMP_JITTER_MS
         ):
-            return None
-        return text
+            kc_exp = _stamp(keychain_value, "expiresAt")
+            file_exp = _stamp(text, "expiresAt")
+            if kc_exp is not None and file_exp is not None and file_exp > kc_exp:
+                return text
+        return None
 
     def _read_active_credentials(self) -> ActiveCredentials:
         """Read Claude Code's active credential, classifying the outcome.

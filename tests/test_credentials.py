@@ -476,3 +476,27 @@ class TestTheTwoLiveStoresCanDisagreeAndTheFRESHERWins:
             "a 427ms-later file stamp from the same rotation lineage won "
             "over the Keychain's current generation"
         )
+
+    def test_a_same_lineage_rotation_jittered_by_ms_lets_the_fresher_generation_win(
+        self, tmp_path, monkeypatch
+    ):
+        """Same rotation lineage, jittered by 427ms — but this time the file
+        also carries the LATER access-token expiry, the signature of the
+        newer generation of the SAME login rather than an older or newer one.
+        Both stores hold the same login; only ``expiresAt`` says which
+        generation of it is current, and the file's must win."""
+        kc_refresh = 1_790_380_487_015
+        fl_refresh = kc_refresh + 427
+        kc = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-superseded", "refreshToken": "rt-superseded",
+            "expiresAt": 1_788_371_089_449,
+            "refreshTokenExpiresAt": kc_refresh}})
+        fl = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-current", "refreshToken": "rt-current",
+            "expiresAt": 1_788_399_592_015,
+            "refreshTokenExpiresAt": fl_refresh}})
+        got = self._store(tmp_path, monkeypatch, kc, fl)._read_active_credentials()
+        assert got.value == fl, (
+            "the Keychain's superseded generation won even though the file "
+            "held the later generation of the same login"
+        )
