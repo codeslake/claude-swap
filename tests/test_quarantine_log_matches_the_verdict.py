@@ -1,9 +1,8 @@
 """The quarantine WARNING is what a person reads when diagnosing, and it fired
 on the RAW strike count while the product's own verdict doubted that strike.
 
-`_strike_is_suspected_race` excuses a FIRST strike that a success preceded
-inside `RACE_WINDOW_S`: the slot keeps being fetched and `token_dead` answers
-False. The log said "is quarantined ... re-login may be needed" anyway, so the
+`_strike_is_suspected_race` excuses a FIRST strike that any success preceded:
+the slot keeps being fetched and `token_dead` answers False. The log said "is quarantined ... re-login may be needed" anyway, so the
 line named a remedy for a slot that was never quarantined -- the consume-gate
 race reads exactly like an expired token in the one place a person looks.
 """
@@ -16,7 +15,7 @@ import pytest
 
 from claude_swap import oauth
 from claude_swap.usage_store import (
-    AUTH_DEAD_STRIKES, RACE_WINDOW_S, FetchRecord as FR, UsageStore,
+    AUTH_DEAD_STRIKES, FetchRecord as FR, UsageStore,
 )
 
 CREDS = json.dumps({"claudeAiOauth": {"accessToken": "sk-a",
@@ -57,7 +56,7 @@ def test_a_second_strike_still_reports_a_quarantine(tmp_path, caplog):
     """THE CONTROL. Without it the assertion above passes for a build that
     stopped logging strikes at all. A wide gap used to reach it; the doubt is
     unbounded now, so the COUNT is what carries a row out of it."""
-    entry, lines = _struck(tmp_path, RACE_WINDOW_S + 60, caplog, strikes=2)
+    entry, lines = _struck(tmp_path, 660.0, caplog, strikes=2)
 
     assert entry.token_dead() is True, "premise: no doubt after two strikes"
     assert any("is quarantined" in m for m in lines), lines

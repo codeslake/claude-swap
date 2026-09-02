@@ -14,7 +14,6 @@ import pytest
 from claude_swap.usage_store import (
     AUTH_DEAD_STRIKES,
     BACKOFF_BASE_S,
-    RACE_WINDOW_S,
     FetchRecord,
     UsageEntry,
     UsageStore,
@@ -22,6 +21,11 @@ from claude_swap.usage_store import (
 )
 
 IDENT = {"1": ("a@x.com", "")}
+
+#: The width the doubt used to be bounded by. It bounds nothing now, so the
+#: cases below carry it themselves: a gap this wide is what USED to end the
+#: doubt, and each one asserts that it no longer does.
+WIDE_GAP_S = 600.0
 
 
 class FakeClock:
@@ -154,13 +158,13 @@ def test_the_retry_that_fails_again_makes_the_strike_stick(store, clock):
         "PREMISE: the first strike must be doubted"
     )
 
-    clock.advance(RACE_WINDOW_S + 1)
+    clock.advance(WIDE_GAP_S + 1)
     store.record({"1": FetchRecord(error="invalid_grant", struck_fp="sha256:a")},
                  IDENT)
     entry = store.entries(IDENT)["1"]
     assert entry.token_dead(), (
         f"a lineage that failed TWICE was still excused as a race "
-        f"(second strike {RACE_WINDOW_S + 311:.0f}s after its last success): "
+        f"(second strike {WIDE_GAP_S + 311:.0f}s after its last success): "
         f"fetched_at={entry.fetched_at} struck_at={entry.struck_at}"
     )
 
@@ -169,7 +173,7 @@ def test_the_retry_that_fails_again_makes_the_strike_stick(store, clock):
     (310, AUTH_DEAD_STRIKES, False),
     # THE CASE THAT FLIPPED. A wide gap used to render the relogin banner; a
     # sibling machine rotates on its own schedule, so it no longer does.
-    (RACE_WINDOW_S + 1, AUTH_DEAD_STRIKES, False),
+    (WIDE_GAP_S + 1, AUTH_DEAD_STRIKES, False),
     # The positive control, and what still ends the doubt: a SECOND strike.
     (310, AUTH_DEAD_STRIKES + 1, True),
 ])
@@ -232,7 +236,7 @@ def test_only_the_FIRST_strike_is_ever_doubted(store, clock):
                      IDENT)
     entry = store.entries(IDENT)["1"]
     gap = entry.struck_at - entry.fetched_at
-    assert gap <= RACE_WINDOW_S, (
+    assert gap <= WIDE_GAP_S, (
         f"PREMISE: the success is recent, so only the count can be killing it "
         f"(gap {gap:.0f}s)"
     )
@@ -256,7 +260,7 @@ def test_a_transient_retry_does_not_erase_the_doubt(store, clock):
                  IDENT)
     assert not store.entries(IDENT)["1"].token_dead(), "PREMISE: doubted"
 
-    clock.advance(RACE_WINDOW_S + 1)
+    clock.advance(WIDE_GAP_S + 1)
     store.record({"1": FetchRecord(error="http-429")}, IDENT)
     entry = store.entries(IDENT)["1"]
     assert entry.auth_dead_strikes == AUTH_DEAD_STRIKES, (
@@ -294,7 +298,7 @@ def test_a_lease_taken_and_never_recorded_does_not_erase_the_doubt(store, clock)
     clock.advance(310)
     store.record({"1": FetchRecord(error="invalid_grant", struck_fp="sha256:a")},
                  IDENT)
-    clock.advance(RACE_WINDOW_S + 1)
+    clock.advance(WIDE_GAP_S + 1)
     assert store.reserve(["1"], IDENT, respect_plans=False), (
         "PREMISE: a doubted row must still be eligible to retry"
     )

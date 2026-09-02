@@ -15778,8 +15778,8 @@ class TestALoginLandsInItsOwnSlot:
         sample_sequence_data: dict,
     ):
         """THE SHAPE EVERY OTHER TEST HERE MISSES. A slot that has ever polled
-        successfully carries `fetchedAt`, so its FIRST invalid_grant lands
-        inside RACE_WINDOW_S and `token_dead` doubts it — correctly, the
+        successfully carries `fetchedAt`, so its FIRST invalid_grant is
+        doubted by `token_dead` — correctly, the
         credential may still be alive. The adopt must refuse on that pass and
         then RUN once the retry confirms the death, instead of spending its
         one attempt while the verdict was still in doubt.
@@ -16246,8 +16246,6 @@ class TestALoginLandsInItsOwnSlot:
             self._resync_as_slot_2(s, same)
         write.assert_not_called()
         assert s._get_sequence_data()["activeAccountNumber"] == 1
-
-
 
 
 class TestCurrentAtLimitOverridesTheFrozenPct:
