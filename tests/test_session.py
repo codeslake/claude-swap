@@ -4196,6 +4196,41 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
     return [n for n, node_id in found if node_id not in sanctioned], len(found)
 
 
+def _notices_before_exec(src: str) -> tuple[list[int], int]:
+    """Print-only calls in the statements that lead straight into an exec.
+
+    For every `<x>.exec_default(...)` statement, the statements before it in
+    the same block, back to the previous `return`, are the notice's whole
+    life on screen. Printer calls in them (by the same matcher as
+    `_print_only_offenders`) are reported; the count of execs seen is the
+    denominator.
+    """
+    import ast
+
+    tree = ast.parse(src)
+    offenders_all, _ = _print_only_offenders(src)
+    offender_lines = set(offenders_all)
+    found: list[int] = []
+    execs = 0
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list):
+            continue
+        for i, stmt in enumerate(body):
+            call = stmt.value if isinstance(stmt, ast.Expr) else None
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "exec_default"):
+                continue
+            execs += 1
+            j = i - 1
+            while j >= 0 and not isinstance(body[j], ast.Return):
+                for sub in ast.walk(body[j]):
+                    if isinstance(sub, ast.Call) and sub.lineno in offender_lines:
+                        found.append(sub.lineno)
+                j -= 1
+    return sorted(set(found)), execs
+
+
 class TestEveryLaunchNoticeOutlivesTheBlank:
     """The screen blank erases stdout, so a print-only notice reaches nobody.
 
@@ -4263,6 +4298,26 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
             "a launch notice is print-only, so the screen blank erases it and "
             f"nothing records why: {[f'session.py:{n}' for n in offenders]}. "
             "Use `_note`."
+        )
+
+    def test_no_launch_notice_in_the_cli_is_print_only(self):
+        """The CLI's own launch path: a notice printed and then `exec_default`.
+
+        The sibling of the `session.py` defect this PR fixed. The block that
+        precedes the exec in the same function is the notice's whole life on
+        screen; anything printed there without a log record is gone with the
+        blank."""
+        import pathlib
+
+        import claude_swap.cli as cli_mod
+
+        src = pathlib.Path(cli_mod.__file__).read_text(encoding="utf-8")
+        offenders, execs = _notices_before_exec(src)
+        assert execs, "no `exec_default` call found in cli.py — the matcher is blind"
+        assert offenders == [], (
+            "a launch notice is print-only in the block before an exec, so the "
+            f"screen blank erases it: {[f'cli.py:{n}' for n in offenders]}. "
+            "Route it through the manager's `_warn`/`_note`."
         )
 
     def test_the_derivation_does_not_depend_on_the_hash_seed(self):
