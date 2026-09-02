@@ -4199,17 +4199,18 @@ def _print_only_offenders(src: str) -> tuple[list[int], int]:
 def _notices_before_exec(src: str) -> tuple[list[int], int]:
     """Print-only calls in the statements that lead straight into an exec.
 
-    For every `<x>.exec_default(...)` statement, the statements before it in
-    the same block, back to the previous `return`, are the notice's whole
-    life on screen. Printer calls in them (by the same matcher as
-    `_print_only_offenders`) are reported; the count of execs seen is the
-    denominator.
+    For every `<x>.exec_default(...)` statement, EVERY statement before it in
+    the same block is the notice's whole life on screen. Deliberately wider
+    than the paths that reach the exec: a branch that returns first is walked
+    too, because the terminator that would skip it cannot see one. A `return`
+    nested in an `if` is not a statement of this block, and a `return` that IS
+    one makes the exec below it unreachable -- so the narrower scan is a
+    promise no shape can keep, and the false alarm it costs names its line.
     """
     import ast
 
     tree = ast.parse(src)
-    offenders_all, _ = _print_only_offenders(src)
-    offender_lines = set(offenders_all)
+    offender_lines = set(_print_only_offenders(src)[0])
     found: list[int] = []
     execs = 0
     for node in ast.walk(tree):
@@ -4222,12 +4223,8 @@ def _notices_before_exec(src: str) -> tuple[list[int], int]:
                     and call.func.attr == "exec_default"):
                 continue
             execs += 1
-            j = i - 1
-            while j >= 0 and not isinstance(body[j], ast.Return):
-                for sub in ast.walk(body[j]):
-                    if isinstance(sub, ast.Call) and sub.lineno in offender_lines:
-                        found.append(sub.lineno)
-                j -= 1
+            found += [c.lineno for prev in body[:i] for c in ast.walk(prev)
+                      if isinstance(c, ast.Call) and c.lineno in offender_lines]
     return sorted(set(found)), execs
 
 
@@ -4314,6 +4311,16 @@ class TestEveryLaunchNoticeOutlivesTheBlank:
         src = pathlib.Path(cli_mod.__file__).read_text(encoding="utf-8")
         offenders, execs = _notices_before_exec(src)
         assert execs, "no `exec_default` call found in cli.py — the matcher is blind"
+        # AND THE OTHER HALF. `execs` is the denominator for finding the exec,
+        # which leaves the half that does the work with none: stubbing
+        # `_print_only_offenders` to `([], 0)` left this case green ON THE
+        # PRE-FIX SOURCE. This is the set the narrowing intersects, so a
+        # populated one says an empty result above is a clean block.
+        printed_anywhere, _ = _print_only_offenders(src)
+        assert printed_anywhere, (
+            "the print-only matcher reported nothing anywhere in cli.py, so an "
+            "empty result above means the matcher is blind, not the block clean"
+        )
         assert offenders == [], (
             "a launch notice is print-only in the block before an exec, so the "
             f"screen blank erases it: {[f'cli.py:{n}' for n in offenders]}. "
