@@ -167,9 +167,10 @@ Examples:
         "--require-session",
         action="store_true",
         help=(
-            "Refuse to launch when the account is already the active default "
-            "login, instead of running plain claude on that login (which a "
-            "later switch could pull out from under the session)"
+            "Never run plain claude on the default login (which a later "
+            "switch could pull out from under the session): refuse when the "
+            "account is already that login, and when no account is named and "
+            "this directory maps to none"
         ),
     )
     parser.add_argument(
