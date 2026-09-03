@@ -9701,6 +9701,37 @@ class TestUnclaimedStashSweep:
             "a slot not confirmed live this pass must not condemn the row"
         )
 
+    def test_sweep_keeps_a_superseded_identity_when_the_matched_slot_is_not_live(
+        self, temp_home, caplog,
+    ):
+        """``live_slots`` non-empty is not enough: it must contain the SLOT
+        THE ROW MATCHES. Slot 5 is live and unrelated; slot 4, which holds
+        the row's identity, was not measured live this pass."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", self._ms(30)),
+            uuid="uuid-4",
+        )
+        self._add_slot(
+            switcher, "5", "other@x.co", self._creds("other-rt", self._ms(30)),
+            uuid="uuid-5",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(10)),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash(live_slots={"5"})
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "slot 5 being live is irrelevant; slot 4, the row's matched "
+            "identity, was not confirmed live this pass"
+        )
+        assert not any(
+            "Dropped" in r.getMessage() for r in caplog.records
+        ), "nothing was positively condemned"
+
     def test_sweep_surfaces_a_newer_login_only_when_the_kept_set_changes(
         self, temp_home, caplog,
     ):
