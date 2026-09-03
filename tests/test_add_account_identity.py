@@ -842,6 +842,51 @@ def test_sync_never_overwrites_a_fresher_plaintext_login_with_an_older_keychain_
     )
 
 
+def test_sync_writes_through_an_older_generation_of_the_same_login_with_no_stash(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """The file holds an OLDER generation of the SAME login being adopted --
+    different access/refresh tokens (a refresh rotates both), but
+    ``refreshTokenExpiresAt`` within the lineage jitter and an older
+    ``expiresAt``. ``credential_fingerprint`` hashes the refresh token, which
+    rotates same as a new login would, so this generation must not be
+    scored as a different login and stashed; it must write through with no
+    stash.
+    """
+    s = _switcher(temp_home, mock_claude_config, "ax@example.com")
+    s.platform = Platform.MACOS
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+    kc_refresh = 88_888_888_888_000
+    file_refresh = kc_refresh - 721  # same lineage, well inside the 5s jitter
+    kc_new = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-NEW", "refreshToken": "rt-NEW",
+        "expiresAt": 99999999999000 + 3_600_000,
+        "refreshTokenExpiresAt": kc_refresh}})
+    file_old = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-OLD", "refreshToken": "rt-OLD",
+        "expiresAt": 99999999999000,
+        "refreshTokenExpiresAt": file_refresh}})  # same lineage, older generation
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(file_old, encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=kc_new), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=3, assume_yes=True)
+
+    assert cred_file.read_text(encoding="utf-8") == kc_new, (
+        "DEFECT: the file's older generation of the same login was not "
+        "synced to the adopted generation"
+    )
+    assert s._store._list_unclaimed_credentials() == {}, (
+        "DEFECT: an older generation of the SAME login was stashed as a "
+        "displaced different login"
+    )
+
+
 def test_sync_never_raises_out_of_add_account_on_an_unparseable_file(
     temp_home: Path, mock_claude_config: Path,
 ):

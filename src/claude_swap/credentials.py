@@ -154,6 +154,17 @@ def newer_login(a_at: "int | float | None", b_at: "int | float | None") -> bool:
         and a_at - b_at > LINEAGE_STAMP_JITTER_MS
     )
 
+
+def _credential_stamp(blob: str, field: str) -> "int | float | None":
+    """Read one numeric field off a credential's ``claudeAiOauth`` payload."""
+    try:
+        obj = json.loads(blob)
+        obj = obj.get("claudeAiOauth") or obj
+        v = obj.get(field)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return v if isinstance(v, (int, float)) else None
+
 # After a Keychain failure the store drops to file mode so one CLI invocation
 # can't split-brain between backends. A long-running daemon (menu bar / TUI)
 # instead re-probes this long after the last failure: far longer than any CLI
@@ -625,17 +636,8 @@ class CredentialStore:
         if not text.strip():
             return None
 
-        def _stamp(blob: str, field: str) -> "int | float | None":
-            try:
-                obj = json.loads(blob)
-                obj = obj.get("claudeAiOauth") or obj
-                v = obj.get(field)
-            except (TypeError, ValueError, AttributeError):
-                return None
-            return v if isinstance(v, (int, float)) else None
-
-        kc_at = _stamp(keychain_value, "refreshTokenExpiresAt")
-        file_at = _stamp(text, "refreshTokenExpiresAt")
+        kc_at = _credential_stamp(keychain_value, "refreshTokenExpiresAt")
+        file_at = _credential_stamp(text, "refreshTokenExpiresAt")
         if not same_lineage_only and newer_login(file_at, kc_at):
             return text
         if (
@@ -643,8 +645,8 @@ class CredentialStore:
             and file_at is not None
             and abs(file_at - kc_at) <= LINEAGE_STAMP_JITTER_MS
         ):
-            kc_exp = _stamp(keychain_value, "expiresAt")
-            file_exp = _stamp(text, "expiresAt")
+            kc_exp = _credential_stamp(keychain_value, "expiresAt")
+            file_exp = _credential_stamp(text, "expiresAt")
             if kc_exp is not None and file_exp is not None and file_exp > kc_exp:
                 return text
         return None
@@ -1259,10 +1261,23 @@ class CredentialStore:
             pass  # unparseable content: cannot compare, write through below
         if current is not None:
             try:
-                different_lineage = (
-                    oauth.credential_fingerprint(current)
-                    != oauth.credential_fingerprint(credentials)
-                )
+                # The fingerprint is a generation, the stamp is the lineage:
+                # a refresh rotates the refresh token same as a new login
+                # does, so credential_fingerprint alone can't tell a rotation
+                # predecessor from a different login. Where both sides carry
+                # refreshTokenExpiresAt, the jitter rule decides; fingerprint
+                # only when a stamp is missing (unknown lineage, preserve).
+                current_at = _credential_stamp(current, "refreshTokenExpiresAt")
+                new_at = _credential_stamp(credentials, "refreshTokenExpiresAt")
+                if current_at is not None and new_at is not None:
+                    different_lineage = (
+                        abs(current_at - new_at) > LINEAGE_STAMP_JITTER_MS
+                    )
+                else:
+                    different_lineage = (
+                        oauth.credential_fingerprint(current)
+                        != oauth.credential_fingerprint(credentials)
+                    )
             except Exception:
                 different_lineage = False  # unparseable: no lineage to preserve
             if different_lineage:
