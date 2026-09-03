@@ -592,6 +592,32 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
+def consume_first_rank_key(
+    usage: dict | str | None,
+    threshold: float,
+    now: float,
+    models: Sequence[str] = (),
+) -> tuple:
+    """Consume-first sort key for one candidate account.
+
+    Same two tiers ``_rank_candidates`` gates on below the threshold —
+    servable (``h > SPENT_HEADROOM_PCT``) before landing-healthy — then
+    soonest 7-day reset, most headroom breaking ties. Pulled out so a display
+    built from this key can never disagree with the account the engine would
+    switch to.
+    """
+    h = oauth.account_headroom(usage, models)
+    if h is None:
+        h = 0.0
+    reset_ts = _seven_day_reset_ts(usage, now)
+    return (
+        0 if h > SPENT_HEADROOM_PCT else 1,
+        0 if (100.0 - h) < threshold else 1,
+        reset_ts if reset_ts is not None else float("inf"),
+        -h,
+    )
+
+
 def _binding_recovery_ts(
     usage: dict | str | None, models: Sequence[str], now: float
 ) -> float:
@@ -2575,11 +2601,8 @@ class AutoSwitchEngine:
                 # servable-but-unhealthy requires a threshold under 97 and
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
-                key = (
-                    0 if h > SPENT_HEADROOM_PCT else 1,
-                    0 if (100.0 - h) < settings.threshold else 1,
-                    reset_ts if reset_ts is not None else float("inf"),
-                    -h,
+                key = consume_first_rank_key(
+                    usage.get(num), settings.threshold, now, self._models
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls

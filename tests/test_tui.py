@@ -1752,6 +1752,11 @@ class TestAutoScreen:
             assert screen._settings.threshold == 50.0  # spec's lower bound
 
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"strategy": "best"},
+        }))
         fake = FakeSwitcher(
             [
                 make_account(1, active=True, entry=make_entry(91.0, 20.0)),
@@ -1780,7 +1785,8 @@ class TestAutoScreen:
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1, "autoswitch": {"model": "Fable"},
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "best"},
         }))
         fake = FakeSwitcher(
             [
@@ -1806,6 +1812,68 @@ class TestAutoScreen:
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
             )
+
+    async def test_candidates_drain_soonest_seven_day_reset_first(
+        self, tmp_path, fake_engine
+    ):
+        """Under the default (consume-first) strategy, 'Next best' lists
+        switchable accounts in the order the engine would actually switch to
+        them: soonest 7-day reset first, so quota is spent before it resets
+        and goes to waste. The active's 5-hour window stays a gate, never a
+        key -- it plays no part in this order."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"threshold": 90},
+        }))
+
+        def _entry(pct7: float, reset7_s: float, pct5: float | None = None) -> UsageEntry:
+            if pct5 is None:
+                pct5 = pct7 - 10.0  # seeded below 7d: immaterial to the order
+            last_good = {
+                "five_hour": {"pct": pct5, "resets_at": _iso_in(7200)},
+                "seven_day": {"pct": pct7, "resets_at": _iso_in(reset7_s)},
+            }
+            return UsageEntry(last_good=last_good, fetched_at=time.time() - 5.0, age_s=5.0)
+
+        fake = FakeSwitcher(
+            [
+                make_account(  # active: 5h 38% resets 55m, 7d 53% resets 1d18h
+                    4, active=True,
+                    entry=UsageEntry(
+                        last_good={
+                            "five_hour": {"pct": 38.0, "resets_at": _iso_in(3300)},
+                            "seven_day": {"pct": 53.0, "resets_at": _iso_in(151200)},
+                        },
+                        fetched_at=time.time() - 5.0, age_s=5.0,
+                    ),
+                ),
+                make_account(6, entry=_entry(37.0, 532800, pct5=0.0)),
+                make_account(3, entry=_entry(44.0, 201600)),
+                make_account(2, entry=_entry(62.0, 309600)),
+                make_account(5, entry=_entry(42.0, 108000)),
+                make_account(1, entry=_entry(62.0, 414000)),  # cloud/OAuth slot
+                make_account(
+                    7, kind="api_key",
+                    entry=make_entry(
+                        pct5=None, pct7=None,
+                        spend={"used": 1.0, "limit": 100.0, "pct": 1.0, "currency": "USD"},
+                    ),
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            positions = [
+                plain.index(f"user{n}@example.com") for n in ("5", "3", "2", "1", "6", "7")
+            ]
+            assert positions == sorted(positions), plain
 
 
 class TestEventText:

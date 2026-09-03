@@ -332,6 +332,7 @@ class TestEngineHarnessIsolation:
 
 class TestDecisionTable:
     def test_below_threshold_is_no_action(self, harness):
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
         outcome = harness.tick_with_usage({
             "1": _usage(50), "2": _usage(10), "3": _usage(10),
         })
@@ -341,6 +342,7 @@ class TestDecisionTable:
         assert reasons == ["below-threshold"]
 
     def test_over_threshold_switches_to_max_headroom(self, harness):
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(40), "3": _usage(20),
         })
@@ -364,6 +366,7 @@ class TestDecisionTable:
         # Failing the margin is NOT exhaustion: no all-exhausted event, no
         # reset-sleep — the next tick must stay at normal cadence so the
         # at-limit escape isn't missed when the active account tops out.
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(86), "3": _usage(88),
         })
@@ -1058,7 +1061,7 @@ class TestDecisionTable:
         # Cooldown disabled so only the gate itself prevents flapping: after
         # 99→89 the roles reverse, and the old account (99%) can never beat
         # the new active (89%) — the move is one-way.
-        h = EngineHarness(temp_home, cooldown_seconds=0.0)
+        h = EngineHarness(temp_home, cooldown_seconds=0.0, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -3501,7 +3504,7 @@ class TestPctLabel:
         assert "switch at 99.9%" in poll.human()
 
     def test_below_threshold_detail_shows_fractional_threshold(self, temp_home):
-        h = EngineHarness(temp_home, threshold=99.9)
+        h = EngineHarness(temp_home, threshold=99.9, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -3516,7 +3519,7 @@ class TestPctLabel:
     ):
         # utilization 99.85 with threshold 99.9: .0f on the left side used
         # to render the logically impossible "100% < 99.9%".
-        h = EngineHarness(temp_home, threshold=99.9)
+        h = EngineHarness(temp_home, threshold=99.9, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -3803,7 +3806,7 @@ class TestModelAwareSwitch:
 
     def test_without_model_setting_the_same_usage_holds(self, temp_home):
         # Default engine ignores scoped windows → #1 reads 5% used, no switch.
-        h = self._seed(temp_home)
+        h = self._seed(temp_home, strategy="best")
         outcome = h.tick_with_usage({
             "1": _model_usage(5, 100),
             "2": _model_usage(5, 30),
@@ -4053,6 +4056,31 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_consume_first_is_the_default_strategy(self, temp_home):
+        """The owner's order: drain the account whose weekly window resets
+        soonest before it resets and the quota is wasted -- opt-in no
+        longer, so DEFAULT settings (no strategy given) must already switch
+        to the soonest-reset candidate, not the one with most headroom."""
+        h = EngineHarness(temp_home)  # strategy defaults to consume-first now
+        h.seed(4, "d@example.com")  # seeded (and made live) first -> active
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.seed(5, "e@example.com")
+        h.seed(6, "f@example.com")
+        h.make_live("d@example.com", 4)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "4": _usage7(95.0, 95.0),                        # active, over threshold
+            "6": _usage7(0.0, 37.0, _iso_at(now + 532800)),   # 6d4h -- most headroom
+            "3": _usage7(34.0, 44.0, _iso_at(now + 201600)),  # 2d8h
+            "2": _usage7(52.0, 62.0, _iso_at(now + 309600)),  # 3d14h
+            "5": _usage7(32.0, 42.0, _iso_at(now + 108000)),  # 1d6h -- soonest
+            "1": _usage7(52.0, 62.0, _iso_at(now + 414000)),  # 4d19h
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5
+
     def test_a_consume_first_target_must_still_be_healthy(self, temp_home):
         """The threshold landing gate has no cover on the consume-first path.
 
@@ -4264,9 +4292,9 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 3
 
     def test_best_strategy_unaffected_below_threshold(self, temp_home):
-        # Regression: default (best) still holds below threshold even when a
-        # peer resets sooner — consume-first behavior must be opt-in.
-        h = EngineHarness(temp_home)  # strategy defaults to "best"
+        # Regression: an explicit "best" still holds below threshold even
+        # when a peer resets sooner — consume-first ranking never leaks in.
+        h = EngineHarness(temp_home, strategy="best")
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com")
         h.make_live("a@example.com", 1)
@@ -11495,6 +11523,11 @@ class TestTheDeliberateWaitNamesTheResetItIsWaitingFor:
         Measured: with the wait widened to every empty ranking, the
         unreadable-fleet version passed and this one fails.
         """
+        # The hysteresis margin gate this control exercises is "best"'s;
+        # consume-first (now the default) admits any below-threshold peer
+        # once the active is over threshold, so it must be pinned to keep
+        # testing what it tests.
+        harness.engine.settings = replace(harness.engine.settings, strategy="best")
         outcome = harness.tick_with_usage({
             "1": _usage(92),   # active, over the threshold -> proactive
             "2": _usage(88),   # healthy, but only 4 points better than active

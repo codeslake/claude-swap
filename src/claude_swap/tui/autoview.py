@@ -29,6 +29,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
+    consume_first_rank_key,
     pct_label,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
@@ -320,12 +321,17 @@ class AutoScreen(Screen):
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by remaining headroom (best first)."""
+        """Switch targets ranked the way the engine's strategy would rank them."""
         # Same window set as the engine (autoswitch.model included), so the
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
-        ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
+        # Same strategy the engine ticks on, so the panel's order can never
+        # disagree with the account a tick would actually switch to.
+        consume_first = bool(
+            self._settings and self._settings.strategy == "consume-first"
+        )
+        ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
             if acc.number == active_number:
@@ -354,7 +360,7 @@ class AutoScreen(Screen):
                 )
                 entry.append(f"  {note}", style=palette.sev_warn)
                 lines[acc.number] = entry
-                ranked.append((1000.0, acc.number))   # last: never a target
+                ranked.append(((1000.0,), acc.number))   # last: never a target
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
@@ -364,7 +370,7 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
+                ranked.append(((998.0,), acc.number))
             elif pct is None:
                 # An extra-usage (pay-as-you-go) account has no 5h/7d window,
                 # so binding_pct answers None — but it is not unknown, it has
@@ -386,7 +392,7 @@ class AutoScreen(Screen):
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
                 # into the sort key would change which account the engine
                 # picks, and the ranking axis is not this row's to move.
-                ranked.append((999.0, acc.number))
+                ranked.append(((999.0,), acc.number))
             else:
                 # Per-window chips, from the same helper the dashboard uses
                 # (data.window_chip_label) so one account cannot read two ways.
@@ -405,7 +411,14 @@ class AutoScreen(Screen):
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
                 if not chips:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                ranked.append((pct, acc.number))
+                key = (
+                    consume_first_rank_key(
+                        acc.usage.last_good, self._settings.threshold, now, models
+                    )
+                    if consume_first
+                    else (pct,)
+                )
+                ranked.append((key, acc.number))
             lines[acc.number] = entry
 
         text = Text()
@@ -416,6 +429,6 @@ class AutoScreen(Screen):
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
+        for _key, number in sorted(ranked):
             text.append(lines[number])
         return text

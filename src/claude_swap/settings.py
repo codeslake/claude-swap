@@ -47,7 +47,7 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    strategy: str = "consume-first"  # "best" (most headroom) or "consume-first" (soonest weekly reset, default)
     include_api_key_accounts: bool = False
     decision_log: bool = False
     unhealthy_ticks: int = 3
