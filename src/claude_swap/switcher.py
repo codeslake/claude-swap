@@ -5358,6 +5358,7 @@ class ClaudeAccountSwitcher:
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        live_slots: set[str] = set()
         for num in info_by_num:
             if num in sentinels:
                 continue
@@ -5366,6 +5367,8 @@ class ClaudeAccountSwitcher:
             dead = self._entry_token_dead(
                 entry, num, _i[1], _i[5], _i[4], self._active_read_degraded
             )
+            if dead is False:
+                live_slots.add(num)
             if dead and self._adopt_stashed_login_for_slot(num, _i[1]):
                 # A login for this slot was set aside while the slot was
                 # still healthy, and nothing looked again once it died. This
@@ -5412,6 +5415,20 @@ class ClaudeAccountSwitcher:
                     expected_fingerprints={num: entry.struck_fingerprint},
                 )
                 entries = store.entries(identities, models)
+        # Every pass, fetches or none: arm A of the sweep still drains a
+        # refresh-and-access-dead row even when every fetch below fails, and
+        # only THIS loop measures which slots are live enough to license
+        # arm C's identity comparison. Contained exactly like the stash-time
+        # call: this runs every tick, so a torn roster must not take the
+        # whole collect pass down with it.
+        try:
+            self._sweep_unclaimed_stash(live_slots=live_slots)
+        except (ClaudeSwitchError, OSError, TypeError, AttributeError):
+            self._logger.warning(
+                "Could not finish sweeping the unclaimed stash; entries it had "
+                "not reached yet are still there.",
+                exc_info=True,
+            )
         requested = [
             num
             for num in info_by_num
@@ -7416,25 +7433,31 @@ class ClaudeAccountSwitcher:
             )
         return entry_id
 
-    def _sweep_unclaimed_stash(self) -> None:
+    def _sweep_unclaimed_stash(self, live_slots: "set[str] | None" = None) -> None:
         """Drop stash entries no login can revive, and report what is kept.
 
-        Only two POSITIVE verdicts drop an entry: a refresh token past its own
-        expiry, and one a managed slot already stores. Everything else is
+        Three POSITIVE verdicts drop an entry: both of its own tokens past
+        their own expiry; one a managed slot already stores; and one whose
+        ``resolvedIdentity`` names a slot that a THIS-PASS liveness check
+        (``live_slots``, empty unless the caller measured it) confirms holds
+        a newer login or generation of the same identity. Everything else is
         KEPT — the entry bytes carry no owner field, so a guess destroys the
         only copy of some account's login.
 
-        Age is deliberately not a third rule. An entry old enough to be
-        worthless is one whose refresh token has expired, which is the first
+        Age is deliberately not a fourth rule. An entry old enough to be
+        worthless is one whose tokens have both expired, which is the first
         rule already; whatever survives that is revivable however old it is.
 
-        The kept count is reported because a pile nobody knows about is the
-        state this sweep exists to end, not a quiet success.
+        The kept-pile warning fires only when the set of kept ids CHANGES
+        from the previous sweep on this instance, so an unresolved pile does
+        not repeat itself every tick.
         """
         entries = self._store._list_unclaimed_credentials()
         if not entries:
             return
+        live_slots = live_slots or set()
         stored: dict[str, str] | None = None
+        by_uuid: dict[str, tuple[str, str]] | None = None
 
         def _slot_fingerprints() -> dict[str, str]:
             # BUILT ON FIRST NEED. This runs inside `_perform_switch`'s three
@@ -7458,13 +7481,36 @@ class ClaudeAccountSwitcher:
                     out.setdefault(fp, num)
             return out
 
-        kept = 0
+        def _slot_by_uuid() -> dict[str, tuple[str, str]]:
+            # Same shape guard as `_slot_fingerprints`; no credential read
+            # here — `configSlot` is not an identity, so only a roster read
+            # is owed before a row's uuid has a slot to compare against.
+            out: dict[str, tuple[str, str]] = {}
+            accounts = (self._get_sequence_data() or {}).get("accounts")
+            for num, account in (
+                accounts if isinstance(accounts, dict) else {}
+            ).items():
+                if not isinstance(account, dict):
+                    continue
+                uuid = (account.get("uuid") or "").strip()
+                if uuid:
+                    out.setdefault(uuid, (num, account.get("email") or ""))
+            return out
+
+        kept_ids: set[str] = set()
         for entry_id in sorted(entries):
+            row = entries.get(entry_id) or {}
             creds, _ = self._store._read_unclaimed_credential(entry_id)
             # Unreadable, absent and corrupt all arrive here with no verdict
             # to act on, and no verdict is KEEP.
             fp = oauth.credential_fingerprint(creds)
-            if creds and oauth.refresh_token_spent(creds):
+            if (
+                creds
+                and oauth.refresh_token_spent(creds)
+                and oauth.is_oauth_token_expired(
+                    (oauth.extract_oauth_data(creds) or {}).get("expiresAt")
+                )
+            ):
                 # ponytail: the shared predicate carries the access-token
                 # buffer, so a row is dropped up to OAUTH_EXPIRY_BUFFER_MS
                 # early. A grant with minutes left mints one more, then dies.
@@ -7475,23 +7521,63 @@ class ClaudeAccountSwitcher:
                 if fp is not None and fp in stored:
                     why = f"Account-{stored[fp]} already stores that credential"
                 else:
-                    # A consume-gate row names its owner (`configSlot`) and the
-                    # generation it succeeds (`consumedFp`), and
-                    # `_adopt_stashed_successor` writes it back — so the
-                    # warning below is false for it, and the purge it suggests
-                    # would destroy the only copy of a spent grant's successor.
-                    if not (entries.get(entry_id) or {}).get("consumedFp"):
-                        kept += 1
-                    continue
+                    why = None
+                    identity = row.get("resolvedIdentity")
+                    row_uuid = (
+                        (identity.get("uuid") or "").strip()
+                        if isinstance(identity, dict) else ""
+                    )
+                    # A consumedFp row names the generation it succeeds and
+                    # `_adopt_stashed_successor` is its only intended writer
+                    # back — arm C must never decide FOR it. Guarded here,
+                    # before the identity match runs, not only in the
+                    # kept-warning exemption below: that exemption fires
+                    # AFTER a drop verdict already formed, which is too late.
+                    if row_uuid and live_slots and not row.get("consumedFp"):
+                        if by_uuid is None:
+                            by_uuid = _slot_by_uuid()
+                        match = by_uuid.get(row_uuid)
+                        if match and match[0] in live_slots:
+                            slot_num, slot_email = match
+                            row_at = _refresh_expiry(creds)
+                            slot_at = _refresh_expiry(
+                                self._read_account_credentials(slot_num, slot_email)
+                            )
+                            if (
+                                row_at is not None and slot_at is not None
+                                and not newer_login(row_at, slot_at)
+                            ):
+                                if newer_login(slot_at, row_at):
+                                    why = (
+                                        f"Account-{slot_num} holds a newer "
+                                        "login of that identity"
+                                    )
+                                else:
+                                    why = (
+                                        f"Account-{slot_num} holds a newer "
+                                        "generation of that login"
+                                    )
+                    if why is None:
+                        # A consume-gate row names its owner (`configSlot`)
+                        # and the generation it succeeds (`consumedFp`), and
+                        # `_adopt_stashed_successor` writes it back — so the
+                        # warning below is false for it, and the purge it
+                        # suggests would destroy the only copy of a spent
+                        # grant's successor.
+                        if not row.get("consumedFp"):
+                            kept_ids.add(entry_id)
+                        continue
             self._store._remove_unclaimed_credential(entry_id)
             self._logger.info("Dropped unclaimed credential %s: %s.", entry_id, why)
-        if kept:
+        last_kept = getattr(self, "_unclaimed_stash_last_kept_ids", None)
+        if kept_ids and kept_ids != last_kept:
             self._logger.warning(
                 "%d unclaimed credential(s) kept: nothing in them names an "
                 "owner, so each may be the only copy of some account's login "
                 "(`cswap unclaimed` lists them, `--purge ID` drops one).",
-                kept,
+                len(kept_ids),
             )
+        self._unclaimed_stash_last_kept_ids = kept_ids
 
     def _switch_to_empty_slot(
         self,

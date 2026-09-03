@@ -475,6 +475,40 @@ class TestTheCollectPassReachesTheStash:
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(FRESH)
 
+    def test_the_adopt_runs_before_the_sweep_that_follows_it(
+        self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
+    ):
+        """Consumer: `_adopt_stashed_login_for_slot`, ordered against arm A
+        of the same pass. A dead slot's stashed login is adopted (and its
+        stash row removed) inside the per-slot loop, BEFORE
+        `_sweep_unclaimed_stash` runs once at the end — so the row is
+        already gone by the time the sweep looks, and nothing is left for
+        arm A to have to drop."""
+        sw = self._switcher(sample_sequence_data)
+        entry_id = sw._store._write_unclaimed_credential(FRESH, {
+            "reason": "foreign",
+            "configSlot": "1",
+            "fingerprint": oauth.credential_fingerprint(FRESH),
+            "resolvedIdentity": {"uuid": "uuid-owner",
+                                 "email": "owner@example.com",
+                                 "organizationUuid": None},
+        })
+        seen_at_sweep_time = {}
+        real_sweep = sw._sweep_unclaimed_stash
+
+        def _spy(*args, **kwargs):
+            seen_at_sweep_time["ids"] = set(sw.list_unclaimed_credentials())
+            return real_sweep(*args, **kwargs)
+
+        monkeypatch.setattr(sw, "_sweep_unclaimed_stash", _spy)
+
+        sw._collect_usage_entries(sw._build_accounts_info(), fetch=set())
+
+        assert "ids" in seen_at_sweep_time, "the sweep must still run"
+        assert entry_id not in seen_at_sweep_time["ids"], (
+            "the adopt must remove the row before the sweep is even called"
+        )
+
     def test_with_nothing_stashed_the_slot_still_asks(
         self, temp_home, mock_claude_config, sample_sequence_data
     ):

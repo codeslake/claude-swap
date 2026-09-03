@@ -1380,6 +1380,52 @@ class TestUnclaimedCommand:
         assert switcher.list_unclaimed_credentials() == {}
         assert not switcher._store._stash_entry_path(entry_id).exists()
 
+    def test_a_purge_and_a_sweep_only_touch_their_own_rows(
+        self, temp_home,
+    ):
+        """Consumer: `cswap unclaimed --purge` (cli.py) beside the sweep.
+        Purging X and sweeping-away Y are two independent removals of the
+        same store — neither one's target is the other's, and a third row
+        with no drop verdict must be left standing by both."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        import time
+
+        def _creds(refresh, refresh_expires_at=None, access_expires_at=None):
+            payload = {"accessToken": "sk-a", "refreshToken": refresh}
+            if refresh_expires_at is not None:
+                payload["refreshTokenExpiresAt"] = refresh_expires_at
+            if access_expires_at is not None:
+                payload["expiresAt"] = access_expires_at
+            return json.dumps({"claudeAiOauth": payload})
+
+        def now_ms(days):
+            return int((time.time() + days * 86400) * 1000)
+
+        purge_target = switcher._store._write_unclaimed_credential(
+            _creds("x-rt", now_ms(20)), {"reason": "foreign"},
+        )
+        sweep_target = switcher._store._write_unclaimed_credential(
+            _creds("y-rt", now_ms(-1), access_expires_at=now_ms(-1)),
+            {"reason": "foreign"},
+        )
+        untouched = switcher._store._write_unclaimed_credential(
+            _creds("z-rt", now_ms(20)), {"reason": "foreign"},
+        )
+
+        with patch.object(os, "geteuid", return_value=1000, create=True):
+            cli._unclaimed_command(["--purge", purge_target])
+        switcher._sweep_unclaimed_stash()
+
+        remaining = switcher.list_unclaimed_credentials()
+        assert purge_target not in remaining
+        assert sweep_target not in remaining
+        assert untouched in remaining, (
+            "a row neither the purge nor the sweep targeted must survive both"
+        )
+
     def test_purging_an_unknown_id_fails_loudly(self, temp_home):
         self._stashed(temp_home)
         with patch("os.geteuid", return_value=1000, create=True), \

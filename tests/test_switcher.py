@@ -9547,27 +9547,34 @@ class TestUnclaimedStashSweep:
     def _ms(self, days):
         return int((time.time() + days * 86400) * 1000)
 
-    def _creds(self, refresh_token, refresh_expires_at=None, access="sk-a"):
+    def _creds(
+        self, refresh_token, refresh_expires_at=None, access="sk-a",
+        access_expires_at=None,
+    ):
         payload = {"accessToken": access, "refreshToken": refresh_token}
         if refresh_expires_at is not None:
             payload["refreshTokenExpiresAt"] = refresh_expires_at
+        if access_expires_at is not None:
+            payload["expiresAt"] = access_expires_at
         return json.dumps({"claudeAiOauth": payload})
 
-    def _add_slot(self, switcher, num, email, creds):
+    def _add_slot(self, switcher, num, email, creds, uuid=None):
         data = switcher._get_sequence_data()
-        data.setdefault("accounts", {})[num] = {
-            "email": email, "organizationUuid": "",
-        }
+        row = {"email": email, "organizationUuid": ""}
+        if uuid is not None:
+            row["uuid"] = uuid
+        data.setdefault("accounts", {})[num] = row
         switcher._write_json(switcher.sequence_file, data)
         switcher._store._write_account_credentials(num, email, creds)
 
     def test_sweep_drops_an_expired_refresh_token(self, temp_home, caplog):
-        """Arm 1: no login can revive it, so keeping it protects nothing."""
+        """Arm A: no login can revive it, so keeping it protects nothing."""
         import logging
 
         switcher = self._switcher(temp_home)
         entry_id = switcher._store._write_unclaimed_credential(
-            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+            {"reason": "foreign"},
         )
         with caplog.at_level(logging.INFO, logger="claude-swap"):
             switcher._sweep_unclaimed_stash()
@@ -9576,6 +9583,184 @@ class TestUnclaimedStashSweep:
             entry_id in r.getMessage() and "expired" in r.getMessage()
             for r in caplog.records
         ), "a drop must say which entry and why"
+
+    def test_sweep_arm_a_requires_both_tokens_expired(self, temp_home):
+        """A refresh token past its own expiry is not enough by itself: an
+        access token with life left can still mint requests until it too
+        expires, so arm A must require both."""
+        switcher = self._switcher(temp_home)
+        kept_id = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(1)),
+            {"reason": "foreign"},
+        )
+        dropped_id = switcher._store._write_unclaimed_credential(
+            self._creds(
+                "dead-rt-2", self._ms(-1), access_expires_at=self._ms(-1),
+            ),
+            {"reason": "foreign"},
+        )
+        switcher._sweep_unclaimed_stash()
+        assert dropped_id not in switcher.list_unclaimed_credentials()
+        assert kept_id in switcher.list_unclaimed_credentials(), (
+            "an unexpired access token can still mint requests"
+        )
+
+    def test_sweep_drops_a_superseded_identity_with_a_newer_login(
+        self, temp_home, caplog,
+    ):
+        """Arm C: the row's identity is confirmed elsewhere with a newer
+        login, and the slot was measured live this pass."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", self._ms(30)),
+            uuid="uuid-4",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(10)),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert entry_id not in switcher.list_unclaimed_credentials()
+        assert any(
+            "Account-4" in r.getMessage() and "newer login" in r.getMessage()
+            for r in caplog.records
+        ), "the drop must name the slot and the newer-login reason"
+
+    def test_sweep_drops_a_superseded_identity_same_generation_window(
+        self, temp_home, caplog,
+    ):
+        """Arm C: stamps within the jitter window and a different
+        fingerprint is a newer generation of the same login, not a newer
+        login itself."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        base = self._ms(10)
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", base + 2000),
+            uuid="uuid-4",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", base),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert entry_id not in switcher.list_unclaimed_credentials()
+        assert any(
+            "Account-4" in r.getMessage() and "newer generation" in r.getMessage()
+            for r in caplog.records
+        ), "stamps within the jitter window must read as a rotation, not a login"
+
+    def test_sweep_keeps_a_superseded_identity_when_the_slot_is_not_live(
+        self, temp_home,
+    ):
+        """Arm C needs the slot MEASURED LIVE this pass; a slot not in the
+        live set (dead is None or True) must not condemn the row."""
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", self._ms(30)),
+            uuid="uuid-4",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(10)),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        switcher._sweep_unclaimed_stash()  # no live slots passed
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "a slot not confirmed live this pass must not condemn the row"
+        )
+
+    def test_sweep_surfaces_a_newer_login_only_when_the_kept_set_changes(
+        self, temp_home, caplog,
+    ):
+        """The row IS the newer login, so it is kept — but the kept-pile
+        warning must fire once, stay silent while the kept set is unchanged,
+        and fire again once it changes."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", self._ms(5)),
+            uuid="uuid-4",
+        )
+        switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(30)),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash(live_slots={"4"})
+        warnings = [
+            r for r in caplog.records if "unclaimed credential" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert not any(
+            "unclaimed credential" in r.getMessage() for r in caplog.records
+        ), "an unchanged kept set must not warn again"
+
+        switcher._store._write_unclaimed_credential(
+            self._creds("no-expiry-rt"), {"reason": "displaced-live-login"},
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert any(
+            "unclaimed credential" in r.getMessage() for r in caplog.records
+        ), "a changed kept set must warn again"
+
+    def test_sweep_keeps_a_row_with_no_resolved_identity_regardless_of_configslot(
+        self, temp_home,
+    ):
+        """``configSlot`` names where a row was written FROM, not an identity
+        it carries — a displaced file could be another account's login, so
+        only ``resolvedIdentity`` licenses arm C."""
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", self._ms(30)),
+            uuid="uuid-4",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(10)),
+            {"reason": "foreign", "configSlot": "4"},
+        )
+        switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "configSlot names no identity; only resolvedIdentity licenses a drop"
+        )
+
+    def test_sweep_never_lets_arm_c_drop_a_consume_gate_row(self, temp_home):
+        """Consumer: `_adopt_stashed_successor`. A consumedFp row names its
+        owner (``configSlot``) and the generation it succeeds — the only
+        writer meant to touch it is the adopt, never arm C's identity
+        match, even when the row sits in the jitter window of a live slot
+        that would otherwise read as the same-generation drop case."""
+        switcher = self._switcher(temp_home)
+        base = self._ms(10)
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", base + 2000),
+            uuid="uuid-4",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", base),
+            {
+                "reason": "consume-gate-cas-conflict",
+                "configSlot": "4",
+                "consumedFp": "some-prior-generation-fp",
+                "resolvedIdentity": {"uuid": "uuid-4"},
+            },
+        )
+        switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "a consumedFp row is _adopt_stashed_successor's; arm C must "
+            "never drop it even when the identity match would otherwise fire"
+        )
 
     def test_sweep_drops_a_credential_a_slot_already_stores(
         self, temp_home, caplog,
@@ -9641,7 +9826,9 @@ class TestUnclaimedStashSweep:
         seam that bounds it without costing every tick a scan."""
         switcher = self._switcher(temp_home)
         stale = switcher._store._write_unclaimed_credential(
-            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+            self._creds(
+                "dead-rt", self._ms(-1), access_expires_at=self._ms(-1),
+            ), {"reason": "foreign"},
         )
         fresh = switcher._stash_live_credential(
             self._creds("fresh-rt", self._ms(20)), "foreign", "1", None,
@@ -9650,6 +9837,38 @@ class TestUnclaimedStashSweep:
         assert fresh in switcher.list_unclaimed_credentials(), (
             "the stash swept away the entry it had just created — that entry "
             "is the licence the caller overwrites the live store on"
+        )
+
+    def test_a_stashed_newer_login_survives_its_own_stash_and_the_next_collect_pass(
+        self, temp_home,
+    ):
+        """Consumer: the switch path, `_stash_live_credential` (inside
+        `_perform_switch`'s lock). The row it just wrote IS the newer login
+        of its identity, so it must survive two sweeps: its own (arm C gets
+        no ``live_slots`` there, so it cannot fire at all) and the very next
+        collector-pass sweep, whose ``live_slots`` now includes the row's
+        own ``configSlot`` — the one case this whole design surfaces to a
+        human instead of purging."""
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "1", "a@b.c", self._creds("slot-rt", self._ms(5)),
+            uuid="uuid-1",
+        )
+        fresh = switcher._stash_live_credential(
+            self._creds("fresh-rt", self._ms(30)), "foreign", "1",
+            {"uuid": "uuid-1"},
+        )
+        assert fresh in switcher.list_unclaimed_credentials(), (
+            "arm C must not fire during the stash's own sweep: it was "
+            "handed no live_slots to compare against"
+        )
+
+        # The next collect pass measures slot 1 live and hands it to the
+        # sweep — the row is still the NEWER login, so it must stay.
+        switcher._sweep_unclaimed_stash(live_slots={"1"})
+        assert fresh in switcher.list_unclaimed_credentials(), (
+            "the row is the newer login of its identity; arm C only drops "
+            "a row the slot has already superseded, never this one"
         )
 
     def test_a_failed_sweep_never_fails_the_stash(self, temp_home):
@@ -9765,7 +9984,9 @@ class TestUnclaimedStashSweep:
             "premise: the bytes must be gone while the manifest row remains"
         )
         doomed = switcher._store._write_unclaimed_credential(
-            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+            self._creds(
+                "dead-rt", self._ms(-1), access_expires_at=self._ms(-1),
+            ), {"reason": "foreign"},
         )
         with caplog.at_level(logging.WARNING, logger="claude-swap"):
             switcher._sweep_unclaimed_stash()
@@ -9796,7 +10017,9 @@ class TestUnclaimedStashSweep:
 
         switcher = self._switcher(temp_home)
         doomed = switcher._store._write_unclaimed_credential(
-            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+            self._creds(
+                "dead-rt", self._ms(-1), access_expires_at=self._ms(-1),
+            ), {"reason": "foreign"},
         )
         switcher._write_json(switcher.sequence_file, {"accounts": accounts})
 
@@ -9855,13 +10078,128 @@ class TestUnclaimedStashSweep:
         switcher = self._switcher(temp_home)
         self._add_slot(switcher, "1", "a@b.c", self._creds("s1", self._ms(20)))
         switcher._store._write_unclaimed_credential(
-            self._creds("dead-rt", self._ms(-1)), {"reason": "foreign"},
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+            {"reason": "foreign"},
         )
         with patch.object(
             switcher, "_read_account_credentials",
             side_effect=AssertionError("read a slot backup with nothing to compare"),
         ):
             switcher._sweep_unclaimed_stash()
+
+    def test_a_row_written_after_the_sweeps_snapshot_is_never_touched(
+        self, temp_home,
+    ):
+        """Consumer: the store (`_write_unclaimed_credential` /
+        `_remove_unclaimed_credential`, credentials.py). The sweep decides
+        off the LIST it takes once at the top; a row a concurrent writer
+        lands AFTER that list was read is not in the snapshot the loop
+        iterates, so it survives even though the same arm would drop it on
+        the very next pass. Each row's own read-modify-write cycle is
+        already serialized by `_mutate_stash_manifest`'s manifest lock —
+        this pins that the sweep never widens that to "the whole sweep",
+        which would instead have to notice and drop the late row too."""
+        switcher = self._switcher(temp_home)
+        doomed = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+            {"reason": "foreign"},
+        )
+        real_list = switcher._store._list_unclaimed_credentials
+        late = {}
+
+        def _list_then_a_concurrent_writer_lands_a_row(*a, **kw):
+            entries = real_list(*a, **kw)
+            # Fires once: a mock's side_effect re-runs on every call the
+            # sweep makes, and re-arming it on a later (fault-injected) call
+            # would land yet another row that never entered ANY snapshot,
+            # masking a widened re-list instead of being caught by it.
+            if "id" not in late:
+                late["id"] = switcher._store._write_unclaimed_credential(
+                    self._creds(
+                        "dead-rt-2", self._ms(-1), access_expires_at=self._ms(-1),
+                    ),
+                    {"reason": "foreign"},
+                )
+            return entries
+
+        with patch.object(
+            switcher._store, "_list_unclaimed_credentials",
+            side_effect=_list_then_a_concurrent_writer_lands_a_row,
+        ):
+            switcher._sweep_unclaimed_stash()
+
+        assert doomed not in switcher.list_unclaimed_credentials()
+        assert late["id"] in switcher.list_unclaimed_credentials(), (
+            "a row written after the sweep's snapshot must not be touched "
+            "by that sweep, even though the drop arm it qualifies for fired "
+            "on a sibling this same pass"
+        )
+
+    def test_sweep_makes_no_network_call_across_arms_a_b_and_c(self, temp_home):
+        """The sweep's own design: liveness comes from the collector's
+        THIS-PASS verdict, never a probe of its own — a 401 on a stashed
+        bearer is never positive evidence (arm A needs BOTH tokens expired
+        by their own stamps), so the sweep must never mint a refresh or GET
+        anything, on any of its three drop arms."""
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "1", "b@x.co", self._creds("slot-1-rt", self._ms(20)),
+        )
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-4-rt", self._ms(30)),
+            uuid="uuid-4",
+        )
+        # Arm A: both tokens of its own expired.
+        switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+            {"reason": "foreign"},
+        )
+        # Arm B: fingerprint a managed slot already stores.
+        switcher._store._write_unclaimed_credential(
+            self._creds("slot-1-rt", self._ms(20)), {"reason": "foreign"},
+        )
+        # Arm C: resolvedIdentity names a live slot with a newer generation.
+        switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(10)),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=AssertionError("the sweep must never touch the network"),
+        ):
+            switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert switcher.list_unclaimed_credentials() == {}, (
+            "all three drop arms must have fired with no network call"
+        )
+
+    def test_collect_usage_entries_sweeps_the_stash_with_this_pass_live_slots(
+        self, temp_home,
+    ):
+        """The stash-time call at ``_stash_live_credential`` sees no live
+        slots at all; only the collector, which measures liveness every
+        tick, can hand arm C a slot to compare against."""
+        switcher = self._switcher(temp_home)
+        live_creds = self._creds("live-rt", self._ms(30))
+        live_info = [(2, "live@x.co", "Org", "", False, live_creds, "")]
+        with patch.object(switcher, "_sweep_unclaimed_stash") as sweep:
+            switcher._collect_usage_entries(live_info, fetch=set())
+        sweep.assert_called_once_with(live_slots={"2"})
+
+        # A pass where the slot's own verdict came back dead: the live set
+        # is empty, but the sweep still runs — arm A still drains, arm C
+        # simply drains nothing this pass.
+        from claude_swap.usage_store import FetchRecord
+
+        switcher._usage_store.record(
+            {"3": FetchRecord(error="invalid_grant")}, {"3": ("dead@x.co", "")},
+        )
+        dead_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "at", "refreshToken": "rt", "expiresAt": 1,
+        }})
+        dead_info = [(3, "dead@x.co", "Org", "", False, dead_creds, "")]
+        with patch.object(switcher, "_sweep_unclaimed_stash") as sweep2:
+            switcher._collect_usage_entries(dead_info, fetch=set())
+        sweep2.assert_called_once_with(live_slots=set())
 
 
 @pytest.mark.usefixtures("_ex_reads_what_the_plain_reader_returns")
