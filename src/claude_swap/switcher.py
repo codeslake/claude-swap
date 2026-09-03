@@ -5148,6 +5148,7 @@ class ClaudeAccountSwitcher:
                 ):
                     return
                 self._write_account_credentials(account_num, email, live)
+                self._store._sync_active_credentials_file_to_adopted_login(live)
                 self._logger.info(
                     "Resynced account %s's backup to the rotated live "
                     "credential (rotation completed outside a collect pass).",

@@ -865,3 +865,57 @@ def test_sync_never_raises_out_of_add_account_on_an_unparseable_file(
     assert s._get_sequence_data()["accounts"]["3"]["email"] == "ax@example.com", (
         "DEFECT: add_account raised before the slot was fully registered"
     )
+
+
+def test_rotation_resync_syncs_the_stale_plaintext_file_to_the_active_slot(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """``_resync_rotated_backup`` writes a rotation that completed outside a
+    collect pass into the ACTIVE slot's Keychain backup, but never touched
+    ``.credentials.json`` -- so an ssh-born reader falling back to the
+    plaintext file kept serving the superseded generation until an unrelated
+    switch happened to write both stores.
+    """
+    s = ClaudeAccountSwitcher()
+    s.platform = Platform.MACOS
+    s._setup_directories()
+    s._init_sequence_file()
+    cfg = s._get_claude_config_path()
+    cfg.write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "ax@example.com", "organizationUuid": "",
+        "accountUuid": "u-ax"}}), encoding="utf-8")
+    seq = s._get_sequence_data()
+    seq["accounts"]["1"] = {
+        "email": "ax@example.com", "uuid": "u-ax", "organizationUuid": ""}
+    seq["sequence"] = [1]
+    seq["activeAccountNumber"] = 1
+    s._write_json(s.sequence_file, seq)
+
+    old_backup = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old-backup", "refreshToken": "rt-OLD-lineage",
+        "expiresAt": 99999999999000, "refreshTokenExpiresAt": 1_000}})
+    s._write_account_credentials("1", "ax@example.com", old_backup)
+
+    kc_new = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-KC-N-PLUS-1", "refreshToken": "rt-NEW",
+        "expiresAt": 99999999999000 + 3_600_000,
+        "refreshTokenExpiresAt": 50_000}})  # generation N+1
+    file_n = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-FILE-N", "refreshToken": "rt-NEW",
+        "expiresAt": 99999999999000,
+        "refreshTokenExpiresAt": 40_000}})  # same lineage, generation N
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(file_n, encoding="utf-8")
+
+    monkeypatch.setattr(s, "_read_credentials", lambda: kc_new)
+
+    with patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s._resync_rotated_backup("1", "ax@example.com", "", kc_new)
+
+    assert cred_file.read_text(encoding="utf-8") == kc_new, (
+        "DEFECT: the plaintext file still held generation N after the "
+        "rotation resync wrote generation N+1 into the slot backup"
+    )
