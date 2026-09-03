@@ -2082,8 +2082,14 @@ class CredentialStore:
         nothing a retry could ever adopt either way.
         """
         path = self._stash_entry_path(entry_id)
+        # BYTES, then decode -- same split as `_read_stash_manifest_ex`.
+        # `read_text` decodes inside the read, and `UnicodeDecodeError` is a
+        # `ValueError`, not an `OSError`: a stash entry holding non-UTF-8
+        # bytes would raise straight out of an OSError-only split, past
+        # every caller's containment. The bytes were readable; their content
+        # is garbage -- that reaches no verdict here, same as bad base64.
         try:
-            encoded = path.read_text(encoding="utf-8").strip()
+            raw = path.read_bytes()
         except FileNotFoundError:
             return "", False
         except OSError as e:
@@ -2092,6 +2098,7 @@ class CredentialStore:
             )
             return "", True
         try:
+            encoded = raw.decode("utf-8").strip()
             return base64.b64decode(encoded, validate=True).decode("utf-8"), False
         except Exception as e:
             self._host._logger.warning(

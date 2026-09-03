@@ -5322,6 +5322,7 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        sweep_stash: bool = True,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -5421,14 +5422,21 @@ class ClaudeAccountSwitcher:
         # arm C's identity comparison. Contained exactly like the stash-time
         # call: this runs every tick, so a torn roster must not take the
         # whole collect pass down with it.
-        try:
-            self._sweep_unclaimed_stash(live_slots=live_slots)
-        except (ClaudeSwitchError, OSError, TypeError, AttributeError):
-            self._logger.warning(
-                "Could not finish sweeping the unclaimed stash; entries it had "
-                "not reached yet are still there.",
-                exc_info=True,
-            )
+        if sweep_stash:
+            try:
+                self._sweep_unclaimed_stash(
+                    live_slots=live_slots,
+                    slot_creds={
+                        num: (info[1], info[5])
+                        for num, info in info_by_num.items()
+                    },
+                )
+            except (ClaudeSwitchError, OSError, TypeError, AttributeError, ValueError):
+                self._logger.warning(
+                    "Could not finish sweeping the unclaimed stash; entries it had "
+                    "not reached yet are still there.",
+                    exc_info=True,
+                )
         requested = [
             num
             for num in info_by_num
@@ -6396,7 +6404,10 @@ class ClaudeAccountSwitcher:
         creds = active.value or ""
         self._record_active_verdict(active)
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
-        return self._collect_usage_entries([info])[str(account_num)]
+        # A one-slot pass has no roster to compare against, so a `slot_creds`
+        # map built from just this slot would make arms B/C keep rows a full
+        # pass drops, flickering the kept-set warning: never sweep here.
+        return self._collect_usage_entries([info], sweep_stash=False)[str(account_num)]
 
     def _build_status_payload(self) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
@@ -7411,7 +7422,7 @@ class ClaudeAccountSwitcher:
             )
         try:
             self._sweep_unclaimed_stash()
-        except (ClaudeSwitchError, OSError, TypeError, AttributeError):
+        except (ClaudeSwitchError, OSError, TypeError, AttributeError, ValueError):
             # Housekeeping, and this method's contract is the opposite: a
             # raise here would read as a failed stash, and every caller aborts
             # the switch on one. Drops already made stand; the rest waits for
@@ -7424,8 +7435,11 @@ class ClaudeAccountSwitcher:
             # roster read is `strict=True`; `TypeError`/`AttributeError`
             # because a file can parse as valid JSON and still be the wrong
             # SHAPE (`{"accounts": "x"}`), and enumerating those one at a time
-            # is how the previous two rounds each found the next one. The
-            # `exc_info` below keeps a genuine coding error visible.
+            # is how the previous two rounds each found the next one.
+            # `ValueError` because `UnicodeDecodeError` (an undecodable
+            # `.unclaimed-*.enc`) is one, and an unswept row must not take
+            # this stash down with it. The `exc_info` below keeps a genuine
+            # coding error visible.
             self._logger.warning(
                 "Could not finish sweeping the unclaimed stash; entries it had "
                 "not reached yet are still there.",
@@ -7433,7 +7447,11 @@ class ClaudeAccountSwitcher:
             )
         return entry_id
 
-    def _sweep_unclaimed_stash(self, live_slots: "set[str] | None" = None) -> None:
+    def _sweep_unclaimed_stash(
+        self,
+        live_slots: "set[str] | None" = None,
+        slot_creds: "dict[str, tuple[str, str]] | None" = None,
+    ) -> None:
         """Drop stash entries no login can revive, and report what is kept.
 
         Three POSITIVE verdicts drop an entry: both of its own tokens past
@@ -7443,6 +7461,10 @@ class ClaudeAccountSwitcher:
         a newer login or generation of the same identity. Everything else is
         KEPT — the entry bytes carry no owner field, so a guess destroys the
         only copy of some account's login.
+
+        ``slot_creds`` (num -> (email, creds)) is what a collect pass already
+        read via ``_build_accounts_info``; when given, ``_slot_fingerprints``
+        uses it instead of reading each slot's backup a second time.
 
         Age is deliberately not a fourth rule. An entry old enough to be
         worthless is one whose tokens have both expired, which is the first
@@ -7466,7 +7488,10 @@ class ClaudeAccountSwitcher:
             # already condemned everything it looked at. Arm C's identity
             # match needs the very same per-slot backup this pass already
             # reads for the fingerprint index, so it is captured here rather
-            # than read a second time.
+            # than read a second time. A collect pass hands it in as
+            # `slot_creds` (already read for this pass by
+            # `_build_accounts_info`), so this only reads the store itself
+            # for the stash-time call, which has no such pass to borrow from.
             fps: dict[str, str] = {}
             by_uuid: dict[str, tuple[str, str, str]] = {}
             accounts = (self._get_sequence_data() or {}).get("accounts")
@@ -7478,8 +7503,11 @@ class ClaudeAccountSwitcher:
             ).items():
                 if not isinstance(account, dict):
                     continue  # a roster row of the wrong SHAPE owns nothing
-                email = account.get("email") or ""
-                creds = self._read_account_credentials(num, email)
+                if slot_creds is not None:
+                    email, creds = slot_creds.get(num, ("", ""))
+                else:
+                    email = account.get("email") or ""
+                    creds = self._read_account_credentials(num, email)
                 fp = oauth.credential_fingerprint(creds)
                 if fp:
                     fps.setdefault(fp, num)
@@ -7549,8 +7577,10 @@ class ClaudeAccountSwitcher:
                                     # `credentials._fresher_plaintext_login`
                                     # — so the row is the later rotation and
                                     # the only unspent refresh grant, unless
-                                    # the SLOT's `expiresAt` is at least as
-                                    # late.
+                                    # the SLOT's `expiresAt` is strictly
+                                    # later (an exact tie is unordered, per
+                                    # `credentials._fresher_plaintext_login`'s
+                                    # own `file_exp > kc_exp`).
                                     row_exp = (
                                         oauth.extract_oauth_data(creds) or {}
                                     ).get("expiresAt")
@@ -7558,10 +7588,16 @@ class ClaudeAccountSwitcher:
                                         oauth.extract_oauth_data(slot_creds)
                                         or {}
                                     ).get("expiresAt")
+                                    # NUMBERS ONLY — the row's bytes are
+                                    # foreign by construction, so a string
+                                    # (or any other non-numeric) `expiresAt`
+                                    # on either side reaches no verdict
+                                    # rather than raising out of the whole
+                                    # sweep, same shape as `_refresh_expiry`.
                                     if (
-                                        row_exp is not None
-                                        and slot_exp is not None
-                                        and slot_exp >= row_exp
+                                        isinstance(row_exp, (int, float))
+                                        and isinstance(slot_exp, (int, float))
+                                        and slot_exp > row_exp
                                     ):
                                         why = (
                                             f"Account-{slot_num} holds a "

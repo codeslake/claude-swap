@@ -9767,15 +9767,23 @@ class TestUnclaimedStashSweep:
         owner (``configSlot``) and the generation it succeeds — the only
         writer meant to touch it is the adopt, never arm C's identity
         match, even when the row sits in the jitter window of a live slot
-        that would otherwise read as the same-generation drop case."""
+        that would otherwise read as the same-generation drop case.
+
+        Both sides carry an ``expiresAt``, with the slot's strictly later,
+        so the within-jitter drop WOULD fire here if the ``consumedFp``
+        guard did not bail out before ever reaching that comparison — a row
+        with no ``expiresAt`` on either side proves nothing about the guard,
+        since the comparison bails on its own regardless of it.
+        """
         switcher = self._switcher(temp_home)
         base = self._ms(10)
         self._add_slot(
-            switcher, "4", "id@x.co", self._creds("slot-rt", base + 2000),
+            switcher, "4", "id@x.co",
+            self._creds("slot-rt", base + 2000, access_expires_at=self._ms(2)),
             uuid="uuid-4",
         )
         entry_id = switcher._store._write_unclaimed_credential(
-            self._creds("row-rt", base),
+            self._creds("row-rt", base, access_expires_at=self._ms(1)),
             {
                 "reason": "consume-gate-cas-conflict",
                 "configSlot": "4",
@@ -9787,6 +9795,63 @@ class TestUnclaimedStashSweep:
         assert entry_id in switcher.list_unclaimed_credentials(), (
             "a consumedFp row is _adopt_stashed_successor's; arm C must "
             "never drop it even when the identity match would otherwise fire"
+        )
+
+    def test_sweep_keeps_a_row_on_an_exact_expires_at_tie_within_jitter(
+        self, temp_home,
+    ):
+        """`credentials._fresher_plaintext_login` uses strict ``>`` for this
+        same comparison (``file_exp > kc_exp``): an exact ``expiresAt`` tie
+        names two unordered generations, so the row must be kept, not
+        dropped on a ``>=``."""
+        switcher = self._switcher(temp_home)
+        base = self._ms(10)
+        tie = self._ms(2)
+        self._add_slot(
+            switcher, "4", "id@x.co",
+            self._creds("slot-rt", base + 2000, access_expires_at=tie),
+            uuid="uuid-4",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", base, access_expires_at=tie),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "an exact expiresAt tie is unordered; the row must be kept"
+        )
+
+    def test_sweep_keeps_a_row_with_a_non_numeric_expires_at_instead_of_crashing(
+        self, temp_home,
+    ):
+        """A stash row's bytes are foreign by construction: a row whose
+        ``expiresAt`` is a string reaching arm C's within-jitter branch must
+        reach no verdict, not raise ``TypeError`` out of the whole sweep and
+        strand every entry ordered after it in the same pass."""
+        switcher = self._switcher(temp_home)
+        base = self._ms(10)
+        self._add_slot(
+            switcher, "4", "id@x.co",
+            self._creds("slot-rt", base + 2000, access_expires_at=self._ms(2)),
+            uuid="uuid-4",
+        )
+        bad = switcher._store._write_unclaimed_credential(
+            json.dumps({"claudeAiOauth": {
+                "accessToken": "sk-a", "refreshToken": "row-rt",
+                "refreshTokenExpiresAt": base, "expiresAt": "not-a-number",
+            }}),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        doomed = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+            {"reason": "foreign"},
+        )
+        switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert bad in switcher.list_unclaimed_credentials(), (
+            "a non-numeric expiresAt must reach no verdict, not a crash"
+        )
+        assert doomed not in switcher.list_unclaimed_credentials(), (
+            "a row after the malformed one must still be swept in the same pass"
         )
 
     def test_sweep_drops_a_credential_a_slot_already_stores(
@@ -10029,6 +10094,32 @@ class TestUnclaimedStashSweep:
             "the sweep dropped a row it could not positively condemn"
         )
 
+    def test_collect_usage_entries_survives_an_undecodable_unclaimed_credential(
+        self, temp_home,
+    ):
+        """`_read_unclaimed_credential`'s ``read_text`` raised
+        ``UnicodeDecodeError`` (a ``ValueError``) on non-UTF-8 bytes,
+        escaping the sweep's per-entry loop AND both callers' containment
+        (neither tuple carried ``ValueError``) -- so a single bad
+        ``.unclaimed-*.enc`` took `cswap list`/`--status`/the TUI's 3s
+        snapshot down with it."""
+        switcher = self._switcher(temp_home)
+        bad = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(20)), {"reason": "foreign"},
+        )
+        switcher._store._stash_entry_path(bad).write_bytes(b"\xff\xfe\x00bad")
+        doomed = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+            {"reason": "foreign"},
+        )
+        entries = switcher._collect_usage_entries([], fetch=set())
+        assert entries == {}
+        remaining = switcher.list_unclaimed_credentials()
+        assert doomed not in remaining, "the doomed row must still drop"
+        assert bad in remaining, "an undecodable row has no verdict: KEEP"
+        creds, _ = switcher._store._read_unclaimed_credential(bad)
+        assert creds == "", "undecodable bytes must read as empty, not raise"
+
     @pytest.mark.parametrize("accounts", [
         None, "not-a-map", ["1"], {"1": None}, {"2": "not-a-dict"},
     ], ids=["null-map", "str-map", "list-map", "null-row", "wrong-type-row"])
@@ -10210,7 +10301,9 @@ class TestUnclaimedStashSweep:
         live_info = [(2, "live@x.co", "Org", "", False, live_creds, "")]
         with patch.object(switcher, "_sweep_unclaimed_stash") as sweep:
             switcher._collect_usage_entries(live_info, fetch=set())
-        sweep.assert_called_once_with(live_slots={"2"})
+        sweep.assert_called_once_with(
+            live_slots={"2"}, slot_creds={"2": ("live@x.co", live_creds)},
+        )
 
         # A pass where the slot's own verdict came back dead: the live set
         # is empty, but the sweep still runs — arm A still drains, arm C
@@ -10226,7 +10319,66 @@ class TestUnclaimedStashSweep:
         dead_info = [(3, "dead@x.co", "Org", "", False, dead_creds, "")]
         with patch.object(switcher, "_sweep_unclaimed_stash") as sweep2:
             switcher._collect_usage_entries(dead_info, fetch=set())
-        sweep2.assert_called_once_with(live_slots=set())
+        sweep2.assert_called_once_with(
+            live_slots=set(), slot_creds={"3": ("dead@x.co", dead_creds)},
+        )
+
+    def test_sweep_uses_this_passs_already_read_credentials_when_given(
+        self, temp_home,
+    ):
+        """The collect site already read every slot's credentials via
+        `_build_accounts_info`; handing them to the sweep as `slot_creds`
+        must save `_slot_fingerprints` a second per-slot store read."""
+        switcher = self._switcher(temp_home)
+        self._add_slot(
+            switcher, "1", "a@b.c", self._creds("shared-rt", self._ms(20)),
+        )
+        self._add_slot(
+            switcher, "4", "id@x.co", self._creds("slot-rt", self._ms(30)),
+            uuid="uuid-4",
+        )
+        dup = switcher._store._write_unclaimed_credential(
+            self._creds("shared-rt", self._ms(20)), {"reason": "foreign"},
+        )
+        identity_row = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(10)),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        slot_creds = {
+            "1": ("a@b.c", self._creds("shared-rt", self._ms(20))),
+            "4": ("id@x.co", self._creds("slot-rt", self._ms(30))),
+        }
+        with patch.object(
+            switcher, "_read_account_credentials",
+            side_effect=AssertionError(
+                "must not re-read a slot the caller already handed in"
+            ),
+        ):
+            switcher._sweep_unclaimed_stash(
+                live_slots={"4"}, slot_creds=slot_creds,
+            )
+        assert dup not in switcher.list_unclaimed_credentials(), (
+            "arm B (duplicate fingerprint) must still fire off slot_creds"
+        )
+        assert identity_row not in switcher.list_unclaimed_credentials(), (
+            "arm C (newer login) must still fire off slot_creds"
+        )
+
+    def test_active_account_usage_never_sweeps(self, temp_home):
+        """A single-slot pass must not sweep: a one-slot `slot_creds` map
+        would make arms B/C keep rows a full pass drops, flickering the
+        kept-set warning."""
+        from claude_swap.credentials import ActiveCredentials
+
+        switcher = self._switcher(temp_home)
+        with patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials("", False, False),
+        ), patch.object(
+            switcher, "_sweep_unclaimed_stash",
+            side_effect=AssertionError("the single-slot pass must never sweep"),
+        ):
+            switcher._active_account_usage("1", "a@b.c", "")
 
     def test_a_failed_sweep_never_fails_the_collect_pass(self, temp_home, caplog):
         """Contained exactly like the stash-time call
