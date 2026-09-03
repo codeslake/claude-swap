@@ -10181,6 +10181,36 @@ class TestUnclaimedStashSweep:
         assert first_id in remaining, "a non-finite stamp has no positive verdict: KEEP"
         assert second_id not in remaining, "the row sorted after it must still drop"
 
+    def test_collect_usage_entries_survives_an_oversized_int_refreshTokenExpiresAt(
+        self, temp_home,
+    ):
+        """An oversized JSON integer stamp is legal JSON that ``json.loads``
+        keeps as a Python ``int``; arm A's own expiry check must not raise on
+        it and take every row sorted after it down with it."""
+        switcher = self._switcher(temp_home)
+        huge_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", self._ms(10)), {"reason": "foreign"},
+        )
+        doomed_id = switcher._store._write_unclaimed_credential(
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+            {"reason": "foreign"},
+        )
+        first_id, second_id = sorted([huge_id, doomed_id])
+        switcher._store._atomic_b64_write(
+            switcher._store._stash_entry_path(first_id),
+            '{"claudeAiOauth": {"accessToken": "sk-a", "refreshToken": '
+            '"row-rt", "refreshTokenExpiresAt": 1' + "0" * 400 + '}}',
+        )
+        switcher._store._atomic_b64_write(
+            switcher._store._stash_entry_path(second_id),
+            self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(-1)),
+        )
+        entries = switcher._collect_usage_entries([], fetch=set())
+        assert entries == {}
+        remaining = switcher.list_unclaimed_credentials()
+        assert first_id in remaining, "an oversized int stamp has no positive verdict: KEEP"
+        assert second_id not in remaining, "the row sorted after it must still drop"
+
     @pytest.mark.parametrize("accounts", [
         None, "not-a-map", ["1"], {"1": None}, {"2": "not-a-dict"},
     ], ids=["null-map", "str-map", "list-map", "null-row", "wrong-type-row"])

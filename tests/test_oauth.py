@@ -42,6 +42,9 @@ class TestIsOauthTokenExpired:
     def test_nan_is_not_expired(self):
         assert oauth.is_oauth_token_expired(float("nan")) is False
 
+    def test_oversized_int_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(10**400) is False
+
 
 class TestAccountHeadroom:
     """Test account_headroom."""
