@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -61,7 +62,7 @@ def credential_fingerprint(credentials: str) -> str | None:
 
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
-    if not isinstance(expires_at, (int, float)):
+    if not isinstance(expires_at, (int, float)) or not math.isfinite(expires_at):
         return False
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
