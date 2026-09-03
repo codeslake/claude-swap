@@ -3875,10 +3875,7 @@ class ClaudeAccountSwitcher:
 
             self._write_account_credentials(account_num, current_email, current_creds)
             self._store._sync_active_credentials_file_to_adopted_login(
-                current_creds,
-                stash=lambda live: self._stash_live_credential(
-                    live, "displaced-live-login", account_num, None,
-                ),
+                current_creds, slot=account_num,
             )
             self._write_account_config(account_num, current_email, current_config)
             self._usage_store.clear_dead_token(
@@ -4024,10 +4021,7 @@ class ClaudeAccountSwitcher:
         # Store backups
         self._write_account_credentials(account_num, current_email, current_creds)
         self._store._sync_active_credentials_file_to_adopted_login(
-            current_creds,
-            stash=lambda live: self._stash_live_credential(
-                live, "displaced-live-login", account_num, None,
-            ),
+            current_creds, slot=account_num,
         )
         self._write_account_config(account_num, current_email, current_config)
         self._usage_store.clear_dead_token(
@@ -5158,7 +5152,9 @@ class ClaudeAccountSwitcher:
                 ):
                     return
                 self._write_account_credentials(account_num, email, live)
-                self._store._sync_active_credentials_file_to_adopted_login(live)
+                self._store._sync_active_credentials_file_to_adopted_login(
+                    live, slot=account_num,
+                )
                 self._logger.info(
                     "Resynced account %s's backup to the rotated live "
                     "credential (rotation completed outside a collect pass).",

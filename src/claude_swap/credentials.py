@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Callable, NamedTuple, Protocol
+from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import (
@@ -1183,7 +1183,7 @@ class CredentialStore:
             )
 
     def _sync_active_credentials_file_to_adopted_login(
-        self, credentials: str, stash: "Callable[[str], object] | None" = None,
+        self, credentials: str, slot: str,
     ) -> None:
         """After an ``add_account`` adopt, bring an existing plaintext file to
         the adopted generation.
@@ -1226,14 +1226,14 @@ class CredentialStore:
 
         The write can still be about to discard a DIFFERENT login's only
         copy — e.g. the split above, read the other way: the file names a
-        newer login than the Keychain that is about to be captured, and
-        no slot backup holds it either. ``stash``, when given, is called
-        with the file's current bytes before that write; a successful
-        stash is the license to overwrite (the same rule
-        :meth:`_stash_live_credential` uses), so on failure the write is
-        skipped and the file is left as is. ``stash`` is ``None`` for a
-        caller that cannot reach this arm at all (a fingerprint-pinned
-        resync).
+        newer login than the Keychain that is about to be captured, and no
+        slot backup holds it either. The file's current bytes are stashed as
+        unclaimed before that write; a successful stash is the license to
+        overwrite (the same rule :meth:`_stash_live_credential` uses), so on
+        failure the write is skipped and the file is left as is. Every
+        caller reaches this arm — including a fingerprint-pinned resync,
+        which compares the Keychain generation to ``credentials``, never to
+        the file — so ``slot`` is required, not optional.
         """
         if self._host.platform != Platform.MACOS:
             return
@@ -1255,11 +1255,21 @@ class CredentialStore:
             return  # absent or unreadable: never-create posture, nothing to sync
         except Exception:
             pass  # unparseable content: cannot compare, write through below
-        if stash is not None:
-            try:
-                stash(current)
-            except Exception:
-                return  # failed stash is not a license to overwrite: leave the file
+        try:
+            self._write_unclaimed_credential(
+                current,
+                {
+                    "reason": "displaced-live-login",
+                    "configSlot": slot,
+                    "fingerprint": oauth.credential_fingerprint(current),
+                },
+            )
+        except Exception as e:
+            self._host._logger.warning(
+                f"Could not stash the plaintext file's login before syncing it "
+                f"to the adopted one ({e}); the file was left as is"
+            )
+            return  # failed stash is not a license to overwrite: leave the file
         self._refresh_stale_credentials_file(credentials)
 
     def _uses_file_backup_backend(self) -> bool:

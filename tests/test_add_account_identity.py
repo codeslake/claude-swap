@@ -903,7 +903,7 @@ def test_rotation_resync_syncs_the_stale_plaintext_file_to_the_active_slot(
     file_n = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-ant-oat01-FILE-N", "refreshToken": "rt-NEW",
         "expiresAt": 99999999999000,
-        "refreshTokenExpiresAt": 40_000}})  # same lineage, generation N
+        "refreshTokenExpiresAt": 48_000}})  # same lineage, generation N
 
     cred_file = temp_home / ".claude" / ".credentials.json"
     cred_file.write_text(file_n, encoding="utf-8")
@@ -918,6 +918,74 @@ def test_rotation_resync_syncs_the_stale_plaintext_file_to_the_active_slot(
     assert cred_file.read_text(encoding="utf-8") == kc_new, (
         "DEFECT: the plaintext file still held generation N after the "
         "rotation resync wrote generation N+1 into the slot backup"
+    )
+
+
+def test_resync_stashes_a_different_login_the_file_alone_held_before_overwriting(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """MEASURED BY THE REVIEWER: the resync site reaches the SAME
+    different-login arm of ``_sync_active_credentials_file_to_adopted_login``
+    the add_account arm does -- the fingerprint pin compares the Keychain
+    generation to ``creds``, never to the file, so a file holding a
+    different, older login is unaffected by the pin. A file login the resync
+    is about to overwrite must be stashed first, same as the add_account
+    arm.
+    """
+    s = ClaudeAccountSwitcher()
+    s.platform = Platform.MACOS
+    s._setup_directories()
+    s._init_sequence_file()
+    cfg = s._get_claude_config_path()
+    cfg.write_text(json.dumps({"oauthAccount": {
+        "emailAddress": "ax@example.com", "organizationUuid": "",
+        "accountUuid": "u-ax"}}), encoding="utf-8")
+    seq = s._get_sequence_data()
+    seq["accounts"]["1"] = {
+        "email": "ax@example.com", "uuid": "u-ax", "organizationUuid": ""}
+    seq["sequence"] = [1]
+    seq["activeAccountNumber"] = 1
+    s._write_json(s.sequence_file, seq)
+
+    old_backup = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-old-backup", "refreshToken": "rt-OLD-lineage",
+        "expiresAt": 99999999999000, "refreshTokenExpiresAt": 1_000}})
+    s._write_account_credentials("1", "ax@example.com", old_backup)
+
+    kc_new = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-KC-N-PLUS-1", "refreshToken": "rt-NEW",
+        "expiresAt": 99999999999000 + 3_600_000,
+        "refreshTokenExpiresAt": 50_000}})
+    file_l = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-FILE-L", "refreshToken": "rt-B-FILE-ONLY",
+        "expiresAt": 99999999999000,
+        "refreshTokenExpiresAt": 40_000}})  # a DIFFERENT login, 10s older
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(file_l, encoding="utf-8")
+
+    monkeypatch.setattr(s, "_read_credentials", lambda: kc_new)
+
+    with patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-ax", "email": "ax@example.com",
+                             "organizationUuid": ""}):
+        s._resync_rotated_backup("1", "ax@example.com", "", kc_new)
+
+    assert cred_file.read_text(encoding="utf-8") == kc_new, (
+        "DEFECT: the plaintext file did not receive the rotated Keychain "
+        "generation"
+    )
+
+    entries = s._store._list_unclaimed_credentials()
+    import base64
+    bodies = [
+        base64.b64decode(
+            s._store._stash_entry_path(eid).read_text().strip()
+        ).decode()
+        for eid in entries
+    ]
+    assert any("rt-B-FILE-ONLY" in b for b in bodies), (
+        "DEFECT: the resync overwrote login L's only copy without stashing it"
     )
 
 
@@ -956,27 +1024,28 @@ def test_sync_overwrites_a_different_login_left_by_a_failed_switch_time_refresh(
         "login A was adopted into the slot"
     )
 
+    entries = s._store._list_unclaimed_credentials()
+    stashed = [
+        s._store._read_unclaimed_credential(eid)[0] for eid in entries
+    ]
+    assert any("rt-B" in c for c in stashed), (
+        "DEFECT: login B's only copy was overwritten with nothing stashed"
+    )
 
-def test_sync_stashes_a_different_login_the_file_alone_held_before_overwriting(
+
+def test_sync_skips_the_write_when_the_stash_fails(
     temp_home: Path, mock_claude_config: Path, monkeypatch,
 ):
-    """MEASURED BY THE REVIEWER (breadth round on 8efa721a): the different-login
-    arm above is not only reached by a failed switch-time refresh -- it is
-    also what a Keychain/file split from #700-706 (one failed Keychain WRITE
-    sends Claude Code to the plaintext file while later Keychain READS keep
-    succeeding with the older item) routes through. There, the file's login
-    (L) is a DIFFERENT, later login than what the Keychain read captures (A),
-    and L lives NOWHERE else -- no slot backup holds it. Overwriting the file
-    with A destroys L's only copy. The write must still happen (A is what was
-    just adopted), but L must be preserved first, the same way an unowned
-    live credential is preserved anywhere else in this codebase: stashed as
-    an unclaimed credential before it is overwritten.
+    """A failed stash is not a licence to overwrite: :meth:`_write_unclaimed_credential`
+    raising must leave the plaintext file exactly as it was, and ``add_account``
+    must still return normally -- the credential the file alone held survives
+    to be stashed on a later pass rather than being destroyed silently.
     """
     s = _switcher(temp_home, mock_claude_config, "a@example.com")
     s.platform = Platform.MACOS
     monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
 
-    kc_refresh = 88_888_888_888_000  # arbitrary, not a wall-clock epoch (not expired)
+    kc_refresh = 88_888_888_888_000
     file_refresh = kc_refresh + 8_000  # beyond the 5s lineage jitter: a DIFFERENT login
     login_a = json.dumps({"claudeAiOauth": {
         "accessToken": "sk-ant-oat01-A", "refreshToken": "rt-A",
@@ -988,25 +1057,17 @@ def test_sync_stashes_a_different_login_the_file_alone_held_before_overwriting(
     cred_file = temp_home / ".claude" / ".credentials.json"
     cred_file.write_text(login_l, encoding="utf-8")
 
+    def boom(*a, **kw):
+        raise OSError("stash write failed")
+
+    monkeypatch.setattr(s._store, "_write_unclaimed_credential", boom)
+
     with patch.object(s, "_read_capture_credentials", return_value=login_a), \
          patch("claude_swap.oauth.fetch_oauth_profile",
                return_value={"uuid": "u-a", "email": "a@example.com",
                              "organizationUuid": ""}):
         s.add_account(slot=3, assume_yes=True)
 
-    assert cred_file.read_text(encoding="utf-8") == login_a, (
-        "DEFECT: the plaintext file still held a different login (L) after "
-        "login A was adopted into the slot"
-    )
-
-    entries = s._store._list_unclaimed_credentials()
-    import base64
-    bodies = [
-        base64.b64decode(
-            s._store._stash_entry_path(eid).read_text().strip()
-        ).decode()
-        for eid in entries
-    ]
-    assert any("rt-L-ONLY-COPY" in b for b in bodies), (
-        "DEFECT: login L's only copy was overwritten with nothing stashed"
+    assert cred_file.read_text(encoding="utf-8") == login_l, (
+        "DEFECT: failed stash still overwrote L"
     )
