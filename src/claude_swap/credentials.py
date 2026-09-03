@@ -30,6 +30,7 @@ from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import (
+    ClaudeSwitchError,
     CredentialError,
     CredentialReadError,
     CredentialWriteError,
@@ -1242,6 +1243,7 @@ class CredentialStore:
             secure_dir = Path(secure_env) if secure_env else get_default_claude_config_home()
             if secure_dir.resolve() != get_claude_config_home().resolve():
                 return
+        current = None
         try:
             if self._fresher_plaintext_login(
                 credentials, same_lineage_only=True
@@ -1255,21 +1257,30 @@ class CredentialStore:
             return  # absent or unreadable: never-create posture, nothing to sync
         except Exception:
             pass  # unparseable content: cannot compare, write through below
-        try:
-            self._write_unclaimed_credential(
-                current,
-                {
-                    "reason": "displaced-live-login",
-                    "configSlot": slot,
-                    "fingerprint": oauth.credential_fingerprint(current),
-                },
-            )
-        except Exception as e:
-            self._host._logger.warning(
-                f"Could not stash the plaintext file's login before syncing it "
-                f"to the adopted one ({e}); the file was left as is"
-            )
-            return  # failed stash is not a license to overwrite: leave the file
+        if current is not None:
+            try:
+                different_lineage = (
+                    oauth.credential_fingerprint(current)
+                    != oauth.credential_fingerprint(credentials)
+                )
+            except Exception:
+                different_lineage = False  # unparseable: no lineage to preserve
+            if different_lineage:
+                try:
+                    self._write_unclaimed_credential(
+                        current,
+                        {
+                            "reason": "displaced-live-login",
+                            "configSlot": slot,
+                            "fingerprint": oauth.credential_fingerprint(current),
+                        },
+                    )
+                except (ClaudeSwitchError, OSError, TypeError, AttributeError) as e:
+                    self._host._logger.warning(
+                        f"Could not stash the plaintext file's login before syncing it "
+                        f"to the adopted one ({e}); the file was left as is"
+                    )
+                    return  # failed stash is not a license to overwrite: leave the file
         self._refresh_stale_credentials_file(credentials)
 
     def _uses_file_backup_backend(self) -> bool:
