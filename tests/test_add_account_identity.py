@@ -919,3 +919,39 @@ def test_rotation_resync_syncs_the_stale_plaintext_file_to_the_active_slot(
         "DEFECT: the plaintext file still held generation N after the "
         "rotation resync wrote generation N+1 into the slot backup"
     )
+
+
+def test_sync_overwrites_a_different_login_left_by_a_failed_switch_time_refresh(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """The fresher-file skip must fire only on a NEWER GENERATION of the SAME
+    login, never on a DIFFERENT login the file happens to name with a later
+    ``refreshTokenExpiresAt``. A file left on account B by a failed
+    switch-time refresh must still be brought to account A once A is the one
+    just adopted -- B's later stamp is not evidence that B belongs there.
+    """
+    s = _switcher(temp_home, mock_claude_config, "a@example.com")
+    s.platform = Platform.MACOS
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+    login_a = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-A", "refreshToken": "rt-A",
+        "expiresAt": 99999999999000, "refreshTokenExpiresAt": 10_000}})
+    login_b = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-B", "refreshToken": "rt-B",
+        "expiresAt": 99999999999000,
+        "refreshTokenExpiresAt": 10_000 + 50_000}})  # a DIFFERENT login
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(login_b, encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=login_a), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-a", "email": "a@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=3, assume_yes=True)
+
+    assert cred_file.read_text(encoding="utf-8") == login_a, (
+        "DEFECT: the plaintext file still held a different login (B) after "
+        "login A was adopted into the slot"
+    )

@@ -596,7 +596,9 @@ class CredentialStore:
         )
         return None, True
 
-    def _fresher_plaintext_login(self, keychain_value: str) -> "str | None":
+    def _fresher_plaintext_login(
+        self, keychain_value: str, *, same_lineage_only: bool = False,
+    ) -> "str | None":
         """The plaintext file's credential when it is a NEWER login, else None.
 
         Compared on ``refreshTokenExpiresAt``, which only a fresh login moves.
@@ -605,6 +607,12 @@ class CredentialStore:
         moves forward on every rotation) tells which is the newer generation of
         it. Any read or parse failure answers None: this decides which of two
         readable credentials to serve, and an unreadable one is not a claim.
+
+        ``same_lineage_only`` restricts the verdict to the within-jitter arm —
+        a later GENERATION of the same login — and never answers on a later
+        ``refreshTokenExpiresAt`` that names a DIFFERENT login. A caller that
+        means "is the file a newer generation of what I'm about to write"
+        must not read "the file holds someone else's later login" as that.
         """
         try:
             cred_file = get_credentials_path()
@@ -627,7 +635,7 @@ class CredentialStore:
 
         kc_at = _stamp(keychain_value, "refreshTokenExpiresAt")
         file_at = _stamp(text, "refreshTokenExpiresAt")
-        if newer_login(file_at, kc_at):
+        if not same_lineage_only and newer_login(file_at, kc_at):
             return text
         if (
             kc_at is not None
@@ -1191,15 +1199,20 @@ class CredentialStore:
         file belongs to a different one — the cross-profile write
         ``_read_capture_credentials`` itself refuses to make.
 
-        Skipped when the file is already the FRESHER login
-        (:meth:`_fresher_plaintext_login`): ``_read_capture_credentials``
-        routes through ``session.read_config_dir_credentials`` when either
-        env var is defined, which is Keychain-first with no freshness
-        arbitration — unlike :meth:`_read_active_credentials`, which does
-        call ``_fresher_plaintext_login``. Without this, an older Keychain
+        Skipped when the file already holds a NEWER GENERATION of this same
+        login (:meth:`_fresher_plaintext_login`, ``same_lineage_only``):
+        ``_read_capture_credentials`` routes through
+        ``session.read_config_dir_credentials`` when either env var is
+        defined, which is Keychain-first with no freshness arbitration —
+        unlike :meth:`_read_active_credentials`, which does call
+        ``_fresher_plaintext_login``. Without this, an older Keychain
         generation (one failed Keychain write, later reads still serving the
         stale item) would overwrite a newer file generation's live refresh
-        token with a spent one, and the write has no backup.
+        token with a spent one, and the write has no backup. Restricted to
+        the same-lineage arm: a file left on a DIFFERENT login by a failed
+        switch-time refresh is not a reason to keep it — that login is
+        superseded by the one just adopted, and belongs to nobody's
+        "fresher".
 
         Skipped when the file already carries these bytes, so a routine
         adopt of an unchanged login causes no rewrite. An unreadable file
@@ -1217,7 +1230,9 @@ class CredentialStore:
             if secure_dir.resolve() != get_claude_config_home().resolve():
                 return
         try:
-            if self._fresher_plaintext_login(credentials) is not None:
+            if self._fresher_plaintext_login(
+                credentials, same_lineage_only=True
+            ) is not None:
                 return
             from claude_swap import oauth
             current = get_credentials_path().read_text(encoding="utf-8")
