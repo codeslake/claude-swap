@@ -756,6 +756,14 @@ def test_adopting_a_keychain_login_syncs_the_stale_plaintext_file(
         "B was adopted from the Keychain into the slot"
     )
 
+    entries = s._store._list_unclaimed_credentials()
+    stashed = [
+        s._store._read_unclaimed_credential(eid)[0] for eid in entries
+    ]
+    assert any("rt-login-a" in c for c in stashed), (
+        "DEFECT: login A's only copy was overwritten with nothing stashed"
+    )
+
 
 def test_sync_skips_when_secure_storage_profile_diverges_from_config_dir(
     temp_home: Path, mock_claude_config: Path, monkeypatch,
@@ -1063,10 +1071,11 @@ def test_resync_writes_through_a_same_lineage_older_generation_with_no_stash(
     """A same-LINEAGE older generation (same ``refreshToken``, the file just
     hasn't caught up to the Keychain's later rotation) is not a different
     login to preserve -- its refresh token is the one about to be persisted
-    to the slot backup by this same resync. The stash arm must gate on
-    ``credential_fingerprint`` (lineage), not on a byte-for-byte payload
-    diff, or the ordinary rotation-resync case writes a stash row for
-    nothing every time.
+    to the slot backup by this same resync. The stash arm must gate on the
+    ``refreshTokenExpiresAt`` stamp (the lineage; ``credential_fingerprint``
+    is a generation, used only when a stamp is missing), not on a
+    byte-for-byte payload diff, or the ordinary rotation-resync case writes
+    a stash row for nothing every time.
     """
     s = ClaudeAccountSwitcher()
     s.platform = Platform.MACOS
