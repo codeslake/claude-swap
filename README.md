@@ -82,7 +82,7 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account whose weekly window resets soonest (the default strategy; `--strategy best` picks the most quota left instead) — before you hit the limit, and safe to run while Claude Code is working:
 
 ```bash
 cswap auto                     # foreground loop, polls every 60s
