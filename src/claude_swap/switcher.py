@@ -7457,14 +7457,18 @@ class ClaudeAccountSwitcher:
             return
         live_slots = live_slots or set()
         stored: dict[str, str] | None = None
-        by_uuid: dict[str, tuple[str, str]] | None = None
+        by_uuid: dict[str, tuple[str, str, str]] | None = None
 
-        def _slot_fingerprints() -> dict[str, str]:
+        def _slot_fingerprints() -> "tuple[dict[str, str], dict[str, tuple[str, str, str]]]":
             # BUILT ON FIRST NEED. This runs inside `_perform_switch`'s three
             # lock block, and on macOS each backup read is a `security`
             # subprocess — a cost no sweep should pay when the expiry arm
-            # already condemned everything it looked at.
-            out: dict[str, str] = {}
+            # already condemned everything it looked at. Arm C's identity
+            # match needs the very same per-slot backup this pass already
+            # reads for the fingerprint index, so it is captured here rather
+            # than read a second time.
+            fps: dict[str, str] = {}
+            by_uuid: dict[str, tuple[str, str, str]] = {}
             accounts = (self._get_sequence_data() or {}).get("accounts")
             # THE MAP'S TYPE TOO, not just each row's: `or {}` covers null
             # and empty but hands a truthy non-mapping (`{"accounts": "x"}`)
@@ -7474,28 +7478,15 @@ class ClaudeAccountSwitcher:
             ).items():
                 if not isinstance(account, dict):
                     continue  # a roster row of the wrong SHAPE owns nothing
-                fp = oauth.credential_fingerprint(
-                    self._read_account_credentials(num, account.get("email") or "")
-                )
+                email = account.get("email") or ""
+                creds = self._read_account_credentials(num, email)
+                fp = oauth.credential_fingerprint(creds)
                 if fp:
-                    out.setdefault(fp, num)
-            return out
-
-        def _slot_by_uuid() -> dict[str, tuple[str, str]]:
-            # Same shape guard as `_slot_fingerprints`; no credential read
-            # here — `configSlot` is not an identity, so only a roster read
-            # is owed before a row's uuid has a slot to compare against.
-            out: dict[str, tuple[str, str]] = {}
-            accounts = (self._get_sequence_data() or {}).get("accounts")
-            for num, account in (
-                accounts if isinstance(accounts, dict) else {}
-            ).items():
-                if not isinstance(account, dict):
-                    continue
+                    fps.setdefault(fp, num)
                 uuid = (account.get("uuid") or "").strip()
                 if uuid:
-                    out.setdefault(uuid, (num, account.get("email") or ""))
-            return out
+                    by_uuid.setdefault(uuid, (num, email, creds))
+            return fps, by_uuid
 
         kept_ids: set[str] = set()
         for entry_id in sorted(entries):
@@ -7517,7 +7508,7 @@ class ClaudeAccountSwitcher:
                 why = "its refresh token has expired"
             else:
                 if stored is None:
-                    stored = _slot_fingerprints()
+                    stored, by_uuid = _slot_fingerprints()
                 if fp is not None and fp in stored:
                     why = f"Account-{stored[fp]} already stores that credential"
                 else:
@@ -7534,15 +7525,13 @@ class ClaudeAccountSwitcher:
                     # kept-warning exemption below: that exemption fires
                     # AFTER a drop verdict already formed, which is too late.
                     if row_uuid and live_slots and not row.get("consumedFp"):
-                        if by_uuid is None:
-                            by_uuid = _slot_by_uuid()
-                        match = by_uuid.get(row_uuid)
+                        # `stored` above always builds `by_uuid` alongside
+                        # it, so by this point it is already populated.
+                        match = (by_uuid or {}).get(row_uuid)
                         if match and match[0] in live_slots:
-                            slot_num, slot_email = match
+                            slot_num, slot_email, slot_creds = match
                             row_at = _refresh_expiry(creds)
-                            slot_at = _refresh_expiry(
-                                self._read_account_credentials(slot_num, slot_email)
-                            )
+                            slot_at = _refresh_expiry(slot_creds)
                             if (
                                 row_at is not None and slot_at is not None
                                 and not newer_login(row_at, slot_at)
@@ -7553,10 +7542,31 @@ class ClaudeAccountSwitcher:
                                         "login of that identity"
                                     )
                                 else:
-                                    why = (
-                                        f"Account-{slot_num} holds a newer "
-                                        "generation of that login"
-                                    )
+                                    # Within jitter: same lineage, different
+                                    # rotation. `expiresAt` (the access
+                                    # token's mint) orders generations of one
+                                    # lineage — this file's own rule at
+                                    # `credentials._fresher_plaintext_login`
+                                    # — so the row is the later rotation and
+                                    # the only unspent refresh grant, unless
+                                    # the SLOT's `expiresAt` is at least as
+                                    # late.
+                                    row_exp = (
+                                        oauth.extract_oauth_data(creds) or {}
+                                    ).get("expiresAt")
+                                    slot_exp = (
+                                        oauth.extract_oauth_data(slot_creds)
+                                        or {}
+                                    ).get("expiresAt")
+                                    if (
+                                        row_exp is not None
+                                        and slot_exp is not None
+                                        and slot_exp >= row_exp
+                                    ):
+                                        why = (
+                                            f"Account-{slot_num} holds a "
+                                            "newer generation of that login"
+                                        )
                     if why is None:
                         # A consume-gate row names its owner (`configSlot`)
                         # and the generation it succeeds (`consumedFp`), and

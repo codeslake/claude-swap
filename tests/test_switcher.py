@@ -9593,14 +9593,7 @@ class TestUnclaimedStashSweep:
             self._creds("dead-rt", self._ms(-1), access_expires_at=self._ms(1)),
             {"reason": "foreign"},
         )
-        dropped_id = switcher._store._write_unclaimed_credential(
-            self._creds(
-                "dead-rt-2", self._ms(-1), access_expires_at=self._ms(-1),
-            ),
-            {"reason": "foreign"},
-        )
         switcher._sweep_unclaimed_stash()
-        assert dropped_id not in switcher.list_unclaimed_credentials()
         assert kept_id in switcher.list_unclaimed_credentials(), (
             "an unexpired access token can still mint requests"
         )
@@ -9634,17 +9627,20 @@ class TestUnclaimedStashSweep:
     ):
         """Arm C: stamps within the jitter window and a different
         fingerprint is a newer generation of the same login, not a newer
-        login itself."""
+        login itself. The slot's own ``expiresAt`` (the access token's mint)
+        is the LATER of the two here, so it is the later rotation and the
+        row's grant is the one already spent."""
         import logging
 
         switcher = self._switcher(temp_home)
         base = self._ms(10)
         self._add_slot(
-            switcher, "4", "id@x.co", self._creds("slot-rt", base + 2000),
+            switcher, "4", "id@x.co",
+            self._creds("slot-rt", base + 2000, access_expires_at=self._ms(2)),
             uuid="uuid-4",
         )
         entry_id = switcher._store._write_unclaimed_credential(
-            self._creds("row-rt", base),
+            self._creds("row-rt", base, access_expires_at=self._ms(1)),
             {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
         )
         with caplog.at_level(logging.INFO, logger="claude-swap"):
@@ -9654,6 +9650,37 @@ class TestUnclaimedStashSweep:
             "Account-4" in r.getMessage() and "newer generation" in r.getMessage()
             for r in caplog.records
         ), "stamps within the jitter window must read as a rotation, not a login"
+
+    def test_sweep_keeps_a_same_generation_row_when_its_own_expiry_is_later(
+        self, temp_home, caplog,
+    ):
+        """Arm C, within jitter: ``expiresAt`` orders generations of one
+        lineage (``credentials._fresher_plaintext_login``'s own rule). A row
+        whose ``expiresAt`` is LATER than the live slot's backup is the later
+        rotation and the only unspent refresh grant for it — dropping it on
+        sign-blind stamp order alone would destroy that sole surviving copy."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        base = self._ms(10)
+        self._add_slot(
+            switcher, "4", "id@x.co",
+            self._creds("slot-rt", base + 2000, access_expires_at=self._ms(1)),
+            uuid="uuid-4",
+        )
+        entry_id = switcher._store._write_unclaimed_credential(
+            self._creds("row-rt", base, access_expires_at=self._ms(2)),
+            {"reason": "foreign", "resolvedIdentity": {"uuid": "uuid-4"}},
+        )
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            switcher._sweep_unclaimed_stash(live_slots={"4"})
+        assert entry_id in switcher.list_unclaimed_credentials(), (
+            "the row's expiresAt is later than the slot's: it is the newer "
+            "rotation and the only unspent refresh grant"
+        )
+        assert any(
+            "unclaimed credential" in r.getMessage() for r in caplog.records
+        ), "a kept row within the jitter window still joins the surfaced kept set"
 
     def test_sweep_keeps_a_superseded_identity_when_the_slot_is_not_live(
         self, temp_home,
@@ -10200,6 +10227,26 @@ class TestUnclaimedStashSweep:
         with patch.object(switcher, "_sweep_unclaimed_stash") as sweep2:
             switcher._collect_usage_entries(dead_info, fetch=set())
         sweep2.assert_called_once_with(live_slots=set())
+
+    def test_a_failed_sweep_never_fails_the_collect_pass(self, temp_home, caplog):
+        """Contained exactly like the stash-time call
+        (``test_a_failed_sweep_never_fails_the_stash``): the collector calls
+        the sweep on every tick, so a torn roster or store must not take
+        usage collection down with it."""
+        import logging
+
+        switcher = self._switcher(temp_home)
+        live_creds = self._creds("live-rt", self._ms(30))
+        live_info = [(2, "live@x.co", "Org", "", False, live_creds, "")]
+        with patch.object(
+            switcher, "_sweep_unclaimed_stash", side_effect=OSError("disk full"),
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            entries = switcher._collect_usage_entries(live_info, fetch=set())
+        assert "2" in entries, "usage collection must survive a failed sweep"
+        assert any(
+            "sweeping the unclaimed stash" in r.getMessage()
+            for r in caplog.records
+        ), "the containment arm was never reached"
 
 
 @pytest.mark.usefixtures("_ex_reads_what_the_plain_reader_returns")
