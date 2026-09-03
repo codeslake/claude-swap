@@ -955,3 +955,58 @@ def test_sync_overwrites_a_different_login_left_by_a_failed_switch_time_refresh(
         "DEFECT: the plaintext file still held a different login (B) after "
         "login A was adopted into the slot"
     )
+
+
+def test_sync_stashes_a_different_login_the_file_alone_held_before_overwriting(
+    temp_home: Path, mock_claude_config: Path, monkeypatch,
+):
+    """MEASURED BY THE REVIEWER (breadth round on 8efa721a): the different-login
+    arm above is not only reached by a failed switch-time refresh -- it is
+    also what a Keychain/file split from #700-706 (one failed Keychain WRITE
+    sends Claude Code to the plaintext file while later Keychain READS keep
+    succeeding with the older item) routes through. There, the file's login
+    (L) is a DIFFERENT, later login than what the Keychain read captures (A),
+    and L lives NOWHERE else -- no slot backup holds it. Overwriting the file
+    with A destroys L's only copy. The write must still happen (A is what was
+    just adopted), but L must be preserved first, the same way an unowned
+    live credential is preserved anywhere else in this codebase: stashed as
+    an unclaimed credential before it is overwritten.
+    """
+    s = _switcher(temp_home, mock_claude_config, "a@example.com")
+    s.platform = Platform.MACOS
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+
+    kc_refresh = 88_888_888_888_000  # arbitrary, not a wall-clock epoch (not expired)
+    file_refresh = kc_refresh + 8_000  # beyond the 5s lineage jitter: a DIFFERENT login
+    login_a = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-A", "refreshToken": "rt-A",
+        "expiresAt": 99999999999000, "refreshTokenExpiresAt": kc_refresh}})
+    login_l = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-L", "refreshToken": "rt-L-ONLY-COPY",
+        "expiresAt": 99999999999000, "refreshTokenExpiresAt": file_refresh}})
+
+    cred_file = temp_home / ".claude" / ".credentials.json"
+    cred_file.write_text(login_l, encoding="utf-8")
+
+    with patch.object(s, "_read_capture_credentials", return_value=login_a), \
+         patch("claude_swap.oauth.fetch_oauth_profile",
+               return_value={"uuid": "u-a", "email": "a@example.com",
+                             "organizationUuid": ""}):
+        s.add_account(slot=3, assume_yes=True)
+
+    assert cred_file.read_text(encoding="utf-8") == login_a, (
+        "DEFECT: the plaintext file still held a different login (L) after "
+        "login A was adopted into the slot"
+    )
+
+    entries = s._store._list_unclaimed_credentials()
+    import base64
+    bodies = [
+        base64.b64decode(
+            s._store._stash_entry_path(eid).read_text().strip()
+        ).decode()
+        for eid in entries
+    ]
+    assert any("rt-L-ONLY-COPY" in b for b in bodies), (
+        "DEFECT: login L's only copy was overwritten with nothing stashed"
+    )
