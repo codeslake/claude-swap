@@ -1097,25 +1097,25 @@ class TestInvalidGrantPropagation:
         return json.dumps(blob)
 
     def test_proactive_refresh_invalid_grant_short_circuits(self):
-        """Expired token + dead refresh: report invalid_grant without hitting usage."""
+        """No refreshTokenExpiresAt field: unknown is not expired, so refresh
+        is still attempted; the dead refresh reports invalid_grant without
+        hitting usage."""
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh, \
              patch("claude_swap.oauth.request_usage_data") as usage:
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._expired_credentials(), is_active=False,
             )
+        refresh.assert_called_once()
         assert outcome.error == "invalid_grant"
         usage.assert_not_called()  # no pointless 401/429 on a lost cause
 
     def test_proactive_refresh_skips_post_when_grant_genuinely_expired(self):
         """Access token AND refresh grant both past expiry: no refresh POST,
         but the outcome still carries invalid_grant and still strikes."""
-        from datetime import timedelta
-        past_ms = int(
-            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
-        )
-        creds = self._expired_credentials(refresh_token_expires_at=past_ms)
-        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, \
+        creds = self._expired_credentials(refresh_token_expires_at=1)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh, \
              patch("claude_swap.oauth.request_usage_data") as usage:
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", creds, is_active=False,
@@ -1139,19 +1139,6 @@ class TestInvalidGrantPropagation:
                 "1", "a@b.c", creds, is_active=False,
             )
         refresh.assert_called_once()
-        assert outcome.error == "invalid_grant"
-
-    def test_proactive_refresh_still_posts_when_grant_expiry_unknown(self):
-        """No refreshTokenExpiresAt field at all: unknown is not expired, so
-        the refresh is still attempted."""
-        creds = self._expired_credentials()
-        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh:
-            outcome = oauth.try_fetch_usage_for_account(
-                "1", "a@b.c", creds, is_active=False,
-            )
-        refresh.assert_called_once()
-        assert outcome.error == "invalid_grant"
 
     def test_401_retry_invalid_grant_is_permanent(self):
         """Valid-looking token, server 401, dead refresh → invalid_grant."""
@@ -1170,17 +1157,14 @@ class TestInvalidGrantPropagation:
     def test_401_retry_skips_post_when_grant_genuinely_expired(self):
         """Valid-looking access token, server 401, but the refresh grant is
         already past expiry: the 401-retry refresh must not POST either."""
-        from datetime import timedelta
-        past_ms = int(
-            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
-        )
-        creds = self._valid_credentials(refresh_token_expires_at=past_ms)
+        creds = self._valid_credentials(refresh_token_expires_at=1)
         err = urllib.error.HTTPError(
             "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
             hdrs=None, fp=None,
         )
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
-             patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh:
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh:
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", creds, is_active=False,
             )
