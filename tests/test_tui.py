@@ -1458,6 +1458,7 @@ class _FakeEngine:
         self.dry_run = dry_run
         self.stopped = False
         self.applied_thresholds: list[float] = []
+        self.applied_strategies: list[str] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1474,6 +1475,10 @@ class _FakeEngine:
     def apply_threshold(self, threshold: float) -> None:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
+
+    def apply_strategy(self, strategy: str) -> None:
+        self.settings = dataclasses.replace(self.settings, strategy=strategy)
+        self.applied_strategies.append(strategy)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -1813,6 +1818,37 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
+    async def test_candidates_show_the_scoped_window_that_binds_them(
+        self, tmp_path, fake_engine
+    ):
+        """The 5h/7d chips alone can't explain a rank set by a per-model
+        window (adr 0008): with `models` configured, a scoped chip must
+        render too, not just fold invisibly into the sort key."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "best"},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 95.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "Fable" in plain
+            assert "95%" in plain
+
     async def test_candidates_drain_soonest_seven_day_reset_first(
         self, tmp_path, fake_engine
     ):
@@ -1874,6 +1910,92 @@ class TestAutoScreen:
                 plain.index(f"user{n}@example.com") for n in ("5", "3", "2", "1", "6", "7")
             ]
             assert positions == sorted(positions), plain
+
+    async def test_candidates_panel_order_under_optim_matches_the_margin_key(
+        self, tmp_path, fake_engine
+    ):
+        """Under `optim` the panel must sort by the SAME margin key the
+        engine's voluntary trigger admits on (adr 0008), not the plain
+        consume-first key -- else the panel can show a target the engine
+        would refuse. #2 resets sooner but sits at Fable 86% (unhealthy at
+        threshold(90) - hysteresis(10) = 80): it must rank BEHIND #3, whose
+        later-resetting but healthier Fable 68% clears the margin."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "optim"},
+        }))
+
+        def _candidate(reset7_s: float, fable_pct: float) -> UsageEntry:
+            last_good = {
+                "five_hour": {"pct": 0.0, "resets_at": _iso_in(7200)},
+                "seven_day": {"pct": 10.0, "resets_at": _iso_in(reset7_s)},
+                "scoped": [
+                    {"name": "Fable", "pct": fable_pct, "resets_at": _iso_in(172800)}
+                ],
+            }
+            return UsageEntry(last_good=last_good, fetched_at=time.time() - 5.0, age_s=5.0)
+
+        fake = FakeSwitcher(
+            [
+                make_account(
+                    1, active=True,
+                    entry=UsageEntry(
+                        last_good={
+                            "five_hour": {"pct": 0.0, "resets_at": _iso_in(7200)},
+                            "seven_day": {"pct": 44.0, "resets_at": _iso_in(300000)},
+                            "scoped": [
+                                {"name": "Fable", "pct": 66.0, "resets_at": _iso_in(172800)}
+                            ],
+                        },
+                        fetched_at=time.time() - 5.0, age_s=5.0,
+                    ),
+                ),
+                make_account(2, entry=_candidate(100000, 86.0)),  # sooner, unhealthy
+                make_account(3, entry=_candidate(200000, 68.0)),  # later, healthy
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
+            )
+
+    async def test_strategy_binding_cycles_and_persists_for_the_session(
+        self, tmp_path, fake_engine
+    ):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert screen._settings.strategy == "consume-first"  # file default
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "optim"
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "best"
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "consume-first"  # cycled back
+            engine = fake_engine.instances[0]
+            assert engine.applied_strategies == ["optim", "best", "consume-first"]
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "strategy consume-first" in summary.render().plain
+            # the override lives in memory only — nothing was persisted
+            assert not (tmp_path / "settings.json").exists()
 
 
 class TestEventText:

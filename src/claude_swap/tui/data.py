@@ -167,6 +167,16 @@ def window_chip_label(last_good: dict | None, key: str, label: str, now: float) 
     return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
 
 
+def relevant_window_chip_label(resets_at: str | None, label: str, now: float) -> str:
+    """``window_chip_label`` for a window pulled from ``oauth.relevant_windows``
+    (5h/7d and scoped per-model windows alike), which carries ``resets_at``
+    directly rather than nested under a top-level key."""
+    reset = reset_text({"resets_at": resets_at} if resets_at else None, now)
+    if not reset:
+        return f"{label}:"
+    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
+
+
 def format_duration(seconds: float) -> str:
     """Compact duration: "45s", "12m", "2h 13m", "3d 4h"."""
     s = int(seconds)
