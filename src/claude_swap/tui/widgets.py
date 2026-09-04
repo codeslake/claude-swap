@@ -304,15 +304,21 @@ def mini_account_text(
             if result and result.ahead:
                 text.append(" (ahead)", style=palette.sev_warn)
         parts += 1
-    maxed = [
-        w["name"]
-        for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
-        if float(w["pct"]) >= 100
-    ]
-    for name in maxed:
+    for window in (last_good.get("scoped") or [] if isinstance(last_good, dict) else []):
+        pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
-        text.append(f"{name} (!)", style=palette.sev_crit)
+        color = palette.severity(pct)
+        # Same chip helper the 5h/7d loop above uses — a scoped window reads
+        # the same way whether it is the account's only window or sits
+        # beside 5h/7d.
+        text.append(
+            data.chip_label(window["name"], data.reset_text(window, now)),
+            style=palette.muted,
+        )
+        text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        if pct >= 100:
+            text.append(" (!)", style=palette.sev_crit)
         parts += 1
     # Spend is a separate axis from a rate-limit window (never enters the
     # ranking — see oauth.relevant_windows) so it must show whether or not a

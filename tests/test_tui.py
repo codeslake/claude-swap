@@ -820,6 +820,44 @@ class TestMiniAccountText:
         )
         assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
 
+    def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
+        """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
+        5h/7d window already rendered (`parts` nonzero) a scoped window below
+        its cap never reaches the dashboard row at all — it is not the
+        `usage unknown` fallback catching it either, since 5h/7d already
+        produced output. An account sitting at 91% on a per-model window
+        reads as if that window does not exist."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 91.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "91%" in out, (
+            f"a scoped window below 100 vanished from the dashboard row: {out!r}"
+        )
+
+    def test_scoped_window_at_100_keeps_its_marker_and_shows_pct(self):
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        last_good = {
+            "five_hour": {"pct": 28.0},
+            "seven_day": {"pct": 70.0},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+        acc = make_account(
+            1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        )
+        out = mini_account_text(acc, now).plain
+        assert "Fable" in out and "100%" in out and "(!)" in out, out
+
 
 class TestRunAction:
     def test_captures_output_and_payload(self):
