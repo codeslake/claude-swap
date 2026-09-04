@@ -103,7 +103,7 @@ class AutoScreen(Screen):
         self._entry_threshold: float | None = None
         # Session-only strategy cycle (s), same precedent: never written to
         # settings.json. ``_configured_strategy`` is the mount-time file
-        # value the summary's "(session)" marker compares against.
+        # value the summary's "(unsaved)" marker compares against.
         self._configured_strategy: str | None = None
 
     def compose(self) -> ComposeResult:
@@ -237,10 +237,10 @@ class AutoScreen(Screen):
             style=palette.accent if self._adjusting else "",
         )
         if self._settings.threshold != self._configured_threshold:
-            text.append(" (session)", style=palette.muted)
+            text.append(" (unsaved)", style=palette.muted)
         text.append(f" · strategy {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
-            text.append(" (session)", style=palette.muted)
+            text.append(" (unsaved)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)

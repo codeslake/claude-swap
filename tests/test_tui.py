@@ -1687,7 +1687,7 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             summary = screen.query_one("#auto-summary", Static)
-            assert "threshold 93% (session)" in summary.render().plain
+            assert "threshold 93% (unsaved)" in summary.render().plain
             await pilot.press("enter")
             await pilot.pause()
             assert engine.wakes == 1  # one forced tick on leaving the mode
@@ -1751,7 +1751,7 @@ class TestAutoScreen:
 
             summary = screen.query_one("#auto-summary", Static)
             # never a lying "100%"
-            assert "threshold 99.9% (session)" in summary.render().plain
+            assert "threshold 99.9% (unsaved)" in summary.render().plain
             screen.action_threshold_step(-60.0)
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
@@ -1984,9 +1984,17 @@ class TestAutoScreen:
             await self._open(pilot)
             screen = app.screen
             assert screen._settings.strategy == "consume-first"  # file default
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            # CONTROL: unchanged from the saved settings carries no marker
+            plain = summary.render().plain
+            assert "(unsaved)" not in plain
+            assert "(session)" not in plain
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "optim"
+            assert "strategy optim (unsaved)" in summary.render().plain
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "best"
@@ -1995,10 +2003,9 @@ class TestAutoScreen:
             assert screen._settings.strategy == "consume-first"  # cycled back
             engine = fake_engine.instances[0]
             assert engine.applied_strategies == ["optim", "best", "consume-first"]
-            from textual.widgets import Static
-
-            summary = screen.query_one("#auto-summary", Static)
-            assert "strategy consume-first" in summary.render().plain
+            plain = summary.render().plain
+            assert "strategy consume-first" in plain
+            assert "(unsaved)" not in plain  # back to the saved value: no marker
             # the override lives in memory only — nothing was persisted
             assert not (tmp_path / "settings.json").exists()
 
