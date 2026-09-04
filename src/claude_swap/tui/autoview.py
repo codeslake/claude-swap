@@ -333,6 +333,41 @@ class AutoScreen(Screen):
         consume_first = bool(
             self._settings and self._settings.strategy == "consume-first"
         )
+        # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
+        # `models`: `_rank_candidates` (autoswitch.py) drops the model set
+        # and retries on 5h/7d alone when the model-gated pass finds no
+        # healthy candidate — so a panel that always ranks on `models` can
+        # name a top row the engine would never pick (still model-gated
+        # ranking a fleet the engine has already dropped it for). Same
+        # predicate as the model-gated pass's own health filter
+        # (`classify_candidate_block` — "open" is exactly what that filter
+        # lets through): any candidate reading "open" means the model-gated
+        # pass has something to work with, so keep `models`; none reading
+        # "open" means it would come back empty, so rank on the retry's
+        # axis instead — a "model"-only block clears once `models` drops,
+        # and a "full" block stays blocked either way.
+        rank_models = models
+        if models and self._settings:
+            threshold = self._settings.threshold
+            for acc in snap.accounts:
+                if (
+                    acc.number == active_number
+                    or not acc.switchable
+                    or acc.usage.sentinel is not None
+                    or binding_pct(acc.usage.last_good, models) is None
+                ):
+                    continue
+                windows = (
+                    (label, p)
+                    for label, p, _ in oauth.relevant_windows(
+                        acc.usage.last_good, models
+                    )
+                )
+                kind, _ = classify_candidate_block(windows, threshold)
+                if kind == "open":
+                    break
+            else:
+                rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         for acc in snap.accounts:
@@ -417,7 +452,11 @@ class AutoScreen(Screen):
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it),
                 # and the two must read the same way here as in the decision
-                # log — same helper, `classify_candidate_block`.
+                # log — same helper, `classify_candidate_block`. Always on
+                # `models`, the full pinned set: this label explains why the
+                # row is not simply "open" on the criteria the user actually
+                # configured, independent of whether `rank_models` below has
+                # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
                     windows = ((label, p) for label, p, _ in oauth.relevant_windows(
                         acc.usage.last_good, models
@@ -429,12 +468,13 @@ class AutoScreen(Screen):
                         entry.append(f"  {blocked_model}-only", style=palette.muted)
                     elif kind == "full":
                         entry.append("  blocked", style=palette.muted)
+                rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, models
+                        acc.usage.last_good, self._settings.threshold, now, rank_models
                     )
                     if consume_first
-                    else (pct,)
+                    else (pct if rank_pct is None else rank_pct,)
                 )
                 ranked.append((key, acc.number))
             lines[acc.number] = entry

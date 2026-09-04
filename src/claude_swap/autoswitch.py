@@ -2561,11 +2561,29 @@ class AutoSwitchEngine:
             reset_ts = (
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
-            if by_recovery_axis or trigger in ("proactive", "consume-first"):
+            if (
+                by_recovery_axis
+                or trigger in ("proactive", "consume-first")
+                or (trigger == "at-limit" and not about_to_wall)
+            ):
                 # Landing must be healthy: an account at/over the threshold
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
+                #
+                # AT-LIMIT ONLY WHEN `about_to_wall` IS FALSE ON THIS AXIS.
+                # `about_to_wall` is axis-local (computed from the
+                # `active_headroom` this very call was passed), so it is the
+                # one signal that tells apart the two calls `_rank_candidates`
+                # makes with the SAME trigger name: the model-gated pass where
+                # at-limit's premise ("the active is genuinely blocked") holds,
+                # and the 5h/7d retry where the active can easily hold real
+                # headroom on this axis even though the model gate spent it.
+                # The escape's landing-gate bypass is earned by the former, not
+                # inherited by the latter — without this, the retry admitted
+                # ANY readable candidate for an at-limit trigger unconditionally
+                # (measured: a 3-account fleet at the same model bar switched
+                # on every tick, `[2,1,2,1,...]`).
                 if (100.0 - h) >= settings.threshold and not all_above:
                     continue
                 if all_above:
@@ -2630,21 +2648,39 @@ class AutoSwitchEngine:
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
                             continue
-                elif consume_first:
+                elif trigger == "consume-first":
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
-                    # than the active one (above the threshold we must move, so
-                    # any healthy account qualifies and the sort picks soonest).
-                    if trigger == "consume-first" and (
+                    # than the active one. A `proactive` (over-threshold)
+                    # trigger under consume-first strategy does NOT take this
+                    # branch — it falls to the ordinary headroom hysteresis
+                    # below, same as `best`; see the note there.
+                    #
+                    # KEYED ON THE TRIGGER, NOT THE STRATEGY BOOLEAN. `elif
+                    # consume_first:` used to catch every candidate under the
+                    # consume-first STRATEGY, including a `proactive` TRIGGER
+                    # (over-threshold, which fires under either strategy) —
+                    # whose body then filtered nothing (it only ever compares
+                    # `trigger == "consume-first"`) and fell through with no
+                    # comparison to the active at all. Every readable candidate
+                    # was admitted, including ones with LESS headroom on the
+                    # axis this pass ranks by, so a switch there re-triggered
+                    # the same over-threshold condition next tick.
+                    if (
                         reset_ts is None
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
                     ):
                         continue
                 elif active_headroom is not None:
-                    # best: the candidate must beat the active account by the
-                    # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
+                    # best, and also consume-first's `proactive` trigger (over
+                    # threshold): the candidate must beat the active account
+                    # by the full hysteresis margin (a one-way move like
+                    # 99%→89% qualifies; near-line pairs can't flap back).
+                    # `active_headroom` is the axis THIS pass ranks by — the
+                    # model-gated one on the primary call, `fallback_headroom
+                    # [current]` on the 5h/7d retry — so a landing is always
+                    # an improvement on the axis that admitted it.
                     if h - active_headroom < settings.hysteresis_pct:
                         continue
             if by_recovery_axis:

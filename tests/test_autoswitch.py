@@ -4080,6 +4080,53 @@ class TestAModelWindowIsNotABlackout:
             "unblock, only a re-rank on 5h/7d"
         )
 
+    def test_the_retry_drops_the_model_gate_from_both_admission_and_ranking(
+        self, temp_home
+    ):
+        """Candidates on BOTH sides of the model bar, unlike the owner's
+        fleet above (its four ranked candidates all land in the same
+        ``consume_first_rank_key`` tier, so a retry that kept re-gating on
+        Fable internally would still rank them identically and the test
+        could not tell). #1's ONLY good axis is 5h/7d (Fable 99% blocks it
+        on the model axis); #3 is genuinely servable on both axes but with
+        less 5h/7d headroom than #1; #2 has real 5h/7d headroom but not
+        enough to beat the ACTIVE's — every one of these needs the retry's
+        `models=()`/`fallback_headroom[current]` pair intact to land right.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+
+        def usage(five_h, fable):
+            return {
+                "five_hour": {"pct": five_h}, "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        fleet_usage = {
+            "0": usage(20.0, 95.0),   # active: 5h/7d headroom 80, model-gated 5
+            "1": usage(5.0, 99.0),    # 5h/7d headroom 95, model-gated 1
+            "2": usage(70.0, 100.0),  # 5h/7d headroom 30 — worse than active's 80
+            "3": usage(8.0, 91.0),    # 5h/7d headroom 92, model-gated 9
+        }
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="0",
+            oauth_candidates=["1", "2", "3"],
+            headroom=headroom, active_headroom=headroom["0"],
+            trigger="proactive",
+        )
+        ordered, any_known, _, _ = h.engine._rank_candidates(**args)
+        assert any_known
+        assert list(ordered) == ["1", "3"], (
+            f"got {list(ordered)} — #2 must stay excluded (worse than the "
+            "active's real 5h/7d headroom), and #1 must rank ahead of #3 "
+            "(more 5h/7d headroom): a retry that re-applies the model gate "
+            "internally instead flips this order (#1 reads unservable on "
+            "Fable and #3 wins) or drops #1 as unhealthy outright"
+        )
+
     def test_a_real_blackout_stays_empty_after_the_retry(self, temp_home):
         """#2 and #3 are ALSO over the bar on 5h, not just Fable — the retry
         on 5h/7d alone must not manufacture a landing that was never there."""
@@ -4204,6 +4251,14 @@ class TestAModelWindowIsNotABlackout:
             [("5h", 5.0), ("7d", 0.0), ("Fable", 95.0)], 90.0
         ) == ("model", "Fable")
 
+    def test_classify_candidate_block_blocks_on_the_threshold_itself(self):
+        """`>=`, not `>`: a window sitting exactly ON the threshold is a
+        landing gate refusal too (`_rank_candidates_pass`'s own arithmetic
+        this classifier mirrors), not an ``"open"`` slot."""
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 0.0), ("Fable", 90.0)], 90.0
+        ) == ("model", "Fable")
+
     def test_the_decision_log_names_what_blocked_each_candidate(self):
         event = PollEvent(
             active={"number": 6, "email": "a@example.com"},
@@ -4220,6 +4275,86 @@ class TestAModelWindowIsNotABlackout:
         assert "#2: 5h 92% · 7d 10% · Fable 20% (blocked)" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
+
+
+class TestTheRetryAdmitsOnlyAnImprovement:
+    """The 5h/7d retry (``_rank_candidates``'s second pass) must compare a
+    landing to the ACTIVE on the retry's own axis, for every trigger shape
+    — not only ``consume-first``. Without that, a candidate that is WORSE on
+    5h/7d than the active still gets admitted, the engine switches onto it,
+    the same model-gated trigger fires again next tick, and the fleet
+    round-robins forever on candidates that were never an improvement.
+    """
+
+    @staticmethod
+    def _usage_fable(fable_pct: float, five_h_pct: float) -> dict:
+        return {
+            "five_hour": {"pct": five_h_pct},
+            "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": fable_pct}],
+        }
+
+    @staticmethod
+    def _tick_loop(harness: EngineHarness, usage_map: dict, ticks: int) -> tuple[int, list]:
+        switches = 0
+        trace = []
+        for _ in range(ticks):
+            outcome = harness.tick_with_usage(usage_map)
+            if outcome is TickOutcome.SWITCHED:
+                switches += 1
+            trace.append(harness.active_number())
+            harness.clock.advance(301.0)  # past cooldown_seconds (300)
+        return switches, trace
+
+    def test_a_proactive_trigger_under_consume_first_never_churns_a_model_bar(
+        self, temp_home
+    ):
+        """Every account is pinned-model-blocked at the same 95%, so every
+        tick re-triggers a `proactive` retry on 5h/7d — under the DEFAULT
+        (consume-first) strategy. A landing must still beat the active by
+        the hysteresis margin on the retry's own 5h/7d axis; none of these
+        candidates do (they hold LESS 5h headroom than whichever account is
+        active), so nothing should ever move.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="consume-first")
+        usage_map = {
+            "1": self._usage_fable(95.0, 10.0),  # 5h headroom 90
+            "2": self._usage_fable(95.0, 20.0),  # 5h headroom 80
+            "3": self._usage_fable(95.0, 30.0),  # 5h headroom 70
+        }
+        for num in usage_map:
+            h.seed(int(num), f"acc{num}@example.com")
+        h.make_live("acc1@example.com", 1)
+        switches, trace = self._tick_loop(h, usage_map, ticks=8)
+        assert switches == 0, (
+            f"got {switches} switches, trace {trace} — every candidate is "
+            "strictly worse on 5h/7d than whichever account is active; the "
+            "retry must never admit a non-improvement"
+        )
+
+    def test_an_at_limit_escape_under_best_never_churns_a_model_bar(self, temp_home):
+        """Same shape, `best` strategy, every account fully spent on the
+        pinned model (`at-limit` trigger). The at-limit escape is allowed
+        to skip the landing gate ONLY when the active is genuinely spent on
+        the axis being ranked; on the 5h/7d retry axis here the active
+        holds real headroom, so the escape must fall back to the ordinary
+        hysteresis comparison — and none of these candidates clear it.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="best")
+        usage_map = {
+            "1": self._usage_fable(100.0, 10.0),  # 5h headroom 90
+            "2": self._usage_fable(100.0, 20.0),  # 5h headroom 80
+            "3": self._usage_fable(100.0, 30.0),  # 5h headroom 70
+        }
+        for num in usage_map:
+            h.seed(int(num), f"acc{num}@example.com")
+        h.make_live("acc1@example.com", 1)
+        switches, trace = self._tick_loop(h, usage_map, ticks=8)
+        assert switches == 0, (
+            f"got {switches} switches, trace {trace} — the active holds "
+            "real 5h/7d headroom on the retry's own axis, so the at-limit "
+            "escape must not bypass the landing comparison"
+        )
 
 
 # --- consume-first strategy ----------------------------------------------------
