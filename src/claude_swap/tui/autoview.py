@@ -25,10 +25,12 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
+    classify_candidate_block,
     consume_first_rank_key,
     pct_label,
 )
@@ -411,6 +413,20 @@ class AutoScreen(Screen):
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
                 if not chips:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # WHAT blocks this candidate, not just the raw chips: a 5h/7d
+                # window (no model choice escapes it) reads differently from
+                # a model-only block (the engine's fallback ranks around it),
+                # and the two must read the same way here as in the decision
+                # log — same helper, `classify_candidate_block`.
+                if self._settings:
+                    windows = ((label, p) for label, p, _ in oauth.relevant_windows(
+                        acc.usage.last_good, models
+                    ))
+                    kind, blocked_model = classify_candidate_block(
+                        windows, self._settings.threshold
+                    )
+                    if kind == "model":
+                        entry.append(f"  {blocked_model}-only", style=palette.muted)
                 key = (
                     consume_first_rank_key(
                         acc.usage.last_good, self._settings.threshold, now, models

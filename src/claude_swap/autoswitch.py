@@ -36,7 +36,7 @@ import math
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -349,7 +349,16 @@ class PollEvent(AutoSwitchEvent):
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
         if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            text = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+            # WHAT actually blocks this candidate — a full 5h/7d block, or
+            # only its pinned model's window (which the engine's fallback in
+            # `_rank_candidates` can rank around; see `classify_candidate_block`).
+            kind, model = classify_candidate_block(wins.items(), self.threshold)
+            if kind == "full":
+                text += " (blocked)"
+            elif kind == "model":
+                text += f" ({model}-only)"
+            return text
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
@@ -711,6 +720,34 @@ def _headroom_by_account(
         )
         for num, value in usage.items()
     }
+
+
+def classify_candidate_block(
+    windows: Iterable[tuple[str, float]], threshold: float
+) -> tuple[str, str | None]:
+    """Why one candidate is blocked at ``threshold``, given its windows.
+
+    ``windows`` is any iterable of ``(label, pct)`` — the same labels
+    :func:`oauth.relevant_windows` reports, "5h"/"7d" plus each configured
+    model's scoped display name. A window blocks when its OWN pct is at or
+    over ``threshold`` — the landing gate's own arithmetic
+    (``_rank_candidates_pass``: ``(100.0 - h) >= threshold`` where
+    ``h = 100 - max(pcts)``, i.e. the binding pct itself), read per window
+    instead of folded across all of them. Three outcomes: ``"open"``
+    (nothing blocks), ``"full"`` (a 5h/7d window blocks — no model choice
+    escapes that one), or ``"model"`` (every blocking window is a scoped
+    model window, naming the first — dropping that model from the criteria
+    set is what escapes it, not moving accounts). This is a report, not a
+    decision: the engine's own model-window fallback in ``_rank_candidates``
+    already acts on the same distinction, so the panel and the decision log
+    read it here instead of re-deriving it and risking a different answer.
+    """
+    blocking = [(label, pct) for label, pct in windows if pct >= threshold]
+    if not blocking:
+        return "open", None
+    if any(label in ("5h", "7d") for label, _ in blocking):
+        return "full", None
+    return "model", blocking[0][0]
 
 
 class AutoSwitchEngine:
@@ -2279,13 +2316,75 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
     ) -> tuple[list[str], bool, float | None, bool]:
-        """Filter and rank OAuth candidates for this tick's trigger.
+        """Rank on the configured model window, and once on 5h/7d alone if
+        that leaves nothing.
+
+        A MODEL WINDOW IS NOT A BLACKOUT. ``self._models`` folds a pinned
+        model's scoped window into every headroom read, so a candidate whose
+        ONLY over-bar window is that model is dropped as an unhealthy
+        landing exactly like one that is genuinely spent on 5h/7d — and when
+        every candidate carries the same model bar, the ranking empties and
+        the active account is stuck at the wall with 5h/7d room going
+        unused. The retry drops the model set and re-ranks on 5h/7d alone;
+        a candidate blocked there stays blocked in the second pass too, so
+        this is the whole rule, not half of one — a real blackout (every
+        candidate over 5h or 7d as well) still comes back empty and the
+        caller's existing blackout path is untouched.
+        """
+        ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
+            models=self._models,
+            trigger=trigger,
+            consume_first=consume_first,
+            oauth_candidates=oauth_candidates,
+            no_return=no_return,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=settings,
+            now=now,
+        )
+        if ordered or not self._models:
+            return ordered, any_known, active_reset_ts, waiting
+        fallback_headroom = _headroom_by_account(usage, ())
+        return self._rank_candidates_pass(
+            models=(),
+            trigger=trigger,
+            consume_first=consume_first,
+            oauth_candidates=oauth_candidates,
+            no_return=no_return,
+            usage=usage,
+            headroom=fallback_headroom,
+            current=current,
+            active_headroom=fallback_headroom.get(current),
+            settings=settings,
+            now=now,
+        )
+
+    def _rank_candidates_pass(
+        self,
+        *,
+        models: Sequence[str],
+        trigger: str,
+        consume_first: bool,
+        oauth_candidates: list[str],
+        no_return: str | None,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        current: str,
+        active_headroom: float | None,
+        settings: AutoSwitchSettings,
+        now: float,
+    ) -> tuple[list[str], bool, float | None, bool]:
+        """Filter and rank OAuth candidates for this tick's trigger, on one
+        window set (``models``).
 
         Returns ``(ordered, any_known, active_reset_ts, waiting_for_recovery)``.
         Pure — no emits, no state writes — so the consume-first two-phase
         commit can run it twice per tick: on the stored snapshot to decide
         provisionally, then on the escalated refetch to re-verify before
-        switching.
+        switching. ``_rank_candidates`` (above) is the entry point every
+        caller uses; it calls this twice at most (see its docstring).
 
         ``waiting_for_recovery`` is the one thing the caller cannot re-derive
         without restating four conditions this method already evaluated: an
@@ -2307,7 +2406,7 @@ class AutoSwitchEngine:
         # proactive gate, so the sort key is the only thing left choosing the
         # target. Read once here; used only by the at-limit key.
         escape_label = (
-            oauth.binding_window_label(usage.get(current), self._models)
+            oauth.binding_window_label(usage.get(current), models)
             if trigger == "at-limit"
             else None
         )
@@ -2359,7 +2458,7 @@ class AutoSwitchEngine:
             default=0.0,
         )
         active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now)
+            _binding_recovery_ts(usage.get(current), models, now)
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
@@ -2416,7 +2515,7 @@ class AutoSwitchEngine:
                 continue
             any_known = True          # it EXISTS and is readable either way
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now)
+                _binding_recovery_ts(usage.get(num), models, now)
                 if all_above
                 else 0.0
             )
@@ -2602,7 +2701,7 @@ class AutoSwitchEngine:
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
                 key = consume_first_rank_key(
-                    usage.get(num), settings.threshold, now, self._models
+                    usage.get(num), settings.threshold, now, models
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -2632,7 +2731,7 @@ class AutoSwitchEngine:
                 # that fell to slot order.
                 escape_h = (
                     oauth.headroom_on_window(
-                        usage.get(num), escape_label, self._models
+                        usage.get(num), escape_label, models
                     )
                     if escape_label
                     else None

@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    classify_candidate_block,
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -3895,12 +3896,15 @@ class TestModelAwareSwitch:
         # #2 is exhausted with NO reset timestamp — it could recover any
         # moment. Sleeping toward #3's known 20:00 reset would suppress
         # checks for hours, so the wake time must be unprovable (bounded
-        # blocked-cadence fallback instead of a reset sleep).
+        # blocked-cadence fallback instead of a reset sleep). #2's 5h is
+        # ALSO maxed (not just Fable): a model-only block is no longer a
+        # blackout (`_rank_candidates`'s retry ranks around it on 5h/7d),
+        # so this fleet needs a genuine dual exhaustion to stay one.
         h = self._seed(temp_home, model="Fable")
         outcome = h.tick_with_usage({
             "1": _model_usage(95, 10),
             "2": {
-                "five_hour": {"pct": 0.0},
+                "five_hour": {"pct": 100.0},  # no resets_at
                 "seven_day": {"pct": 0.0},
                 "scoped": [{"name": "Fable", "pct": 100.0}],  # no resets_at
             },
@@ -3915,9 +3919,13 @@ class TestModelAwareSwitch:
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
 
-    def test_scoped_only_exhaustion_drives_the_wake_time(self, temp_home):
-        # Candidates blocked ONLY by Fable: the wake must come from the scoped
-        # reset — the 5h/7d-only scan would find no ≥100% window at all.
+    def test_scoped_only_block_is_not_a_blackout_and_switches(self, temp_home):
+        # #2 and #3 are blocked ONLY by Fable — 5h/7d both have room (3%
+        # used). That is no longer treated as exhaustion: `_rank_candidates`
+        # drops the model window once every candidate is blocked only by it
+        # and ranks on 5h/7d instead, so the engine moves rather than
+        # waiting out the Fable reset. (Was `BLOCKED` with the wake time
+        # taken from the scoped reset — the exact shape this fixes.)
         h = self._seed(temp_home, model="Fable")
         fable_reset = "2026-07-06T09:00:00Z"
         blocked = {
@@ -3928,9 +3936,11 @@ class TestModelAwareSwitch:
         outcome = h.tick_with_usage({
             "1": _model_usage(95, 10), "2": blocked, "3": blocked,
         })
-        assert outcome is TickOutcome.BLOCKED
-        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
-        assert exhausted.earliest_reset_at == fable_reset
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — #2/#3's only over-bar window is Fable, with "
+            "5h/7d wide open, so the fleet is not exhausted"
+        )
+        assert h.active_number() in (2, 3)
 
     def test_scoped_binding_window_keeps_active_cadence_tight(self, temp_home):
         # Fable moving at 88% is inside the escalation band: with the model
@@ -3989,6 +3999,180 @@ class TestModelAwareSwitch:
             "3": _model_usage(5, 10),
         })
         assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
+
+
+class TestAModelWindowIsNotABlackout:
+    """A pinned model's scoped window is folded into every headroom read
+    alongside 5h/7d — so a candidate whose ONLY over-bar window is the model
+    was dropped as an unhealthy landing exactly like one genuinely spent on
+    5h/7d, and when every candidate carries that same model bar the ranking
+    emptied while 5h/7d headroom went unused. ``_rank_candidates`` retries
+    once on 5h/7d alone when the model-gated pass comes back empty; a
+    candidate blocked on 5h/7d too stays blocked in that retry, so a real
+    blackout is untouched.
+    """
+
+    def _args(self, harness, *, usage, current, oauth_candidates, headroom,
+              active_headroom, trigger="consume-first", consume_first=True,
+              threshold=90.0):
+        return dict(
+            trigger=trigger,
+            consume_first=consume_first,
+            no_return=None,
+            oauth_candidates=oauth_candidates,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=AutoSwitchSettings(threshold=threshold),
+            now=harness.clock.now,
+        )
+
+    def test_the_owners_fleet_moves_once_the_model_window_is_dropped(
+        self, temp_home
+    ):
+        """The reported fleet, reproduced exactly: six accounts, Fable
+        pinned, threshold 90. 1/3/4/5's only over-bar window is Fable — 5h
+        and 7d both have room — so the model-gated pass empties and the
+        retry on 5h/7d alone must both rescue it and rank it (soonest 7-day
+        reset first, the consume-first strategy's own key). #2 stays out
+        either way: its OWN 5h sits at the bar with no model involved."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        now = h.clock.now
+
+        def usage(five_h, seven_d, fable, days_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(now + days_out * 86400),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        fleet_usage = {
+            "6": {
+                "five_hour": {"pct": 72.0},
+                "seven_day": {
+                    "pct": 0.0, "resets_at": _iso_at(now + 100 * 86400),
+                },
+            },
+            "1": usage(34, 69, 91, 4),
+            "2": usage(90, 79, 87, 0.5),
+            "3": usage(33, 69, 94, 3),
+            "4": usage(0, 64, 91, 2),
+            "5": usage(0, 62, 90, 1),
+        }
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="6",
+            oauth_candidates=["1", "2", "3", "4", "5"],
+            headroom=headroom, active_headroom=headroom["6"],
+        )
+        ordered, any_known, _, _ = h.engine._rank_candidates(**args)
+        assert any_known
+        assert list(ordered) == ["5", "4", "3", "1"], (
+            f"got {list(ordered)} — every candidate's only over-bar window "
+            "is Fable, 5h/7d has room on all of 1/3/4/5, and #2 must stay "
+            "excluded on its own 5h at 90%: the retry is not a blanket "
+            "unblock, only a re-rank on 5h/7d"
+        )
+
+    def test_a_real_blackout_stays_empty_after_the_retry(self, temp_home):
+        """#2 and #3 are ALSO over the bar on 5h, not just Fable — the retry
+        on 5h/7d alone must not manufacture a landing that was never there."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        active = {
+            "five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 10.0}],
+        }
+        blocked = {
+            "five_hour": {"pct": 95.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 95.0}],
+        }
+        fleet_usage = {"1": active, "2": blocked, "3": blocked}
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="1", oauth_candidates=["2", "3"],
+            headroom=headroom, active_headroom=headroom["1"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == [], (
+            f"got {list(ordered)} — #2 and #3 are genuinely spent on 5h "
+            "too, so dropping the model window must not rescue them"
+        )
+
+    def test_the_fallback_does_not_engage_when_the_model_set_already_lands(
+        self, temp_home
+    ):
+        """#2 is healthier once Fable is dropped than #1's Fable-gated pick
+        — if the retry ran anyway and got merged in, #2 would win. It must
+        never run: the model-gated pass already found #1, and that stays
+        the answer."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        active = {
+            "five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 0.0}],
+        }
+        usage_1 = {  # eligible on Fable too
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 20.0}],
+        }
+        usage_2 = {  # model-only blocked; would win once Fable is dropped
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 95.0}],
+        }
+        fleet_usage = {"3": active, "1": usage_1, "2": usage_2}
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="3", oauth_candidates=["1", "2"],
+            headroom=headroom, active_headroom=headroom["3"],
+            trigger="proactive", consume_first=False,
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == ["1"], (
+            f"got {list(ordered)} — the model-gated pass already found #1 "
+            "eligible; #2 must never enter the ranking"
+        )
+
+    def test_classify_open_full_and_model_only(self):
+        """The three outcomes ``classify_candidate_block`` reports, read by
+        both the panel and the decision log so they cannot disagree."""
+        assert classify_candidate_block(
+            [("5h", 10.0), ("7d", 5.0), ("Fable", 20.0)], 90.0
+        ) == ("open", None)
+        assert classify_candidate_block(
+            [("5h", 95.0), ("7d", 5.0), ("Fable", 10.0)], 90.0
+        ) == ("full", None)
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 0.0), ("Fable", 95.0)], 90.0
+        ) == ("model", "Fable")
+
+    def test_the_decision_log_names_what_blocked_each_candidate(self):
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "1": 9.0, "2": 40.0, "3": 60.0},
+            threshold=90.0,
+            windows={
+                "1": {"5h": 34.0, "7d": 69.0, "Fable": 91.0},  # model-only
+                "2": {"5h": 92.0, "7d": 10.0, "Fable": 20.0},  # full (5h)
+                "3": {"5h": 5.0, "7d": 5.0, "Fable": 5.0},     # open
+            },
+        )
+        text = event.human()
+        assert "#1: 5h 34% · 7d 69% · Fable 91% (Fable-only)" in text, text
+        assert "#2: 5h 92% · 7d 10% · Fable 20% (blocked)" in text, text
+        assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
+        assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
 
 
 # --- consume-first strategy ----------------------------------------------------
