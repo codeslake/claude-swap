@@ -671,8 +671,8 @@ class TestMiniAccountText:
 
         The dashboard rendered `5h 100% (resets 2h 28m)` while the auto view
         rendered `5h(⟳2h28m):100%` for the same window in the same second.
-        Both now come from data.window_chip_label, so a change to one surface
-        cannot silently diverge from the other.
+        Both now come from data.relevant_window_chip_label, so a change to
+        one surface cannot silently diverge from the other.
         """
         from claude_swap.tui import data
         from claude_swap.tui.widgets import mini_account_text
@@ -1822,8 +1822,8 @@ class TestAutoScreen:
         self, tmp_path, fake_engine
     ):
         """The 5h/7d chips alone can't explain a rank set by a per-model
-        window (adr 0008): with `models` configured, a scoped chip must
-        render too, not just fold invisibly into the sort key."""
+        window: with `models` configured, a scoped chip must render too,
+        not just fold invisibly into the sort key."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -1915,8 +1915,8 @@ class TestAutoScreen:
         self, tmp_path, fake_engine
     ):
         """Under `optim` the panel must sort by the SAME margin key the
-        engine's voluntary trigger admits on (adr 0008), not the plain
-        consume-first key -- else the panel can show a target the engine
+        engine's voluntary trigger admits on, not the plain consume-first
+        key -- else the panel can show a target the engine
         would refuse. #2 resets sooner but sits at Fable 86% (unhealthy at
         threshold(90) - hysteresis(10) = 80): it must rank BEHIND #3, whose
         later-resetting but healthier Fable 68% clears the margin."""

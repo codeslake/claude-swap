@@ -2407,11 +2407,18 @@ class AutoSwitchEngine:
         # `optim` tightens the landing bar for the VOLUNTARY move only; every
         # forced trigger sees the plain threshold (`_landing_threshold`).
         landing_threshold = _landing_threshold(trigger, settings)
+        # The KEY, unlike the gate, is always evaluated at the margin under
+        # `optim`: the gate takes `trigger` (a forced move still lands on a
+        # near-wall target), but ranking a forced move's admitted peers at
+        # the plain threshold reintroduces the round trip `optim` exists to
+        # close (a sooner reset beating a peer with real room to spare).
+        key_landing_threshold = _landing_threshold("consume-first", settings)
 
-        # ONE NAME FOR BOTH THE GATE AND THE KEY. They were two copies of the
-        # same trigger tuple, and this file has already had to close two
-        # defects where a filter ran on one axis while the sort ran on
-        # another.
+        # BOTH ON THE UTILIZATION AXIS: the gate and the key differ only in
+        # which threshold each reads, never in what they measure. They were
+        # two copies of the same trigger tuple, and this file has already had
+        # to close two defects where a filter ran on one axis while the sort
+        # ran on another.
         by_recovery_axis = all_above and (
             trigger in ("proactive", "consume-first")
             or (
@@ -2628,7 +2635,7 @@ class AutoSwitchEngine:
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
                 key = consume_first_rank_key(
-                    usage.get(num), landing_threshold, now, self._models
+                    usage.get(num), key_landing_threshold, now, self._models
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls

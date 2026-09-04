@@ -84,8 +84,6 @@ class AutoScreen(Screen):
         Binding("escape,q", "back", "Back"),
     ]
 
-    _STRATEGIES = ("best", "consume-first", "optim")
-
     app: "CswapApp"
 
     def __init__(self, *, start_live: bool = False) -> None:
@@ -181,11 +179,8 @@ class AutoScreen(Screen):
         self.refresh_bindings()
 
     def action_cycle_strategy(self) -> None:
-        strategies = self._STRATEGIES
-        try:
-            idx = strategies.index(self._settings.strategy)
-        except ValueError:
-            idx = -1  # an unknown value (hand-edited file) starts the cycle
+        strategies = SETTING_SPECS["autoswitch.strategy"].choices
+        idx = strategies.index(self._settings.strategy)
         strategy = strategies[(idx + 1) % len(strategies)]
         self._settings = replace(self._settings, strategy=strategy)
         if self._engine is not None:

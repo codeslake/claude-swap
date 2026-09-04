@@ -19,7 +19,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings
+from claude_swap.settings import SETTING_SPECS, load_ui_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -677,7 +677,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first", "optim"),
+        choices=SETTING_SPECS["autoswitch.strategy"].choices,
         default=None,
         help=(
             "Target selection: 'best' (most quota left), "

@@ -153,24 +153,25 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
 
 
 def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
-    """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
-
-    THE one place that decides how a window reads — the dashboard's inactive
-    rows and the auto view's Next-best rows both draw it, so one account
-    cannot read two ways on two screens. The caller appends the pct so it can
-    colour it by severity. The countdown shows whenever it is known, not only
-    at 100%: a saturated candidate's worth IS when it comes back.
+    """The reading for one top-level 5h/7d window, without its percentage:
+    ``5h(⟳2h28m)``. A thin adapter over ``relevant_window_chip_label`` (THE
+    one place that decides how a window reads) for callers holding a window
+    nested under a top-level key rather than a bare ``resets_at``.
     """
-    reset = window_reset_text(last_good, key, now)
-    if not reset:
-        return f"{label}:"
-    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
+    window = last_good.get(key) if isinstance(last_good, dict) else None
+    resets_at = window.get("resets_at") if isinstance(window, dict) else None
+    return relevant_window_chip_label(resets_at, label, now)
 
 
 def relevant_window_chip_label(resets_at: str | None, label: str, now: float) -> str:
-    """``window_chip_label`` for a window pulled from ``oauth.relevant_windows``
-    (5h/7d and scoped per-model windows alike), which carries ``resets_at``
-    directly rather than nested under a top-level key."""
+    """THE one place that decides how a window reads — the dashboard's
+    inactive rows and the auto view's Next-best rows both draw it (5h/7d
+    directly, and scoped per-model windows from ``oauth.relevant_windows``),
+    so one account cannot read two ways on two screens. The caller appends
+    the pct so it can colour it by severity. The countdown shows whenever it
+    is known, not only at 100%: a saturated candidate's worth IS when it
+    comes back.
+    """
     reset = reset_text({"resets_at": resets_at} if resets_at else None, now)
     if not reset:
         return f"{label}:"

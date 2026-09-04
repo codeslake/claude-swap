@@ -4473,7 +4473,7 @@ class TestOptimStrategy:
     """`optim` is consume-first with a landing margin: a VOLUNTARY move
     (trigger ``consume-first``) needs `hysteresis_pct` of room below
     `threshold`, closing the round trip where a target admitted four points
-    under the wall burned to it in one tick (adr 0008)."""
+    under the wall burned to it in one tick."""
 
     def _harness(self, temp_home: Path, strategy: str = "optim") -> EngineHarness:
         h = EngineHarness(
@@ -4530,6 +4530,44 @@ class TestOptimStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
+
+    def test_forced_move_ranks_by_the_margin_key_not_the_plain_one(self, temp_home):
+        """Two peers, both admitted by the plain gate: #2 resets sooner but
+        is tier-1 under the margin (Fable 86, only 14 pts of room); #3 resets
+        later but is tier-0 (Fable 68, 32 pts of room). `optim` must rank the
+        key at the margin for every trigger, so the forced move lands on #3,
+        not on #2's sooner reset."""
+        h = self._harness(temp_home)
+        h.seed(3, "c@example.com")
+        active_91 = _usage7(0, 44, _R_LATER, scoped=[{"name": "Fable", "pct": 91.0}])
+        later_with_room = _usage7(
+            0, 10, _R_LATER, scoped=[{"name": "Fable", "pct": 68.0}]
+        )
+        outcome = h.tick_with_usage({
+            "1": active_91,
+            "2": self._candidate_fable(86.0),  # sooner reset, tier-1 (no room)
+            "3": later_with_room,              # later reset, tier-0 (room)
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_consume_first_strategy_ranks_the_same_pair_by_reset(self, temp_home):
+        """Same three accounts, plain `consume-first`: no margin on the key,
+        so the sooner reset (#2) wins -- pinning the difference from `optim`
+        above."""
+        h = self._harness(temp_home, strategy="consume-first")
+        h.seed(3, "c@example.com")
+        active_91 = _usage7(0, 44, _R_LATER, scoped=[{"name": "Fable", "pct": 91.0}])
+        later_with_room = _usage7(
+            0, 10, _R_LATER, scoped=[{"name": "Fable", "pct": 68.0}]
+        )
+        outcome = h.tick_with_usage({
+            "1": active_91,
+            "2": self._candidate_fable(86.0),
+            "3": later_with_room,
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
 
     def test_consume_first_strategy_has_no_landing_margin(self, temp_home):
         """Pins the difference: the identical 86-candidate scenario switches
