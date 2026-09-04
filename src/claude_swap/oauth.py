@@ -60,7 +60,7 @@ def credential_fingerprint(credentials: str) -> str | None:
     return "sha256-full:" + hashlib.sha256(credentials.encode()).hexdigest()
 
 
-def is_oauth_token_expired(expires_at: object) -> bool:
+def is_oauth_token_expired(expires_at: object, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)) or (
         isinstance(expires_at, float) and not math.isfinite(expires_at)
@@ -68,10 +68,10 @@ def is_oauth_token_expired(expires_at: object) -> bool:
         return False
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
+    return now_ms + buffer_ms >= int(expires_at)
 
 
-def refresh_token_spent(credentials: str) -> bool:
+def refresh_token_spent(credentials: str, buffer_ms: int = OAUTH_EXPIRY_BUFFER_MS) -> bool:
     """Has this credential's own refresh token expired?
 
     Unknown is not expired — no field, a non-numeric one, JSON carrying no
@@ -85,7 +85,8 @@ def refresh_token_spent(credentials: str) -> bool:
     bytes.
     """
     return is_oauth_token_expired(
-        (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt")
+        (extract_oauth_data(credentials) or {}).get("refreshTokenExpiresAt"),
+        buffer_ms=buffer_ms,
     )
 
 
@@ -689,6 +690,14 @@ def try_fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
+        # A grant already past its own expiry (not just inside the refresh
+        # buffer) cannot be revived by a POST — the server will only say
+        # invalid_grant. Skip straight to that outcome.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
@@ -744,6 +753,11 @@ def try_fetch_usage_for_account(
         # is permanently dead — surface it distinctly (not the generic
         # "refresh-failed") so the store can quarantine instead of retrying a
         # dead token forever.
+        if refresh_token_spent(working_credentials, buffer_ms=0):
+            return UsageOutcome(
+                None, error="invalid_grant",
+                struck_fp=credential_fingerprint(working_credentials),
+            )
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:

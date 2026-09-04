@@ -1069,26 +1069,32 @@ class TestInvalidGrantPropagation:
     from a transient 'refresh-failed', so the store can quarantine the account."""
 
     @staticmethod
-    def _expired_credentials() -> str:
+    def _expired_credentials(refresh_token_expires_at=None) -> str:
         from datetime import timedelta
         past_ms = int(
             (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
         )
-        return json.dumps({"claudeAiOauth": {
+        blob = {"claudeAiOauth": {
             "accessToken": "old-access", "refreshToken": "dead-refresh",
             "expiresAt": past_ms,
-        }})
+        }}
+        if refresh_token_expires_at is not None:
+            blob["claudeAiOauth"]["refreshTokenExpiresAt"] = refresh_token_expires_at
+        return json.dumps(blob)
 
     @staticmethod
-    def _valid_credentials() -> str:
+    def _valid_credentials(refresh_token_expires_at=None) -> str:
         from datetime import timedelta
         future_ms = int(
             (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
         )
-        return json.dumps({"claudeAiOauth": {
+        blob = {"claudeAiOauth": {
             "accessToken": "good-access", "refreshToken": "dead-refresh",
             "expiresAt": future_ms,
-        }})
+        }}
+        if refresh_token_expires_at is not None:
+            blob["claudeAiOauth"]["refreshTokenExpiresAt"] = refresh_token_expires_at
+        return json.dumps(blob)
 
     def test_proactive_refresh_invalid_grant_short_circuits(self):
         """Expired token + dead refresh: report invalid_grant without hitting usage."""
@@ -1100,6 +1106,52 @@ class TestInvalidGrantPropagation:
             )
         assert outcome.error == "invalid_grant"
         usage.assert_not_called()  # no pointless 401/429 on a lost cause
+
+    def test_proactive_refresh_skips_post_when_grant_genuinely_expired(self):
+        """Access token AND refresh grant both past expiry: no refresh POST,
+        but the outcome still carries invalid_grant and still strikes."""
+        from datetime import timedelta
+        past_ms = int(
+            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
+        )
+        creds = self._expired_credentials(refresh_token_expires_at=past_ms)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh, \
+             patch("claude_swap.oauth.request_usage_data") as usage:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=False,
+            )
+        refresh.assert_not_called()
+        usage.assert_not_called()
+        assert outcome.error == "invalid_grant"
+        assert outcome.struck_fp == oauth.credential_fingerprint(creds)
+
+    def test_proactive_refresh_still_posts_inside_expiry_buffer(self):
+        """Grant expiring in 60s, inside the 5-minute buffer: refresh is still
+        attempted — it can still mint an access token good for hours."""
+        from datetime import timedelta
+        soon_ms = int(
+            (datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp() * 1000
+        )
+        creds = self._expired_credentials(refresh_token_expires_at=soon_ms)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=False,
+            )
+        refresh.assert_called_once()
+        assert outcome.error == "invalid_grant"
+
+    def test_proactive_refresh_still_posts_when_grant_expiry_unknown(self):
+        """No refreshTokenExpiresAt field at all: unknown is not expired, so
+        the refresh is still attempted."""
+        creds = self._expired_credentials()
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=False,
+            )
+        refresh.assert_called_once()
+        assert outcome.error == "invalid_grant"
 
     def test_401_retry_invalid_grant_is_permanent(self):
         """Valid-looking token, server 401, dead refresh → invalid_grant."""
@@ -1114,6 +1166,27 @@ class TestInvalidGrantPropagation:
                 "1", "a@b.c", self._valid_credentials(), is_active=False,
             )
         assert outcome.error == "invalid_grant"
+
+    def test_401_retry_skips_post_when_grant_genuinely_expired(self):
+        """Valid-looking access token, server 401, but the refresh grant is
+        already past expiry: the 401-retry refresh must not POST either."""
+        from datetime import timedelta
+        past_ms = int(
+            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
+        )
+        creds = self._valid_credentials(refresh_token_expires_at=past_ms)
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as refresh:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=False,
+            )
+        refresh.assert_not_called()
+        assert outcome.error == "invalid_grant"
+        assert outcome.struck_fp == oauth.credential_fingerprint(creds)
 
     def test_transient_refresh_failure_is_not_permanent(self):
         """A transient refresh failure stays 'refresh-failed', not invalid_grant."""
