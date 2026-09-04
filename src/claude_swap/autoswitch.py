@@ -363,7 +363,7 @@ class PollEvent(AutoSwitchEvent):
             # `_rank_candidates` can rank around; see `classify_candidate_block`).
             kind, model = classify_candidate_block(wins.items(), self.threshold)
             if kind == "full":
-                text += " (blocked)"
+                text += f" ({model} full)"
             elif kind == "model":
                 text += f" ({model}-only)"
             return text
@@ -769,9 +769,11 @@ def classify_candidate_block(
     ``h = 100 - max(pcts)``, i.e. the binding pct itself), read per window
     instead of folded across all of them. Three outcomes: ``"open"``
     (nothing blocks), ``"full"`` (a 5h/7d window blocks — no model choice
-    escapes that one), or ``"model"`` (every blocking window is a scoped
-    model window, naming the first — dropping that model from the criteria
-    set is what escapes it, not moving accounts). This is a report, not a
+    escapes that one, named the same way a model block already is: the
+    first in `windows` order, i.e. 5h before 7d when both block), or
+    ``"model"`` (every blocking window is a scoped model window, naming
+    the first — dropping that model from the criteria set is what escapes
+    it, not moving accounts). This is a report, not a
     decision: the engine's own model-window fallback in ``_rank_candidates``
     already acts on the same distinction, so the panel and the decision log
     read it here instead of re-deriving it and risking a different answer.
@@ -779,8 +781,11 @@ def classify_candidate_block(
     blocking = [(label, pct) for label, pct in windows if pct >= threshold]
     if not blocking:
         return "open", None
-    if any(label in ("5h", "7d") for label, _ in blocking):
-        return "full", None
+    # 5h/7d before models in `relevant_windows` order, so the first
+    # matching entry in `blocking` is deterministically 5h over 7d.
+    full = next((label for label, _ in blocking if label in ("5h", "7d")), None)
+    if full is not None:
+        return "full", full
     return "model", blocking[0][0]
 
 

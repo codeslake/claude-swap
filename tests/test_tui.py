@@ -2428,10 +2428,11 @@ class TestUnswitchableRowsAreListed:
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends
-        `(blocked)` for `full` (`_describe`), and the chip colour alone does
-        not say "blocked": it is driven by the fixed WARN/CRIT constants in
-        `theme.py`, not by `settings.threshold`, so at an off-default
-        threshold the colour and the block classification can disagree."""
+        `(<window> full)` for `full` (`_describe`), and the chip colour
+        alone does not say which window blocked: it is driven by the fixed
+        WARN/CRIT constants in `theme.py`, not by `settings.threshold`, so
+        at an off-default threshold the colour and the block classification
+        can disagree."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(model="Fable", threshold=90.0)
@@ -2450,7 +2451,27 @@ class TestUnswitchableRowsAreListed:
             }),
         ), active="1", settings=settings)
         assert "Fable-only" in out, out
-        assert "  blocked" in out, out
+        assert "  5h full" in out, out
+
+    def test_the_panel_chips_include_the_window_its_label_names(self):
+        """A row's chips and its label must read the SAME window set — a
+        `model`-blocked row used to name the scoped window in its label
+        while the chips, built from a literal 5h/7d pair, never printed it
+        at all. Account #4's real values: 5h 28%, 7d 70%, Fable 91%,
+        threshold 90, model Fable — the label already read `Fable-only`;
+        the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%`."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("4", "d@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 28.0}, "seven_day": {"pct": 70.0},
+                "scoped": [{"name": "Fable", "pct": 91.0}],
+            }),
+        ), active="1", settings=settings)
+        assert "Fable-only" in out, out
+        assert "Fable:91%" in out, out
 
     def test_panel_top_matches_the_engines_pick_under_consume_first(
         self, temp_home

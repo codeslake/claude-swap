@@ -467,21 +467,20 @@ class AutoScreen(Screen):
                 ranked.append(((999.0,), acc.number))
             else:
                 # Per-window chips, from the same helper the dashboard uses
-                # (data.window_chip_label) so one account cannot read two ways.
+                # (data.chip_label) so one account cannot read two ways. The
+                # SAME relevant_windows call feeds the label below, so the
+                # chips and the label can never disagree on which windows
+                # exist for this account.
                 now = time.time()
-                chips = [
-                    (key, label, data.window_pct(acc.usage.last_good, key))
-                    for label, key in (("5h", "five_hour"), ("7d", "seven_day"))
-                ]
-                chips = [c for c in chips if c[2] is not None]
-                for i, (key, label, wpct) in enumerate(chips):
+                windows = oauth.relevant_windows(acc.usage.last_good, models)
+                for i, (label, wpct, resets_at) in enumerate(windows):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     entry.append(
-                        data.window_chip_label(acc.usage.last_good, key, label, now),
+                        data.chip_label(label, data.reset_text({"resets_at": resets_at}, now)),
                         style=palette.muted,
                     )
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
-                if not chips:  # no window data at all — keep the old reading
+                if not windows:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
@@ -493,16 +492,13 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
-                    windows = ((label, p) for label, p, _ in oauth.relevant_windows(
-                        acc.usage.last_good, models
-                    ))
                     kind, blocked_model = classify_candidate_block(
-                        windows, self._settings.threshold
+                        ((label, p) for label, p, _ in windows), self._settings.threshold
                     )
                     if kind == "model":
                         entry.append(f"  {blocked_model}-only", style=palette.muted)
                     elif kind == "full":
-                        entry.append("  blocked", style=palette.muted)
+                        entry.append(f"  {blocked_model} full", style=palette.muted)
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
