@@ -4269,7 +4269,7 @@ class TestAModelWindowIsNotABlackout:
         ) == ("open", None)
         assert classify_candidate_block(
             [("5h", 95.0), ("7d", 5.0), ("Fable", 10.0)], 90.0
-        ) == ("full", None)
+        ) == ("full", "5h")
         assert classify_candidate_block(
             [("5h", 5.0), ("7d", 0.0), ("Fable", 95.0)], 90.0
         ) == ("model", "Fable")
@@ -4281,6 +4281,22 @@ class TestAModelWindowIsNotABlackout:
         assert classify_candidate_block(
             [("5h", 5.0), ("7d", 0.0), ("Fable", 90.0)], 90.0
         ) == ("model", "Fable")
+
+    def test_classify_full_names_the_binding_window(self):
+        """A ``"full"`` block must name which 5h/7d window blocked it, the
+        same way a ``"model"`` block already names its window — a caller
+        cannot otherwise render `<window> full` instead of a bare
+        "blocked". #5's real values: 5h 0%, 7d 90%, Fable 100%, threshold 90."""
+        assert classify_candidate_block(
+            [("5h", 0.0), ("7d", 90.0), ("Fable", 100.0)], 90.0
+        ) == ("full", "7d")
+
+    def test_classify_full_names_the_first_window_in_relevant_windows_order(self):
+        """Both 5h and 7d blocking: name 5h, the order `relevant_windows`
+        reports them in — deterministic, not the loudest one."""
+        assert classify_candidate_block(
+            [("5h", 95.0), ("7d", 92.0), ("Fable", 10.0)], 90.0
+        ) == ("full", "5h")
 
     def test_the_decision_log_names_what_blocked_each_candidate(self):
         event = PollEvent(
@@ -4295,7 +4311,7 @@ class TestAModelWindowIsNotABlackout:
         )
         text = event.human()
         assert "#1: 5h 34% · 7d 69% · Fable 91% (Fable-only)" in text, text
-        assert "#2: 5h 92% · 7d 10% · Fable 20% (blocked)" in text, text
+        assert "#2: 5h 92% · 7d 10% · Fable 20% (5h full)" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
 

@@ -152,7 +152,7 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     return reset_text(last_good.get(key), now)
 
 
-def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
+def chip_label(label: str, reset: str | None) -> str:
     """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
 
     THE one place that decides how a window reads — the dashboard's inactive
@@ -161,10 +161,14 @@ def window_chip_label(last_good: dict | None, key: str, label: str, now: float) 
     colour it by severity. The countdown shows whenever it is known, not only
     at 100%: a saturated candidate's worth IS when it comes back.
     """
-    reset = window_reset_text(last_good, key, now)
     if not reset:
         return f"{label}:"
     return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
+
+
+def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
+    """`chip_label` for one of the top-level 5h/7d windows."""
+    return chip_label(label, window_reset_text(last_good, key, now))
 
 
 def format_duration(seconds: float) -> str:
