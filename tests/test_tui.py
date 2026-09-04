@@ -1915,15 +1915,16 @@ class TestAutoScreen:
         self, tmp_path, fake_engine
     ):
         """Under `optim` the panel must sort by the SAME margin key the
-        engine's voluntary trigger admits on, not by raw utilization -- else
-        the panel's order can disagree with the account the engine would
-        actually pick. Both #2 (Fable 78%) and #3 (Fable 40%) clear the
-        margin (threshold(90) - hysteresis(10) = 80), so the margin key ties
-        them on tier and breaks the tie on #2's sooner weekly reset -- #2
-        first. Raw pct disagrees: 40 < 78 sorts #3 first. Picked so the two
-        orderings differ, unlike the accounts this test used to carry (a
-        raw-pct read gave the same order the margin key did, so a mutant
-        collapsing `optim` onto plain pct ordering left this test green)."""
+        engine's voluntary trigger admits on, not by raw utilization or by
+        the plain threshold -- else the panel's order can disagree with the
+        account the engine would actually pick. #2 (Fable 78%) and #3 (Fable
+        40%) both clear the margin (threshold(90) - hysteresis(10) = 80) and
+        tie on tier, breaking the tie on #2's sooner weekly reset; #4 (Fable
+        86%, soonest reset of all) sits ABOVE the margin, so it ranks below
+        both regardless of its reset. The margin key gives #2, #3, #4; the
+        plain threshold (90, no margin) puts #4 in the same tier as the
+        others and its soonest reset wins, giving #4, #2, #3; raw pct sorts
+        by utilization alone, giving #3, #2, #4. All three orders distinct."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -1958,6 +1959,7 @@ class TestAutoScreen:
                 ),
                 make_account(2, entry=_candidate(100000, 78.0)),  # sooner, healthy
                 make_account(3, entry=_candidate(200000, 40.0)),  # later, healthy
+                make_account(4, entry=_candidate(50000, 86.0)),  # soonest, over margin
             ],
             tmp_path,
         )
@@ -1968,9 +1970,8 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user2@example.com") < plain.index(
-                "user3@example.com"
-            )
+            positions = [plain.index(f"user{n}@example.com") for n in ("2", "3", "4")]
+            assert positions == sorted(positions), plain
 
     async def test_strategy_binding_cycles_and_persists_for_the_session(
         self, tmp_path, fake_engine

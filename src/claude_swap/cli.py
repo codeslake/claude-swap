@@ -683,8 +683,8 @@ Defaults live in settings.json in the backup root; flags override them.
             "Target selection: 'best' (most quota left), "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest; default), or 'optim' (consume-first with a "
-            "landing margin: the voluntary below-threshold move needs "
-            "threshold - hysteresis of room)"
+            "landing margin: the voluntary below-threshold move only lands "
+            "on an account below threshold - hysteresis)"
         ),
     )
     parser.add_argument(
