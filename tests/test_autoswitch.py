@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    classify_candidate_block,
     pct_label,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
@@ -3478,6 +3479,19 @@ class TestSessionThreshold:
         assert {"1", "2", "3"} not in self._collect_fetch_sets(harness, 99.9)
 
 
+class TestSessionStrategy:
+    """apply_strategy(): the TUI's session-only, mid-run override. The
+    existing coverage (test_tui.py's test_strategy_cycle_is_session_only)
+    only asserts against `_FakeEngine.applied_strategies`, never a real
+    `AutoSwitchEngine` — the whole suite passes with `apply_strategy`'s body
+    replaced by `pass`. This is the real-engine check."""
+
+    def test_apply_strategy_retargets_settings(self, harness):
+        assert harness.engine.settings.strategy == "consume-first"
+        harness.engine.apply_strategy("dynamic")
+        assert harness.engine.settings.strategy == "dynamic"
+
+
 class TestPctLabel:
     def test_whole_numbers_drop_the_decimal(self):
         assert pct_label(90.0) == "90"
@@ -3895,12 +3909,15 @@ class TestModelAwareSwitch:
         # #2 is exhausted with NO reset timestamp — it could recover any
         # moment. Sleeping toward #3's known 20:00 reset would suppress
         # checks for hours, so the wake time must be unprovable (bounded
-        # blocked-cadence fallback instead of a reset sleep).
+        # blocked-cadence fallback instead of a reset sleep). #2's 5h is
+        # ALSO maxed (not just Fable): a model-only block is no longer a
+        # blackout (`_rank_candidates`'s retry ranks around it on 5h/7d),
+        # so this fleet needs a genuine dual exhaustion to stay one.
         h = self._seed(temp_home, model="Fable")
         outcome = h.tick_with_usage({
             "1": _model_usage(95, 10),
             "2": {
-                "five_hour": {"pct": 0.0},
+                "five_hour": {"pct": 100.0},  # no resets_at
                 "seven_day": {"pct": 0.0},
                 "scoped": [{"name": "Fable", "pct": 100.0}],  # no resets_at
             },
@@ -3915,10 +3932,17 @@ class TestModelAwareSwitch:
         assert h.engine._sleep_until_ts is None
         assert h.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
 
-    def test_scoped_only_exhaustion_drives_the_wake_time(self, temp_home):
-        # Candidates blocked ONLY by Fable: the wake must come from the scoped
-        # reset — the 5h/7d-only scan would find no ≥100% window at all.
-        h = self._seed(temp_home, model="Fable")
+    def test_scoped_only_block_is_not_a_blackout_and_switches(self, temp_home):
+        # #2 and #3 are blocked ONLY by Fable — 5h/7d both have room (3%
+        # used). That is no longer treated as exhaustion: `_rank_candidates`
+        # drops the model window once every candidate is blocked only by it
+        # and ranks on 5h/7d instead, so the engine moves rather than
+        # waiting out the Fable reset. (Was `BLOCKED` with the wake time
+        # taken from the scoped reset — the exact shape this fixes.)
+        # The retry that rescues it is `dynamic`-only (see
+        # TestAModelWindowIsNotABlackout's `_args`); `best`/`consume-first`
+        # keep today's behaviour and stay blocked here, unchanged.
+        h = self._seed(temp_home, model="Fable", strategy="dynamic")
         fable_reset = "2026-07-06T09:00:00Z"
         blocked = {
             "five_hour": {"pct": 3.0, "resets_at": "2026-07-05T12:00:00Z"},
@@ -3928,9 +3952,11 @@ class TestModelAwareSwitch:
         outcome = h.tick_with_usage({
             "1": _model_usage(95, 10), "2": blocked, "3": blocked,
         })
-        assert outcome is TickOutcome.BLOCKED
-        exhausted = next(e for e in h.events if isinstance(e, AllExhaustedEvent))
-        assert exhausted.earliest_reset_at == fable_reset
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — #2/#3's only over-bar window is Fable, with "
+            "5h/7d wide open, so the fleet is not exhausted"
+        )
+        assert h.active_number() in (2, 3)
 
     def test_scoped_binding_window_keeps_active_cadence_tight(self, temp_home):
         # Fable moving at 88% is inside the escalation band: with the model
@@ -3991,6 +4017,416 @@ class TestModelAwareSwitch:
         assert not any(isinstance(e, ConfigWarningEvent) for e in h.events)
 
 
+class TestAModelWindowIsNotABlackout:
+    """A pinned model's scoped window is folded into every headroom read
+    alongside 5h/7d — so a candidate whose ONLY over-bar window is the model
+    was dropped as an unhealthy landing exactly like one genuinely spent on
+    5h/7d, and when every candidate carries that same model bar the ranking
+    emptied while 5h/7d headroom went unused. ``_rank_candidates`` retries
+    once on 5h/7d alone when the model-gated pass comes back empty; a
+    candidate blocked on 5h/7d too stays blocked in that retry, so a real
+    blackout is untouched.
+    """
+
+    def _args(self, harness, *, usage, current, oauth_candidates, headroom,
+              active_headroom, trigger=None, consume_first=True,
+              strategy="dynamic"):
+        # The retry this class tests (`_rank_candidates`'s 5h/7d fallback
+        # pass) is gated to `strategy == "dynamic"` — `best`/`consume-first`
+        # never re-rank on 5h/7d alone, by the owner's word that they must
+        # read exactly as deployed today. `trigger` defaults to the
+        # strategy name (the voluntary below-threshold trigger an engine
+        # actually produces for it) unless a test names a specific trigger.
+        return dict(
+            trigger=trigger if trigger is not None else strategy,
+            consume_first=consume_first,
+            no_return=None,
+            oauth_candidates=oauth_candidates,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=AutoSwitchSettings(threshold=90.0, strategy=strategy),
+            now=harness.clock.now,
+        )
+
+    def test_the_owners_fleet_moves_once_the_model_window_is_dropped(
+        self, temp_home
+    ):
+        """The reported fleet, reproduced exactly: six accounts, Fable
+        pinned, threshold 90. 1/3/4/5's only over-bar window is Fable — 5h
+        and 7d both have room — so the model-gated pass empties and the
+        retry on 5h/7d alone must both rescue it and rank it (soonest 7-day
+        reset first, the consume-first strategy's own key). #2 stays out
+        either way: its OWN 5h sits at the bar with no model involved."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        now = h.clock.now
+
+        def usage(five_h, seven_d, fable, days_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(now + days_out * 86400),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        fleet_usage = {
+            "6": {
+                "five_hour": {"pct": 72.0},
+                "seven_day": {
+                    "pct": 0.0, "resets_at": _iso_at(now + 100 * 86400),
+                },
+            },
+            "1": usage(34, 69, 91, 4),
+            "2": usage(90, 79, 87, 0.5),
+            "3": usage(33, 69, 94, 3),
+            "4": usage(0, 64, 91, 2),
+            "5": usage(0, 62, 90, 1),
+        }
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="6",
+            oauth_candidates=["1", "2", "3", "4", "5"],
+            headroom=headroom, active_headroom=headroom["6"],
+        )
+        ordered, any_known, _, _ = h.engine._rank_candidates(**args)
+        assert any_known
+        assert list(ordered) == ["5", "4", "3", "1"], (
+            f"got {list(ordered)} — every candidate's only over-bar window "
+            "is Fable, 5h/7d has room on all of 1/3/4/5, and #2 must stay "
+            "excluded on its own 5h at 90%: the retry is not a blanket "
+            "unblock, only a re-rank on 5h/7d"
+        )
+
+    def test_the_retry_drops_the_model_gate_from_both_admission_and_ranking(
+        self, temp_home
+    ):
+        """Candidates on BOTH sides of the model bar, unlike the owner's
+        fleet above (its four ranked candidates all land in the same
+        ``consume_first_rank_key`` tier, so a retry that kept re-gating on
+        Fable internally would still rank them identically and the test
+        could not tell). #1's ONLY good axis is 5h/7d (Fable 99% blocks it
+        on the model axis); #3 is genuinely servable on both axes but with
+        less 5h/7d headroom than #1; #2 has real 5h/7d headroom but not
+        enough to beat the ACTIVE's — every one of these needs the retry's
+        `models=()`/`fallback_headroom[current]` pair intact to land right.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+
+        def usage(five_h, fable):
+            return {
+                "five_hour": {"pct": five_h}, "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        fleet_usage = {
+            "0": usage(20.0, 95.0),   # active: 5h/7d headroom 80, model-gated 5
+            "1": usage(5.0, 99.0),    # 5h/7d headroom 95, model-gated 1
+            "2": usage(70.0, 100.0),  # 5h/7d headroom 30 — worse than active's 80
+            "3": usage(8.0, 91.0),    # 5h/7d headroom 92, model-gated 9
+        }
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="0",
+            oauth_candidates=["1", "2", "3"],
+            headroom=headroom, active_headroom=headroom["0"],
+            trigger="proactive",
+        )
+        ordered, any_known, _, _ = h.engine._rank_candidates(**args)
+        assert any_known
+        assert list(ordered) == ["1", "3"], (
+            f"got {list(ordered)} — #2 must stay excluded (worse than the "
+            "active's real 5h/7d headroom), and #1 must rank ahead of #3 "
+            "(more 5h/7d headroom): a retry that re-applies the model gate "
+            "internally instead flips this order (#1 reads unservable on "
+            "Fable and #3 wins) or drops #1 as unhealthy outright"
+        )
+
+    def test_a_real_blackout_stays_empty_after_the_retry(self, temp_home):
+        """#2 and #3 are ALSO over the bar on 5h, not just Fable — the retry
+        on 5h/7d alone must not manufacture a landing that was never there."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        active = {
+            "five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 10.0}],
+        }
+        blocked = {
+            "five_hour": {"pct": 95.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 95.0}],
+        }
+        fleet_usage = {"1": active, "2": blocked, "3": blocked}
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="1", oauth_candidates=["2", "3"],
+            headroom=headroom, active_headroom=headroom["1"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == [], (
+            f"got {list(ordered)} — #2 and #3 are genuinely spent on 5h "
+            "too, so dropping the model window must not rescue them"
+        )
+
+    def test_the_fallback_does_not_engage_when_the_model_set_already_lands(
+        self, temp_home
+    ):
+        """#2 is healthier once Fable is dropped than #1's Fable-gated pick
+        — if the retry ran anyway and got merged in, #2 would win. It must
+        never run: the model-gated pass already found #1, and that stays
+        the answer."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        active = {
+            "five_hour": {"pct": 50.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 0.0}],
+        }
+        usage_1 = {  # eligible on Fable too
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 20.0}],
+        }
+        usage_2 = {  # model-only blocked; would win once Fable is dropped
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": 95.0}],
+        }
+        fleet_usage = {"3": active, "1": usage_1, "2": usage_2}
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="3", oauth_candidates=["1", "2"],
+            headroom=headroom, active_headroom=headroom["3"],
+            trigger="proactive", consume_first=False,
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == ["1"], (
+            f"got {list(ordered)} — the model-gated pass already found #1 "
+            "eligible; #2 must never enter the ranking"
+        )
+
+    def test_a_real_blackout_at_the_limit_keeps_the_first_passs_waiting_flag(
+        self, temp_home
+    ):
+        """A genuine blackout (5h AND 7d spent too, not just Fable) must
+        report the same `waiting` verdict the model-gated pass reached, not
+        whatever the 5h/7d-only retry happens to compute. Rigged so the two
+        passes disagree: the active's ONLY knowable reset is Fable's scoped
+        window, so the model-gated pass can name a recovery moment
+        (`waiting=True`) while the 5h/7d-only retry sees no knowable reset at
+        all and reports `waiting=False`. Returning the retry's tuple here —
+        the bug this cut fixes — silently drops the wait."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        now = h.clock.now
+        fleet_usage = {
+            "1": {
+                "five_hour": {"pct": 100.0},
+                "seven_day": {"pct": 100.0},
+                "scoped": [
+                    {"name": "Fable", "pct": 100.0, "resets_at": _iso_at(now + 3600)}
+                ],
+            },
+            "2": {
+                "five_hour": {"pct": 100.0},
+                "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],
+            },
+        }
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="1", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=headroom["1"],
+            trigger="at-limit", consume_first=False,
+        )
+        ordered, any_known, _, waiting = h.engine._rank_candidates(**args)
+        assert list(ordered) == [], (
+            f"got {list(ordered)} — #2 is genuinely spent on 5h/7d too, so "
+            "dropping the model window must not rescue it"
+        )
+        assert any_known
+        assert waiting is True, (
+            "waiting came back False — the retry's tuple leaked through "
+            "instead of the model-gated pass's, which had a knowable "
+            "recovery moment (Fable's reset) the retry cannot see"
+        )
+
+    def test_classify_open_full_and_model_only(self):
+        """The three outcomes ``classify_candidate_block`` reports, read by
+        both the panel and the decision log so they cannot disagree."""
+        assert classify_candidate_block(
+            [("5h", 10.0), ("7d", 5.0), ("Fable", 20.0)], 90.0
+        ) == ("open", None)
+        assert classify_candidate_block(
+            [("5h", 95.0), ("7d", 5.0), ("Fable", 10.0)], 90.0
+        ) == ("full", None)
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 0.0), ("Fable", 95.0)], 90.0
+        ) == ("model", "Fable")
+
+    def test_classify_candidate_block_blocks_on_the_threshold_itself(self):
+        """`>=`, not `>`: a window sitting exactly ON the threshold is a
+        landing gate refusal too (`_rank_candidates_pass`'s own arithmetic
+        this classifier mirrors), not an ``"open"`` slot."""
+        assert classify_candidate_block(
+            [("5h", 5.0), ("7d", 0.0), ("Fable", 90.0)], 90.0
+        ) == ("model", "Fable")
+
+    def test_the_decision_log_names_what_blocked_each_candidate(self):
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "1": 9.0, "2": 40.0, "3": 60.0},
+            threshold=90.0,
+            windows={
+                "1": {"5h": 34.0, "7d": 69.0, "Fable": 91.0},  # model-only
+                "2": {"5h": 92.0, "7d": 10.0, "Fable": 20.0},  # full (5h)
+                "3": {"5h": 5.0, "7d": 5.0, "Fable": 5.0},     # open
+            },
+        )
+        text = event.human()
+        assert "#1: 5h 34% · 7d 69% · Fable 91% (Fable-only)" in text, text
+        assert "#2: 5h 92% · 7d 10% · Fable 20% (blocked)" in text, text
+        assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
+        assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
+
+
+class TestTheRetryAdmitsOnlyAnImprovement:
+    """The 5h/7d retry (``_rank_candidates``'s second pass) must compare a
+    landing to the ACTIVE on the retry's own axis, for every trigger shape
+    — not only ``consume-first``. Without that, a candidate that is WORSE on
+    5h/7d than the active still gets admitted, the engine switches onto it,
+    the same model-gated trigger fires again next tick, and the fleet
+    round-robins forever on candidates that were never an improvement.
+    """
+
+    @staticmethod
+    def _usage_fable(fable_pct: float, five_h_pct: float) -> dict:
+        return {
+            "five_hour": {"pct": five_h_pct},
+            "seven_day": {"pct": 0.0},
+            "scoped": [{"name": "Fable", "pct": fable_pct}],
+        }
+
+    @staticmethod
+    def _tick_loop(harness: EngineHarness, usage_map: dict, ticks: int) -> tuple[int, list]:
+        switches = 0
+        trace = []
+        for _ in range(ticks):
+            outcome = harness.tick_with_usage(usage_map)
+            if outcome is TickOutcome.SWITCHED:
+                switches += 1
+            trace.append(harness.active_number())
+            harness.clock.advance(301.0)  # past cooldown_seconds (300)
+        return switches, trace
+
+    def test_a_proactive_trigger_under_dynamic_never_churns_a_model_bar(
+        self, temp_home
+    ):
+        """Every account is pinned-model-blocked at the same 95%, so every
+        tick re-triggers a `proactive` retry on 5h/7d — under `dynamic`,
+        the only strategy that ever reaches the retry. A landing must
+        still beat the active by the hysteresis margin on the retry's own
+        5h/7d axis; none of these candidates do (they hold LESS 5h
+        headroom than whichever account is active), so nothing should
+        ever move.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        usage_map = {
+            "1": self._usage_fable(95.0, 10.0),  # 5h headroom 90
+            "2": self._usage_fable(95.0, 20.0),  # 5h headroom 80
+            "3": self._usage_fable(95.0, 30.0),  # 5h headroom 70
+        }
+        for num in usage_map:
+            h.seed(int(num), f"acc{num}@example.com")
+        h.make_live("acc1@example.com", 1)
+        switches, trace = self._tick_loop(h, usage_map, ticks=8)
+        assert switches == 0, (
+            f"got {switches} switches, trace {trace} — every candidate is "
+            "strictly worse on 5h/7d than whichever account is active; the "
+            "retry must never admit a non-improvement"
+        )
+
+    def test_a_proactive_trigger_under_consume_first_skips_the_retry_and_holds(
+        self, temp_home
+    ):
+        """SAME fleet as above, `consume-first` — today's deployed
+        strategy. The retry is `dynamic`-only, so a model-gated pass that
+        empties here never re-ranks on 5h/7d at all; the engine holds,
+        exactly as it does before this PR, not because a landing
+        comparison rejected a candidate."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="consume-first")
+        usage_map = {
+            "1": self._usage_fable(95.0, 10.0),
+            "2": self._usage_fable(95.0, 20.0),
+            "3": self._usage_fable(95.0, 30.0),
+        }
+        for num in usage_map:
+            h.seed(int(num), f"acc{num}@example.com")
+        h.make_live("acc1@example.com", 1)
+        switches, trace = self._tick_loop(h, usage_map, ticks=8)
+        assert switches == 0, (
+            f"got {switches} switches, trace {trace} — consume-first must "
+            "never reach the 5h/7d retry at all"
+        )
+
+    def test_an_at_limit_escape_under_dynamic_never_churns_a_model_bar(
+        self, temp_home
+    ):
+        """Same shape, `dynamic` strategy, every account fully spent on the
+        pinned model (`at-limit` trigger). The at-limit escape is allowed
+        to skip the landing gate ONLY when the active is genuinely spent on
+        the axis being ranked; on the 5h/7d retry axis here the active
+        holds real headroom, so the escape must fall back to the ordinary
+        hysteresis comparison — and none of these candidates clear it.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        usage_map = {
+            "1": self._usage_fable(100.0, 10.0),  # 5h headroom 90
+            "2": self._usage_fable(100.0, 20.0),  # 5h headroom 80
+            "3": self._usage_fable(100.0, 30.0),  # 5h headroom 70
+        }
+        for num in usage_map:
+            h.seed(int(num), f"acc{num}@example.com")
+        h.make_live("acc1@example.com", 1)
+        switches, trace = self._tick_loop(h, usage_map, ticks=8)
+        assert switches == 0, (
+            f"got {switches} switches, trace {trace} — the active holds "
+            "real 5h/7d headroom on the retry's own axis, so the at-limit "
+            "escape must not bypass the landing comparison"
+        )
+
+    def test_an_at_limit_escape_under_best_skips_the_retry_and_holds(
+        self, temp_home
+    ):
+        """SAME fleet as above, `best` — the retry is `dynamic`-only, so
+        `best`'s model-gated pass emptying here never re-ranks on 5h/7d at
+        all; the engine holds exactly as it does before this PR."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="best")
+        usage_map = {
+            "1": self._usage_fable(100.0, 10.0),
+            "2": self._usage_fable(100.0, 20.0),
+            "3": self._usage_fable(100.0, 30.0),
+        }
+        for num in usage_map:
+            h.seed(int(num), f"acc{num}@example.com")
+        h.make_live("acc1@example.com", 1)
+        switches, trace = self._tick_loop(h, usage_map, ticks=8)
+        assert switches == 0, (
+            f"got {switches} switches, trace {trace} — best must never "
+            "reach the 5h/7d retry at all"
+        )
+
+
 # --- consume-first strategy ----------------------------------------------------
 
 # Weekly-reset instants in ascending order (all valid ISO-8601, absolute).
@@ -4008,6 +4444,485 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     if reset7:
         seven["resets_at"] = reset7
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
+
+
+class TestDynamicStrategy:
+    """``dynamic``: consume-first's ranking key, the model basis re-picked
+    each tick, and a landing rule that never lands on a candidate with no
+    room on the axis in force — even when every account is above the
+    threshold, where the pre-existing ``all_above`` recovery-axis escape
+    otherwise admits one on a "recovers soonest" basis alone. Scoped to
+    ``strategy == "dynamic"`` throughout: `best`/`consume-first` keep
+    whatever they did before this class exists, and several tests below
+    assert that directly, on the SAME inputs.
+    """
+
+    @staticmethod
+    def _args(harness, *, usage, current, oauth_candidates, headroom,
+              active_headroom, trigger, strategy, no_return=None):
+        return dict(
+            trigger=trigger,
+            consume_first=strategy in ("consume-first", "dynamic"),
+            no_return=no_return,
+            oauth_candidates=oauth_candidates,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=AutoSwitchSettings(threshold=90.0, strategy=strategy),
+            now=harness.clock.now,
+        )
+
+    def test_the_voluntary_arm_never_lands_on_a_candidate_with_no_room(
+        self, temp_home
+    ):
+        """Below the threshold (the `dynamic`/`consume-first` trigger), a
+        candidate whose weekly window resets sooner than the active's is
+        still not a landing if it has no room at all: `#2` resets sooner
+        (`_R_SOON` < `_R_LATEST`) but sits at 95% on its 5-hour window. The
+        landing bar runs before the reset-ordering filter for every
+        strategy that reaches this trigger, so this arm never needed a
+        `dynamic`-only change — this pins that it still holds."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        usage = {
+            "1": _usage7(10.0, 20.0, _R_LATEST),   # active: headroom 90
+            "2": _usage7(95.0, 5.0, _R_SOON),      # headroom 5, resets sooner
+        }
+        headroom = {"1": 90.0, "2": 5.0}
+        args = self._args(
+            h, usage=usage, current="1", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=90.0,
+            trigger="dynamic", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == [], (
+            f"got {ordered} — #2 has no room (headroom 5, threshold 90) and "
+            "must never be a landing no matter how soon its reset is"
+        )
+
+    def test_the_proactive_arm_never_lands_on_a_candidate_still_at_the_wall(
+        self, temp_home
+    ):
+        """Reproduces the live trace: active over threshold with real
+        headroom (`proactive`, not `at-limit`), every account above the
+        threshold (`all_above`), and a peer whose OWN window is already at
+        the switch threshold but whose binding window happens to reset
+        soonest. The pre-existing `all_above` recovery-axis escape admits
+        that peer on recovery timing alone — measured live, the very next
+        tick read `cooldown` while still blocked. `dynamic` closes it;
+        `best`/`consume-first` keep the escape (asserted on the SAME
+        inputs, both directions, as the "unchanged" evidence)."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "6": {  # active: headroom 8, recovers in ~5.5h
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {  # candidate: headroom 10 (at the wall), recovers in 2min
+                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"6": 8.0, "2": 10.0}
+        for strategy, expected in (
+            ("dynamic", []),
+            ("consume-first", ["2"]),
+            ("best", ["2"]),
+        ):
+            args = self._args(
+                h, usage=usage, current="6", oauth_candidates=["2"],
+                headroom=headroom, active_headroom=8.0,
+                trigger="proactive", strategy=strategy,
+            )
+            ordered, _, _, _ = h.engine._rank_candidates(**args)
+            assert ordered == expected, (
+                f"strategy={strategy}: got {ordered}, want {expected} — #2 "
+                "is still at the wall (headroom 10, threshold 90) and only "
+                "`dynamic` may refuse to land there"
+            )
+
+    def test_consume_first_switches_on_a_plain_proactive_trigger_dynamic_holds(
+        self, temp_home
+    ):
+        """No `--model`, primary pass. Active at 91% (over the 90 threshold,
+        `proactive`, headroom 9); one healthy candidate at 85% (headroom
+        15) — 6 points better, short of the default 10-point
+        `hysteresis_pct`. `consume-first` must switch here exactly as it
+        does today (its base behaviour on this trigger is unconditional
+        admission, restored on the owner's word — a real anti-flap gate
+        for it is a separate, authorized round); `dynamic` holds, gated by
+        the ordinary hysteresis margin like `best`."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "1": {  # active: headroom 9, over threshold
+                "five_hour": {"pct": 91.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {  # candidate: headroom 15, healthy but < hysteresis margin
+                "five_hour": {"pct": 85.0, "resets_at": _iso_at(now + 90000)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"1": 9.0, "2": 15.0}
+        for strategy, expected in (
+            ("consume-first", ["2"]),
+            ("dynamic", []),
+        ):
+            args = self._args(
+                h, usage=usage, current="1", oauth_candidates=["2"],
+                headroom=headroom, active_headroom=9.0,
+                trigger="proactive", strategy=strategy,
+            )
+            ordered, _, _, _ = h.engine._rank_candidates(**args)
+            assert ordered == expected, (
+                f"strategy={strategy}: got {ordered}, want {expected} — "
+                "#2 beats the active by 6 points, under the 10-point "
+                "hysteresis margin"
+            )
+
+    def test_the_at_limit_arm_never_lands_on_a_candidate_still_at_the_wall(
+        self, temp_home
+    ):
+        """Same shape as the proactive case, `at-limit` trigger with the
+        active NOT `about_to_wall` on this axis (the 5h/7d retry pass,
+        where the active can hold real headroom even though the model gate
+        that set the trigger spent it) — the other trigger the `all_above`
+        recovery axis reaches."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "6": {
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {
+                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"6": 8.0, "2": 10.0}
+        for strategy, expected in (
+            ("dynamic", []),
+            ("consume-first", ["2"]),
+        ):
+            args = self._args(
+                h, usage=usage, current="6", oauth_candidates=["2"],
+                headroom=headroom, active_headroom=8.0,
+                trigger="at-limit", strategy=strategy,
+            )
+            ordered, _, _, _ = h.engine._rank_candidates(**args)
+            assert ordered == expected, (
+                f"strategy={strategy}: got {ordered}, want {expected} — the "
+                "at-limit escape must not bypass the landing bar for "
+                "dynamic just because `about_to_wall` is false on this axis"
+            )
+
+    def test_the_at_limit_escape_still_lands_when_the_active_is_genuinely_spent(
+        self, temp_home
+    ):
+        """The primary at-limit arm, deliberately UNCHANGED: when the
+        active is genuinely spent on the axis in force (`about_to_wall`),
+        the escape still lands on a candidate with real headroom even
+        though every candidate here is ALSO over the switch threshold
+        (`all_above` holds too). Sitting on a zero-headroom account serves
+        nothing; a candidate at 92% still serves 8%. The reviewer proposed
+        extending the landing gate to this arm; the owner ruled against it
+        — this pins the refusal, not a gap."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "1": {  # active: fully spent
+                "five_hour": {"pct": 100.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {  # candidate: over the switch threshold, not spent
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 300)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"1": 0.0, "2": 8.0}
+        args = self._args(
+            h, usage=usage, current="1", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=0.0,
+            trigger="at-limit", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == ["2"], (
+            f"got {ordered} — the active holds no headroom at all; the "
+            "at-limit escape must still land on #2's real 8 points even "
+            "though #2 is itself over the 90 threshold"
+        )
+
+    def test_fleet_churn_a_reset_driven_departure_does_not_dominance_release(
+        self, temp_home
+    ):
+        """`_left_account_recovered`'s dominance leg releases the no-return
+        bar when the barred account now beats the CURRENT active by a wide
+        margin — correct when we left for headroom reasons, but a
+        `consume-first`/`dynamic` departure leaves for RESET ordering, so
+        the barred account can dominate the very account we moved to from
+        the moment we left (its headroom never needed to move). Measured:
+        re-testing that same, unchanged dominance every tick released the
+        bar every tick and the reset-ordering key sent the engine straight
+        back — two accounts ping-ponging while neither ever changed.
+        `dynamic` requires a REAL improvement against the departure
+        baseline instead (the two legs below this one); `best`/
+        `consume-first` keep the bare dominance leg, asserted here on the
+        SAME state."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        state = {
+            "lastSwitchFrom": "5",
+            "leftHeadroom": 50.0,
+            "leftRecoveryAt": now + 50000,
+            "leftTrigger": "dynamic",
+        }
+        usage = {
+            # The barred account: IDENTICAL to its departure snapshot —
+            # same headroom, same reset — only the active changed.
+            "5": {
+                "five_hour": {"pct": 50.0, "resets_at": _iso_at(now + 50000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {
+                "five_hour": {"pct": 80.0, "resets_at": _iso_at(now + 90000)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"5": 50.0, "2": 20.0}
+        recovered_dynamic = h.engine._left_account_recovered(
+            state, usage, headroom, 20.0,
+            AutoSwitchSettings(threshold=90.0, strategy="dynamic"),
+            now, current="2",
+        )
+        recovered_consume_first = h.engine._left_account_recovered(
+            state, usage, headroom, 20.0,
+            AutoSwitchSettings(threshold=90.0, strategy="consume-first"),
+            now, current="2",
+        )
+        assert recovered_consume_first is True, (
+            "consume-first must be unchanged: bare dominance over the "
+            "current active still releases the bar"
+        )
+        assert recovered_dynamic is False, (
+            "dynamic must hold: #5 is byte-identical to when we left it, "
+            "so re-measuring the same dominance is not an improvement"
+        )
+
+    # -- the owner's live acceptance fixture, exact numbers ------------------
+    #
+    #   acct   5h    7d   Fable   note
+    #     5     0    62     90    7d reset soonest, ~14h
+    #     4     0    64     91
+    #     3    33    69     94
+    #     1    34    69     91
+    #     2    94     —      —    5h at the wall; nothing can use it
+    #     6    90     —      —    5h at the wall
+    #
+    # Placeholder emails throughout — none of the owner's real addresses.
+
+    @staticmethod
+    def _owner_fleet(now: float) -> dict:
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d, "resets_at": _iso_at(now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        return {
+            "5": acct(0, 62, 90, 14),
+            "4": acct(0, 64, 91, 20),
+            "3": acct(33, 69, 94, 40),
+            "1": acct(34, 69, 91, 60),
+            "2": {"five_hour": {"pct": 94.0}},
+            "6": {"five_hour": {"pct": 90.0}},
+        }
+
+    def _owner_harness(self, temp_home, *, active_num: int) -> EngineHarness:
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+        )
+        order = [active_num] + [n for n in (1, 2, 3, 4, 5, 6) if n != active_num]
+        for num in order:
+            h.seed(num, f"acct{num}@example.invalid")
+        h.make_live(f"acct{active_num}@example.invalid", active_num)
+        return h
+
+    def test_owner_fixture_no_departure_from_account_5(self, temp_home):
+        """Account 5's Fable window sits at the switch threshold (90), but
+        its 5h/7d have room — the model basis, re-picked each tick, must
+        not read that as "active at threshold". Ten ticks, static usage
+        (nothing genuinely changes): zero switches.
+
+        The owner's six accounts alone do not DISCRIMINATE this: every one
+        of them is also blocked on the model-gated axis (>=90), so the
+        landing gate refuses them whether or not the re-pick ran, and this
+        test used to pass with the entire re-pick deleted. Account 7 (added
+        here, not one of the owner's six) is open and healthy on the
+        model-gated axis with headroom clearing account 5's UNWIDENED
+        headroom (10) by more than the hysteresis (10) — so WITHOUT the
+        re-pick, trigger reads "proactive" and account 7 is admitted on
+        plain hysteresis, a real departure. WITH the re-pick, trigger reads
+        "dynamic" (below threshold) and account 7's reset (100h) loses to
+        account 5's own (14h) under consume-first-style reset ordering, so
+        it is never admitted.
+        """
+        from claude_swap.autoswitch import _dynamic_active_headroom
+
+        h = self._owner_harness(temp_home, active_num=5)
+        h.seed(7, "acct7@example.invalid")
+        fleet_usage = dict(self._owner_fleet(h.clock.now))
+        fleet_usage["7"] = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {
+                "pct": 0.0,
+                "resets_at": _iso_at(h.clock.now + 100 * 3600),
+            },
+            "scoped": [{"name": "Fable", "pct": 75.0}],
+        }
+
+        # The active_headroom the tick actually uses: unwidened (model-
+        # gated) 10.0 re-picked to the unmodeled 5h/7d value 38.0.
+        widened = _dynamic_active_headroom(
+            h.engine.settings, h.engine._models, fleet_usage, "5", 10.0,
+        )
+        assert widened == 38.0, (
+            f"got {widened!r} — account 5's re-picked basis must be its "
+            "unmodeled 5h/7d headroom (100 - 62 = 38), not the model-gated "
+            "10"
+        )
+
+        switches = 0
+        reasons = []
+        for _ in range(10):
+            h.events.clear()
+            outcome = h.tick_with_usage(fleet_usage)
+            if outcome is TickOutcome.SWITCHED:
+                switches += 1
+            else:
+                reasons.extend(
+                    e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+                )
+            h.clock.advance(301.0)  # past cooldown_seconds (300, the default)
+        assert switches == 0, (
+            f"got {switches} switches off account 5 — its Fable window "
+            "must not force a departure while 5h/7d have room, and account "
+            "7's later-resetting weekly window must not admit it either"
+        )
+        assert h.active_number() == 5
+        # The trigger the tick actually used: every hold reads as the
+        # dynamic below-threshold path (consume-first-style reset
+        # ordering), never the plain-hysteresis "proactive" a dropped
+        # re-pick would have taken (which would have switched to 7, not
+        # held).
+        assert all(r == "already-consuming-soonest" for r in reasons), reasons
+
+    def test_owner_fixture_account_5_is_the_target(self, temp_home):
+        """Starting from account 2 (the account nothing can use), the
+        engine must land on account 5 — soonest 7-day reset among the
+        candidates that actually have room on the basis in force. NOT #2
+        (no room anywhere) and NOT #6 (no room anywhere) — both sides of
+        the reset-ordering bar are present in this fleet, so the assertion
+        is not decided by headroom alone."""
+        h = self._owner_harness(temp_home, active_num=2)
+        fleet_usage = self._owner_fleet(h.clock.now)
+        outcome = h.tick_with_usage(fleet_usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5, (
+            f"landed on {h.active_number()} instead of account 5"
+        )
+
+    def test_the_model_basis_re_pick_is_what_makes_the_trigger_voluntary(
+        self, temp_home
+    ):
+        """The single-account shape that tells the re-pick apart from the
+        landing rule alone: active blocked ONLY on Fable (5h/7d have real
+        room), no OTHER account in rotation at all. Without re-picking the
+        basis, the trigger reads `proactive` (the raw, model-gated headroom
+        is at the threshold) and an engine with zero candidates takes the
+        generic `no-candidates` / BLOCKED path. Re-picking the basis first
+        finds 5h/7d has room, so the trigger is the ordinary below-threshold
+        `dynamic` one — and THAT path's own "no OAuth peer to compare
+        against" branch answers `below-threshold` / NO_ACTION instead,
+        before candidate selection is ever reached. Same event either way
+        that "nothing switched" — the reason and exit code are what only
+        the re-pick gets right."""
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+        )
+        h.seed(5, "acct5@example.invalid")
+        h.make_live("acct5@example.invalid", 5)
+        outcome = h.tick_with_usage({
+            "5": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 62.0},
+                "scoped": [{"name": "Fable", "pct": 90.0}],
+            },
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — the model basis must be re-picked BEFORE the "
+            "no-candidates check, or a lone account blocked only on its "
+            "model window reads as genuinely blocked (BLOCKED, not "
+            "NO_ACTION)"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"], (
+            f"got {reasons} — without the re-pick this reads `no-candidates`"
+        )
+
+    def test_primary_pass_ranks_active_and_candidate_headroom_on_one_basis(
+        self, temp_home
+    ):
+        """The hysteresis leg (``h - active_headroom``) must compare two
+        headrooms from the SAME window basis. `:1508`'s widening puts
+        `active_headroom` on the unmodeled 5h/7d axis while `headroom` (and
+        `h`, read from it) stays model-gated — mixing the two understates
+        the bar and can admit the account that resets LAST over one that
+        resets soonest.
+
+        Active #1 is blocked on Fable alone (model-gated headroom 2,
+        widened/unmodeled 8, utilization 92 -> `proactive`). #2 and #3 are
+        both healthy candidates with the SAME model-gated headroom bar
+        (25 and 15); #3 resets far sooner (5h vs 60h). Mixing bases lets
+        the widened 8 admit #2 (25-8=17>=10) while refusing #3 (15-8=7<10)
+        -- landing on the account that resets LAST. On one basis both
+        clear the model-gated bar (25-2=23, 15-2=13, both >=10) and #3's
+        soonest reset wins.
+        """
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(3, "acct3@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        outcome = h.tick_with_usage({
+            "1": acct(50, 92, 98, 30),
+            "2": acct(10, 10, 75, 60),
+            "3": acct(10, 10, 85, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} instead of account 3 — the "
+            "soonest-resetting healthy candidate, not the one that merely "
+            "cleared a hysteresis bar mixed across two window bases"
+        )
 
 
 class TestConsumeFirstStrategy:
@@ -4626,6 +5541,106 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         assert state.get("leftTrigger") == "failover", (
             f"expected leftTrigger='failover', got {state.get('leftTrigger')!r}"
         )
+
+
+class TestPhase2RefetchKeepsTheDynamicModelBasis:
+    """`dynamic`'s model-basis widening (the re-pick that turns a pinned
+    model's own window into "not a blackout" for the ACTIVE, above) must
+    still be in force after the consume-first two-phase commit's refetch
+    re-derives `active_headroom` from fresh usage -- the trigger is
+    classified on one basis and the refetch must not silently switch the
+    tick to a narrower one. Two accounts, `--model all`: both read
+    model-gated headroom 0 (Fable pinned at 100%) but real 5h/7d room, so
+    the widened basis is the only thing that tells the engine it is not
+    genuinely at the wall.
+    """
+
+    def test_leftHeadroom_is_recorded_on_the_widened_basis_not_the_model_gated_one(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home, model="all", threshold=95.0, hysteresis_pct=20.0,
+            strategy="dynamic",
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        out = h.tick_with_usage({
+            "1": acct(5, 90, 100, 14),   # model-gated headroom 0, unmodeled 10
+            "2": acct(20, 92, 100, 8),   # model-gated headroom 0, unmodeled 8; sooner reset
+        })
+        assert out is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.engine._read_state()
+        assert state.get("leftHeadroom") == 10.0, (
+            f"leftHeadroom={state.get('leftHeadroom')!r} — the phase-2 "
+            "refetch must record the SAME widened basis (10.0, account 1's "
+            "unmodeled 5h/7d headroom) the trigger was classified on, not "
+            "the narrower model-gated 0.0"
+        )
+
+    def test_a_wrong_leftHeadroom_of_zero_does_not_cause_a_two_tick_ping_pong_back(
+        self, temp_home
+    ):
+        """The failure mode a dropped widening produces: `leftHeadroom: 0.0`
+        makes `_left_account_recovered`'s headroom leg release on account
+        1's very next model-gated headroom (`h >= min(0+3, 100)`, i.e. any
+        h >= 3), for essentially free -- and the engine switches straight
+        back, the two-tick ping-pong the landing rule exists to stop. With
+        the widened basis (10.0) that same leg needs `h >= 13`, which
+        account 1's 3.0 does not clear."""
+        h = EngineHarness(
+            temp_home, model="all", threshold=95.0, hysteresis_pct=20.0,
+            strategy="dynamic",
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        out1 = h.tick_with_usage({
+            "1": acct(5, 90, 100, 14),
+            "2": acct(20, 92, 100, 8),
+        })
+        assert out1 is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.clock.advance(301.0)  # past cooldown_seconds (default 300)
+        out2 = h.tick_with_usage({
+            # Account 1 resets SOONER than account 2 here (5h vs 30h), so
+            # consume-first's reset-ordering gate alone does not exclude it
+            # as a candidate -- isolates the no-return bar / recovered
+            # check as the only thing standing between account 1 and a
+            # switch back.
+            "1": acct(20, 5, 97, 5),    # model-gated headroom 3.0
+            "2": acct(92, 20, 90, 30),
+        })
+        assert out2 is TickOutcome.NO_ACTION, (
+            f"got {out2}, active now {h.active_number()!r} — account 1's "
+            "3.0-point model-gated headroom must not read as 'recovered' "
+            "against a leftHeadroom baseline that was itself wrong"
+        )
+        assert h.active_number() == 2
 
 
 class TestEveryAccountAboveThreshold:

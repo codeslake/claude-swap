@@ -1087,6 +1087,20 @@ class TestAutoCommand:
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True
 
+    def test_strategy_dynamic_is_accepted(self, temp_home):
+        self._run(["--once", "--strategy", "dynamic"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.strategy == "dynamic"
+
+    def test_strategy_bogus_is_still_rejected(self, temp_home):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(
+                 sys, "argv",
+                 ["claude-swap", "auto", "--strategy", "bogus"],
+             ):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2  # argparse usage error
+
     def test_json_stdout_is_pure_jsonl(self, temp_home, capsys):
         from claude_swap.autoswitch import NoSwitchEvent, TickOutcome
 

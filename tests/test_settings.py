@@ -99,6 +99,16 @@ class TestLoadSettings:
         set_setting(tmp_path, "autoswitch.strategy", "consume-first")
         assert load_settings(tmp_path).strategy == "consume-first"
 
+    def test_dynamic_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "dynamic"}})
+        )
+        assert load_settings(tmp_path).strategy == "dynamic"
+
+    def test_set_strategy_dynamic(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "dynamic")
+        assert load_settings(tmp_path).strategy == "dynamic"
+
 
 class TestSaveSettings:
     def test_roundtrip(self, tmp_path: Path):
