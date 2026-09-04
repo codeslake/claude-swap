@@ -2414,8 +2414,19 @@ class AutoSwitchEngine:
             settings=settings,
             now=now,
         )
+        # THE PRIMARY PASS RANKS ON `headroom`, WHICH IS ALWAYS MODEL-GATED —
+        # so `active_headroom` here must be too, even under `dynamic` where
+        # the caller's copy was widened to the unmodeled 5h/7d value for
+        # trigger classification (`_dynamic_active_headroom`, above). Passing
+        # the widened value through mixed a margin between two different
+        # axes: `h - active_headroom` compared a model-gated candidate to an
+        # unmodeled active, understating the bar and admitting a candidate
+        # the model-gated axis alone would have refused. `headroom.get
+        # (current)` is that same widened value's PRE-widen input, so this is
+        # a no-op for `best`/`consume-first` (never widened) and only changes
+        # `dynamic`'s primary pass.
         ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
-            models=self._models, headroom=headroom, active_headroom=active_headroom, **kw
+            models=self._models, headroom=headroom, active_headroom=headroom.get(current), **kw
         )
         # `dynamic` ONLY. Any strategy with `self._models` set whose
         # model-gated pass empties re-ranked on 5h/7d alone and could move

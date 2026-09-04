@@ -4875,6 +4875,55 @@ class TestDynamicStrategy:
             f"got {reasons} — without the re-pick this reads `no-candidates`"
         )
 
+    def test_primary_pass_ranks_active_and_candidate_headroom_on_one_basis(
+        self, temp_home
+    ):
+        """The hysteresis leg (``h - active_headroom``) must compare two
+        headrooms from the SAME window basis. `:1508`'s widening puts
+        `active_headroom` on the unmodeled 5h/7d axis while `headroom` (and
+        `h`, read from it) stays model-gated — mixing the two understates
+        the bar and can admit the account that resets LAST over one that
+        resets soonest.
+
+        Active #1 is blocked on Fable alone (model-gated headroom 2,
+        widened/unmodeled 8, utilization 92 -> `proactive`). #2 and #3 are
+        both healthy candidates with the SAME model-gated headroom bar
+        (25 and 15); #3 resets far sooner (5h vs 60h). Mixing bases lets
+        the widened 8 admit #2 (25-8=17>=10) while refusing #3 (15-8=7<10)
+        -- landing on the account that resets LAST. On one basis both
+        clear the model-gated bar (25-2=23, 15-2=13, both >=10) and #3's
+        soonest reset wins.
+        """
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(3, "acct3@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        outcome = h.tick_with_usage({
+            "1": acct(50, 92, 98, 30),
+            "2": acct(10, 10, 75, 60),
+            "3": acct(10, 10, 85, 5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} instead of account 3 — the "
+            "soonest-resetting healthy candidate, not the one that merely "
+            "cleared a hysteresis bar mixed across two window bases"
+        )
+
 
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
