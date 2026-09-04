@@ -166,11 +166,6 @@ def chip_label(label: str, reset: str | None) -> str:
     return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
 
 
-def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
-    """`chip_label` for one of the top-level 5h/7d windows."""
-    return chip_label(label, window_reset_text(last_good, key, now))
-
-
 def format_duration(seconds: float) -> str:
     """Compact duration: "45s", "12m", "2h 13m", "3d 4h"."""
     s = int(seconds)

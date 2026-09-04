@@ -296,7 +296,7 @@ def spend_row(rows: list[tuple]) -> tuple | None:
     """The pay-as-you-go spend row out of :func:`usage_rows`, or ``None``.
 
     Both compact surfaces render spend, so the label lives here rather than
-    as a literal in each of them — the same reason `data.window_chip_label`
+    as a literal in each of them — the same reason `data.chip_label`
     exists for a window.
     """
     return next((r for r in rows if r[0] == SPEND_LABEL), None)
@@ -355,7 +355,7 @@ def mini_account_text(
         # Same chip the auto view's Next-best rows draw, from the same
         # helper — one account must not read two ways on two screens.
         text.append(
-            data.window_chip_label(last_good, key, label, now), style=palette.muted
+            data.chip_label(label, data.reset_text(window, now)), style=palette.muted
         )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
         if key == "seven_day":
@@ -397,19 +397,10 @@ def mini_account_text(
         text.append(f" · {suffix}", style=palette.muted)
         parts += 1
     if not parts:
-        # Nothing above rendered — an account whose only window is a
-        # per-model (scoped) limit below its cap (the maxed loop only counts
-        # ones at/over 100) still has something to show via the same helper,
-        # rather than reading as no data at all. `rows` has no spend row
-        # here, or `parts` would already be nonzero.
-        if not rows:
-            text.append("usage unknown", style=palette.muted)
-        for i, (label, pct, _suffix, _full) in enumerate(rows):
-            if i:
-                text.append(" · ", style=palette.track)
-            color = palette.severity(pct)
-            text.append(f"{label} ", style=palette.muted)
-            text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
+        # Nothing above rendered — every source `usage_rows` draws from
+        # (spend, 5h, 7d, scoped) uses the same truthiness test as the loops
+        # above, so `rows` is provably empty here too.
+        text.append("usage unknown", style=palette.muted)
     return text
 
 

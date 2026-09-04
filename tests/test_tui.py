@@ -675,7 +675,7 @@ class TestMiniAccountText:
 
         The dashboard rendered `5h 100% (resets 2h 28m)` while the auto view
         rendered `5h(⟳2h28m):100%` for the same window in the same second.
-        Both now come from data.window_chip_label, so a change to one surface
+        Both now come from data.chip_label, so a change to one surface
         cannot silently diverge from the other.
         """
         from claude_swap.tui import data
@@ -690,7 +690,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        chip = data.window_chip_label(last_good, "five_hour", "5h", now)
+        chip = data.chip_label("5h", data.reset_text(last_good["five_hour"], now))
         assert chip == "5h(⟳2h28m):"
         assert f"{chip}100%" in mini_account_text(acc, now).plain
 
