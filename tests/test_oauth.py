@@ -1135,7 +1135,7 @@ class TestInvalidGrantPropagation:
         creds = self._expired_credentials(refresh_token_expires_at=soon_ms)
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh:
-            outcome = oauth.try_fetch_usage_for_account(
+            oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", creds, is_active=False,
             )
         refresh.assert_called_once()
