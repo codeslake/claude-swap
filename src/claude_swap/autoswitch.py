@@ -2331,35 +2331,33 @@ class AutoSwitchEngine:
         candidate over 5h or 7d as well) still comes back empty and the
         caller's existing blackout path is untouched.
         """
-        ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
-            models=self._models,
+        kw = dict(
             trigger=trigger,
             consume_first=consume_first,
             oauth_candidates=oauth_candidates,
             no_return=no_return,
             usage=usage,
-            headroom=headroom,
             current=current,
-            active_headroom=active_headroom,
             settings=settings,
             now=now,
+        )
+        ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
+            models=self._models, headroom=headroom, active_headroom=active_headroom, **kw
         )
         if ordered or not self._models:
             return ordered, any_known, active_reset_ts, waiting
         fallback_headroom = _headroom_by_account(usage, ())
-        return self._rank_candidates_pass(
+        fb = self._rank_candidates_pass(
             models=(),
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            no_return=no_return,
-            usage=usage,
             headroom=fallback_headroom,
-            current=current,
             active_headroom=fallback_headroom.get(current),
-            settings=settings,
-            now=now,
+            **kw,
         )
+        # A genuine blackout (every candidate over 5h or 7d too) is the
+        # first pass's tuple, not the retry's: the retry's `waiting` was
+        # computed with models=() and all_above over 5h/7d headroom alone,
+        # while the caller still reads the model-gated headroom/self._models.
+        return fb if fb[0] else (ordered, any_known, active_reset_ts, waiting)
 
     def _rank_candidates_pass(
         self,

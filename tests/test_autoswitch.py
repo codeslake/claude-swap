@@ -4013,8 +4013,7 @@ class TestAModelWindowIsNotABlackout:
     """
 
     def _args(self, harness, *, usage, current, oauth_candidates, headroom,
-              active_headroom, trigger="consume-first", consume_first=True,
-              threshold=90.0):
+              active_headroom, trigger="consume-first", consume_first=True):
         return dict(
             trigger=trigger,
             consume_first=consume_first,
@@ -4024,7 +4023,7 @@ class TestAModelWindowIsNotABlackout:
             headroom=headroom,
             current=current,
             active_headroom=active_headroom,
-            settings=AutoSwitchSettings(threshold=threshold),
+            settings=AutoSwitchSettings(threshold=90.0),
             now=harness.clock.now,
         )
 
@@ -4142,6 +4141,54 @@ class TestAModelWindowIsNotABlackout:
         assert list(ordered) == ["1"], (
             f"got {list(ordered)} — the model-gated pass already found #1 "
             "eligible; #2 must never enter the ranking"
+        )
+
+    def test_a_real_blackout_at_the_limit_keeps_the_first_passs_waiting_flag(
+        self, temp_home
+    ):
+        """A genuine blackout (5h AND 7d spent too, not just Fable) must
+        report the same `waiting` verdict the model-gated pass reached, not
+        whatever the 5h/7d-only retry happens to compute. Rigged so the two
+        passes disagree: the active's ONLY knowable reset is Fable's scoped
+        window, so the model-gated pass can name a recovery moment
+        (`waiting=True`) while the 5h/7d-only retry sees no knowable reset at
+        all and reports `waiting=False`. Returning the retry's tuple here —
+        the bug this cut fixes — silently drops the wait."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        now = h.clock.now
+        fleet_usage = {
+            "1": {
+                "five_hour": {"pct": 100.0},
+                "seven_day": {"pct": 100.0},
+                "scoped": [
+                    {"name": "Fable", "pct": 100.0, "resets_at": _iso_at(now + 3600)}
+                ],
+            },
+            "2": {
+                "five_hour": {"pct": 100.0},
+                "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],
+            },
+        }
+        headroom = {
+            num: oauth.account_headroom(val, ("Fable",))
+            for num, val in fleet_usage.items()
+        }
+        args = self._args(
+            h, usage=fleet_usage, current="1", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=headroom["1"],
+            trigger="at-limit", consume_first=False,
+        )
+        ordered, any_known, _, waiting = h.engine._rank_candidates(**args)
+        assert list(ordered) == [], (
+            f"got {list(ordered)} — #2 is genuinely spent on 5h/7d too, so "
+            "dropping the model window must not rescue it"
+        )
+        assert any_known
+        assert waiting is True, (
+            "waiting came back False — the retry's tuple leaked through "
+            "instead of the model-gated pass's, which had a knowable "
+            "recovery moment (Fable's reset) the retry cannot see"
         )
 
     def test_classify_open_full_and_model_only(self):

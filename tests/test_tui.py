@@ -2153,13 +2153,13 @@ class TestUnswitchableRowsAreListed:
         a.usage.sentinel = sentinel
         return a
 
-    def _render(self, snap, active):
+    def _render(self, snap, active, *, settings=None):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
 
         v = AutoScreen.__new__(AutoScreen)
-        v._settings = AutoSwitchSettings()
+        v._settings = settings or AutoSwitchSettings()
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
@@ -2297,6 +2297,33 @@ class TestUnswitchableRowsAreListed:
             self._acct("1", "a@x.com", switchable=True),
         ), active="9")
         assert out.index("a@x.com") < out.index("empty@x.com")
+
+    def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
+        """`classify_candidate_block`'s two blocked outcomes must both reach
+        the panel, not just `model` — the decision log already appends
+        `(blocked)` for `full` (`_describe`), and the chip colour alone does
+        not say "blocked": it is driven by the fixed WARN/CRIT constants in
+        `theme.py`, not by `settings.threshold`, so at an off-default
+        threshold the colour and the block classification can disagree."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=90.0)
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            # Model-only block: 5h/7d have room, only the pinned model's
+            # scoped window is over the bar.
+            self._acct("2", "model-only@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 95.0}],
+            }),
+            # Full block: 5h itself is over the bar, no model choice escapes it.
+            self._acct("3", "c@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 95.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 10.0}],
+            }),
+        ), active="1", settings=settings)
+        assert "Fable-only" in out, out
+        assert "  blocked" in out, out
 
 
 @pytest.mark.asyncio

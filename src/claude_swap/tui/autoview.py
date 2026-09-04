@@ -427,6 +427,8 @@ class AutoScreen(Screen):
                     )
                     if kind == "model":
                         entry.append(f"  {blocked_model}-only", style=palette.muted)
+                    elif kind == "full":
+                        entry.append("  blocked", style=palette.muted)
                 key = (
                     consume_first_rank_key(
                         acc.usage.last_good, self._settings.threshold, now, models
