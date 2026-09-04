@@ -1915,11 +1915,15 @@ class TestAutoScreen:
         self, tmp_path, fake_engine
     ):
         """Under `optim` the panel must sort by the SAME margin key the
-        engine's voluntary trigger admits on, not the plain consume-first
-        key -- else the panel can show a target the engine
-        would refuse. #2 resets sooner but sits at Fable 86% (unhealthy at
-        threshold(90) - hysteresis(10) = 80): it must rank BEHIND #3, whose
-        later-resetting but healthier Fable 68% clears the margin."""
+        engine's voluntary trigger admits on, not by raw utilization -- else
+        the panel's order can disagree with the account the engine would
+        actually pick. Both #2 (Fable 78%) and #3 (Fable 40%) clear the
+        margin (threshold(90) - hysteresis(10) = 80), so the margin key ties
+        them on tier and breaks the tie on #2's sooner weekly reset -- #2
+        first. Raw pct disagrees: 40 < 78 sorts #3 first. Picked so the two
+        orderings differ, unlike the accounts this test used to carry (a
+        raw-pct read gave the same order the margin key did, so a mutant
+        collapsing `optim` onto plain pct ordering left this test green)."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -1952,8 +1956,8 @@ class TestAutoScreen:
                         fetched_at=time.time() - 5.0, age_s=5.0,
                     ),
                 ),
-                make_account(2, entry=_candidate(100000, 86.0)),  # sooner, unhealthy
-                make_account(3, entry=_candidate(200000, 68.0)),  # later, healthy
+                make_account(2, entry=_candidate(100000, 78.0)),  # sooner, healthy
+                make_account(3, entry=_candidate(200000, 40.0)),  # later, healthy
             ],
             tmp_path,
         )
@@ -1964,8 +1968,8 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user3@example.com") < plain.index(
-                "user2@example.com"
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
             )
 
     async def test_strategy_binding_cycles_and_persists_for_the_session(

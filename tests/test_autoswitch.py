@@ -3478,6 +3478,70 @@ class TestSessionThreshold:
         assert {"1", "2", "3"} not in self._collect_fetch_sets(harness, 99.9)
 
 
+class TestSessionStrategy:
+    """apply_strategy(): apply_threshold's sibling above -- the TUI's
+    session-only, mid-run override of the ranking strategy."""
+
+    def test_apply_strategy_retargets_the_live_strategy_mid_run(self, temp_home):
+        """The very next tick after ``apply_strategy("optim")`` must decide
+        with the new strategy, not the one the engine was constructed with.
+
+        Built under ``consume-first`` (never constructed as ``optim``), so a
+        no-op ``apply_strategy`` is caught rather than masked by a fixture
+        that already carries the target strategy. First tick: active #1 at
+        Fable 66% (below the 90 threshold, later weekly reset) against peer
+        #2 at Fable 86% (sooner reset, 14 points of headroom) -- plain
+        ``consume-first`` admits the 14-point peer and switches.
+        ``apply_strategy("optim")`` follows, then a second tick with #2 (now
+        active) at the same 66%/later-reset shape against a fresh peer #3 at
+        the same 86%/sooner-reset shape (#1 sits unreachable at 95%, clear of
+        either strategy's gate): under ``optim``'s tightened landing margin
+        (threshold - hysteresis = 80) that 14-point peer is refused, so the
+        second tick must HOLD on ``already-consuming-soonest`` where the
+        constructed ``consume-first`` would switch onto #3.
+        """
+        h = EngineHarness(
+            temp_home, strategy="consume-first", threshold=90.0,
+            hysteresis_pct=10.0, model="Fable",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        active_66_later = _usage7(
+            0, 44, _R_LATER, scoped=[{"name": "Fable", "pct": 66.0}]
+        )
+        peer_86_soon = _usage7(
+            0, 10, _R_SOON, scoped=[{"name": "Fable", "pct": 86.0}]
+        )
+        outcome = h.tick_with_usage({
+            "1": active_66_later,
+            "2": peer_86_soon,
+            "3": _usage7(0, 10, _R_LATEST, scoped=[{"name": "Fable", "pct": 86.0}]),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.engine.apply_strategy("optim")
+        assert h.engine.settings.strategy == "optim"
+        h.clock.advance(301.0)  # clear cooldown_seconds (300 default)
+        h.events.clear()
+
+        active_66_latest = _usage7(
+            0, 44, _R_LATEST, scoped=[{"name": "Fable", "pct": 66.0}]
+        )
+        outcome = h.tick_with_usage({
+            "1": _usage7(0, 44, _R_LATER, scoped=[{"name": "Fable", "pct": 95.0}]),
+            "2": active_66_latest,
+            "3": peer_86_soon,
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 2
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+
 class TestPctLabel:
     def test_whole_numbers_drop_the_decimal(self):
         assert pct_label(90.0) == "90"

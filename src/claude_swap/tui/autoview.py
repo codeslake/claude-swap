@@ -357,8 +357,11 @@ class AutoScreen(Screen):
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
         # `optim`'s landing margin, evaluated the same way the engine's
-        # voluntary (consume-first) trigger evaluates it, so this panel can
-        # never show a target the engine would refuse as too close to the wall.
+        # voluntary (consume-first) trigger evaluates it, so the panel's
+        # ORDER can never disagree with the engine's. A listed candidate can
+        # still be one the engine would refuse as too close to the wall --
+        # it just ranks in the lower (unhealthy) tier rather than being
+        # dropped from the list.
         landing_threshold = (
             _landing_threshold("consume-first", self._settings)
             if consume_first
