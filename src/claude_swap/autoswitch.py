@@ -152,6 +152,11 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# `optim` is consume-first with a landing margin (`_landing_threshold`): both
+# strategies proactively burn the weekly window that resets soonest, so both
+# take the consume-first code paths below.
+CONSUME_FIRST_STRATEGIES = ("consume-first", "optim")
+
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
@@ -616,6 +621,23 @@ def consume_first_rank_key(
         reset_ts if reset_ts is not None else float("inf"),
         -h,
     )
+
+
+def _landing_threshold(trigger: str, settings: AutoSwitchSettings) -> float:
+    """The utilization cutoff a landing candidate must clear.
+
+    Under ``optim``, the VOLUNTARY move (``trigger == "consume-first"``: the
+    active still below the threshold, drifting to a sooner-resetting peer)
+    needs ``hysteresis_pct`` of margin below ``threshold`` -- a candidate
+    admitted four points under the wall burns to it in one tick (the round
+    trip this strategy exists to close). Every forced trigger (``proactive``,
+    ``at-limit``, ``failover``, ``disabled-active``) keeps the plain
+    threshold: a near-wall target still beats staying on one, and none of
+    them reaches this function with ``trigger == "consume-first"``.
+    """
+    if settings.strategy == "optim" and trigger == "consume-first":
+        return settings.threshold - settings.hysteresis_pct
+    return settings.threshold
 
 
 def _binding_recovery_ts(
@@ -1446,7 +1468,7 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                if settings.strategy not in CONSUME_FIRST_STRATEGIES:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1566,7 +1588,7 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        consume_first = settings.strategy == "consume-first"
+        consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -2382,6 +2404,10 @@ class AutoSwitchEngine:
         # NOT failover: there the active is dead or unreadable, so its
         # recovery time is not a quota fact anyone can wait for.
         #
+        # `optim` tightens the landing bar for the VOLUNTARY move only; every
+        # forced trigger sees the plain threshold (`_landing_threshold`).
+        landing_threshold = _landing_threshold(trigger, settings)
+
         # ONE NAME FOR BOTH THE GATE AND THE KEY. They were two copies of the
         # same trigger tuple, and this file has already had to close two
         # defects where a filter ran on one axis while the sort ran on
@@ -2469,7 +2495,7 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if (100.0 - h) >= landing_threshold and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -2602,7 +2628,7 @@ class AutoSwitchEngine:
                 # spent-but-healthy over it, so no ONE fleet can hold both --
                 # and it takes both to order a pair differently.
                 key = consume_first_rank_key(
-                    usage.get(num), settings.threshold, now, self._models
+                    usage.get(num), landing_threshold, now, self._models
                 )
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
@@ -3217,6 +3243,13 @@ class AutoSwitchEngine:
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
+
+    def apply_strategy(self, strategy: str) -> None:
+        """Session override from the TUI: retarget the ranking strategy
+        mid-run. Every tick reads ``self.settings.strategy`` fresh (`tick()`
+        snapshots ``self.settings`` once per call), so this needs no lock and
+        no restart -- the same frozen-settings swap ``apply_threshold`` uses."""
+        self.settings = replace(self.settings, strategy=strategy)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

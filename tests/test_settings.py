@@ -281,6 +281,10 @@ class TestMergedWithCli:
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
         assert merged.strategy == "consume-first"
 
+    def test_strategy_override_accepts_optim(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="optim"))
+        assert merged.strategy == "optim"
+
 
 class TestAtomicWriteThroughSymlink:
     """A rename does not follow links, so renaming onto a symlinked path

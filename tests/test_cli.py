@@ -1096,6 +1096,10 @@ class TestAutoCommand:
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
 
+    def test_strategy_optim_accepted(self, temp_home):
+        self._run(["--once", "--strategy", "optim"], temp_home)
+        assert self.FakeEngine.instances[-1].settings.strategy == "optim"
+
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)
         assert self.FakeEngine.instances[-1].dry_run is True

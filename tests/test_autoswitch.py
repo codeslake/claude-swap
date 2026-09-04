@@ -4002,12 +4002,28 @@ _R_LATER = "2024-01-08T00:00:00Z"
 _R_LATEST = "2024-01-10T00:00:00Z"
 
 
-def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
-    """Usage with an explicit 7-day window (utilization + optional reset)."""
+def _usage7(
+    pct5: float,
+    pct7: float,
+    reset7: str | None = None,
+    *,
+    scoped: list[dict] | None = None,
+) -> dict:
+    """Usage with an explicit 7-day window (utilization + optional reset).
+
+    ``scoped`` is a list of ``{"name", "pct"}`` per-model weekly windows
+    (see ``oauth.relevant_windows``); folded into the returned dict's
+    ``"scoped"`` key when given, and into ``account_headroom``/the
+    consume-first key whenever the engine is constructed with a matching
+    ``model``.
+    """
     seven: dict = {"pct": pct7}
     if reset7:
         seven["resets_at"] = reset7
-    return {"five_hour": {"pct": pct5}, "seven_day": seven}
+    usage: dict = {"five_hour": {"pct": pct5}, "seven_day": seven}
+    if scoped:
+        usage["scoped"] = scoped
+    return usage
 
 
 class TestConsumeFirstStrategy:
@@ -4451,6 +4467,84 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit"
+
+
+class TestOptimStrategy:
+    """`optim` is consume-first with a landing margin: a VOLUNTARY move
+    (trigger ``consume-first``) needs `hysteresis_pct` of room below
+    `threshold`, closing the round trip where a target admitted four points
+    under the wall burned to it in one tick (adr 0008)."""
+
+    def _harness(self, temp_home: Path, strategy: str = "optim") -> EngineHarness:
+        h = EngineHarness(
+            temp_home, strategy=strategy, threshold=90.0, hysteresis_pct=10.0,
+            model="Fable",
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    # Active: 5h 0%, 7d 44% (resets later), Fable 66% -> headroom 34, util 66%.
+    _ACTIVE_66 = _usage7(0, 44, _R_LATER, scoped=[{"name": "Fable", "pct": 66.0}])
+
+    @staticmethod
+    def _candidate_fable(pct: float) -> dict:
+        # 5h/7d roomy and resetting SOONER than the active's _R_LATER; Fable
+        # is the binding window, exactly the shape the panel must show too.
+        return _usage7(0, 10, _R_SOON, scoped=[{"name": "Fable", "pct": pct}])
+
+    def test_voluntary_move_refused_four_points_under_the_wall(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._ACTIVE_66,
+            "2": self._candidate_fable(86.0),  # 14 pts: sooner, but < 80 fails
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_voluntary_move_taken_with_room_to_spare(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": self._ACTIVE_66,
+            "2": self._candidate_fable(68.0),  # 32 pts: sooner, and >= 80 room
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "consume-first"
+
+    def test_forced_move_keeps_the_plain_threshold(self, temp_home):
+        """The active pinned at the wall (util 91%, headroom 9) must still
+        escape onto the 86-candidate: forced triggers never tighten the gate
+        by `hysteresis_pct` -- only the voluntary move does."""
+        h = self._harness(temp_home)
+        active_91 = _usage7(0, 44, _R_LATER, scoped=[{"name": "Fable", "pct": 91.0}])
+        outcome = h.tick_with_usage({
+            "1": active_91,
+            "2": self._candidate_fable(86.0),  # the only peer
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_consume_first_strategy_has_no_landing_margin(self, temp_home):
+        """Pins the difference: the identical 86-candidate scenario switches
+        under plain `consume-first` (no margin), only `optim` refuses it."""
+        h = self._harness(temp_home, strategy="consume-first")
+        outcome = h.tick_with_usage({
+            "1": self._ACTIVE_66,
+            "2": self._candidate_fable(86.0),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_optim_is_a_valid_settings_choice(self):
+        from claude_swap.settings import SETTING_SPECS
+        assert "optim" in SETTING_SPECS["autoswitch.strategy"].choices
 
 
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:

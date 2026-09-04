@@ -47,7 +47,7 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "consume-first"  # "best" (most headroom) or "consume-first" (soonest weekly reset, default)
+    strategy: str = "consume-first"  # "best" (most headroom), "consume-first" (soonest weekly reset, default), or "optim" (consume-first with a landing margin)
     include_api_key_accounts: bool = False
     decision_log: bool = False
     unhealthy_ticks: int = 3
@@ -121,7 +121,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "optim"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
