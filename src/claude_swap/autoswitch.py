@@ -1482,10 +1482,7 @@ class AutoSwitchEngine:
             and self._models
             and active_headroom is not None
         ):
-            active_value = usage.get(current)
-            unmodeled = oauth.account_headroom(
-                active_value if isinstance(active_value, dict) else None, ()
-            )
+            unmodeled = _headroom_by_account(usage, ()).get(current)
             if unmodeled is not None and unmodeled > active_headroom:
                 active_headroom = unmodeled
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
@@ -2395,7 +2392,12 @@ class AutoSwitchEngine:
         ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
             models=self._models, headroom=headroom, active_headroom=active_headroom, **kw
         )
-        if ordered or not self._models:
+        # `dynamic` ONLY. Any strategy with `self._models` set whose
+        # model-gated pass empties re-ranked on 5h/7d alone and could move
+        # there — including `best`/`consume-first`, which must never
+        # re-target off a plain model-gated exhaustion the owner has not
+        # asked either of them to look past.
+        if ordered or not self._models or settings.strategy != "dynamic":
             return ordered, any_known, active_reset_ts, waiting
         fallback_headroom = _headroom_by_account(usage, ())
         fb = self._rank_candidates_pass(
@@ -2715,32 +2717,33 @@ class AutoSwitchEngine:
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
                             continue
-                elif trigger in CONSUME_FIRST_STRATEGIES:
-                    # Purely proactive on reset ordering: below the threshold,
-                    # only move to accounts whose weekly window resets sooner
-                    # than the active one. A `proactive` (over-threshold)
-                    # trigger under consume-first strategy does NOT take this
-                    # branch — it falls to the ordinary headroom hysteresis
-                    # below, same as `best`; see the note there.
+                elif (
+                    trigger in CONSUME_FIRST_STRATEGIES
+                    or settings.strategy == "consume-first"
+                ):
+                    # Below the threshold (`trigger` itself is "consume-first"
+                    # or "dynamic"): purely proactive on reset ordering, only
+                    # move to accounts whose weekly window resets sooner than
+                    # the active one.
                     #
-                    # KEYED ON THE TRIGGER, NOT THE STRATEGY BOOLEAN. `elif
-                    # consume_first:` used to catch every candidate under the
-                    # consume-first STRATEGY, including a `proactive` TRIGGER
-                    # (over-threshold, which fires under either strategy) —
-                    # whose body then filtered nothing (it only ever compares
-                    # `trigger == "consume-first"`) and fell through with no
-                    # comparison to the active at all. Every readable candidate
-                    # was admitted, including ones with LESS headroom on the
-                    # axis this pass ranks by, so a switch there re-triggered
-                    # the same over-threshold condition next tick.
-                    if (
+                    # `consume-first` STRATEGY, any OTHER trigger (over-
+                    # threshold `proactive`, or `at-limit` with the active not
+                    # `about_to_wall`): admitted unconditionally, no reset
+                    # comparison at all — this is `consume-first`'s BASE
+                    # behaviour, restored on the owner's word that it must
+                    # read exactly as deployed today, and not this PR's to
+                    # change; a real anti-flap gate here is a separate,
+                    # authorized round. `dynamic` does not get this: its own
+                    # `proactive`/`at-limit` triggers fall to the hysteresis
+                    # leg below instead, same as `best`.
+                    if trigger in CONSUME_FIRST_STRATEGIES and (
                         reset_ts is None
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
                     ):
                         continue
                 elif active_headroom is not None:
-                    # best, and also consume-first's `proactive` trigger (over
+                    # best, and also dynamic's `proactive` trigger (over
                     # threshold): the candidate must beat the active account
                     # by the full hysteresis margin (a one-way move like
                     # 99%→89% qualifies; near-line pairs can't flap back).
