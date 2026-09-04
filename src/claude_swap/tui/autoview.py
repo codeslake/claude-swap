@@ -27,6 +27,7 @@ from textual.widgets import Footer, RichLog, Static
 
 from claude_swap import oauth
 from claude_swap.autoswitch import (
+    CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
@@ -72,10 +73,14 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     return text
 
 
+_STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
+
+
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
+        Binding("s", "cycle_strategy", "Strategy"),
         Binding("left", "threshold_step(-1)", "-1%"),
         Binding("right", "threshold_step(1)", "+1%"),
         Binding("enter", "adjust_done", "Done"),
@@ -99,6 +104,11 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Session-only strategy override (s cycles best -> consume-first ->
+        # dynamic). Same precedent as the threshold above: never written to
+        # settings.json. ``_configured_strategy`` is the mount-time file
+        # value the screen reverts to on exit.
+        self._configured_strategy: str | None = None
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -121,6 +131,7 @@ class AutoScreen(Screen):
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
         self.app.threshold_pct = self._settings.threshold
+        self._configured_strategy = self._settings.strategy
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -208,6 +219,24 @@ class AutoScreen(Screen):
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
+    def action_cycle_strategy(self) -> None:
+        # Session-only, exactly like `t`/threshold above: never written to
+        # settings.json, reverted to the file value on unmount.
+        current = _STRATEGY_CYCLE.index(self._settings.strategy)
+        value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
+        self._settings = replace(self._settings, strategy=value)
+        if self._engine is not None:
+            self._engine.apply_strategy(value)
+            self._engine.wake()  # show a decision under the new strategy now
+        self.query_one("#auto-active-panel", AccountsPanel).refresh()
+        self._update_summary()
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— strategy set to {value} for this session —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
+
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
@@ -217,6 +246,9 @@ class AutoScreen(Screen):
             style=palette.accent if self._adjusting else "",
         )
         if self._settings.threshold != self._configured_threshold:
+            text.append(" (session)", style=palette.muted)
+        text.append(f" · {self._settings.strategy}")
+        if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
         text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
@@ -331,7 +363,7 @@ class AutoScreen(Screen):
         # Same strategy the engine ticks on, so the panel's order can never
         # disagree with the account a tick would actually switch to.
         consume_first = bool(
-            self._settings and self._settings.strategy == "consume-first"
+            self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
         # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
         # `models`: `_rank_candidates` (autoswitch.py) drops the model set

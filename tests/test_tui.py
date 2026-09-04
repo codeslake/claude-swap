@@ -1458,6 +1458,7 @@ class _FakeEngine:
         self.dry_run = dry_run
         self.stopped = False
         self.applied_thresholds: list[float] = []
+        self.applied_strategies: list[str] = []
         self.wakes = 0
         self._stop = threading.Event()
         _FakeEngine.instances.append(self)
@@ -1474,6 +1475,10 @@ class _FakeEngine:
     def apply_threshold(self, threshold: float) -> None:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
+
+    def apply_strategy(self, strategy: str) -> None:
+        self.settings = dataclasses.replace(self.settings, strategy=strategy)
+        self.applied_strategies.append(strategy)
 
     def wake(self) -> None:
         self.wakes += 1
@@ -1536,6 +1541,9 @@ class _ContendedFakeEngine:
         self._stop.set()
 
     def apply_threshold(self, threshold: float) -> None:
+        pass
+
+    def apply_strategy(self, strategy: str) -> None:
         pass
 
     def wake(self) -> None:
@@ -1699,6 +1707,41 @@ class TestAutoScreen:
             # leaving the screen reverts the tick and unpins poll planning
             assert app.threshold_pct == 90.0
             assert fake._poll_inputs_override is None
+
+    async def test_strategy_cycle_is_session_only(self, tmp_path, fake_engine):
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            assert screen._settings.strategy == "consume-first"  # the default
+            from textual.widgets import Static
+
+            summary = screen.query_one("#auto-summary", Static)
+            assert "consume-first" in summary.render().plain
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "dynamic"
+            engine = fake_engine.instances[0]
+            assert engine.applied_strategies == ["dynamic"]
+            assert engine.wakes == 1  # a forced tick shows the new strategy
+            assert "dynamic (session)" in summary.render().plain
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "best"
+            await pilot.press("s")
+            await pilot.pause()
+            assert screen._settings.strategy == "consume-first"  # wraps around
+            # the override lives in memory only — nothing was persisted
+            assert not (tmp_path / "settings.json").exists()
+            await pilot.press("escape")
+            await settle(pilot)
+            # the session strategy does not outlive the screen: a fresh open
+            # reverts to the file value, same precedent as the threshold.
+            await self._open(pilot)
+            assert app.screen._settings.strategy == "consume-first"
 
     async def test_threshold_adjust_escape_exits_mode_not_screen(
         self, tmp_path, fake_engine

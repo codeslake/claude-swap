@@ -152,6 +152,14 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# Strategies that rank by soonest weekly reset rather than most headroom.
+# `dynamic` shares consume-first's ranking key (and every gate keyed on the
+# below-threshold "consume-first" trigger, which this literal also drives —
+# `trigger = settings.strategy` when the strategy is one of these) and adds
+# its own behaviour on top, gated separately on `settings.strategy ==
+# "dynamic"` so `consume-first` itself is untouched by that addition.
+CONSUME_FIRST_STRATEGIES = ("consume-first", "dynamic")
+
 
 def _recovery_is_useful(
     candidate_recovery_ts: float,
@@ -1457,6 +1465,29 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # THE MODEL BASIS, RE-PICKED EACH TICK (dynamic only). `headroom` is
+        # always model-gated (folds `self._models` in), so a pinned model's
+        # own window can read the ACTIVE as blocked while its 5h/7d have
+        # real room — the mirror image of "a model window is not a
+        # blackout" for candidates, applied to the account we are sitting
+        # on. Without this, dynamic departs an account whose 5h/7d have
+        # room for everything except that one model, even though nothing
+        # forces it to leave: the model wall only bites the work that uses
+        # that model, and the landing rule already re-admits that account as
+        # a target once here. `best`/`consume-first` are unaffected — this
+        # only widens `active_headroom`, never narrows it, and only runs
+        # under `strategy == "dynamic"`.
+        if (
+            settings.strategy == "dynamic"
+            and self._models
+            and active_headroom is not None
+        ):
+            active_value = usage.get(current)
+            unmodeled = oauth.account_headroom(
+                active_value if isinstance(active_value, dict) else None, ()
+            )
+            if unmodeled is not None and unmodeled > active_headroom:
+                active_headroom = unmodeled
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -1483,7 +1514,7 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                if settings.strategy != "consume-first":
+                if settings.strategy not in CONSUME_FIRST_STRATEGIES:
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
@@ -1500,7 +1531,7 @@ class AutoSwitchEngine:
                 # whichever account's weekly window resets soonest, to burn the
                 # most-perishable quota first. Candidate selection decides whether
                 # a sooner-resetting account with room actually exists.
-                trigger = "consume-first"
+                trigger = settings.strategy
             else:
                 trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
@@ -1551,7 +1582,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in ("proactive", *CONSUME_FIRST_STRATEGIES) and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1574,7 +1605,7 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger == "consume-first"
+            trigger in CONSUME_FIRST_STRATEGIES
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1603,7 +1634,7 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        consume_first = settings.strategy == "consume-first"
+        consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
 
         def _rank(**kw):
             """Rank with the no-return bar, and WITHOUT it if that empties AND
@@ -1691,7 +1722,7 @@ class AutoSwitchEngine:
             now=decided_now,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in CONSUME_FIRST_STRATEGIES and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1724,7 +1755,7 @@ class AutoSwitchEngine:
                 now=decided_now,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and api_key_candidates and trigger not in CONSUME_FIRST_STRATEGIES:
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
@@ -1741,7 +1772,7 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            if trigger == "consume-first":
+            if trigger in CONSUME_FIRST_STRATEGIES:
                 # Below the threshold and healthy: staying put is a correct
                 # outcome, never a block. Distinguish *why* nothing qualified
                 # so an opted-in user can see the strategy working (or inert).
@@ -1847,7 +1878,7 @@ class AutoSwitchEngine:
                 # loop runs over every candidate.
                 raise _EngineStopped()
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in CONSUME_FIRST_STRATEGIES:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -2010,7 +2041,7 @@ class AutoSwitchEngine:
         left, or only a different active?
         """
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        if trigger not in ("proactive", *CONSUME_FIRST_STRATEGIES) or came_from is None:
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -2281,11 +2312,31 @@ class AutoSwitchEngine:
         # live without anyone revisiting this function -- silently reading
         # None as "no dominance" would then be exactly the bug the
         # unreadable-active fallback was added for.
+        # FLEET CHURN, dynamic only: a departure recorded with `leftTrigger`
+        # in `CONSUME_FIRST_STRATEGIES` left for RESET ordering, not because
+        # the barred account ran low — so it can dominate the account we
+        # landed on from the moment we left (the docstring's own case), and
+        # re-testing that same dominance here is not evidence of anything
+        # having improved. Measured: a consume-first-style departure to a
+        # sooner-resetting peer, then every following tick re-admitted the
+        # barred account through this leg alone (its headroom never moved)
+        # and the reset-ordering key sent the engine straight back,
+        # ping-ponging on two accounts neither of which ever changed.
+        # Skipped only for that recorded shape — an ordinary (headroom- or
+        # at-limit-driven) departure keeps the leg, exactly as `best` and
+        # `consume-first` still do; those are untouched by this gate.
+        left_for_reset = (
+            settings.strategy == "dynamic"
+            and state.get("leftTrigger") in CONSUME_FIRST_STRATEGIES
+        )
         if h is not None:
             if active_headroom is not None:
-                if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
+                if (
+                    not left_for_reset
+                    and h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT
+                ):
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif not left_for_reset and h > 100.0 - settings.threshold:
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -2484,7 +2535,7 @@ class AutoSwitchEngine:
         # defects where a filter ran on one axis while the sort ran on
         # another.
         by_recovery_axis = all_above and (
-            trigger in ("proactive", "consume-first")
+            trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
             or (
                 trigger == "at-limit"
                 # A KNOWABLE RETURN FOR THE ACCOUNT WE ARE LEAVING, or there
@@ -2563,7 +2614,7 @@ class AutoSwitchEngine:
             )
             if (
                 by_recovery_axis
-                or trigger in ("proactive", "consume-first")
+                or trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
                 or (trigger == "at-limit" and not about_to_wall)
             ):
                 # Landing must be healthy: an account at/over the threshold
@@ -2584,9 +2635,25 @@ class AutoSwitchEngine:
                 # ANY readable candidate for an at-limit trigger unconditionally
                 # (measured: a 3-account fleet at the same model bar switched
                 # on every tick, `[2,1,2,1,...]`).
-                if (100.0 - h) >= settings.threshold and not all_above:
+                # THE LANDING RULE (dynamic only): never admit a candidate
+                # with no room on the axis this pass ranks by, even when
+                # every account is above the threshold. The `all_above`
+                # recovery-axis escape below exists so a proactive/at-limit
+                # trigger can wait on whichever account recovers soonest when
+                # nothing currently qualifies — but "recovers soonest" is a
+                # future fact, and landing on it NOW moved the engine onto an
+                # account that was ITSELF still blocked (measured live: a
+                # proactive move onto an account whose own 5h was already at
+                # the switch threshold, which the very next tick read as
+                # `cooldown` while still blocked, and the tick after that had
+                # burned worse). `best`/`consume-first` keep the escape
+                # unchanged — this is additive, gated on the strategy alone.
+                dynamic_landing = settings.strategy == "dynamic"
+                if (100.0 - h) >= settings.threshold and not (
+                    all_above and not dynamic_landing
+                ):
                     continue
-                if all_above:
+                if all_above and not dynamic_landing:
                     # Checked before the strategies, because with nothing below
                     # the threshold the strategy question is moot: consume-first
                     # exists to spend perishable WEEKLY quota, and every account
@@ -2648,7 +2715,7 @@ class AutoSwitchEngine:
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
                             continue
-                elif trigger == "consume-first":
+                elif trigger in CONSUME_FIRST_STRATEGIES:
                     # Purely proactive on reset ordering: below the threshold,
                     # only move to accounts whose weekly window resets sooner
                     # than the active one. A `proactive` (over-threshold)
@@ -3012,7 +3079,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in ("proactive", *CONSUME_FIRST_STRATEGIES) and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -3350,6 +3417,14 @@ class AutoSwitchEngine:
         and each tick snapshots ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
         self.switcher.set_poll_policy_inputs(threshold, self._models)
+
+    def apply_strategy(self, strategy: str) -> None:
+        """Session override from the TUI: retarget which strategy the next
+        tick ranks by. Same atomic frozen-settings swap as
+        `apply_threshold`, and the same "never written to settings.json"
+        precedent — the TUI mutates its own in-memory copy and hands it
+        here; nothing here touches disk."""
+        self.settings = replace(self.settings, strategy=strategy)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

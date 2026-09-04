@@ -4376,6 +4376,310 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+class TestDynamicStrategy:
+    """``dynamic``: consume-first's ranking key, the model basis re-picked
+    each tick, and a landing rule that never lands on a candidate with no
+    room on the axis in force — even when every account is above the
+    threshold, where the pre-existing ``all_above`` recovery-axis escape
+    otherwise admits one on a "recovers soonest" basis alone. Scoped to
+    ``strategy == "dynamic"`` throughout: `best`/`consume-first` keep
+    whatever they did before this class exists, and several tests below
+    assert that directly, on the SAME inputs.
+    """
+
+    @staticmethod
+    def _args(harness, *, usage, current, oauth_candidates, headroom,
+              active_headroom, trigger, strategy, no_return=None):
+        return dict(
+            trigger=trigger,
+            consume_first=strategy in ("consume-first", "dynamic"),
+            no_return=no_return,
+            oauth_candidates=oauth_candidates,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=active_headroom,
+            settings=AutoSwitchSettings(threshold=90.0, strategy=strategy),
+            now=harness.clock.now,
+        )
+
+    def test_the_voluntary_arm_never_lands_on_a_candidate_with_no_room(
+        self, temp_home
+    ):
+        """Below the threshold (the `dynamic`/`consume-first` trigger), a
+        candidate whose weekly window resets sooner than the active's is
+        still not a landing if it has no room at all: `#2` resets sooner
+        (`_R_SOON` < `_R_LATEST`) but sits at 95% on its 5-hour window. The
+        landing bar runs before the reset-ordering filter for every
+        strategy that reaches this trigger, so this arm never needed a
+        `dynamic`-only change — this pins that it still holds."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        usage = {
+            "1": _usage7(10.0, 20.0, _R_LATEST),   # active: headroom 90
+            "2": _usage7(95.0, 5.0, _R_SOON),      # headroom 5, resets sooner
+        }
+        headroom = {"1": 90.0, "2": 5.0}
+        args = self._args(
+            h, usage=usage, current="1", oauth_candidates=["2"],
+            headroom=headroom, active_headroom=90.0,
+            trigger="dynamic", strategy="dynamic",
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert ordered == [], (
+            f"got {ordered} — #2 has no room (headroom 5, threshold 90) and "
+            "must never be a landing no matter how soon its reset is"
+        )
+
+    def test_the_proactive_arm_never_lands_on_a_candidate_still_at_the_wall(
+        self, temp_home
+    ):
+        """Reproduces the live trace: active over threshold with real
+        headroom (`proactive`, not `at-limit`), every account above the
+        threshold (`all_above`), and a peer whose OWN window is already at
+        the switch threshold but whose binding window happens to reset
+        soonest. The pre-existing `all_above` recovery-axis escape admits
+        that peer on recovery timing alone — measured live, the very next
+        tick read `cooldown` while still blocked. `dynamic` closes it;
+        `best`/`consume-first` keep the escape (asserted on the SAME
+        inputs, both directions, as the "unchanged" evidence)."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "6": {  # active: headroom 8, recovers in ~5.5h
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {  # candidate: headroom 10 (at the wall), recovers in 2min
+                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"6": 8.0, "2": 10.0}
+        for strategy, expected in (
+            ("dynamic", []),
+            ("consume-first", ["2"]),
+            ("best", ["2"]),
+        ):
+            args = self._args(
+                h, usage=usage, current="6", oauth_candidates=["2"],
+                headroom=headroom, active_headroom=8.0,
+                trigger="proactive", strategy=strategy,
+            )
+            ordered, _, _, _ = h.engine._rank_candidates(**args)
+            assert ordered == expected, (
+                f"strategy={strategy}: got {ordered}, want {expected} — #2 "
+                "is still at the wall (headroom 10, threshold 90) and only "
+                "`dynamic` may refuse to land there"
+            )
+
+    def test_the_at_limit_arm_never_lands_on_a_candidate_still_at_the_wall(
+        self, temp_home
+    ):
+        """Same shape as the proactive case, `at-limit` trigger with the
+        active NOT `about_to_wall` on this axis (the 5h/7d retry pass,
+        where the active can hold real headroom even though the model gate
+        that set the trigger spent it) — the other trigger the `all_above`
+        recovery axis reaches."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        usage = {
+            "6": {
+                "five_hour": {"pct": 92.0, "resets_at": _iso_at(now + 20000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {
+                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 120)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"6": 8.0, "2": 10.0}
+        for strategy, expected in (
+            ("dynamic", []),
+            ("consume-first", ["2"]),
+        ):
+            args = self._args(
+                h, usage=usage, current="6", oauth_candidates=["2"],
+                headroom=headroom, active_headroom=8.0,
+                trigger="at-limit", strategy=strategy,
+            )
+            ordered, _, _, _ = h.engine._rank_candidates(**args)
+            assert ordered == expected, (
+                f"strategy={strategy}: got {ordered}, want {expected} — the "
+                "at-limit escape must not bypass the landing bar for "
+                "dynamic just because `about_to_wall` is false on this axis"
+            )
+
+    def test_fleet_churn_a_reset_driven_departure_does_not_dominance_release(
+        self, temp_home
+    ):
+        """`_left_account_recovered`'s dominance leg releases the no-return
+        bar when the barred account now beats the CURRENT active by a wide
+        margin — correct when we left for headroom reasons, but a
+        `consume-first`/`dynamic` departure leaves for RESET ordering, so
+        the barred account can dominate the very account we moved to from
+        the moment we left (its headroom never needed to move). Measured:
+        re-testing that same, unchanged dominance every tick released the
+        bar every tick and the reset-ordering key sent the engine straight
+        back — two accounts ping-ponging while neither ever changed.
+        `dynamic` requires a REAL improvement against the departure
+        baseline instead (the two legs below this one); `best`/
+        `consume-first` keep the bare dominance leg, asserted here on the
+        SAME state."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        state = {
+            "lastSwitchFrom": "5",
+            "leftHeadroom": 50.0,
+            "leftRecoveryAt": now + 50000,
+            "leftTrigger": "dynamic",
+        }
+        usage = {
+            # The barred account: IDENTICAL to its departure snapshot —
+            # same headroom, same reset — only the active changed.
+            "5": {
+                "five_hour": {"pct": 50.0, "resets_at": _iso_at(now + 50000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {
+                "five_hour": {"pct": 80.0, "resets_at": _iso_at(now + 90000)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"5": 50.0, "2": 20.0}
+        recovered_dynamic = h.engine._left_account_recovered(
+            state, usage, headroom, 20.0,
+            AutoSwitchSettings(threshold=90.0, strategy="dynamic"),
+            now, current="2",
+        )
+        recovered_consume_first = h.engine._left_account_recovered(
+            state, usage, headroom, 20.0,
+            AutoSwitchSettings(threshold=90.0, strategy="consume-first"),
+            now, current="2",
+        )
+        assert recovered_consume_first is True, (
+            "consume-first must be unchanged: bare dominance over the "
+            "current active still releases the bar"
+        )
+        assert recovered_dynamic is False, (
+            "dynamic must hold: #5 is byte-identical to when we left it, "
+            "so re-measuring the same dominance is not an improvement"
+        )
+
+    # -- the owner's live acceptance fixture, exact numbers ------------------
+    #
+    #   acct   5h    7d   Fable   note
+    #     5     0    62     90    7d reset soonest, ~14h
+    #     4     0    64     91
+    #     3    33    69     94
+    #     1    34    69     91
+    #     2    94     —      —    5h at the wall; nothing can use it
+    #     6    90     —      —    5h at the wall
+    #
+    # Placeholder emails throughout — none of the owner's real addresses.
+
+    @staticmethod
+    def _owner_fleet(now: float) -> dict:
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d, "resets_at": _iso_at(now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        return {
+            "5": acct(0, 62, 90, 14),
+            "4": acct(0, 64, 91, 20),
+            "3": acct(33, 69, 94, 40),
+            "1": acct(34, 69, 91, 60),
+            "2": {"five_hour": {"pct": 94.0}},
+            "6": {"five_hour": {"pct": 90.0}},
+        }
+
+    def _owner_harness(self, temp_home, *, active_num: int) -> EngineHarness:
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+        )
+        order = [active_num] + [n for n in (1, 2, 3, 4, 5, 6) if n != active_num]
+        for num in order:
+            h.seed(num, f"acct{num}@example.invalid")
+        h.make_live(f"acct{active_num}@example.invalid", active_num)
+        return h
+
+    def test_owner_fixture_no_departure_from_account_5(self, temp_home):
+        """Account 5's Fable window sits at the switch threshold (90), but
+        its 5h/7d have room — the model basis, re-picked each tick, must
+        not read that as "active at threshold". Ten ticks, static usage
+        (nothing genuinely changes): zero switches."""
+        h = self._owner_harness(temp_home, active_num=5)
+        fleet_usage = self._owner_fleet(h.clock.now)
+        switches = 0
+        for _ in range(10):
+            outcome = h.tick_with_usage(fleet_usage)
+            if outcome is TickOutcome.SWITCHED:
+                switches += 1
+            h.clock.advance(301.0)  # past cooldown_seconds (300, the default)
+        assert switches == 0, (
+            f"got {switches} switches off account 5 — its Fable window "
+            "must not force a departure while 5h/7d have room"
+        )
+        assert h.active_number() == 5
+
+    def test_owner_fixture_account_5_is_the_target(self, temp_home):
+        """Starting from account 2 (the account nothing can use), the
+        engine must land on account 5 — soonest 7-day reset among the
+        candidates that actually have room on the basis in force. NOT #2
+        (no room anywhere) and NOT #6 (no room anywhere) — both sides of
+        the reset-ordering bar are present in this fleet, so the assertion
+        is not decided by headroom alone."""
+        h = self._owner_harness(temp_home, active_num=2)
+        fleet_usage = self._owner_fleet(h.clock.now)
+        outcome = h.tick_with_usage(fleet_usage)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 5, (
+            f"landed on {h.active_number()} instead of account 5"
+        )
+
+    def test_the_model_basis_re_pick_is_what_makes_the_trigger_voluntary(
+        self, temp_home
+    ):
+        """The single-account shape that tells the re-pick apart from the
+        landing rule alone: active blocked ONLY on Fable (5h/7d have real
+        room), no OTHER account in rotation at all. Without re-picking the
+        basis, the trigger reads `proactive` (the raw, model-gated headroom
+        is at the threshold) and an engine with zero candidates takes the
+        generic `no-candidates` / BLOCKED path. Re-picking the basis first
+        finds 5h/7d has room, so the trigger is the ordinary below-threshold
+        `dynamic` one — and THAT path's own "no OAuth peer to compare
+        against" branch answers `below-threshold` / NO_ACTION instead,
+        before candidate selection is ever reached. Same event either way
+        that "nothing switched" — the reason and exit code are what only
+        the re-pick gets right."""
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+        )
+        h.seed(5, "acct5@example.invalid")
+        h.make_live("acct5@example.invalid", 5)
+        outcome = h.tick_with_usage({
+            "5": {
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 62.0},
+                "scoped": [{"name": "Fable", "pct": 90.0}],
+            },
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — the model basis must be re-picked BEFORE the "
+            "no-candidates check, or a lone account blocked only on its "
+            "model window reads as genuinely blocked (BLOCKED, not "
+            "NO_ACTION)"
+        )
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"], (
+            f"got {reasons} — without the re-pick this reads `no-candidates`"
+        )
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")

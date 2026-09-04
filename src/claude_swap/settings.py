@@ -121,7 +121,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "dynamic"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
