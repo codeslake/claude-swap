@@ -730,6 +730,32 @@ def _headroom_by_account(
     }
 
 
+def _dynamic_active_headroom(
+    settings: "AutoSwitchSettings",
+    models: tuple[str, ...],
+    usage: dict[str, dict | str | None],
+    current: str,
+    active_headroom: float | None,
+) -> float | None:
+    """Widen ``active_headroom`` to the unmodeled 5h/7d value under
+    ``dynamic``, so the trigger classification and every re-rank this tick
+    read the active account on the same basis. ``headroom`` is always
+    model-gated (folds ``models`` in), so a pinned model's own window can
+    read the ACTIVE as blocked while its 5h/7d have real room — this only
+    widens, never narrows, and only runs under ``strategy == "dynamic"``.
+    Both the first classification and the consume-first phase-2 refetch
+    call this on the SAME axis — a second, independent computation at
+    either site is how the trigger and the re-rank end up deciding on
+    different bases within one tick.
+    """
+    if settings.strategy != "dynamic" or not models or active_headroom is None:
+        return active_headroom
+    unmodeled = _headroom_by_account(usage, ()).get(current)
+    if unmodeled is not None and unmodeled > active_headroom:
+        return unmodeled
+    return active_headroom
+
+
 def classify_candidate_block(
     windows: Iterable[tuple[str, float]], threshold: float
 ) -> tuple[str, str | None]:
@@ -1476,15 +1502,12 @@ class AutoSwitchEngine:
         # that model, and the landing rule already re-admits that account as
         # a target once here. `best`/`consume-first` are unaffected — this
         # only widens `active_headroom`, never narrows it, and only runs
-        # under `strategy == "dynamic"`.
-        if (
-            settings.strategy == "dynamic"
-            and self._models
-            and active_headroom is not None
-        ):
-            unmodeled = _headroom_by_account(usage, ()).get(current)
-            if unmodeled is not None and unmodeled > active_headroom:
-                active_headroom = unmodeled
+        # under `strategy == "dynamic"`. The consume-first phase-2 refetch
+        # below re-derives `active_headroom` from a fresh `headroom` too —
+        # calling the same helper there is what keeps them on one axis.
+        active_headroom = _dynamic_active_headroom(
+            settings, self._models, usage, current, active_headroom
+        )
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -1738,7 +1761,9 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
-            active_headroom = headroom.get(current)
+            active_headroom = _dynamic_active_headroom(
+                settings, self._models, usage, current, headroom.get(current)
+            )
             decided_now = self.clock()
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
                 trigger=trigger,

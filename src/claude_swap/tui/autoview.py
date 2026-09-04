@@ -370,8 +370,11 @@ class AutoScreen(Screen):
         # and retries on 5h/7d alone when the model-gated pass finds no
         # healthy candidate — so a panel that always ranks on `models` can
         # name a top row the engine would never pick (still model-gated
-        # ranking a fleet the engine has already dropped it for). Same
-        # predicate as the model-gated pass's own health filter
+        # ranking a fleet the engine has already dropped it for). But the
+        # engine only runs that retry under `strategy == "dynamic"`
+        # (autoswitch.py's `_rank_candidates`) — gated the same way here, or
+        # `best`/`consume-first` rank on an axis the engine is forbidden to
+        # use. Same predicate as the model-gated pass's own health filter
         # (`classify_candidate_block` — "open" is exactly what that filter
         # lets through): any candidate reading "open" means the model-gated
         # pass has something to work with, so keep `models`; none reading
@@ -379,7 +382,7 @@ class AutoScreen(Screen):
         # axis instead — a "model"-only block clears once `models` drops,
         # and a "full" block stays blocked either way.
         rank_models = models
-        if models and self._settings:
+        if models and self._settings and self._settings.strategy == "dynamic":
             threshold = self._settings.threshold
             for acc in snap.accounts:
                 if (

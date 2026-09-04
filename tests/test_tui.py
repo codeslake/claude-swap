@@ -1861,15 +1861,18 @@ class TestAutoScreen:
     ):
         """Both candidates' ONLY over-bar window is the pinned model, exactly
         the shape ``_rank_candidates`` (autoswitch.py) retries on 5h/7d alone
-        for — so the panel must rank them on that same axis, not stay on the
-        model-gated one. Ranking on the model-gated axis here would name #2
-        (95% Fable) the worse account when its real 5h is #3's better one:
-        the two are on OPPOSITE sides of `-Fable, +5h` vs `+Fable, -5h`."""
+        for — but that retry is `dynamic`-only (autoswitch.py:2400): `best`/
+        `consume-first` never rank on 5h/7d alone, so under those strategies
+        the panel must NOT drop the model gate either, even here. `strategy`
+        must be `dynamic` for the panel to take this path at all — ranking on
+        the model-gated axis here would name #2 (95% Fable) the worse account
+        when its real 5h is #3's better one: the two are on OPPOSITE sides of
+        `-Fable, +5h` vs `+Fable, -5h`."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
             "schemaVersion": 1,
-            "autoswitch": {"model": "Fable", "strategy": "best", "threshold": 90},
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
         }))
         fake = FakeSwitcher(
             [
@@ -1896,6 +1899,45 @@ class TestAutoScreen:
             # would put #3 first (90% Fable < 95% Fable).
             assert plain.index("user2@example.com") < plain.index(
                 "user3@example.com"
+            )
+
+    async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
+        self, tmp_path, fake_engine
+    ):
+        """The regression this gate exists to stop: same fleet as the test
+        above (both candidates blocked ONLY by the pinned model), but
+        `strategy: "best"` — the engine's own retry never drops the model
+        set for `best`/`consume-first` (autoswitch.py:2400), so the panel
+        must not either. Ranking stays on the model-gated axis: #3 (90%
+        Fable) ranks first, the OPPOSITE order from the `dynamic` test
+        above."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "best", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(
+                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 95.0)])
+                ),
+                make_account(
+                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 90.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert plain.index("user3@example.com") < plain.index(
+                "user2@example.com"
             )
 
     async def test_candidates_drain_soonest_seven_day_reset_first(
@@ -2409,6 +2451,76 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "Fable-only" in out, out
         assert "  blocked" in out, out
+
+    def test_panel_top_matches_the_engines_pick_under_consume_first(
+        self, temp_home
+    ):
+        """The engine's own model-window fallback (`_rank_candidates`,
+        autoswitch.py) only drops the model set under `strategy ==
+        "dynamic"` (`autoswitch.py:2400`) — `best`/`consume-first` never
+        rank on 5h/7d alone. The panel's `rank_models` fallback must be
+        gated the same way, or under `consume-first` it names a top row
+        the engine is forbidden to pick.
+
+        Four accounts, `model="Fable"`, `threshold=90`, `strategy=
+        "consume-first"`: every candidate is blocked on the model-gated
+        axis (account 2 on its own 5h window, 3 and 4 only on Fable), so
+        an ungated panel drops `models` and ranks 3/4 on 5h/7d alone,
+        naming account 3 top. The real engine, ticked on the identical
+        fleet, switches to account 2 — the panel must agree.
+        """
+        from tests.test_autoswitch import EngineHarness, _iso_at
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.settings import AutoSwitchSettings
+
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="consume-first",
+        )
+        for num, email in (
+            (1, "a@x.invalid"), (2, "b@x.invalid"),
+            (3, "c@x.invalid"), (4, "d@x.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a@x.invalid", 1)
+
+        def w(five_h, seven_d, fable, hours_out):
+            d = {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+            }
+            if fable is not None:
+                d["scoped"] = [{"name": "Fable", "pct": fable}]
+            return d
+
+        fleet = {
+            "1": w(0, 91, 99, 10),
+            "2": w(91, 5, None, 5),
+            "3": w(20, 50, 100, 20),
+            "4": w(5, 88, 95, 40),
+        }
+        out = h.tick_with_usage(fleet)
+        assert out is TickOutcome.SWITCHED, f"expected a switch, got {out}"
+        engine_pick = str(h.active_number())
+
+        settings = AutoSwitchSettings(
+            model="Fable", threshold=90.0, strategy="consume-first",
+        )
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, last_good=fleet["1"]),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=fleet["2"]),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=fleet["3"]),
+            self._acct("4", "d@x.invalid", switchable=True, last_good=fleet["4"]),
+        ), active="1", settings=settings)
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid", "4": "d@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == engine_pick, (
+            f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
+            f"panel out:\n{rendered}"
+        )
 
 
 @pytest.mark.asyncio

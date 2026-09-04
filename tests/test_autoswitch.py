@@ -3479,6 +3479,19 @@ class TestSessionThreshold:
         assert {"1", "2", "3"} not in self._collect_fetch_sets(harness, 99.9)
 
 
+class TestSessionStrategy:
+    """apply_strategy(): the TUI's session-only, mid-run override. The
+    existing coverage (test_tui.py's test_strategy_cycle_is_session_only)
+    only asserts against `_FakeEngine.applied_strategies`, never a real
+    `AutoSwitchEngine` — the whole suite passes with `apply_strategy`'s body
+    replaced by `pass`. This is the real-engine check."""
+
+    def test_apply_strategy_retargets_settings(self, harness):
+        assert harness.engine.settings.strategy == "consume-first"
+        harness.engine.apply_strategy("dynamic")
+        assert harness.engine.settings.strategy == "dynamic"
+
+
 class TestPctLabel:
     def test_whole_numbers_drop_the_decimal(self):
         assert pct_label(90.0) == "90"
@@ -4744,20 +4757,70 @@ class TestDynamicStrategy:
         """Account 5's Fable window sits at the switch threshold (90), but
         its 5h/7d have room — the model basis, re-picked each tick, must
         not read that as "active at threshold". Ten ticks, static usage
-        (nothing genuinely changes): zero switches."""
+        (nothing genuinely changes): zero switches.
+
+        The owner's six accounts alone do not DISCRIMINATE this: every one
+        of them is also blocked on the model-gated axis (>=90), so the
+        landing gate refuses them whether or not the re-pick ran, and this
+        test used to pass with the entire re-pick deleted. Account 7 (added
+        here, not one of the owner's six) is open and healthy on the
+        model-gated axis with headroom clearing account 5's UNWIDENED
+        headroom (10) by more than the hysteresis (10) — so WITHOUT the
+        re-pick, trigger reads "proactive" and account 7 is admitted on
+        plain hysteresis, a real departure. WITH the re-pick, trigger reads
+        "dynamic" (below threshold) and account 7's reset (100h) loses to
+        account 5's own (14h) under consume-first-style reset ordering, so
+        it is never admitted.
+        """
+        from claude_swap.autoswitch import _dynamic_active_headroom
+
         h = self._owner_harness(temp_home, active_num=5)
-        fleet_usage = self._owner_fleet(h.clock.now)
+        h.seed(7, "acct7@example.invalid")
+        fleet_usage = dict(self._owner_fleet(h.clock.now))
+        fleet_usage["7"] = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {
+                "pct": 0.0,
+                "resets_at": _iso_at(h.clock.now + 100 * 3600),
+            },
+            "scoped": [{"name": "Fable", "pct": 75.0}],
+        }
+
+        # The active_headroom the tick actually uses: unwidened (model-
+        # gated) 10.0 re-picked to the unmodeled 5h/7d value 38.0.
+        widened = _dynamic_active_headroom(
+            h.engine.settings, h.engine._models, fleet_usage, "5", 10.0,
+        )
+        assert widened == 38.0, (
+            f"got {widened!r} — account 5's re-picked basis must be its "
+            "unmodeled 5h/7d headroom (100 - 62 = 38), not the model-gated "
+            "10"
+        )
+
         switches = 0
+        reasons = []
         for _ in range(10):
+            h.events.clear()
             outcome = h.tick_with_usage(fleet_usage)
             if outcome is TickOutcome.SWITCHED:
                 switches += 1
+            else:
+                reasons.extend(
+                    e.reason for e in h.events if isinstance(e, NoSwitchEvent)
+                )
             h.clock.advance(301.0)  # past cooldown_seconds (300, the default)
         assert switches == 0, (
             f"got {switches} switches off account 5 — its Fable window "
-            "must not force a departure while 5h/7d have room"
+            "must not force a departure while 5h/7d have room, and account "
+            "7's later-resetting weekly window must not admit it either"
         )
         assert h.active_number() == 5
+        # The trigger the tick actually used: every hold reads as the
+        # dynamic below-threshold path (consume-first-style reset
+        # ordering), never the plain-hysteresis "proactive" a dropped
+        # re-pick would have taken (which would have switched to 7, not
+        # held).
+        assert all(r == "already-consuming-soonest" for r in reasons), reasons
 
     def test_owner_fixture_account_5_is_the_target(self, temp_home):
         """Starting from account 2 (the account nothing can use), the
@@ -5429,6 +5492,106 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         assert state.get("leftTrigger") == "failover", (
             f"expected leftTrigger='failover', got {state.get('leftTrigger')!r}"
         )
+
+
+class TestPhase2RefetchKeepsTheDynamicModelBasis:
+    """`dynamic`'s model-basis widening (the re-pick that turns a pinned
+    model's own window into "not a blackout" for the ACTIVE, above) must
+    still be in force after the consume-first two-phase commit's refetch
+    re-derives `active_headroom` from fresh usage -- the trigger is
+    classified on one basis and the refetch must not silently switch the
+    tick to a narrower one. Two accounts, `--model all`: both read
+    model-gated headroom 0 (Fable pinned at 100%) but real 5h/7d room, so
+    the widened basis is the only thing that tells the engine it is not
+    genuinely at the wall.
+    """
+
+    def test_leftHeadroom_is_recorded_on_the_widened_basis_not_the_model_gated_one(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home, model="all", threshold=95.0, hysteresis_pct=20.0,
+            strategy="dynamic",
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        out = h.tick_with_usage({
+            "1": acct(5, 90, 100, 14),   # model-gated headroom 0, unmodeled 10
+            "2": acct(20, 92, 100, 8),   # model-gated headroom 0, unmodeled 8; sooner reset
+        })
+        assert out is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        state = h.engine._read_state()
+        assert state.get("leftHeadroom") == 10.0, (
+            f"leftHeadroom={state.get('leftHeadroom')!r} — the phase-2 "
+            "refetch must record the SAME widened basis (10.0, account 1's "
+            "unmodeled 5h/7d headroom) the trigger was classified on, not "
+            "the narrower model-gated 0.0"
+        )
+
+    def test_a_wrong_leftHeadroom_of_zero_does_not_cause_a_two_tick_ping_pong_back(
+        self, temp_home
+    ):
+        """The failure mode a dropped widening produces: `leftHeadroom: 0.0`
+        makes `_left_account_recovered`'s headroom leg release on account
+        1's very next model-gated headroom (`h >= min(0+3, 100)`, i.e. any
+        h >= 3), for essentially free -- and the engine switches straight
+        back, the two-tick ping-pong the landing rule exists to stop. With
+        the widened basis (10.0) that same leg needs `h >= 13`, which
+        account 1's 3.0 does not clear."""
+        h = EngineHarness(
+            temp_home, model="all", threshold=95.0, hysteresis_pct=20.0,
+            strategy="dynamic",
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+
+        def acct(five_h, seven_d, fable, hours_out):
+            return {
+                "five_hour": {"pct": five_h},
+                "seven_day": {
+                    "pct": seven_d,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        out1 = h.tick_with_usage({
+            "1": acct(5, 90, 100, 14),
+            "2": acct(20, 92, 100, 8),
+        })
+        assert out1 is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.clock.advance(301.0)  # past cooldown_seconds (default 300)
+        out2 = h.tick_with_usage({
+            # Account 1 resets SOONER than account 2 here (5h vs 30h), so
+            # consume-first's reset-ordering gate alone does not exclude it
+            # as a candidate -- isolates the no-return bar / recovered
+            # check as the only thing standing between account 1 and a
+            # switch back.
+            "1": acct(20, 5, 97, 5),    # model-gated headroom 3.0
+            "2": acct(92, 20, 90, 30),
+        })
+        assert out2 is TickOutcome.NO_ACTION, (
+            f"got {out2}, active now {h.active_number()!r} — account 1's "
+            "3.0-point model-gated headroom must not read as 'recovered' "
+            "against a leftHeadroom baseline that was itself wrong"
+        )
+        assert h.active_number() == 2
 
 
 class TestEveryAccountAboveThreshold:
