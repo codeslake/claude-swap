@@ -5257,16 +5257,25 @@ class ClaudeAccountSwitcher:
             # consumed generation until then) and take the idle path below,
             # refresh included, on that credential. A profile already on the
             # backup's generation, or behind a fresh re-login in the backup,
-            # needs no adoption and takes the same path on the backup. An
-            # adoption refused for any other reason (lock contention, a
-            # session record that could not be read) leaves both copies as
-            # they were.
-            try:
-                if self._adopt_session_credential(str(num), email, org_uuid):
-                    creds = session_creds
-            except LockError:
-                pass
-            session_creds = None
+            # needs no adoption and takes the same path on the backup.
+            #
+            # Quiescence is checked here too, not just inside the adoption
+            # call: an unreadable session record makes it unknown whether a
+            # claude is still live against this profile, and "unknown" must
+            # not fall through to refreshing the backup grant below, which
+            # can already be a consumed generation the live claude rotated
+            # past. Only a CONFIRMED-quiescent profile takes that fallback;
+            # an unreadable one keeps session_creds set so the read-only path
+            # below runs on the profile's own (unrefreshed) credential.
+            from claude_swap.session import profile_is_quiescent
+
+            if profile_is_quiescent(session_dir):
+                try:
+                    if self._adopt_session_credential(str(num), email, org_uuid):
+                        creds = session_creds
+                except LockError:
+                    pass
+                session_creds = None
         if session_creds:
             session_oauth = oauth.extract_oauth_data(session_creds)
             if session_oauth and session_oauth.get("accessToken"):

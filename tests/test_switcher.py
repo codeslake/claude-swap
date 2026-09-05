@@ -12839,6 +12839,85 @@ class TestInactiveRefreshRoutesThroughGate:
         assert record.error is None
 
 
+class TestRefusedAdoptionStaysReadOnly:
+    """A refused ``_adopt_session_credential`` (unreadable session record,
+    quiescence unknown) must fall back to the session profile's own
+    read-only fetch, never spend the stale backup grant via
+    ``consume_backup_grant``."""
+
+    FRESH_PROFILE = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "b", "refreshToken": "PROFILE-FRESH",
+            "expiresAt": 9999999999000,
+        }
+    })
+    STALE_BACKUP = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "a", "refreshToken": "BACKUP-GRANT", "expiresAt": 0,
+        }
+    })
+
+    def _run(self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
+              session_record: str):
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        s._write_account_credentials("2", "account2@example.com", self.STALE_BACKUP)
+        session_dir = s._session_dir("2", "account2@example.com")
+        (session_dir / "sessions").mkdir(parents=True)
+        (session_dir / "sessions" / "s1.json").write_text(
+            session_record, encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "claude_swap.session.read_session_credentials",
+            lambda d: self.FRESH_PROFILE,
+        )
+        monkeypatch.setattr(
+            "claude_swap.session.session_identity_drifted",
+            lambda d, e, o: False,
+        )
+        seen = {}
+
+        def fake(num, email, creds, *, is_active=False, refresh_via=None, **kw):
+            seen.update(creds=creds, is_active=is_active, refresh_via=refresh_via)
+            return oauth.UsageOutcome(usage=None)
+
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", fake)
+        info = (2, "account2@example.com", "", "", False, self.STALE_BACKUP, "")
+        s._fetch_account_usage(info)
+        return seen
+
+    def test_unreadable_session_record_must_not_post_the_backup_grant(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        seen = self._run(
+            temp_home, sample_sequence_data, monkeypatch, "{ this is not json"
+        )
+        assert seen["refresh_via"] is None, (
+            "unreadable session record -> stale backup grant is POSTed: "
+            f"refresh_via={seen['refresh_via']} creds={seen['creds'][:50]}"
+        )
+        assert seen["creds"] == self.FRESH_PROFILE
+        assert seen["is_active"] is True
+
+    def test_control_readable_quiescent_record_still_adopts(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A readable, quiescent record (no live pid) still takes the
+        adoption path: the fix must not simply disable it."""
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_adopt_session_credential",
+            lambda self, num, email, org: True,
+        )
+        seen = self._run(
+            temp_home, sample_sequence_data, monkeypatch,
+            json.dumps({"pid": 4000000}),
+        )
+        assert seen["creds"] == self.FRESH_PROFILE
+        assert seen["refresh_via"] is not None
+        assert seen["is_active"] is False
+
+
 class TestStrikeUnbindsInCollector:
     """M3: the collector's quarantine scan passes the stored credential's
     fingerprint — a replaced credential lifts 're-login needed' without a
