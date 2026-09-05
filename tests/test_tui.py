@@ -2463,6 +2463,28 @@ class TestUnswitchableRowsAreListed:
         ), active="9")
         assert out.index("a@x.com") < out.index("empty@x.com")
 
+    def test_the_first_chip_starts_at_the_same_column_across_rows(self):
+        """Each row's chips must start where the widest email in this block
+        ends, not where its own email ends — otherwise a long email pushes
+        its row's chips far right while short ones sit left, and the
+        columns never line up.
+        """
+        out = self._render(self._snap(
+            self._acct("2", "brief@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("3", "a-much-longer-address@example.com",
+                       switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+        ), active="9")
+        rows = [line for line in out.split("\n") if "5h:" in line]
+        assert len(rows) == 2, rows
+        columns = [line.index("5h:") for line in rows]
+        assert columns[0] == columns[1], (
+            f"chips do not share a column: {columns} in {rows!r}"
+        )
+
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends
