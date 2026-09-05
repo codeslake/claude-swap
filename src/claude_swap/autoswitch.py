@@ -658,6 +658,27 @@ def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
     return entry is not None and entry.fresh(now)
 
 
+def _numeric_probe_cooldown(raw: object) -> dict[str, float]:
+    """``state["probeCooldown"]``, TYPE-GUARDED to a fresh dict of numeric
+    values only -- every writer of ``self._last_probe_cooldown`` (the
+    panel's only view of this record, see its docstring) must filter
+    through this SAME function: a non-dict survives ``... or {}`` unchanged
+    when it is truthy (a non-empty list has no ``.get``), and a dict with a
+    non-numeric value (``{"2": null}``) passes but raises on the
+    ``probe_cooldown.get(num, 0.0) > now`` comparison in
+    ``select_probe_target`` when that key is read. Returning a fresh dict
+    rather than the input also matters when the caller goes on to mutate
+    the original in place (``_perform``'s ``pop``/``[number] =``): publishing
+    anything but a copy would let that later write mutate a dict the panel's
+    thread is reading.
+    """
+    return (
+        {k: v for k, v in raw.items() if isinstance(v, (int, float))}
+        if isinstance(raw, dict)
+        else {}
+    )
+
+
 def select_probe_target(
     usage: dict[str, dict | str | None],
     oauth_candidates: Sequence[str],
@@ -1864,12 +1885,9 @@ class AutoSwitchEngine:
         # `... or {}` unchanged when it is truthy (a non-empty list has no
         # `.get`), and a dict with a non-numeric value (`{"2": null}`)
         # passes but raises on the comparison below when that key is read.
-        raw_probe_cooldown = state.get("probeCooldown")
-        probe_cooldown = (
-            {k: v for k, v in raw_probe_cooldown.items() if isinstance(v, (int, float))}
-            if isinstance(raw_probe_cooldown, dict)
-            else {}
-        )
+        # See `_numeric_probe_cooldown` -- `_perform`'s own write of
+        # `self._last_probe_cooldown` shares this same filter.
+        probe_cooldown = _numeric_probe_cooldown(state.get("probeCooldown"))
         self._last_probe_cooldown = probe_cooldown
         decided_now = self.clock()
         ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
@@ -3453,7 +3471,18 @@ class AutoSwitchEngine:
             # this same write, and a tick that returns early on `_in_cooldown`
             # never reaches the other refresh -- leaving the panel naming a
             # released account as still cooling down, or vice versa.
-            self._last_probe_cooldown = probe_cooldown
+            #
+            # TYPE-GUARDED THE SAME WAY as `_rank_candidates`'s read
+            # (`_numeric_probe_cooldown`): this method only pops/sets the
+            # ONE account it just switched to, so a non-numeric entry for
+            # any OTHER account (a hand-edited state file) survives
+            # untouched and would otherwise reach the panel's own
+            # `select_probe_target` call and raise on `None > now`. A
+            # filtered COPY, not `probe_cooldown` itself -- that object IS
+            # `state["probeCooldown"]`, so publishing it unfiltered also
+            # handed the panel's thread a dict this method's own next call
+            # (or the next tick's) can go on mutating in place.
+            self._last_probe_cooldown = _numeric_probe_cooldown(probe_cooldown)
             atomic_write_json(self.state_path, state)
 
         warnings = list(result.get("warnings", []))

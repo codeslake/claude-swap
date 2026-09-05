@@ -4983,6 +4983,53 @@ class TestDynamicStrategy:
             "cleared a hysteresis bar mixed across two window bases"
         )
 
+    def test_a_probe_admitted_only_by_the_models_dropped_fallback_pass_is_named_probe(
+        self, temp_home
+    ):
+        """`_rank_candidates`'s model-gated primary pass and its `models=()`
+        fallback pass each return their OWN probe pick (`_rank_candidates_pass`'s
+        5th tuple field) — `self._last_probe_num` must be whichever pass's
+        `ordered` the caller actually goes on to use, not always the
+        primary's. Both accounts here are blocked on their Fable window
+        (95%, over the 90 threshold), so the primary pass admits nothing at
+        all and `ordered` is empty; only the fallback, dropping the model
+        set, sees #2's real 5h/7d headroom and its never-reported weekly
+        reset, and probes it. Setting `self._last_probe_num` to the
+        PRIMARY pass's pick (`None`, since it admitted nothing) instead of
+        the fallback's would leave the switch that follows named with the
+        tick's raw trigger ("dynamic") rather than "probe" — recording NO
+        cooldown for the account, so the very next tick probes it again."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        h.seed(1, "a@example.invalid")
+        h.seed(2, "b@example.invalid")
+        h.make_live("a@example.invalid", 1)
+
+        active = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {
+                "pct": 10.0, "resets_at": _iso_at(h.clock.now + 100 * 3600),
+            },
+            "scoped": [{"name": "Fable", "pct": 95.0}],
+        }
+        probe_candidate = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0},  # never-reported weekly reset
+            "scoped": [{"name": "Fable", "pct": 95.0}],
+        }
+        outcome = h.tick_with_usage({"1": active, "2": probe_candidate})
+        assert outcome is TickOutcome.SWITCHED, f"got {outcome}"
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "probe", (
+            f"got {sw.trigger!r} — a switch admitted only by the fallback "
+            "pass's probe pick must still be named \"probe\""
+        )
+        cooldown = h.state().get("probeCooldown", {})
+        assert cooldown.get("2") is not None and cooldown["2"] > h.clock.now, (
+            f"got {cooldown!r} — a probe switch must record a cooldown for "
+            "the account it landed on, same as any other probe"
+        )
+
 
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
@@ -5579,19 +5626,29 @@ class TestConsumeFirstProbesAnUnknownReset:
     ):
         """`_last_probe_cooldown` is the engine's only side channel the
         "Next best" panel reads (see its docstring next to the attribute) --
-        without the cache-write in `_rank_candidates`, the panel would see
-        `{}` forever while the state file goes on recording real cooldowns,
-        and would re-top a candidate the engine is still cooling down on."""
+        without the cache-write in `_tick_inner`, the panel would see `{}`
+        forever while the state file goes on recording real cooldowns, and
+        would re-top a candidate the engine is still cooling down on.
+
+        The fleet below is a NO_ACTION tick (`already-consuming-soonest`):
+        `_perform` is never called, so this assertion can only pass through
+        `_tick_inner`'s own read. A fleet that switches (as this test used
+        to use) passes even with that read deleted -- `_perform` writes the
+        identical, unfiltered map to `_last_probe_cooldown` again on the
+        SAME tick right afterward (see the aliasing note by its own write),
+        which is indistinguishable here from the cache this test means to
+        check."""
         h = self._harness(temp_home)
         h.switcher._write_json(
             h.switcher.backup_dir / "autoswitch_state.json",
             {"probeCooldown": {"2": h.clock.now + PROBE_COOLDOWN_S - 1}},
         )
-        h.tick_with_usage({
-            "1": _usage7(20, 20, _R_LATER),
-            "2": _usage7(10, 10),          # cooling down, skipped this tick
-            "3": _usage7(1, 1, _R_SOON),
+        outcome = h.tick_with_usage({
+            "1": _usage7(20, 20, _R_SOON),    # active already resets soonest
+            "2": _usage7(10, 10, _R_LATER),   # cooling down anyway
+            "3": _usage7(10, 10, _R_LATER),
         })
+        assert outcome is TickOutcome.NO_ACTION, f"got {outcome}"
         assert h.engine._last_probe_cooldown.get("2") == (
             h.clock.now + PROBE_COOLDOWN_S - 1
         ), (

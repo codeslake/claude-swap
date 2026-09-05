@@ -2795,6 +2795,53 @@ class TestUnswitchableRowsAreListed:
             f"of the known-soon-reset one -- panel out:\n{rendered}"
         )
 
+    def test_the_panel_survives_a_null_cooldown_left_behind_by_a_switch_to_another_account(
+        self, temp_home
+    ):
+        """`_perform` (autoswitch.py) publishes the RAW `state["probeCooldown"]`
+        into `_last_probe_cooldown` -- it pops only the account the switch just
+        landed ON, so a corrupted entry for any OTHER account (`{"5": null}`,
+        e.g. from a hand-edited state file) survives into the panel's cache
+        untouched, bypassing the type filter `_rank_candidates` applies for
+        exactly this reason. A switch to a DIFFERENT account then leaves the
+        panel's own `select_probe_target` call comparing `None > now` for
+        account 5 and raising `TypeError` as soon as 5 has readable headroom
+        and an unmeasured 7-day reset."""
+        from tests.test_autoswitch import EngineHarness, _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@x.invalid")
+        h.seed(2, "b@x.invalid")
+        h.make_live("a@x.invalid", 1)
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            {"probeCooldown": {"5": None}},
+        )
+        # Lands on "2", not "5" -- the pop in `_perform` never reaches "5".
+        h.engine._perform("2", "b@x.invalid", "proactive", (90.0, float("inf")))
+        assert h.active_number() == 2
+
+        # The panel reads real wall-clock time (`time.time()`), not the
+        # engine harness's `FakeClock` (near epoch 1_000_000) -- a reset
+        # timestamped off the fake clock would read as already elapsed
+        # (== unknown) to the panel and never reach the comparison this
+        # test exists to exercise.
+        real_now = time.time()
+        known_active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_at(real_now + 8 * 86400)},
+        }
+        unknown_headroom = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("2", "b@x.invalid", switchable=True, last_good=known_active),
+            self._acct("5", "e@x.invalid", switchable=True,
+                        last_good=unknown_headroom),
+        ), active="2", settings=settings, engine=h.engine)
+        assert "e@x.invalid" in rendered, rendered
+
     def test_the_panel_never_probes_off_an_active_reset_the_engine_has_stopped_trusting(
         self,
     ):
