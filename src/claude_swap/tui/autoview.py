@@ -34,6 +34,7 @@ from claude_swap.autoswitch import (
     classify_candidate_block,
     consume_first_rank_key,
     pct_label,
+    select_probe_target,
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
@@ -423,6 +424,52 @@ class AutoScreen(Screen):
             default=0,
         )
         now = time.time()
+        # THE SAME PROBE TARGET THE ENGINE WOULD ADMIT, never re-derived --
+        # `select_probe_target` (autoswitch.py) is the one function both
+        # this panel and `_rank_candidates_pass` call, so an unknown-reset
+        # candidate cannot sort last here while the engine ranks it first.
+        probe_num = None
+        if consume_first:
+            usage_by_account = {
+                acc.number: (
+                    acc.usage.sentinel
+                    if acc.usage.sentinel is not None
+                    else acc.usage.last_good
+                )
+                for acc in snap.accounts
+            }
+            oauth_candidates = [
+                acc.number
+                for acc in snap.accounts
+                if acc.number != active_number
+                and acc.switchable
+                and acc.kind != "api_key"
+            ]
+            # `decision_value()`, not `usage_by_account`'s sentinel-or-
+            # last_good: the engine's own gate (`select_probe_target`'s
+            # `active_reset_ts is None` guard) runs on `decision_value()`,
+            # which drops a `last_good` older than `STALE_OK_S` -- reading
+            # the raw `last_good` here instead let the panel see an active
+            # reset the engine had already stopped trusting, and jump an
+            # unknown-reset candidate to the top of a probe the engine would
+            # never run.
+            active_acc_usage = next(
+                (acc.usage for acc in snap.accounts if acc.number == active_number),
+                None,
+            )
+            active_value = (
+                active_acc_usage.decision_value()
+                if active_acc_usage is not None
+                else None
+            )
+            probe_num = select_probe_target(
+                usage_by_account,
+                oauth_candidates,
+                rank_models,
+                active_value,
+                self._engine._last_probe_cooldown if self._engine is not None else None,
+                now,
+            )
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
         # own payload (`relevant_windows`), so "chip 1" is not the same
@@ -550,7 +597,8 @@ class AutoScreen(Screen):
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, rank_models
+                        acc.usage.last_good, self._settings.threshold, now,
+                        rank_models, probe=(acc.number == probe_num),
                     )
                     if consume_first
                     else (pct if rank_pct is None else rank_pct,)
