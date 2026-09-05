@@ -160,9 +160,16 @@ def chip_label(label: str, reset: str | None) -> str:
     cannot read two ways on two screens. The caller appends the pct so it can
     colour it by severity. The countdown shows whenever it is known, not only
     at 100%: a saturated candidate's worth IS when it comes back.
+
+    An unknown reset is a fact worth showing, not a reason to go blank: the
+    strategy needs exactly this account activated once to learn it (see
+    autoswitch.py's consume-first probe admission), so hiding the gap read as
+    "nothing to report" when it meant the opposite. ``?`` keeps the same
+    token shape a known reset has (``5h(⟳?):``) so a column of chips still
+    lines up — callers compute width from this string, never a literal.
     """
     if not reset:
-        return f"{label}:"
+        return f"{label}(⟳?):"
     return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
 
 

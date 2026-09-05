@@ -89,15 +89,20 @@ def usage_bar(
     return text
 
 
-def _reset_parts(window: dict, now: float) -> tuple[str | None, str | None]:
+def _reset_parts(window: dict, now: float) -> tuple[str, str]:
     """Countdown suffix and its clock-extended variant for one window.
 
     ``("resets 2h 13m", "resets 2h 13m · 20:39")`` — the second form is what
     a row shows when it has the width for it. Equal when no clock is known.
+
+    An unknown reset used to return ``(None, None)`` and this row's suffix
+    then went blank — the same "nothing to report" reading that hid it in
+    the chips, on the account's OWN detail card this time. Named instead, so
+    the reset column never disappears merely because it is unmeasured.
     """
     reset = data.reset_text(window, now)
     if not reset:
-        return None, None
+        return "reset unknown", "reset unknown"
     clock = data.reset_clock(window, now)
     return reset, f"{reset} · {clock}" if clock else reset
 

@@ -2560,7 +2560,9 @@ class TestUnswitchableRowsAreListed:
         while the chips, built from a literal 5h/7d pair, never printed it
         at all. Account #4's real values: 5h 28%, 7d 70%, Fable 91%,
         threshold 90, model Fable — the label already read `Fable-only`;
-        the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%`."""
+        the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%` (none
+        of the three windows carry a reset here, so each chip reads its
+        explicit unknown-reset marker rather than the bare label)."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(model="Fable", threshold=90.0)
@@ -2572,7 +2574,7 @@ class TestUnswitchableRowsAreListed:
             }),
         ), active="1", settings=settings)
         assert "Fable-only" in out, out
-        assert "Fable:91%" in out, out
+        assert "Fable(⟳?):91%" in out, out
 
     def test_panel_top_matches_the_engines_pick_under_consume_first(
         self, temp_home
