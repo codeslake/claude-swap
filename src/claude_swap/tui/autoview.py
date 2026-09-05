@@ -435,12 +435,29 @@ class AutoScreen(Screen):
                 and acc.switchable
                 and acc.kind != "api_key"
             ]
+            # `decision_value()`, not `usage_by_account`'s sentinel-or-
+            # last_good: the engine's own gate (`select_probe_target`'s
+            # `active_reset_ts is None` guard) runs on `decision_value()`,
+            # which drops a `last_good` older than `STALE_OK_S` -- reading
+            # the raw `last_good` here instead let the panel see an active
+            # reset the engine had already stopped trusting, and jump an
+            # unknown-reset candidate to the top of a probe the engine would
+            # never run.
+            active_acc_usage = next(
+                (acc.usage for acc in snap.accounts if acc.number == active_number),
+                None,
+            )
+            active_value = (
+                active_acc_usage.decision_value()
+                if active_acc_usage is not None
+                else None
+            )
             probe_num = select_probe_target(
                 usage_by_account,
                 oauth_candidates,
                 rank_models,
-                usage_by_account.get(active_number),
-                None,
+                active_value,
+                self._engine._last_probe_cooldown if self._engine is not None else None,
                 now,
             )
         # Chip columns are keyed by WINDOW NAME, never by position: two rows

@@ -1022,6 +1022,13 @@ class AutoSwitchEngine:
         # `_rank_candidates`'s side channel for its probe pick; see its
         # docstring. Never read before a tick has ranked at least once.
         self._last_probe_num: str | None = None
+        # The type-guarded `probeCooldown` this tick read from state (see
+        # `_tick_inner`), cached the same way as `_last_probe_num` so the
+        # "Next best" panel's own `select_probe_target` call can see exactly
+        # the cooldown record the engine ranked against instead of a
+        # hardcoded `None` — a probe the engine is still cooling down from
+        # would otherwise read as fresh to the panel and jump back to the top.
+        self._last_probe_cooldown: dict[str, float] = {}
 
     def _announce_demotion(self) -> None:
         """Say once, on the first tick, that this engine lost the LIVE lock.
@@ -1863,6 +1870,7 @@ class AutoSwitchEngine:
             if isinstance(raw_probe_cooldown, dict)
             else {}
         )
+        self._last_probe_cooldown = probe_cooldown
         decided_now = self.clock()
         ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
             trigger=trigger,
@@ -2778,7 +2786,6 @@ class AutoSwitchEngine:
         # unchanged stale-usage gate in `_tick_inner` aborts the whole tick
         # on the first candidate whose entry is not `fresh()`.
         probe_candidates: list[str] = []
-        probe_cooldown = probe_cooldown or {}
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)

@@ -1511,6 +1511,11 @@ class _FakeEngine:
         self.applied_strategies: list[str] = []
         self.wakes = 0
         self._stop = threading.Event()
+        # Mirrors AutoSwitchEngine's own cached probe-cooldown attribute
+        # (see its docstring) -- `_candidates_text` reads it straight off
+        # `self._engine`, and a real screen mount reaches that read before
+        # any real tick would populate it.
+        self._last_probe_cooldown: dict[str, float] = {}
         _FakeEngine.instances.append(self)
 
     def run_loop(self) -> int:
@@ -2322,21 +2327,33 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None):
+              sentinel=None, usage=None):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
-        a.usage.last_good = last_good
-        a.usage.sentinel = sentinel
+        if usage is not None:
+            a.usage = usage
+        else:
+            # A real UsageEntry, not a MagicMock -- `.decision_value()` is
+            # real code, not an auto-mocked callable, and needs actual
+            # `sentinel`/`last_good`/`age_s` to answer correctly. `age_s=0.0`
+            # reads as freshly-fetched, matching every test here that sets
+            # only `last_good`/`sentinel` and has no opinion on staleness; a
+            # test that DOES care passes `usage=` with its own `age_s`.
+            a.usage = UsageEntry(
+                sentinel=sentinel, last_good=last_good,
+                fetched_at=time.time(), age_s=0.0,
+            )
         return a
 
-    def _render(self, snap, active, *, settings=None):
+    def _render(self, snap, active, *, settings=None, engine=None):
         from unittest.mock import MagicMock, patch
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.settings import AutoSwitchSettings
 
         v = AutoScreen.__new__(AutoScreen)
         v._settings = settings or AutoSwitchSettings()
+        v._engine = engine
         from claude_swap.tui.theme import CSWAP_DARK
         app = MagicMock()
         app.current_theme = CSWAP_DARK      # Palette.from_theme reads real fields
@@ -2720,6 +2737,107 @@ class TestUnswitchableRowsAreListed:
         assert panel_top == engine_pick, (
             f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
             f"panel out:\n{rendered}"
+        )
+
+    def test_the_panel_never_probes_an_account_the_engine_has_put_on_cooldown(
+        self,
+    ):
+        """`_candidates_text` used to hardcode `probe_cooldown=None` into its
+        own `select_probe_target` call (autoview.py), so a candidate the
+        ENGINE was still cooling down from a previous probe
+        (`_perform`'s `probeCooldown[num] = now + PROBE_COOLDOWN_S`,
+        autoswitch.py) read as fresh here and jumped back to the top of
+        "Next best" for up to an hour, pointing at an account the engine
+        will not go to. The panel must read the same cooldown record the
+        engine cached from its own tick (`AutoSwitchEngine._last_probe_cooldown`).
+        """
+        from tests.test_autoswitch import _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        class _FakeEngine:
+            def __init__(self, cooldown):
+                self._last_probe_cooldown = cooldown
+
+        real_now = time.time()
+        soon = _iso_at(real_now + 5 * 86400)
+
+        active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_at(real_now + 8 * 86400)},
+        }
+        unknown = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        known_soon = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": soon},
+        }
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        engine = _FakeEngine({"2": real_now + 3600})
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True,
+                        usage=UsageEntry(last_good=active, age_s=0.0,
+                                          fetched_at=real_now)),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=unknown),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=known_soon),
+        ), active="1", settings=settings, engine=engine)
+
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "3", (
+            f"panel probed a cooling-down account ({panel_top!r}) instead "
+            f"of the known-soon-reset one -- panel out:\n{rendered}"
+        )
+
+    def test_the_panel_never_probes_off_an_active_reset_the_engine_has_stopped_trusting(
+        self,
+    ):
+        """The panel used to read the active account's `sentinel or
+        last_good` for its own `select_probe_target` call, ignoring
+        staleness -- so once the active account's store row aged past
+        `STALE_OK_S` the panel still saw its old known 7-day reset while the
+        engine's own gate (`decision_value()`) had already stopped trusting
+        it and reads no active reset at all. `select_probe_target`'s
+        ``active_reset_ts is None`` guard (autoswitch.py) exists exactly for
+        that case: with a stale active it must refuse to name any probe
+        target, and the unknown-reset candidate must sort LAST like any
+        other candidate with no reset, never jump to the top on `-inf`.
+        """
+        from tests.test_autoswitch import _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        real_now = time.time()
+        soon = _iso_at(real_now + 5 * 86400)
+
+        stale_last_good = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_at(real_now + 8 * 86400)},
+        }
+        active_usage = UsageEntry(
+            last_good=stale_last_good,
+            fetched_at=real_now - STALE_OK_S - 100.0,
+            age_s=STALE_OK_S + 100.0,
+        )
+        unknown = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0}}
+        known_soon = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": soon},
+        }
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, usage=active_usage),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=unknown),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=known_soon),
+        ), active="1", settings=settings)
+
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "3", (
+            f"panel put the unknown-reset account on top ({panel_top!r}) "
+            f"while the active account's own reset is stale and unknown to "
+            f"the engine -- panel out:\n{rendered}"
         )
 
 

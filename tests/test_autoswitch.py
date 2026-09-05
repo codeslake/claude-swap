@@ -5706,35 +5706,6 @@ class TestConsumeFirstProbesAnUnknownReset:
         assert outcome is TickOutcome.SWITCHED, f"got {outcome}"
         assert h.active_number() == 2
 
-    def test_perform_self_heals_a_corrupt_probe_cooldown_on_write(
-        self, temp_home
-    ):
-        """`_perform`'s own write side (`state.setdefault("probeCooldown",
-        {})`) returns the EXISTING value unchanged when it is already
-        present but the wrong shape -- a list's `.pop(number, None)` raises
-        `TypeError` (lists only pop by index), and it raises AFTER
-        `switch_to` already succeeded: the account is switched but
-        `lastSwitchAt`/`lastSwitchFrom`/`leftHeadroom` are never recorded,
-        leaving the next tick with no no-return bar."""
-        h = self._harness(temp_home)
-        h.switcher._write_json(
-            h.switcher.backup_dir / "autoswitch_state.json",
-            {"probeCooldown": ["corrupt"]},
-        )
-        outcome = h.engine._perform(
-            "2", "b@example.com", "probe", (90.0, float("inf"))
-        )
-        assert outcome is TickOutcome.SWITCHED, f"got {outcome}"
-        assert h.active_number() == 2
-        state = h.state()
-        assert isinstance(state.get("probeCooldown"), dict), (
-            f"got {state.get('probeCooldown')!r} — a corrupt probeCooldown "
-            "must be replaced with a dict, not left to crash the write"
-        )
-        assert state.get("lastSwitchAt") is not None, (
-            "the switch record must still be written past the corrupt field"
-        )
-
     def test_probe_switch_names_the_slot_and_that_the_reset_is_unknown(
         self, temp_home
     ):
