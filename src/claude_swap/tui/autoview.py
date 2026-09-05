@@ -502,7 +502,7 @@ class AutoScreen(Screen):
                 # SAME relevant_windows call feeds the label below, so the
                 # chips and the label can never disagree on which windows
                 # exist for this account.
-                windows = row_windows.get(acc.number, [])
+                windows = row_windows[acc.number]
                 for i, (label, wpct, resets_at) in enumerate(windows):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     label_text = data.chip_label(
@@ -517,8 +517,7 @@ class AutoScreen(Screen):
                     # suffix or the pin badge.
                     if i < len(windows) - 1:
                         pad = chip_width[label] - len(label_text) - len(pct_text)
-                        if pad > 0:
-                            entry.append(" " * pad, style=palette.muted)
+                        entry.append(" " * pad, style=palette.muted)
                 if not windows:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
