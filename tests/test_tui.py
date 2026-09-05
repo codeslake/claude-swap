@@ -2478,6 +2478,34 @@ class TestUnswitchableRowsAreListed:
         ), active="9")
         assert out.index("a@x.com") < out.index("empty@x.com")
 
+    def test_the_first_chip_starts_at_the_same_column_across_rows(self):
+        """Each row's content must start where the widest email in this
+        block ends, not where its own email ends — otherwise a long email
+        pushes its row's content far right while short ones sit left, and
+        the columns never line up. This must hold at BOTH sites that pad
+        the email: the switchable rows (chips) and the unswitchable row
+        (a sentinel note instead), which are two separate append sites in
+        the panel and can drift out of alignment independently.
+        """
+        import re
+
+        out = self._render(self._snap(
+            self._acct("2", "brief@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("3", "a-much-longer-address@example.com",
+                       switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+            self._acct("4", "new@x.com", switchable=False),
+        ), active="9")
+        rows = [line for line in out.split("\n") if re.match(r"\s+\d+\s+\S+\s+", line)]
+        assert len(rows) == 3, rows
+        columns = [re.match(r"\s+\d+\s+\S+\s+", line).end() for line in rows]
+        assert columns[0] == columns[1] == columns[2], (
+            f"content does not share a column: {columns} in {rows!r}"
+        )
+
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends

@@ -415,6 +415,13 @@ class AutoScreen(Screen):
         # mistake was fixed for the pin lookup itself — see the test that pins
         # its call count.
         pin_applying = pin.pin_is_applying(self.app.switcher) if pinned_identity else None
+        # Padded to the widest email among the rows THIS block renders, so
+        # every row's chips start in the same column — computed from exactly
+        # the accounts the loop below iterates (all but the active one).
+        email_width = max(
+            (len(acc.email) for acc in snap.accounts if acc.number != active_number),
+            default=0,
+        )
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -426,7 +433,7 @@ class AutoScreen(Screen):
             if not acc.switchable:
                 entry = Text()
                 entry.append(f"\n  {acc.number:>2}  ", style=palette.muted)
-                entry.append(acc.email, style=palette.muted)
+                entry.append(f"{acc.email:<{email_width}}", style=palette.muted)
                 # From SENTINEL_NOTES, not written here: an API-key slot has no
                 # login to restore, and the switch screen reads the same table,
                 # so both surfaces must describe a slot identically.
@@ -447,7 +454,7 @@ class AutoScreen(Screen):
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
             entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+            entry.append(f"{acc.email:<{email_width}}", style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
