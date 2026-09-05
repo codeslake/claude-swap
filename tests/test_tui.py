@@ -2506,6 +2506,41 @@ class TestUnswitchableRowsAreListed:
             f"content does not share a column: {columns} in {rows!r}"
         )
 
+    def test_later_chips_align_by_window_name_not_position(self):
+        """The email pad only lines up the FIRST chip. `5h(⟳4h9m):45%` is
+        nine characters wider than `5h:0%`, so a row whose 5h window carries
+        a live countdown pushes its 7d and Fable chips right of a row whose
+        5h window does not — a positional pad over `chip_label` cannot fix
+        this because the two rows' window LISTS can differ in length and
+        membership; the column has to be keyed by window NAME. Same emails-
+        length rows to isolate this from the already-covered email pad.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 45.0,
+                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                "seven_day": {"pct": 9.0,
+                              "resets_at": (now + timedelta(days=3, hours=8)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 8.0,
+                            "resets_at": (now + timedelta(days=3, hours=8)).isoformat()}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 0.0},
+                "scoped": [{"name": "Fable", "pct": 0.0}],
+            }),
+        ), active="9", settings=settings)
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 "))]
+        assert len(lines) == 2, lines
+        seven_d = [line.index("7d") for line in lines]
+        fable = [line.index("Fable") for line in lines]
+        assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
+        assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
+
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach
         the panel, not just `model` — the decision log already appends
