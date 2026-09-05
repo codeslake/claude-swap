@@ -5574,6 +5574,31 @@ class TestConsumeFirstProbesAnUnknownReset:
             "a probe switch must record a cooldown for the account it landed on"
         )
 
+    def test_the_probe_cooldown_read_from_state_is_cached_for_the_panel(
+        self, temp_home
+    ):
+        """`_last_probe_cooldown` is the engine's only side channel the
+        "Next best" panel reads (see its docstring next to the attribute) --
+        without the cache-write in `_rank_candidates`, the panel would see
+        `{}` forever while the state file goes on recording real cooldowns,
+        and would re-top a candidate the engine is still cooling down on."""
+        h = self._harness(temp_home)
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            {"probeCooldown": {"2": h.clock.now + PROBE_COOLDOWN_S - 1}},
+        )
+        h.tick_with_usage({
+            "1": _usage7(20, 20, _R_LATER),
+            "2": _usage7(10, 10),          # cooling down, skipped this tick
+            "3": _usage7(1, 1, _R_SOON),
+        })
+        assert h.engine._last_probe_cooldown.get("2") == (
+            h.clock.now + PROBE_COOLDOWN_S - 1
+        ), (
+            f"got {h.engine._last_probe_cooldown!r} — the engine's cached "
+            "view of state's probeCooldown must match what it just read"
+        )
+
     def test_landing_on_a_cooling_down_account_again_clears_its_cooldown(
         self, temp_home
     ):
@@ -5611,6 +5636,24 @@ class TestConsumeFirstProbesAnUnknownReset:
         assert cooldown.get("2") == h.clock.now + PROBE_COOLDOWN_S, (
             f"got {cooldown.get('2')!r} — a probe's own landing must not "
             "clear the cooldown it just wrote for the same account"
+        )
+
+    def test_the_cached_cooldown_is_refreshed_at_the_same_write(
+        self, temp_home
+    ):
+        """`_perform` writes `state["probeCooldown"]` directly -- and used
+        to leave `_last_probe_cooldown` (the panel's only view of it) stale
+        until the next tick's `_rank_candidates` reached its own refresh,
+        which a tick returning early on `_in_cooldown` may never do. The
+        panel then names a cooling-down account as its own next probe
+        target for as long as that early return holds."""
+        h = self._harness(temp_home)
+        h.engine._perform("2", "b@example.com", "probe", (90.0, float("inf")))
+        cooldown = h.state().get("probeCooldown", {})
+        assert h.engine._last_probe_cooldown == cooldown, (
+            f"got {h.engine._last_probe_cooldown!r}, state has {cooldown!r} "
+            "-- the cache must be refreshed at the same write, not only on "
+            "a later tick that reaches `_rank_candidates`"
         )
 
     def test_a_probe_switch_backs_off_under_the_concurrent_engine_cooldown(

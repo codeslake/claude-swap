@@ -1568,6 +1568,12 @@ class _ContendedFakeEngine:
         self.stopped = False
         self._stop = threading.Event()
         self._promote_requested = threading.Event()
+        # Mirrors _FakeEngine's `_last_probe_cooldown` -- the panel reads it
+        # off `self._engine` on every store-only snapshot, and a mount that
+        # reaches that read once this engine is live raised AttributeError
+        # (swallowed as a "Store refresh failed" worker notification,
+        # freezing the candidates panel on a stale render) until this line.
+        self._last_probe_cooldown: dict[str, float] = {}
         _ContendedFakeEngine.instances.append(self)
 
     def run_loop(self) -> int:

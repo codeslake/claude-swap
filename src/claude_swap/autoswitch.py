@@ -3447,6 +3447,13 @@ class AutoSwitchEngine:
             probe_cooldown.pop(number, None)
             if trigger == "probe":
                 probe_cooldown[number] = self.clock() + PROBE_COOLDOWN_S
+            # Refresh the panel's cache HERE too, not only on the next tick's
+            # `_rank_candidates` read: a hand switch (or any other trigger)
+            # that lands on a cooling-down account releases its cooldown on
+            # this same write, and a tick that returns early on `_in_cooldown`
+            # never reaches the other refresh -- leaving the panel naming a
+            # released account as still cooling down, or vice versa.
+            self._last_probe_cooldown = probe_cooldown
             atomic_write_json(self.state_path, state)
 
         warnings = list(result.get("warnings", []))
