@@ -1772,17 +1772,10 @@ class AutoSwitchEngine:
                 kw["current"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
-            # `_rank_candidates` reports its probe pick via `_last_probe_num`
-            # (a side channel, not the 4-tuple every caller including tests
-            # already unpacks) -- captured per call so a fallback to the
-            # barred result below restores the RIGHT one rather than the
-            # unbarred retry's, which runs after it and would otherwise win.
-            ranked_probe_num = self._last_probe_num
             if no_return is not None and not ranked[0] and recovered:
                 unbarred = self._rank_candidates(no_return=None, **kw)
                 if unbarred[0]:
                     return unbarred
-            self._last_probe_num = ranked_probe_num
             return ranked
 
         # The engine's own state, not a fresh read: two-phase commit re-ranks
@@ -2423,7 +2416,7 @@ class AutoSwitchEngine:
         # `consume-first` still do; those are untouched by this gate.
         left_for_reset = (
             settings.strategy == "dynamic"
-            and state.get("leftTrigger") in CONSUME_FIRST_STRATEGIES
+            and state.get("leftTrigger") in (*CONSUME_FIRST_STRATEGIES, "probe")
         )
         if h is not None:
             if active_headroom is not None:

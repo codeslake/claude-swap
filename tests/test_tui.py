@@ -598,6 +598,18 @@ class TestUsageRows:
         row = usage_rows(last_good, now)[0]
         assert "pace" not in row[2]
 
+    def test_seven_day_with_no_reported_reset_shows_reset_unknown(self):
+        """The card must name the gap, not go blank, when a probe candidate's
+        weekly reset has never been reported -- the visible half of the
+        unknown-reset feature (the decision log carries the other half)."""
+        from claude_swap.tui.widgets import usage_rows
+
+        now = time.time()
+        last_good = {"seven_day": {"pct": 10.0}}  # no resets_at at all
+        row = usage_rows(last_good, now)[0]
+        assert row[2] == "reset unknown", row
+        assert row[3] == "reset unknown", row
+
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
         # keeps 5h/7d clocks while the longer spend row falls back to its

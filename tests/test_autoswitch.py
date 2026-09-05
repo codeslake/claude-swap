@@ -4729,6 +4729,47 @@ class TestDynamicStrategy:
             "so re-measuring the same dominance is not an improvement"
         )
 
+    def test_fleet_churn_a_probe_departure_does_not_dominance_release(
+        self, temp_home
+    ):
+        """A `probe` departure is a consume-first admission of an
+        unknown-reset candidate, not a headroom-driven move — the same
+        reset-ordering shape `test_fleet_churn_a_reset_driven_departure_
+        does_not_dominance_release` covers for `leftTrigger in
+        CONSUME_FIRST_STRATEGIES`. `_left_account_recovered`'s dominance
+        leg must not re-admit the barred account on bare dominance alone
+        here either, or a probe departure re-arms the bar it was meant to
+        skip and the next tick can ping-pong straight back."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        state = {
+            "lastSwitchFrom": "5",
+            "leftHeadroom": 50.0,
+            "leftRecoveryAt": now + 50000,
+            "leftTrigger": "probe",
+        }
+        usage = {
+            "5": {
+                "five_hour": {"pct": 50.0, "resets_at": _iso_at(now + 50000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {
+                "five_hour": {"pct": 80.0, "resets_at": _iso_at(now + 90000)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"5": 50.0, "2": 20.0}
+        recovered_dynamic = h.engine._left_account_recovered(
+            state, usage, headroom, 20.0,
+            AutoSwitchSettings(threshold=90.0, strategy="dynamic"),
+            now, current="2",
+        )
+        assert recovered_dynamic is False, (
+            "dynamic must hold after a probe departure: #5 is "
+            "byte-identical to when we left it, so re-measuring the same "
+            "dominance is not an improvement"
+        )
+
     # -- the owner's live acceptance fixture, exact numbers ------------------
     #
     #   acct   5h    7d   Fable   note
@@ -5459,6 +5500,43 @@ class TestConsumeFirstProbesAnUnknownReset:
         assert sw.trigger == "probe"
         assert sw.to_ref == {"number": 4, "email": "d@example.com"}
 
+    def test_at_most_one_unknown_reset_candidate_enters_qualifying(
+        self, temp_home
+    ):
+        """The winner-is-4 assertion above holds even if BOTH unknown-reset
+        candidates were admitted (the sort puts 4 first on `-h` either way),
+        so it measures the tie-break, not the one-at-a-time bound. This
+        measures the bound directly: with two unknown-reset candidates, at
+        most one DISTINCT account is ever passed to `consume_first_rank_key`
+        with `probe=True` -- the two-phase commit re-ranks the same tick more
+        than once, so the same winning account can legitimately be probed
+        twice, but a second, DIFFERENT account must never also be probed."""
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(4, "d@example.com")
+        h.make_live("a@example.com", 1)
+        probed_accounts = set()
+        real_key = autoswitch_mod.consume_first_rank_key
+
+        def spy(usage, threshold, now, models=(), **kw):
+            if kw.get("probe"):
+                probed_accounts.add(json.dumps(usage, sort_keys=True))
+            return real_key(usage, threshold, now, models, **kw)
+
+        with patch.object(autoswitch_mod, "consume_first_rank_key", spy):
+            outcome = h.tick_with_usage({
+                "1": _usage7(20, 20, _R_LATER),
+                "2": _usage7(10, 10),   # unknown reset, 90 pts headroom
+                "4": _usage7(5, 5),     # unknown reset, 95 pts
+            })
+        assert outcome is TickOutcome.SWITCHED
+        assert len(probed_accounts) == 1, (
+            f"got {len(probed_accounts)} distinct probe-flagged candidates "
+            "admitted into qualifying, want exactly 1 — two unknown-reset "
+            "candidates must not both be admitted in the same decision"
+        )
+
     def test_a_probed_account_is_not_reprobed_within_its_cooldown(
         self, temp_home
     ):
@@ -5511,6 +5589,28 @@ class TestConsumeFirstProbesAnUnknownReset:
         assert h.active_number() == 2
         assert "2" not in h.state().get("probeCooldown", {}), (
             "landing on a cooling-down account again must clear its cooldown"
+        )
+
+    def test_a_probes_own_landing_does_not_clear_the_cooldown_it_just_wrote(
+        self, temp_home
+    ):
+        """`_perform` pops any standing cooldown for the account BEFORE
+        writing a fresh one for a `probe` trigger, in that order in the same
+        call — the release above and the set below it are not a race where
+        the probe's own release could wipe out its own write. Seed a stale
+        cooldown for #2, probe #2 again, and require the record left behind
+        is the FRESH one, not gone."""
+        h = self._harness(temp_home)
+        h.switcher._write_json(
+            h.switcher.backup_dir / "autoswitch_state.json",
+            {"probeCooldown": {"2": h.clock.now - 1}},  # already elapsed
+        )
+        h.engine._perform("2", "b@example.com", "probe", (90.0, float("inf")))
+        assert h.active_number() == 2
+        cooldown = h.state().get("probeCooldown", {})
+        assert cooldown.get("2") == h.clock.now + PROBE_COOLDOWN_S, (
+            f"got {cooldown.get('2')!r} — a probe's own landing must not "
+            "clear the cooldown it just wrote for the same account"
         )
 
     def test_probe_switch_names_the_slot_and_that_the_reset_is_unknown(
