@@ -642,6 +642,74 @@ def _seven_day_reset_unmeasured(usage: dict | str | None) -> bool:
     return _parse_reset_ts(window.get("resets_at")) is None
 
 
+def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
+    """Whether ``num``'s store entry is fresh enough to admit it as a probe
+    target — the SAME predicate ``_tick_inner``'s stale-usage gate uses
+    (``entry.fresh(now)``), read here BEFORE admission instead of after, so a
+    candidate this gate would refuse can never occupy the ``ordered`` slot
+    that gate itself aborts the whole tick on. ``entries=None`` (a caller
+    with no store-entry data, e.g. a direct unit-test call predating
+    probing, or a display) skips the gate rather than refusing every
+    candidate.
+    """
+    if entries is None:
+        return True
+    entry = entries.get(num)
+    return entry is not None and entry.fresh(now)
+
+
+def select_probe_target(
+    usage: dict[str, dict | str | None],
+    oauth_candidates: Sequence[str],
+    models: Sequence[str],
+    active_usage: dict | str | None,
+    probe_cooldown: dict[str, float] | None,
+    now: float,
+) -> str | None:
+    """Which account (if any) this fleet admits as this tick's probe
+    target: the readable candidate with the most headroom whose weekly
+    reset has never been reported, and which is not cooling down from a
+    previous probe.
+
+    ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
+    narrowed to candidates that cleared its own servability/no-return/
+    recovery-axis gates) to decide the switch; the "Next best" panel calls
+    it on the full candidate list to decide what to DISPLAY. Before this
+    function existed the panel had no notion of probing at all and ranked
+    every candidate with ``probe=False``, so an unknown-reset account read
+    its own absent reset as ``+inf`` (last) there while the engine ranks
+    the same candidate ``-inf`` (first) — the two could name different
+    accounts for the identical fleet. A single shared answer is the fix,
+    not a second, hand-matched copy of the predicate.
+
+    ``active_usage`` (the ACTIVE account's own decision value, not a
+    precomputed timestamp) so both callers can pass what they already have
+    on hand rather than importing this module's private reset-parsing
+    helper. Its weekly reset must be known — an account cannot be ranked on
+    a reset the strategy has refused to ever measure, on either side of the
+    comparison.
+    """
+    active_reset_ts = _seven_day_reset_ts(active_usage, now)
+    if active_reset_ts is None:
+        return None
+    probe_cooldown = probe_cooldown or {}
+    pool: list[tuple[float, str]] = []
+    for num in oauth_candidates:
+        value = usage.get(num)
+        h = oauth.account_headroom(value if isinstance(value, dict) else None, models)
+        if h is None:
+            continue
+        if not _seven_day_reset_unmeasured(value):
+            continue
+        if probe_cooldown.get(num, 0.0) > now:
+            continue
+        pool.append((h, num))
+    if not pool:
+        return None
+    _, num = max(pool, key=lambda t: t[0])
+    return num
+
+
 def consume_first_rank_key(
     usage: dict | str | None,
     threshold: float,
@@ -1782,7 +1850,19 @@ class AutoSwitchEngine:
         # on later usage but the same tick's cooldown record, so a probe
         # admitted provisionally and one re-verified on the escalated refetch
         # can never disagree about which account is in cooldown.
-        probe_cooldown = state.get("probeCooldown") or {}
+        #
+        # TYPE-GUARDED like every other state field this file reads back
+        # (`leftHeadroom`'s `isinstance(..., (int, float))`, the explicit
+        # `"leftHeadroom" not in state` probe): a non-dict survives
+        # `... or {}` unchanged when it is truthy (a non-empty list has no
+        # `.get`), and a dict with a non-numeric value (`{"2": null}`)
+        # passes but raises on the comparison below when that key is read.
+        raw_probe_cooldown = state.get("probeCooldown")
+        probe_cooldown = (
+            {k: v for k, v in raw_probe_cooldown.items() if isinstance(v, (int, float))}
+            if isinstance(raw_probe_cooldown, dict)
+            else {}
+        )
         decided_now = self.clock()
         ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
             trigger=trigger,
@@ -1795,6 +1875,7 @@ class AutoSwitchEngine:
             settings=settings,
             now=decided_now,
             probe_cooldown=probe_cooldown,
+            entries=entries,
         )
 
         if trigger in CONSUME_FIRST_STRATEGIES and ordered:
@@ -1831,6 +1912,7 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
                 probe_cooldown=probe_cooldown,
+                entries=entries,
             )
 
         if not ordered and api_key_candidates and trigger not in CONSUME_FIRST_STRATEGIES:
@@ -2456,6 +2538,7 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         probe_cooldown: dict[str, float] | None = None,
+        entries: dict | None = None,
     ) -> tuple[list[str], bool, float | None, bool]:
         """Rank on the configured model window, and once on 5h/7d alone if
         that leaves nothing.
@@ -2489,6 +2572,7 @@ class AutoSwitchEngine:
             settings=settings,
             now=now,
             probe_cooldown=probe_cooldown,
+            entries=entries,
         )
         # THE PRIMARY PASS RANKS ON `headroom`, WHICH IS ALWAYS MODEL-GATED —
         # so `active_headroom` here must be too, even under `dynamic` where
@@ -2544,6 +2628,7 @@ class AutoSwitchEngine:
         settings: AutoSwitchSettings,
         now: float,
         probe_cooldown: dict[str, float] | None = None,
+        entries: dict | None = None,
     ) -> tuple[list[str], bool, float | None, bool, str | None]:
         """Filter and rank OAuth candidates for this tick's trigger, on one
         window set (``models``).
@@ -2683,10 +2768,16 @@ class AutoSwitchEngine:
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
-        # Candidates otherwise eligible below but held for reset-unknown,
-        # with their headroom -- at most one is admitted, after the loop, so
-        # several unknown-reset peers in one tick never race each other in.
-        probe_pool: list[tuple[float, str]] = []
+        # Candidates otherwise eligible below but held for reset-unknown --
+        # `select_probe_target` (below, after the loop) picks at most one,
+        # so several unknown-reset peers in one tick never race each other
+        # in. Membership here already carries every filter this loop ran
+        # (servability, no-return, landing-health) PLUS freshness: a
+        # candidate served from a stale store entry must never enter —
+        # admitted `-inf`, it would sort first in `ordered` and the
+        # unchanged stale-usage gate in `_tick_inner` aborts the whole tick
+        # on the first candidate whose entry is not `fresh()`.
+        probe_candidates: list[str] = []
         probe_cooldown = probe_cooldown or {}
         any_known = False
         for num in oauth_candidates:
@@ -2892,22 +2983,19 @@ class AutoSwitchEngine:
                             # this branch's own base case; the escape axis
                             # keeps its existing behaviour untouched.
                             #
-                            # `_seven_day_reset_unmeasured`, NOT this `None`
-                            # directly: `reset_ts is None` also covers a
-                            # stale snapshot whose reset has since elapsed,
-                            # which is a fact already in hand, not a gap to
-                            # probe -- it refreshes on the account's ordinary
-                            # polling cadence with no need to activate it
-                            # (measured: without this, an elapsed-reset
-                            # candidate outranked one with a real soon reset,
-                            # the exact inversion the "past == unknown" rule
-                            # in `_seven_day_reset_ts` exists to prevent).
-                            if (
-                                not by_recovery_axis
-                                and _seven_day_reset_unmeasured(usage.get(num))
-                                and probe_cooldown.get(num, 0.0) <= now
+                            # `select_probe_target` re-applies
+                            # `_seven_day_reset_unmeasured` and the cooldown
+                            # (the same reset-vs-past distinction as the
+                            # comment this replaced, and the shared function
+                            # both this pass and the panel now call) --
+                            # membership here only needs the two conditions
+                            # that ARE this loop's own: not on the
+                            # recovery axis, and fresh enough to admit
+                            # without risking the stale-usage abort below.
+                            if not by_recovery_axis and _probe_source_fresh(
+                                entries, num, now
                             ):
-                                probe_pool.append((h, num))
+                                probe_candidates.append(num)
                             continue
                         if reset_ts >= active_reset_ts:
                             continue
@@ -3021,12 +3109,14 @@ class AutoSwitchEngine:
                     recovery_ts,
                 )
             qualifying.append((key, num))
-        # AT MOST ONE PROBE PER DECISION. Most headroom wins, same tie-break
-        # the key itself uses (`-h`) -- `max` keeps the first-seen winner on
-        # a tie, which is sequence order, so no extra rule is needed here.
-        probe_num: str | None = None
-        if probe_pool:
-            _, probe_num = max(probe_pool, key=lambda t: t[0])
+        # AT MOST ONE PROBE PER DECISION. `select_probe_target` picks the
+        # most headroom among `probe_candidates`, same tie-break the key
+        # itself uses (`-h`) -- the shared function this pass and the
+        # "Next best" panel both call, so neither re-derives the predicate.
+        probe_num = select_probe_target(
+            usage, probe_candidates, models, usage.get(current), probe_cooldown, now
+        )
+        if probe_num is not None:
             qualifying.append((
                 consume_first_rank_key(
                     usage.get(probe_num), settings.threshold, now, models, probe=True
@@ -3331,10 +3421,22 @@ class AutoSwitchEngine:
             # used" -- whatever cooldown a past probe of it left standing
             # has already done its job, so it is released unconditionally.
             # A probe switch then sets a fresh one, so the very next tick
-            # cannot pick the same still-unknown account right back out of
-            # `probe_pool` -- released early the same way if anything (a
-            # probe or otherwise) switches to it again before it elapses.
-            probe_cooldown = state.setdefault("probeCooldown", {})
+            # cannot pick the same still-unknown account right back out via
+            # `select_probe_target` -- released early the same way if
+            # anything (a probe or otherwise) switches to it again before
+            # it elapses.
+            #
+            # TYPE-GUARDED: `setdefault` returns the EXISTING value
+            # unchanged when the key is already present but the wrong shape
+            # (a list from a prior corrupt write), and `list.pop(number,
+            # None)` raises `TypeError` (lists only pop by index) — AFTER
+            # `switch_to` above already succeeded, leaving the account
+            # switched with no `lastSwitchAt`/`lastSwitchFrom`/`leftHeadroom`
+            # recorded at all. Replaced rather than trusted, like every
+            # other state field this method writes back.
+            if not isinstance(state.get("probeCooldown"), dict):
+                state["probeCooldown"] = {}
+            probe_cooldown = state["probeCooldown"]
             probe_cooldown.pop(number, None)
             if trigger == "probe":
                 probe_cooldown[number] = self.clock() + PROBE_COOLDOWN_S

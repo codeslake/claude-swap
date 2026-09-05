@@ -2658,6 +2658,70 @@ class TestUnswitchableRowsAreListed:
             f"panel out:\n{rendered}"
         )
 
+    def test_the_panel_top_agrees_with_the_engine_on_an_unknown_reset_candidate(
+        self, temp_home
+    ):
+        """`consume_first_rank_key` used to be called with no `probe` flag and
+        no knowledge of the probe target, so an unknown-reset candidate read
+        its own absent reset as `+inf` (sorted last) here while the engine
+        ranks the SAME candidate `-inf` (first) once it admits it as a probe
+        — `consume_first_rank_key`'s own docstring: "a display built from
+        this key can never disagree with the account the engine would switch
+        to." Same fleet as `TestConsumeFirstProbesAnUnknownReset
+        .test_admits_the_unknown_reset_candidate_ahead_of_a_known_soon_reset`.
+        """
+        from tests.test_autoswitch import EngineHarness, _iso_at
+        from claude_swap.autoswitch import TickOutcome
+        from claude_swap.settings import AutoSwitchSettings
+
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@x.invalid")
+        h.seed(2, "b@x.invalid")
+        h.seed(3, "c@x.invalid")
+        h.make_live("a@x.invalid", 1)
+
+        # Anchored to REAL wall-clock time, not the engine harness's
+        # `FakeClock` (which starts near epoch 1_000_000): the panel reads
+        # `time.time()` directly, and a fixed past ISO date would read as
+        # "reset already elapsed" (== unknown) there while the harness's own
+        # far-future-relative `now` still sees it as a real future reset —
+        # masking exactly the disagreement this test exists to catch.
+        real_now = time.time()
+        later = _iso_at(real_now + 8 * 86400)
+        soon = _iso_at(real_now + 5 * 86400)
+
+        def w7(five_h, seven_d, reset=None):
+            seven: dict = {"pct": seven_d}
+            if reset:
+                seven["resets_at"] = reset
+            return {"five_hour": {"pct": five_h}, "seven_day": seven}
+
+        fleet = {
+            "1": w7(20, 20, later),  # active, known reset
+            "2": w7(10, 10),         # UNKNOWN reset -- never probed
+            "3": w7(10, 10, soon),   # known, soonest of the KNOWN
+        }
+        out = h.tick_with_usage(fleet)
+        assert out is TickOutcome.SWITCHED, f"expected a switch, got {out}"
+        engine_pick = str(h.active_number())
+        assert engine_pick == "2", (
+            f"harness precondition: expected the probe (2), got {engine_pick}"
+        )
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, last_good=fleet["1"]),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=fleet["2"]),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=fleet["3"]),
+        ), active="1", settings=settings)
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == engine_pick, (
+            f"panel top={panel_top!r}, engine picked {engine_pick!r} — "
+            f"panel out:\n{rendered}"
+        )
+
 
 @pytest.mark.asyncio
 class TestNeedsLoginIsReported:
