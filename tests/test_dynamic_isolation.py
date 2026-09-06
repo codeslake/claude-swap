@@ -42,6 +42,13 @@ _GOLDEN = {
     ("consume-first", "Fable"): "4a4bc2fffb074934516f616dd246906b98960da4e06b8550cfaceaf0af8751d7",
 }
 
+# For `test_dynamic_actually_moved_from_the_base_revision` only: `_SEED`'s
+# fleet does NOT reach the drain tier differently between `_BASE_REV` and
+# HEAD (measured: identical digest both sides), which would make that
+# control vacuous. Found by sweeping seeds 1-59 for one whose dynamic/Fable
+# trace actually differs.
+_DYNAMIC_SEED = 5
+
 
 def _random_fleet(seed: int, now: float, n: int = 5) -> dict:
     rng = random.Random(seed)
@@ -168,7 +175,14 @@ class TestDynamicLeavesTheBaseRevisionAlone:
     Windows job has no shell-out to it.
     """
 
-    def test_e9afe401_produces_the_same_four_digests(self, tmp_path):
+    @staticmethod
+    def _digests_at_base_rev(tmp_path, combos, seed):
+        """`{"strategy|model": digest}` computed against `_BASE_REV`, in a
+        subprocess (a different `claude_swap` package must not share
+        `sys.modules` with this process). Shared by every test in this
+        class so each one states only WHICH combos it needs and what it
+        expects of them.
+        """
         repo_root = Path(__file__).resolve().parents[1]
         probe = subprocess.run(
             ["git", "-C", str(repo_root), "cat-file", "-e", f"{_BASE_REV}^{{commit}}"],
@@ -183,17 +197,18 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         )
         with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
             tf.extractall(old_root, filter="data")  # trusted: our own repo's history
+        combos_literal = json.dumps(list(combos))
         driver = (
             "import sys, json\n"
             f"sys.path.insert(0, {str(old_root)!r})\n"
             f"sys.path.insert(0, {str(old_root / 'src')!r})\n"
             f"sys.path.insert(0, {str(tmp_path)!r})\n"  # this module's own dir, for _run_trace
-            "from test_dynamic_isolation import _run_trace, _GOLDEN\n"
+            "from test_dynamic_isolation import _run_trace\n"
             "from pathlib import Path\n"
             "import hashlib, json as _json\n"
             "import claude_swap\n"
             "out = {'_claude_swap_file': claude_swap.__file__}\n"
-            "for i, (strategy, model) in enumerate(_GOLDEN):\n"
+            f"for i, (strategy, model) in enumerate({combos_literal}):\n"
             "    trace = _run_trace(Path(sys.argv[1]) / f'b{i}', strategy, model, int(sys.argv[2]))\n"
             "    out[f'{strategy}|{model}'] = hashlib.sha256("
             "_json.dumps(trace, sort_keys=True).encode()).hexdigest()\n"
@@ -207,7 +222,7 @@ class TestDynamicLeavesTheBaseRevisionAlone:
         runs_dir = tmp_path / "runs"
         runs_dir.mkdir()
         result = subprocess.run(
-            [sys.executable, str(driver_path), str(runs_dir), str(_SEED)],
+            [sys.executable, str(driver_path), str(runs_dir), str(seed)],
             capture_output=True, text=True, cwd=str(old_root),
         )
         assert result.returncode == 0, (
@@ -227,6 +242,10 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             "this test compared HEAD against itself, not against "
             f"{_BASE_REV}"
         )
+        return got
+
+    def test_e9afe401_produces_the_same_four_digests(self, tmp_path):
+        got = self._digests_at_base_rev(tmp_path, _GOLDEN.keys(), _SEED)
         for (strategy, model), golden in _GOLDEN.items():
             key = f"{strategy}|{model}"
             assert got[key] == golden, (
@@ -234,3 +253,30 @@ class TestDynamicLeavesTheBaseRevisionAlone:
                 f"{got[key]}, HEAD gives {golden} — this round moved "
                 "behaviour this strategy never authorized"
             )
+
+    def test_dynamic_actually_moved_from_the_base_revision(self, tmp_path):
+        """The four `best`/`consume-first` combos above passing is equally
+        consistent with "dynamic's bar correctly reaches neither strategy"
+        and with "the seed-2 fleet never reaches any line this branch
+        changed" — a negative guaranteed by construction either way, and
+        the mutant control (`test_mutant_control_moves_every_digest`)
+        cannot close it either: it inverts `oauth.account_headroom`, which
+        every strategy reads every tick, so it proves sensitivity to
+        ranking inputs in general, not that the drain tier is ever
+        entered. This is the control: `("dynamic", "Fable")` must DIFFER
+        between `_BASE_REV` and HEAD, on `_DYNAMIC_SEED`'s fleet — proving
+        the fixture actually reaches the new code at all. `_SEED` itself
+        was tried first and measured NOT to discriminate here (identical
+        digest both sides) — reported rather than adjusting the
+        assertion; `_DYNAMIC_SEED` was found by sweeping for one that
+        does."""
+        got = self._digests_at_base_rev(
+            tmp_path, [("dynamic", "Fable")], _DYNAMIC_SEED
+        )
+        base_digest = got["dynamic|Fable"]
+        head_digest = _digest(tmp_path / "head", "dynamic", "Fable", _DYNAMIC_SEED)
+        assert base_digest != head_digest, (
+            f"got the same digest ({head_digest}) on both {_BASE_REV} and "
+            "HEAD for dynamic/Fable — the fleet never reached the new "
+            "code, and this whole module proves nothing about it"
+        )

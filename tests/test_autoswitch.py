@@ -5293,6 +5293,48 @@ class TestDynamicDrainBarLiveness:
             "the engine must move to #6's real headroom"
         )
 
+    def test_a_tie_between_five_hour_and_weekly_counts_as_binding(self, temp_home):
+        """At 5h 90 / 7d 90 every point spent is weekly quota — a tie must
+        count as the seven-day window binding, not fall to whichever label
+        `relevant_windows` happens to append first (5h). Not measure-zero:
+        a draining account's 5h climbs THROUGH its 7d by construction and
+        lands on equality on the way."""
+        h = self._harness(temp_home)
+        fleet = self._land_on_2(h)
+        fleet["2"]["five_hour"]["pct"] = 90.0  # ties #2's own 7d (90)
+        n0 = len(h.events)
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a tie between 5h and 7d must count as the "
+            "weekly window binding; the drain hold must still apply"
+        )
+        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"], (
+            f"got {reasons} — must hold via the drain bar specifically"
+        )
+
+    def test_a_pinned_model_binding_does_not_release_the_hold(self, temp_home):
+        """A pinned model's window climbing above the weekly one must NOT
+        release the hold — that is exactly the departure
+        `_dynamic_active_headroom` exists to prevent for the account
+        `dynamic` deliberately chose to sit on. On the ADR's own observed
+        fleet (Fable 91-94 against 7d 62-69) a model-gated binding check
+        would hold for one tick and then depart on almost every draining
+        account; this is the shape that regression guards against."""
+        h = self._harness(temp_home)
+        fleet = self._land_on_2(h)
+        fleet["2"]["scoped"][0]["pct"] = 95.0  # Fable climbs above #2's own 7d (90)
+        n0 = len(h.events)
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a pinned model binding must not release the "
+            "drain hold; only the weekly window's own binding status may"
+        )
+        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"], (
+            f"got {reasons} — must hold via the drain bar specifically"
+        )
+
 
 class TestDynamicDrainStateResumesAfterRestart:
     """`state["draining"]` rides the persisted `autoswitch_state.json`, so a

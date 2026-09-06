@@ -1662,16 +1662,30 @@ class AutoSwitchEngine:
             # leaving abandons nothing and the account is simply re-picked
             # once its 5h refills and the weekly is still in band. A model
             # window binding is a different subject entirely (#321's own),
-            # not this hold's to override. `> 0`, not a headroom floor: an
-            # `> SPENT_HEADROOM_PCT` bar was tried and measured wrong — the
-            # reported fleet (5h 95 / 7d 90, folded headroom 5) sits ABOVE
-            # 3.0 and stayed held regardless of the constant; only the
-            # BINDING WINDOW answers it, at any headroom down to the wall
-            # (7d 99 / 5h 10, headroom 1, DOES hold — that last point is the
-            # quota being drained, and `h <= 0` takes it from there).
-            windows = oauth.relevant_windows(usage.get(current), self._models)
-            seven_day_binds = (
-                bool(windows) and max(windows, key=lambda w: w[1])[0] == "7d"
+            # not this hold's to override. `()`, never `self._models`: a
+            # pinned model binding must NOT release this hold — that is
+            # exactly the departure `_dynamic_active_headroom` (above)
+            # exists to prevent for the account dynamic deliberately chose
+            # to sit on, and on the ADR's own observed fleet the model
+            # window sits ABOVE 7d on the normal case, not a corner, so
+            # gating on the model-included set held for one tick and then
+            # departed on almost every draining account. `> 0`, not a
+            # headroom floor: an `> SPENT_HEADROOM_PCT` bar was tried and
+            # measured wrong — the reported fleet (5h 95 / 7d 90, folded
+            # headroom 5) sits ABOVE 3.0 and stayed held regardless of the
+            # constant; only the BINDING WINDOW answers it, at any headroom
+            # down to the wall (7d 99 / 5h 10, headroom 1, DOES hold — that
+            # last point is the quota being drained, and `h <= 0` takes it
+            # from there). TIES COUNT AS BINDING: `max()` alone returns the
+            # FIRST tied window (`relevant_windows` appends 5h before 7d),
+            # an accident of append order — at 5h 90 / 7d 90 every point
+            # spent is weekly quota, and a drained account's 5h climbs
+            # THROUGH its 7d by construction, landing on equality on the
+            # way, not a measure-zero case.
+            windows = oauth.relevant_windows(usage.get(current), ())
+            seven_day_binds = bool(windows) and any(
+                label == "7d" and pct == max(w[1] for w in windows)
+                for label, pct, _ in windows
             )
             departure_pct = settings.threshold
             if (
