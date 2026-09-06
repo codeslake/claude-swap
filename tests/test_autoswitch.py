@@ -4478,17 +4478,20 @@ class TestDynamicStrategy:
     ):
         """Below the threshold (the `dynamic`/`consume-first` trigger), a
         candidate whose weekly window resets sooner than the active's is
-        still not a landing if it has no room at all: `#2` resets sooner
-        (`_R_SOON` < `_R_LATEST`) but sits at 95% on its 5-hour window. The
-        landing bar runs before the reset-ordering filter for every
-        strategy that reaches this trigger, so this arm never needed a
-        `dynamic`-only change — this pins that it still holds."""
+        still not a landing if it has NO room at all (headroom 0, at the
+        drain bar too — `#2` sits at 100% on its 5-hour window). DRAIN
+        STATE (see `_pick_drain_candidate`) deliberately widens this arm
+        for the one soonest-resetting candidate genuinely BETWEEN the
+        ordinary threshold and the drain bar when nothing else is
+        available — this pins the floor under that: a candidate with
+        nothing left, past the drain bar as well, must never land no
+        matter how soon its reset is."""
         h = EngineHarness(temp_home, strategy="dynamic")
         usage = {
-            "1": _usage7(10.0, 20.0, _R_LATEST),   # active: headroom 90
-            "2": _usage7(95.0, 5.0, _R_SOON),      # headroom 5, resets sooner
+            "1": _usage7(10.0, 20.0, _R_LATEST),    # active: headroom 90
+            "2": _usage7(100.0, 5.0, _R_SOON),      # headroom 0, resets sooner
         }
-        headroom = {"1": 90.0, "2": 5.0}
+        headroom = {"1": 90.0, "2": 0.0}
         args = self._args(
             h, usage=usage, current="1", oauth_candidates=["2"],
             headroom=headroom, active_headroom=90.0,
@@ -4496,8 +4499,9 @@ class TestDynamicStrategy:
         )
         ordered, _, _, _ = h.engine._rank_candidates(**args)
         assert ordered == [], (
-            f"got {ordered} — #2 has no room (headroom 5, threshold 90) and "
-            "must never be a landing no matter how soon its reset is"
+            f"got {ordered} — #2 has no room (headroom 0, past the drain "
+            "bar too) and must never be a landing no matter how soon its "
+            "reset is"
         )
 
     def test_the_proactive_arm_never_lands_on_a_candidate_still_at_the_wall(
@@ -4974,6 +4978,399 @@ class TestDynamicStrategy:
             f"landed on {h.active_number()} instead of account 3 — the "
             "soonest-resetting healthy candidate, not the one that merely "
             "cleared a hysteresis bar mixed across two window bases"
+        )
+
+
+class TestDynamicAdmitsACandidateBeyondTheOrdinaryThreshold:
+    """``dynamic``'s whole point is spending a window to 100%, so its
+    candidate-admission bar must not be ``settings.threshold`` — the same
+    number that decides when the ACTIVE account leaves. Reproduces a live
+    fleet: the active is nowhere near blocked (dynamic trigger, below
+    threshold), and both other accounts sit exactly at the ordinary
+    threshold with real headroom past it — the landing gate must not read
+    that as "full" when the strategy is dynamic.
+    """
+
+    @staticmethod
+    def _acct(h, five_h, seven_d, fable, hours_out):
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {
+                "pct": seven_d,
+                "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+            },
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    def test_lands_on_the_soonest_resetting_account_with_real_headroom(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home, model="Fable", threshold=90.0, strategy="dynamic",
+        )
+        h.seed(6, "acct6@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(1, "acct1@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+
+        usage_map = {
+            "6": self._acct(h, 61, 52, 37, 72),  # active, resets last
+            "2": self._acct(h, 0, 90, 78, 24),   # at the ordinary bar, resets soonest
+            "1": self._acct(h, 90, 63, 50, 48),  # at the ordinary bar, resets middle
+        }
+        outcome = h.tick_with_usage(usage_map)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — dynamic's whole purpose is spending a window "
+            "to 100%; a candidate at 90% utilization with 10 points of real "
+            "headroom left must be admitted, not read as 'full' at the same "
+            "bar the ACTIVE leaves at"
+        )
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — of the two candidates past "
+            "the ordinary threshold, #2 resets soonest and must win"
+        )
+
+
+class TestDynamicDrainStateDoesNotRotate:
+    """Widening the landing bar alone (`_admit_pct`) is not a fix: the admit
+    bar and the departure bar (`settings.threshold`) are two functions of one
+    axis with no gap between them, so any account landed on with utilization
+    in ``[threshold, DYNAMIC_ADMIT_PCT)`` is simultaneously a valid landing
+    AND immediately departure-eligible next tick — a 3+ account ROTATION
+    (measured: 48 switches in 48 ticks on a synthetic 6-account fleet),
+    which the one-hop no-return bar cannot catch by construction (it only
+    refuses a return to the IMMEDIATELY prior account).
+
+    DRAIN STATE closes the gap for exactly the one account `dynamic`
+    deliberately lands on past the ordinary threshold: `_perform` marks it
+    `draining` (`state["draining"]`/`state["drainingResetAt"]`), and while
+    that holds `_tick_inner`'s departure gate uses the SAME widened bar the
+    landing gate admitted it at, so admit and depart agree for that one
+    account and disagree for nobody else.
+
+    Six accounts, real weekly-reset ORDER (synthetic relative offsets, never
+    real timestamps — ORIGIN IS PUBLIC): `2 < 1 < 6 < 5 < 4 < 3`. `#2`/`#1`/
+    `#4` sit exactly at the ordinary bar (headroom 10, the shape that used to
+    flap); `#5` is genuinely healthy (headroom 69) — the ordinary "proactive"
+    escape's real pick when the active is itself near its own wall; `#3` is
+    nearly fully spent (headroom 1) and never a target either way.
+    """
+
+    _RESET_HOURS = {"2": 24, "1": 48, "6": 72, "5": 96, "4": 120, "3": 240}
+
+    @classmethod
+    def _peer(cls, h, num, five, seven, fable):
+        return {
+            "five_hour": {"pct": five},
+            "seven_day": {
+                "pct": seven,
+                "resets_at": _iso_at(h.clock.now + cls._RESET_HOURS[num] * 3600),
+            },
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    @classmethod
+    def _fleet(cls, h, active_util):
+        """`active_util` is #6's own utilization — below the ordinary
+        threshold (healthy, "dynamic" trigger) or above it ("proactive")."""
+        fleet = {
+            "6": cls._peer(h, "6", active_util, 40.0, 30.0),
+            "2": cls._peer(h, "2", 0.0, 90.0, 78.0),    # at the bar, resets soonest
+            "1": cls._peer(h, "1", 90.0, 63.0, 50.0),   # at the bar
+            "5": cls._peer(h, "5", 31.0, 20.0, 20.0),   # genuinely healthy
+            "4": cls._peer(h, "4", 20.0, 90.0, 55.0),   # at the bar
+            "3": cls._peer(h, "3", 99.0, 95.0, 90.0),   # nearly fully spent
+        }
+        return fleet
+
+    def _harness(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num in self._RESET_HOURS:
+            h.seed(int(num), f"acct{num}@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+        return h
+
+    @staticmethod
+    def _run(h, fleet, ticks=24):
+        switches = 0
+        trace = []
+        for _ in range(ticks):
+            outcome = h.tick_with_usage(fleet)
+            if outcome is TickOutcome.SWITCHED:
+                switches += 1
+            trace.append(h.active_number())
+            h.clock.advance(300.0)
+        return switches, trace
+
+    def test_healthy_active_lands_once_and_holds(self, temp_home):
+        """#6 starts well below the threshold (52% used, "dynamic" trigger)."""
+        h = self._harness(temp_home)
+        fleet = self._fleet(h, active_util=52.0)
+        switches, trace = self._run(h, fleet)
+        assert switches == 1, (
+            f"got {switches} switches, trace {trace} — DRAIN STATE must "
+            "hold the account it lands on past the ordinary threshold, "
+            "not rotate through every other at-bar candidate"
+        )
+        assert h.active_number() == 2, (
+            f"ended on {h.active_number()} — must park on #2"
+        )
+
+    def test_near_limit_active_takes_the_extra_hop_and_holds(self, temp_home):
+        """#6 starts ITSELF over the ordinary threshold (94% used) — the
+        departure classifies `proactive`, which ranks by headroom and picks
+        the genuinely healthy #5 first; only from #5 does the widened
+        landing gate reach #2. One extra hop, not a bug — the brief this
+        round replaced explicitly says so."""
+        h = self._harness(temp_home)
+        fleet = self._fleet(h, active_util=94.0)
+        switches, trace = self._run(h, fleet)
+        assert switches == 2, (
+            f"got {switches} switches, trace {trace} — expected exactly "
+            "one proactive hop (6->5) then one dynamic landing (5->2), "
+            "then held"
+        )
+        assert trace[-1] == 2, f"ended on {trace[-1]} — must park on #2"
+
+    def test_mutant_suppressing_the_drain_mark_reopens_the_rotation(
+        self, temp_home, monkeypatch
+    ):
+        """Not a vacuous pin: seam 3 (`_perform` writing `state["draining"]`)
+        is what this test protects. Suppressing it must reopen the
+        rotation the healthy-active case above holds against."""
+        import claude_swap.autoswitch as autoswitch
+
+        real_read_state = autoswitch.AutoSwitchEngine._read_state
+
+        def stripped(self):
+            state = real_read_state(self)
+            state.pop("draining", None)
+            state.pop("drainingResetAt", None)
+            return state
+
+        monkeypatch.setattr(autoswitch.AutoSwitchEngine, "_read_state", stripped)
+        h = self._harness(temp_home)
+        fleet = self._fleet(h, active_util=52.0)
+        switches, trace = self._run(h, fleet)
+        assert switches > 1, (
+            f"got {switches} switches, trace {trace} — suppressing the "
+            "drain mark must reopen the rotation (measured elsewhere: "
+            "1 -> 24 on a comparable fleet)"
+        )
+
+
+class TestDynamicDrainBarLiveness:
+    """The departure gate's widened bar is a LOCAL value computed once per
+    tick — a silent fallback to the ordinary bar (a swallowed exception, a
+    typo'd condition) produces a plausible-looking trace with the real
+    mechanism dead. These assert the OUTCOME can only be explained by the
+    intended bar, not by coincidence.
+    """
+
+    _RESET_HOURS = TestDynamicDrainStateDoesNotRotate._RESET_HOURS
+    _peer = TestDynamicDrainStateDoesNotRotate._peer
+
+    def _harness(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        h.seed(6, "acct6@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(1, "acct1@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+        return h
+
+    def _land_on_2(self, h):
+        """Drives the healthy-active landing (6->2) so #2 carries
+        `state["draining"]` for the assertions below."""
+        fleet = {
+            "6": self._peer(h, "6", 52.0, 40.0, 30.0),
+            "2": self._peer(h, "2", 0.0, 90.0, 78.0),
+            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2
+        h.clock.advance(300.0)  # clear cooldown before the next tick
+        return fleet
+
+    def test_a_draining_account_between_the_two_bars_is_not_departed(
+        self, temp_home
+    ):
+        """95% is >= the ordinary threshold (90) and < the drain bar
+        (99.9). If the departure gate silently used `settings.threshold`
+        instead of the drain bar, this would depart (`proactive`); it must
+        not, and the reason must name the branch that actually held it."""
+        h = self._harness(temp_home)
+        fleet = self._land_on_2(h)
+        fleet["2"]["seven_day"]["pct"] = 95.0
+        n0 = len(h.events)
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a draining account at 95% must not be read "
+            "as departure-eligible against the ordinary 90% bar"
+        )
+        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"], (
+            f"got {reasons} — must hold via the dynamic (below-drain-bar) "
+            "branch, not some other accidental NO_ACTION"
+        )
+
+    def test_active_headroom_at_zero_clears_the_drain_bar(self, temp_home):
+        """Fully spent (100% used, headroom 0) must escape via `at-limit`,
+        never wait on a drain bar nothing can still satisfy."""
+        h = self._harness(temp_home)
+        fleet = self._land_on_2(h)
+        fleet["2"]["seven_day"]["pct"] = 100.0
+        n0 = len(h.events)
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a fully spent draining account must escape"
+        )
+        sw = next(e for e in h.events[n0:] if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit", (
+            f"got trigger={sw.trigger!r} — headroom 0 must clear the drain "
+            "bar and classify at-limit, not stay pinned on a bar nothing "
+            "can satisfy"
+        )
+
+    def test_the_reset_deadline_clears_the_drain_bar(self, temp_home):
+        """95% (between the two bars) held while draining; once #2's OWN
+        weekly reset — the fact that made it a drain candidate — passes,
+        the ordinary bar must apply again and depart it, with nothing else
+        about the fleet having changed."""
+        h = self._harness(temp_home)
+        fleet = self._land_on_2(h)
+        fleet["2"]["seven_day"]["pct"] = 95.0
+        # Still holds before the deadline (same assertion as above, briefer).
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.NO_ACTION
+        # Past #2's own reset (it was +24h from the harness's start; the
+        # landing tick has already advanced the clock once via tick_with_
+        # usage's caller convention — advance well past it either way).
+        h.clock.advance(25 * 3600.0)
+        n0 = len(h.events)
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — past its own reset the drain bar must clear "
+            "and the ordinary 90% bar must depart a still-95%-used account"
+        )
+
+
+class TestDynamicDrainStateResumesAfterRestart:
+    """`state["draining"]` rides the persisted `autoswitch_state.json`, so a
+    second engine reading the SAME file (a TUI restart mid-drain) must
+    resume holding the drain bar, not silently drop back to the ordinary
+    one because the mark lived only in the first engine's memory."""
+
+    def test_a_fresh_engine_over_the_same_state_resumes_the_drain(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        h.seed(6, "acct6@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(1, "acct1@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+        peer = TestDynamicDrainStateDoesNotRotate._peer
+        fleet = {
+            "6": peer(h, "6", 52.0, 40.0, 30.0),
+            "2": peer(h, "2", 0.0, 90.0, 78.0),
+            "1": peer(h, "1", 90.0, 63.0, 50.0),
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2
+        assert h.state().get("draining") == "2", "the first engine must persist the mark"
+
+        fleet["2"]["seven_day"]["pct"] = 95.0
+        fresh = h._make_engine()
+        with patch.object(h.switcher, "usage_entries_by_account", return_value={
+            num: _entry_for(value, h.clock.now) for num, value in fleet.items()
+        }):
+            outcome = fresh.tick()
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a fresh engine reading the same state file "
+            "must resume holding #2's drain bar, not depart it at 95% "
+            "against a freshly-forgotten ordinary bar"
+        )
+
+
+class TestDrainCandidateIsScopedToExactlyOne:
+    """`_pick_drain_candidate` must never widen the bar for more than the
+    single soonest-resetting in-band account — the whole safety property
+    (every OTHER blocked candidate keeps its ordinary ~10-point margin)
+    depends on scoping to exactly one."""
+
+    def test_the_soonest_resetting_in_band_account_wins_the_argmin(
+        self, temp_home
+    ):
+        """LBAD control: the picked candidate must always equal an
+        INDEPENDENTLY recomputed argmin over reset time — never a
+        runner-up. Multiple in-band candidates, distinct resets, active
+        healthy: only the true minimum may ever be returned."""
+        now = 1_000_000.0
+        active_reset = now + 500 * 3600  # far out; every candidate is sooner
+        candidates = {
+            "2": (10.0, now + 24 * 3600),   # in-band, soonest
+            "4": (10.0, now + 48 * 3600),   # in-band, later
+            "5": (10.0, now + 12 * 3600),   # in-band, EVEN sooner than #2
+            "1": (69.0, now + 6 * 3600),    # healthy — not in-band at all
+        }
+        headroom = {num: h for num, (h, _) in candidates.items()}
+        usage = {
+            num: {"seven_day": {"pct": 100.0 - h, "resets_at": _iso_at(ts)}}
+            for num, (h, ts) in candidates.items()
+        }
+        usage["6"] = {"seven_day": {"pct": 20.0, "resets_at": _iso_at(active_reset)}}
+        settings = AutoSwitchSettings(threshold=90.0, strategy="dynamic")
+
+        from claude_swap.autoswitch import _pick_drain_candidate
+
+        got = _pick_drain_candidate(
+            list(candidates), headroom, usage, "6", settings, now
+        )
+        # Independently recomputed reference: the in-band candidate (util
+        # in [threshold, DYNAMIC_ADMIT_PCT)) with the minimum reset_ts,
+        # written from scratch rather than calling the function under test.
+        in_band = [
+            num for num, (h, _) in candidates.items()
+            if 90.0 <= 100.0 - h < 99.9
+        ]
+        reference = min(in_band, key=lambda num: candidates[num][1])
+        assert got == reference == "5", (
+            f"got {got}, independently-recomputed argmin {reference} — a "
+            "candidate other than the true soonest-resetting minimum must "
+            "never be widened (LBAD: bar widened for a non-argmin candidate)"
+        )
+
+    def test_two_accounts_in_band_only_the_sooner_resetting_lands(
+        self, temp_home
+    ):
+        """#2 and #4 both sit exactly at the ordinary bar (headroom 10);
+        #2 resets sooner. #4 must stay excluded even though it is ALSO
+        in-band, and every account's headroom except the drained one
+        (#2) must still read >= 10 at the moment of departure — the
+        safety property draining exactly one exists to buy."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        h.seed(6, "acct6@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(4, "acct4@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+        peer = TestDynamicDrainStateDoesNotRotate._peer
+        fleet = {
+            "6": peer(h, "6", 52.0, 40.0, 30.0),
+            "2": peer(h, "2", 0.0, 90.0, 78.0),   # in-band, resets soonest
+            "4": peer(h, "4", 20.0, 90.0, 55.0),  # in-band, resets later
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2, (
+            f"got {outcome}, active {h.active_number()} — the sooner-"
+            "resetting in-band account must be the one drained"
+        )
+        assert h.state().get("draining") == "2", "must mark #2, not #4"
+
+        headroom_at_departure = {
+            num: oauth.account_headroom(usage, ("Fable",))
+            for num, usage in fleet.items()
+            if num != "2"
+        }
+        assert min(headroom_at_departure.values()) >= 10.0, (
+            f"got {headroom_at_departure} — every non-drained account must "
+            "keep its ordinary ~10-point margin"
         )
 
 
