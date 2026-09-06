@@ -170,17 +170,6 @@ CONSUME_FIRST_STRATEGIES = ("consume-first", "dynamic")
 DYNAMIC_ADMIT_PCT = 99.9
 
 
-def _admit_pct(settings: "AutoSwitchSettings") -> float:
-    """The widened (drain) bar `dynamic` may admit its ONE drain candidate
-    at; every other strategy (and every other `dynamic` candidate) keeps
-    `settings.threshold` exactly as before. One helper so the landing gate
-    (`_rank_candidates_pass`'s per-candidate exclusion), the drain-candidate
-    picker (`_pick_drain_candidate`) and the departure gate
-    (`AutoSwitchEngine._tick_inner`) cannot read two different bars for the
-    same decision."""
-    return DYNAMIC_ADMIT_PCT if settings.strategy == "dynamic" else settings.threshold
-
-
 def _pick_drain_candidate(
     oauth_candidates: list[str],
     headroom: dict[str, float | None],
@@ -191,7 +180,8 @@ def _pick_drain_candidate(
 ) -> str | None:
     """The single account (``dynamic`` only) to give the widened admission
     bar: the SOONEST-resetting candidate otherwise blocked strictly between
-    the ordinary threshold and the drain bar (``_admit_pct``).
+    the ordinary threshold and the drain bar (``DYNAMIC_ADMIT_PCT`` — the
+    caller only reaches this for ``strategy == "dynamic"``).
 
     Called by ``_rank_candidates`` ONLY after BOTH the ordinary primary
     (model-gated) and model-dropped retry passes come up completely empty —
@@ -216,7 +206,6 @@ def _pick_drain_candidate(
     ordinary bar with its ~10-point margin intact — that margin is the
     whole safety property this function exists to buy.
     """
-    admit_pct = _admit_pct(settings)
     active_reset_ts = _seven_day_reset_ts(usage.get(current), now)
     best_reset = None
     drain_candidate = None
@@ -225,7 +214,7 @@ def _pick_drain_candidate(
         if ch is None:
             continue
         cu = 100.0 - ch
-        if not (settings.threshold <= cu < admit_pct):
+        if not (settings.threshold <= cu < DYNAMIC_ADMIT_PCT):
             continue  # not in the band only the wider bar reaches
         reset_ts = _seven_day_reset_ts(usage.get(cand), now)
         # Must reset strictly sooner than the account we are ON — the same
@@ -424,13 +413,6 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
-    # The candidate-admission bar (`_admit_pct`) — `dynamic`'s own under
-    # that strategy, `threshold` for everyone else. `None` (pre-upgrade
-    # callers, direct test construction) falls back to `threshold`, the
-    # behaviour before this field existed. Additive field: separate from
-    # `threshold`, which still names when the ACTIVE leaves and must not
-    # change meaning for `best`/`consume-first`.
-    admit: float | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -451,8 +433,7 @@ class PollEvent(AutoSwitchEvent):
             # WHAT actually blocks this candidate — a full 5h/7d block, or
             # only its pinned model's window (which the engine's fallback in
             # `_rank_candidates` can rank around; see `classify_candidate_block`).
-            admit_pct = self.admit if self.admit is not None else self.threshold
-            kind, model = classify_candidate_block(wins.items(), admit_pct)
+            kind, model = classify_candidate_block(wins.items(), self.threshold)
             if kind == "full":
                 text += " (blocked)"
             elif kind == "model":
@@ -996,13 +977,14 @@ class AutoSwitchEngine:
         # it. `--once` never reaches that loop, which is why the emit records
         # rather than raises.
         self._consumer_gone = False
-        # Which candidate (at most one, dynamic only) `_rank_candidates_pass`
-        # admitted past the ordinary threshold this tick — reset every tick
-        # by `_tick_inner`; defaulted here too so a caller exercising
-        # `_rank_candidates_pass` directly (a "pure" function, per its own
-        # docstring) on a freshly constructed engine does not hit an
-        # AttributeError before the first tick ever runs.
-        self._dynamic_widened = {}
+        # `(number, reset_ts)` of the ONE candidate `_rank_candidates`
+        # picked past the ordinary threshold this tick (dynamic only), or
+        # `None` — set there (never inside `_rank_candidates_pass`, which
+        # stays pure per its own docstring) and read by `_perform` to decide
+        # `state["draining"]`. Reset every tick by `_tick_inner`; defaulted
+        # here too so `_perform` never hits an AttributeError before the
+        # first tick ever runs.
+        self._drain: tuple[str, float | None] | None = None
 
     def _announce_demotion(self) -> None:
         """Say once, on the first tick, that this engine lost the LIVE lock.
@@ -1496,12 +1478,12 @@ class AutoSwitchEngine:
             raise _EngineStopped()
         settings = self.settings
         state = self._read_state()
-        # Per-tick: which candidates the WIDENED (drain) bar admitted this
-        # tick, not the ordinary one — `_rank_candidates_pass` fills it in;
-        # `_perform` reads it to decide whether the account just landed on
-        # is a drain candidate. Unconditional: deciding nothing here keeps
-        # `best`/`consume-first` untouched (they never populate it).
-        self._dynamic_widened = {}
+        # Per-tick: the ONE candidate the WIDENED (drain) bar admitted this
+        # tick, if any — `_rank_candidates` fills it in; `_perform` reads it
+        # to decide whether the account just landed on is a drain
+        # candidate. Unconditional: deciding nothing here keeps
+        # `best`/`consume-first` untouched (they never set it).
+        self._drain = None
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
             # only released (state mutation) on real ticks.
@@ -1558,7 +1540,6 @@ class AutoSwitchEngine:
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
-                admit=_admit_pct(settings),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1639,10 +1620,10 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             # DRAIN STATE: this account was landed on BECAUSE the widened
-            # (drain) bar admitted it (`_rank_candidates_pass`'s
-            # `_dynamic_widened`, recorded onto `state["draining"]` by
-            # `_perform`) — the departure gate must agree with that same
-            # bar while it holds, or every landing is instantly a
+            # (drain) bar admitted it (`_rank_candidates`'s `self._drain`,
+            # recorded onto `state["draining"]` by `_perform`) — the
+            # departure gate must agree with that same bar while it holds,
+            # or every landing is instantly a
             # departure next tick (measured: a 3+ account rotation, not a
             # 2-account flap). Clears once the account bottoms out
             # (nothing left to drain) or its own weekly reset — the fact
@@ -1653,9 +1634,9 @@ class AutoSwitchEngine:
                 settings.strategy == "dynamic"
                 and state.get("draining") == current
                 and active_headroom > 0
-                and self.clock() < (state.get("drainingResetAt") or float("inf"))
+                and self.clock() < state.get("drainingResetAt")
             ):
-                departure_pct = _admit_pct(settings)
+                departure_pct = DYNAMIC_ADMIT_PCT
             if utilization < departure_pct:
                 if settings.strategy not in CONSUME_FIRST_STRATEGIES:
                     self._emit(
@@ -2602,14 +2583,24 @@ class AutoSwitchEngine:
                 oauth_candidates, drain_headroom, usage, current, settings, now
             )
             if drain is not None:
+                # `models=()`: when `drain_headroom is headroom` (no retry
+                # ran), `self._models` is already falsy here or the primary
+                # pass's own retry branch above would have run instead —
+                # either way the model-gated axis is never the one drain
+                # measures on.
                 drained = self._rank_candidates_pass(
-                    models=self._models if drain_headroom is headroom else (),
+                    models=(),
                     headroom=drain_headroom,
                     active_headroom=drain_headroom.get(current),
                     drain_candidate=drain,
                     **kw,
                 )
                 if drained[0]:
+                    # `_rank_candidates_pass` stays pure (no state writes,
+                    # per its own docstring) — recorded here instead, where
+                    # `drained[0]` is already known non-empty. `_perform`
+                    # reads this to mark `state["draining"]`.
+                    self._drain = (drain, _seven_day_reset_ts(usage.get(drain), now))
                     return drained
         return result
 
@@ -2876,17 +2867,6 @@ class AutoSwitchEngine:
                     all_above and not dynamic_landing
                 ):
                     continue
-                # `_perform` marks the account we land on as `draining` from
-                # this set, so the departure gate (`_tick_inner`, below) can
-                # agree with the bar that admitted it instead of reading it
-                # as departure-eligible on the very next tick (measured: an
-                # admit bar looser than the departure bar is a landing zone
-                # where every landing is instantly a departure — a 3+
-                # account rotation, not a 2-account flap).
-                if num == drain_candidate:
-                    self._dynamic_widened[num] = _seven_day_reset_ts(
-                        usage.get(num), now
-                    )
                 if all_above and not dynamic_landing:
                     # Checked before the strategies, because with nothing below
                     # the threshold the strategy question is moot: consume-first
@@ -3373,13 +3353,16 @@ class AutoSwitchEngine:
             state["leftTrigger"] = trigger
             # DRAIN STATE: this landing was only admitted by the widened
             # (drain) bar, so while it holds the departure gate must agree
-            # with the SAME bar — see `_rank_candidates_pass`'s
-            # `_dynamic_widened` and `_tick_inner`'s departure check.
-            # `best`/`consume-first` never populate `_dynamic_widened`, so
-            # the `else` below is a no-op for them — nothing to gate.
-            if self.settings.strategy == "dynamic" and number in self._dynamic_widened:
-                state["draining"] = number
-                state["drainingResetAt"] = self._dynamic_widened[number]
+            # with the SAME bar — see `_rank_candidates`'s `self._drain` and
+            # `_tick_inner`'s departure check. `best`/`consume-first` never
+            # set `self._drain`, so the `else` below is a no-op for them —
+            # nothing to gate.
+            if (
+                self.settings.strategy == "dynamic"
+                and self._drain is not None
+                and self._drain[0] == number
+            ):
+                state["draining"], state["drainingResetAt"] = self._drain
             else:
                 state.pop("draining", None)
                 state.pop("drainingResetAt", None)
