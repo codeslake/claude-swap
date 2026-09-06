@@ -10686,6 +10686,43 @@ class TestFreshenRoutesThroughGate:
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
 
+    def test_unreadable_session_record_does_not_spend_the_backup_grant(
+        self, temp_home
+    ):
+        """``live_session_pids_for`` is scan-shaped: an unreadable session
+        record contributes no PID, so it reads as "no live session" here --
+        but not knowing is not the same as knowing nothing is live, and a
+        live claude may already have rotated past the stored backup grant.
+        The freshen must not spend it while a session record cannot be read."""
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
+        session_dir = harness.switcher._session_dir("2", "b@example.com")
+        (session_dir / "sessions").mkdir(parents=True)
+        (session_dir / "sessions" / "s1.json").write_text(
+            "{ not json", encoding="utf-8"
+        )
+        with patch.object(
+            harness.switcher, "consume_backup_grant"
+        ) as gate:
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert not gate.called, (
+            f"unreadable session record -> backup grant spent; status={status!r}"
+        )
+
+    def test_control_readable_live_session_still_skips(self, temp_home):
+        """The control: a readable record with a live pid must still stop
+        the freshen -- the fix must not simply disable the existing check."""
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
+        with patch.object(
+            harness.switcher, "live_session_pids_for", return_value=[4242]
+        ), patch.object(
+            harness.switcher, "consume_backup_grant"
+        ) as gate:
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "skip-live-session"
+        assert not gate.called
+
 
 class TestDisabledActiveAccount:
     """A DISABLED account the engine is sitting on must be left at once.

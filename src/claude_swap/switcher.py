@@ -5221,6 +5221,7 @@ class ClaudeAccountSwitcher:
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
         from claude_swap.session import (
+            profile_is_quiescent,
             read_session_credentials,
             session_identity_drifted,
         )
@@ -5259,16 +5260,11 @@ class ClaudeAccountSwitcher:
             # backup's generation, or behind a fresh re-login in the backup,
             # needs no adoption and takes the same path on the backup.
             #
-            # Quiescence is checked here too, not just inside the adoption
-            # call: an unreadable session record makes it unknown whether a
-            # claude is still live against this profile, and "unknown" must
-            # not fall through to refreshing the backup grant below, which
-            # can already be a consumed generation the live claude rotated
-            # past. Only a CONFIRMED-quiescent profile takes that fallback;
-            # an unreadable one keeps session_creds set so the read-only path
-            # below runs on the profile's own (unrefreshed) credential.
-            from claude_swap.session import profile_is_quiescent
-
+            # Gate on confirmed quiescence here, not only inside the
+            # adoption, because an unreadable record makes _live_session_pids
+            # blind ([]) and "unknown" must not reach the backup-grant
+            # refresh below; unreadable keeps session_creds so the read-only
+            # path runs.
             if profile_is_quiescent(session_dir):
                 try:
                     if self._adopt_session_credential(str(num), email, org_uuid):

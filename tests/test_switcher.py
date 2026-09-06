@@ -12840,9 +12840,8 @@ class TestInactiveRefreshRoutesThroughGate:
 
 
 class TestRefusedAdoptionStaysReadOnly:
-    """A refused ``_adopt_session_credential`` (unreadable session record,
-    quiescence unknown) must fall back to the session profile's own
-    read-only fetch, never spend the stale backup grant via
+    """An unreadable session record (quiescence unknown) must take the
+    profile's read-only fetch, never spend the backup grant via
     ``consume_backup_grant``."""
 
     FRESH_PROFILE = json.dumps({
