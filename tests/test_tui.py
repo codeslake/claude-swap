@@ -2724,6 +2724,25 @@ class TestUnswitchableRowsAreListed:
         assert "5h(⟳refetching):" in out, out
         assert "5h full" not in out, out
 
+    def test_the_panel_still_calls_a_genuinely_full_window_full(self):
+        """CONTROL for the test above: a fetch that landed AFTER the reset
+        carries a fresh pct, so a window that is really at/over threshold
+        must still read `5h full` -- the filter must not go unconditional."""
+        now = time.time()
+        fresh_usage = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                "seven_day": {"pct": 5.0},
+            },
+            fetched_at=now - 10,  # measured after the reset fired
+            age_s=10.0,
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=fresh_usage),
+        ), active="1")
+        assert "5h full" in out, out
+
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
         `model`-blocked row used to name the scoped window in its label
