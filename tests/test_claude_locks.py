@@ -176,11 +176,14 @@ class TestProperLockfile:
 
         monkeypatch.setattr(claude_locks.os, "stat", one_bad_stat)
         seen = set()
+
+        def _advanced():
+            seen.add(real_stat(lock_dir).st_mtime_ns)
+            return len(seen) > 1
+
         with proper_lockfile(lock_dir):
             state["armed"] = True
-            for _ in range(12):
-                time.sleep(0.02)
-                seen.add(real_stat(lock_dir).st_mtime_ns)
+            _wait_for(_advanced)
 
         assert state["fired"] == 1, "premise: the injected error never fired"
         assert len(seen) > 1, (
@@ -2112,7 +2115,7 @@ class TestATransientErrnoIsNotFatalToTheHold:
             lambda a: raised.append(f"{a.exc_type.__name__}: {a.exc_value}"),
         )
         with proper_lockfile(lock, timeout=2.0):
-            time.sleep(0.2)
+            _wait_for(lambda: state["fired"])
 
         assert state["fired"], "premise: the injected error never fired"
         assert not raised, f"the heartbeat thread died: {raised}"
