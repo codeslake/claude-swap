@@ -3271,10 +3271,10 @@ class AutoSwitchEngine:
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
 
-        Takes the min over every row the engine's own planner could fetch
-        NEXT TICK, not only the active account's: a candidate's reset-driven
-        wake (``plan_after_fetch`` pins its ``next_poll_at`` to its own
-        reset) must cut the sleep too, or a reset that makes a candidate
+        Takes the min over every row the planner could fetch, plus the
+        active account unconditionally: a candidate's reset-driven wake
+        (``plan_after_fetch`` pins its ``next_poll_at`` to its own reset)
+        must cut the sleep too, or a reset that makes a candidate
         immediately due waits for the active row's cadence instead.
 
         Fetchable is a STRUCTURAL test and a STORE-level test, and a row
@@ -3297,9 +3297,9 @@ class AutoSwitchEngine:
         usage unconditionally; a sentinelled OR backed-off active (e.g. an
         hour-scale post-429 backoff, where ``last_good`` stays decision-
         trusted so the tick reads healthy) can still pin a sleep at a past
-        deadline for as long as that state lasts, but that is bounded
-        elsewhere (an unhealthy active drives a failover trigger before
-        ``_next_delay`` is ever reached).
+        deadline for as long as that state lasts — bounded only by the
+        backoff's own expiry, not by anything in this function or in
+        ``tick()``.
 
         The planner tightens the active row to URGENT_INTERVAL_S while it
         burns toward the threshold, but the loop always slept
