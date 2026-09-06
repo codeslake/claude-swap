@@ -228,16 +228,28 @@ def _pick_drain_candidate(
         # file routes through (`isinstance(window, dict)` and a numeric
         # `pct`) — a cached `{"seven_day": null}` or a non-numeric `pct`
         # would otherwise raise here and kill the tick instead of just
-        # reading as "no 7d reading".
+        # reading as "no 7d reading". `models=()`, same axis the hold
+        # (`_tick_inner`'s `seven_day_binds`) reads.
+        windows = oauth.relevant_windows(usage.get(cand), ())
         seven_day_pct = next(
-            (pct for label, pct, _ in oauth.relevant_windows(usage.get(cand), ())
-             if label == "7d"),
-            None,
+            (pct for label, pct, _ in windows if label == "7d"), None
         )
         if seven_day_pct is None:
             continue  # no 7d reading — nothing to band or order by
         if not (settings.threshold <= seven_day_pct < DYNAMIC_ADMIT_PCT):
             continue  # not in the band only the wider bar reaches
+        # THE 7-DAY WINDOW MUST BIND — the SAME predicate the hold applies
+        # (`seven_day_binds`), not merely "in band". A previous successful
+        # drain leaves exactly the shape that breaks this without it: the
+        # drained account's 5h wall (95%+) sits ABOVE its still-in-band
+        # weekly pct for up to five hours, in-band on this check alone but
+        # structurally unable to satisfy the hold the very next tick — the
+        # tier would land there, mark it draining, and immediately fall
+        # back to the ordinary bar and depart, having drained no weekly
+        # quota at all. `<`, not `<=`: a tie counts as binding, identical
+        # to the hold.
+        if seven_day_pct < max(w[1] for w in windows):
+            continue
         reset_ts = _seven_day_reset_ts(usage.get(cand), now)
         # Must reset strictly sooner than the account we are ON — the same
         # ordering the ordinary consume-first arm already requires, so

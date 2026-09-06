@@ -4480,17 +4480,26 @@ class TestDynamicStrategy:
         """Below the threshold (the `dynamic`/`consume-first` trigger), a
         candidate whose weekly window resets sooner than the active's is
         still not a landing if it is AT the drain bar too (headroom 0.1,
-        util 99.9 — `#2` sits at 99.9% on its 5-hour window). Headroom 0
-        would die at the `h <= 0` "itself at its limit" check before either
-        bar is ever consulted, leaving `DYNAMIC_ADMIT_PCT`'s own upper edge
+        util 99.9 — `#2` sits at 99.9% on its SEVEN-DAY window, the axis
+        the pick and the hold both band and bind on). Headroom 0 would die
+        at the `h <= 0` "itself at its limit" check before either bar is
+        ever consulted, leaving `DYNAMIC_ADMIT_PCT`'s own upper edge
         unpinned by the whole suite — 0.1 survives that check and is
         excluded by the ordinary bar itself (`_pick_drain_candidate`'s own
         band, and the pass's admission check, both read `< DYNAMIC_ADMIT_
-        PCT` as exclusive)."""
+        PCT` as exclusive).
+
+        NOT `_usage7(99.9, 5.0, _R_SOON)` (5h 99.9 / 7d 5.0): measured
+        vacuous — #2's 7-day pct (5.0) is nowhere near the
+        `[threshold, DYNAMIC_ADMIT_PCT)` band `_pick_drain_candidate`
+        reads, so it is excluded there before the edge this test claims to
+        pin is ever reached. Flipping `< DYNAMIC_ADMIT_PCT` to `<=` at the
+        band, or `>= this_admit_pct` to `>` at the pass's own admission
+        check, both stayed green against that fixture."""
         h = EngineHarness(temp_home, strategy="dynamic")
         usage = {
             "1": _usage7(10.0, 20.0, _R_LATEST),   # active: headroom 90
-            "2": _usage7(99.9, 5.0, _R_SOON),      # headroom 0.1, resets sooner
+            "2": _usage7(0.0, 99.9, _R_SOON),      # headroom 0.1, resets sooner
         }
         headroom = {"1": 90.0, "2": 0.1}
         args = self._args(
@@ -5437,6 +5446,47 @@ class TestDrainCandidateBandsOnTheWeeklyWindowNotFoldedHeadroom:
             f"got outcome={outcome}, active={h.active_number()} — #2's "
             "binding window is its 5-hour one (95%), not its weekly one "
             "(10%); it must never be picked as the drain candidate"
+        )
+        assert h.state().get("draining") != "2", "must never mark #2 draining"
+
+    def test_a_previously_drained_five_hour_wall_is_never_re_picked(
+        self, temp_home
+    ):
+        """The mirror shape: 7d IN band, but 5h sits ABOVE it — exactly
+        what a PREVIOUS successful drain of that same account leaves
+        behind for up to five hours. The pick must require the 7-day
+        window to BIND (the same predicate the departure hold applies),
+        not merely sit in band — otherwise the tier lands on an account it
+        is structurally unable to hold, marks it draining, and the very
+        next tick falls back to the ordinary bar and departs, having
+        drained no weekly quota at all."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        h.seed(6, "acct6@example.invalid")
+        h.seed(5, "acct5@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+
+        def acct(five, seven, fable, hours_out):
+            return {
+                "five_hour": {"pct": five},
+                "seven_day": {
+                    "pct": seven,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        fleet = {
+            "6": acct(20.0, 40.0, 95.0, 200),  # active: healthy 5h/7d, model-blocked
+            "5": acct(0.0, 20.0, 99.0, 300),   # healthy but resets LATER than active
+            "2": acct(96.0, 92.0, 50.0, 24),   # 7d in-band, but 5h binds ABOVE it
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert h.active_number() != 2, (
+            f"got outcome={outcome}, active={h.active_number()} — #2's "
+            "7-day pct (92) is in band, but its 5-hour window (96) binds "
+            "ABOVE it; the pick must never choose an account it cannot "
+            "hold the very next tick"
         )
         assert h.state().get("draining") != "2", "must never mark #2 draining"
 

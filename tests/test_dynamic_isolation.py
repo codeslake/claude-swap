@@ -280,3 +280,21 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             "HEAD for dynamic/Fable — the fleet never reached the new "
             "code, and this whole module proves nothing about it"
         )
+
+    def test_the_discriminating_seed_still_leaves_best_and_consume_first_alone(
+        self, tmp_path
+    ):
+        """`_DYNAMIC_SEED` was picked because its fleet reaches dynamic's
+        new code (the test above) — that alone does not say `best`/
+        `consume-first` are still untouched ON THIS SAME fleet, only that
+        `_SEED`'s fleet says so on a fleet proven NOT to reach the new
+        code at all. Same population `_DYNAMIC_SEED` exercises, both
+        strategies, still byte-identical to `_BASE_REV`."""
+        combos = [("best", "Fable"), ("consume-first", "Fable")]
+        got = self._digests_at_base_rev(tmp_path, combos, _DYNAMIC_SEED)
+        for i, (s, m) in enumerate(combos):
+            key = f"{s}|{m}"
+            assert got[key] == _digest(tmp_path / f"h{i}", s, m, _DYNAMIC_SEED), (
+                f"{s}/{m}: digest moved between {_BASE_REV} and HEAD on "
+                "_DYNAMIC_SEED's own fleet"
+            )
