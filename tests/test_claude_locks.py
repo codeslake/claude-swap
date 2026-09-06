@@ -34,6 +34,22 @@ def lock_dir(tmp_path: Path) -> Path:
     return tmp_path / "target.lock"
 
 
+def _wait_for(predicate, *, timeout=5.0, interval=0.01):
+    """Poll `predicate` until it is true, or `timeout` elapses.
+
+    A PREMISE gate: the heartbeat tick it waits on can take arbitrarily long
+    on a loaded runner, so a fixed sleep races it. Returns the last value of
+    `predicate()` either way; a timeout is a False the caller turns into its
+    own assertion message, not a swallowed pass.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        result = predicate()
+        if result or time.monotonic() >= deadline:
+            return result
+        time.sleep(interval)
+
+
 class TestProperLockfile:
     def test_acquire_creates_and_release_removes(self, lock_dir):
         with proper_lockfile(lock_dir):
@@ -722,9 +738,10 @@ class TestTheAcquireAndReleaseAreBounded:
 
         monkeypatch.setattr(claude_locks.os, "stat", rewinding)
         with proper_lockfile(lock):
-            time.sleep(0.1)
+            assert _wait_for(lambda: touches["n"] >= 1), (
+                "premise: the heartbeat never ran at all"
+            )
             before = touches["n"]
-            assert before >= 1, "premise: the heartbeat never ran at all"
             armed.set()
             assert rewound.wait(2.0), (
                 "premise: no tick read the lock after arming, so no rewind "
@@ -1632,7 +1649,7 @@ class TestATransientErrnoIsNotFatalToTheHold:
             lambda a: raised.append(f"{a.exc_type.__name__}: {a.exc_value}"),
         )
         with proper_lockfile(lock, timeout=2.0):
-            time.sleep(0.2)
+            _wait_for(lambda: seen["after"] > 0)
             in_body = seen["after"]
         assert seen["before"], "premise: the injected error never fired"
         return lock, raised, in_body
