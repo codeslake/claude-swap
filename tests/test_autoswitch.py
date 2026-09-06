@@ -3443,6 +3443,41 @@ class TestLoopObeysThePollPlan:
         delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
         assert 0.9 * 60 <= delay <= 1.1 * 60
 
+    def _plan_candidate(self, harness, num: str, *, due_in: float) -> None:
+        real = harness.engine.switcher.usage_entries_by_account
+
+        def patched(fetch=frozenset(), **kw):
+            entries = dict(real(fetch=fetch, **kw))
+            entries[num] = replace(
+                entries[num], next_poll_at=harness.clock() + due_in
+            )
+            return entries
+
+        harness.engine.switcher.usage_entries_by_account = patched
+
+    def test_a_candidates_sooner_plan_shortens_the_sleep(self, harness):
+        """A reset-driven wake is written to a CANDIDATE's own row
+        (`plan_after_fetch`), not only the active account's — the loop must
+        wake for it instead of oversleeping to the active row's cadence."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=360.0
+        )
+        current = harness.engine.switcher.current_account_number()
+        candidate = "2" if current != "2" else "3"
+        self._plan_candidate(harness, candidate, due_in=60.0)
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 60.0
+
+    def test_a_candidates_distant_plan_does_not_shorten_the_sleep(self, harness):
+        """A candidate's plan far in the future must not pull the sleep in
+        at all — only a SOONER plan (active or candidate) may shorten it."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=60.0
+        )
+        current = harness.engine.switcher.current_account_number()
+        candidate = "2" if current != "2" else "3"
+        self._plan_candidate(harness, candidate, due_in=3600.0)
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) <= 1.1 * 60
+
 
 class TestSessionThreshold:
     """apply_threshold(): the TUI's session-only, mid-run override."""

@@ -3271,6 +3271,12 @@ class AutoSwitchEngine:
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
 
+        Takes the min over every row, not only the active account's: a
+        candidate's reset-driven wake (``plan_after_fetch`` pins its
+        ``next_poll_at`` to its own reset) must cut the sleep too, or a
+        reset that makes a candidate immediately due waits for the active
+        row's cadence instead.
+
         The planner tightens the active row to URGENT_INTERVAL_S while it
         burns toward the threshold, but the loop always slept
         ``interval_seconds`` — so the plan ran late. Measured mid-episode: the
@@ -3292,13 +3298,15 @@ class AutoSwitchEngine:
         if self._stop.is_set():
             return delay
         try:
-            current = self.switcher.current_account_number()
-            if current is None:
+            entries = self.switcher.usage_entries_by_account(fetch=set())
+            due_ats = [
+                entry.next_poll_at
+                for entry in entries.values()
+                if entry.next_poll_at is not None
+            ]
+            if not due_ats:
                 return delay
-            entry = self.switcher.usage_entries_by_account(fetch=set()).get(current)
-            if entry is None or entry.next_poll_at is None:
-                return delay
-            due_in = entry.next_poll_at - self.clock()
+            due_in = min(due_ats) - self.clock()
             # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
             # raises a delay that was ALREADY below U: at the configurable
             # floor of 15s it turns a 13.5s jittered sleep into 60s, and at
