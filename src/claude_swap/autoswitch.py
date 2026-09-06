@@ -3271,17 +3271,32 @@ class AutoSwitchEngine:
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
 
-        Takes the min over every FETCHABLE row, not only the active
-        account's: a candidate's reset-driven wake (``plan_after_fetch``
-        pins its ``next_poll_at`` to its own reset) must cut the sleep too,
-        or a reset that makes a candidate immediately due waits for the
-        active row's cadence instead. A row ``due_candidate`` will never
-        fetch again (sentinel, in backoff, or a dead token) is excluded:
-        ``record()`` writes ``nextPollAt`` only on its success branch, so
-        such a row's plan is frozen in the past forever and would otherwise
-        pin every sleep at ``URGENT_INTERVAL_S``. The active row always
-        votes regardless — it is not gated on fetchability, matching every
-        other call site that reads its usage unconditionally.
+        Takes the min over every row the engine's own planner could fetch
+        NEXT TICK, not only the active account's: a candidate's reset-driven
+        wake (``plan_after_fetch`` pins its ``next_poll_at`` to its own
+        reset) must cut the sleep too, or a reset that makes a candidate
+        immediately due waits for the active row's cadence instead.
+
+        Fetchable is a STRUCTURAL test and a STORE-level test, and a row
+        excluded by either must not vote — ``record()`` writes
+        ``nextPollAt`` only on its success branch, so an unfetchable row's
+        plan is frozen wherever it was left and would otherwise pin every
+        sleep at ``URGENT_INTERVAL_S`` forever:
+
+        - structurally: ``{current} | switchable_account_numbers() -
+          quarantined`` mirrors the candidate list ``_collect_scheduled_usage``
+          builds — a disabled slot or one in the engine's own quarantine
+          ledger is never planned or fetched regardless of its stored state;
+        - at the store: ``due_candidate`` additionally skips a row that is
+          ``sentinel``, in backoff, or a dead token (e.g. quarantined by
+          ``authDeadStrikes``) even though it passed the structural test —
+          same reason, a different mechanism recording it.
+
+        The active row is exempt from the store-level test (it always votes
+        when eligible at all), matching every other call site that reads its
+        usage unconditionally; a sentinelled ACTIVE can still pin a sleep,
+        but that is bounded elsewhere (an unhealthy active drives a failover
+        trigger before ``_next_delay`` is ever reached).
 
         The planner tightens the active row to URGENT_INTERVAL_S while it
         burns toward the threshold, but the loop always slept
@@ -3310,11 +3325,21 @@ class AutoSwitchEngine:
         try:
             now = self.clock()
             current = self.switcher.current_account_number()
+            state = self._read_state()
+            quarantined = set(
+                state.get("quarantine", {})
+                if isinstance(state.get("quarantine"), dict)
+                else {}
+            )
+            votable = set(self.switcher.switchable_account_numbers()) - quarantined
+            if current is not None:
+                votable.add(current)
             entries = self.switcher.usage_entries_by_account(fetch=set())
             due_ats = [
                 entry.next_poll_at
                 for num, entry in entries.items()
                 if entry.next_poll_at is not None
+                and num in votable
                 and (
                     num == current
                     or not (

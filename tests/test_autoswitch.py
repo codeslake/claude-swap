@@ -3389,9 +3389,9 @@ class TestLoopObeysThePollPlan:
     row to URGENT_INTERVAL_S so the crossing is caught quickly. The loop used
     to sleep ``interval_seconds`` regardless, so on any machine configured
     slower than the plan (360s here, the default) that plan could not be
-    honoured: measured on the linux box mid-episode, the active row asked to
-    be polled 112s ago while the engine still had minutes of sleep left, and
-    the account sat over the threshold until the engine was restarted by hand.
+    honoured: the row could be due for a long time while the engine still
+    had most of its sleep left, and the account would sit over the threshold
+    until the process was restarted by hand.
     """
 
     def _plan(self, harness, *, due_in: float, num: str | None = None) -> None:
@@ -3431,10 +3431,10 @@ class TestLoopObeysThePollPlan:
         """Only ever shortens — a distant plan must not stretch the cadence
         past what the user configured."""
         harness.engine.settings = replace(
-            harness.engine.settings, interval_seconds=60.0
+            harness.engine.settings, interval_seconds=360.0
         )
         self._plan(harness, due_in=3600.0)
-        assert harness.engine._next_delay(TickOutcome.NO_ACTION) <= 1.1 * 60
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) <= 1.1 * 360
 
     def test_a_store_failure_leaves_the_cadence_alone(self, harness):
         def boom(*a, **k):
@@ -3460,13 +3460,13 @@ class TestLoopObeysThePollPlan:
         """A candidate's plan far in the future must not pull the sleep in
         at all — only a SOONER plan (active or candidate) may shorten it."""
         harness.engine.settings = replace(
-            harness.engine.settings, interval_seconds=60.0
+            harness.engine.settings, interval_seconds=360.0
         )
         current = harness.engine.switcher.current_account_number()
         candidate = "2" if current != "2" else "3"
         self._plan(harness, due_in=3600.0, num=candidate)
         delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
-        assert 0.9 * 60 <= delay <= 1.1 * 60
+        assert 0.9 * 360 <= delay <= 1.1 * 360
 
     def test_a_quarantined_candidates_frozen_plan_never_pins_the_floor(
         self, harness
@@ -3503,6 +3503,25 @@ class TestLoopObeysThePollPlan:
         delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
         assert 0.9 * 360 <= delay <= 1.1 * 360, (
             f"a quarantined row's frozen next_poll_at pinned the sleep at "
+            f"{delay}, not the configured 360s cadence"
+        )
+
+    def test_a_disabled_slots_frozen_plan_never_pins_the_floor(self, harness):
+        """A slot taken out of rotation by `cswap disable` is dropped from
+        `switchable_account_numbers()`, not from the usage store — its own
+        row is never touched, so a plan left behind from before it was
+        disabled is frozen exactly like a quarantined row's, by a mechanism
+        no per-entry store predicate (sentinel/backoff/token_dead) sees."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=360.0
+        )
+        current = harness.engine.switcher.current_account_number()
+        disabled = "2" if current != "2" else "3"
+        harness.switcher.set_account_disabled(disabled, True)
+        self._plan(harness, due_in=-500.0, num=disabled)
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert 0.9 * 360 <= delay <= 1.1 * 360, (
+            f"a disabled slot's frozen next_poll_at pinned the sleep at "
             f"{delay}, not the configured 360s cadence"
         )
 
