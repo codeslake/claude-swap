@@ -152,7 +152,7 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     return reset_text(last_good.get(key), now)
 
 
-def chip_label(label: str, reset: str | None, full_window: str | None = None) -> str:
+def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
 
     THE one place that decides how a window reads — the dashboard's inactive
@@ -168,32 +168,17 @@ def chip_label(label: str, reset: str | None, full_window: str | None = None) ->
     token shape a known reset has (``5h(⟳?):``) so a column of chips still
     lines up — callers compute width from this string, never a literal.
 
-    ``full_window`` is opt-in and does nothing unless a caller has already
-    established that a window reports no reset AND no usage: the whole
-    window has nothing withheld, so it may pass its literal duration (e.g.
-    ``"5h"``) to read as its own countdown instead of the unknown-reset
-    marker.
+    The one exception: a 5h window with no reported reset AND no usage
+    (``pct == 0``, not merely falsy — ``None`` from a caller that never
+    passes it must not match) has nothing withheld, the whole window is
+    what's left, so it reads its own full duration instead of ``⟳?``. A 5h
+    window WITH usage but no reported reset is live and its reset really
+    was withheld, and any other window (7d, a scoped model) always keeps
+    the plain unknown-reset marker; #325 is what resolves those.
     """
     if not reset:
-        if full_window:
-            return f"{label}(⟳{full_window}):"
-        return f"{label}(⟳?):"
+        return "5h(⟳5h):" if label == "5h" and pct == 0 else f"{label}(⟳?):"
     return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
-
-
-def five_hour_full_window(label: str, wpct: float, resets_at: str | None) -> str | None:
-    """``chip_label``'s ``full_window``, for the 5h window only.
-
-    A 5h window with no reported reset AND no usage has nothing withheld —
-    the whole window is what's left. A 5h window with usage but no reported
-    reset is a LIVE window whose reset the server withheld, and any other
-    window (7d, a scoped model) keeps the plain unknown-reset marker; #325
-    is what resolves those. One copy, called by both the dashboard's
-    inactive rows and the auto view's Next-best rows — the same reason
-    ``chip_label`` itself is one function: one account cannot read two ways
-    on two screens.
-    """
-    return label if label == "5h" and not resets_at and not wpct else None
 
 
 def format_duration(seconds: float) -> str:

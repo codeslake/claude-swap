@@ -610,6 +610,24 @@ class TestUsageRows:
         assert row[2] == "reset unknown", row
         assert row[3] == "reset unknown", row
 
+    def test_five_hour_with_no_reported_reset_and_no_usage_shows_resets_5h(self):
+        """A lapsed 5h window (no reset reported, no usage) has nothing
+        withheld -- the ACTIVE account's own card row must not claim
+        "reset unknown" about it either (PR #325, same defect as the
+        inactive-row chip and the auto view's Next-best row)."""
+        from claude_swap.tui.widgets import account_card_text, usage_rows
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 0.0}}  # no resets_at at all
+        row = usage_rows(last_good, now)[0]
+        assert row[2] == "resets 5h", row
+        assert row[3] == "resets 5h", row
+
+        entry = UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
+        card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
+        assert "resets 5h" in card, card
+        assert "reset unknown" not in card, card
+
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
         # keeps 5h/7d clocks while the longer spend row falls back to its
@@ -706,9 +724,9 @@ class TestMiniAccountText:
         """The same fix as the auto view's Next-best row (PR #325): a 5h
         window with no reported reset AND no usage reads its own full-window
         countdown here too, not `⟳?` -- the dashboard and the auto view share
-        `data.chip_label`/`data.five_hour_full_window`, so a fix to one that
-        does not reach the other reproduces the exact "comment asserts an
-        invariant the code does not hold" shape #323 was opened for."""
+        one `data.chip_label`, so a fix to one that does not reach the other
+        reproduces the exact "comment asserts an invariant the code does
+        not hold" shape #323 was opened for."""
         from claude_swap.tui.widgets import mini_account_text
 
         now = time.time()

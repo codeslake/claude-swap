@@ -482,7 +482,7 @@ class AutoScreen(Screen):
                 width = len(
                     data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now),
-                        data.five_hour_full_window(label, wpct, resets_at),
+                        wpct,
                     )
                 ) + len(f"{wpct:.0f}%")
                 chip_width[label] = max(chip_width.get(label, 0), width)
@@ -557,7 +557,7 @@ class AutoScreen(Screen):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     label_text = data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now),
-                        data.five_hour_full_window(label, wpct, resets_at),
+                        wpct,
                     )
                     entry.append(label_text, style=palette.muted)
                     pct_text = f"{wpct:.0f}%"

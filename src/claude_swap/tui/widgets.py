@@ -134,21 +134,23 @@ def usage_rows(
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
+        # A monthly budget the server never reported a reset for has no
+        # usage-window reset to name at all -- unlike 5h/7d/scoped, this
+        # is not a gap in a real countdown, so it reads its own truth
+        # (the amounts alone) instead of borrowing "reset unknown".
+        suffix = suffix_full = amounts
         if spend.get("resets_at"):
             reset, reset_full = _reset_parts(spend, now)
-            suffix = f"{reset}  {amounts}" if reset else amounts
-            suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
-        else:
-            # A monthly budget the server never reported a reset for has no
-            # usage-window reset to name at all -- unlike 5h/7d/scoped, this
-            # is not a gap in a real countdown, so it reads its own truth
-            # (the amounts alone) instead of borrowing "reset unknown".
-            suffix = suffix_full = amounts
+            suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
         rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
             reset, reset_full = _reset_parts(window, now)
+            # A lapsed 5h window (no reported reset, no usage) has nothing
+            # withheld -- "reset unknown" would assert a gap that isn't one.
+            if key == "five_hour" and not window.get("resets_at") and window["pct"] == 0:
+                reset = reset_full = "resets 5h"
             suffix, suffix_full = reset or "", reset_full or ""
             if key == "seven_day":
                 marker = _pace_suffix(window, fetched_at)
@@ -310,7 +312,7 @@ def mini_account_text(
         text.append(
             data.chip_label(
                 label, data.reset_text(window, now),
-                data.five_hour_full_window(label, pct, window.get("resets_at")),
+                pct,
             ),
             style=palette.muted,
         )
