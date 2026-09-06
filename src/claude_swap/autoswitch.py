@@ -223,10 +223,16 @@ def _pick_drain_candidate(
         # almost nothing while a real 7d-blocked peer held real headroom
         # (measured: a 95%-on-5h/10%-on-7d candidate drained ahead of the
         # account it exists to serve).
-        window = usage.get(cand)
-        seven_day_pct = (
-            window.get("seven_day", {}).get("pct")
-            if isinstance(window, dict) else None
+        # `oauth.relevant_windows`, not a hand-rolled `.get("seven_day",
+        # {}).get("pct")`: the same shape guard every other reader in this
+        # file routes through (`isinstance(window, dict)` and a numeric
+        # `pct`) — a cached `{"seven_day": null}` or a non-numeric `pct`
+        # would otherwise raise here and kill the tick instead of just
+        # reading as "no 7d reading".
+        seven_day_pct = next(
+            (pct for label, pct, _ in oauth.relevant_windows(usage.get(cand), ())
+             if label == "7d"),
+            None,
         )
         if seven_day_pct is None:
             continue  # no 7d reading — nothing to band or order by
@@ -1645,11 +1651,27 @@ class AutoSwitchEngine:
             # (nothing left to drain) or its own weekly reset — the fact
             # that made it a drain candidate — has passed; from then on
             # it is an ordinary account again.
+            #
+            # `> SPENT_HEADROOM_PCT`, the same "can this still serve" bar
+            # every sibling test in this file uses (`peer_can_serve`,
+            # `about_to_wall`, the spent-candidate guard) — not `> 0`. The
+            # drain band moved to the 7-day pct; this hold had not, so a
+            # drained account's OWN 5h window walling out independently
+            # (folded headroom still a few points above zero) kept the
+            # widened bar and refused every sooner-resetting peer as
+            # "already-consuming-soonest" — parking on a few points from a
+            # five-hour wall while a real peer held real headroom. Below
+            # this bar the hold releases, the ordinary bar governs, the
+            # engine departs, and the leave-clear below fires normally;
+            # once the 5h window refills, the account is simply re-picked
+            # as a drain candidate on its still-in-band weekly window —
+            # correct, since a weekly window cannot be consumed faster
+            # than its five-hour windows allow.
             departure_pct = settings.threshold
             if (
                 settings.strategy == "dynamic"
                 and state.get("draining") == current
-                and active_headroom > 0
+                and active_headroom > SPENT_HEADROOM_PCT
                 and self.clock() < (state.get("drainingResetAt") or 0)
             ):
                 departure_pct = DYNAMIC_ADMIT_PCT

@@ -5243,6 +5243,40 @@ class TestDynamicDrainBarLiveness:
             "and the ordinary 90% bar must depart a still-95%-used account"
         )
 
+    def test_the_own_five_hour_wall_clears_the_drain_bar_even_before_reset(
+        self, temp_home
+    ):
+        """The drain band moved to the 7-day pct; this hold's own
+        servability check had not — it read `active_headroom > 0`, so a
+        draining account whose OWN five-hour window walls out independently
+        (folded headroom still a few noise-band points above zero, weekly
+        untouched, deadline nowhere near) kept the widened bar and refused
+        every sooner-resetting peer as `already-consuming-soonest`, parking
+        on a sliver from a five-hour wall while a real peer held real
+        headroom.
+
+        NOTE ON THE NUMBERS: five-hour 98% (folded headroom 2, BELOW
+        `SPENT_HEADROOM_PCT`=3.0) is used here, not the round "5h 95%"
+        figure the finding used to illustrate the shape — measured
+        directly, 5h 95% (headroom 5, ABOVE 3.0) does not cross the fixed
+        bar and still holds under this same fix; only a headroom inside the
+        noise band releases it. Reported as measured, not silently
+        adjusted: the fix is exactly what was specified
+        (`active_headroom > SPENT_HEADROOM_PCT`), and this is the smallest
+        change to the illustrating fleet that actually crosses it.
+        """
+        h = self._harness(temp_home)
+        fleet = self._land_on_2(h)
+        fleet["2"]["five_hour"]["pct"] = 98.0  # 7d untouched at 90, deadline untouched
+        n0 = len(h.events)
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED and h.active_number() == 6, (
+            f"got {outcome}, active={h.active_number()} — #2's own 5h wall "
+            "(headroom 2, below SPENT_HEADROOM_PCT) must clear the drain "
+            "bar and let the engine move to #6's real headroom, not park "
+            "on a sliver"
+        )
+
 
 class TestDynamicDrainStateResumesAfterRestart:
     """`state["draining"]` rides the persisted `autoswitch_state.json`, so a
@@ -5267,7 +5301,17 @@ class TestDynamicDrainStateResumesAfterRestart:
         assert h.state().get("draining") == "2", "the first engine must persist the mark"
 
         fleet["2"]["seven_day"]["pct"] = 95.0
+        # "Across instances" means a restart: the old engine is gone before
+        # the new one exists. Stopping it releases the LIVE lock, so the
+        # successor comes up LIVE — a fresh engine that silently demoted
+        # itself would return NO_ACTION for that reason alone
+        # (`_perform`'s dry-run short-circuit), proving nothing about the
+        # persisted mark (see TestQuarantineLifecycle for the same pattern).
+        h.engine.stop()
+        h.clock.advance(300.0)  # clear cooldown — the resumed trigger needs it too
         fresh = h._make_engine()
+        assert not fresh.dry_run
+        n0 = len(h.events)
         with patch.object(h.switcher, "usage_entries_by_account", return_value={
             num: _entry_for(value, h.clock.now) for num, value in fleet.items()
         }):
@@ -5276,6 +5320,16 @@ class TestDynamicDrainStateResumesAfterRestart:
             f"got {outcome} — a fresh engine reading the same state file "
             "must resume holding #2's drain bar, not depart it at 95% "
             "against a freshly-forgotten ordinary bar"
+        )
+        # THE DISCRIMINATING CHECK: NO_ACTION alone is also what a live
+        # lock demotion or an unexpired cooldown produces, neither of which
+        # says anything about `state["draining"]`. Only the dynamic
+        # (below-drain-bar) branch reads this exact reason.
+        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"], (
+            f"got {reasons} — must hold via the resumed drain bar "
+            "specifically, not a demotion or a cooldown that would read "
+            "NO_ACTION regardless of whether the mark was ever resumed"
         )
 
 
