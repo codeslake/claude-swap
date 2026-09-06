@@ -3434,7 +3434,8 @@ class TestLoopObeysThePollPlan:
             harness.engine.settings, interval_seconds=360.0
         )
         self._plan(harness, due_in=3600.0)
-        assert harness.engine._next_delay(TickOutcome.NO_ACTION) <= 1.1 * 360
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert 0.9 * 360 <= delay <= 1.1 * 360
 
     def test_a_store_failure_leaves_the_cadence_alone(self, harness):
         def boom(*a, **k):
@@ -3523,6 +3524,23 @@ class TestLoopObeysThePollPlan:
         assert 0.9 * 360 <= delay <= 1.1 * 360, (
             f"a disabled slot's frozen next_poll_at pinned the sleep at "
             f"{delay}, not the configured 360s cadence"
+        )
+
+    def test_no_current_account_never_pins_the_floor(self, harness):
+        """`current is None` (unmanaged or absent login) is a TICK-class
+        exemption: `tick()` returns NO_ACTION before `_collect_scheduled_
+        usage` ever runs, so no candidate can be fetched this tick at all —
+        a switchable, unquarantined candidate's past-due plan can never be
+        honoured and must not vote."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=360.0
+        )
+        harness.engine.switcher.current_account_number = lambda: None
+        self._plan(harness, due_in=-500.0, num="2")
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert 0.9 * 360 <= delay <= 1.1 * 360, (
+            f"an unmanaged login still let a candidate's frozen plan pin "
+            f"the sleep at {delay}, not the configured 360s cadence"
         )
 
 

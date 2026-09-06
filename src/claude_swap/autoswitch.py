@@ -3294,9 +3294,12 @@ class AutoSwitchEngine:
 
         The active row is exempt from the store-level test (it always votes
         when eligible at all), matching every other call site that reads its
-        usage unconditionally; a sentinelled ACTIVE can still pin a sleep,
-        but that is bounded elsewhere (an unhealthy active drives a failover
-        trigger before ``_next_delay`` is ever reached).
+        usage unconditionally; a sentinelled OR backed-off active (e.g. an
+        hour-scale post-429 backoff, where ``last_good`` stays decision-
+        trusted so the tick reads healthy) can still pin a sleep at a past
+        deadline for as long as that state lasts, but that is bounded
+        elsewhere (an unhealthy active drives a failover trigger before
+        ``_next_delay`` is ever reached).
 
         The planner tightens the active row to URGENT_INTERVAL_S while it
         burns toward the threshold, but the loop always slept
@@ -3316,15 +3319,19 @@ class AutoSwitchEngine:
         every other ``fetch=set()`` caller is a plain store-only read with no
         `_stop` concept, and legitimately wants the heal write.
 
-        No early-out on ``current is None`` (an unmanaged or absent login):
-        a candidate can still be due, and there is no cheaper source of that
-        answer than this same store read.
+        ``current is None`` (an unmanaged or absent login) is a TICK-class
+        exemption, not a row-class one: ``tick()`` returns ``NO_ACTION``
+        before ever calling ``_collect_scheduled_usage`` in that state, so no
+        candidate can be fetched this tick regardless of its plan — a due
+        candidate's vote could never be honoured, so it must not be counted.
         """
         if self._stop.is_set():
             return delay
         try:
-            now = self.clock()
             current = self.switcher.current_account_number()
+            if current is None:
+                return delay
+            now = self.clock()
             state = self._read_state()
             quarantined = set(
                 state.get("quarantine", {})
@@ -3332,8 +3339,7 @@ class AutoSwitchEngine:
                 else {}
             )
             votable = set(self.switcher.switchable_account_numbers()) - quarantined
-            if current is not None:
-                votable.add(current)
+            votable.add(current)
             entries = self.switcher.usage_entries_by_account(fetch=set())
             due_ats = [
                 entry.next_poll_at
