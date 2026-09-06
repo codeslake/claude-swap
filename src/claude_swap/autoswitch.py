@@ -1652,26 +1652,33 @@ class AutoSwitchEngine:
             # that made it a drain candidate — has passed; from then on
             # it is an ordinary account again.
             #
-            # `> SPENT_HEADROOM_PCT`, the same "can this still serve" bar
-            # every sibling test in this file uses (`peer_can_serve`,
-            # `about_to_wall`, the spent-candidate guard) — not `> 0`. The
-            # drain band moved to the 7-day pct; this hold had not, so a
-            # drained account's OWN 5h window walling out independently
-            # (folded headroom still a few points above zero) kept the
-            # widened bar and refused every sooner-resetting peer as
-            # "already-consuming-soonest" — parking on a few points from a
-            # five-hour wall while a real peer held real headroom. Below
-            # this bar the hold releases, the ordinary bar governs, the
-            # engine departs, and the leave-clear below fires normally;
-            # once the 5h window refills, the account is simply re-picked
-            # as a drain candidate on its still-in-band weekly window —
-            # correct, since a weekly window cannot be consumed faster
-            # than its five-hour windows allow.
+            # HOLDS ONLY WHILE THE SEVEN-DAY WINDOW IS THE BINDING ONE — not
+            # a headroom floor. The drain mark means "this weekly window is
+            # about to reset with quota unused, stay and consume it", which
+            # is only true while the weekly window is what is actually
+            # limiting us: 5h binding means staying consumes no additional
+            # weekly quota (5h refills in five hours — a GATE, never a KEY,
+            # same ruling the drain band itself already follows), so
+            # leaving abandons nothing and the account is simply re-picked
+            # once its 5h refills and the weekly is still in band. A model
+            # window binding is a different subject entirely (#321's own),
+            # not this hold's to override. `> 0`, not a headroom floor: an
+            # `> SPENT_HEADROOM_PCT` bar was tried and measured wrong — the
+            # reported fleet (5h 95 / 7d 90, folded headroom 5) sits ABOVE
+            # 3.0 and stayed held regardless of the constant; only the
+            # BINDING WINDOW answers it, at any headroom down to the wall
+            # (7d 99 / 5h 10, headroom 1, DOES hold — that last point is the
+            # quota being drained, and `h <= 0` takes it from there).
+            windows = oauth.relevant_windows(usage.get(current), self._models)
+            seven_day_binds = (
+                bool(windows) and max(windows, key=lambda w: w[1])[0] == "7d"
+            )
             departure_pct = settings.threshold
             if (
                 settings.strategy == "dynamic"
                 and state.get("draining") == current
-                and active_headroom > SPENT_HEADROOM_PCT
+                and active_headroom > 0
+                and seven_day_binds
                 and self.clock() < (state.get("drainingResetAt") or 0)
             ):
                 departure_pct = DYNAMIC_ADMIT_PCT

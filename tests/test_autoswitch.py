@@ -5255,15 +5255,12 @@ class TestDynamicDrainBarLiveness:
         on a sliver from a five-hour wall while a real peer held real
         headroom.
 
-        NOTE ON THE NUMBERS: five-hour 98% (folded headroom 2, BELOW
-        `SPENT_HEADROOM_PCT`=3.0) is used here, not the round "5h 95%"
-        figure the finding used to illustrate the shape — measured
-        directly, 5h 95% (headroom 5, ABOVE 3.0) does not cross the fixed
-        bar and still holds under this same fix; only a headroom inside the
-        noise band releases it. Reported as measured, not silently
-        adjusted: the fix is exactly what was specified
-        (`active_headroom > SPENT_HEADROOM_PCT`), and this is the smallest
-        change to the illustrating fleet that actually crosses it.
+        The hold is gated on the SEVEN-DAY window being the binding one,
+        not a headroom floor — a floor was tried first and measured wrong
+        (the illustrating fleet's own headroom sits above any reasonable
+        floor and stayed held regardless of the constant). At five-hour
+        98% (well above #2's 7d 90%), the FIVE-hour window binds, so the
+        hold does not apply regardless of how much headroom is left.
         """
         h = self._harness(temp_home)
         fleet = self._land_on_2(h)
@@ -5272,9 +5269,28 @@ class TestDynamicDrainBarLiveness:
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.SWITCHED and h.active_number() == 6, (
             f"got {outcome}, active={h.active_number()} — #2's own 5h wall "
-            "(headroom 2, below SPENT_HEADROOM_PCT) must clear the drain "
-            "bar and let the engine move to #6's real headroom, not park "
-            "on a sliver"
+            "binds (95 < 98), clearing the drain bar and letting the "
+            "engine move to #6's real headroom, not park on a sliver"
+        )
+
+    def test_the_five_hour_window_binding_clears_the_hold_at_any_headroom(
+        self, temp_home
+    ):
+        """The exact fleet the finding used to illustrate the shape (5h
+        95%, 7d 90% — headroom 5, which a headroom-floor fix left broken
+        regardless of the floor's value): the FIVE-hour window binds
+        (95 > 90), so the hold must not apply no matter how much headroom
+        is left. #6 holds ~48 points and resets later; the engine must
+        move there rather than park on #2's five-hour sliver."""
+        h = self._harness(temp_home)
+        fleet = self._land_on_2(h)
+        fleet["2"]["five_hour"]["pct"] = 95.0  # 7d untouched at 90, deadline untouched
+        n0 = len(h.events)
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED and h.active_number() == 6, (
+            f"got {outcome}, active={h.active_number()} — #2's five-hour "
+            "window binds (95 > 90); the drain hold must not apply, and "
+            "the engine must move to #6's real headroom"
         )
 
 
