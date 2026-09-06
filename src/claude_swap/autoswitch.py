@@ -2347,14 +2347,27 @@ class AutoSwitchEngine:
         # Skipped only for that recorded shape — an ordinary (headroom- or
         # at-limit-driven) departure keeps the leg, exactly as `best` and
         # `consume-first` still do; those are untouched by this gate.
+        #
+        # BUT the ping-pong this guards against is two accounts flapping on
+        # a VOLUNTARY reset-ordering return, neither of which ever needed to
+        # move. It is not evidence that a FORCED return is wrong: once the
+        # active itself has burned down to the switch threshold, the engine
+        # must land on whatever the strategy would actually pick, same as an
+        # ordinary departure — hiding the best candidate here just delays
+        # the correct switch by a tick or two of cooldown. `active_headroom`
+        # and `settings.threshold` are already in hand; no new state.
         left_for_reset = (
             settings.strategy == "dynamic"
             and state.get("leftTrigger") in CONSUME_FIRST_STRATEGIES
         )
+        active_at_threshold = (
+            active_headroom is not None
+            and active_headroom <= 100.0 - settings.threshold
+        )
         if h is not None:
             if active_headroom is not None:
                 if (
-                    not left_for_reset
+                    (not left_for_reset or active_at_threshold)
                     and h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT
                 ):
                     return True

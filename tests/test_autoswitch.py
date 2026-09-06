@@ -4711,6 +4711,58 @@ class TestDynamicStrategy:
             "so re-measuring the same dominance is not an improvement"
         )
 
+    def test_a_forced_threshold_return_still_dominance_releases_under_dynamic(
+        self, temp_home
+    ):
+        """The fleet-churn suppression above guards a VOLUNTARY reset-ordering
+        return (nobody had to move). It must not also hold when the ACTIVE
+        has itself burned down to the switch threshold: at that point a
+        return is forced, same as an ordinary departure, and hiding the best
+        candidate just delays the correct switch behind extra cooldown
+        ticks. Exact numbers from a reproduced live trace: #1 was left at
+        62 pts on a `dynamic`-trigger preference departure (reset ordering,
+        not headroom), then #2 (the account we moved to) burned down to the
+        90% threshold while #1 sat essentially unchanged at 61 pts — #1
+        should be released and re-admitted as a candidate."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        state = {
+            "lastSwitchFrom": "1",
+            "lastSwitchTo": "2",
+            "leftHeadroom": 62.0,
+            "leftRecoveryAt": now + 9_000_000,
+            "leftTrigger": "dynamic",
+        }
+        usage = {
+            "1": {
+                "five_hour": {"pct": 39.0, "resets_at": _iso_at(now + 9_000_000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {
+                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 300)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"1": 61.0, "2": 10.0}
+        settings = AutoSwitchSettings(threshold=90.0, strategy="dynamic")
+        recovered = h.engine._left_account_recovered(
+            state, usage, headroom, 10.0, settings, now, current="2",
+        )
+        assert recovered is True, (
+            "the active is AT the 90% threshold (10 pts headroom left) — "
+            "this is a forced return, not the voluntary reset-ordering "
+            "ping-pong the fleet-churn leg guards against, so #1's "
+            "dominance over the active must still release the bar"
+        )
+        no_return = h.engine._no_return_account(
+            "proactive", state, headroom, 10.0, recovered, settings, current="2",
+        )
+        assert no_return is None, (
+            f"got no_return={no_return!r} — a released bar must also clear "
+            "the ranking loop's exclusion, or the proactive arm still "
+            "cannot land on #1"
+        )
+
     # -- the owner's live acceptance fixture, exact numbers ------------------
     #
     #   acct   5h    7d   Fable   note
