@@ -386,6 +386,27 @@ class TestFormatting:
         assert tui_data.reset_clock(elapsed, now) is None
         assert tui_data.reset_text(elapsed, now) == "resets now"
 
+    def test_reset_text_names_a_pct_that_provably_predates_the_reset(self):
+        """A window whose reset elapsed while the served pct is older still
+        (`fetched_at < resets_at <= now`) must not claim "resets now" beside
+        a pct that is provably pre-reset -- PR #325."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_before_reset = now - 120
+        assert (
+            tui_data.reset_text(window, now, fetched_at=fetched_before_reset)
+            == "refetching"
+        )
+        # CONTROL: a fetch that landed AFTER the reset carries a fresh pct,
+        # so the ordinary elapsed reading applies.
+        fetched_after_reset = now - 10
+        assert (
+            tui_data.reset_text(window, now, fetched_at=fetched_after_reset)
+            == "resets now"
+        )
+        # No fetched_at at all: cannot prove staleness, keep prior behaviour.
+        assert tui_data.reset_text(window, now) == "resets now"
+
 
 class TestSnapshotSource:
     def _source(self, tmp_path: Path, accounts=None):
@@ -628,6 +649,31 @@ class TestUsageRows:
         assert "resets 5h" in card, card
         assert "reset unknown" not in card, card
 
+    def test_active_cards_5h_row_reads_refetching_not_a_stale_100pct_reset(self):
+        """A window whose reset has passed while the served pct still
+        predates it must not claim "resets now" beside a 100% that is
+        already wrong -- PR #325, the active card's own copy of the defect
+        the inactive-row chip and the Next-best row also carried."""
+        from claude_swap.tui.widgets import account_card_text, usage_rows
+
+        now = time.time()
+        last_good = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}}
+        fetched_at = now - 120  # measured well before the reset fired
+        row = usage_rows(last_good, now, fetched_at)[0]
+        assert row[2] == "refetching", row
+        assert row[3] == "refetching", row
+
+        entry = UsageEntry(last_good=last_good, fetched_at=fetched_at, age_s=120.0)
+        card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
+        assert "refetching" in card, card
+        assert "resets now" not in card, card
+
+        # CONTROL: a fetch that landed after the reset carries a fresh pct,
+        # so the ordinary "resets now" reading must still apply.
+        fresh_fetched_at = now - 10
+        row = usage_rows(last_good, now, fresh_fetched_at)[0]
+        assert row[2] == "resets now", row
+
     def test_card_shows_clock_only_where_it_fits(self):
         # Per-row degradation: the wide card shows every clock, a mid width
         # keeps 5h/7d clocks while the longer spend row falls back to its
@@ -751,6 +797,24 @@ class TestMiniAccountText:
         )
         acc = make_account(1, entry=entry)
         assert "5h(⟳?):42%" in mini_account_text(acc, now).plain
+
+    def test_dashboard_chip_reads_refetching_not_stale_reset_now(self):
+        """Same PR #325 defect, third surface: the dashboard's inactive-row
+        chip must not say `⟳now` beside a pct that provably predates the
+        reset it names."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        fetched_at = now - 120
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}},
+            fetched_at=fetched_at,
+            age_s=120.0,
+        )
+        acc = make_account(1, entry=entry)
+        out = mini_account_text(acc, now).plain
+        assert "5h(⟳refetching):100%" in out, out
+        assert "⟳now" not in out, out
 
     @pytest.mark.parametrize(
         "age_s, expect_dim",
@@ -2638,6 +2702,27 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "Fable-only" in out, out
         assert "  5h full" in out, out
+
+    def test_the_panel_never_calls_a_refetching_window_full(self):
+        """PR #325: a 5h window whose reset just fired reads `refetching`
+        on the chip -- the same row's block label must not still say
+        `5h full` off the same provably-stale pct, which would contradict
+        the chip it sits beside."""
+        now = time.time()
+        stale_usage = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)},
+                "seven_day": {"pct": 5.0},
+            },
+            fetched_at=now - 120,  # measured well before the reset fired
+            age_s=120.0,
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=stale_usage),
+        ), active="1")
+        assert "5h(⟳refetching):" in out, out
+        assert "5h full" not in out, out
 
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a

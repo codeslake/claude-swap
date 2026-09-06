@@ -103,11 +103,21 @@ def window_pct(last_good: dict | None, key: str) -> float | None:
     return float(pct) if isinstance(pct, (int, float)) else None
 
 
-def reset_text(window: dict | None, now: float) -> str | None:
+def reset_text(
+    window: dict | None, now: float, fetched_at: float | None = None
+) -> str | None:
     """Live countdown to one window's reset ("resets 2h 13m"), if known.
 
     Computed from ``resets_at`` at render time — the countdown the API sent
     was correct at *fetch* time and drifts as the measurement ages.
+
+    ``fetched_at``, when given, catches the window between the reset firing
+    and the next refetch landing: once ``resets_at`` has passed, the pct
+    beside this text is only fresh if it was MEASURED after the reset too.
+    ``fetched_at < resets_at <= now`` proves it wasn't, so that state reads
+    "refetching" instead of asserting "resets now" beside a pct that
+    provably predates it (#325). Without ``fetched_at`` nothing can be
+    proven either way, so the elapsed reading is unchanged.
     """
     if not isinstance(window, dict):
         return None
@@ -120,6 +130,8 @@ def reset_text(window: dict | None, now: float) -> str | None:
         return None
     remaining = ts - now
     if remaining <= 0:
+        if fetched_at is not None and fetched_at < ts:
+            return "refetching"
         return "resets now"
     return f"resets {format_duration(remaining)}"
 

@@ -467,6 +467,7 @@ class AutoScreen(Screen):
         # exactly the accounts that will reach the chip branch below
         # (switchable, no sentinel, a known binding pct).
         row_windows: dict[str, list[tuple[str, float, str | None]]] = {}
+        fetched_by_number: dict[str, float | None] = {}
         for acc in snap.accounts:
             if (
                 acc.number == active_number
@@ -476,12 +477,15 @@ class AutoScreen(Screen):
             ):
                 continue
             row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
+            fetched_by_number[acc.number] = acc.usage.fetched_at
         chip_width: dict[str, int] = {}
-        for windows in row_windows.values():
+        for number, windows in row_windows.items():
+            fetched_at = fetched_by_number[number]
             for label, wpct, resets_at in windows:
                 width = len(
                     data.chip_label(
-                        label, data.reset_text({"resets_at": resets_at}, now),
+                        label,
+                        data.reset_text({"resets_at": resets_at}, now, fetched_at),
                         wpct,
                     )
                 ) + len(f"{wpct:.0f}%")
@@ -553,10 +557,12 @@ class AutoScreen(Screen):
                 # chips and the label can never disagree on which windows
                 # exist for this account.
                 windows = row_windows[acc.number]
+                fetched_at = acc.usage.fetched_at
                 for i, (label, wpct, resets_at) in enumerate(windows):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     label_text = data.chip_label(
-                        label, data.reset_text({"resets_at": resets_at}, now),
+                        label,
+                        data.reset_text({"resets_at": resets_at}, now, fetched_at),
                         wpct,
                     )
                     entry.append(label_text, style=palette.muted)
@@ -581,8 +587,24 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
+                    # A window whose chip just read "refetching" is not
+                    # blocking on a pct known to predate its own reset --
+                    # a "full" beside it would contradict the chip on the
+                    # very same row (#325).
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), self._settings.threshold
+                        (
+                            (
+                                label,
+                                0.0
+                                if data.reset_text(
+                                    {"resets_at": resets_at}, now, fetched_at
+                                )
+                                == "refetching"
+                                else p,
+                            )
+                            for label, p, resets_at in windows
+                        ),
+                        self._settings.threshold,
                     )
                     if kind == "model":
                         entry.append(f"  {blocked_model}-only", style=palette.muted)

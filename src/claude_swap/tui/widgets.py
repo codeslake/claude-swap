@@ -89,7 +89,9 @@ def usage_bar(
     return text
 
 
-def _reset_parts(window: dict, now: float) -> tuple[str, str]:
+def _reset_parts(
+    window: dict, now: float, fetched_at: float | None = None
+) -> tuple[str, str]:
     """Countdown suffix and its clock-extended variant for one window.
 
     ``("resets 2h 13m", "resets 2h 13m · 20:39")`` — the second form is what
@@ -100,7 +102,7 @@ def _reset_parts(window: dict, now: float) -> tuple[str, str]:
     the chips, on the account's OWN detail card this time. Named instead, so
     the reset column never disappears merely because it is unmeasured.
     """
-    reset = data.reset_text(window, now)
+    reset = data.reset_text(window, now, fetched_at)
     if not reset:
         return "reset unknown", "reset unknown"
     clock = data.reset_clock(window, now)
@@ -140,13 +142,13 @@ def usage_rows(
         # (the amounts alone) instead of borrowing "reset unknown".
         suffix = suffix_full = amounts
         if spend.get("resets_at"):
-            reset, reset_full = _reset_parts(spend, now)
+            reset, reset_full = _reset_parts(spend, now, fetched_at)
             suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
         rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
-            reset, reset_full = _reset_parts(window, now)
+            reset, reset_full = _reset_parts(window, now, fetched_at)
             # A lapsed 5h window (no reported reset, no usage) has nothing
             # withheld -- "reset unknown" would assert a gap that isn't one.
             if key == "five_hour" and not window.get("resets_at") and window["pct"] == 0:
@@ -160,7 +162,7 @@ def usage_rows(
             rows.append((label, float(window["pct"]), suffix, suffix_full))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
-        suffix, suffix_full = _reset_parts(window, now)
+        suffix, suffix_full = _reset_parts(window, now, fetched_at)
         suffix, suffix_full = suffix or "", suffix_full or ""
         if pct >= 100:
             suffix = f"{suffix}  (!)" if suffix else "(!)"
@@ -311,7 +313,7 @@ def mini_account_text(
         # helper — one account must not read two ways on two screens.
         text.append(
             data.chip_label(
-                label, data.reset_text(window, now),
+                label, data.reset_text(window, now, fetched_at),
                 pct,
             ),
             style=palette.muted,
@@ -331,7 +333,7 @@ def mini_account_text(
         # the same way whether it is the account's only window or sits
         # beside 5h/7d.
         text.append(
-            data.chip_label(window["name"], data.reset_text(window, now)),
+            data.chip_label(window["name"], data.reset_text(window, now, fetched_at)),
             style=palette.muted,
         )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
