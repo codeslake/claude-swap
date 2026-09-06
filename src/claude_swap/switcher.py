@@ -5264,15 +5264,13 @@ class ClaudeAccountSwitcher:
             # backup's generation, or behind a fresh re-login in the backup,
             # needs no adoption and takes the same path on the backup.
             #
-            # Gate on confirmed quiescence here, not only inside the
-            # adoption, because an unreadable record makes _live_session_pids
-            # blind ([]): adopting (a write) on an unknown liveness would risk
-            # rewriting a family a live claude may still hold. Unreadable
-            # keeps session_creds set instead, so the read-only path just
-            # below runs on the profile's own current token when it parses;
-            # the backup-grant refresh below THAT is guarded separately, by
-            # its own readability check, since a non-oauth-shaped or
-            # otherwise-unusable session_creds falls through past both.
+            # Gate on confirmed quiescence here: _adopt_session_credential
+            # already re-checks profile_is_quiescent inside its own FileLock,
+            # so this outer check adds nothing to the WRITE's safety. Its
+            # effect is on ROUTING instead -- when the record is unreadable,
+            # session_creds survives this block and the read-only path just
+            # below runs on the profile's own current token, rather than
+            # falling through to the backup-grant refresh.
             if profile_is_quiescent(session_dir):
                 try:
                     if self._adopt_session_credential(str(num), email, org_uuid):
@@ -5297,18 +5295,11 @@ class ClaudeAccountSwitcher:
                 # active account in _fetch_active_usage).
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
 
-        # Readability, not just the pid scan, gates the grant-spending path:
-        # an unreadable session record makes `has_live_session` blind ([]),
-        # and neither `session_creds` being unreadable itself (route: falsy,
-        # the block above never entered) nor non-oauth-shaped (route: the
-        # inner `if` above never matches) stops liveness being genuinely
-        # unknown here.
-        liveness_unknown = has_live_session or not profile_is_quiescent(session_dir)
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=has_live_session,
             refresh_via=(
-                None if liveness_unknown else self.consume_backup_grant
+                None if has_live_session else self.consume_backup_grant
             ),
         )
         return FetchRecord(

@@ -10720,7 +10720,10 @@ class TestFreshenRoutesThroughGate:
     ):
         """The fail-closed skip above is silent otherwise: nothing names the
         slot or the stuck record, so an account can sit out of the fleet
-        forever with no lead to a human. The diagnostic must name both."""
+        forever with no lead to a human. The diagnostic must name both --
+        and must be VISIBLE on the daemon's default run, which is INFO
+        (logging_config.setup_logging with debug=False), not only under a
+        caplog level forced down to DEBUG."""
         harness = EngineHarness(temp_home)
         harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
         session_dir = harness.switcher._session_dir("2", "b@example.com")
@@ -10728,7 +10731,7 @@ class TestFreshenRoutesThroughGate:
         (session_dir / "sessions" / "s1.json").write_text(
             "{ not json", encoding="utf-8"
         )
-        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
             status = harness.engine._freshen_target("2", "b@example.com")
         assert status == "skip-live-session"
         messages = [r.getMessage() for r in caplog.records]
@@ -10739,11 +10742,10 @@ class TestFreshenRoutesThroughGate:
 
     def test_control_readable_live_session_still_skips(self, temp_home):
         """The control: a readable record with a genuinely live pid must
-        still stop the freshen -- the fix must not simply disable the
-        existing check. Drives the real predicate (a session record naming
-        this test process's own pid, so ``is_pid_alive`` reads True) rather
-        than patching ``live_session_pids_for`` in isolation, which the
-        freshen path no longer even calls."""
+        still stop the freshen. Drives the real predicate end to end (a
+        session record naming this test process's own pid, so
+        ``scan_live_sessions`` reads it as live) rather than patching a pid
+        helper in isolation."""
         harness = EngineHarness(temp_home)
         harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
         session_dir = harness.switcher._session_dir("2", "b@example.com")

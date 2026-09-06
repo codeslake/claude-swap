@@ -1098,10 +1098,9 @@ class AutoSwitchEngine:
         from claude_swap.session import scan_live_sessions
 
         session_dir = self.switcher._session_dir(number, email)
-        # `sessions` alone would be the pid check (`live_session_pids_for`),
-        # which one scan of the same directory already subsumes: a non-empty
-        # list makes `unreadable` irrelevant to the verdict, so there is
-        # nothing a separate pid call adds here.
+        # One scan carries both the live pids and the unreadable count, so
+        # a record that cannot be parsed is never lost behind a pid-only
+        # check: either signal alone is enough to skip below.
         sessions, unreadable = scan_live_sessions(session_dir)
         if sessions or unreadable:
             # A live `cswap run` session owns this account's token in its own
@@ -1121,7 +1120,12 @@ class AutoSwitchEngine:
                 # (Claude Code's own files; cswap never deletes them). Name
                 # the slot and the directory, the same shape as
                 # `_ensure_no_live_session`'s identical verdict.
-                _logger.debug(
+                # WARNING, not debug: the daemon runs at INFO by default
+                # (logging_config.setup_logging), and a debug-level record
+                # here never reaches the log file or console at all --
+                # silently removing a slot from the fleet earns better than
+                # a level nobody enables.
+                _logger.warning(
                     "Account-%s (%s): %d session record(s) in %s could "
                     "not be read, so whether a Claude instance is live "
                     "cannot be determined; skipping as a freshen "

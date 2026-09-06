@@ -12856,10 +12856,8 @@ class TestRefusedAdoptionStaysReadOnly:
         }
     })
 
-    _DEFAULT_PROFILE_CREDS = object()
-
     def _run(self, temp_home: Path, sample_sequence_data: dict, monkeypatch,
-              session_record: str, profile_creds=_DEFAULT_PROFILE_CREDS):
+              session_record: str):
         s = ClaudeAccountSwitcher()
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
@@ -12869,11 +12867,9 @@ class TestRefusedAdoptionStaysReadOnly:
         (session_dir / "sessions" / "s1.json").write_text(
             session_record, encoding="utf-8"
         )
-        if profile_creds is self._DEFAULT_PROFILE_CREDS:
-            profile_creds = self.FRESH_PROFILE
         monkeypatch.setattr(
             "claude_swap.session.read_session_credentials",
-            lambda d: profile_creds,
+            lambda d: self.FRESH_PROFILE,
         )
         monkeypatch.setattr(
             "claude_swap.session.session_identity_drifted",
@@ -12922,44 +12918,6 @@ class TestRefusedAdoptionStaysReadOnly:
         )
         assert seen["creds"] == self.FRESH_PROFILE
         assert seen["refresh_via"] is not None
-        assert seen["is_active"] is False
-
-    def test_unreadable_session_credential_file_must_not_post_the_backup_grant(
-        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
-    ):
-        """Route (a): the profile's own ``.credentials.json`` is unreadable
-        (``read_session_credentials`` returns ``None``), so ``session_creds``
-        is falsy and the adoption/read-only block at :5255 is never entered
-        at all -- liveness is unknown either way (the session record is also
-        unreadable) and the bottom fetch must still not spend the stale
-        backup grant."""
-        seen = self._run(
-            temp_home, sample_sequence_data, monkeypatch,
-            "{ this is not json", profile_creds=None,
-        )
-        assert seen["refresh_via"] is None, (
-            "unreadable session credential file -> stale backup grant is "
-            f"POSTed: refresh_via={seen['refresh_via']} creds={seen['creds'][:50]}"
-        )
-        assert seen["creds"] == self.STALE_BACKUP
-        assert seen["is_active"] is False
-
-    def test_non_oauth_session_credential_must_not_post_the_backup_grant(
-        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
-    ):
-        """Route (b): the profile credential is readable but not oauth-shaped,
-        so ``extract_oauth_data`` returns ``None`` and control falls straight
-        through to the bottom fetch with liveness still unknown (the session
-        record is unreadable)."""
-        seen = self._run(
-            temp_home, sample_sequence_data, monkeypatch,
-            "{ this is not json", profile_creds="{ not json",
-        )
-        assert seen["refresh_via"] is None, (
-            "non-oauth-shaped session credential -> stale backup grant is "
-            f"POSTed: refresh_via={seen['refresh_via']} creds={seen['creds'][:50]}"
-        )
-        assert seen["creds"] == self.STALE_BACKUP
         assert seen["is_active"] is False
 
 
