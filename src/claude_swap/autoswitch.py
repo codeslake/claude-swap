@@ -3271,11 +3271,17 @@ class AutoSwitchEngine:
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
 
-        Takes the min over every row, not only the active account's: a
-        candidate's reset-driven wake (``plan_after_fetch`` pins its
-        ``next_poll_at`` to its own reset) must cut the sleep too, or a
-        reset that makes a candidate immediately due waits for the active
-        row's cadence instead.
+        Takes the min over every FETCHABLE row, not only the active
+        account's: a candidate's reset-driven wake (``plan_after_fetch``
+        pins its ``next_poll_at`` to its own reset) must cut the sleep too,
+        or a reset that makes a candidate immediately due waits for the
+        active row's cadence instead. A row ``due_candidate`` will never
+        fetch again (sentinel, in backoff, or a dead token) is excluded:
+        ``record()`` writes ``nextPollAt`` only on its success branch, so
+        such a row's plan is frozen in the past forever and would otherwise
+        pin every sleep at ``URGENT_INTERVAL_S``. The active row always
+        votes regardless — it is not gated on fetchability, matching every
+        other call site that reads its usage unconditionally.
 
         The planner tightens the active row to URGENT_INTERVAL_S while it
         burns toward the threshold, but the loop always slept
@@ -3294,19 +3300,31 @@ class AutoSwitchEngine:
         Guarded at the engine's own call site rather than in the switcher:
         every other ``fetch=set()`` caller is a plain store-only read with no
         `_stop` concept, and legitimately wants the heal write.
+
+        No early-out on ``current is None`` (an unmanaged or absent login):
+        a candidate can still be due, and there is no cheaper source of that
+        answer than this same store read.
         """
         if self._stop.is_set():
             return delay
         try:
+            now = self.clock()
+            current = self.switcher.current_account_number()
             entries = self.switcher.usage_entries_by_account(fetch=set())
             due_ats = [
                 entry.next_poll_at
-                for entry in entries.values()
+                for num, entry in entries.items()
                 if entry.next_poll_at is not None
+                and (
+                    num == current
+                    or not (
+                        entry.sentinel or entry.in_backoff(now) or entry.token_dead()
+                    )
+                )
             ]
             if not due_ats:
                 return delay
-            due_in = min(due_ats) - self.clock()
+            due_in = min(due_ats) - now
             # Clamp the DEADLINE, not the result. max(min(delay, due_in), U)
             # raises a delay that was ALREADY below U: at the configurable
             # floor of 15s it turns a 13.5s jittered sleep into 60s, and at

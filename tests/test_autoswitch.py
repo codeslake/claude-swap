@@ -3394,8 +3394,9 @@ class TestLoopObeysThePollPlan:
     the account sat over the threshold until the engine was restarted by hand.
     """
 
-    def _plan(self, harness, *, due_in: float) -> None:
-        num = harness.engine.switcher.current_account_number()
+    def _plan(self, harness, *, due_in: float, num: str | None = None) -> None:
+        if num is None:
+            num = harness.engine.switcher.current_account_number()
         real = harness.engine.switcher.usage_entries_by_account
 
         def patched(fetch=frozenset(), **kw):
@@ -3443,18 +3444,6 @@ class TestLoopObeysThePollPlan:
         delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
         assert 0.9 * 60 <= delay <= 1.1 * 60
 
-    def _plan_candidate(self, harness, num: str, *, due_in: float) -> None:
-        real = harness.engine.switcher.usage_entries_by_account
-
-        def patched(fetch=frozenset(), **kw):
-            entries = dict(real(fetch=fetch, **kw))
-            entries[num] = replace(
-                entries[num], next_poll_at=harness.clock() + due_in
-            )
-            return entries
-
-        harness.engine.switcher.usage_entries_by_account = patched
-
     def test_a_candidates_sooner_plan_shortens_the_sleep(self, harness):
         """A reset-driven wake is written to a CANDIDATE's own row
         (`plan_after_fetch`), not only the active account's — the loop must
@@ -3464,7 +3453,7 @@ class TestLoopObeysThePollPlan:
         )
         current = harness.engine.switcher.current_account_number()
         candidate = "2" if current != "2" else "3"
-        self._plan_candidate(harness, candidate, due_in=60.0)
+        self._plan(harness, due_in=60.0, num=candidate)
         assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 60.0
 
     def test_a_candidates_distant_plan_does_not_shorten_the_sleep(self, harness):
@@ -3475,8 +3464,47 @@ class TestLoopObeysThePollPlan:
         )
         current = harness.engine.switcher.current_account_number()
         candidate = "2" if current != "2" else "3"
-        self._plan_candidate(harness, candidate, due_in=3600.0)
-        assert harness.engine._next_delay(TickOutcome.NO_ACTION) <= 1.1 * 60
+        self._plan(harness, due_in=3600.0, num=candidate)
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert 0.9 * 60 <= delay <= 1.1 * 60
+
+    def test_a_quarantined_candidates_frozen_plan_never_pins_the_floor(
+        self, harness
+    ):
+        """A row `due_candidate` will never fetch again (quarantined, here
+        via authDeadStrikes) must not vote: `record()` only writes
+        `nextPollAt` on its success branch, so a quarantined row's plan is
+        frozen at whatever it was when it stopped being fetched — counting
+        it would pin the loop at URGENT_INTERVAL_S forever instead of the
+        configured cadence."""
+        harness.engine.settings = replace(
+            harness.engine.settings, interval_seconds=360.0
+        )
+        current = harness.engine.switcher.current_account_number()
+        quarantined = "2" if current != "2" else "3"
+        path = harness.switcher._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                quarantined: {
+                    "email": f"{'b' if quarantined == '2' else 'c'}@example.com",
+                    "organizationUuid": "",
+                    "authDeadStrikes": 1,
+                    "consecutiveFailures": 5,
+                    "lastError": "invalid_grant",
+                    "backoffUntil": 0.0,
+                    "fetchedAt": harness.clock.now - 1000.0,
+                    "nextPollAt": harness.clock.now - 500.0,
+                    "lastGood": {"five_hour": {"pct": 10.0}},
+                }
+            },
+        }))
+        delay = harness.engine._next_delay(TickOutcome.NO_ACTION)
+        assert 0.9 * 360 <= delay <= 1.1 * 360, (
+            f"a quarantined row's frozen next_poll_at pinned the sleep at "
+            f"{delay}, not the configured 360s cadence"
+        )
 
 
 class TestSessionThreshold:
