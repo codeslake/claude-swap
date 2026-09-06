@@ -308,7 +308,11 @@ def mini_account_text(
         # Same chip the auto view's Next-best rows draw, from the same
         # helper — one account must not read two ways on two screens.
         text.append(
-            data.chip_label(label, data.reset_text(window, now)), style=palette.muted
+            data.chip_label(
+                label, data.reset_text(window, now),
+                data.five_hour_full_window(label, pct, window.get("resets_at")),
+            ),
+            style=palette.muted,
         )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
         if key == "seven_day":

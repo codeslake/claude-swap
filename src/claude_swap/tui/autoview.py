@@ -77,18 +77,6 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
 
-def _five_hour_full_window(label: str, wpct: float, resets_at: str | None) -> str | None:
-    """``chip_label``'s ``full_window``, for the 5h window only.
-
-    A 5h window with no reported reset AND no usage has nothing withheld —
-    the whole window is what's left. A 5h window with usage but no reported
-    reset is a LIVE window whose reset the server withheld, and any other
-    window (7d, a scoped model) keeps the plain unknown-reset marker; #325
-    is what resolves those.
-    """
-    return label if label == "5h" and not resets_at and not wpct else None
-
-
 class AutoScreen(Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
@@ -494,7 +482,7 @@ class AutoScreen(Screen):
                 width = len(
                     data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now),
-                        _five_hour_full_window(label, wpct, resets_at),
+                        data.five_hour_full_window(label, wpct, resets_at),
                     )
                 ) + len(f"{wpct:.0f}%")
                 chip_width[label] = max(chip_width.get(label, 0), width)
@@ -569,7 +557,7 @@ class AutoScreen(Screen):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
                     label_text = data.chip_label(
                         label, data.reset_text({"resets_at": resets_at}, now),
-                        _five_hour_full_window(label, wpct, resets_at),
+                        data.five_hour_full_window(label, wpct, resets_at),
                     )
                     entry.append(label_text, style=palette.muted)
                     pct_text = f"{wpct:.0f}%"

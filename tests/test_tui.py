@@ -702,6 +702,38 @@ class TestMiniAccountText:
         assert chip == "5h(⟳2h28m):"
         assert f"{chip}100%" in mini_account_text(acc, now).plain
 
+    def test_a_dead_5h_window_reads_its_own_full_countdown_on_the_dashboard(self):
+        """The same fix as the auto view's Next-best row (PR #325): a 5h
+        window with no reported reset AND no usage reads its own full-window
+        countdown here too, not `⟳?` -- the dashboard and the auto view share
+        `data.chip_label`/`data.five_hour_full_window`, so a fix to one that
+        does not reach the other reproduces the exact "comment asserts an
+        invariant the code does not hold" shape #323 was opened for."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 0.0}}, fetched_at=now, age_s=0.0,
+        )
+        acc = make_account(1, entry=entry)
+        assert "5h(⟳5h):0%" in mini_account_text(acc, now).plain
+
+    def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker_on_the_dashboard(
+        self,
+    ):
+        """CONTROL for the test above: a 5h window with usage but no
+        reported reset is a live window whose reset the server withheld, and
+        must keep `⟳?` on the dashboard exactly as it does on the auto
+        view."""
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 42.0}}, fetched_at=now, age_s=0.0,
+        )
+        acc = make_account(1, entry=entry)
+        assert "5h(⟳?):42%" in mini_account_text(acc, now).plain
+
     @pytest.mark.parametrize(
         "age_s, expect_dim",
         [(5.0, False), (STALE_OK_S + 100, True)],
