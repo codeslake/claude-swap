@@ -535,7 +535,7 @@ class AutoScreen(Screen):
                 # axis from a rate-limit window), so this row was the only
                 # place the same account read two different ways.
                 spend = spend_row(
-                    usage_rows(acc.usage.last_good, time.time())
+                    usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
                 )
                 if spend is not None:
                     _label, spend_pct, spend_suffix, _full = spend
@@ -589,15 +589,15 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
-                    # A window whose chip just read "refetching" has no
+                    # A window whose chip just read data.REFETCHING has no
                     # opinion to contribute -- its pct provably predates its
-                    # own reset, so it is dropped rather than zeroed: zeroing
-                    # would still block at threshold <= 0, right beside a
-                    # chip saying otherwise (#325).
+                    # own reset -- so it is dropped rather than zeroed: a
+                    # zeroed pct would still be a fabricated measurement,
+                    # never one the window actually reported (#325).
                     kind, blocked_model = classify_candidate_block(
                         (
                             (label, p) for label, p, reset in chips
-                            if reset != "refetching"
+                            if reset != data.REFETCHING
                         ),
                         self._settings.threshold,
                     )

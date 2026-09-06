@@ -103,6 +103,9 @@ def window_pct(last_good: dict | None, key: str) -> float | None:
     return float(pct) if isinstance(pct, (int, float)) else None
 
 
+REFETCHING = "refetching"
+
+
 def reset_text(
     window: dict | None, now: float, fetched_at: float | None = None
 ) -> str | None:
@@ -131,7 +134,7 @@ def reset_text(
     remaining = ts - now
     if remaining <= 0:
         if fetched_at is not None and fetched_at < ts:
-            return "refetching"
+            return REFETCHING
         return "resets now"
     return f"resets {format_duration(remaining)}"
 
@@ -221,6 +224,7 @@ def clock_stamp() -> str:
 
 __all__ = [
     "ActionResult",
+    "REFETCHING",
     "SnapshotSource",
     "format_age",
     "format_duration",

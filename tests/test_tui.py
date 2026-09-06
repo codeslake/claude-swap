@@ -2570,6 +2570,31 @@ class TestUnswitchableRowsAreListed:
         assert "$10.29" in out and "$20.00" in out, out
         assert "51%" in out, out
 
+    def test_a_spend_only_candidates_reset_agrees_with_the_dashboard(self):
+        """PR #325, the pay-as-you-go row: this branch used to call
+        `usage_rows` with no `fetched_at`, so an elapsed spend reset with a
+        pre-reset pct read `resets now` here while the dashboard's
+        `mini_account_text` (which IS threaded) already read `refetching`
+        for the same account -- one account reading two ways again, the
+        exact defect the comment three lines above names."""
+        now = time.time()
+        stale_usage = UsageEntry(
+            last_good={
+                "spend": {
+                    "pct": 96.0, "used": 48.0, "limit": 50.0,
+                    "resets_at": _iso_in(-60),
+                },
+            },
+            fetched_at=now - 120,  # measured well before the reset fired
+            age_s=120.0,
+        )
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "paid@x.com", switchable=True, usage=stale_usage),
+        ), active="1")
+        assert "refetching" in out, out
+        assert "resets now" not in out, out
+
     def test_spend_does_not_enter_the_ranking(self):
         """Showing spend must not make it a sort key. Spend is a budget, not
         rate-limit headroom, and `relevant_windows` excludes it from every
