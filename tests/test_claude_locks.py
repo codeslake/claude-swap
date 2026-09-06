@@ -34,20 +34,20 @@ def lock_dir(tmp_path: Path) -> Path:
     return tmp_path / "target.lock"
 
 
-def _wait_for(predicate, *, timeout=5.0, interval=0.01):
-    """Poll `predicate` until it is true, or `timeout` elapses.
+def _wait_for(predicate):
+    """Poll `predicate` until it is true, or 5s elapses.
 
     A PREMISE gate: the heartbeat tick it waits on can take arbitrarily long
     on a loaded runner, so a fixed sleep races it. Returns the last value of
     `predicate()` either way; a timeout is a False the caller turns into its
     own assertion message, not a swallowed pass.
     """
-    deadline = time.monotonic() + timeout
+    deadline = time.monotonic() + 5.0
     while True:
         result = predicate()
         if result or time.monotonic() >= deadline:
             return result
-        time.sleep(interval)
+        time.sleep(0.01)
 
 
 class TestProperLockfile:
@@ -747,7 +747,7 @@ class TestTheAcquireAndReleaseAreBounded:
                 "premise: no tick read the lock after arming, so no rewind "
                 "was ever placed for one to see"
             )
-            time.sleep(0.15)
+            _wait_for(lambda: touches["n"] > before)
             after = touches["n"]
 
         assert after > before, (
@@ -808,7 +808,7 @@ class TestTheAcquireAndReleaseAreBounded:
         monkeypatch.setattr(claude_locks.os, "utime", counting_utime)
         monkeypatch.setattr(claude_locks.os, "stat", failing_stat)
         with proper_lockfile(lock, timeout=2.0):
-            time.sleep(0.4)
+            _wait_for(lambda: state["after"] >= 2)
         monkeypatch.undo()
 
         assert state["injected"], (
@@ -2153,10 +2153,10 @@ class TestATransientErrnoIsNotFatalToTheHold:
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.02)
         monkeypatch.setattr(claude_locks.os, "utime", counting)
         with proper_lockfile(lock, timeout=2.0):
-            time.sleep(0.2)
+            _wait_for(lambda: ticks["n"] > 1)
             assert lock.exists(), "premise: the lock was never taken"
         assert ticks["n"] > 1, (
-            f"{ticks['n']} refresh(es) in 0.2s at a 0.02s interval — the "
+            f"{ticks['n']} refresh(es) at a 0.02s interval — the "
             "instrument, not the code"
         )
         assert not lock.exists()
