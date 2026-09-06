@@ -152,7 +152,7 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
     return reset_text(last_good.get(key), now)
 
 
-def chip_label(label: str, reset: str | None) -> str:
+def chip_label(label: str, reset: str | None, full_window: str | None = None) -> str:
     """The reading for one window, without its percentage: ``5h(⟳2h28m)``.
 
     THE one place that decides how a window reads — the dashboard's inactive
@@ -167,8 +167,16 @@ def chip_label(label: str, reset: str | None) -> str:
     "nothing to report" when it meant the opposite. ``?`` keeps the same
     token shape a known reset has (``5h(⟳?):``) so a column of chips still
     lines up — callers compute width from this string, never a literal.
+
+    ``full_window`` is opt-in and unused by every existing caller: a window
+    that reports no reset AND no usage has nothing withheld, the whole
+    window is what's left, so a caller that has already established that may
+    pass its literal duration (e.g. ``"5h"``) to read as its own countdown
+    instead of the unknown-reset marker.
     """
     if not reset:
+        if full_window:
+            return f"{label}(⟳{full_window}):"
         return f"{label}(⟳?):"
     return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
 

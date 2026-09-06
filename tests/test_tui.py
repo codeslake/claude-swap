@@ -2611,6 +2611,52 @@ class TestUnswitchableRowsAreListed:
         assert "Fable-only" in out, out
         assert "Fable(⟳?):91%" in out, out
 
+    def test_a_dead_5h_window_reads_its_own_full_countdown_not_unknown(self):
+        """A 5h window with no reported reset AND no usage is not a gap to
+        flag -- the whole window is what's left, so it reads that literally
+        instead of the uniform `⟳?` marker (owner-directed, PR #325 round).
+        The 7d window on the same account still has no reported reset
+        either, and must keep reading `⟳?`: this PR does not touch 7d."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
+            }),
+        ), active="1")
+        assert "5h(⟳5h):0%" in out, out
+        assert "7d(⟳?):0%" in out, out
+
+    def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker(self):
+        """CONTROL for the pct conjunct above: a 5h window that HAS usage but
+        no reported reset is a live window whose reset the server withheld,
+        not an untouched one -- it must keep `⟳?`, never the full-window
+        countdown."""
+        from tests.test_autoswitch import _iso_at
+
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 42.0}, "seven_day": {"pct": 9.0,
+                    "resets_at": _iso_at(time.time() + 2 * 86400)},
+            }),
+        ), active="1")
+        assert "5h(⟳?):42%" in out, out
+
+    def test_a_budget_only_account_names_no_reset_marker_at_all(self):
+        """A monthly-budget (API-key/spend) account has no usage-window
+        reset to report -- `usage unknown`/`⟳?` are both false there.
+        Owner-directed, same round: the $$ chip must read its own truth,
+        not borrow the unknown-reset wording."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, last_good={
+                "spend": {"used": 12.5, "limit": 50.0, "pct": 25.0, "currency": "USD"},
+            }),
+        ), active="1")
+        assert "$$" in out, out
+        assert "$12.50 / $50.00" in out, out
+        assert "reset unknown" not in out, out
+
     def test_panel_top_matches_the_engines_pick_under_consume_first(
         self, temp_home
     ):

@@ -134,9 +134,16 @@ def usage_rows(
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
-        reset, reset_full = _reset_parts(spend, now)
-        suffix = f"{reset}  {amounts}" if reset else amounts
-        suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
+        if spend.get("resets_at"):
+            reset, reset_full = _reset_parts(spend, now)
+            suffix = f"{reset}  {amounts}" if reset else amounts
+            suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
+        else:
+            # A monthly budget the server never reported a reset for has no
+            # usage-window reset to name at all -- unlike 5h/7d/scoped, this
+            # is not a gap in a real countdown, so it reads its own truth
+            # (the amounts alone) instead of borrowing "reset unknown".
+            suffix = suffix_full = amounts
         rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
