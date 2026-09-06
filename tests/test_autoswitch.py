@@ -2565,9 +2565,12 @@ class TestFreshening:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
         h.make_live("a@example.com", 1)
-        with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
-        ), patch(
+        target_session_dir = h.switcher._session_dir("2", "b@example.com")
+        (target_session_dir / "sessions").mkdir(parents=True)
+        (target_session_dir / "sessions" / "s1.json").write_text(
+            json.dumps({"pid": os.getpid()}), encoding="utf-8"
+        )
+        with patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
@@ -2635,9 +2638,12 @@ class TestFreshening:
         h.seed(1, "a@example.com")
         h.seed(2, "b@example.com", expires_at=1)  # long expired
         h.make_live("a@example.com", 1)
-        with patch.object(
-            h.switcher, "live_session_pids_for", return_value=[4242]
-        ), patch(
+        target_session_dir = h.switcher._session_dir("2", "b@example.com")
+        (target_session_dir / "sessions").mkdir(parents=True)
+        (target_session_dir / "sessions" / "s1.json").write_text(
+            json.dumps({"pid": os.getpid()}), encoding="utf-8"
+        )
+        with patch(
             "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials"
         ) as mock_refresh:
             outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(10)})
@@ -10709,16 +10715,43 @@ class TestFreshenRoutesThroughGate:
             f"unreadable session record -> backup grant spent; status={status!r}"
         )
 
-    def test_control_readable_live_session_still_skips(self, temp_home):
-        """The control: a readable record with a live pid must still stop
-        the freshen -- the fix must not simply disable the existing check."""
+    def test_unreadable_session_record_skip_names_the_slot_and_record(
+        self, temp_home, caplog
+    ):
+        """The fail-closed skip above is silent otherwise: nothing names the
+        slot or the stuck record, so an account can sit out of the fleet
+        forever with no lead to a human. The diagnostic must name both."""
         harness = EngineHarness(temp_home)
         harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
-        with patch.object(
-            harness.switcher, "live_session_pids_for", return_value=[4242]
-        ), patch.object(
-            harness.switcher, "consume_backup_grant"
-        ) as gate:
+        session_dir = harness.switcher._session_dir("2", "b@example.com")
+        (session_dir / "sessions").mkdir(parents=True)
+        (session_dir / "sessions" / "s1.json").write_text(
+            "{ not json", encoding="utf-8"
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            status = harness.engine._freshen_target("2", "b@example.com")
+        assert status == "skip-live-session"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "2" in m and "b@example.com" in m and str(session_dir / "sessions") in m
+            for m in messages
+        ), f"skip left no diagnostic naming the slot and the record: {messages}"
+
+    def test_control_readable_live_session_still_skips(self, temp_home):
+        """The control: a readable record with a genuinely live pid must
+        still stop the freshen -- the fix must not simply disable the
+        existing check. Drives the real predicate (a session record naming
+        this test process's own pid, so ``is_pid_alive`` reads True) rather
+        than patching ``live_session_pids_for`` in isolation, which the
+        freshen path no longer even calls."""
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)  # near-expiry
+        session_dir = harness.switcher._session_dir("2", "b@example.com")
+        (session_dir / "sessions").mkdir(parents=True)
+        (session_dir / "sessions" / "s1.json").write_text(
+            json.dumps({"pid": os.getpid()}), encoding="utf-8"
+        )
+        with patch.object(harness.switcher, "consume_backup_grant") as gate:
             status = harness.engine._freshen_target("2", "b@example.com")
         assert status == "skip-live-session"
         assert not gate.called

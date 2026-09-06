@@ -198,7 +198,11 @@ ERROR_NOTES = {
 }
 
 SENTINEL_NOTES = {
-    USAGE_TOKEN_EXPIRED: "token expired — auto-refreshing on the next pass (≤1m); no action needed",
+    # Not always the ≤1m the wording used to promise: this also covers an
+    # unreadable session record, where liveness is unknown and nothing
+    # refreshes it until the record is repaired (a debug log names the slot
+    # and the record when that is why a candidate is being skipped).
+    USAGE_TOKEN_EXPIRED: "token expired — refreshes automatically once Claude Code or cswap can safely do it; if this persists, check the account's session record",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
@@ -5262,9 +5266,13 @@ class ClaudeAccountSwitcher:
             #
             # Gate on confirmed quiescence here, not only inside the
             # adoption, because an unreadable record makes _live_session_pids
-            # blind ([]) and "unknown" must not reach the backup-grant
-            # refresh below; unreadable keeps session_creds so the read-only
-            # path runs.
+            # blind ([]): adopting (a write) on an unknown liveness would risk
+            # rewriting a family a live claude may still hold. Unreadable
+            # keeps session_creds set instead, so the read-only path just
+            # below runs on the profile's own current token when it parses;
+            # the backup-grant refresh below THAT is guarded separately, by
+            # its own readability check, since a non-oauth-shaped or
+            # otherwise-unusable session_creds falls through past both.
             if profile_is_quiescent(session_dir):
                 try:
                     if self._adopt_session_credential(str(num), email, org_uuid):
@@ -5289,11 +5297,18 @@ class ClaudeAccountSwitcher:
                 # active account in _fetch_active_usage).
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
 
+        # Readability, not just the pid scan, gates the grant-spending path:
+        # an unreadable session record makes `has_live_session` blind ([]),
+        # and neither `session_creds` being unreadable itself (route: falsy,
+        # the block above never entered) nor non-oauth-shaped (route: the
+        # inner `if` above never matches) stops liveness being genuinely
+        # unknown here.
+        liveness_unknown = has_live_session or not profile_is_quiescent(session_dir)
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
             is_active=has_live_session,
             refresh_via=(
-                None if has_live_session else self.consume_backup_grant
+                None if liveness_unknown else self.consume_backup_grant
             ),
         )
         return FetchRecord(

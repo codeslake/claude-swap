@@ -1095,13 +1095,15 @@ class AutoSwitchEngine:
         """
         if self.switcher.account_kind_for(number) == "api_key":
             return "ok"  # API keys don't expire/refresh
-        from claude_swap.session import profile_is_quiescent
+        from claude_swap.session import scan_live_sessions
 
         session_dir = self.switcher._session_dir(number, email)
-        if (
-            self.switcher.live_session_pids_for(number, email)
-            or not profile_is_quiescent(session_dir)
-        ):
+        # `sessions` alone would be the pid check (`live_session_pids_for`),
+        # which one scan of the same directory already subsumes: a non-empty
+        # list makes `unreadable` irrelevant to the verdict, so there is
+        # nothing a separate pid call adds here.
+        sessions, unreadable = scan_live_sessions(session_dir)
+        if sessions or unreadable:
             # A live `cswap run` session owns this account's token in its own
             # profile -- or its record could not be read, which is not
             # evidence that nothing is live, and a live claude may already
@@ -1112,6 +1114,20 @@ class AutoSwitchEngine:
             # its quota is already being consumed by that session anyway.
             # Manual switch_to keeps its warn-and-proceed behavior; auto
             # skips.
+            if unreadable and not sessions:
+                # No live pid was found, so this skip is the unreadable-record
+                # case, not a known-live one -- the slot leaves the fleet
+                # silently until a human happens to find the stuck record
+                # (Claude Code's own files; cswap never deletes them). Name
+                # the slot and the directory, the same shape as
+                # `_ensure_no_live_session`'s identical verdict.
+                _logger.debug(
+                    "Account-%s (%s): %d session record(s) in %s could "
+                    "not be read, so whether a Claude instance is live "
+                    "cannot be determined; skipping as a freshen "
+                    "candidate until repaired",
+                    number, email, unreadable, session_dir / "sessions",
+                )
             return "skip-live-session"
         creds = self.switcher.read_account_credentials(number, email)
         if not creds:
