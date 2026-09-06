@@ -210,11 +210,27 @@ def _pick_drain_candidate(
     best_reset = None
     drain_candidate = None
     for cand in oauth_candidates:
-        ch = headroom.get(cand)
-        if ch is None:
-            continue
-        cu = 100.0 - ch
-        if not (settings.threshold <= cu < DYNAMIC_ADMIT_PCT):
+        if headroom.get(cand) is None:
+            continue  # unreadable this tick — same skip every other pass uses
+        # BAND ON THE 7-DAY PCT ALONE, never the folded (5h/7d/model)
+        # headroom `_rank_candidates_pass` uses elsewhere: 5h refills in
+        # five hours, so nothing in it is wasted at a reset — it is a GATE
+        # (the `h <= 0` servability check, untouched), never a KEY. Drain
+        # exists for the WEEKLY window about to reset with quota unused; an
+        # account whose binding window is its 5h one has nothing weekly to
+        # rescue, and banding on folded headroom admitted exactly that
+        # account, then pinned it under the widened departure bar serving
+        # almost nothing while a real 7d-blocked peer held real headroom
+        # (measured: a 95%-on-5h/10%-on-7d candidate drained ahead of the
+        # account it exists to serve).
+        window = usage.get(cand)
+        seven_day_pct = (
+            window.get("seven_day", {}).get("pct")
+            if isinstance(window, dict) else None
+        )
+        if seven_day_pct is None:
+            continue  # no 7d reading — nothing to band or order by
+        if not (settings.threshold <= seven_day_pct < DYNAMIC_ADMIT_PCT):
             continue  # not in the band only the wider bar reaches
         reset_ts = _seven_day_reset_ts(usage.get(cand), now)
         # Must reset strictly sooner than the account we are ON — the same
@@ -1634,7 +1650,7 @@ class AutoSwitchEngine:
                 settings.strategy == "dynamic"
                 and state.get("draining") == current
                 and active_headroom > 0
-                and self.clock() < state.get("drainingResetAt")
+                and self.clock() < (state.get("drainingResetAt") or 0)
             ):
                 departure_pct = DYNAMIC_ADMIT_PCT
             if utilization < departure_pct:
@@ -2521,6 +2537,16 @@ class AutoSwitchEngine:
         candidate over 5h or 7d as well) still comes back empty and the
         caller's existing blackout path is untouched.
         """
+        # Cleared on EVERY call, not once per tick: this method itself runs
+        # more than once in a tick (the consume-first two-phase commit's
+        # phase-2 refetch, and the no-return bar's own unbarred retry), and
+        # a stale value from an earlier call in the SAME tick is exactly as
+        # wrong as one from last tick — `_perform` must only ever see the
+        # decision the call it is reading FROM actually made (measured: a
+        # phase-1 drain pick surviving into a phase-2 result the ordinary
+        # pass alone had already satisfied left `_perform` marking an
+        # account nothing in the winning pass had widened for).
+        self._drain = None
         kw = dict(
             trigger=trigger,
             consume_first=consume_first,

@@ -30,6 +30,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    _seven_day_reset_ts,
     classify_candidate_block,
     pct_label,
 )
@@ -5275,6 +5276,105 @@ class TestDynamicDrainStateResumesAfterRestart:
             f"got {outcome} — a fresh engine reading the same state file "
             "must resume holding #2's drain bar, not depart it at 95% "
             "against a freshly-forgotten ordinary bar"
+        )
+
+
+class TestDrainCandidateBandsOnTheWeeklyWindowNotFoldedHeadroom:
+    """`_pick_drain_candidate` must band on the 7-day pct ALONE — never the
+    folded (5h/7d/model) headroom `_rank_candidates_pass` ranks by
+    elsewhere. A 5-hour window refills in five hours, so nothing in it is
+    wasted at a reset: it is a GATE (the `h <= 0` servability check,
+    untouched by this), never the KEY that decides the band, the deadline
+    or the order. Drain exists for the weekly window about to reset with
+    quota unused.
+
+    Reproduces exactly: active `#6` healthy on 5h/7d (blocked only by its
+    pinned model, so `dynamic`'s widening still trigger-classifies it
+    below threshold); `#5` genuinely 7d-healthy but resets LATER than the
+    active, so the ordinary reset-ordering filter excludes it on its own;
+    `#2` is 95% on its FIVE-hour window (in the old, wrong band) but only
+    10% on its weekly one (nowhere near either bar) — banding on folded
+    headroom drained #2 anyway, parking on an account with nothing weekly
+    to rescue while #6 held 60 real points.
+    """
+
+    def test_a_five_hour_bound_candidate_is_never_drained(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        h.seed(6, "acct6@example.invalid")
+        h.seed(5, "acct5@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+
+        def acct(five, seven, fable, hours_out):
+            return {
+                "five_hour": {"pct": five},
+                "seven_day": {
+                    "pct": seven,
+                    "resets_at": _iso_at(h.clock.now + hours_out * 3600),
+                },
+                "scoped": [{"name": "Fable", "pct": fable}],
+            }
+
+        fleet = {
+            "6": acct(20.0, 40.0, 95.0, 200),  # active: healthy 5h/7d, model-blocked
+            "5": acct(0.0, 20.0, 99.0, 300),   # 7d-healthy but resets LATER than active
+            "2": acct(95.0, 10.0, 50.0, 24),   # 5h-bound; 7d nowhere near either bar
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert h.active_number() != 2, (
+            f"got outcome={outcome}, active={h.active_number()} — #2's "
+            "binding window is its 5-hour one (95%), not its weekly one "
+            "(10%); it must never be picked as the drain candidate"
+        )
+        assert h.state().get("draining") != "2", "must never mark #2 draining"
+
+
+class TestDrainDoesNotSurviveAStaleCall:
+    """`self._drain` is set inside `_rank_candidates`, which the
+    consume-first two-phase commit (and the no-return bar's own unbarred
+    retry) can call more than once in a single tick. A call that reaches
+    the drain tier must not leave `self._drain` for a LATER call to be read
+    against, once that later call's own data lets the ORDINARY pass admit
+    something on its own — `_perform` would then mark an account
+    `draining` when nothing in the call it actually acted on ever widened
+    for it. Direct calls to `_rank_candidates`, not a full tick: the two-
+    phase commit's own call count/shape is internal plumbing this guard
+    does not need to reproduce."""
+
+    def test_a_later_ordinary_call_clears_an_earlier_drain_pick(self, temp_home):
+        h = EngineHarness(temp_home, threshold=90.0, strategy="dynamic")
+        h.seed(6, "acct6@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.make_live("acct6@example.invalid", 6)
+        args = TestDynamicStrategy._args
+
+        active_usage = _usage7(20.0, 40.0, _R_LATEST)  # active resets far out
+
+        # Call 1: #2 (headroom 5, in-band) is reachable ONLY via the drain
+        # tier — the ordinary pass excludes it outright.
+        drained, *_ = h.engine._rank_candidates(**args(
+            h, usage={"6": active_usage, "2": _usage7(0.0, 95.0, _R_SOON)},
+            current="6", oauth_candidates=["2"],
+            headroom={"6": 60.0, "2": 5.0}, active_headroom=60.0,
+            trigger="dynamic", strategy="dynamic",
+        ))
+        assert drained == ["2"] and h.engine._drain == (
+            "2", _seven_day_reset_ts(_usage7(0.0, 95.0, _R_SOON), h.clock.now)
+        ), "setup check: call 1 must reach the drain tier and set self._drain"
+
+        # Call 2: #2 has genuinely recovered (headroom 50) — the ORDINARY
+        # pass admits it with no drain needed at all.
+        ordinary, *_ = h.engine._rank_candidates(**args(
+            h, usage={"6": active_usage, "2": _usage7(0.0, 50.0, _R_SOON)},
+            current="6", oauth_candidates=["2"],
+            headroom={"6": 60.0, "2": 50.0}, active_headroom=60.0,
+            trigger="dynamic", strategy="dynamic",
+        ))
+        assert ordinary == ["2"], "setup check: call 2 must admit #2 ordinarily"
+        assert h.engine._drain is None, (
+            f"got self._drain={h.engine._drain!r} — call 1's drain pick "
+            "must not survive into call 2's result, which the ordinary "
+            "pass alone already satisfied"
         )
 
 

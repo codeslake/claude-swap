@@ -9,13 +9,17 @@ Not a simulator — a small, deterministic fixture with a fixed answer.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import random
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from tests.test_autoswitch import EngineHarness, _iso_at
 
@@ -23,12 +27,13 @@ from tests.test_autoswitch import EngineHarness, _iso_at
 # below. Not "integration"/trunk; this branch's history.
 _BASE_REV = "e9afe401"
 
-# Captured on this branch (seed picked so `#1` starts ABOVE `threshold` —
-# below it, `best`/`consume-first` never reach `_rank_candidates` at all
+# Captured against `_BASE_REV` (e9afe401), not self-referentially against
+# this branch: `TestDynamicLeavesTheBaseRevisionAlone` re-derives these
+# same four digests from that revision's own `autoswitch.py`, which is the
+# actual adr/0009 measurement. Seed picked so `#1` starts ABOVE `threshold`
+# — below it, `best`/`consume-first` never reach `_rank_candidates` at all
 # and 8x NO_ACTION would pin nothing; `test_traces_actually_rank_not_just_
-# hold` guards against that regressing silently), with `best`/`consume-
-# first` untouched by the dynamic-only admission bar
-# (adr/0009-a-model-window-is-not-a-blackout.md).
+# hold` guards against that regressing silently.
 _SEED = 2
 _GOLDEN = {
     ("best", ""): "0ba84e943f68f81a84f95aea6437eb497d65ad6da9e1494b4e5cd51c3e540b46",
@@ -151,17 +156,33 @@ class TestDynamicLeavesTheBaseRevisionAlone:
     `tests/test_autoswitch.py` (the `EngineHarness` this module imports)
     and `src/claude_swap` are archived from that revision into a scratch
     tree and run there, unchanged, in a subprocess (a different
-    `claude_swap` package must not share `sys.modules` with this process)."""
+    `claude_swap` package must not share `sys.modules` with this process).
+
+    SKIPPED, not failed, when `_BASE_REV` is not in the object database —
+    CI checks out at `refs/pull/N/merge` with `fetch-depth: 1` (no history,
+    depth 1), and this branch's own base commit is never IN that checkout at
+    all. `git archive` under that condition is a `CalledProcessError`, which
+    would redden all three CI jobs today and every run forever once the PR
+    branch is deleted post-merge — measured against `.github/workflows/
+    ci.yml`, not assumed. `tarfile` (stdlib), not the `tar` binary: the
+    Windows job has no shell-out to it.
+    """
 
     def test_e9afe401_produces_the_same_four_digests(self, tmp_path):
         repo_root = Path(__file__).resolve().parents[1]
+        probe = subprocess.run(
+            ["git", "-C", str(repo_root), "cat-file", "-e", f"{_BASE_REV}^{{commit}}"],
+        )
+        if probe.returncode != 0:
+            pytest.skip(f"{_BASE_REV} is not in this checkout's object database")
         old_root = tmp_path / "base"
         old_root.mkdir()
         archive = subprocess.run(
-            ["git", "-C", str(repo_root), "archive", _BASE_REV, "src", "tests"],
+            ["git", "-C", str(repo_root), "archive", "--format=tar", _BASE_REV, "src", "tests"],
             capture_output=True, check=True,
         )
-        subprocess.run(["tar", "-x", "-C", str(old_root)], input=archive.stdout, check=True)
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
+            tf.extractall(old_root, filter="data")  # trusted: our own repo's history
         driver = (
             "import sys, json\n"
             f"sys.path.insert(0, {str(old_root)!r})\n"
@@ -170,7 +191,8 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             "from test_dynamic_isolation import _run_trace, _GOLDEN\n"
             "from pathlib import Path\n"
             "import hashlib, json as _json\n"
-            "out = {}\n"
+            "import claude_swap\n"
+            "out = {'_claude_swap_file': claude_swap.__file__}\n"
             "for i, (strategy, model) in enumerate(_GOLDEN):\n"
             "    trace = _run_trace(Path(sys.argv[1]) / f'b{i}', strategy, model, int(sys.argv[2]))\n"
             "    out[f'{strategy}|{model}'] = hashlib.sha256("
@@ -193,6 +215,18 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             f"STDERR={result.stderr}"
         )
         got = json.loads(result.stdout.strip().splitlines()[-1])
+        # POSITIVE CONTROL: today the editable install is a plain `.pth`
+        # path line, so inserting `old_root/src` first on `sys.path` is
+        # what makes the import resolve to the archived tree — a
+        # setuptools `__editable___*_finder` backend would silently
+        # resolve `claude_swap` to the working tree regardless, and this
+        # test would compare HEAD against HEAD and pass for the wrong
+        # reason. Assert the imported module actually came from `old_root`.
+        assert got.pop("_claude_swap_file").startswith(str(old_root)), (
+            f"the subprocess imported claude_swap from outside {old_root} — "
+            "this test compared HEAD against itself, not against "
+            f"{_BASE_REV}"
+        )
         for (strategy, model), golden in _GOLDEN.items():
             key = f"{strategy}|{model}"
             assert got[key] == golden, (
