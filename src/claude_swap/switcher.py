@@ -4867,32 +4867,53 @@ class ClaudeAccountSwitcher:
         if session_creds:
             session_oauth = oauth.extract_oauth_data(session_creds)
             if session_oauth and session_oauth.get("accessToken"):
-                if not oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
-                    outcome = oauth.try_fetch_usage_for_account(
-                        str(num), email, session_creds, is_active=True,
-                    )
-                    return FetchRecord(
-                        usage=outcome.usage,
-                        error=outcome.error,
-                        retry_after_s=outcome.retry_after_s,
-                    )
                 # The live claude refreshes lazily on its next API call;
                 # requesting now would just 401 (same rule as the owned
                 # active account in _fetch_active_usage).
+                if oauth.is_oauth_token_expired(session_oauth.get("expiresAt")):
+                    return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+                return self._read_only_record(oauth.try_fetch_usage_for_account(
+                    str(num), email, session_creds, is_active=True,
+                ))
+
+        if has_live_session:
+            # No profile credential to read (wiped under the session, or
+            # unreadable): the backup copy serves read-only, and once the
+            # live claude has rotated past it the server refuses it for
+            # good. An expired copy is known refused without asking.
+            backup_oauth = oauth.extract_oauth_data(creds) or {}
+            if oauth.is_oauth_token_expired(backup_oauth.get("expiresAt")):
                 return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+            return self._read_only_record(oauth.try_fetch_usage_for_account(
+                str(num), email, creds, is_active=True,
+            ))
 
         outcome = oauth.try_fetch_usage_for_account(
             str(num), email, creds,
-            is_active=has_live_session,
-            refresh_via=(
-                None if has_live_session else self.consume_backup_grant
-            ),
+            is_active=False,
+            refresh_via=self.consume_backup_grant,
         )
         return FetchRecord(
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
+        )
+
+    @staticmethod
+    def _read_only_record(outcome: oauth.UsageOutcome) -> FetchRecord:
+        """A fetch made with a live session's credential, which cswap must
+        never refresh. A 401 is the live claude having rotated past the copy
+        we hold; it refreshes on its own next call, so the slot is expired,
+        not failing: recording the 401 would back the slot off and draw a
+        429 from the usage endpoint for nothing. Every other error keeps its
+        identity, a 429 above all, since that budget is the account's."""
+        if outcome.error == "http-401":
+            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED)
+        return FetchRecord(
+            usage=outcome.usage,
+            error=outcome.error,
+            retry_after_s=outcome.retry_after_s,
         )
 
     def _run_usage_fetches(
