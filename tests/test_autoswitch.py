@@ -5017,7 +5017,16 @@ class TestAModelWindowIsNotABlackout:
         and 7d both have room — so the model-gated pass empties and the
         retry on 5h/7d alone must both rescue it and rank it (soonest 7-day
         reset first, the consume-first strategy's own key). #2 stays out
-        either way: its OWN 5h sits at the bar with no model involved."""
+        either way: its OWN 5h sits at the bar with no model involved.
+
+        The active (#6) also reports its own over-bar Fable window — every
+        account genuinely pinned to a model reports that model's window,
+        and this round's fix (`_model_window_binds_everywhere`) requires
+        the ACTIVE to be walled too before the retry is allowed to drop the
+        model set (never a candidate-only reading): an active with real
+        Fable headroom must not have the wall dropped just because its
+        candidates all happen to be model-blocked.
+        """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0)
         now = h.clock.now
 
@@ -5037,6 +5046,7 @@ class TestAModelWindowIsNotABlackout:
                 "seven_day": {
                     "pct": 0.0, "resets_at": _iso_at(now + 100 * 86400),
                 },
+                "scoped": [{"name": "Fable", "pct": 95.0}],
             },
             "1": usage(34, 69, 91, 4),
             "2": usage(90, 79, 87, 0.5),
@@ -5762,24 +5772,27 @@ class TestDynamicStrategy:
 
     def test_owner_fixture_no_departure_from_account_5(self, temp_home):
         """Account 5's Fable window sits at the switch threshold (90), but
-        its 5h/7d have room — the model basis, re-picked each tick, must
-        not read that as "active at threshold". Ten ticks, static usage
-        (nothing genuinely changes): zero switches.
+        its 5h/7d have room. Ten ticks, static usage (nothing genuinely
+        changes): zero switches — held by a DIFFERENT guard than the one
+        this test used to exercise, and that is the point of the update
+        below.
 
-        The owner's six accounts alone do not DISCRIMINATE this: every one
-        of them is also blocked on the model-gated axis (>=90), so the
-        landing gate refuses them whether or not the re-pick ran, and this
-        test used to pass with the entire re-pick deleted. Account 7 (added
-        here, not one of the owner's six) is open and healthy on the
-        model-gated axis with headroom clearing account 5's UNWIDENED
-        headroom (10) by more than the hysteresis (10) — so WITHOUT the
-        re-pick, trigger reads "proactive" and account 7 is admitted on
-        plain hysteresis, a real departure. WITH the re-pick, the widened
-        basis (38) is nowhere near `about_to_wall` (#375), so `dynamic`'s
-        proactive arm never fires at all and account 7 (never active, cold)
-        is not an alternation partner either — the hold is `below-threshold`
-        either way, but only the re-pick keeps account 5 the ACTIVE one at
-        the widened 38 rather than misreading it as blocked at 10.
+        The owner's six accounts alone do not DISCRIMINATE the re-pick:
+        every one of them is also blocked on the model-gated axis (>=90),
+        so the landing gate refuses them whether or not the re-pick ran.
+        Account 7 (added here, not one of the owner's six) is open and
+        healthy on the model-gated axis — which is exactly why, post-fix,
+        the re-pick must NOT widen account 5 here: `_model_window_binds_
+        everywhere` is false the moment any account (7) is open with the
+        model folded in, so widening account 5 past its real 10%-headroom
+        Fable reading would be calling a genuinely near-walled active
+        healthy on the strength of an unrelated account's headroom — the
+        exact bug this round fixed (an active pinned on a real wall while
+        a real Fable-healthy candidate sat idle). Account 5 still does not
+        depart, but now because account 7 is COLD (never active) and its
+        model-gated headroom (25) does not clear `cold_switch_cost_pct`
+        (#375's own floor, orthogonal to this fix) — not because the
+        re-pick manufactured a healthier reading for account 5.
         """
         from claude_swap.autoswitch import _dynamic_active_headroom
 
@@ -5795,15 +5808,18 @@ class TestDynamicStrategy:
             "scoped": [{"name": "Fable", "pct": 75.0}],
         }
 
-        # The active_headroom the tick actually uses: unwidened (model-
-        # gated) 10.0 re-picked to the unmodeled 5h/7d value 38.0.
+        # The active_headroom the tick actually uses: UNCHANGED at the
+        # model-gated 10.0 — account 7's real Fable headroom means the
+        # model window does not bind everywhere, so the re-pick must leave
+        # account 5's reading alone rather than widening it to the
+        # unmodeled 38.
         widened = _dynamic_active_headroom(
             h.engine.settings, h.engine._models, fleet_usage, "5", 10.0,
         )
-        assert widened == 38.0, (
-            f"got {widened!r} — account 5's re-picked basis must be its "
-            "unmodeled 5h/7d headroom (100 - 62 = 38), not the model-gated "
-            "10"
+        assert widened == 10.0, (
+            f"got {widened!r} — account 7 is open on the model-gated axis, "
+            "so the window does not bind everywhere and account 5's real "
+            "10% Fable headroom must stand, not be widened to 38"
         )
 
         switches = 0
@@ -5825,11 +5841,12 @@ class TestDynamicStrategy:
         )
         assert h.active_number() == 5
         # Every hold reads as `cold` (#375: `dynamic`'s proactive arm needs
-        # `about_to_wall`, and account 5's widened headroom (38) is nowhere
-        # near it; account 7 clears the floor but is cold and the active
-        # is not walled) — never the plain-hysteresis "proactive" a dropped
-        # re-pick would have taken (which would have switched to 7, not
-        # held).
+        # `about_to_wall` (SPENT_HEADROOM_PCT=3.0), and account 5's
+        # headroom (10, no longer widened by this round's fix) is nowhere
+        # near it either; account 7 is open but never active, so it lands
+        # cold and does not clear `cold_switch_cost_pct`) — never the
+        # plain-hysteresis "proactive" a fully-dropped re-pick would have
+        # taken (which would have switched to 7, not held).
         assert all(r == "cold" for r in reasons), reasons
 
     def test_owner_fixture_account_5_is_the_target(self, temp_home):
@@ -14193,3 +14210,219 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
             "ranking read the 5-hour reset the account is not waiting for"
         )
         assert harness.active_number() == 2
+
+
+
+
+
+
+
+class TestTheModelWindowBindsUnlessItBindsEverywhere:
+    """The 2026-09-07 21:37Z incident, reproduced as fixtures: a fleet stuck
+    switching ONTO, and then pinned ON, a Fable-100% wall (account 4) while a
+    real Fable-82% candidate/escape (account 2) sat idle. Root cause: the
+    "a model window is not a blackout" retry (`_rank_candidates`, the
+    proactive/alternation ranker's own copy, and `_dynamic_active_headroom`'s
+    widening) dropped the model criteria whenever ITS OWN pass came back
+    empty, without ever asking whether the ACTIVE was model-walled too — so
+    an active with genuine model headroom got treated as if the whole fleet
+    were blacked out. `_model_window_binds_everywhere` is the one predicate
+    all three now consume: false the moment ANY account (active included) is
+    still open with the model folded in.
+
+    F1/F4/F5 drive `_rank_candidates` directly (an ENGINE method, bound to a
+    real `EngineHarness`'s switcher/settings — not a bare pure-function
+    reimplementation), the same pattern `TestAModelWindowIsNotABlackout`
+    already uses: a `dynamic`/consume-first-shaped trigger only admits a
+    candidate whose weekly reset is SOONER than the active's, so every
+    fixture below gives the active a far-out reset and candidates a sooner
+    one — a fixture that gives every account the same reset date fails for
+    that reason alone, not the one under test (measured while building
+    this: a uniform `days_out` masked every case behind `reset_ts >=
+    active_reset_ts`).
+
+    F2/F3/F6 drive the full `tick()` — reachable there because an active
+    genuinely AT its wall (Fable 100%, model-gated headroom exactly 0)
+    classifies as `dynamic`'s `at-limit` trigger, which bypasses both the
+    alternation machinery and (structurally, by `_COOLDOWN_GATED_TRIGGERS`
+    excluding `at-limit`) the cooldown gate — so F2/F3 land on the SAME
+    widening fix via two different entry points, and F3's cooldown state
+    turns out to be inert for this exact roster (see its own docstring).
+    """
+
+    @staticmethod
+    def _u(five_h, seven_d, fable, days_out):
+        now = 1_000_000.0
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": seven_d, "resets_at": _iso_at(now + days_out * 86400)},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    def test_f1_never_switch_into_a_wall(self, temp_home):
+        """The 21:37:18Z census verbatim: active #2 (5h 15/7d 60/Fable 82,
+        genuinely open on the model axis) must not have #4 (Fable 100)
+        rescued into the ranking just because #4/#1/#3 are all model-walled
+        — the model window does not bind everywhere while #2 is open.
+        """
+        cls = TestAModelWindowIsNotABlackout()
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        usage = {
+            "2": self._u(15, 60, 82, 100),
+            "4": self._u(8, 86, 100, 2),
+            "1": self._u(0, 100, 92, 4),
+            "3": self._u(0, 79, 100, 3),
+        }
+        headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}
+        args = cls._args(
+            h, usage=usage, current="2", oauth_candidates=["1", "3", "4"],
+            headroom=headroom, active_headroom=headroom["2"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == [], (
+            f"got {list(ordered)!r} — account 2 is open on the model axis "
+            "(Fable 82% < the 90% threshold), so the window does not bind "
+            "everywhere and the retry must not rescue #4's model-only wall"
+        )
+
+    def test_f2_leave_a_wall(self, temp_home):
+        """Active #4 fully walled on Fable (100%, model-gated headroom 0,
+        5h/7d otherwise fine); candidate #2 open (Fable 82%). The owner's
+        stated expectation: switch OUT of the wall to the best real-headroom
+        candidate. Pre-fix this held at #4 forever (`_dynamic_active_
+        headroom` widened 0 to the unmodeled 14, so `_classify_dynamic_
+        trigger` never saw the wall)."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((4, "a4@example.invalid"), (2, "a2@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        fleet = {"4": self._u(8, 86, 100, 1), "2": self._u(15, 60, 82, 1)}
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a Fable-100% active with a Fable-82% "
+            "candidate open must switch, not hold"
+        )
+        assert h.active_number() == 2
+
+    def test_f3_cooldown_does_not_pin_a_walled_active(self, temp_home):
+        """F2's roster with `lastSwitchAt` set inside `cooldown_seconds`.
+        Still switches — but by way of `_dynamic_active_headroom`'s fix,
+        not `_in_cooldown`'s: a model-gated headroom of exactly 0 always
+        classifies as `at-limit` (`_classify_dynamic_trigger`), and
+        `at-limit` is not in `_COOLDOWN_GATED_TRIGGERS` regardless of this
+        round's change — so cooldown was never actually consulted for
+        THIS roster, pre- or post-fix. `_in_cooldown`'s own exemption is
+        proven directly below (`test_in_cooldown_exempts_a_walled_active`),
+        where `at-limit`'s structural bypass does not apply.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((4, "a4@example.invalid"), (2, "a2@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock.now - 10))
+        fleet = {"4": self._u(8, 86, 100, 1), "2": self._u(15, 60, 82, 1)}
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a walled active must escape even inside "
+            "the cooldown window"
+        )
+        assert h.active_number() == 2
+
+    def test_in_cooldown_exempts_a_walled_active(self, temp_home):
+        """`_in_cooldown` itself, direct: a fresh store read shows account
+        4 walled on Fable (headroom 0), `lastSwitchAt` is inside
+        `cooldown_seconds` — `_in_cooldown` must read False (not gated),
+        not the time-only True a caller reached through `proactive`/
+        `alternation`/consume-first-style triggers (unlike `at-limit`,
+        those ARE in `_COOLDOWN_GATED_TRIGGERS`) would otherwise get
+        pinned by for the full 300s.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        h.seed(4, "a4@example.invalid")
+        h.make_live("a4@example.invalid", 4)
+        entries = {
+            "4": _entry_for(self._u(8, 86, 100, 1), h.clock.now),
+        }
+        with patch.object(h.switcher, "usage_entries_by_account", return_value=entries):
+            h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock.now - 10))
+            state = h.engine._read_state()
+            assert h.engine._in_cooldown(state) is False, (
+                "a Fable-walled active (headroom 0) must not be pinned by "
+                "the ordinary time-only cooldown"
+            )
+
+    def test_f4_control_the_primary_pass_still_lands_it(self, temp_home):
+        """F1's roster with #4's Fable at 50% instead of 100%: #4's own
+        binding window is now 7d (86%, headroom 14), never blocked at the
+        90% threshold — admitted by the PRIMARY (model-gated) pass with no
+        retry involved at all. Identical before and after this round's
+        fix: the predicate only gates the RETRY, never the primary pass.
+        """
+        cls = TestAModelWindowIsNotABlackout()
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        usage = {
+            "2": self._u(15, 60, 82, 100),
+            "4": self._u(8, 86, 50, 2),
+            "1": self._u(0, 100, 92, 4),
+            "3": self._u(0, 79, 100, 3),
+        }
+        headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}
+        args = cls._args(
+            h, usage=usage, current="2", oauth_candidates=["1", "3", "4"],
+            headroom=headroom, active_headroom=headroom["2"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == ["4"], (
+            f"got {list(ordered)!r} — #4 is not model-blocked (Fable 50%) "
+            "and must land via the primary pass alone"
+        )
+
+    def test_f5_control_a_true_fleet_wide_blackout_still_retries(self, temp_home):
+        """The design intent #321 exists for, preserved: active #4 AND
+        every candidate (#1, #3) are Fable-walled (100%) — a genuine
+        fleet-wide model blackout. The retry must still drop the model set
+        and rank on 5h/7d: #1's 7d (92%) still blocks it there, #3's (79%)
+        does not, so #3 is the only admissible landing.
+        """
+        cls = TestAModelWindowIsNotABlackout()
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        usage = {
+            "4": self._u(8, 86, 100, 100),
+            "1": self._u(0, 92, 100, 4),
+            "3": self._u(0, 79, 100, 3),
+        }
+        headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}
+        args = cls._args(
+            h, usage=usage, current="4", oauth_candidates=["1", "3"],
+            headroom=headroom, active_headroom=headroom["4"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == ["3"], (
+            f"got {list(ordered)!r} — a true fleet-wide model blackout "
+            "must still retry on 5h/7d and rank #3 (7d 79%), never come "
+            "back empty just because this round bounds the retry"
+        )
+
+    def test_f6_no_flap_back_onto_a_still_walled_account(self, temp_home):
+        """After F2's escape (4 -> 2), the next tick — same fleet, #4 still
+        Fable-walled, #2 still open — must not flap back to #4. Emerges
+        for free from the fix: #2 (active) is open, so `_model_window_
+        binds_everywhere` is false and #4's model-only wall is never
+        dropped back into the ranking.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((4, "a4@example.invalid"), (2, "a2@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        fleet = {"4": self._u(8, 86, 100, 1), "2": self._u(15, 60, 82, 1)}
+        outcome1 = h.tick_with_usage(fleet)
+        assert outcome1 is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(301.0)
+        h.events.clear()
+        outcome2 = h.tick_with_usage(fleet)
+        assert outcome2 is not TickOutcome.SWITCHED, (
+            f"got {outcome2!r} — must not flap back onto #4 while it is "
+            "still Fable-walled"
+        )
+        assert h.active_number() == 2

@@ -888,8 +888,18 @@ def _dynamic_active_headroom(
     call this on the SAME axis — a second, independent computation at
     either site is how the trigger and the re-rank end up deciding on
     different bases within one tick.
+
+    Only when :func:`_model_window_binds_everywhere` says the model window
+    is a fleet-wide blackout: a real candidate still open on the model
+    axis (this account's own window bites nobody else) must read the
+    active as genuinely walled, or the engine calls a fully-blocked active
+    HEALTHY and never leaves it (measured 2026-09-07: pinned on a
+    Fable-100% active for a full poll window with a Fable-82% candidate
+    sitting idle).
     """
     if settings.strategy != "dynamic" or not models or active_headroom is None:
+        return active_headroom
+    if not _model_window_binds_everywhere(usage, models, settings.threshold):
         return active_headroom
     unmodeled = _headroom_by_account(usage, ()).get(current)
     if unmodeled is not None and unmodeled > active_headroom:
@@ -923,6 +933,43 @@ def classify_candidate_block(
     if any(label in ("5h", "7d") for label, _ in blocking):
         return "full", None
     return "model", blocking[0][0]
+
+
+def _model_window_binds_everywhere(
+    usage: dict[str, dict | str | None], models: tuple[str, ...], threshold: float
+) -> bool:
+    """True only when the model window blocks every account in ``usage``
+    (model-gated) and at least one of them is blocked ONLY by that window
+    (:func:`classify_candidate_block` returns ``"model"``, never
+    ``"open"``) — i.e. dropping ``models`` is what rescues the fleet, not
+    a stand-in for a genuine 5h/7d exhaustion. "A MODEL WINDOW IS NOT A
+    BLACKOUT" (#321) only holds where staying model-gated is worse than
+    every alternative; the moment ANY account (the active included, since
+    it is always a key of ``usage``) is still OPEN with the model folded
+    in, the window does not bind everywhere. `_rank_candidates`'s retry,
+    the proactive/alternation ranker's copy of it, and
+    `_dynamic_active_headroom`'s widening all consume this ONE predicate
+    rather than re-deriving their own — the duplicated retry (measured
+    2026-09-07: a fleet stuck switching onto, and then pinned on, a
+    Fable-100% wall while a real Fable-82% candidate sat idle) is what
+    happens when they don't.
+    """
+    if not models:
+        return False
+    saw_model_only_wall = False
+    for value in usage.values():
+        windows = [
+            (label, pct)
+            for label, pct, _ in oauth.relevant_windows(
+                value if isinstance(value, dict) else None, models
+            )
+        ]
+        outcome, _ = classify_candidate_block(windows, threshold)
+        if outcome == "open":
+            return False
+        if outcome == "model":
+            saw_model_only_wall = True
+    return saw_model_only_wall
 
 
 class AutoSwitchEngine:
@@ -1827,13 +1874,20 @@ class AutoSwitchEngine:
                 oauth_candidates, headroom, now, active_headroom,
             )
             floor_headroom = headroom
-            if not warm_ordered and not cold_ordered and self._models:
-                # A MODEL WINDOW IS NOT A BLACKOUT (#321): every candidate
-                # blocked only by the model set folds to headroom 0 above
-                # and is dropped before ever being ranked — retry once on
-                # the unmodeled (5h/7d only) axis, same rule `_rank_
-                # candidates`'s own model retry applies, before calling it
-                # a real blackout.
+            if (
+                not warm_ordered
+                and not cold_ordered
+                and self._models
+                and _model_window_binds_everywhere(usage, self._models, settings.threshold)
+            ):
+                # A MODEL WINDOW IS NOT A BLACKOUT (#321) — ONLY where it
+                # binds everywhere (`_model_window_binds_everywhere`, the
+                # one predicate `_rank_candidates`'s own model retry also
+                # consumes): every candidate blocked only by the model set
+                # folds to headroom 0 above and is dropped before ever
+                # being ranked, but only a fleet-wide model wall (the
+                # active included) makes dropping the model set the right
+                # call — retry once on the unmodeled (5h/7d only) axis.
                 unmodeled = _headroom_by_account(usage, ())
                 warm_ordered, cold_ordered, bar_active = _dynamic_rank(
                     oauth_candidates, unmodeled, now, unmodeled.get(current),
@@ -2790,19 +2844,27 @@ class AutoSwitchEngine:
         now: float,
     ) -> tuple[list[str], bool, float | None, bool]:
         """Rank on the configured model window, and once on 5h/7d alone if
-        that leaves nothing.
+        that leaves nothing AND the model window binds everywhere.
 
-        A MODEL WINDOW IS NOT A BLACKOUT. ``self._models`` folds a pinned
-        model's scoped window into every headroom read, so a candidate whose
-        ONLY over-bar window is that model is dropped as an unhealthy
-        landing exactly like one that is genuinely spent on 5h/7d — and when
-        every candidate carries the same model bar, the ranking empties and
-        the active account is stuck at the wall with 5h/7d room going
-        unused. The retry drops the model set and re-ranks on 5h/7d alone;
-        a candidate blocked there stays blocked in the second pass too, so
-        this is the whole rule, not half of one — a real blackout (every
-        candidate over 5h or 7d as well) still comes back empty and the
-        caller's existing blackout path is untouched.
+        A MODEL WINDOW IS NOT A BLACKOUT — ONLY where it binds everywhere.
+        ``self._models`` folds a pinned model's scoped window into every
+        headroom read, so a candidate whose ONLY over-bar window is that
+        model is dropped as an unhealthy landing exactly like one that is
+        genuinely spent on 5h/7d. When every candidate AND the active
+        carry the same model bar, the ranking empties and the active
+        account is stuck at the wall with 5h/7d room going unused, so the
+        retry drops the model set and re-ranks on 5h/7d alone. But the
+        model-gated pass can also empty because the active itself still
+        has real model headroom and simply outranks every candidate on
+        that axis (nothing wrong with staying put) — dropping the model
+        set THERE moves the fleet onto a wall nothing forced it onto
+        (measured 2026-09-07). ``_model_window_binds_everywhere`` is what
+        tells the two apart: it is false the moment ANY account, active
+        included, is still open with the model folded in. A candidate
+        blocked on 5h/7d as well stays blocked in the second pass too, so
+        this is the whole rule, not half of one — a real blackout still
+        comes back empty and the caller's existing blackout path is
+        untouched.
         """
         kw = dict(
             trigger=trigger,
@@ -2836,7 +2898,11 @@ class AutoSwitchEngine:
         # there — including `best`/`consume-first`, which must never
         # re-target off a plain model-gated exhaustion the owner has not
         # asked either of them to look past.
-        if not ordered and self._models:
+        if (
+            not ordered
+            and self._models
+            and _model_window_binds_everywhere(usage, self._models, settings.threshold)
+        ):
             fallback_headroom = _headroom_by_account(usage, ())
             fb = self._rank_candidates_pass(
                 models=(),
@@ -3614,10 +3680,29 @@ class AutoSwitchEngine:
     # -- helpers --------------------------------------------------------------
 
     def _in_cooldown(self, state: dict) -> bool:
+        """Time-gate a rapid re-switch — except a WALLED active, which
+        cannot serve the pinned model at all and must never be pinned here
+        for the full ``cooldown_seconds`` (measured 2026-09-07: a fleet
+        held on a Fable-100% active for the whole cooldown window with a
+        real candidate open). Reads the active's OWN stored usage
+        (store-only, no network) rather than taking it as a parameter, so
+        every caller of `_in_cooldown` — present or future — gets the
+        exemption without threading it through.
+        """
         last = state.get("lastSwitchAt")
         if not isinstance(last, (int, float)):
             return False
-        return (self.clock() - last) < self.settings.cooldown_seconds
+        if (self.clock() - last) >= self.settings.cooldown_seconds:
+            return False
+        if not self._models:
+            return True
+        current = self.switcher.current_account_number()
+        if current is None:
+            return True
+        entry = self.switcher.usage_entries_by_account(fetch=set()).get(current)
+        value = entry.decision_value() if entry is not None else None
+        h = oauth.account_headroom(value if isinstance(value, dict) else None, self._models)
+        return not (h is not None and h <= 0)
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]
