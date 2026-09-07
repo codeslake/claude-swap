@@ -280,15 +280,17 @@ def approved_form(api_key: str) -> str:
 class _StoreHost(Protocol):
     """The live configuration view ``CredentialStore`` reads from its owner.
 
-    Data only — the store reads these attributes at call time so post-construction
-    overrides (e.g. tests setting ``switcher.platform``) are honored. The store
-    must not reach for any *method* here.
+    Mostly data — the store reads these attributes at call time so post-construction
+    overrides (e.g. tests setting ``switcher.platform``) are honored. The one
+    method, ``_get_sequence_data``, reuses the roster read the owner already
+    performs rather than duplicating it as a second data attribute.
     """
 
     platform: Platform
     credentials_dir: Path
     _logger: logging.Logger
-    _sequence_accounts: dict[str, str]
+
+    def _get_sequence_data(self) -> dict | None: ...
 
 
 class CredentialStore:
@@ -1188,19 +1190,32 @@ class CredentialStore:
         value = self._read_account_credentials_direct(account_num, email, failed)
         if value or failed:
             return value
-        accounts = self._host._sequence_accounts
+        accounts = {
+            num: account.get("email", "")
+            for num, account in (
+                self._host._get_sequence_data() or {}
+            ).get("accounts", {}).items()
+        }
         if accounts.get(account_num) != email:
             return ""
         # The stale number itself is gone from `accounts` (that IS the
         # renumber), so the candidates are a bounded integer sweep up to the
         # highest slot number the roster currently uses, not `accounts`'
-        # own keys — exact lookups only, never a wildcard scan.
-        try:
-            bound = max(
-                [int(account_num)] + [int(n) for n in accounts if n.isdigit()]
-            )
-        except ValueError:
-            return ""
+        # own keys — exact lookups only, never a wildcard scan. `account_num`
+        # is already known to be a key of `accounts` (the check above), so
+        # `int(account_num)` and every `int(n)` below (guarded by `isdigit`)
+        # cannot raise.
+        #
+        # +1: a single bare renumber (one slot removed, every account above
+        # it shifts down by exactly one position) can leave the stale item
+        # exactly ONE past the new roster max — remove slot 3 of 9, slots
+        # 4..9 become 3..8, and the old top slot's backup stays keyed under
+        # 9, one above the new max of 8. Without the +1 that slot is never
+        # probed and the roster's own bound (never above its current max)
+        # forces a re-login the fallback exists to avoid.
+        bound = (
+            max([int(account_num)] + [int(n) for n in accounts if n.isdigit()]) + 1
+        )
         for n in range(1, bound + 1):
             other_num = str(n)
             if other_num == account_num or other_num in accounts:
@@ -1485,10 +1500,15 @@ class CredentialStore:
         # docstring says "conflates absent with unreadable" — so an
         # unreadable-but-present view (a locked Keychain, a permission
         # glitch on the .enc) would pass verification and resurface later.
-        # `_ex` distinguishes the two; either a served value OR an
-        # unreadable verdict aborts the commit.
-        value, unreadable = self._read_account_credentials_ex(account_num, email)
-        if value or unreadable:
+        # DIRECT, never the renumber-fallback wrapper: this asks "is THIS
+        # slot's own item gone", and the fallback answers a different
+        # question ("can this account's login be found somewhere") — on a
+        # same-email swap it would find a stale sibling item, MIRROR IT BACK
+        # under the slot just cleared, and then this verify would see that
+        # write and raise "Could not clear" against the clear it just undid.
+        failed: list = []
+        value = self._read_account_credentials_direct(account_num, email, failed)
+        if value or failed:
             raise CredentialError(
                 f"Could not clear stored credentials for slot {account_num} "
                 f"({email}) — aborting before commit"

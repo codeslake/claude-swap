@@ -7616,6 +7616,47 @@ class TestStashAndRetentionStore:
             "premise: the no-op'd unlink left material behind"
         )
 
+    def test_strict_clear_survives_a_stale_sibling_under_an_absent_slot(
+        self, temp_home,
+    ):
+        """CRITICAL: the final-belt verify must ask "is THIS slot's own item
+        gone", never "can this account's login be found somewhere" (the
+        renumber-fallback wrapper). A same-email swap can leave a stale
+        item under a slot number the roster no longer lists; on the real
+        clear, the wrapper would find that stale sibling, MIRROR IT BACK
+        under the slot just cleared (the converge-write), and the verify
+        would then see its own write and raise "Could not clear" against a
+        clear that had already succeeded.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"1": {"email": email, "uuid": "uuid-1"}},
+            },
+        )
+        store._write_account_credentials("1", email, "live-material")
+        # A genuinely stale leftover under a slot the roster no longer
+        # lists — e.g. left behind by an earlier bare renumber.
+        store._write_account_credentials("2", email, "stale-leftover")
+
+        store.delete_account_credentials_strict("1", email)
+
+        assert store._read_account_credentials_direct("1", email) == "", (
+            "the clear was undone by its own verify mirroring the stale "
+            "sibling back in"
+        )
+        # Never delete the source item.
+        assert (
+            store._read_account_credentials_direct("2", email)
+            == "stale-leftover"
+        )
+
 
 class TestActiveRefreshProvenance:
     """_fetch_active_usage must not rotate-and-persist an unattributed

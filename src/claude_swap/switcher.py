@@ -827,22 +827,6 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         return self._store._read_account_credentials(account_num, email)
 
-    @property
-    def _sequence_accounts(self) -> dict[str, str]:
-        """``{slot_number: email}`` for the current roster, ``{}`` without one.
-
-        Read by ``CredentialStore`` (a plain data attribute, same footing as
-        ``credentials_dir``/``platform``, never a method call — see
-        ``_StoreHost``) so its renumber fallback in ``_read_account_credentials``
-        can tell a slot's CURRENT email apart from a stale one, reusing the
-        roster read ``_get_sequence_data`` already is rather than a second one.
-        """
-        data = self._get_sequence_data() or {}
-        return {
-            num: account.get("email", "")
-            for num, account in data.get("accounts", {}).items()
-        }
-
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
     ) -> bool:
