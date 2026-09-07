@@ -747,7 +747,9 @@ def try_fetch_usage_for_account(
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(
+                working_credentials, slot=account_num,
+            )
         if refresh.credentials:
             working_credentials = refresh.credentials
             if refresh_via is None:
@@ -815,7 +817,9 @@ def try_fetch_usage_for_account(
         if refresh_via is not None:
             refresh = refresh_via(account_num, email, working_credentials)
         else:
-            refresh = try_refresh_oauth_credentials(working_credentials)
+            refresh = try_refresh_oauth_credentials(
+                working_credentials, slot=account_num,
+            )
         if not refresh.credentials:
             _log_usage_failure(context, e, kind)
             dead = refresh.error in ("invalid_grant", "no_refresh_token")

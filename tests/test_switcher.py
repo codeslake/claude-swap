@@ -13224,6 +13224,41 @@ class TestConsumeGate:
         # nothing consumed; the backup is exactly as it was
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    def test_gate_survives_a_roster_read_that_raises_after_the_lock_releases(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`_lineage_key` -> `account_identity` -> `_get_sequence_data()` is a
+        STRICT read (raises `ConfigError` on a torn `sequence.json`). The
+        probe-verdict gate calls it AFTER the slot `FileLock` has released
+        and outside the enclosing `try/except` -- so a roster renumber (an
+        account moving slots) tearing the file in exactly that window must
+        not escape `consume_backup_grant`: the collect pass thread-pools
+        every slot's gate call and never expects one to raise."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        real_read = s._get_sequence_data
+        calls = {"n": 0}
+
+        def flaky_read():
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise ConfigError("sequence.json torn by a concurrent renumber")
+            return real_read()
+
+        with patch.object(s, "_get_sequence_data", side_effect=flaky_read), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "transient"
+        # nothing consumed; the backup is exactly as it was
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict
     ):
