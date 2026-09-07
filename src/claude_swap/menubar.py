@@ -440,6 +440,40 @@ def _adapt_snapshot(snap) -> dict:
     }
 
 
+def switch_notification(payload: dict | None = None) -> tuple[str, str]:
+    """``(title, body)`` for the notification a completed switch posts.
+
+    A ``needsLogin`` landing is a switch onto a slot with no stored login, so
+    the machine is now logged out: the propagation note below would tell the
+    user to wait for an account that never arrives.
+    """
+    if (payload or {}).get("needsLogin"):
+        return (
+            "Logged out",
+            (payload or {}).get("message")
+            or "That slot has no stored login — run /login in Claude Code.",
+        )
+    return (
+        "Account switched",
+        "Switch takes effect within ~30s — restart Claude Code to apply "
+        "immediately.",
+    )
+
+
+def exhausted_notification(event) -> tuple[str, str]:
+    """``(title, body)`` for the notification an ``all-exhausted`` event posts.
+
+    One kind carries two states. A deliberate wait is entered BECAUSE every
+    candidate was READ and one still holds quota, so "All accounts exhausted"
+    is the one thing it is not -- and the notification is a surface
+    `AllExhaustedEvent`'s own enumeration ("the panel, the JSON and the log")
+    does not count.
+    """
+    if getattr(event, "deliberate_wait", False):
+        return "Waiting for a reset", event.human()
+    return "All accounts exhausted", event.human()
+
+
 # macOS 26 stopped drawing status items for processes launched through an
 # exec trampoline, and a CPython *framework* build is exactly that: its
 # ``bin/python3.x`` is a stub that posix_spawns into ``Python.app``
@@ -514,40 +548,6 @@ def framework_build_warning(
         "observed not to draw the menu bar icon: the process runs and logs "
         "nothing, but no status item appears.\n" + remedy
     )
-
-
-def switch_notification(payload: dict | None = None) -> tuple[str, str]:
-    """``(title, body)`` for the notification a completed switch posts.
-
-    A ``needsLogin`` landing is a switch onto a slot with no stored login, so
-    the machine is now logged out: the propagation note below would tell the
-    user to wait for an account that never arrives.
-    """
-    if (payload or {}).get("needsLogin"):
-        return (
-            "Logged out",
-            (payload or {}).get("message")
-            or "That slot has no stored login — run /login in Claude Code.",
-        )
-    return (
-        "Account switched",
-        "Switch takes effect within ~30s — restart Claude Code to apply "
-        "immediately.",
-    )
-
-
-def exhausted_notification(event) -> tuple[str, str]:
-    """``(title, body)`` for the notification an ``all-exhausted`` event posts.
-
-    One kind carries two states. A deliberate wait is entered BECAUSE every
-    candidate was READ and one still holds quota, so "All accounts exhausted"
-    is the one thing it is not -- and the notification is a surface
-    `AllExhaustedEvent`'s own enumeration ("the panel, the JSON and the log")
-    does not count.
-    """
-    if getattr(event, "deliberate_wait", False):
-        return "Waiting for a reset", event.human()
-    return "All accounts exhausted", event.human()
 
 
 def run(switcher) -> int:
