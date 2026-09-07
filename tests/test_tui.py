@@ -780,7 +780,7 @@ class TestMiniAccountText:
             last_good={"five_hour": {"pct": 0.0}}, fetched_at=now, age_s=0.0,
         )
         acc = make_account(1, entry=entry)
-        assert "5h(⟳5h):0%" in mini_account_text(acc, now).plain
+        assert "5h(⟳5h00m):0%" in mini_account_text(acc, now).plain
 
     def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker_on_the_dashboard(
         self,
@@ -2802,7 +2802,7 @@ class TestUnswitchableRowsAreListed:
                 "five_hour": {"pct": 0.0}, "seven_day": {"pct": 0.0},
             }),
         ), active="1")
-        assert "5h(⟳5h):0%" in out, out
+        assert "5h(⟳5h00m):0%" in out, out
         assert "7d(⟳?):0%" in out, out
 
     def test_a_live_5h_window_with_no_reported_reset_keeps_unknown_marker(self):
@@ -2820,6 +2820,28 @@ class TestUnswitchableRowsAreListed:
             }),
         ), active="1")
         assert "5h(⟳?):42%" in out, out
+
+    def test_a_lapsed_5h_chip_is_the_same_width_as_a_live_one(self):
+        """The owner's five Next-best rows: a lapsed 5h chip (no reset,
+        pct 0) renders 4 columns narrower than a live one, so the caller's
+        column pad fills the gap with spaces the owner rejected
+        (`5h(⟳5h):0%     ·`, owner-directed 2026-09-07). `5h00m` closes
+        that gap. The unknown-reset case below is the control: it must NOT
+        gain the same width, because it is a different state."""
+        from claude_swap.tui import data
+
+        lapsed = data.chip_label("5h", None, pct=0.0)
+        live = data.chip_label("5h", "resets 2h 14m")
+        assert len(lapsed) == len(live), (lapsed, live)
+
+    def test_an_unknown_5h_reset_with_usage_keeps_its_own_width(self):
+        """CONTROL for the test above: a 5h window WITH usage but no
+        reported reset is a live window whose reset the server withheld,
+        not an untouched one -- it keeps the plain `⟳?` marker, and must
+        not widen to `5h00m`."""
+        from claude_swap.tui import data
+
+        assert data.chip_label("5h", None, pct=42.0) == "5h(⟳?):"
 
     def test_a_budget_only_account_names_no_reset_marker_at_all(self):
         """A monthly-budget (API-key/spend) account has no usage-window

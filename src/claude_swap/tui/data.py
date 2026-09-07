@@ -192,7 +192,7 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     the plain unknown-reset marker; #325 is what resolves those.
     """
     if not reset:
-        return "5h(⟳5h):" if label == "5h" and pct == 0 else f"{label}(⟳?):"
+        return "5h(⟳5h00m):" if label == "5h" and pct == 0 else f"{label}(⟳?):"
     return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
 
 
