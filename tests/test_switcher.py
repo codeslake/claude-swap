@@ -30,6 +30,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
+from claude_swap.settings import AutoSwitchSettings, save_settings
 from claude_swap.credentials import ActiveCredentials
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
@@ -18394,6 +18395,39 @@ class TestSwitchOffAtLimitAccount:
             with contextlib.suppress(Exception):
                 s.switch()
             assert built == [], "switch() routed through an engine"
+
+    def test_it_honors_the_configured_model_limit(self, temp_home: Path):
+        """The pin's failover entry omits `models`, so it must resolve the
+        configured `autoswitch.model` itself (as `cli.py --strategy best`
+        does) rather than ranking candidates on 5h/7d alone — a candidate
+        whose named model is exhausted must not be handed back as the
+        target just because 5h/7d still have headroom."""
+        s = TestCurrentAtLimitOverridesTheFrozenPct()._setup(temp_home)
+        seed = TestCurrentAtLimitOverridesTheFrozenPct()._seed
+        seed(s, 1, "a@example.com")
+        seed(s, 2, "b@example.com")
+        (temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "sk-live"}})
+        )
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com",
+                             "accountUuid": "uuid-1"}
+        }))
+        save_settings(s.backup_dir, AutoSwitchSettings(model="Fable"))
+        usage = {
+            "1": {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 0.0}},
+            "2": {
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],
+            },
+        }
+
+        with patch.object(s, "_usage_by_account", return_value=usage):
+            result = switch_off_at_limit_account(s)
+
+        assert result["switched"] is False
+        assert result["reason"] == "candidates-exhausted"
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
 
 
 class TestAnEmptySlotLandingKeepsTheWarningsAlreadyEarned:

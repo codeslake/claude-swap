@@ -6634,7 +6634,7 @@ class ClaudeAccountSwitcher:
         self,
         strategy: str | None = None,
         json_output: bool = False,
-        models: tuple[str, ...] = (),
+        models: tuple[str, ...] | None = None,
         model_source: str | None = None,
         current_at_limit: bool = False,
     ) -> dict | None:
@@ -6672,6 +6672,10 @@ class ClaudeAccountSwitcher:
         struck: set[str] = set()
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
+        elif models is None:
+            models = parse_model_names(load_settings(self.backup_dir).model)
+            if models and model_source is None:
+                model_source = "autoswitch.model"
         if models and not json_output:
             source = "--model" if model_source == "cli" else model_source
             print(dimmed(
