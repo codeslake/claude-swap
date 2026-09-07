@@ -3250,6 +3250,23 @@ class ClaudeAccountSwitcher:
             oauth_account.get("accountUuid", "") or "",
         )
 
+    def _unattributed_live_login(
+        self, *, ask_server: bool, reason: str
+    ) -> "tuple[str, str] | None":
+        """Last resort when a witness `_live_login_identity` needs is missing.
+
+        Never the raw config identity: under a splice that value is the
+        pin's, and a witness gap has not established it is anything else.
+        Asks the oracle, the one independent read left; answers ``None``
+        when it too cannot say, matching `current_account_number`'s
+        "no guessed slot" guarantee.
+        """
+        self._logger.warning(
+            "live login identity unattributed (%s); asking the oracle", reason
+        )
+        resolved = self._login_identity_from_the_oracle(ask_server=ask_server)
+        return (resolved[0], resolved[1]) if resolved is not None else None
+
     def _live_login_identity(
         self, *, ask_server: bool = True
     ) -> "tuple[str, str] | None":
@@ -3289,7 +3306,11 @@ class ClaudeAccountSwitcher:
 
             pinned = _pin.pinned_identity(self)
         except Exception:  # noqa: BLE001 — an optional extra cannot break this
-            return identity
+            # UNREADABLE IS SPLICE-UNKNOWN, NOT NO-SPLICE: `identity` here may
+            # be the pin's forged value and nothing has confirmed it isn't.
+            return self._unattributed_live_login(
+                ask_server=ask_server, reason="pin witness unreadable"
+            )
         # THE COMPOSITE. Comparing the email alone cannot tell a splice from a
         # genuine `claude /login` into a SAME-EMAIL sibling — a personal
         # account at the address of an org one, which this codebase states is
@@ -3302,10 +3323,14 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         recorded = data.get("activeAccountNumber")
         if recorded is None:
-            return identity
+            return self._unattributed_live_login(
+                ask_server=ask_server, reason="no recorded active slot"
+            )
         slot = (data.get("accounts") or {}).get(str(recorded))
         if not isinstance(slot, dict) or not slot.get("email"):
-            return identity
+            return self._unattributed_live_login(
+                ask_server=ask_server, reason="recorded slot has no email"
+            )
         # A SPLICE MOVES THE CONFIG AND NOTHING ELSE. Logging in AS the pinned
         # account writes the same value into `oauthAccount` -- and that login
         # is the documented repair for a dead pin credential -- so the two

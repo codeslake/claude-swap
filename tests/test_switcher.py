@@ -12964,6 +12964,78 @@ class TestTheLiveCredentialIsReadThroughTheStore:
         assert s.current_account_number() == "2"
 
 
+class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
+    """A witness gap (the pin unreadable, no recorded active slot, or a
+    recorded slot with no stored email) must not fall back to the raw config
+    identity: under a splice that value IS the pin's. Each exit asks the
+    oracle instead and answers ``None`` when it too cannot say -- never the
+    pin (the same class `test_the_resolver_keeps_the_recorded_slot...`
+    already fixed, above)."""
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def test_a_pin_witness_that_raises_never_answers_the_pin(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+
+        def _raises(_s):
+            raise RuntimeError("pin state unreadable")
+
+        monkeypatch.setattr(_pin, "pinned_identity", _raises)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle",
+            lambda **kw: ("other@example.com", "org-other", "u-other"))
+        assert s._live_login_identity() == ("other@example.com", "org-other"), (
+            "the pin witness raised and the answer was the raw config "
+            "identity, which under a splice is the pin's"
+        )
+
+    def test_no_recorded_active_slot_never_answers_the_pin(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: {"accounts": {}})
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle", lambda **kw: None)
+        assert s._live_login_identity() is None, (
+            "no recorded active slot and the answer was the raw config "
+            "identity, which under a splice is the pin's"
+        )
+
+    def test_a_recorded_slot_with_no_stored_email_never_answers_the_pin(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"organizationUuid": "org-b"}}})
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle", lambda **kw: None)
+        assert s._live_login_identity() is None, (
+            "the recorded slot carried no email and the answer was the raw "
+            "config identity, which under a splice is the pin's"
+        )
+
+
 class TestTheResolverAsksTheServerOnlyOutsideTheLocks:
     """The resolver may reach the network; its under-lock callers may not.
 
