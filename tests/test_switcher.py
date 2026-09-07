@@ -13093,14 +13093,135 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
         )
 
 
+class TestConfigNamesThePinNeverAsksWiringWhenTheRecordAnswers:
+    """`_config_names_the_pin`'s `pinned is None` branch is load-bearing:
+    `_wiring_present` must never run while the record already names an
+    account (a wired-but-mismatched host would then answer True from
+    `_wiring_present` alone, independent of whether `pinned` actually
+    matches -- exactly the forged-identity leak this predicate exists to
+    close), and a raising `_wiring_present` must never surface past
+    `_live_login_identity`'s own guarantee never to answer the raw config
+    identity under a splice.
+
+    The second half is not the invariant it looks like: see the test's own
+    assertion and docstring below for what it actually measures.
+    """
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def test_wiring_present_is_not_asked_when_the_record_already_answers(
+        self, temp_home: Path, monkeypatch
+    ):
+        from claude_swap import pin as _pin
+
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+
+        def _boom(_s):
+            raise AssertionError("_wiring_present was asked with pinned known")
+
+        monkeypatch.setattr(_pin, "_wiring_present", _boom)
+        assert s._config_names_the_pin(*self.PIN) is True
+        assert s._config_names_the_pin("other@example.com", "org-x") is False
+
+    def test_a_raising_wiring_present_on_a_silent_record_still_leaks_the_raw_config(
+        self, temp_home: Path, monkeypatch
+    ):
+        """NOT a passing guarantee -- a recorded finding. `pinned is None`
+        plus a raising `_wiring_present` (the config/backup dir is present
+        but unreadable, say) is caught by `_config_names_the_pin`'s own
+        `except Exception: return False`, so `_live_login_identity` reads
+        "not spliced" and takes its `if not spliced: return identity`
+        exit -- the SAME raw, possibly-forged config identity the
+        `except Exception: return identity` arm two lines above would also
+        have answered. Measured directly (a throwaway script, HOME
+        isolated) on 835d30c2: `_live_login_identity()` returned the wired
+        config's identity unchanged. Reported to the lead rather than
+        patched here: closing it needs `_config_names_the_pin` to tell
+        "definitely not spliced" apart from "could not tell", which is a
+        third return value, not a few lines.
+        """
+        from claude_swap import pin as _pin
+
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+
+        def _boom(_s):
+            raise RuntimeError("ledger unreadable")
+
+        monkeypatch.setattr(_pin, "_wiring_present", _boom)
+        assert s._live_login_identity() == self.PIN, (
+            "if this ever answers None or something else, the finding "
+            "below is stale -- update the docstring rather than deleting "
+            "the test"
+        )
+
+
+class TestForgetLiveLoginWarningsResetsTheDedupe:
+    """`_forget_live_login_warnings` exists so the NEXT gap logs again --
+    without it the dedupe key set on the first gap would stay set forever,
+    and a mutant whose body is bare `return` (never discarding) would pass
+    every other test in this file, since none of them cross a
+    gap -> clean resolution -> gap boundary in one process."""
+
+    PIN = ("pinned@example.com", "org-pin")
+
+    def _switcher(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def test_a_clean_resolution_between_two_gaps_lets_the_second_log(
+        self, temp_home: Path, monkeypatch, caplog
+    ):
+        import logging as _logging
+
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        no_recorded_slot = {"accounts": {}}
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: no_recorded_slot)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle", lambda **kw: None)
+
+        with caplog.at_level(_logging.WARNING):
+            monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+            monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+            s._live_login_identity()                       # gap 1: logs
+
+            monkeypatch.setattr(
+                s, "_get_current_account", lambda: ("plain@example.com", ""))
+            monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+            monkeypatch.setattr(_pin, "_wiring_present", lambda _s: False)
+            s._live_login_identity()                       # clean: forgets
+
+            monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+            monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+            s._live_login_identity()                       # gap 2: logs again
+
+        warnings = [r.message for r in caplog.records
+                    if r.levelno == _logging.WARNING and "unattributed" in r.message]
+        assert len(warnings) == 2, (
+            f"the dedupe was not reset by the clean resolution in between: "
+            f"{warnings}"
+        )
+
+
 class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
     """Routing "not pinned but wiring present" through the oracle-or-None
     fallback (`_unattributed_live_login`) left `current_identity=None`
     whenever the oracle could not answer (offline, an expired token, a
     timeout -- failures are never memoized). `None` sends the switch down
     the no-backup direct-activation path, which SKIPS the back-up-current
-    step, so the outgoing slot's stored generation is destroyed rather than
-    updated.
+    step, so the outgoing slot's stored backup goes stale (its rotation
+    unrecorded) rather than updated.
 
     The fix reuses the mechanism this PR already built for a genuine splice:
     the recorded slot plus a local byte/lineage compare, oracle only as a

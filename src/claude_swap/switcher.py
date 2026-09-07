@@ -3332,18 +3332,17 @@ class ClaudeAccountSwitcher:
             return None
         email, org_uuid = identity
         try:
-            from claude_swap import pin as _pin
-
-            pinned = _pin.pinned_identity(self)
             # THE RECORD IS NOT THE ONLY WITNESS THAT A PIN IS WIRED. A torn
             # or absent record reads identically to "nothing pinned" here;
             # `apply_pin(None, ...)`'s clear ordering is a second way to
             # reach the same state (it removes the record before it
             # un-splices the config, and that un-splice can fail and never
             # run). Either way, the wiring outliving the record means
-            # `identity` may still be a pin's forged value even though
-            # `pinned` reads None.
-            wiring_present = pinned is None and _pin._wiring_present(self)
+            # `identity` may still be a pin's forged value even though the
+            # record reads nothing pinned. `_config_names_the_pin` covers
+            # both witnesses and is shared with `add_account`, which must
+            # never disagree with this resolver over what counts as spliced.
+            spliced = self._config_names_the_pin(email, org_uuid)
         except Exception:  # noqa: BLE001 — an optional extra cannot break this
             return identity
         # THE COMPOSITE. Comparing the email alone cannot tell a splice from a
@@ -3357,9 +3356,8 @@ class ClaudeAccountSwitcher:
         # / local-credential resolution below rather than the oracle-or-None
         # helper: that answers from local bytes with no network, and `None`
         # here would send `_perform_switch_locked` down the no-backup
-        # direct-activation path, destroying the outgoing slot's stored
-        # generation instead of updating it.
-        spliced = wiring_present if pinned is None else (email, org_uuid) == pinned
+        # direct-activation path, leaving the outgoing slot's stored backup
+        # stale (its rotation unrecorded) instead of updated.
         if not spliced:
             self._forget_live_login_warnings()
             return identity
@@ -4038,13 +4036,25 @@ class ClaudeAccountSwitcher:
             self._logger.debug("post-add re-pin skipped", exc_info=True)
 
     def _config_names_the_pin(self, email: str, org_uuid: str) -> bool:
-        """Whether ``.claude.json`` names the pinned account right now."""
+        """Whether ``.claude.json``'s identity is a pin splice right now.
+
+        Two witnesses, not one: the record itself, or -- when it is silent --
+        the wiring outliving it (a witness gap resolves the same way a
+        genuine splice does). Shared with `_live_login_identity`, which
+        calls this instead of duplicating it: `add_account`'s own splice
+        guards must never disagree with the resolver over what counts as
+        spliced, or a witness gap sends one down the honest oracle-or-refuse
+        path while the other still reads the raw config and finds a
+        mismatch it blames on the pin.
+        """
         try:
             from claude_swap import pin as _pin
             pinned = _pin.pinned_identity(self)
+            if pinned is None:
+                return _pin._wiring_present(self)
+            return (email, org_uuid or "") == pinned
         except Exception:  # noqa: BLE001 -- an optional extra cannot decide this
             return False
-        return bool(pinned) and (email, org_uuid or "") == pinned
 
     def _login_identity_from_the_oracle(
         self, *, ask_server: bool = True

@@ -12388,6 +12388,102 @@ class TestAddAccountUnderASpliceRegistersTheLogin:
         assert sw._get_sequence_data()["activeAccountNumber"] == 2
 
 
+class TestAddAccountUnderAWitnessGapRegistersTheLogin:
+    """`cswap add` after CONTEXT.md's documented re-login repair: `/login` as
+    slot 3 in a throwaway session, then a bare `cswap add`, run while the
+    roster's active slot is still 2 and the pin record is unreadable (the
+    ~2.5 min mint window, or the persistent clear-ordering state).
+
+    `_config_names_the_pin` used to ask only the record, so a witness gap
+    (record silent, wiring still present) left `add_account`'s first guard
+    unfired; `current_email`/`current_org_uuid` stayed the config's own
+    (honest) values and `_live_login_identity()` -- which DOES treat a gap
+    as a splice -- resolved through the recorded slot instead, so the second
+    guard compared the honest login against a different account and refused
+    with the "pin is rewriting" message: a message that blames the pin for
+    a plain `/login` it never touched.
+    """
+
+    def _gapped_switcher(self, temp_home, mock_claude_config):
+        """A real, on-disk witness gap: settings.json absent (never written),
+        the sidecar wiring receipt present, `activeAccountNumber` still 2,
+        and `.claude.json` honestly naming slot 3's account -- the genuine
+        `/login` CONTEXT.md's repair describes."""
+        import json as _json
+
+        from claude_swap import pin as _pin
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, {
+            "activeAccountNumber": 2,
+            "sequence": [2, 3],
+            "accounts": {
+                "2": {"email": "slot2@example.com", "organizationUuid": "",
+                      "uuid": "uuid-2"},
+                "3": {"email": "slot3@example.com", "organizationUuid": "",
+                      "uuid": "uuid-3"},
+            },
+        })
+        sw._write_account_credentials("3", "slot3@example.com", _json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-stale",
+                               "refreshToken": "rt-stale"}}))
+        # Slot 2's OWN stored backup, byte-different from the live login
+        # below -- `_live_credential_is` must answer a definite False (not
+        # the "could not tell" None a missing backup would give), or the
+        # recorded-slot resolver never reaches the oracle tie-break at all.
+        sw._write_account_credentials("2", "slot2@example.com", _json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-slot2",
+                               "refreshToken": "rt-slot2"}}))
+
+        config_path = sw._get_claude_config_path()
+        config_path.write_text(_json.dumps({"oauthAccount": {
+            "emailAddress": "slot3@example.com", "accountUuid": "uuid-3"}}))
+
+        ledger_path = _pin._ledger_path(config_path)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(_json.dumps({_pin._WIRE_MARK: ["HTTPS_PROXY"]}))
+        assert _pin.pinned_identity(sw) is None, "test premise: record silent"
+        assert _pin._wiring_present(sw) is True, "test premise: wiring present"
+
+        live = _json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        sw._write_credentials(live)
+        return sw
+
+    def test_a_gap_with_an_oracle_answer_succeeds_and_rewrites_the_backup(
+        self, temp_home, mock_claude_config
+    ):
+        import json as _json
+
+        sw = self._gapped_switcher(temp_home, mock_claude_config)
+        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value={
+                "uuid": "uuid-3", "email": "slot3@example.com",
+                "organizationUuid": ""}):
+            sw.add_account()
+        assert _json.loads(sw._read_account_credentials(
+            "3", "slot3@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            "slot 3's backup was not rewritten with the live login"
+        )
+        assert sw._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_a_gap_with_no_oracle_answer_gives_the_honest_refusal(
+        self, temp_home, mock_claude_config
+    ):
+        from claude_swap.exceptions import ConfigError
+
+        sw = self._gapped_switcher(temp_home, mock_claude_config)
+        with _patch("claude_swap.oauth.fetch_oauth_profile", return_value=None), \
+                pytest.raises(ConfigError, match="could not say whose") as exc:
+            sw.add_account()
+        assert "accountUuid is not recoverable" not in str(exc.value), (
+            "the gap fell through to the SECOND guard's message instead of "
+            f"the first, honest one: {exc.value}"
+        )
+
+
 class TestAPinSwingIsNotALoginInFlight:
     """`_reject_identity_drift_since_verify` samples `oauthAccount` twice and
     refuses on any difference. Under a pin that field has a SECOND writer.
