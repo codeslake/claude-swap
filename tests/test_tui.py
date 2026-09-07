@@ -2523,7 +2523,7 @@ class TestUnswitchableRowsAreListed:
                 "scoped": [{"name": "Fable", "pct": 10.0}],
             }),
         ), active="1", settings=settings)
-        assert "Fable-only" in out, out
+        assert "Fable-walled" in out, out
         assert "  blocked" in out, out
 
     def test_panel_top_matches_the_engines_pick_under_consume_first(

@@ -33,6 +33,7 @@ from claude_swap.autoswitch import (
     binding_pct,
     classify_candidate_block,
     consume_first_rank_key,
+    model_block_label,
     pct_label,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
@@ -507,7 +508,10 @@ class AutoScreen(Screen):
                         windows, self._settings.threshold
                     )
                     if kind == "model":
-                        entry.append(f"  {blocked_model}-only", style=palette.muted)
+                        entry.append(
+                            f"  {model_block_label(blocked_model)}",
+                            style=palette.muted,
+                        )
                     elif kind == "full":
                         entry.append("  blocked", style=palette.muted)
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)

@@ -5263,7 +5263,7 @@ class TestAModelWindowIsNotABlackout:
             },
         )
         text = event.human()
-        assert "#1: 5h 34% · 7d 69% · Fable 91% (Fable-only)" in text, text
+        assert "#1: 5h 34% · 7d 69% · Fable 91% (Fable-walled)" in text, text
         assert "#2: 5h 92% · 7d 10% · Fable 20% (blocked)" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
@@ -6470,6 +6470,33 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
+    def test_walled_active_yields_to_any_room_not_only_a_sooner_reset(
+        self, temp_home
+    ):
+        """The mirror of 7d5b5d33 (#375): that commit stopped a HEALTHY
+        active leaving for a candidate's merely-sooner reset; this is the
+        opposite gap — a WALLED active (headroom 1, ``about_to_wall``) below
+        its own high departure threshold (99.9, still literally the
+        `consume-first` trigger) stayed on `already-consuming-soonest`
+        against a candidate with 63 points of headroom purely because that
+        candidate's weekly reset was not sooner. Prompted by
+        usage-census-2026-09-07 lmd42.md §9's 171-row reset-preference
+        bucket, but NOT a replay of it: that census's own rows, at their
+        annotated threshold (90), already switch on this branch's floor
+        without this guard (`TestUsageCensus20260907Replay`) — this closes
+        the narrower case a departure threshold set above ~97% opens.
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=99.9)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.0, 85.0, _R_SOON),    # walled: headroom 1
+            "2": _usage7(0.0, 37.0, _R_LATEST),   # 63 headroom, resets LATER
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_consume_first_is_the_default_strategy(self, temp_home):
         """The owner's order: drain the account whose weekly window resets
         soonest before it resets and the quota is wasted -- opt-in no
@@ -6834,13 +6861,17 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
 
-    def test_threshold_crossed_in_phase_two_holds_then_escapes_next_tick(
+    def test_threshold_crossed_in_phase_two_now_escapes_immediately(
         self, temp_home
     ):
-        # Deliberate design pin: phase 2 never re-classifies the trigger
-        # mid-tick. When the fresh active is over the threshold with no
-        # strictly-sooner candidate, the tick holds; the NEXT tick classifies
-        # at-limit and escapes normally (no freshness gate on escapes).
+        # Phase 2 still never re-classifies the TRIGGER string mid-tick
+        # (it stays literally "consume-first"), but the walled-active
+        # override (`_walled_may_take_any_room`, this round) now reads the
+        # FRESH headroom the same as the stored one: once phase 2 shows the
+        # active genuinely walled, a candidate need not reset sooner to be
+        # admitted -- closing the one-tick gap a prior design pin here used
+        # to accept (previously NO_ACTION with "already-consuming-soonest"
+        # until the next tick's at-limit reclassification escaped it).
         h = self._harness(temp_home)
         stored = {
             "1": _usage7(20, 20, _R_LATER),
@@ -6853,18 +6884,85 @@ class TestConsumeFirstStrategy:
             "3": _usage7(10, 10, _R_LATEST),
         }
         outcome, fetch_sets = self._two_phase_tick(h, stored, fresh)
-        assert outcome is TickOutcome.NO_ACTION
-        assert h.active_number() == 1
-        assert not any(isinstance(e, SwitchEvent) for e in h.events)
-        assert {"1", "2", "3"} in fetch_sets
-        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["already-consuming-soonest"]
-        h.events.clear()
-        outcome = h.tick_with_usage(fresh)
         assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() in (2, 3)
+        assert {"1", "2", "3"} in fetch_sets
+
+
+class TestUsageCensus20260907Replay:
+    """usage-census-2026-09-07/lmd42.md §9 names 225 "reachable wall" rows
+    and annotates every one "(trig 90)" -- the fleet's own printed
+    threshold. Replayed at that SAME threshold (not the higher one
+    ``test_walled_active_yields_to_any_room_not_only_a_sooner_reset`` needs
+    to reach ``_walled_may_take_any_room`` at all), the active's own
+    utilization is already >= 90 in every row, so `tick()` classifies
+    `proactive`/`at-limit` -- not the literal `consume-first` trigger the
+    strict reset-order filter gates on -- and the existing (pre-this-round)
+    admission already switches. Mutation-checked (guard removed, still
+    green): these 3 rows do not exercise THIS round's fix; they confirm
+    7d5b5d33 + 392172f1 (this branch's floor) already closes the exact
+    numeric shapes the census measured, on the census's own stated
+    threshold. The gap this round closes (`about_to_wall`, <=3pt headroom,
+    literal `consume-first` trigger) needs a departure threshold configured
+    ABOVE ~97% to keep that literal trigger while genuinely walled -- a
+    shape the census's threshold=90 fleet cannot produce, and not
+    represented in these 225 rows. See that test for the reproduced defect.
+
+    Coverage: 3 of 225 rows (a representative sample of the 171-row
+    reset-preference class: rows 39, 171, 224, its no-model,
+    model-and-walled, and model-and-partial-headroom shapes). The 27-row
+    model-window-as-wall and 1-row stale-usage classes are
+    ``TestTheModelWindowBindsUnlessItBindsEverywhere``'s own territory
+    (392172f1); a 2-account reduction of one of those rows hits
+    `AllExhaustedEvent` before that retry runs (needs the original fleet's
+    account count), so it is not replayed here.
+    """
+
+    @staticmethod
+    def _replay(temp_home, active_windows, peer_windows, *, threshold=90.0, model=None):
+        kwargs = {"strategy": "consume-first", "threshold": threshold}
+        if model:
+            kwargs["model"] = model
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "active@example.com")
+        h.seed(2, "peer@example.com")
+        h.make_live("active@example.com", 1)
+        active = {"five_hour": {"pct": active_windows[0]},
+                  "seven_day": {"pct": active_windows[1], "resets_at": _R_SOON}}
+        peer = {"five_hour": {"pct": peer_windows[0]},
+                "seven_day": {"pct": peer_windows[1], "resets_at": _R_LATEST}}
+        if len(active_windows) > 2:
+            active["scoped"] = [{"name": "Fable", "pct": active_windows[2],
+                                  "resets_at": _R_SOON}]
+            peer["scoped"] = [{"name": "Fable", "pct": peer_windows[2],
+                                "resets_at": _R_LATEST}]
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        return outcome, h
+
+    def test_row_39_reset_preference(self, temp_home):
+        # lmd42.md §9 row 39: active #4 91% (0/64/91), best candidate #6
+        # (1/55/77). No candidate resets sooner -> old code declined.
+        outcome, h = self._replay(temp_home, (0.0, 91.0), (1.0, 77.0))
+        assert outcome is TickOutcome.SWITCHED, outcome
         assert h.active_number() == 2
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "at-limit"
+
+    def test_row_171_reset_preference(self, temp_home):
+        # lmd42.md §9 row 171: active #4 100% (94/85/100), best candidate
+        # #2 (0/37/51).
+        outcome, h = self._replay(
+            temp_home, (94.0, 85.0, 100.0), (0.0, 37.0, 51.0), model="Fable"
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2
+
+    def test_row_224_reset_preference(self, temp_home):
+        # lmd42.md §9 row 224: active #4 100% (8/86/100), best candidate
+        # #2 (15/60/82).
+        outcome, h = self._replay(
+            temp_home, (8.0, 86.0, 100.0), (15.0, 60.0, 82.0), model="Fable"
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2
 
 
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:

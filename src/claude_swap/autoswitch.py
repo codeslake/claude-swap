@@ -179,6 +179,18 @@ def _about_to_wall(active_headroom: float | None) -> bool:
     return (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
 
 
+def _walled_may_take_any_room(about_to_wall: bool, candidate_headroom: float) -> bool:
+    """Whether a WALLED active must yield to THIS candidate regardless of
+    reset order — the mirror of 7d5b5d33 (#375), read in the opposite
+    direction. That commit stops a HEALTHY active leaving for a candidate
+    whose reset is merely sooner; this stops a WALLED one staying for a
+    candidate whose reset is merely later. One function for both readings
+    of the same ``about_to_wall``/``peer_can_serve`` pair, not a second,
+    independently-written copy of it (see ``_about_to_wall``'s docstring).
+    """
+    return about_to_wall and candidate_headroom > SPENT_HEADROOM_PCT
+
+
 def _classify_dynamic_trigger(active_headroom: float) -> str:
     """`dynamic`'s own trigger classification (#375 item 1): drop the bare
     threshold, `_about_to_wall` (SPENT_HEADROOM_PCT) is the only bar left
@@ -505,7 +517,7 @@ class PollEvent(AutoSwitchEvent):
             if kind == "full":
                 text += " (blocked)"
             elif kind == "model":
-                text += f" ({model}-only)"
+                text += f" ({model_block_label(model)})"
             return text
         h = self.headroom.get(num)
         if h is not None:
@@ -933,6 +945,20 @@ def classify_candidate_block(
     if any(label in ("5h", "7d") for label, _ in blocking):
         return "full", None
     return "model", blocking[0][0]
+
+
+def model_block_label(model: str) -> str:
+    """The shared "blocked by this model's window alone" chip/log text.
+
+    ONE function so the panel, the decision log, and any future
+    ``cswap list`` reader change together (the way ``#320``'s
+    ``chip_label`` does) — a second, independently-worded copy is how a
+    rename like this one (``-only`` -> ``-walled``, the owner read "only"
+    as "can ONLY serve this model", backwards from the intent: the
+    account's 5h/7d still have room, only the model window blocks) drifts
+    between call sites.
+    """
+    return f"{model}-walled"
 
 
 def _model_window_binds_everywhere(
@@ -3179,8 +3205,7 @@ class AutoSwitchEngine:
                         # window but two points of weekly quota -- which takes
                         # work for minutes and then walls behind a reset days
                         # out -- is already excluded by it.
-                        peer_can_serve = h > SPENT_HEADROOM_PCT
-                        if not (about_to_wall and peer_can_serve):
+                        if not _walled_may_take_any_room(about_to_wall, h):
                             # Hysteresis on the axis we actually rank by. It
                             # bounds the flap RATE rather than making a reverse
                             # move impossible: the target must come back
@@ -3212,7 +3237,22 @@ class AutoSwitchEngine:
                     # Below the threshold (`trigger` itself is "consume-first"
                     # or "dynamic"): purely proactive on reset ordering, only
                     # move to accounts whose weekly window resets sooner than
-                    # the active one.
+                    # the active one -- UNLESS the active is itself walled
+                    # (`about_to_wall`), in which case reset-preference is a
+                    # TIE-BREAK, not an admission filter: a departure
+                    # threshold set high enough (e.g. 99.9) keeps `trigger`
+                    # literally "consume-first" long after the active is
+                    # functionally spent (<=SPENT_HEADROOM_PCT headroom), and
+                    # this candidate's LATER reset is no reason to decline the
+                    # only room on the fleet (`_walled_may_take_any_room`, the
+                    # mirror of 7d5b5d33). NOT the same gap as usage-census-
+                    # 2026-09-07 lmd42.md §9's 171-row bucket -- replayed at
+                    # that census's own annotated threshold (90), those rows
+                    # already classify `proactive`/`at-limit` and switch
+                    # without this guard (`TestUsageCensus20260907Replay`);
+                    # this closes the narrower case a departure threshold
+                    # above ~97% opens, which that census's threshold=90
+                    # fleet cannot reach.
                     #
                     # `consume-first` STRATEGY, any OTHER trigger (over-
                     # threshold `proactive`, or `at-limit` with the active not
@@ -3224,10 +3264,14 @@ class AutoSwitchEngine:
                     # authorized round. `dynamic` does not get this: its own
                     # `proactive`/`at-limit` triggers fall to the hysteresis
                     # leg below instead, same as `best`.
-                    if trigger in CONSUME_FIRST_STRATEGIES and (
-                        reset_ts is None
-                        or active_reset_ts is None
-                        or reset_ts >= active_reset_ts
+                    if (
+                        trigger in CONSUME_FIRST_STRATEGIES
+                        and not _walled_may_take_any_room(about_to_wall, h)
+                        and (
+                            reset_ts is None
+                            or active_reset_ts is None
+                            or reset_ts >= active_reset_ts
+                        )
                     ):
                         continue
                 elif active_headroom is not None:
