@@ -288,6 +288,7 @@ class _StoreHost(Protocol):
     platform: Platform
     credentials_dir: Path
     _logger: logging.Logger
+    _sequence_accounts: dict[str, str]
 
 
 class CredentialStore:
@@ -1160,6 +1161,75 @@ class CredentialStore:
         self._write_backup_enc(account_num, email, credentials)
 
     def _read_account_credentials(
+        self, account_num: str, email: str, failed: list | None = None
+    ) -> str:
+        """Read account credentials from backup, following a bare renumber.
+
+        A renumber that only rewrites ``sequence.json`` (no ``move_account``)
+        leaves the backup keyed under the OLD slot number: same email, wrong
+        number. When the roster confirms ``account_num`` *is* this email's
+        current slot and the direct read comes back genuinely absent (not
+        merely unreadable — see ``_read_account_credentials_ex``), retry the
+        same email under every OTHER slot number up to the roster's current
+        highest — bounded and exact, never a wildcard scan (neither backend
+        supports one). A hit is mirrored under ``account_num`` — the source
+        slot is never touched — so the next read is direct.
+
+        Guarding on "is account_num this email's current slot" matters: a
+        slot number the roster has since FREED (``move_account`` relocates
+        the backup file itself, so the old number should read empty, not
+        borrow its new home's copy) must not trigger this fallback. So does
+        skipping any candidate still PRESENT in the roster: two slots can
+        legitimately share one email (same login, different org), each with
+        its own backup — including a deliberately empty one — and only a
+        number the roster no longer lists at all is a stale leftover rather
+        than a sibling account's own key.
+        """
+        value = self._read_account_credentials_direct(account_num, email, failed)
+        if value or failed:
+            return value
+        accounts = self._host._sequence_accounts
+        if accounts.get(account_num) != email:
+            return ""
+        # The stale number itself is gone from `accounts` (that IS the
+        # renumber), so the candidates are a bounded integer sweep up to the
+        # highest slot number the roster currently uses, not `accounts`'
+        # own keys — exact lookups only, never a wildcard scan.
+        try:
+            bound = max(
+                [int(account_num)] + [int(n) for n in accounts if n.isdigit()]
+            )
+        except ValueError:
+            return ""
+        for n in range(1, bound + 1):
+            other_num = str(n)
+            if other_num == account_num or other_num in accounts:
+                continue
+            sub_failed: list = []
+            value = self._read_account_credentials_direct(other_num, email, sub_failed)
+            if sub_failed:
+                # The sibling slot is unreadable too (e.g. a locked Keychain
+                # would refuse every slot alike) — stop rather than probing
+                # the rest, and surface it exactly as an unreadable primary
+                # read would.
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            if value:
+                try:
+                    if self._host.platform == Platform.MACOS and self._use_keychain():
+                        self._kc_write_backup(account_num, email, value)
+                    else:
+                        self._write_backup_enc(account_num, email, value)
+                except Exception as e:
+                    self._host._logger.warning(
+                        f"Found account {account_num}'s backup relocated under "
+                        f"{other_num}, but could not mirror it back: {e}"
+                    )
+                return value
+        return ""
+
+    def _read_account_credentials_direct(
         self, account_num: str, email: str, failed: list | None = None
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
