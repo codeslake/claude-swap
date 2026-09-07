@@ -23,6 +23,7 @@ from claude_swap.switcher import USAGE_API_KEY
 
 # --- notification identity -----------------------------------------------------
 
+
 def test_notification_identity_creates_and_preserves_info_plist(tmp_path: Path):
     executable = tmp_path / "bin" / "python3"
     executable.parent.mkdir()
@@ -66,6 +67,7 @@ def test_notification_identity_is_noop_off_macos(tmp_path: Path):
 
 
 # --- settings ------------------------------------------------------------------
+
 
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
@@ -117,6 +119,7 @@ _USAGE = {
 
 
 # --- usage display helpers -----------------------------------------------------
+
 
 def test_tightest_pct_uses_max_window():
     assert menubar.tightest_pct(_USAGE) == 42.0
@@ -240,6 +243,7 @@ def test_format_account_label_disabled_marker():
 
 # --- usage logging -------------------------------------------------------------
 
+
 def test_format_usage_log_full():
     usage = {
         "five_hour": {"pct": 35.0, "clock": "06:59"},
@@ -276,6 +280,7 @@ def test_usage_log_key_ignores_clock_tracks_pct():
 
 
 # --- title ---------------------------------------------------------------------
+
 
 def test_format_title_name_and_5h():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
@@ -365,6 +370,7 @@ def test_format_title_both_keeps_available_window():
 
 # --- reset-time helpers --------------------------------------------------------
 
+
 def test_resets_at_ts_orders_and_handles_missing():
     early = {"resets_at": "2026-06-24T07:00:00+00:00"}
     late = {"resets_at": "2026-06-26T07:00:00+00:00"}
@@ -441,6 +447,7 @@ def test_parse_switch_history_empty_or_no_matches():
 
 # --- snapshot adapter (fakes for AccountsSnapshot / UsageEntry) -----------------
 
+
 class _FakeEntry:
     def __init__(self, sentinel=None, last_good=None, fetched_at=None):
         self.sentinel = sentinel
@@ -498,6 +505,7 @@ def test_adapt_snapshot_empty():
 
 # --- weekly reset roll-forward (static 7-day cadence) --------------------------
 
+
 def test_rolled_weekly_window_advances_passed_reset():
     w = {"pct": 95.0, "resets_at": _iso(-3 * 86400), "countdown": "stale", "clock": "old"}
     rolled = menubar._rolled_weekly_window(w, _NOW)
@@ -544,6 +552,7 @@ def test_format_title_reflects_passed_weekly_reset():
 
 # --- run() app glue ------------------------------------------------------------
 
+
 def test_run_without_rumps_raises_clean_error(monkeypatch):
     """A missing menubar extra surfaces as ClaudeSwitchError, not a traceback.
 
@@ -559,6 +568,7 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
 
 
 # --- switch notification -------------------------------------------------------
+
 
 def test_a_plain_switch_reports_the_propagation_delay():
     title, body = menubar.switch_notification({"switched": True})
@@ -608,6 +618,8 @@ def test_a_deliberate_wait_is_not_titled_an_exhausted_fleet():
     assert menubar.exhausted_notification(real)[0] == "All accounts exhausted", (
         "a genuinely exhausted fleet lost its own title"
     )
+
+
 class TestFrameworkBuildWarning:
     """The menu bar draws nothing from a framework build on macOS 26.
 
