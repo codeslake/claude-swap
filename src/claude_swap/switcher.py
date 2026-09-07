@@ -3267,8 +3267,9 @@ class ClaudeAccountSwitcher:
         otherwise re-log it every poll for as long as it stays there.
         """
         key = (reason, "", "live-login-unattributed")
-        if key not in self._provenance_warned:
-            self._provenance_warned.add(key)
+        warned = getattr(self, "_provenance_warned", None)
+        if warned is not None and key not in warned:
+            warned.add(key)
             self._logger.warning(
                 "live login identity unattributed (%s); asking the oracle",
                 reason,

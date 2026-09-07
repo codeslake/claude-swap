@@ -13214,6 +13214,22 @@ class TestForgetLiveLoginWarningsResetsTheDedupe:
         )
 
 
+class TestUnattributedLiveLoginSurvivesADoubleWithNoProvenanceWarned:
+    """`_unattributed_live_login` read `self._provenance_warned` bare --
+    unlike its sibling `_forget_live_login_warnings`, which already uses
+    `getattr(self, "_provenance_warned", None)` for exactly this reason: many
+    tests reach these resolvers through a bare `ClaudeAccountSwitcher.__new__`
+    double that skips `__init__` and so never sets the attribute."""
+
+    def test_no_provenance_warned_attribute_does_not_raise(self):
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._login_identity_from_the_oracle = lambda **kw: (
+            "o@example.com", "org-o", "u-o")
+        assert s._unattributed_live_login(
+            ask_server=False, reason="no recorded active slot"
+        ) == ("o@example.com", "org-o")
+
+
 class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
     """Routing "not pinned but wiring present" through the oracle-or-None
     fallback (`_unattributed_live_login`) left `current_identity=None`
