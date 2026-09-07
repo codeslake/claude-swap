@@ -7181,11 +7181,14 @@ class TestPidIsAliveIsPortableAcrossOS:
     is never reached on that branch.
     """
 
-    def _fake_kernel32(self, monkeypatch, *, open_returns, last_error=0):
+    def _fake_kernel32(
+        self, monkeypatch, *, open_returns, last_error=0,
+        exit_code=259, get_exit_code_succeeds=True,  # 259 == STILL_ACTIVE
+    ):
         import ctypes
         import types
 
-        calls = {"open": [], "close": []}
+        calls = {"open": [], "close": [], "exit_code": []}
 
         class _Kernel32:
             def OpenProcess(self, access, inherit, pid):
@@ -7199,6 +7202,13 @@ class TestPidIsAliveIsPortableAcrossOS:
             def GetLastError(self):
                 return last_error
 
+            def GetExitCodeProcess(self, handle, out):
+                calls["exit_code"].append(handle)
+                if not get_exit_code_succeeds:
+                    return 0
+                out._obj.value = exit_code
+                return 1
+
         monkeypatch.setattr(
             ctypes, "windll",
             types.SimpleNamespace(kernel32=_Kernel32()), raising=False,
@@ -7210,17 +7220,40 @@ class TestPidIsAliveIsPortableAcrossOS:
             raise AssertionError("os.kill must not be called on the Windows branch")
         monkeypatch.setattr(os, "kill", _boom)
 
-    def test_a_live_handle_is_alive(self, monkeypatch):
+    def test_a_still_active_handle_is_alive(self, monkeypatch):
         import sys
 
         from claude_swap import pin
 
         monkeypatch.setattr(sys, "platform", "win32")
-        calls = self._fake_kernel32(monkeypatch, open_returns=1234)
+        calls = self._fake_kernel32(monkeypatch, open_returns=1234, exit_code=259)
         self._no_os_kill(monkeypatch)
 
         assert pin._pid_is_alive(999) is True
         assert calls["close"] == [1234], "the opened handle was never closed"
+
+    def test_an_open_handle_to_an_already_exited_process_is_dead(
+        self, monkeypatch
+    ):
+        """THE REGRESSION: a terminated process's kernel object stays
+        resident, and `OpenProcess` keeps succeeding, for as long as ANY
+        handle to it is held -- including this test's own `subprocess.Popen`,
+        which never closes its handle after `.wait()`. `_pid_is_alive` read
+        that open as "alive" and made `test_a_dead_pid_behind_the_record_is_
+        still_healed` fail on real `test-windows (pin-cli)` CI (a genuinely
+        exited pid, `changed` came back False, "Nothing to heal"). A
+        successful open with an exit code other than STILL_ACTIVE must read
+        as dead.
+        """
+        import sys
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        self._fake_kernel32(monkeypatch, open_returns=1234, exit_code=0)
+        self._no_os_kill(monkeypatch)
+
+        assert pin._pid_is_alive(999) is False
 
     def test_access_denied_still_means_alive(self, monkeypatch):
         import sys
@@ -7245,6 +7278,21 @@ class TestPidIsAliveIsPortableAcrossOS:
         self._no_os_kill(monkeypatch)
 
         assert pin._pid_is_alive(999) is False
+
+    def test_an_unreadable_exit_code_fails_closed(self, monkeypatch):
+        import sys
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        self._fake_kernel32(
+            monkeypatch, open_returns=1234, get_exit_code_succeeds=False
+        )
+        self._no_os_kill(monkeypatch)
+
+        assert pin._pid_is_alive(999) is True, (
+            "GetExitCodeProcess failing must not read as confirmed dead"
+        )
 
 
 class TestTheDeadPortCanBeInTheOtherConfig:

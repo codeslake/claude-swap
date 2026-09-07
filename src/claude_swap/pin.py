@@ -126,9 +126,18 @@ def _pid_is_alive(pid: int) -> bool:
     Called with this process's own pid inside a CI worker that IS the
     console's process group leader, that took down the entire pytest run
     with a stray `KeyboardInterrupt` -- reproduced on `test-windows
-    (pin-cli)`. Windows instead asks the OS to open a handle: a live pid
-    opens, a gone one fails with "not found", and access denied (the pid
-    exists, we may not query it) still means alive.
+    (pin-cli)`. Windows instead asks the OS to open a handle: access denied
+    (the pid exists, we may not query it) means alive, and a pid nothing
+    can open at all means gone.
+
+    OPENING IS NOT ENOUGH, EITHER: a terminated process's kernel object
+    stays resident -- and `OpenProcess` keeps succeeding for it -- for as
+    long as ANY handle to it is still held, including one this same test
+    process's own `subprocess.Popen` never closed after `.wait()`. That
+    read a genuinely-exited pid as alive and reproduced the T2 regression
+    on `test-windows (pin-cli)` the run after the broadcast fix. So a
+    successful open is followed by `GetExitCodeProcess`: only `STILL_ACTIVE`
+    means the process itself, not merely its handle, is still running.
     """
     import sys
 
@@ -137,11 +146,17 @@ def _pid_is_alive(pid: int) -> bool:
 
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if handle:
+        if not handle:
+            return kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED: exists, alive
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return True  # cannot tell: fail closed
+            return exit_code.value == STILL_ACTIVE
+        finally:
             kernel32.CloseHandle(handle)
-            return True
-        return kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED: exists, alive
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
