@@ -12965,12 +12965,15 @@ class TestTheLiveCredentialIsReadThroughTheStore:
 
 
 class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
-    """A witness gap (the record silent while the wiring is still present,
-    no recorded active slot, or a recorded slot with no stored email) must
-    not fall back to the raw config identity: under a splice that value IS
-    the pin's. Each exit asks the oracle instead and answers ``None`` when
-    it too cannot say -- never the pin (the same class
-    `test_the_resolver_keeps_the_recorded_slot...` already fixed, above).
+    """Two shapes, one invariant: a witness gap must never fall back to the
+    raw config identity, which under a splice is the pin's forged value.
+
+    - The record is silent (cleared, or unreadable) but the wiring is
+      still present: falls through to the same recorded-slot /
+      local-credential resolver a genuine splice uses.
+    - No recorded active slot, or a recorded slot with no stored email:
+      neither witness can attribute the login, so this asks the oracle and
+      answers ``None`` when it too cannot say -- never the pin.
 
     `pinned_identity` itself never raises (`pin.py`'s `_pinned_email_now`
     degrades every read failure to ``None``, and `pinned_identity` wraps it
@@ -12992,11 +12995,13 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
     def test_record_cleared_but_wiring_still_present_never_answers_the_pin(
         self, temp_home: Path, monkeypatch
     ):
-        """MEASURED shape: `cswap_pin.proxy.apply_pin`'s clear path writes
-        `save_pin(..., None, None)` (the record gone) BEFORE it un-splices
-        `~/.claude.json` -- and that un-splice can fail and never run. In
-        that window the config still names the just-cleared pin while
-        `pinned_identity()` already answers None."""
+        """`cswap_pin.proxy.apply_pin`'s clear path writes `save_pin(...,
+        None, None)` (the record gone) BEFORE it un-splices
+        `~/.claude.json` -- and that un-splice can fail and never run. A
+        fresh switcher has no recorded active slot yet, so this reaches
+        the same "no recorded active slot" exit a genuine splice would;
+        the guard is that the answer is never the just-cleared pin's
+        forged value, not which exit gets there."""
         from claude_swap import pin as _pin
 
         s = self._switcher(temp_home)
@@ -13065,49 +13070,37 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
             lambda **kw: pytest.fail("no pin and no wiring asked the oracle"))
         assert s._live_login_identity() == ("plain@example.com", "")
 
-    def test_no_recorded_active_slot_never_answers_the_pin(
-        self, temp_home: Path, monkeypatch
+    @pytest.mark.parametrize("sequence_data, why", [
+        ({"accounts": {}}, "no recorded active slot"),
+        ({"activeAccountNumber": 2,
+          "accounts": {"2": {"organizationUuid": "org-b"}}},
+         "the recorded slot carried no email"),
+    ])
+    def test_no_attributable_slot_never_answers_the_pin(
+        self, temp_home: Path, monkeypatch, sequence_data, why
     ):
         from claude_swap import pin as _pin
 
         s = self._switcher(temp_home)
         monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
         monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
-        monkeypatch.setattr(s, "_get_sequence_data", lambda: {"accounts": {}})
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: sequence_data)
         monkeypatch.setattr(
             s, "_login_identity_from_the_oracle", lambda **kw: None)
         assert s._live_login_identity() is None, (
-            "no recorded active slot and the answer was the raw config "
-            "identity, which under a splice is the pin's"
-        )
-
-    def test_a_recorded_slot_with_no_stored_email_never_answers_the_pin(
-        self, temp_home: Path, monkeypatch
-    ):
-        from claude_swap import pin as _pin
-
-        s = self._switcher(temp_home)
-        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
-        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
-        monkeypatch.setattr(s, "_get_sequence_data", lambda: {
-            "activeAccountNumber": 2,
-            "accounts": {"2": {"organizationUuid": "org-b"}}})
-        monkeypatch.setattr(
-            s, "_login_identity_from_the_oracle", lambda **kw: None)
-        assert s._live_login_identity() is None, (
-            "the recorded slot carried no email and the answer was the raw "
-            "config identity, which under a splice is the pin's"
+            f"{why} and the answer was the raw config identity, which "
+            "under a splice is the pin's"
         )
 
 
 class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
-    """C1: routing "not pinned but wiring present" through the oracle-or-None
-    fallback (`_unattributed_live_login`) left `current_identity=None` at
-    `_perform_switch_locked`'s :7561 whenever the oracle could not answer
-    (offline, an expired token, a timeout -- failures are never memoized).
-    `None` sends the switch down the no-backup direct-activation path, which
-    SKIPS the back-up-current step, so the outgoing slot's stored generation
-    is destroyed rather than updated.
+    """Routing "not pinned but wiring present" through the oracle-or-None
+    fallback (`_unattributed_live_login`) left `current_identity=None`
+    whenever the oracle could not answer (offline, an expired token, a
+    timeout -- failures are never memoized). `None` sends the switch down
+    the no-backup direct-activation path, which SKIPS the back-up-current
+    step, so the outgoing slot's stored generation is destroyed rather than
+    updated.
 
     The fix reuses the mechanism this PR already built for a genuine splice:
     the recorded slot plus a local byte/lineage compare, oracle only as a
@@ -13222,33 +13215,34 @@ class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
             f"the switch could not attribute who it left: {result['from']!r}"
         )
 
-    def test_I1_force_activate_still_attributes_from_despite_skipping_the_prefetch(
+    def test_force_activate_still_attributes_from(
         self, temp_home: Path, mock_claude_config, monkeypatch
     ):
         """`force_activate` skips `_prefetch_live_identity` entirely
         (`provenance = {"live": None, "resolved": None}`) and always takes
-        the direct-activation branch -- but `current_identity` is resolved
-        UNDER THE LOCK regardless of `force_activate` or `provenance`, so
-        `from_ref` must still name slot 2, not go unattributed, even though
-        the backup-current step itself is (correctly) skipped either way."""
-        switcher, _creds_store, _slot2_live = self._witness_gap_switch_harness(
+        the direct-activation branch, which correctly skips the
+        backup-current step -- but `current_identity` is resolved UNDER
+        THE LOCK regardless of `force_activate` or `provenance`, so
+        `from_ref` must still name slot 2, not go unattributed."""
+        switcher, creds_store, _slot2_live = self._witness_gap_switch_harness(
             temp_home, monkeypatch
         )
+        slot2_backup_before = creds_store[("2", "slot2@example.com")]
         with patch.object(switcher, "list_accounts"):
             result = switcher._perform_switch(
                 "3", emit_output=False, force_activate=True
             )
+        assert creds_store[("2", "slot2@example.com")] == slot2_backup_before, (
+            "force_activate did not skip the backup-current step"
+        )
         assert result["from"] == {"number": 2, "email": "slot2@example.com"}, (
             f"force_activate left `from` unattributed: {result['from']!r}"
         )
 
-    def test_I2_current_account_number_asks_nobody_when_bytes_match_the_slot(
-        self, temp_home: Path, mock_claude_config, monkeypatch
-    ):
-        """`current_account_number` calls `_live_login_identity()` at its
-        DEFAULT `ask_server=True` -- but when the live bytes are already
-        the recorded slot's (no lineage divergence), the local compare
-        answers before the oracle is ever asked, egress or none."""
+    def _wired_slot2(self, monkeypatch) -> ClaudeAccountSwitcher:
+        """Real wiring marker, `activeAccountNumber` 2, and slot 2's live
+        credential byte-identical to its own stored backup (no lineage
+        divergence)."""
         from claude_swap import pin as _pin
         from claude_swap import switcher as _sw
 
@@ -13272,6 +13266,18 @@ class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
                              lambda: ActiveCredentials(matching, False))
         monkeypatch.setattr(switcher, "_read_capture_credentials",
                              lambda: matching)
+        return switcher
+
+    def test_a_byte_match_with_the_recorded_slot_asks_nobody(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        """`current_account_number` calls `_live_login_identity()` at its
+        DEFAULT `ask_server=True` -- but when the live bytes are already
+        the recorded slot's (no lineage divergence), the local compare
+        answers before the oracle is ever asked, egress or none."""
+        from claude_swap import switcher as _sw
+
+        switcher = self._wired_slot2(monkeypatch)
         asked = []
         monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
             asked.append(tok) or None))
@@ -13280,37 +13286,14 @@ class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
         assert asked == [], (
             f"the local byte match still asked the oracle: {asked}")
 
-    def test_I4_live_identity_matches_holds_on_a_witness_gap_matching_the_slot(
+    def test_live_identity_matches_holds_on_a_witness_gap(
         self, temp_home: Path, mock_claude_config, monkeypatch
     ):
         """`_live_identity_matches` (the TOCTOU re-check the locked refresh
         and the rotated-backup resync both gate on) must still answer True
         for the recorded slot's own identity on a witness gap -- otherwise
         both callers silently stop running for as long as the gap lasts."""
-        from claude_swap import pin as _pin
-        from claude_swap import switcher as _sw
-
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        switcher._write_json(switcher.sequence_file, {
-            "activeAccountNumber": 2,
-            "accounts": {"2": {"email": "slot2@example.com",
-                               "organizationUuid": "", "uuid": "uuid-2"}},
-        })
-        config_path = _sw.get_global_config_path()
-        ledger_path = _pin._ledger_path(config_path)
-        ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        ledger_path.write_text(json.dumps({_pin._WIRE_MARK: ["HTTPS_PROXY"]}))
-
-        matching = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-slot2", "refreshToken": "rt-slot2"}})
-        monkeypatch.setattr(switcher, "_read_account_credentials",
-                             lambda num, email: matching)
-        monkeypatch.setattr(switcher, "_read_active_credentials",
-                             lambda: ActiveCredentials(matching, False))
-        monkeypatch.setattr(switcher, "_read_capture_credentials",
-                             lambda: matching)
-
+        switcher = self._wired_slot2(monkeypatch)
         assert switcher._live_identity_matches("slot2@example.com", "") is True
 
 
