@@ -221,6 +221,7 @@ def account_row(
     last_good_usage: dict | None = None,
     alias: str = "",
     disabled: bool = False,
+    login_expires_at: str | None = None,
 ) -> dict:
     """A full account row for ``--list``."""
     status, usage = usage_fields(usage_entry, usage_fetched_at)
@@ -240,6 +241,11 @@ def account_row(
     # existing consumers keying on the base schema are unaffected.
     if disabled:
         row["disabled"] = True
+    # Additive field: when the stored login records the expiry of its refresh
+    # token (see ``oauth.login_expires_at_iso``), scripts can warn ahead of the
+    # ``relogin_required`` that follows; absent when the login carries none.
+    if login_expires_at:
+        row["loginExpiresAt"] = login_expires_at
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
