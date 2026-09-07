@@ -366,14 +366,21 @@ class TestMoveAccount:
             switcher._read_account_credentials("5", "account2@example.com")
             == "creds-two"
         )
-        # Converged: slot 5 now holds its own copy...
-        assert switcher._store._backup_enc_path(
-            "5", "account2@example.com"
-        ).exists()
+        # Converged: a DIRECT read (no fallback) now finds slot 5's own
+        # copy, on whichever backend this platform actually writes to...
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "5", "account2@example.com"
+            )
+            == "creds-two"
+        )
         # ...and the old slot's item was never touched.
-        assert switcher._store._backup_enc_path(
-            "2", "account2@example.com"
-        ).exists()
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "2", "account2@example.com"
+            )
+            == "creds-two"
+        )
 
     def test_move_relocates_session_profile(
         self, temp_home: Path, sample_sequence_data: dict
