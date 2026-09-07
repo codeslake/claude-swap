@@ -7205,6 +7205,12 @@ class ClaudeAccountSwitcher:
         # the divergence can't be classified — pre-fix behavior, silent — and
         # a *resolved* divergence falls through so _perform_switch can
         # reconcile it.
+        # Resolved once, here, before the probe — reused verbatim by the
+        # `except TargetCredentialDead` refusal below instead of re-reading
+        # `~/.claude.json` a second time: under a pin splice that file names
+        # the pin, not the account this switch is actually leaving, so a
+        # second, later read can answer a different question than this one.
+        identity: tuple[str, str] | None = None
         provenance: dict | None = None
         if not force and data:
             identity = self._get_current_account()
@@ -7251,7 +7257,6 @@ class ClaudeAccountSwitcher:
                 provenance=provenance,
             )
         except TargetCredentialDead as exc:
-            identity = self._get_current_account()
             if identity is not None:
                 cur_num = self._find_account_slot(data, identity[0], identity[1])
                 cur_ref = (
