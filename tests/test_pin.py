@@ -7193,6 +7193,65 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "a wired config with no daemon record at all was not condemned"
         )
 
+    def test_a_second_read_of_the_port_going_stale_does_not_strand_the_config(
+        self, tmp_path, monkeypatch
+    ):
+        """[I]: the narrowing filter used to call `_port_of_config` a SECOND
+        time instead of reusing the value the first read (which builds
+        `dead`) already captured. Claude Code rewrites `.claude.json`
+        routinely, so if the file changes between the two reads and the
+        second one comes back `None`, `None != rec_port` reads as "still
+        dead" and strips a wiring the daemon's own record shows alive on
+        its recorded port -- the exact stranding this guard exists to
+        prevent."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        port = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", port)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        self._record(sw, port=port, pid=os.getpid(), fingerprint="fp")
+
+        real = pin._port_of_config
+        calls = {"n": 0}
+
+        def _flaky(path):
+            calls["n"] += 1
+            return real(path) if calls["n"] == 1 else None
+
+        monkeypatch.setattr(pin, "_port_of_config", _flaky)
+
+        assert bool(pin._dead_wired_configs(sw)) is False, (
+            "a config wired to the daemon's own recorded, alive port was "
+            "condemned because a SECOND read of its port came back None"
+        )
+
+    def test_an_alive_pid_with_no_port_in_the_record_spares_everything(
+        self, tmp_path, monkeypatch
+    ):
+        """[m]: `_wired_daemon_port` returns None for a record with an alive
+        pid but a missing/out-of-range port, and `_dead_wired_configs` falls
+        back to the old, machine-wide spare (`[]`) rather than narrowing to
+        nothing and condemning. That fallback is the deliberate fail-closed
+        direction -- deleting a live wiring is the destructive one -- and
+        was untested, so a future edit could narrow it silently."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        self._record(sw, pid=os.getpid())  # alive pid, no "port" key at all
+
+        assert pin._dead_wired_configs(sw) == [], (
+            "an alive-pid record with no port must spare everything, not "
+            "narrow to nothing and condemn a wiring the record cannot rule out"
+        )
+
 
 class TestPidIsAliveIsPortableAcrossOS:
     """`os.kill(pid, 0)` is a pure liveness probe on POSIX. On Windows the
@@ -7238,10 +7297,17 @@ class TestPidIsAliveIsPortableAcrossOS:
                 out._obj.value = exit_code
                 return 1
 
-        monkeypatch.setattr(
-            ctypes, "WinDLL",
-            lambda name, use_last_error=False: _Kernel32(), raising=False,
-        )
+        def _win_dll(name, use_last_error=False):
+            assert use_last_error is True, (
+                "production must call WinDLL(..., use_last_error=True): a "
+                "bare `windll` handle reads GetLastError through an "
+                "intervening ctypes attribute lookup that can clobber the "
+                "thread's real error value between the failing call and "
+                "the read"
+            )
+            return _Kernel32()
+
+        monkeypatch.setattr(ctypes, "WinDLL", _win_dll, raising=False)
         monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
         return calls
 

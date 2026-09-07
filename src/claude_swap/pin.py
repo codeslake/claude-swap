@@ -259,8 +259,13 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     # unmarked foreign port must not make this list non-empty, and "I cannot
     # read the port" is not "the port is dead". Either would have the launch
     # path tear down a wiring whose proxy may be live.
+    # (path, port) pairs, so the narrowing filter below reuses the port THIS
+    # read captured rather than reading the config a second time -- Claude
+    # Code rewrites `.claude.json` routinely, and a second read landing on a
+    # rewritten/truncated file would silently re-strand the exact wiring this
+    # guard exists to protect.
     dead = [
-        path
+        (path, port)
         for path in _each_config()
         if (port := _port_of_config(path)) and not _port_answers(port, connect_timeout)
     ]
@@ -274,8 +279,8 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
         rec_port = _wired_daemon_port(_switcher)
         if rec_port is None:
             return []
-        dead = [d for d in dead if _port_of_config(d) != rec_port]
-    return dead
+        dead = [(path, port) for path, port in dead if port != rec_port]
+    return [path for path, _port in dead]
 
 
 def clear_wiring(switcher, timeout: float | None = None, only=None,
