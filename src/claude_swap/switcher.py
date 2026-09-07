@@ -2335,7 +2335,34 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        # Ownership attribution for `refresh_input` — the ONE POST site with
+        # no bytes gate at all, unlike every sibling (the active path's
+        # `refresh_via`, `_classify_outgoing_credential`'s own-rotated/
+        # known-foreign check): each of those refuses a lineage
+        # `_probe_verdicts` has already condemned as another account's,
+        # keyed the same way (`_lineage_key`, bound to this slot's full
+        # identity so a slot re-created for a different account never
+        # inherits its predecessor's verdicts). This gate never consulted
+        # that memo at all — so a lineage already proven foreign under this
+        # slot's identity (e.g. by the active path's own oracle probe) could
+        # still be POSTed here and its one-time grant burned. `current`
+        # itself carries no identity to check when no such verdict exists —
+        # only a network probe could ever tell whose bytes these are, and
+        # that is forbidden under this lock — so an absent verdict is not
+        # proof of anything and is not gated; only a definitive `False` is.
+        if self._probe_verdicts.get(
+            self._lineage_key(account_num, email, consumed_fp or "")
+        ) is False:
+            self._logger.info(
+                "Account %s's backup grant is a lineage already condemned "
+                "as another account's; deferring rather than consuming it.",
+                account_num,
+            )
+            return oauth.RefreshOutcome(None, "transient")
+
+        result = oauth.try_refresh_oauth_credentials(
+            refresh_input, slot=account_num
+        )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
@@ -4841,7 +4868,7 @@ class ClaudeAccountSwitcher:
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                            refresh_input, timeout_s=6.0, slot=account_num
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"

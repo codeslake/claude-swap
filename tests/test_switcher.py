@@ -13189,6 +13189,41 @@ class TestConsumeGate:
 
         assert posted["creds"] == profile_newer
 
+    def test_a_lineage_already_condemned_as_foreign_is_never_consumed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`current` is read straight from the backup store with nothing to
+        attribute it to this slot — unlike every sibling POST site (the
+        active path's `refresh_via`, `_classify_outgoing_credential`'s
+        known-foreign check), this gate never consulted `_probe_verdicts` at
+        all. So a lineage some OTHER code path already proved foreign under
+        this slot's identity (an oracle probe from the active-path drift
+        resync, say) could still be POSTed here and its one-time grant
+        burned. This is the shape behind the 2026-09-07 forced-relogin
+        incident: a different writer bug landed account 6's live bytes in
+        slot 1's backup, and the consume gate had no bytes gate to catch a
+        lineage already known not to be this slot's."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._probe_verdicts[
+            s._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._OLD),
+            )
+        ] = False
+
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(self._NEW, None),
+        ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "transient"
+        # nothing consumed; the backup is exactly as it was
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict
     ):

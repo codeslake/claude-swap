@@ -132,13 +132,17 @@ class RefreshOutcome:
 
 
 def try_refresh_oauth_credentials(
-    credentials: str, timeout_s: float = 10.0
+    credentials: str, timeout_s: float = 10.0, slot: str | None = None
 ) -> RefreshOutcome:
     """Refresh an OAuth access token via direct token endpoint POST.
 
     ``timeout_s`` bounds the network exchange. Callers that hold locks other
     processes contend for should pass a budget comfortably inside the
     contenders' acquire timeout (see ``_fetch_active_usage``).
+
+    ``slot`` is logging only (an account number, when the caller has one) —
+    this used to log nothing on success and only at DEBUG on failure, so no
+    refresh POST was ever dateable from the log at all.
     """
     # ``no_refresh_token`` is a PERMANENT verdict (it strikes at
     # AUTH_DEAD_STRIKES=1), so it demands a structurally complete OAuth dict
@@ -183,6 +187,7 @@ def try_refresh_oauth_credentials(
             oauth["scopes"] = resp_data["scope"].split()
 
         data["claudeAiOauth"] = oauth
+        _logger.info("Refresh POST for account %s: ok", slot)
         return RefreshOutcome(
             json.dumps(data), None, _parse_token_account(resp_data)
         )
@@ -210,10 +215,13 @@ def try_refresh_oauth_credentials(
             # (client_id rotated/blocked), no evidence about any slot, so it
             # keeps its own kind and lands no strike.
             if err in ("invalid_grant", "invalid_client"):
+                _logger.info("Refresh POST for account %s: failed (%s)", slot, err)
                 return RefreshOutcome(None, err)
+        _logger.info("Refresh POST for account %s: failed (transient)", slot)
         return RefreshOutcome(None, "transient")
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
+        _logger.info("Refresh POST for account %s: failed (transient)", slot)
         return RefreshOutcome(None, "transient")
 
 
