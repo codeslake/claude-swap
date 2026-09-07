@@ -14051,21 +14051,3 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
             "ranking read the 5-hour reset the account is not waiting for"
         )
         assert harness.active_number() == 2
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

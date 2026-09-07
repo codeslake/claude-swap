@@ -538,7 +538,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    # proactive | at-limit | failover | consume-first | dynamic | alternation
+    # proactive | at-limit | failover | consume-first | alternation
     # | disabled-active
     trigger: str
     from_ref: dict | None
@@ -1795,6 +1795,9 @@ class AutoSwitchEngine:
         # arms below: the bar's own meaning ("never undo the switch this
         # engine itself just made") does not depend on which of the two
         # new triggers is asking.
+        last_active_at = state.get("lastActiveAt")
+        last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
+
         def _dynamic_rank(cands, hroom, at_now, active_h):
             recovered = self._left_account_recovered(
                 state, usage, hroom, active_h, settings, at_now, current,
@@ -1817,8 +1820,6 @@ class AutoSwitchEngine:
         dynamic_ordered: list[str] | None = None
         if settings.strategy == "dynamic" and trigger == "proactive":
             now = self.clock()
-            last_active_at = state.get("lastActiveAt")
-            last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
             warm_ordered, cold_ordered = _dynamic_rank(
                 oauth_candidates, headroom, now, active_headroom,
             )
@@ -1852,27 +1853,15 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
         elif settings.strategy == "dynamic" and trigger == "dynamic-healthy":
             now = self.clock()
-            last_active_at = state.get("lastActiveAt")
-            last_active_at = last_active_at if isinstance(last_active_at, dict) else {}
-            # NOT `_dynamic_rank`: the no-return bar's `recovered` check asks
-            # "is this account a genuinely different proposition than when
-            # we left it", which a healthy, unchanged account (F3's own
-            # design: two warm accounts alternating every chunk, neither
-            # ever needing to change) can never satisfy on purpose — that
-            # would turn ALTERNATION's own deliberate return into the exact
-            # flap the bar exists to stop everywhere else. The fable trace
-            # this round is fixing is the `about_to_wall` arm specifically
-            # (a candidate re-admitted while genuinely spent); alternation
-            # already floors its partner at `cold_switch_cost_pct`, well
-            # above spent.
+            # NOT `_dynamic_rank`: the no-return bar would permanently
+            # block F3's deliberate, healthy alternation between two
+            # unchanged accounts (never "recovered").
             warm_ordered, cold_ordered = _rank_dynamic_candidates(
                 oauth_candidates, headroom, usage, now, last_active_at,
                 settings.cache_ttl_seconds,
             )
-            # Item 4: alternation — a WARM partner past the floor, and only
-            # once we have sat on the current active for a full chunk. No
-            # reference (never landed here via a switch) reads as "not yet"
-            # rather than "immediately eligible".
+            # Alternation: a warm partner past the floor, once we've sat
+            # on the active for a full chunk.
             partner = next(
                 (n for n in warm_ordered if headroom.get(n, 0.0) >= settings.cold_switch_cost_pct),
                 None,
@@ -1883,15 +1872,8 @@ class AutoSwitchEngine:
                 or since is None
                 or now - since < settings.alternation_chunk_seconds
             ):
-                # WHY there is no alternation this tick, one label per
-                # story (item 5's shared vocabulary): a warm partner exists
-                # but has not been dwelt on long enough yet stays the
-                # generic below-threshold hold (nothing cold-related to
-                # report); no warm candidate at all, and a cold one that
-                # clears the floor, is refused only because the active
-                # itself is not walled -- `cold`; a cold one that does NOT
-                # even clear the floor -- `below-floor`; neither exists --
-                # below-threshold.
+                # One label per story (item 5): a warm partner not yet
+                # dwelt on, or a cold one clearing/not-clearing the floor.
                 if warm_ordered:
                     reason = "below-threshold"
                 elif any(
