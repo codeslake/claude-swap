@@ -13018,7 +13018,9 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
         """The gap is a persistent state, not an event: a scheduled caller
         (`_tick_inner`, the sleep shortener, a per-slot token check) asks on
         every poll for as long as it stays there, and must not re-log it
-        every time."""
+        every time. TWO different reasons, not one: a dedupe keyed on
+        nothing ("log once, ever, no matter why") would pass a same-reason
+        repeat too, and only a second, DIFFERENT reason tells them apart."""
         import logging as _logging
 
         from claude_swap import pin as _pin
@@ -13026,24 +13028,31 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
         s = self._switcher(temp_home)
         monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
         monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
-        monkeypatch.setattr(s, "_get_sequence_data", lambda: {"accounts": {}})
         monkeypatch.setattr(
             s, "_login_identity_from_the_oracle", lambda **kw: None)
+        no_recorded_slot = {"accounts": {}}
+        no_stored_email = {"activeAccountNumber": 2, "accounts": {"2": {}}}
         with caplog.at_level(_logging.WARNING):
+            monkeypatch.setattr(s, "_get_sequence_data", lambda: no_recorded_slot)
             s._live_login_identity()
-            s._live_login_identity()
-        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING
-                    and "unattributed" in r.message]
-        assert len(warnings) == 1, (
-            f"the witness gap logged {len(warnings)} times across two calls "
-            f"instead of once: {[r.message for r in warnings]}"
+            s._live_login_identity()               # repeat: no new line
+            monkeypatch.setattr(s, "_get_sequence_data", lambda: no_stored_email)
+            s._live_login_identity()                # different reason: a new line
+        warnings = [r.message for r in caplog.records
+                    if r.levelno == _logging.WARNING and "unattributed" in r.message]
+        assert len(warnings) == 2, (
+            f"expected one line per distinct reason (no recorded slot, "
+            f"no stored email), got {len(warnings)}: {warnings}"
         )
+        assert warnings[0] != warnings[1], warnings
 
     def test_CONTROL_no_pin_and_no_wiring_still_answers_the_config(
         self, temp_home: Path, monkeypatch
     ):
         """The overwhelmingly common case: nothing was ever pinned. Both
-        witnesses agree, and the honest config identity ships unchanged."""
+        witnesses agree, and the honest config identity ships unchanged --
+        with no detour through the oracle, which the deleted-feature version
+        of this test could not tell from a correct one."""
         from claude_swap import pin as _pin
 
         s = self._switcher(temp_home)
@@ -13051,6 +13060,9 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
                              lambda: ("plain@example.com", ""))
         monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
         monkeypatch.setattr(_pin, "_wiring_present", lambda _s: False)
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle",
+            lambda **kw: pytest.fail("no pin and no wiring asked the oracle"))
         assert s._live_login_identity() == ("plain@example.com", "")
 
     def test_no_recorded_active_slot_never_answers_the_pin(
@@ -13086,6 +13098,220 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
             "the recorded slot carried no email and the answer was the raw "
             "config identity, which under a splice is the pin's"
         )
+
+
+class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
+    """C1: routing "not pinned but wiring present" through the oracle-or-None
+    fallback (`_unattributed_live_login`) left `current_identity=None` at
+    `_perform_switch_locked`'s :7561 whenever the oracle could not answer
+    (offline, an expired token, a timeout -- failures are never memoized).
+    `None` sends the switch down the no-backup direct-activation path, which
+    SKIPS the back-up-current step, so the outgoing slot's stored generation
+    is destroyed rather than updated.
+
+    The fix reuses the mechanism this PR already built for a genuine splice:
+    the recorded slot plus a local byte/lineage compare, oracle only as a
+    tie-breaker, and the recorded slot standing when the oracle cannot say.
+    No pin, no `_wiring_present` stub -- the REAL sidecar receipt on disk,
+    the same file `pin.py` itself reads and writes."""
+
+    def _witness_gap_switch_harness(self, temp_home: Path, monkeypatch):
+        """A real, on-disk witness gap: settings.json absent (never
+        written), the sidecar wiring receipt present (the exact file
+        `pin.py`'s own writer/reader use -- no `_wiring_present` stub),
+        slot 2 recorded active with a stored backup slot 2's live
+        credential has rotated PAST (both tokens differ, no shared
+        lineage stamp -- `_live_credential_is` answers False), slot 3 the
+        switch target, and the oracle stubbed unreachable."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        sequence = {
+            "activeAccountNumber": 2,
+            "accounts": {
+                "2": {"email": "slot2@example.com", "organizationUuid": "",
+                      "uuid": "uuid-2"},
+                "3": {"email": "slot3@example.com", "organizationUuid": "",
+                      "uuid": "uuid-3"},
+            },
+        }
+        switcher._write_json(switcher.sequence_file, sequence)
+
+        config_path = _sw.get_global_config_path()
+        ledger_path = _pin._ledger_path(config_path)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps({_pin._WIRE_MARK: ["HTTPS_PROXY"]}))
+        assert _pin._wiring_present(switcher) is True, "test premise"
+
+        slot2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot2-old", "refreshToken": "rt-slot2-old",
+            "refreshTokenExpiresAt": 1000}})
+        slot2_live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot2-live", "refreshToken": "rt-slot2-live",
+            "refreshTokenExpiresAt": 999999999999}})
+        slot3_stored = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot3", "refreshToken": "rt-slot3"}})
+        creds_store = {
+            ("2", "slot2@example.com"): slot2_backup,
+            ("3", "slot3@example.com"): slot3_stored,
+        }
+        configs_store = {
+            ("2", "slot2@example.com"): json.dumps({"oauthAccount": {
+                "emailAddress": "slot2@example.com", "accountUuid": "uuid-2"}}),
+            ("3", "slot3@example.com"): json.dumps({"oauthAccount": {
+                "emailAddress": "slot3@example.com", "accountUuid": "uuid-3"}}),
+        }
+        live_state = {"creds": slot2_live}
+
+        def read_creds(num, email):
+            return creds_store.get((str(num), email), "")
+
+        def read_creds_ex(num, email):
+            return creds_store.get((str(num), email), ""), False
+
+        def write_creds(num, email, creds):
+            creds_store[(str(num), email)] = creds
+
+        def read_cfg(num, email):
+            return configs_store.get((str(num), email), "")
+
+        def write_cfg(num, email, cfg):
+            configs_store[(str(num), email)] = cfg
+
+        def read_live():
+            return live_state.get("creds", "")
+
+        def write_live(creds):
+            live_state["creds"] = creds
+
+        monkeypatch.setattr(switcher, "_read_account_credentials", read_creds)
+        monkeypatch.setattr(switcher, "_read_account_credentials_ex", read_creds_ex)
+        monkeypatch.setattr(switcher, "_write_account_credentials", write_creds)
+        monkeypatch.setattr(switcher, "_read_account_config", read_cfg)
+        monkeypatch.setattr(switcher, "_write_account_config", write_cfg)
+        monkeypatch.setattr(switcher, "_read_credentials", read_live)
+        monkeypatch.setattr(switcher, "_write_credentials", write_live)
+        monkeypatch.setattr(
+            switcher, "_read_active_credentials",
+            lambda: ActiveCredentials(read_live(), False))
+        monkeypatch.setattr(switcher, "_read_capture_credentials", read_live)
+        # THE ORACLE CANNOT SAY: offline, a timeout, an expired access token
+        # -- whatever the cause, it answers nothing, and a failed lookup is
+        # never memoized (`_login_identity_from_the_oracle`), so this is
+        # asked again on every attempt within the budget this test allows.
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: None)
+        return switcher, creds_store, live_state["creds"]
+
+    def test_the_outgoing_slot_is_still_backed_up_when_the_oracle_cannot_say(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        switcher, creds_store, slot2_live = self._witness_gap_switch_harness(
+            temp_home, monkeypatch
+        )
+        with patch.object(switcher, "list_accounts"):
+            result = switcher._perform_switch("3", emit_output=False)
+
+        assert creds_store[("2", "slot2@example.com")] == slot2_live, (
+            "the outgoing slot's backup was not updated with the live bytes "
+            "-- the direct-activation path skipped the backup-current step "
+            "and slot 2's rotated generation was lost"
+        )
+        assert result["from"] == {"number": 2, "email": "slot2@example.com"}, (
+            f"the switch could not attribute who it left: {result['from']!r}"
+        )
+
+    def test_I1_force_activate_still_attributes_from_despite_skipping_the_prefetch(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        """`force_activate` skips `_prefetch_live_identity` entirely
+        (`provenance = {"live": None, "resolved": None}`) and always takes
+        the direct-activation branch -- but `current_identity` is resolved
+        UNDER THE LOCK regardless of `force_activate` or `provenance`, so
+        `from_ref` must still name slot 2, not go unattributed, even though
+        the backup-current step itself is (correctly) skipped either way."""
+        switcher, _creds_store, _slot2_live = self._witness_gap_switch_harness(
+            temp_home, monkeypatch
+        )
+        with patch.object(switcher, "list_accounts"):
+            result = switcher._perform_switch(
+                "3", emit_output=False, force_activate=True
+            )
+        assert result["from"] == {"number": 2, "email": "slot2@example.com"}, (
+            f"force_activate left `from` unattributed: {result['from']!r}"
+        )
+
+    def test_I2_current_account_number_asks_nobody_when_bytes_match_the_slot(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        """`current_account_number` calls `_live_login_identity()` at its
+        DEFAULT `ask_server=True` -- but when the live bytes are already
+        the recorded slot's (no lineage divergence), the local compare
+        answers before the oracle is ever asked, egress or none."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"email": "slot2@example.com",
+                               "organizationUuid": "", "uuid": "uuid-2"}},
+        })
+        config_path = _sw.get_global_config_path()
+        ledger_path = _pin._ledger_path(config_path)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps({_pin._WIRE_MARK: ["HTTPS_PROXY"]}))
+
+        matching = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot2", "refreshToken": "rt-slot2"}})
+        monkeypatch.setattr(switcher, "_read_account_credentials",
+                             lambda num, email: matching)
+        monkeypatch.setattr(switcher, "_read_active_credentials",
+                             lambda: ActiveCredentials(matching, False))
+        monkeypatch.setattr(switcher, "_read_capture_credentials",
+                             lambda: matching)
+        asked = []
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
+            asked.append(tok) or None))
+
+        assert switcher.current_account_number() == "2"
+        assert asked == [], (
+            f"the local byte match still asked the oracle: {asked}")
+
+    def test_I4_live_identity_matches_holds_on_a_witness_gap_matching_the_slot(
+        self, temp_home: Path, mock_claude_config, monkeypatch
+    ):
+        """`_live_identity_matches` (the TOCTOU re-check the locked refresh
+        and the rotated-backup resync both gate on) must still answer True
+        for the recorded slot's own identity on a witness gap -- otherwise
+        both callers silently stop running for as long as the gap lasts."""
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": 2,
+            "accounts": {"2": {"email": "slot2@example.com",
+                               "organizationUuid": "", "uuid": "uuid-2"}},
+        })
+        config_path = _sw.get_global_config_path()
+        ledger_path = _pin._ledger_path(config_path)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(json.dumps({_pin._WIRE_MARK: ["HTTPS_PROXY"]}))
+
+        matching = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-slot2", "refreshToken": "rt-slot2"}})
+        monkeypatch.setattr(switcher, "_read_account_credentials",
+                             lambda num, email: matching)
+        monkeypatch.setattr(switcher, "_read_active_credentials",
+                             lambda: ActiveCredentials(matching, False))
+        monkeypatch.setattr(switcher, "_read_capture_credentials",
+                             lambda: matching)
+
+        assert switcher._live_identity_matches("slot2@example.com", "") is True
 
 
 class TestTheResolverAsksTheServerOnlyOutsideTheLocks:

@@ -3276,6 +3276,27 @@ class ClaudeAccountSwitcher:
         resolved = self._login_identity_from_the_oracle(ask_server=ask_server)
         return (resolved[0], resolved[1]) if resolved is not None else None
 
+    def _forget_live_login_warnings(self) -> None:
+        """Clear the witness-gap dedupe keys on a clean resolution.
+
+        The gap is a persistent state; a discard's absence is a no-op, so
+        calling this on every attributed exit costs nothing and lets the
+        NEXT gap log again instead of staying silent forever once one has
+        fired (the same shape as :5030/:5500's discard on their own clean
+        exits).
+
+        ``getattr``, not `self._provenance_warned` directly: this runs on
+        `_live_login_identity`'s ordinary, most-taken exit, which many
+        tests reach through a bare `ClaudeAccountSwitcher.__new__` double
+        that skips `__init__` (and so never sets the attribute) because
+        the scenario under test has nothing to do with this dedupe.
+        """
+        warned = getattr(self, "_provenance_warned", None)
+        if warned is None:
+            return
+        for reason in ("no recorded active slot", "recorded slot has no email"):
+            warned.discard((reason, "", "live-login-unattributed"))
+
     def _live_login_identity(
         self, *, ask_server: bool = True
     ) -> "tuple[str, str] | None":
@@ -3314,6 +3335,16 @@ class ClaudeAccountSwitcher:
             from claude_swap import pin as _pin
 
             pinned = _pin.pinned_identity(self)
+            # THE RECORD IS NOT THE ONLY WITNESS THAT A PIN IS WIRED. A torn
+            # or absent record reads identically to "nothing pinned" here
+            # (measured: the record file left dangling for 2.5 minutes
+            # during a checkout move); `apply_pin(None, ...)`'s clear
+            # ordering is a second way to reach the same state (it removes
+            # the record before it un-splices the config, and that
+            # un-splice can fail and never run). Either way, the wiring
+            # outliving the record means `identity` may still be a pin's
+            # forged value even though `pinned` reads None.
+            wiring_present = pinned is None and _pin._wiring_present(self)
         except Exception:  # noqa: BLE001 — an optional extra cannot break this
             return identity
         # THE COMPOSITE. Comparing the email alone cannot tell a splice from a
@@ -3324,21 +3355,20 @@ class ClaudeAccountSwitcher:
         # handed back the roster's slot: the refresh path then wrote the
         # personal credential over the org account's stored backup.
         if not pinned:
-            # A CLEAR REMOVES THE RECORD BEFORE IT UN-SPLICES THE CONFIG.
-            # `apply_pin(None, ...)` (cswap_pin's `proxy.py`) writes
-            # `save_pin(..., None, None)` FIRST and only THEN un-splices
-            # `~/.claude.json` -- and that un-splice can fail and never run
-            # (its own `except Exception` there just logs and keeps going).
-            # So "the record names no pin" does not mean "the config was
-            # never spliced": while the wiring still shows a pin was wired,
-            # `identity` may still be that pin's forged value.
-            if _pin._wiring_present(self):
-                return self._unattributed_live_login(
-                    ask_server=ask_server,
-                    reason="pin record cleared but wiring still present",
-                )
-            return identity
-        if (email, org_uuid) != pinned:
+            if not wiring_present:
+                self._forget_live_login_warnings()
+                return identity
+            # SPLICED, PINNED IDENTITY UNKNOWN: fall through to the same
+            # recorded-slot / local-credential resolution below as a genuine
+            # splice. Routing this into `_unattributed_live_login` instead
+            # (oracle-or-None) used to leave `current_identity` None on a
+            # network failure, which sends `_perform_switch_locked` down the
+            # no-backup direct-activation path and destroys the outgoing
+            # slot's stored generation — the recorded slot answers from
+            # local bytes alone and costs nothing this branch didn't
+            # already risk for a genuine splice.
+        elif (email, org_uuid) != pinned:
+            self._forget_live_login_warnings()
             return identity
         data = self._get_sequence_data() or {}
         recorded = data.get("activeAccountNumber")
@@ -3372,7 +3402,9 @@ class ClaudeAccountSwitcher:
                 ask_server=ask_server
             )
             if resolved is not None:
+                self._forget_live_login_warnings()
                 return (resolved[0], resolved[1])
+        self._forget_live_login_warnings()
         return (slot["email"], slot.get("organizationUuid", "") or "")
 
     def _live_credential_is(self, num: str, email: str) -> "bool | None":
