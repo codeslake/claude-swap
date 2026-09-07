@@ -5797,6 +5797,12 @@ class ClaudeAccountSwitcher:
         entry = self._usage_store.entries(ident).get(num)
         if entry is None:
             return False
+        if entry.auth_dead_strikes == 0:
+            # `token_dead`'s own threshold guard (`auth_dead_strikes <
+            # threshold`) can never answer True from here — skip the
+            # credential reads below (a Keychain call per slot on macOS)
+            # unconditionally reached otherwise.
+            return False
         is_active = num == self.current_account_number()
         # The backup is a stored source on BOTH paths — directly when idle,
         # and as _entry_token_dead's second source when active — and each
@@ -8149,10 +8155,15 @@ class ClaudeAccountSwitcher:
             if reprobe_live is True:
                 return True, outcome.credentials, False
             if reprobe_live is False:
+                # NOT `outcome.consumed_fp` — that fingerprints the
+                # PRE-refresh bytes the gate POSTed, and the store now holds
+                # `outcome.credentials` (this branch's guard on
+                # `outcome.credentials` above proves it is set). Binding to
+                # `consumed_fp` strikes a generation the store no longer
+                # carries, so `_slot_token_dead`'s fingerprint compare misses
+                # forever and the panel never says re-login.
                 self._strike_dead_target(
-                    num, email,
-                    outcome.consumed_fp
-                    or oauth.credential_fingerprint(outcome.credentials),
+                    num, email, oauth.credential_fingerprint(outcome.credentials)
                 )
                 return False, None, True
             return None, creds, True  # re-probe gave no verdict

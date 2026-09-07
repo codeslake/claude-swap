@@ -2584,6 +2584,50 @@ class TestFreshening:
         assert "2" in dead_events[0].detail
         assert "b@example.com" in dead_events[0].detail
 
+    def test_switch_time_unconfirmed_credential_advances_without_quarantine(
+        self, temp_home
+    ):
+        """A real 401 whose escalation cannot confirm dead-or-alive (consume
+        lock contention, a transient refresh failure) raises
+        `TargetCredentialUnconfirmed`, not `TargetCredentialDead` — the slot
+        must not be struck on an inconclusive probe, but the tick still must
+        not stop and read it as `already-active`: it advances to the next
+        healthy candidate in the SAME tick, same as a confirmed-dead one."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-2": False, "sk-3": True}.get(token)
+
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ), patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ), patch.object(
+            h.switcher, "consume_backup_grant",
+            return_value=oauth.RefreshOutcome(None, "consume-busy"),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3  # landed on 3 in the SAME tick
+        assert "2" not in h.state().get("quarantine", {})  # not struck
+        assert not any(isinstance(e, QuarantineEvent) for e in h.events)
+        unconfirmed_events = [
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent)
+            and e.reason == "target-credential-unconfirmed"
+        ]
+        assert unconfirmed_events  # not read as "already-active"
+        assert "2" in unconfirmed_events[0].detail
+        assert "b@example.com" in unconfirmed_events[0].detail
+
     def test_transient_failure_skips_without_quarantine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

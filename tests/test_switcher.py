@@ -8154,13 +8154,24 @@ class TestSwitchTargetLivenessGuard:
         the API accepted anything — the "world already moved past the
         snapshot" and CAS-conflict shapes never POST at all. The re-probe of
         the freshened credential is what must decide; here it answers dead,
-        so the switch must not activate it."""
+        so the switch must not activate it.
+
+        The strike must bind to the bytes the store now holds
+        (``outcome.credentials``, the freshened generation the reprobe just
+        proved dead) — never ``consumed_fp``, which fingerprints the
+        PRE-refresh bytes the real gate already consumed and which rotation
+        makes stale. The write inside ``fake_probe`` mirrors the real
+        ``consume_backup_grant``'s own store write, which the mock below
+        skips."""
         s = self._setup(temp_home)
         self._seed(s, 1, "a@example.com")
         self._seed(s, 2, "b@example.com")
         self._make_live(temp_home, "a@example.com", 1)
         creds_path = temp_home / ".claude" / ".credentials.json"
         before = creds_path.read_bytes()
+        original_backup = json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2"},
+        })
         freshened = json.dumps({
             "claudeAiOauth": {
                 "accessToken": "sk-2-stashed", "refreshToken": "rt-2-stashed",
@@ -8168,13 +8179,18 @@ class TestSwitchTargetLivenessGuard:
         })
 
         def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            if token == "sk-2-stashed":
+                s._write_account_credentials("2", "b@example.com", freshened)
             return {"sk-2": False, "sk-2-stashed": False}.get(token)
 
         with patch(
             "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
         ), patch.object(
             s, "consume_backup_grant",
-            return_value=oauth.RefreshOutcome(freshened, None),
+            return_value=oauth.RefreshOutcome(
+                freshened, None,
+                consumed_fp=oauth.credential_fingerprint(original_backup),
+            ),
         ):
             result = s.switch_to("2", json_output=True)
 
@@ -8184,6 +8200,7 @@ class TestSwitchTargetLivenessGuard:
         assert s._usage_store.entries(
             {"2": self._identity("b@example.com")}
         )["2"].token_dead()
+        assert s._slot_token_dead("2", "b@example.com")
 
     def test_freshened_credential_reprobe_confirms_live_activates(
         self, temp_home: Path
@@ -8224,6 +8241,26 @@ class TestSwitchTargetLivenessGuard:
             (temp_home / ".claude" / ".credentials.json").read_text()
         )
         assert live["claudeAiOauth"]["accessToken"] == "sk-2-stashed"
+
+    def test_slot_token_dead_skips_credential_read_with_no_strikes(
+        self, temp_home: Path
+    ):
+        """`_slot_token_dead` is called per candidate per pass by the new
+        filters; a slot with zero strikes can never be dead
+        (`token_dead`'s own `auth_dead_strikes < threshold` guard), so
+        reading its stored credential — a Keychain call per slot on macOS —
+        to reach that same answer is unconditional, wasted work. Answer from
+        the usage-store entry alone before touching the credential store."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch.object(
+            s, "_read_account_credentials_ex"
+        ) as mock_read:
+            assert s._slot_token_dead("2", "b@example.com") is False
+        mock_read.assert_not_called()
 
 
 class TestClaudeCodeLockCooperation:

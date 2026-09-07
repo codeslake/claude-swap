@@ -261,20 +261,24 @@ class _EngineStopped(Exception):
 
 
 class _CandidateDead(Exception):
-    """`_perform`'s `switch_to` call hit `target-credential-dead` (issue
-    #199's switch-time liveness guard, past `_freshen_target`'s own
-    near-expiry check). Raised from inside `_perform`'s ``with
-    self._state_lock():`` block, so the quarantine write (which takes that
-    same non-reentrant lock via `_mutate_state`) cannot happen here — the
-    `for num in ordered` loop in `_tick_inner` catches this AFTER the lock
-    has released on unwind, quarantines there, and advances to the next
-    candidate in the SAME tick rather than reading the freshly-struck slot
-    as "already-active"."""
+    """`_perform`'s `switch_to` call hit `target-credential-dead` or
+    `target-credential-unconfirmed` (issue #199's switch-time liveness
+    guard, past `_freshen_target`'s own near-expiry check). Raised from
+    inside `_perform`'s ``with self._state_lock():`` block, so the
+    quarantine write (which takes that same non-reentrant lock via
+    `_mutate_state`) cannot happen here — the `for num in ordered` loop in
+    `_tick_inner` catches this AFTER the lock has released on unwind,
+    advances to the next candidate in the SAME tick rather than reading the
+    freshly-refused slot as "already-active", and quarantines only when
+    `confirmed` is True: an unconfirmed 401 (consume-busy, a transient
+    refresh failure, `store-unmirrored`) proves nothing about the
+    credential, so striking the slot on it would be a guess."""
 
-    def __init__(self, number: str, email: str, detail: str):
+    def __init__(self, number: str, email: str, detail: str, confirmed: bool = True):
         super().__init__(f"account {number} ({email}): {detail}")
         self.number = number
         self.email = email
+        self.confirmed = confirmed
 
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
@@ -1922,11 +1926,21 @@ class AutoSwitchEngine:
             try:
                 return self._perform(num, email, trigger, left_snapshot)
             except _CandidateDead as exc:
-                # Past `_perform`'s `with self._state_lock():`, which has
-                # released on unwind — safe to take it again here via
-                # `_quarantine`'s own `_mutate_state`.
-                self._quarantine(exc.number, exc.email, "invalid_grant")
-                self._emit(NoSwitchEvent(reason="invalid_grant", detail=str(exc)))
+                if exc.confirmed:
+                    # Past `_perform`'s `with self._state_lock():`, which
+                    # has released on unwind — safe to take it again here
+                    # via `_quarantine`'s own `_mutate_state`.
+                    self._quarantine(exc.number, exc.email, "invalid_grant")
+                    self._emit(
+                        NoSwitchEvent(reason="invalid_grant", detail=str(exc))
+                    )
+                else:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="target-credential-unconfirmed",
+                            detail=str(exc),
+                        )
+                    )
                 continue
 
         if systemic or transient_failure:
@@ -2973,6 +2987,14 @@ class AutoSwitchEngine:
                     # once this raise has unwound out of the `with` above.
                     detail = (result or {}).get("message", "")
                     raise _CandidateDead(number, email, detail)
+                if reason == "target-credential-unconfirmed":
+                    # A real 401 whose escalation gave no verdict (consume-
+                    # busy, transient, store-unmirrored) — `switch_to` did
+                    # not strike the slot, and neither do we; advance to the
+                    # next candidate instead of stopping the tick here and
+                    # reporting a refused slot as "already-active".
+                    detail = (result or {}).get("message", "")
+                    raise _CandidateDead(number, email, detail, confirmed=False)
                 self._emit(
                     NoSwitchEvent(reason="already-active", detail=reason)
                 )
