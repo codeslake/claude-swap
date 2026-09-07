@@ -192,12 +192,27 @@ def candidate_is_untrustworthy(entry: UsageEntry | None, now: float) -> bool:
     is never fetched, so ``fetched_at`` never advances and ``fresh()`` is
     permanently False. ``entry is None`` is not a ranked OAuth candidate
     (``_rank`` drops headroom-``None``) and is skipped defensively.
+
+    An active backoff or a run of failures is ALSO not disqualifying on its
+    own: ``fetched_at`` moves only on success and ``backoffUntil``/
+    ``consecutiveFailures`` only on failure, so "succeeded 30s ago, then one
+    poll 429'd" carries both signals while the reading is still fresh and
+    decision-trusted — refusing it here for the whole backoff (up to
+    ``RATE_LIMIT_TRUST_MAX_AGE_S``, hours) contradicts the failover arm's own
+    principle just below: a backed-off peer is a fine target when its cached
+    figures can still be trusted. So the two combine: only a candidate that
+    is BOTH in backoff/failing AND whose reading ``decision_value()`` no
+    longer trusts (``entry.decision_value() is None``) is refused — "we
+    genuinely have no usable reading", not merely "polling is having a bad
+    day".
     """
     return (
         entry is None
         or entry.token_dead()
-        or entry.in_backoff(now)
-        or entry.consecutive_failures > 0
+        or (
+            (entry.in_backoff(now) or entry.consecutive_failures > 0)
+            and entry.decision_value() is None
+        )
     )
 
 

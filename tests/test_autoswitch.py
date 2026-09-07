@@ -2456,33 +2456,45 @@ class TestProactiveExcludesStaleUsage:
         return h
 
     def test_proactive_does_not_admit_a_backed_off_candidate(self, temp_home):
+        """The Account-6 shape: `lastGood` genuinely too old (past even the
+        collector's own extended trust, not merely `fresh()`'s TTL —
+        `trust_extended=False`, unlike the decision-trusted backoff a peer
+        stays a target on, see `test_proactive_admits_a_throttled_but_fresh_
+        candidate`), a run of failures and an active backoff. `decision_
+        value()` no longer trusts this reading -- and BEFORE
+        `candidate_is_untrustworthy` is ever consulted, ranking's own
+        headroom-None filter has already dropped it (`usage[num] =
+        entry.decision_value()`, `headroom.get(num) is None: continue` in
+        `_rank_candidates_pass`) -- so the tick reads "no candidate has
+        readable usage", not the per-candidate skip. Either way the
+        candidate is never landed on."""
+        from claude_swap.autoswitch import candidate_is_untrustworthy
+
         h = self._harness(temp_home)
         # Active over threshold (headroom 5 < hysteresis floor) -> must move.
         active_entry = _entry_for(_usage(95), h.clock.now)
         # #2's cached figures (headroom 100) would rank it best, but the
         # entry is exactly what a walled, failing candidate looks like: old
-        # `fetched_at` (a chain of failures keeps it from ever moving),
-        # repeated failures, an active backoff and a failure `lastError` —
-        # `trust_extended=True` because that is what makes the collector
-        # still SERVE this row for ranking, same as the incident.
+        # `fetched_at` well past decision trust, repeated failures, an
+        # active backoff and a failure `lastError`.
         stale_entry = UsageEntry(
             last_good=_usage(0),
-            fetched_at=h.clock.now - 1000.0,
-            age_s=1000.0,
+            fetched_at=h.clock.now - 7200.0,
+            age_s=7200.0,
             consecutive_failures=9,
             last_error="http-429",
             backoff_until=h.clock.now + 400.0,
-            trust_extended=True,
         )
+        assert stale_entry.decision_value() is None
+        assert candidate_is_untrustworthy(stale_entry, h.clock.now)
         outcome = h.tick_with_entries({"1": active_entry, "2": stale_entry})
-        # `proactive` skips a stale candidate rather than holding on it —
-        # with no OTHER candidate in this 2-account fleet, the engine falls
-        # through the loop with nothing landed: BLOCKED ("wanted to switch
-        # but no viable target"), not NO_ACTION.
+        # No OTHER candidate in this 2-account fleet, and #2's usage is
+        # unreadable (decision-untrusted) -> BLOCKED ("wanted to switch but
+        # no viable target"), not NO_ACTION.
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert "stale-candidate-skipped" in reasons
+        assert "no-comparison" in reasons
 
     def test_control_the_same_candidate_fresh_is_admitted(self, temp_home):
         """Mutant control: the same candidate, freshly fetched, IS switched
@@ -2517,23 +2529,28 @@ class TestProactiveExcludesStaleUsage:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
 
-    def test_control_the_same_age_with_a_failure_is_still_skipped(
+    def test_control_the_same_age_with_a_bare_failure_is_still_admitted(
         self, temp_home
     ):
-        """Mutant control: identical age, but a recorded failure IS the
-        incident's own signature -- still skipped, proving the admission
-        above is not simply "any entry is now let through"."""
+        """Mutant control: identical age (200s, inside STALE_OK_S), and a
+        recorded failure but no backoff -- a bare failure count is not the
+        incident's signature on its own; `decision_value()` still trusts
+        this reading, so it stays admitted, same as the age-alone case
+        above. Only backoff/failures COMBINED with a reading `decision_
+        value()` no longer trusts refuses (see
+        `test_proactive_does_not_admit_a_backed_off_candidate`)."""
         h = self._harness(temp_home)
         active_entry = _entry_for(_usage(95), h.clock.now)
         failing_stale = UsageEntry(
             last_good=_usage(0), fetched_at=h.clock.now - 200.0, age_s=200.0,
             consecutive_failures=3,
         )
+        assert failing_stale.decision_value() is not None
         outcome = h.tick_with_entries({"1": active_entry, "2": failing_stale})
-        assert outcome is TickOutcome.BLOCKED
-        assert h.active_number() == 1
-        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert "stale-candidate-skipped" in reasons
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
 
     def test_proactive_does_not_admit_a_struck_candidate_even_when_fresh(
         self, temp_home
@@ -2560,6 +2577,77 @@ class TestProactiveExcludesStaleUsage:
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert "stale-candidate-skipped" in reasons
 
+    def test_proactive_admits_a_throttled_but_fresh_candidate(self, temp_home):
+        """The reviewer's own fixture: `fetched_at` moves only on success,
+        `backoffUntil`/`consecutiveFailures` only on failure, so "succeeded
+        30s ago, then one poll 429'd" is fresh (well inside `STALE_OK_S`,
+        300s) and decision-trusted — `in_backoff`/`consecutive_failures`
+        alone is not the incident's signature; only backoff/failures PLUS a
+        reading `decision_value()` no longer trusts is. Today (before the
+        fix) this candidate is refused for the whole backoff and the tick
+        falls through to BLOCKED — see the mutant below, which reproduces
+        that by dropping the reading-stale half of the predicate."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        throttled_but_fresh = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now - 30.0,
+            age_s=30.0,
+            consecutive_failures=1,
+            last_error="http-429",
+            backoff_until=h.clock.now + 3600.0,
+        )
+        outcome = h.tick_with_entries({"1": active_entry, "2": throttled_but_fresh})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_candidate_is_untrustworthy_construction(self):
+        """The predicate itself, on the five cases the fix must classify
+        correctly (`_rank_candidates_pass`'s own headroom-None filter
+        already keeps a decision-untrusted candidate out of the engine's
+        per-candidate loop -- see `test_proactive_does_not_admit_a_backed_
+        off_candidate` -- so this checks the FUNCTION directly rather than
+        only through a reachable tick)."""
+        from claude_swap.autoswitch import candidate_is_untrustworthy
+
+        now = 1_000_000.0
+        # 1. API-key last-resort sentinel: never fetched, no failures.
+        sentinel = UsageEntry(sentinel="api-key")
+        assert not candidate_is_untrustworthy(sentinel, now)
+        # 2. A claimed/still-fresh-enough row, no failures.
+        claimed = UsageEntry(
+            last_good=_usage(0), fetched_at=now - 200.0, age_s=200.0,
+        )
+        assert not candidate_is_untrustworthy(claimed, now)
+        # 3. Throttled but fresh: the reviewer's own shape.
+        throttled_but_fresh = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=now - 30.0,
+            age_s=30.0,
+            consecutive_failures=1,
+            last_error="http-429",
+            backoff_until=now + 3600.0,
+        )
+        assert not candidate_is_untrustworthy(throttled_but_fresh, now)
+        # 4. Account-6 shape: genuinely too old for decision_value() to
+        # trust, on top of the failures/backoff.
+        account_6 = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=now - 7200.0,
+            age_s=7200.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=now + 400.0,
+        )
+        assert candidate_is_untrustworthy(account_6, now)
+        # 5. Struck, even while fresh.
+        struck = UsageEntry(
+            last_good=_usage(0), fetched_at=now, age_s=0.0, auth_dead_strikes=2,
+        )
+        assert candidate_is_untrustworthy(struck, now)
+
 
 class TestProactiveSkipsAStaleTopCandidateForTheNextRanked:
     """A stale top-ranked candidate must not park the WHOLE tick: `proactive`
@@ -2577,19 +2665,26 @@ class TestProactiveSkipsAStaleTopCandidateForTheNextRanked:
         return h
 
     def test_switches_to_the_healthy_next_ranked_candidate(self, temp_home):
+        from claude_swap.autoswitch import candidate_is_untrustworthy
+
         h = self._harness(temp_home)
         # Active over threshold, real headroom (5) -> proactive, not at-limit.
         active_entry = _entry_for(_usage(95), h.clock.now)
-        # #2 would rank best (headroom 100) but is walled by the collector.
+        # #2 would rank best (headroom 100) but is walled by the collector,
+        # and genuinely too old for `decision_value()` to trust any more
+        # (unlike a decision-trusted backoff, which stays a target — see
+        # TestProactiveExcludesStaleUsage.test_proactive_admits_a_throttled_
+        # but_fresh_candidate).
         stale_top = UsageEntry(
             last_good=_usage(0),
-            fetched_at=h.clock.now - 1000.0,
-            age_s=1000.0,
+            fetched_at=h.clock.now - 7200.0,
+            age_s=7200.0,
             consecutive_failures=9,
             last_error="http-429",
             backoff_until=h.clock.now + 400.0,
-            trust_extended=True,
         )
+        assert stale_top.decision_value() is None
+        assert candidate_is_untrustworthy(stale_top, h.clock.now)
         # #3 ranks second (headroom 90) and is healthy — the fix's target.
         healthy_next = _entry_for(_usage(10), h.clock.now)
         outcome = h.tick_with_entries(
@@ -2598,12 +2693,12 @@ class TestProactiveSkipsAStaleTopCandidateForTheNextRanked:
         assert outcome is TickOutcome.SWITCHED
         # The FAULT this guards: landing on the stale top candidate instead
         # of skipping to the healthy one — assert the marker directly, not
-        # only the outcome.
+        # only the outcome. #2's unreadable usage drops it out of ranking
+        # itself (headroom-None), so no per-candidate skip event fires here
+        # — see test_proactive_does_not_admit_a_backed_off_candidate.
         assert h.active_number() == 3
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
-        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert "stale-candidate-skipped" in reasons
 
     def test_control_the_same_top_candidate_fresh_is_taken_instead(
         self, temp_home
@@ -2863,6 +2958,22 @@ class TestOutcomeDigestAgainstBase:
                 entries[num] = UsageEntry(
                     last_good=last_good, fetched_at=now, age_s=0.0,
                     auth_dead_strikes=2,
+                )
+            elif roll < 0.55:
+                # m-1: FRESH but just failed once -- `fetched_at` moves only
+                # on success, `backoffUntil`/`consecutiveFailures` only on
+                # failure, the reviewer's own shape. Decision-trusted
+                # (well inside `STALE_OK_S`) -- deliberately NOT added to
+                # `stale_nums`, so the assertions below can tell an
+                # authorized exclusion from an over-exclusion: this cell
+                # must never be the one a diff traces to.
+                entries[num] = UsageEntry(
+                    last_good=last_good,
+                    fetched_at=now - rng.uniform(5, 60),
+                    age_s=rng.uniform(5, 60),
+                    consecutive_failures=1,
+                    last_error="http-429",
+                    backoff_until=now + rng.uniform(500, 3600),
                 )
             else:
                 entries[num] = _entry_for(last_good, now)
