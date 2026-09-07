@@ -2254,6 +2254,63 @@ class TestTheAutoFlagIsTheOnlyRouteToLive:
                 "--auto did not start a LIVE engine"
             )
 
+class TestNextBestMarksStaleUsage:
+    """The 'Next best' panel must not present a candidate's cached figures
+    as live when the engine's own admission gate would refuse them
+    (``autoswitch.candidate_usage_is_stale`` — reused here, not
+    recomputed, so the panel and the engine can never disagree)."""
+
+    def _render(self, snap, active, *, settings=None):
+        from unittest.mock import MagicMock, patch
+        from claude_swap.tui.autoview import AutoScreen
+        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.tui.theme import CSWAP_DARK
+
+        v = AutoScreen.__new__(AutoScreen)
+        v._settings = settings or AutoSwitchSettings(strategy="best")
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK
+        with patch.object(AutoScreen, "app", property(lambda s: app)):
+            return str(v._candidates_text(snap, active_number=active))
+
+    def test_a_backed_off_candidate_is_marked(self):
+        stale_entry = UsageEntry(
+            last_good=make_entry(0.0, 0.0).last_good,
+            fetched_at=time.time() - 1000.0,
+            age_s=1000.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=time.time() + 400.0,
+            trust_extended=True,
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=stale_entry),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        out = self._render(snap, active="1")
+        assert "user2@example.com" in out
+        row2 = out[out.index("user2@example.com"):]
+        assert "stale" in row2, f"no stale mark on the backed-off row: {out!r}"
+
+    def test_a_fresh_candidate_is_not_marked(self):
+        """Control: the same panel, no backoff/failures — no mark."""
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=make_entry(0.0, 0.0)),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        out = self._render(snap, active="1")
+        row2 = out[out.index("user2@example.com"):]
+        assert "stale" not in row2, f"a fresh row was marked stale: {out!r}"
+
+
 class TestUnswitchableRowsAreListed:
     """A slot you cannot switch to must still appear, with the reason.
 

@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     binding_pct,
+    candidate_usage_is_stale,
     classify_candidate_block,
     consume_first_rank_key,
     pct_label,
@@ -483,6 +484,12 @@ class AutoScreen(Screen):
                     entry.append(f"{wpct:.0f}%", style=palette.severity(wpct))
                 if not chips:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # The engine's OWN admission gate, not a re-derivation: a
+                # candidate `_tick_inner` would refuse as stale-usage (an
+                # active backoff, a run of poll failures, a struck token)
+                # must not present its cached figures as live here either.
+                if candidate_usage_is_stale(acc.usage, now):
+                    entry.append("  stale", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it),

@@ -54,7 +54,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import UsageEntry, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -159,6 +159,21 @@ SPENT_HEADROOM_PCT = 3.0
 # its own behaviour on top, gated separately on `settings.strategy ==
 # "dynamic"` so `consume-first` itself is untouched by that addition.
 CONSUME_FIRST_STRATEGIES = ("consume-first", "dynamic")
+
+
+def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
+    """Whether a candidate's cached usage cannot be trusted for admission.
+
+    Unreadable, past ``UsageEntry.fresh``'s TTL (the collector could not
+    refresh it this tick — backoff or a concurrent poller), or a
+    collector-struck (``invalid_grant``) token (``token_dead()``, unqualified
+    — the same unbound call ``due_candidate`` uses). The ONE definition of
+    "stale-usage": `_tick_inner`'s proactive/consume-first admission gate and
+    the TUI's Next-best panel both call this rather than each computing their
+    own, so a candidate can never read differently on the two surfaces.
+    """
+    return entry is None or not entry.fresh(now) or entry.token_dead()
+
 
 # `dynamic`'s own candidate-admission bar. `settings.threshold` decides when
 # the ACTIVE account leaves; `dynamic`'s whole purpose is spending a window
@@ -1301,6 +1316,10 @@ class AutoSwitchEngine:
             and now_ms + FRESHEN_BUFFER_MS >= expires_at
         )
         if not near_expiry:
+            # This proves only that the STORED token outlives the refresh
+            # buffer, never that the account is a live target — that liveness
+            # gap is closed at admission (the stale-usage exclusion above
+            # `_tick_inner`'s freshen loop), not by probing here.
             return "ok"
         # The consume gate serializes every backup-rt POST (the recovery
         # branch in `_fetch_active_usage` is a second call site, under the
@@ -2075,14 +2094,22 @@ class AutoSwitchEngine:
                 # loop runs over every candidate.
                 raise _EngineStopped()
             email = self.switcher.account_email(num)
-            if trigger in CONSUME_FIRST_STRATEGIES:
+            if trigger in ("proactive", *CONSUME_FIRST_STRATEGIES):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
-                # poller, which then serve their stored entries. Consume-first
-                # is opportunistic, not an escape — never act on stale data
-                # or slide to a worse-ranked target; hold and retry next tick.
+                # poller, which then serve their stored entries. Neither
+                # trigger is an escape from that — never act on stale data or
+                # slide to a worse-ranked target; hold and retry next tick.
+                # `proactive` has no phase-2 refetch of its own, so this reads
+                # the same scheduled-collection entry a backed-off or
+                # repeatedly-failing candidate was already serving stale —
+                # the liveness gap `_freshen_target` cannot close (see there).
                 entry = entries.get(num)
-                if entry is None or not entry.fresh(self.clock()):
+                # `self.clock()` short-circuited, not eagerly evaluated: a
+                # None entry must call it zero times, matching every other
+                # clock read on this path (call-order-sensitive tests script
+                # the clock as a fixed sequence).
+                if entry is None or candidate_usage_is_stale(entry, self.clock()):
                     self._emit(
                         NoSwitchEvent(
                             reason="stale-usage",

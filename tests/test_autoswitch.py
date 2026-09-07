@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
+import random
+import subprocess
+import sys
 import threading
+import types
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -105,8 +110,13 @@ def _blind_quarantine(h, num, email, reason="identity-conflict"):
 class EngineHarness:
     """Seeded switcher + engine + captured events, on the Linux file backend."""
 
-    def __init__(self, temp_home: Path, **settings_kwargs):
+    def __init__(self, temp_home: Path, *, engine_cls=None, **settings_kwargs):
         self.temp_home = temp_home
+        # Base-vs-head comparison (TestOutcomeDigestAgainstBase) drives the
+        # SAME switcher/settings/clock through a different `AutoSwitchEngine`
+        # class (a pre-fix source loaded separately) — this is the one hook
+        # that needs, so the harness itself stays a single implementation.
+        self._engine_cls = engine_cls or AutoSwitchEngine
         # get_backup_root() (switcher.py) resolves via Path.home() on every
         # platform (both its XDG branch and its legacy
         # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
@@ -138,7 +148,7 @@ class EngineHarness:
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
-        return AutoSwitchEngine(
+        return self._engine_cls(
             self.switcher,
             self.settings,
             self.events.append,
@@ -2426,6 +2436,229 @@ class TestAdaptiveScheduler:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
+
+
+class TestProactiveExcludesStaleUsage:
+    """The `proactive` trigger (strategy `best`, above threshold) must refuse
+    a candidate the same way `consume-first`'s phase-2 refetch already does:
+    a cached usage row that is stale/unreadable (active backoff, a run of
+    poll failures, a failure `lastError`) is never admitted as a landing
+    spot, even when its `last_good` figures rank it best. Without this, a
+    candidate walled off by the collector (repeated 429s) gets consumed as
+    if its cached headroom were live."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_proactive_does_not_admit_a_backed_off_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        # Active over threshold (headroom 5 < hysteresis floor) -> must move.
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        # #2's cached figures (headroom 100) would rank it best, but the
+        # entry is exactly what a walled, failing candidate looks like: old
+        # `fetched_at` (a chain of failures keeps it from ever moving),
+        # repeated failures, an active backoff and a failure `lastError` —
+        # `trust_extended=True` because that is what makes the collector
+        # still SERVE this row for ranking, same as the incident.
+        stale_entry = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now - 1000.0,
+            age_s=1000.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=h.clock.now + 400.0,
+            trust_extended=True,
+        )
+        outcome = h.tick_with_entries({"1": active_entry, "2": stale_entry})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-usage" in reasons
+
+    def test_control_the_same_candidate_fresh_is_admitted(self, temp_home):
+        """Mutant control: the same candidate, freshly fetched, IS switched
+        to — proving #2 was otherwise rank-eligible and the hold above is the
+        staleness gate firing, not some other refusal."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        fresh_entry = _entry_for(_usage(0), h.clock.now)
+        outcome = h.tick_with_entries({"1": active_entry, "2": fresh_entry})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_proactive_does_not_admit_a_struck_candidate_even_when_fresh(
+        self, temp_home
+    ):
+        """A collector-struck (`invalid_grant`, twice — past the race-doubt
+        window) candidate must not be admitted even in the narrow window
+        where its `fetched_at` still reads fresh (the strike landed without
+        a later success reaging it) — the freshness gate alone (previous
+        test) would pass this one through."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        struck_entry = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now,
+            age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert struck_entry.token_dead()
+        outcome = h.tick_with_entries({"1": active_entry, "2": struck_entry})
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-usage" in reasons
+
+
+_PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
+
+
+def _load_base_autoswitch():
+    """The pre-fix `autoswitch.py` as an independent module — same
+    `switcher`/`usage_store`/`settings` (untouched by this fix), a
+    different `AutoSwitchEngine`. Loaded once per process and cached in
+    `sys.modules`."""
+    mod_name = f"claude_swap._autoswitch_base_{_PR_321_BASE_SHA}"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    repo_root = Path(__file__).resolve().parents[1]
+    src = subprocess.run(
+        ["git", "-C", str(repo_root), "show",
+         f"{_PR_321_BASE_SHA}:src/claude_swap/autoswitch.py"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    mod = types.ModuleType(mod_name)
+    mod.__file__ = f"<git show {_PR_321_BASE_SHA}:src/claude_swap/autoswitch.py>"
+    sys.modules[mod_name] = mod
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    return mod
+
+
+class TestOutcomeDigestAgainstBase:
+    """The #321 invariant: `best`'s ranking/admission must stay identical to
+    the PR's base commit except the one exclusion this PR adds. Proven by
+    running identical random fleets through the pre-fix and post-fix
+    `AutoSwitchEngine` and diffing the whole per-tick outcome sequence —
+    with a mutant control that reproduces the pre-fix digest exactly by
+    neutralizing only the new exclusion, so the delta is attributable to
+    that one function and nothing else moved.
+    """
+
+    _N_FLEETS = 40
+
+    def _fleet(self, rng: random.Random, now: float):
+        resets = (_R_SOON, _R_LATER, _R_LATEST)   # module globals, late-bound
+        active = _entry_for(
+            _usage7(rng.uniform(80, 99), rng.uniform(0, 50), rng.choice(resets)),
+            now,
+        )
+        entries = {"1": active}
+        stale_nums = set()
+        for num in ("2", "3"):
+            last_good = _usage7(
+                rng.uniform(0, 60), rng.uniform(0, 60), rng.choice(resets)
+            )
+            if rng.random() < 0.35:
+                stale_nums.add(num)
+                entries[num] = UsageEntry(
+                    last_good=last_good,
+                    fetched_at=now - rng.uniform(200, 2000),
+                    age_s=rng.uniform(200, 2000),
+                    consecutive_failures=rng.randint(3, 12),
+                    last_error=rng.choice(["http-429", "timeout"]),
+                    backoff_until=now + rng.uniform(50, 500),
+                    trust_extended=True,
+                )
+            else:
+                entries[num] = _entry_for(last_good, now)
+        return entries, stale_nums
+
+    def _run(self, engine_cls, tmp_path: Path, tag: str, fleets: list[dict]):
+        # `EngineHarness.__init__` only patches `Path.home()` for its own
+        # setup — every OTHER test in this file relies on the `temp_home`
+        # fixture holding that patch for the whole test. This one drives
+        # its own directories, so it holds the same patch itself; without
+        # it `seed`/`make_live`/`current_account_number()` read the REAL
+        # `$HOME` and every tick reads unmanaged-active-account.
+        results = []
+        for i, entries in enumerate(fleets):
+            home = tmp_path / f"{tag}{i}"
+            (home / ".claude").mkdir(parents=True)
+            with (
+                patch("pathlib.Path.home", return_value=home),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HOME": str(home),
+                        "USERPROFILE": str(home),
+                        "XDG_DATA_HOME": str(home / ".local" / "share"),
+                    },
+                ),
+            ):
+                h = EngineHarness(home, engine_cls=engine_cls, strategy="best")
+                h.seed(1, "a@example.com")
+                h.seed(2, "b@example.com")
+                h.seed(3, "c@example.com")
+                h.make_live("a@example.com", 1)
+                outcome = h.tick_with_entries(entries)
+            events = tuple((e.kind, getattr(e, "reason", None)) for e in h.events)
+            results.append((outcome.name, h.active_number(), events))
+        return results
+
+    def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path):
+        base_mod = _load_base_autoswitch()
+        rng = random.Random(20260321)
+        now = 1_000_000.0
+        fleets: list[dict] = []
+        stale_by_fleet: list[set] = []
+        for _ in range(self._N_FLEETS):
+            entries, stale_nums = self._fleet(rng, now)
+            fleets.append(entries)
+            stale_by_fleet.append(stale_nums)
+
+        head_results = self._run(AutoSwitchEngine, tmp_path, "head", fleets)
+        base_results = self._run(base_mod.AutoSwitchEngine, tmp_path, "base", fleets)
+
+        head_digest = hashlib.sha256(repr(head_results).encode()).hexdigest()
+        base_digest = hashlib.sha256(repr(base_results).encode()).hexdigest()
+
+        diffs = [
+            i for i in range(self._N_FLEETS) if head_results[i] != base_results[i]
+        ]
+        assert diffs, (
+            "the fixture never exercised the exclusion on this seed — "
+            "strengthen it before trusting the digest"
+        )
+        for i in diffs:
+            assert stale_by_fleet[i], (
+                f"fleet {i} differs with NO stale candidate — a scope error, "
+                f"not the intended exclusion: head={head_results[i]!r} "
+                f"base={base_results[i]!r}"
+            )
+
+        # Mutant control: neutralize ONLY the new exclusion (the admission
+        # gate always reads "not stale") and reproduce the pre-fix engine
+        # exactly on the SAME fleets.
+        with patch(
+            "claude_swap.autoswitch.candidate_usage_is_stale", return_value=False
+        ):
+            mutant_results = self._run(AutoSwitchEngine, tmp_path, "mutant", fleets)
+        mutant_digest = hashlib.sha256(repr(mutant_results).encode()).hexdigest()
+
+        assert mutant_digest != head_digest, (
+            "the mutant must move the digest — a no-op injection proves nothing"
+        )
+        assert mutant_results == base_results, (
+            f"neutralizing the exclusion should reproduce the pre-fix engine "
+            f"exactly for a `best`-strategy fleet: head={head_digest} "
+            f"base={base_digest} mutant={mutant_digest} diffs={diffs}"
+        )
 
 
 class TestApiKeyAccounts:
@@ -8978,11 +9211,14 @@ class TestHorizonAxisDoesNotFlap:
         stale_reread = ranking_now + 200.0             # past reset_at
 
         # Enough values for the OLD code's clock() call order (pre-tick
-        # check, ranking now, left_snapshot re-read, freshen expiry check,
-        # _perform's lastSwitchAt) with a couple of spares so neither code
-        # path can exhaust the sequence.
+        # check, ranking now, the proactive admission gate's own freshness
+        # read — real elapsed time since a candidate fetched THIS ranking
+        # pass, unrelated to the re-read bug this test targets, so it gets
+        # a ranking-time value rather than `stale_reread` — left_snapshot
+        # re-read, freshen expiry check, _perform's lastSwitchAt) with a
+        # couple of spares so neither code path can exhaust the sequence.
         clock_values = iter([
-            ranking_now, ranking_now, stale_reread,
+            ranking_now, ranking_now, ranking_now, stale_reread,
             stale_reread, stale_reread, stale_reread,
         ])
         with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
