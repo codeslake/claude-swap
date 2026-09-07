@@ -2579,7 +2579,9 @@ class TestOutcomeDigestAgainstBase:
                 entries[num] = _entry_for(last_good, now)
         return entries, stale_nums
 
-    def _run(self, engine_cls, tmp_path: Path, tag: str, fleets: list[dict]):
+    def _run(
+        self, engine_cls, tmp_path: Path, tag: str, fleets: list[dict], strategy: str
+    ):
         # `EngineHarness.__init__` only patches `Path.home()` for its own
         # setup — every OTHER test in this file relies on the `temp_home`
         # fixture holding that patch for the whole test. This one drives
@@ -2601,7 +2603,7 @@ class TestOutcomeDigestAgainstBase:
                     },
                 ),
             ):
-                h = EngineHarness(home, engine_cls=engine_cls, strategy="best")
+                h = EngineHarness(home, engine_cls=engine_cls, strategy=strategy)
                 h.seed(1, "a@example.com")
                 h.seed(2, "b@example.com")
                 h.seed(3, "c@example.com")
@@ -2611,7 +2613,8 @@ class TestOutcomeDigestAgainstBase:
             results.append((outcome.name, h.active_number(), events))
         return results
 
-    def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path):
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
         base_mod = _load_base_autoswitch()
         rng = random.Random(20260321)
         now = 1_000_000.0
@@ -2622,8 +2625,10 @@ class TestOutcomeDigestAgainstBase:
             fleets.append(entries)
             stale_by_fleet.append(stale_nums)
 
-        head_results = self._run(AutoSwitchEngine, tmp_path, "head", fleets)
-        base_results = self._run(base_mod.AutoSwitchEngine, tmp_path, "base", fleets)
+        head_results = self._run(AutoSwitchEngine, tmp_path, "head", fleets, strategy)
+        base_results = self._run(
+            base_mod.AutoSwitchEngine, tmp_path, "base", fleets, strategy
+        )
 
         head_digest = hashlib.sha256(repr(head_results).encode()).hexdigest()
         base_digest = hashlib.sha256(repr(base_results).encode()).hexdigest()
@@ -2648,17 +2653,57 @@ class TestOutcomeDigestAgainstBase:
         with patch(
             "claude_swap.autoswitch.candidate_usage_is_stale", return_value=False
         ):
-            mutant_results = self._run(AutoSwitchEngine, tmp_path, "mutant", fleets)
+            mutant_results = self._run(
+                AutoSwitchEngine, tmp_path, "mutant", fleets, strategy
+            )
         mutant_digest = hashlib.sha256(repr(mutant_results).encode()).hexdigest()
 
         assert mutant_digest != head_digest, (
             "the mutant must move the digest — a no-op injection proves nothing"
         )
-        assert mutant_results == base_results, (
-            f"neutralizing the exclusion should reproduce the pre-fix engine "
-            f"exactly for a `best`-strategy fleet: head={head_digest} "
-            f"base={base_digest} mutant={mutant_digest} diffs={diffs}"
-        )
+        if strategy == "best":
+            # `best`'s trigger is never the literal "consume-first"/"dynamic"
+            # string, so pre-fix it never entered this gate at all (the base
+            # engine's `if trigger in CONSUME_FIRST_STRATEGIES:` was False on
+            # every `best` tick). There is no pre-existing freshness check at
+            # this trigger for the blanket mutant to also wipe out, so it
+            # reproduces base byte-for-byte.
+            assert mutant_results == base_results, (
+                f"neutralizing the exclusion should reproduce the pre-fix "
+                f"engine exactly for a `{strategy}`-strategy fleet: "
+                f"head={head_digest} base={base_digest} mutant={mutant_digest} "
+                f"diffs={diffs}"
+            )
+        else:
+            # `consume-first`/`dynamic` already ran a freshness check at this
+            # gate BEFORE this PR (`trigger in CONSUME_FIRST_STRATEGIES` was
+            # already true whenever `trigger = settings.strategy`), so this
+            # PR only ADDS the `token_dead()` half — but that half is nested
+            # inside the SAME `candidate_usage_is_stale` this mutant blanks
+            # to `False`, so the mutant also neutralizes the pre-existing
+            # freshness check and cannot reproduce base byte-for-byte here.
+            # Bound it precisely instead: every fleet where the mutant
+            # diverges from BASE must be one where the divergence traces to
+            # a candidate this fixture already marked stale (never a
+            # candidate with no stale/dead entry at all, which would be a
+            # ranking-order change with no attributable cause).
+            mutant_diffs = [
+                i
+                for i in range(self._N_FLEETS)
+                if mutant_results[i] != base_results[i]
+            ]
+            assert mutant_diffs, (
+                "the fixture never exercised the pre-existing freshness "
+                "check this mutant also neutralizes on this seed — "
+                "strengthen it before trusting the bound"
+            )
+            for i in mutant_diffs:
+                assert stale_by_fleet[i], (
+                    f"fleet {i} mutant/base divergence with NO stale "
+                    f"candidate — a scope error, not the pre-existing "
+                    f"freshness check the mutant over-neutralizes: "
+                    f"mutant={mutant_results[i]!r} base={base_results[i]!r}"
+                )
 
 
 class TestApiKeyAccounts:
