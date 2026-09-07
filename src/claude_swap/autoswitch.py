@@ -259,6 +259,23 @@ class _EngineStopped(Exception):
     once. Returning an empty result instead is indistinguishable from a fetch
     that answered nothing, and charges `_unhealthy_ticks` for a stop."""
 
+
+class _CandidateDead(Exception):
+    """`_perform`'s `switch_to` call hit `target-credential-dead` (issue
+    #199's switch-time liveness guard, past `_freshen_target`'s own
+    near-expiry check). Raised from inside `_perform`'s ``with
+    self._state_lock():`` block, so the quarantine write (which takes that
+    same non-reentrant lock via `_mutate_state`) cannot happen here — the
+    `for num in ordered` loop in `_tick_inner` catches this AFTER the lock
+    has released on unwind, quarantines there, and advances to the next
+    candidate in the SAME tick rather than reading the freshly-struck slot
+    as "already-active"."""
+
+    def __init__(self, number: str, email: str, detail: str):
+        super().__init__(f"account {number} ({email}): {detail}")
+        self.number = number
+        self.email = email
+
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
@@ -1902,7 +1919,15 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            try:
+                return self._perform(num, email, trigger, left_snapshot)
+            except _CandidateDead as exc:
+                # Past `_perform`'s `with self._state_lock():`, which has
+                # released on unwind — safe to take it again here via
+                # `_quarantine`'s own `_mutate_state`.
+                self._quarantine(exc.number, exc.email, "invalid_grant")
+                self._emit(NoSwitchEvent(reason="invalid_grant", detail=str(exc)))
+                continue
 
         if systemic or transient_failure:
             self._emit(
@@ -2937,11 +2962,19 @@ class AutoSwitchEngine:
                     self._release_pending = False
                     self._release_live()
             if not result or not result.get("switched"):
+                reason = (result or {}).get("reason", "")
+                if reason == "target-credential-dead":
+                    # Freshening (`_freshen_target`) only catches a near-
+                    # expiry token; `switch_to`'s own liveness probe just
+                    # proved this one dead right now, after `_perform`
+                    # already committed to it. The quarantine write itself
+                    # cannot happen here: `_mutate_state` takes this same
+                    # non-reentrant `_state_lock`, so the caller quarantines
+                    # once this raise has unwound out of the `with` above.
+                    detail = (result or {}).get("message", "")
+                    raise _CandidateDead(number, email, detail)
                 self._emit(
-                    NoSwitchEvent(
-                        reason="already-active",
-                        detail=(result or {}).get("reason", ""),
-                    )
+                    NoSwitchEvent(reason="already-active", detail=reason)
                 )
                 return TickOutcome.NO_ACTION
 

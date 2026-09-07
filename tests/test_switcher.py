@@ -7716,6 +7716,211 @@ class TestSwitchTargetLivenessGuard:
         assert result.get("validated") is True
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
+    def test_best_strategy_never_falls_through_to_struck_slot_via_rotation(
+        self, temp_home: Path
+    ):
+        """Fable's binding finding: with only one other switchable account,
+        a struck top candidate used to leave ``_select_best_switchable``
+        landing on ``(None, "none")``, which fell through to plain rotation
+        — and rotation's own filter didn't read ``_slot_token_dead``, so it
+        picked the struck slot right back up and activated the credential
+        this same call had just proven dead."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        creds_path = temp_home / ".claude" / ".credentials.json"
+        before = creds_path.read_bytes()
+        usage = {"1": self._usage(50), "2": self._usage(5)}
+
+        with patch.object(s, "_usage_by_account", return_value=usage), patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=False
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            result = s.switch(
+                strategy="best", json_output=True, current_at_limit=True
+            )
+
+        assert result["switched"] is False
+        assert creds_path.read_bytes() == before  # nothing activated, live untouched
+        assert s._usage_store.entries(
+            {"2": self._identity("b@example.com")}
+        )["2"].token_dead()
+        assert any("Account-2" in w for w in result["warnings"])
+
+    def test_plain_rotation_skips_dead_candidate_and_lands_on_next(
+        self, temp_home: Path
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-2": False, "sk-3": True}.get(token)
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            result = s.switch(json_output=True)
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 3
+        assert s._usage_store.entries(
+            {"2": self._identity("b@example.com")}
+        )["2"].token_dead()
+
+    def test_next_available_rotation_skips_dead_candidate_and_lands_on_next(
+        self, temp_home: Path
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        usage = {"1": self._usage(50), "2": self._usage(10), "3": self._usage(20)}
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-2": False, "sk-3": True}.get(token)
+
+        with patch.object(s, "_usage_by_account", return_value=usage), patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            result = s.switch(strategy="next-available", json_output=True)
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 3
+
+    def test_fresh_machine_switch_skips_dead_preferred_and_lands_on_fallback(
+        self, temp_home: Path
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        # No live credential/config written: identity is None, so this is
+        # the fresh-machine path (right after `cswap --import`).
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-1": False, "sk-2": True}.get(token)
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            result = s.switch(json_output=True)
+
+        assert result["to"]["number"] == 2
+        assert s._usage_store.entries(
+            {"1": self._identity("a@example.com")}
+        )["1"].token_dead()
+
+    def test_reconcile_self_switch_runs_no_probe_and_no_consume(
+        self, temp_home: Path
+    ):
+        """The reconcile self-switch (target == active slot, provenance
+        resolved) must never probe: the "target" here is the active slot's
+        own stored backup — by definition the older generation the live
+        session has already consumed, so probing it would strike the
+        active slot on its own stale copy."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        # Live rotated past account 1's stored backup (e.g. Claude Code
+        # refreshed it since the last switch) — a divergence that must
+        # reconcile, not probe.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-1-rotated", "refreshToken": "rt-1-rotated",
+            },
+        }))
+
+        probe = MagicMock(return_value=True)
+        refresh = MagicMock(
+            return_value=oauth.RefreshOutcome(None, "invalid_grant")
+        )
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value={
+                "uuid": "uuid-1", "email": "a@example.com",
+                "organizationUuid": None,
+            },
+        ), patch("claude_swap.oauth.probe_oauth_profile_live", probe), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials", refresh):
+            result = s.switch_to("1", json_output=True)
+
+        probe.assert_not_called()
+        refresh.assert_not_called()
+        assert result["reason"] == "already-active"
+        backup = json.loads(s._read_account_credentials("1", "a@example.com"))
+        assert backup["claudeAiOauth"]["accessToken"] == "sk-1-rotated"
+
+    def test_session_ahead_refusal_runs_before_any_probe(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        probe = MagicMock(return_value=True)
+        with patch(
+            "claude_swap.session.scan_live_sessions",
+            return_value=([MagicMock(pid=4242)], 0),
+        ), patch.object(s, "_session_profile_ahead", return_value=True), patch(
+            "claude_swap.oauth.probe_oauth_profile_live", probe
+        ):
+            with pytest.raises(SwitchError, match="Exit the session"):
+                s.switch_to("2", json_output=True)
+
+        probe.assert_not_called()
+
+    def test_validated_key_is_fingerprint_true_only_when_store_unrotated(
+        self, temp_home: Path
+    ):
+        """``validated`` must reflect the STORE's bytes at activation time,
+        not the ones the probe happened to see: a racing collector rotation
+        between the probe and the lock must still activate what the store
+        now holds."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        def rotate_after_probe(token: str, timeout_s: float = 5.0) -> bool:
+            s._write_account_credentials(
+                "2", "b@example.com",
+                json.dumps({
+                    "claudeAiOauth": {
+                        "accessToken": "sk-2-rotated",
+                        "refreshToken": "rt-2-rotated",
+                    },
+                }),
+            )
+            return True
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live",
+            side_effect=rotate_after_probe,
+        ):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is True
+        assert "validated" not in result
+        live = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        assert live["claudeAiOauth"]["accessToken"] == "sk-2-rotated"
+
 
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
@@ -11550,7 +11755,6 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
-            validated_creds=None,
         )
 
     def test_switch_to_unknown_alias_raises_account_not_found_not_validation(

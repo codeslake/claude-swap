@@ -37,6 +37,17 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class TargetCredentialDead(SwitchError):
+    """A switch target's stored credential was just proven dead (a profile
+    401 followed by a refresh that answered a permanent auth error), raised
+    by ``_perform_switch``'s pre-lock liveness probe after striking the slot.
+    Callers with more than one candidate catch this and advance; a caller
+    with only one target converts it to a ``target-credential-dead`` noop.
+    """
+
+    pass
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 

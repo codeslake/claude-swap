@@ -2543,6 +2543,47 @@ class TestFreshening:
         assert (q.number, q.reason) == ("2", "invalid_grant")
         assert "2" in h.state()["quarantine"]
 
+    def test_switch_time_dead_credential_advances_to_next_candidate(
+        self, temp_home
+    ):
+        """`_freshen_target` only catches a NEAR-EXPIRY token (issue #199 is
+        about a credential the API has already revoked that isn't near
+        expiry) — so both candidates here are seeded far from expiry, and
+        the dead verdict can only come from `_perform_switch`'s own liveness
+        probe, hit through `switch_to` inside `_perform`. The tick must
+        still land on the second candidate in the same tick, not read the
+        freshly-struck slot as `already-active`."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-2": False, "sk-3": True}.get(token)
+
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ), patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3  # landed on 3 in the SAME tick
+        q = next(e for e in h.events if isinstance(e, QuarantineEvent))
+        assert (q.number, q.reason) == ("2", "invalid_grant")
+        dead_events = [
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent) and e.reason == "invalid_grant"
+        ]
+        assert dead_events  # not read as "already-active"
+        assert "2" in dead_events[0].detail
+        assert "b@example.com" in dead_events[0].detail
+
     def test_transient_failure_skips_without_quarantine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

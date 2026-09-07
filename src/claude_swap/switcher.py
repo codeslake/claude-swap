@@ -24,6 +24,7 @@ from claude_swap.exceptions import (
     LockError,
     SessionError,
     SwitchError,
+    TargetCredentialDead,
     ValidationError,
 )
 from claude_swap import oauth, pace
@@ -6680,9 +6681,19 @@ class ClaudeAccountSwitcher:
             if not preferred:
                 raise ConfigError("No accounts are managed yet")
 
+            def _fresh_machine_switchable(num: str) -> bool:
+                # Skip a slot already known dead the same way the "best"
+                # ranking does (`_select_best_switchable`) — the live probe
+                # below still runs on whatever this leaves, catching a
+                # credential that has died since the last strike.
+                email = data.get("accounts", {}).get(num, {}).get("email", "")
+                return self._account_is_switchable(
+                    num
+                ) and not self._slot_token_dead(num, email)
+
             target = str(preferred)
             target_disabled = self._disabled_from_data(data, target)
-            if target_disabled or not self._account_is_switchable(target):
+            if target_disabled or not _fresh_machine_switchable(target):
                 if target_disabled:
                     reason = console_reason = "(disabled)"
                 else:
@@ -6699,7 +6710,7 @@ class ClaudeAccountSwitcher:
                     (str(num) for num in sequence
                      if str(num) != target
                      and not self._disabled_from_data(data, str(num))
-                     and self._account_is_switchable(str(num))),
+                     and _fresh_machine_switchable(str(num))),
                     None,
                 )
                 if not fallback:
@@ -6715,11 +6726,38 @@ class ClaudeAccountSwitcher:
                         "Re-add a slot with: cswap --add-account --slot <number>"
                     )
                 target = fallback
-            op = self._perform_switch(target, emit_output=not json_output)
-            return (
-                self._switch_result_from_op(op, strategy_label, warnings)
-                if json_output else None
+            # A dead verdict from `_perform_switch`'s own liveness probe
+            # (issue #199) advances to the next switchable, non-dead slot
+            # rather than falling through with nothing activated.
+            candidates = [target] + [
+                str(num) for num in sequence
+                if str(num) != target
+                and not self._disabled_from_data(data, str(num))
+                and _fresh_machine_switchable(str(num))
+            ]
+            for candidate in candidates:
+                try:
+                    op = self._perform_switch(
+                        candidate, emit_output=not json_output
+                    )
+                except TargetCredentialDead:
+                    continue
+                return (
+                    self._switch_result_from_op(op, strategy_label, warnings)
+                    if json_output else None
+                )
+            message = (
+                "Every managed account's stored credential was rejected by "
+                "the API; nothing was activated. Log in and run: cswap add"
             )
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label,
+                    reason="target-credential-dead",
+                    message=message,
+                )
+            warning(message)
+            return None
 
         current_email, current_org_uuid = identity
 
@@ -6783,37 +6821,21 @@ class ClaudeAccountSwitcher:
             # Bounded by the candidate count: a struck candidate is excluded
             # from the NEXT `_select_best_switchable` call (its own
             # `_slot_token_dead` filter), so this can loop at most once per
-            # slot before landing on "none"/"stay"/a live target.
-            validated_creds: str | None = None
-            validated: bool | None = None
+            # slot before landing on "none"/"stay"/a live target. A dead
+            # verdict from `_perform_switch`'s own pre-lock liveness probe
+            # (issue #199) advances the same way — it is the one place that
+            # probes, strikes, and activates, so a struck top candidate can
+            # never be the one this call ends up switching onto.
             for _ in range(len(sequence)):
                 if target is None:
                     break
-                accts = self._get_sequence_data() or {}
-                target_email = (
-                    accts.get("accounts", {}).get(target, {}).get("email", "")
-                )
-                probe_creds = self._read_target_credentials(target, target_email)
-                if not probe_creds:
-                    break  # let _perform_switch's own empty-slot handling run
-                live, validated_creds = self._probe_target_credential(
-                    target, target_email, probe_creds
-                )
-                if live is False:
+                try:
+                    op = self._perform_switch(target, emit_output=not json_output)
+                except TargetCredentialDead:
                     target, note = self._select_best_switchable(
                         current_num, models, best_usage, current_at_limit
                     )
                     continue
-                validated = live  # True (confirmed), or None (transport failure)
-                break
-            if target is not None:
-                op = self._perform_switch(
-                    target,
-                    emit_output=not json_output,
-                    validated_creds=validated_creds,
-                )
-                if validated:
-                    op["validated"] = True
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
@@ -6906,138 +6928,178 @@ class ClaudeAccountSwitcher:
         # never lands a no-op on the slot you're already on when the live login
         # has drifted from the recorded activeAccountNumber. Plain rotation keeps
         # anchoring on active_account for byte-for-byte unchanged behavior.
-        anchor = current_num if strategy == "next-available" else active_account
-        try:
-            current_index = sequence.index(int(anchor))
-        except (TypeError, ValueError):
+        #
+        # The whole scan is retried, bounded by the candidate count, when
+        # `_perform_switch`'s own liveness probe (issue #199) proves a
+        # selected candidate dead: the strike it records makes the same scan
+        # skip that slot on the next pass (`_slot_token_dead` below), so the
+        # retry always makes progress rather than reselecting it.
+        for _ in range(len(sequence)):
+            anchor = current_num if strategy == "next-available" else active_account
             try:
-                current_index = sequence.index(active_account)
+                current_index = sequence.index(int(anchor))
             except (TypeError, ValueError):
-                current_index = 0
+                try:
+                    current_index = sequence.index(active_account)
+                except (TypeError, ValueError):
+                    current_index = 0
 
-        # Only fetch usage when needed; an empty map means the headroom check
-        # below is always None (skipped), preserving the non-usage-aware path.
-        usage = self._usage_by_account() if strategy == "next-available" else {}
-        if strategy == "next-available":
-            self._warn_inert_models(usage, models, json_output, warnings)
-
-        next_account: str | None = None
-        skipped_exhausted: list[str] = []
-        for offset in range(1, len(sequence)):
-            candidate = str(sequence[(current_index + offset) % len(sequence)])
-            if self._disabled_from_data(data, candidate):
-                if json_output:
-                    warnings.append(f"Skipped Account-{candidate} (disabled)")
-                else:
-                    print(f"{accent('Skipping')} Account-{candidate} (disabled)")
-                continue
-            if not self._account_is_switchable(candidate):
-                if json_output:
-                    warnings.append(
-                        f"Skipped Account-{candidate} (no stored credentials)"
-                    )
-                else:
-                    print(
-                        f"{accent('Skipping')} Account-{candidate} "
-                        f"(no stored credentials, re-add with "
-                        f"cswap --add-account --slot {candidate})"
-                    )
-                continue
+            # Only fetch usage when needed; an empty map means the headroom
+            # check below is always None (skipped), preserving the
+            # non-usage-aware path.
+            usage = self._usage_by_account() if strategy == "next-available" else {}
             if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate), models)
-                if headroom is not None and headroom <= 0:
-                    skipped_exhausted.append(candidate)
-                    label = "5h/7d"
-                    if models:
-                        # Name what actually binds ("Fable", "5h/Fable", ...)
-                        # so a config-driven skip is never mysterious.
-                        at = [
-                            name
-                            for name, pct, _ in oauth.relevant_windows(
-                                usage.get(candidate), models
-                            )
-                            if pct >= 100.0
-                        ]
-                        if at:
-                            label = "/".join(at)
+                self._warn_inert_models(usage, models, json_output, warnings)
+
+            next_account: str | None = None
+            skipped_exhausted: list[str] = []
+            for offset in range(1, len(sequence)):
+                candidate = str(sequence[(current_index + offset) % len(sequence)])
+                if self._disabled_from_data(data, candidate):
+                    if json_output:
+                        warnings.append(f"Skipped Account-{candidate} (disabled)")
+                    else:
+                        print(f"{accent('Skipping')} Account-{candidate} (disabled)")
+                    continue
+                if not self._account_is_switchable(candidate):
                     if json_output:
                         warnings.append(
-                            f"Skipped Account-{candidate} (at {label} limit)"
+                            f"Skipped Account-{candidate} (no stored credentials)"
                         )
                     else:
-                        print(f"{accent('Skipping')} Account-{candidate} (at {label} limit)")
+                        print(
+                            f"{accent('Skipping')} Account-{candidate} "
+                            f"(no stored credentials, re-add with "
+                            f"cswap --add-account --slot {candidate})"
+                        )
                     continue
-            next_account = candidate
-            break
+                if self._slot_token_dead(
+                    candidate,
+                    data.get("accounts", {}).get(candidate, {}).get("email", ""),
+                ):
+                    if json_output:
+                        warnings.append(
+                            f"Skipped Account-{candidate} "
+                            "(credential rejected by the API)"
+                        )
+                    else:
+                        print(
+                            f"{accent('Skipping')} Account-{candidate} "
+                            "(credential rejected by the API)"
+                        )
+                    continue
+                if strategy == "next-available":
+                    headroom = oauth.account_headroom(usage.get(candidate), models)
+                    if headroom is not None and headroom <= 0:
+                        skipped_exhausted.append(candidate)
+                        label = "5h/7d"
+                        if models:
+                            # Name what actually binds ("Fable", "5h/Fable", ...)
+                            # so a config-driven skip is never mysterious.
+                            at = [
+                                name
+                                for name, pct, _ in oauth.relevant_windows(
+                                    usage.get(candidate), models
+                                )
+                                if pct >= 100.0
+                            ]
+                            if at:
+                                label = "/".join(at)
+                        if json_output:
+                            warnings.append(
+                                f"Skipped Account-{candidate} (at {label} limit)"
+                            )
+                        else:
+                            print(f"{accent('Skipping')} Account-{candidate} (at {label} limit)")
+                        continue
+                next_account = candidate
+                break
 
-        # Every rotation target is at its limit. Switching onto an exhausted
-        # account would not help, so stay on the current one instead.
-        if next_account is None and skipped_exhausted:
-            # With model limits in play the binding window may be a scoped
-            # one (the per-skip lines name it), so don't claim "5h/7d".
-            limits_label = "usage limits" if models else "5h/7d limit"
-            if json_output:
-                return self._switch_noop(
-                    strategy=strategy_label, reason="candidates-exhausted",
-                    to_ref=current_ref, warnings=warnings,
-                    message=(
-                        f"All other accounts are at their {limits_label} — staying on "
-                        f"Account-{current_num}."
-                    ),
-                )
-            warning(
-                f"All other accounts are at their {limits_label} — staying on "
-                f"Account-{current_num}."
-            )
-            return None
-
-        if next_account is None:
-            if json_output:
-                return self._switch_noop(
-                    strategy=strategy_label, reason="no-valid-target",
-                    to_ref=current_ref, warnings=warnings,
-                    message="No other accounts have valid stored credentials/config.",
-                )
-            print(dimmed(
-                "No other accounts have valid stored credentials/config.\n"
-                "Re-add a skipped slot with: cswap --add-account --slot <number>"
-            ))
-            return None
-
-        # Rotation anchored on a drifted activeAccountNumber can land on the
-        # slot the user is already on — a self-switch would pointlessly rewrite
-        # the live credentials (issue #79's hazard, on the strategy path).
-        # Provenance-aware: only a no-op when the live credential matches the
-        # slot's backup (or the divergence can't be classified — pre-fix
-        # behavior, silent); a resolved divergence falls through so
-        # _perform_switch can reconcile it.
-        provenance: dict | None = None
-        if next_account == current_num:
-            action, provenance = self._self_switch_action(
-                next_account, current_email
-            )
-            if action != "reconcile":
+            # Every rotation target is at its limit. Switching onto an
+            # exhausted account would not help, so stay on the current one
+            # instead.
+            if next_account is None and skipped_exhausted:
+                # With model limits in play the binding window may be a
+                # scoped one (the per-skip lines name it), so don't claim
+                # "5h/7d".
+                limits_label = "usage limits" if models else "5h/7d limit"
                 if json_output:
                     return self._switch_noop(
-                        strategy=strategy_label,
-                        reason="already-active",
-                        from_ref=current_ref,
-                        to_ref=current_ref,
-                        warnings=warnings,
-                        message=f"Already on Account-{next_account} ({current_email})",
+                        strategy=strategy_label, reason="candidates-exhausted",
+                        to_ref=current_ref, warnings=warnings,
+                        message=(
+                            f"All other accounts are at their {limits_label} — staying on "
+                            f"Account-{current_num}."
+                        ),
                     )
-                print(
-                    f"{accent('Already on')} Account-{next_account} ({current_email})"
+                warning(
+                    f"All other accounts are at their {limits_label} — staying on "
+                    f"Account-{current_num}."
                 )
                 return None
 
-        op = self._perform_switch(
-            next_account, emit_output=not json_output, provenance=provenance
+            if next_account is None:
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="no-valid-target",
+                        to_ref=current_ref, warnings=warnings,
+                        message="No other accounts have valid stored credentials/config.",
+                    )
+                print(dimmed(
+                    "No other accounts have valid stored credentials/config.\n"
+                    "Re-add a skipped slot with: cswap --add-account --slot <number>"
+                ))
+                return None
+
+            # Rotation anchored on a drifted activeAccountNumber can land on the
+            # slot the user is already on — a self-switch would pointlessly rewrite
+            # the live credentials (issue #79's hazard, on the strategy path).
+            # Provenance-aware: only a no-op when the live credential matches the
+            # slot's backup (or the divergence can't be classified — pre-fix
+            # behavior, silent); a resolved divergence falls through so
+            # _perform_switch can reconcile it.
+            provenance: dict | None = None
+            if next_account == current_num:
+                action, provenance = self._self_switch_action(
+                    next_account, current_email
+                )
+                if action != "reconcile":
+                    if json_output:
+                        return self._switch_noop(
+                            strategy=strategy_label,
+                            reason="already-active",
+                            from_ref=current_ref,
+                            to_ref=current_ref,
+                            warnings=warnings,
+                            message=f"Already on Account-{next_account} ({current_email})",
+                        )
+                    print(
+                        f"{accent('Already on')} Account-{next_account} ({current_email})"
+                    )
+                    return None
+
+            try:
+                op = self._perform_switch(
+                    next_account, emit_output=not json_output, provenance=provenance
+                )
+            except TargetCredentialDead:
+                continue
+            return (
+                self._switch_result_from_op(op, strategy_label, warnings)
+                if json_output else None
+            )
+
+        message = (
+            "Every other account's stored credential was rejected by the "
+            "API; nothing was activated. Log in and run: cswap add"
         )
-        return (
-            self._switch_result_from_op(op, strategy_label, warnings)
-            if json_output else None
-        )
+        if json_output:
+            return self._switch_noop(
+                strategy=strategy_label, reason="target-credential-dead",
+                to_ref=current_ref, warnings=warnings, message=message,
+            )
+        warning(message)
+        return None
 
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
@@ -7140,50 +7202,38 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
-        target_email = data.get("accounts", {}).get(target_account, {}).get("email", "")
-        probe_creds = self._read_target_credentials(target_account, target_email)
-        validated_creds: str | None = None
-        validated: bool | None = None
-        if probe_creds:
-            live, validated_creds = self._probe_target_credential(
-                target_account, target_email, probe_creds
+        # The switch-time liveness guard (issue #199) lives in
+        # `_perform_switch` itself — the one choke point every activation
+        # routes through — so this call gets it for free; a dead verdict
+        # raises `TargetCredentialDead` after striking the slot.
+        try:
+            op = self._perform_switch(
+                target_account,
+                emit_output=not json_output,
+                force_activate=force,
+                provenance=provenance,
             )
-            if live is False:
-                identity = self._get_current_account()
-                if identity is not None:
-                    cur_num = self._find_account_slot(data, identity[0], identity[1])
-                    cur_ref = (
-                        account_ref(int(cur_num), identity[0])
-                        if cur_num else account_ref(None, identity[0])
-                    )
-                else:
-                    cur_ref = None
-                message = (
-                    f"Account-{target_account} ({target_email})'s stored "
-                    "credential was rejected by the API; nothing was "
-                    "activated. Log in as it and run: cswap add"
+        except TargetCredentialDead as exc:
+            identity = self._get_current_account()
+            if identity is not None:
+                cur_num = self._find_account_slot(data, identity[0], identity[1])
+                cur_ref = (
+                    account_ref(int(cur_num), identity[0])
+                    if cur_num else account_ref(None, identity[0])
                 )
-                if not json_output:
-                    warning(message)
-                    return None
-                return self._switch_noop(
-                    strategy="direct",
-                    reason="target-credential-dead",
-                    from_ref=cur_ref,
-                    to_ref=cur_ref,
-                    message=message,
-                )
-            validated = live
-
-        op = self._perform_switch(
-            target_account,
-            emit_output=not json_output,
-            force_activate=force,
-            provenance=provenance,
-            validated_creds=validated_creds,
-        )
-        if validated:
-            op["validated"] = True
+            else:
+                cur_ref = None
+            message = str(exc)
+            if not json_output:
+                warning(message)
+                return None
+            return self._switch_noop(
+                strategy="direct",
+                reason="target-credential-dead",
+                from_ref=cur_ref,
+                to_ref=cur_ref,
+                message=message,
+            )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
@@ -8082,7 +8132,6 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
-        validated_creds: str | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -8098,10 +8147,24 @@ class ClaudeAccountSwitcher:
         credentials without backing the live ones up first (post-import recovery
         when the live login is stale).
 
-        ``validated_creds``, when set, is what a caller's own pre-lock
-        ``_probe_target_credential`` confirmed live (or refreshed) — used in
-        place of a fresh ``_read_target_credentials`` so the activated bytes
-        are exactly the ones the probe checked, not a second, unchecked read.
+        The one choke point for the switch-time liveness guard (issue #199):
+        every caller with more than one candidate (`switch`'s "best" ranking,
+        plain rotation, the fresh-machine walk) or exactly one (`switch_to`)
+        routes activation through here, so probing here — pre-lock, after the
+        session check, before ``_prefetch_live_identity`` — reaches all of
+        them from one place. A dead verdict raises ``TargetCredentialDead``
+        (after striking the slot through ``_probe_target_credential``); a
+        multi-candidate caller catches it and advances, `switch_to` converts
+        it to the existing ``target-credential-dead`` noop. Skipped when
+        ``provenance`` is already set: that only happens on the reconcile
+        self-switch, where the "target" is the active slot's own stored
+        backup — by definition the older generation the live session has
+        already consumed, so probing it would strike the active slot on its
+        own stale copy. The returned dict carries ``"validated": True`` when
+        the activated bytes' fingerprint matches what the probe confirmed
+        live (never a raw activate-what-the-probe-saw: a collector rotation
+        between the probe and the lock must still activate what the store
+        now holds, not the probed generation).
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -8161,6 +8224,29 @@ class ClaudeAccountSwitcher:
             else:
                 self._adopt_session_credential(target_account, pre_email, pre_org)
 
+        # Switch-time liveness guard (issue #199), pre-lock: confirm the
+        # target's stored credential is actually accepted by the API before
+        # it is ever activated. `probed_fp` is compared against the STORE's
+        # fingerprint once the lock is held (see the docstring) rather than
+        # activating these bytes directly.
+        probed_fp: str | None = None
+        if provenance is None:
+            target_creds_probe = self._read_target_credentials(
+                target_account, pre_email
+            )
+            if target_creds_probe:
+                live, probed_creds = self._probe_target_credential(
+                    target_account, pre_email, target_creds_probe
+                )
+                if live is False:
+                    raise TargetCredentialDead(
+                        f"Account-{target_account} ({pre_email})'s stored "
+                        "credential was rejected by the API; nothing was "
+                        "activated. Log in as it and run: cswap add"
+                    )
+                if live is True:
+                    probed_fp = oauth.credential_fingerprint(probed_creds)
+
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch
         # reconciliation) pass it in; force activation never backs up the
@@ -8213,8 +8299,12 @@ class ClaudeAccountSwitcher:
                     from_ref = account_ref(None, current_identity[0])
                 else:
                     from_ref = account_ref(int(current_account), current_identity[0])
-                target_creds = validated_creds or self._read_target_credentials(
+                target_creds = self._read_target_credentials(
                     target_account, target_email
+                )
+                validated = (
+                    probed_fp is not None
+                    and oauth.credential_fingerprint(target_creds) == probed_fp
                 )
                 if not target_creds:
                     return self._switch_to_empty_slot(
@@ -8390,7 +8480,10 @@ class ClaudeAccountSwitcher:
                     target_email,
                     data["accounts"][target_account].get("organizationUuid", ""),
                 )
-                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                result = {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                if validated:
+                    result["validated"] = True
+                return result
 
             current_email, _ = current_identity
             from_ref = account_ref(int(current_account), current_email)
@@ -8575,8 +8668,12 @@ class ClaudeAccountSwitcher:
                     self._logger.info(f"Backed up account {current_account}")
 
                 # Step 2: Retrieve target account
-                target_creds = validated_creds or self._read_target_credentials(
+                target_creds = self._read_target_credentials(
                     target_account, target_email
+                )
+                validated = (
+                    probed_fp is not None
+                    and oauth.credential_fingerprint(target_creds) == probed_fp
                 )
                 if not target_creds:
                     return self._switch_to_empty_slot(
@@ -8670,7 +8767,10 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        result = {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        if validated:
+            result["validated"] = True
+        return result
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
