@@ -2482,7 +2482,7 @@ class TestProactiveExcludesStaleUsage:
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert "stale-usage" in reasons
+        assert "stale-candidate-skipped" in reasons
 
     def test_control_the_same_candidate_fresh_is_admitted(self, temp_home):
         """Mutant control: the same candidate, freshly fetched, IS switched
@@ -2520,7 +2520,7 @@ class TestProactiveExcludesStaleUsage:
         assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert "stale-usage" in reasons
+        assert "stale-candidate-skipped" in reasons
 
 
 class TestProactiveSkipsAStaleTopCandidateForTheNextRanked:
@@ -2565,7 +2565,7 @@ class TestProactiveSkipsAStaleTopCandidateForTheNextRanked:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert "stale-usage" in reasons
+        assert "stale-candidate-skipped" in reasons
 
     def test_control_the_same_top_candidate_fresh_is_taken_instead(
         self, temp_home
@@ -2642,6 +2642,61 @@ class TestFailoverSkipsAStaleTopCandidate:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "failover"
 
+    @staticmethod
+    def _backed_off(usage, now):
+        """A peer in a 429 backoff: past `fresh()`'s TTL, still decision-
+        trusted (`trust_extended`), credential fine."""
+        return UsageEntry(
+            last_good=usage, fetched_at=now - 1000.0, age_s=1000.0,
+            consecutive_failures=9, last_error="http-429",
+            backoff_until=now + 400.0, trust_extended=True,
+        )
+
+    def test_lands_on_a_backed_off_peer_when_the_active_is_struck(
+        self, temp_home
+    ):
+        """I-a: failover is the ACTIVE credential failing. A peer in a 429
+        backoff is trusted-but-not-fresh by design (usage_store keeps
+        serving a throttled row so it stays a switch target); gating
+        failover on the full staleness predicate refused every such peer
+        and left the engine BLOCKED on a fleet whose credentials were all
+        fine. Only a struck credential may disqualify a failover target."""
+        h = self._harness(temp_home)
+        outcome = self._drive_to_failover(
+            h,
+            {
+                "1": UsageEntry(),
+                "2": self._backed_off(_usage(0), h.clock.now),
+                "3": self._backed_off(_usage(10), h.clock.now),
+            },
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+    def test_control_a_struck_top_peer_is_still_skipped_for_a_backed_off_one(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        struck_top = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert struck_top.token_dead()
+        outcome = self._drive_to_failover(
+            h,
+            {
+                "1": UsageEntry(),
+                "2": struck_top,
+                "3": self._backed_off(_usage(10), h.clock.now),
+            },
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 3
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-candidate-skipped" in reasons
+
 
 _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 
@@ -2679,6 +2734,9 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
         tf.extractall(old_root, filter="data")  # trusted: our own repo's history
     module_dir = tmp_path / "base_driver"
     module_dir.mkdir()
+    # HEAD's test module runs against BASE's package: a name this file imports
+    # from `claude_swap` that post-dates the base sha reddens the driver
+    # (ImportError) instead of skipping.
     (module_dir / "test_autoswitch.py").write_text(Path(__file__).read_text())
     homes_dir = tmp_path / f"base_homes_{strategy}"
     homes_dir.mkdir()
@@ -2748,7 +2806,8 @@ class TestOutcomeDigestAgainstBase:
             last_good = _usage7(
                 rng.uniform(0, 60), rng.uniform(0, 60), rng.choice(resets)
             )
-            if rng.random() < 0.35:
+            roll = rng.random()
+            if roll < 0.35:
                 stale_nums.add(num)
                 entries[num] = UsageEntry(
                     last_good=last_good,
@@ -2758,6 +2817,14 @@ class TestOutcomeDigestAgainstBase:
                     last_error=rng.choice(["http-429", "timeout"]),
                     backoff_until=now + rng.uniform(50, 500),
                     trust_extended=True,
+                )
+            elif roll < 0.45:
+                # Collector-struck while still FRESH: the `token_dead()` half
+                # of the exclusion, which the freshness half alone admits.
+                stale_nums.add(num)
+                entries[num] = UsageEntry(
+                    last_good=last_good, fetched_at=now, age_s=0.0,
+                    auth_dead_strikes=2,
                 )
             else:
                 entries[num] = _entry_for(last_good, now)
@@ -2797,8 +2864,7 @@ class TestOutcomeDigestAgainstBase:
             results.append((outcome.name, h.active_number(), events))
         return results
 
-    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
-    def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
+    def _head(self, tmp_path, strategy):
         rng = random.Random(self._DIGEST_SEED)
         now = 1_000_000.0
         fleets: list[dict] = []
@@ -2807,14 +2873,40 @@ class TestOutcomeDigestAgainstBase:
             entries, stale_nums = self._fleet(rng, now)
             fleets.append(entries)
             stale_by_fleet.append(stale_nums)
-
         head_results = self._run(AutoSwitchEngine, tmp_path, "head", fleets, strategy)
+        return fleets, stale_by_fleet, head_results
+
+    def _mutant(self, tmp_path, fleets, strategy):
+        # Neutralize ONLY the new exclusion (the admission gate always reads
+        # "not stale") on the SAME fleets.
+        with patch(
+            "claude_swap.autoswitch.candidate_usage_is_stale", return_value=False
+        ):
+            return self._run(AutoSwitchEngine, tmp_path, "mutant", fleets, strategy)
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    def test_mutant_moves_the_head_digest(self, tmp_path, strategy):
+        """Needs no base checkout, so it runs on CI's shallow clone too."""
+        fleets, _stale, head_results = self._head(tmp_path, strategy)
+        mutant_results = self._mutant(tmp_path, fleets, strategy)
+        assert mutant_results != head_results, (
+            "the mutant must move the digest — a no-op injection proves nothing"
+        )
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
+        fleets, stale_by_fleet, head_results = self._head(tmp_path, strategy)
         base_results = _base_engine_results(
             tmp_path, strategy, self._DIGEST_SEED, self._N_FLEETS
         )
-
-        head_digest = hashlib.sha256(repr(head_results).encode()).hexdigest()
-        base_digest = hashlib.sha256(repr(base_results).encode()).hexdigest()
+        # The consume-first HOLD keeps the `stale-usage` literal; a SKIP
+        # (`proactive`, or `failover` on the fleet's own unhealthy-active
+        # path — reachable under ANY strategy, `consume-first`/`dynamic`
+        # included) abandons the candidate and goes on to switch or block,
+        # citing a distinct literal so a log reader never sees a stall's
+        # word ahead of a `Switched` line. Keyed on the OUTCOME, not the
+        # strategy: a consume-first-strategy fleet's active account can
+        # still fail over.
 
         diffs = [
             i for i in range(self._N_FLEETS) if head_results[i] != base_results[i]
@@ -2827,16 +2919,17 @@ class TestOutcomeDigestAgainstBase:
             # "The fleet carried a stale candidate somewhere" alone does not
             # exclude a ranking change on that same fleet for an unrelated
             # reason — pin it to the mechanism: HEAD itself must have hit
-            # the exclusion (a `stale-usage` event), and BASE's landing
-            # account must be one this fixture actually marked stale.
+            # the exclusion, and BASE's landing account must be one this
+            # fixture actually marked stale.
             assert stale_by_fleet[i], (
                 f"fleet {i} differs with NO stale candidate — a scope error, "
                 f"not the intended exclusion: head={head_results[i]!r} "
                 f"base={base_results[i]!r}"
             )
-            assert ("no-switch", "stale-usage") in head_results[i][2], (
+            expected = "stale-usage" if head_results[i][0] == "NO_ACTION" else "stale-candidate-skipped"
+            assert ("no-switch", expected) in head_results[i][2], (
                 f"fleet {i} differs and carries a stale candidate, but "
-                f"head's own events never cite stale-usage — the "
+                f"head's own events never cite {expected} — the "
                 f"divergence traces to something else, not the exclusion: "
                 f"head={head_results[i]!r}"
             )
@@ -2848,20 +2941,7 @@ class TestOutcomeDigestAgainstBase:
                 f"base={base_results[i]!r}"
             )
 
-        # Mutant control: neutralize ONLY the new exclusion (the admission
-        # gate always reads "not stale") and reproduce the pre-fix engine
-        # exactly on the SAME fleets.
-        with patch(
-            "claude_swap.autoswitch.candidate_usage_is_stale", return_value=False
-        ):
-            mutant_results = self._run(
-                AutoSwitchEngine, tmp_path, "mutant", fleets, strategy
-            )
-        mutant_digest = hashlib.sha256(repr(mutant_results).encode()).hexdigest()
-
-        assert mutant_digest != head_digest, (
-            "the mutant must move the digest — a no-op injection proves nothing"
-        )
+        mutant_results = self._mutant(tmp_path, fleets, strategy)
         if strategy == "best":
             # `best`'s trigger is never the literal "consume-first"/"dynamic"
             # string, so pre-fix it never entered this gate at all (the base
@@ -2872,7 +2952,6 @@ class TestOutcomeDigestAgainstBase:
             assert mutant_results == base_results, (
                 f"neutralizing the exclusion should reproduce the pre-fix "
                 f"engine exactly for a `{strategy}`-strategy fleet: "
-                f"head={head_digest} base={base_digest} mutant={mutant_digest} "
                 f"diffs={diffs}"
             )
         else:
@@ -2883,11 +2962,11 @@ class TestOutcomeDigestAgainstBase:
             # inside the SAME `candidate_usage_is_stale` this mutant blanks
             # to `False`, so the mutant also neutralizes the pre-existing
             # freshness check and cannot reproduce base byte-for-byte here.
-            # Bound it precisely instead: every fleet where the mutant
-            # diverges from BASE must be one where the divergence traces to
-            # a candidate this fixture already marked stale (never a
-            # candidate with no stale/dead entry at all, which would be a
-            # ranking-order change with no attributable cause).
+            # Bound it symmetrically to the head/base loop above: on every
+            # fleet where the mutant diverges from BASE, base HELD (the hold
+            # its own freshness check produced) and the mutant LANDED on a
+            # candidate this fixture marked stale — never a ranking-order
+            # change with no attributable cause.
             mutant_diffs = [
                 i
                 for i in range(self._N_FLEETS)
@@ -2904,6 +2983,17 @@ class TestOutcomeDigestAgainstBase:
                     f"candidate — a scope error, not the pre-existing "
                     f"freshness check the mutant over-neutralizes: "
                     f"mutant={mutant_results[i]!r} base={base_results[i]!r}"
+                )
+                assert base_results[i][:2] == ("NO_ACTION", 1), (
+                    f"fleet {i}: base did not hold on its own freshness "
+                    f"check: base={base_results[i]!r}"
+                )
+                assert str(mutant_results[i][1]) in stale_by_fleet[i], (
+                    f"fleet {i}: the mutant landed on account "
+                    f"{mutant_results[i][1]!r}, which this fixture never "
+                    f"marked stale ({stale_by_fleet[i]!r}) — a ranking "
+                    f"change, not the neutralized gate admitting a stale "
+                    f"candidate: mutant={mutant_results[i]!r}"
                 )
 
 

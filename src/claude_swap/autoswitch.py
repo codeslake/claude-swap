@@ -168,9 +168,9 @@ def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
     refresh it this tick — backoff or a concurrent poller), or a
     collector-struck (``invalid_grant``) token (``token_dead()``, unqualified
     — the same unbound call ``due_candidate`` uses). The ONE definition of
-    "stale-usage": `_tick_inner`'s proactive/consume-first admission gate and
-    the TUI's Next-best panel both call this rather than each computing their
-    own, so a candidate can never read differently on the two surfaces.
+    "stale-usage": `_tick_inner`'s proactive/consume-first admission gate.
+    `failover` gates on ``token_dead()`` alone (a backed-off peer is a fine
+    target when the ACTIVE credential is the one failing).
     """
     return entry is None or not entry.fresh(now) or entry.token_dead()
 
@@ -2110,26 +2110,55 @@ class AutoSwitchEngine:
                 # None entry must call it zero times, matching every other
                 # clock read on this path (call-order-sensitive tests script
                 # the clock as a fixed sequence).
-                if entry is None or candidate_usage_is_stale(entry, self.clock()):
-                    self._emit(
-                        NoSwitchEvent(
-                            reason="stale-usage",
-                            detail=(
-                                f"account {num} usage could not be refreshed "
-                                "this tick (backoff or a concurrent poller); "
-                                "retrying"
-                            ),
-                        )
+                if trigger == "failover":
+                    # Failover is the ACTIVE credential failing, and a peer
+                    # in a 429 backoff is exactly what `trust_extended` keeps
+                    # serving past `fresh()`'s TTL so it stays a usable
+                    # target (usage_store's own reasoning). The full
+                    # staleness predicate here would refuse every backed-off
+                    # peer and leave the engine `no-viable-target` on a fleet
+                    # whose credentials are all fine — only a struck
+                    # credential disqualifies a failover target.
+                    unusable = entry is not None and entry.token_dead()
+                else:
+                    unusable = entry is None or candidate_usage_is_stale(
+                        entry, self.clock()
                     )
+                if unusable:
                     if trigger in CONSUME_FIRST_STRATEGIES:
                         # Sliding to a worse-ranked, later-reset candidate
                         # defeats consume-first's whole point (burn the
                         # soonest-resetting quota first) — hold instead and
                         # retry next tick.
+                        self._emit(
+                            NoSwitchEvent(
+                                reason="stale-usage",
+                                detail=(
+                                    f"account {num} usage could not be "
+                                    "refreshed this tick (backoff or a "
+                                    "concurrent poller); retrying"
+                                ),
+                            )
+                        )
                         return TickOutcome.NO_ACTION
                     # `proactive`/`failover`: a stale top candidate must not
                     # park the engine at the wall while a healthy, lower-
-                    # ranked candidate goes untried — skip it.
+                    # ranked candidate goes untried — skip it. A DISTINCT
+                    # literal from the hold above: this tick abandons the
+                    # candidate and usually goes on to switch, and a watcher
+                    # reading `stale-usage` (the literal of a real stall)
+                    # ahead of a `Switched` line would report the move as a
+                    # stall.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="stale-candidate-skipped",
+                            detail=(
+                                f"account {num} skipped this tick (usage not "
+                                "refreshable, or its credential is struck); "
+                                "trying the next-ranked candidate"
+                            ),
+                        )
+                    )
                     continue
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no

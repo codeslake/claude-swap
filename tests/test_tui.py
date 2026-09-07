@@ -2256,9 +2256,10 @@ class TestTheAutoFlagIsTheOnlyRouteToLive:
 
 class TestNextBestMarksStaleUsage:
     """The 'Next best' panel must not present a candidate's cached figures
-    as live when the engine's own admission gate would refuse them
-    (``autoswitch.candidate_usage_is_stale`` — reused here, not
-    recomputed, so the panel and the engine can never disagree)."""
+    as live when its last poll failed (an active backoff, a run of
+    failures) — and must NOT mark a healthy row merely because its
+    `fetched_at` is past the 180 s serve TTL, which is most of every poll
+    cycle."""
 
     def _render(self, snap, active, *, settings=None):
         from unittest.mock import MagicMock, patch
@@ -2295,6 +2296,22 @@ class TestNextBestMarksStaleUsage:
         assert "user2@example.com" in out
         row2 = out[out.index("user2@example.com"):]
         assert "stale" in row2, f"no stale mark on the backed-off row: {out!r}"
+
+    def test_a_healthy_candidate_past_the_serve_ttl_is_not_marked(self):
+        """I-c: a healthy row at age 300 s (no failures, no backoff) is a
+        row the engine lands on happily; marking it `stale` on the TTL
+        made the panel cry wolf on most candidates most of the time."""
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=make_entry(0.0, 0.0, age_s=300.0)),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        out = self._render(snap, active="1")
+        row2 = out[out.index("user2@example.com"):]
+        assert "stale" not in row2, f"a healthy row was marked stale: {out!r}"
 
     def test_a_fresh_candidate_is_not_marked(self):
         """Control: the same panel, no backoff/failures — no mark."""
