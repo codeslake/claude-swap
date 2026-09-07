@@ -7169,6 +7169,84 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
         )
 
 
+class TestPidIsAliveIsPortableAcrossOS:
+    """`os.kill(pid, 0)` is a pure liveness probe on POSIX. On Windows the
+    same call is NOT a probe -- signal 0 there IS `CTRL_C_EVENT`, so
+    `os.kill(pid, 0)` calls `GenerateConsoleCtrlEvent`, which BROADCASTS a
+    console-control event to the whole console process group. Reproduced on
+    `test-windows (pin-cli)`: calling it with this process's own pid inside
+    an xdist worker that IS the console's process-group leader took the
+    whole pytest run down with a stray `KeyboardInterrupt` mid-run. Windows
+    goes through `OpenProcess` instead, and this class pins that `os.kill`
+    is never reached on that branch.
+    """
+
+    def _fake_kernel32(self, monkeypatch, *, open_returns, last_error=0):
+        import ctypes
+        import types
+
+        calls = {"open": [], "close": []}
+
+        class _Kernel32:
+            def OpenProcess(self, access, inherit, pid):
+                calls["open"].append((access, inherit, pid))
+                return open_returns
+
+            def CloseHandle(self, handle):
+                calls["close"].append(handle)
+                return 1
+
+            def GetLastError(self):
+                return last_error
+
+        monkeypatch.setattr(
+            ctypes, "windll",
+            types.SimpleNamespace(kernel32=_Kernel32()), raising=False,
+        )
+        return calls
+
+    def _no_os_kill(self, monkeypatch):
+        def _boom(*a, **k):
+            raise AssertionError("os.kill must not be called on the Windows branch")
+        monkeypatch.setattr(os, "kill", _boom)
+
+    def test_a_live_handle_is_alive(self, monkeypatch):
+        import sys
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        calls = self._fake_kernel32(monkeypatch, open_returns=1234)
+        self._no_os_kill(monkeypatch)
+
+        assert pin._pid_is_alive(999) is True
+        assert calls["close"] == [1234], "the opened handle was never closed"
+
+    def test_access_denied_still_means_alive(self, monkeypatch):
+        import sys
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        self._fake_kernel32(monkeypatch, open_returns=0, last_error=5)
+        self._no_os_kill(monkeypatch)
+
+        assert pin._pid_is_alive(999) is True, (
+            "ERROR_ACCESS_DENIED means the process exists — must fail closed"
+        )
+
+    def test_a_pid_windows_cannot_open_at_all_is_dead(self, monkeypatch):
+        import sys
+
+        from claude_swap import pin
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        self._fake_kernel32(monkeypatch, open_returns=0, last_error=87)
+        self._no_os_kill(monkeypatch)
+
+        assert pin._pid_is_alive(999) is False
+
+
 class TestTheDeadPortCanBeInTheOtherConfig:
     """`_wiring_is_stale` short-circuited False whenever THIS process's OWN
     config (what the per-config read, `_wired_port_of`, used — since deleted

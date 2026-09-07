@@ -115,6 +115,42 @@ def _port_of_config(path) -> int | None:
     return port if 0 < port <= 65535 else None
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Is a process actually running with this pid? Never raises.
+
+    NOT `os.kill(pid, 0)` unconditionally: on POSIX signal 0 is a pure
+    liveness probe, but on Windows `os.kill`'s signal argument is not a
+    signal number at all -- 0 there IS `CTRL_C_EVENT`, so `os.kill(pid, 0)`
+    calls `GenerateConsoleCtrlEvent`, which BROADCASTS a real console-control
+    event to the whole console process group rather than checking anything.
+    Called with this process's own pid inside a CI worker that IS the
+    console's process group leader, that took down the entire pytest run
+    with a stray `KeyboardInterrupt` -- reproduced on `test-windows
+    (pin-cli)`. Windows instead asks the OS to open a handle: a live pid
+    opens, a gone one fails with "not found", and access denied (the pid
+    exists, we may not query it) still means alive.
+    """
+    import sys
+
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED: exists, alive
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # PermissionError and anything else: fail closed
+    return True
+
+
 def _wired_daemon_is_alive(_switcher) -> bool:
     """Is a still-alive daemon recorded behind this machine's pin wiring?
 
@@ -142,13 +178,7 @@ def _wired_daemon_is_alive(_switcher) -> bool:
         pid = int(raw["pid"])
     except (KeyError, TypeError, ValueError):
         return True  # no readable pid: fail closed
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True  # PermissionError and anything else: fail closed
-    return True
+    return _pid_is_alive(pid)
 
 
 def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
