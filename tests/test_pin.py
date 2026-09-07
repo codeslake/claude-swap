@@ -7036,6 +7036,139 @@ class TestAWiringWeCannotReadIsNotAWiringThatIsDead:
         )
 
 
+class TestADaemonRecordCorroboratesAOneShotProbe:
+    """`_dead_wired_configs` condemned a wiring on ONE loopback miss, no
+    corroboration. A daemon draining requests under load can miss the
+    `_LAUNCH_PROBE_S`-budgeted connect and still be alive, so the guard also
+    asks the daemon's own record (`pin-proxy/proxy.json`, written by
+    cswap-pin's `write_daemon_state`: ``{port, pid, fingerprint}``) before it
+    condemns -- a pid that is still alive survives a single dead probe.
+    """
+
+    def _sw(self, tmp_path):
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text(json.dumps({}))
+        return types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+
+    def _record(self, sw, **fields):
+        certdir = sw.backup_dir / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        (certdir / "proxy.json").write_text(json.dumps(fields), encoding="utf-8")
+
+    def test_a_confirmed_alive_daemon_survives_a_dead_probe(
+        self, tmp_path, monkeypatch
+    ):
+        """T1, the defect: an alive pid behind the record must not be
+        deleted on the port miss alone."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        self._record(sw, port=dead, pid=os.getpid(), fingerprint="fp")
+
+        assert bool(pin._dead_wired_configs(sw)) is False, (
+            "a wired config whose daemon record names a pid that is alive "
+            "was condemned on one dead probe alone"
+        )
+
+    def test_ensure_leaves_the_env_wired_when_the_daemon_record_is_alive(
+        self, tmp_path, monkeypatch
+    ):
+        """T1, end to end through the launch path: `--ensure` must not strip
+        `HTTPS_PROXY` out from under a daemon its own record says is alive."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        self._record(sw, port=dead, pid=os.getpid(), fingerprint="fp")
+        monkeypatch.setattr(pin, "heal", lambda s, **_k: (False, "Nothing to heal"))
+
+        assert pin.run(sw, None, ensure=True) == 0
+        after = json.loads(cfg.read_text(encoding="utf-8"))
+        assert after["env"].get("HTTPS_PROXY") == f"http://127.0.0.1:{dead}", (
+            "--ensure stripped a wiring whose daemon record shows the pid "
+            f"alive: {after!r}"
+        )
+
+    def test_a_dead_pid_behind_the_record_is_still_healed(
+        self, tmp_path, monkeypatch
+    ):
+        """T2, heal's contract, stays green: a record whose pid is gone is
+        exactly as dead as no record at all."""
+        import subprocess
+        import sys
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self._record(sw, port=dead, pid=proc.pid, fingerprint="fp")
+
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)  # package removed
+        changed, message = pin.heal(sw)
+        assert changed, message
+        assert message == (
+            "Removed a cloud pin wiring whose proxy was gone. sessions "
+            "fall back to the proxy they had before the pin"
+        ), message
+
+    def test_an_unreadable_record_fails_closed(self, tmp_path, monkeypatch):
+        """T3: a record mid-rewrite (truncated JSON) must never read as
+        'no daemon' -- unreadable is not the same claim as absent."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        certdir = sw.backup_dir / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        (certdir / "proxy.json").write_text("{truncated", encoding="utf-8")
+
+        assert bool(pin._dead_wired_configs(sw)) is False, (
+            "an unreadable daemon record was read as proof of death"
+        )
+
+    def test_no_record_at_all_is_still_condemned(self, tmp_path, monkeypatch):
+        """The common case (no package, no daemon ever spawned) must keep
+        working exactly as before: no record is not corroboration."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        assert bool(pin._dead_wired_configs(sw)) is True, (
+            "a wired config with no daemon record at all was not condemned"
+        )
+
+
 class TestTheDeadPortCanBeInTheOtherConfig:
     """`_wiring_is_stale` short-circuited False whenever THIS process's OWN
     config (what the per-config read, `_wired_port_of`, used — since deleted

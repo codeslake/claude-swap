@@ -115,6 +115,42 @@ def _port_of_config(path) -> int | None:
     return port if 0 < port <= 65535 else None
 
 
+def _wired_daemon_is_alive(_switcher) -> bool:
+    """Is a still-alive daemon recorded behind this machine's pin wiring?
+
+    Corroborates a dead PROBE against the daemon's own state file
+    (``pin-proxy/proxy.json``, written by cswap-pin's ``write_daemon_state``
+    as ``{port, pid, fingerprint}``): a daemon draining requests under load
+    can miss a single budgeted connect and still be alive, and a launch-path
+    probe must not be the sole judge of that. Fails CLOSED wherever the
+    record cannot be read as "confirmed gone" -- deleting a live wiring is
+    the destructive direction. No record at all (the common case: no
+    package, nothing ever spawned) is not corroboration either way, so it
+    reads as "nothing to corroborate with", same as before this existed.
+    """
+    try:
+        certdir = _certdir(_switcher)
+    except Exception:  # noqa: BLE001 — no switcher to ask: nothing to corroborate with
+        return False
+    try:
+        raw = json.loads((certdir / "proxy.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except Exception:  # noqa: BLE001 — present but unreadable: fail closed
+        return True
+    try:
+        pid = int(raw["pid"])
+    except (KeyError, TypeError, ValueError):
+        return True  # no readable pid: fail closed
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # PermissionError and anything else: fail closed
+    return True
+
+
 def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     """Every wired config whose OWN port is not answering -- and no more.
 
@@ -131,17 +167,25 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     be removed" is exactly "is any wired config's own port dead".
 
     Whether any of it is cswap's to condemn at all is asked by
-    :func:`_port_of_config`, once per config, and not again here.
+    :func:`_port_of_config`, once per config, and not again here. A dead
+    PORT is not on its own a dead DAEMON: :func:`_wired_daemon_is_alive`
+    corroborates the miss against the daemon's own record before this
+    condemns.
     """
     # Both guards are enforced one scope down, in `_port_of_config`: an
     # unmarked foreign port must not make this list non-empty, and "I cannot
     # read the port" is not "the port is dead". Either would have the launch
     # path tear down a wiring whose proxy may be live.
-    return [
+    dead = [
         path
         for path in _each_config()
         if (port := _port_of_config(path)) and not _port_answers(port, connect_timeout)
     ]
+    # Only asked when the probe already condemns something: an idle machine
+    # (nothing dead) never touches the daemon record.
+    if dead and _wired_daemon_is_alive(_switcher):
+        return []
+    return dead
 
 
 def clear_wiring(switcher, timeout: float | None = None, only=None,
