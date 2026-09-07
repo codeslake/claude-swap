@@ -2834,10 +2834,14 @@ class TestFailoverSkipsAStaleTopCandidate:
 _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 
 
-def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int):
+def _base_engine_results(
+    tmp_path: Path, strategy: str, seed: int, n_fleets: int,
+    *, base_sha: str = _PR_321_BASE_SHA, custom_fleets: list[dict] | None = None,
+):
     """`n_fleets` fleets generated from `seed` (the same generator
-    `TestOutcomeDigestAgainstBase._fleet` uses), run through the pre-#321
-    `AutoSwitchEngine` in a fresh subprocess against `_PR_321_BASE_SHA`'s own
+    `TestOutcomeDigestAgainstBase._fleet` uses) — or, when `custom_fleets`
+    is given, those NAMED fleets verbatim instead — run through the
+    `base_sha` `AutoSwitchEngine` in a fresh subprocess against ITS OWN
     `claude_swap` package — a different `usage_store`/`switcher`/`settings`/
     `autoswitch`, not merely a fresh module namespace sharing this process's
     `sys.modules`. Same technique as `test_dynamic_isolation.py`'s
@@ -2845,22 +2849,22 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
     driver subprocess, a positive control on where `claude_swap` resolved
     from.
 
-    SKIPPED, not failed, when `_PR_321_BASE_SHA` is not in the object
-    database — CI checks out at `refs/pull/N/merge` with fetch-depth 1, so
-    this branch's own pre-PR base is never in that checkout, and a bare
+    SKIPPED, not failed, when `base_sha` is not in the object database —
+    CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
+    branch's own pre-PR base is never in that checkout, and a bare
     `git show` there would redden every job today and every run forever
     once the branch is deleted post-merge.
     """
     repo_root = Path(__file__).resolve().parents[1]
     probe = subprocess.run(
-        ["git", "-C", str(repo_root), "cat-file", "-e", f"{_PR_321_BASE_SHA}^{{commit}}"],
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
     )
     if probe.returncode != 0:
-        pytest.skip(f"{_PR_321_BASE_SHA} is not in this checkout's object database")
+        pytest.skip(f"{base_sha} is not in this checkout's object database")
     old_root = tmp_path / "base_src"
     old_root.mkdir()
     archive = subprocess.run(
-        ["git", "-C", str(repo_root), "archive", "--format=tar", _PR_321_BASE_SHA, "src"],
+        ["git", "-C", str(repo_root), "archive", "--format=tar", base_sha, "src"],
         capture_output=True, check=True,
     )
     with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
@@ -2876,6 +2880,30 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
     homes_dir = tmp_path / f"base_homes_{strategy}"
     homes_dir.mkdir()
     driver = module_dir / "_zz_base_engine_driver.py"
+    if custom_fleets is not None:
+        # `custom_fleets`: raw {account: usage-dict} maps (JSON-friendly);
+        # `_run` wants {account: UsageEntry} same as `_fleet` produces, so
+        # the driver converts via `_entry_for` at the SAME `now` `_fleet`
+        # anchors on.
+        fleets_dir = tmp_path / "custom_fleets"
+        fleets_dir.mkdir()
+        fleets_file = fleets_dir / "fleets.json"
+        fleets_file.write_text(json.dumps(custom_fleets))
+        fleets_setup = (
+            f"raw_fleets = json.loads(Path({str(fleets_file)!r}).read_text())\n"
+            "fleets = [\n"
+            "    {num: ta._entry_for(v, 1_000_000.0) for num, v in raw.items()}\n"
+            "    for raw in raw_fleets\n"
+            "]\n"
+        )
+    else:
+        fleets_setup = (
+            f"rng = random.Random({seed})\n"
+            "fleets = []\n"
+            f"for _ in range({n_fleets}):\n"
+            "    entries, _ = ta.TestOutcomeDigestAgainstBase._fleet(None, rng, 1_000_000.0)\n"
+            "    fleets.append(entries)\n"
+        )
     driver.write_text(
         "import sys, json, random\n"
         "from pathlib import Path\n"
@@ -2883,11 +2911,7 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
         f"sys.path.insert(0, {str(module_dir)!r})\n"
         "import claude_swap\n"
         "import test_autoswitch as ta\n"
-        f"rng = random.Random({seed})\n"
-        "fleets = []\n"
-        f"for _ in range({n_fleets}):\n"
-        "    entries, _ = ta.TestOutcomeDigestAgainstBase._fleet(None, rng, 1_000_000.0)\n"
-        "    fleets.append(entries)\n"
+        f"{fleets_setup}"
         "results = ta.TestOutcomeDigestAgainstBase._run(\n"
         f"    None, ta.AutoSwitchEngine, Path(sys.argv[1]), 'base', fleets, {strategy!r}\n"
         ")\n"
@@ -2902,10 +2926,10 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
         # The digest is a PR-branch invariant (base vs THIS PR's head), not
         # an integration one: where a later PR's merge has added a symbol
         # to `claude_swap.autoswitch` that this test module now imports,
-        # base's own package (frozen at `_PR_321_BASE_SHA`) cannot satisfy
-        # it and the comparison is undefined — SKIP, exactly as this
-        # function already skips when the base object itself is absent.
-        # Any OTHER subprocess failure (a real digest-run crash) still reds.
+        # base's own package (frozen at `base_sha`) cannot satisfy it and
+        # the comparison is undefined — SKIP, exactly as this function
+        # already skips when the base object itself is absent. Any OTHER
+        # subprocess failure (a real digest-run crash) still reds.
         import_line = next(
             (
                 line for line in result.stderr.splitlines()
@@ -2915,7 +2939,7 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
         )
         if import_line is not None:
             pytest.skip(
-                f"base {_PR_321_BASE_SHA[:8]} cannot import this test "
+                f"base {base_sha[:8]} cannot import this test "
                 f"module: {import_line}"
             )
     assert result.returncode == 0, (
@@ -2928,7 +2952,7 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
     # `sys.path` order, which would compare HEAD against itself.
     assert out["_claude_swap_file"].startswith(str(old_root)), (
         f"the subprocess imported claude_swap from outside {old_root} — "
-        f"this compared HEAD against itself, not against {_PR_321_BASE_SHA}"
+        f"this compared HEAD against itself, not against {base_sha}"
     )
     return [
         (name, active, tuple(tuple(e) for e in events))
@@ -3075,7 +3099,17 @@ class TestOutcomeDigestAgainstBase:
             "the mutant must move the digest — a no-op injection proves nothing"
         )
 
-    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    # `dynamic` excluded here (#375): this checks base ``_PR_321_BASE_SHA``
+    # (PR #321's OWN base commit) against head, on the invariant "nothing
+    # but the stale-candidate exclusion moved" — true when #321 was the
+    # only round touching `dynamic` since that base. #375 is a further,
+    # separately-authorized round narrowing `dynamic`'s proactive trigger
+    # to `about_to_wall` and adding alternation, so `dynamic` now diverges
+    # from that same old base for many more fleets than the stale
+    # exclusion alone explains — expected, not a regression.
+    # `TestOutcomeDigestAgainstBase375` below re-proves the SAME shape of
+    # invariant against THIS round's own base/head instead.
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
     def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
         fleets, stale_by_fleet, head_results = self._head(tmp_path, strategy)
         base_results = _base_engine_results(
@@ -3177,6 +3211,114 @@ class TestOutcomeDigestAgainstBase:
                     f"change, not the neutralized gate admitting a stale "
                     f"candidate: mutant={mutant_results[i]!r}"
                 )
+
+
+_ROUND_375_BASE_SHA = "a32a34d779ac5cb2838afe49df1cc41ec801be27"
+
+
+class TestOutcomeDigest375:
+    """F5 (#375): the motivating window, reconstructed as a named fixture
+    from the coordinator/analyzer evidence (10:01:32Z Account-3 at 5h 78% /
+    7d 56%, healthy; Account-5 at 7d 96%) — BASE (this round's own start,
+    `_ROUND_375_BASE_SHA`) must switch Account-3 -> Account-5 exactly as
+    the fleet did live, and HEAD must not (the whole point of #375). A
+    mutant that restores `_classify_dynamic_trigger`'s pre-#375 shape
+    (the bare-threshold `"dynamic"` literal) must reproduce BASE's digest
+    exactly — the control that the divergence traces to THAT function and
+    nothing else moved. Composes (never subclasses, which would re-collect
+    every one of its own tests under this class too) `TestOutcomeDigest
+    AgainstBase`'s `_fleet`/`_run`/`_mutant`/`_head` machinery unchanged
+    for the second half: `best`/`consume-first` stay byte-identical
+    against THIS round's own base, over the same random fleets, with the
+    same stale-exclusion mutant control still moving them.
+    """
+
+    _base = TestOutcomeDigestAgainstBase()
+
+    @staticmethod
+    def _motivating_fleet(now: float) -> dict:
+        # Account numbers 1/2 (not the incident's own 3/5): `_run`
+        # (`TestOutcomeDigestAgainstBase`, reused verbatim) always seeds
+        # accounts 1/2/3 and makes 1 live — account 3 stays unseeded here.
+        return {
+            "1": {  # active ("Account-3" in the incident): healthy, well
+                     # clear of about_to_wall
+                "five_hour": {"pct": 78.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 56.0, "resets_at": _iso_at(now + 5 * 86400)},
+            },
+            "2": {  # candidate ("Account-5"): near-empty, but resets first
+                "five_hour": {"pct": 0.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 96.0, "resets_at": _iso_at(now + 1 * 86400)},
+            },
+        }
+
+    def _run_motivating(self, engine_cls, tmp_path, tag):
+        raw = self._motivating_fleet(1_000_000.0)
+        entries = {num: _entry_for(v, 1_000_000.0) for num, v in raw.items()}
+        return self._base._run(engine_cls, tmp_path, tag, [entries], "dynamic")[0]
+
+    def test_base_switches_head_does_not_and_the_mutant_restores_base(
+        self, tmp_path
+    ):
+        head = self._run_motivating(AutoSwitchEngine, tmp_path, "head")
+        assert head[0] == "NO_ACTION", (
+            f"got {head!r} — #375's whole point: a healthy active "
+            "(headroom 22) must not move for a soonest-resetting, "
+            "near-empty candidate any more"
+        )
+        base_results = _base_engine_results(
+            tmp_path, "dynamic", seed=0, n_fleets=1,
+            base_sha=_ROUND_375_BASE_SHA,
+            custom_fleets=[self._motivating_fleet(1_000_000.0)],
+        )
+        base = base_results[0]
+        assert base[0] == "SWITCHED" and base[1] == 2, (
+            f"got {base!r} — the reconstructed fixture must reproduce the "
+            "live incident (Switched Account-3 -> Account-5, here "
+            "accounts 1 -> 2) against this round's own start commit"
+        )
+
+        import claude_swap.autoswitch as autoswitch
+
+        old_classify = autoswitch._classify_dynamic_trigger
+
+        def pre_375_classify(active_headroom, utilization, departure_pct):
+            if utilization < departure_pct:
+                return "dynamic"
+            return "at-limit" if active_headroom <= 0 else "proactive"
+
+        autoswitch._classify_dynamic_trigger = pre_375_classify
+        try:
+            mutant = self._run_motivating(AutoSwitchEngine, tmp_path, "mutant")
+        finally:
+            autoswitch._classify_dynamic_trigger = old_classify
+        assert mutant == base, (
+            f"got {mutant!r}, want {base!r} — restoring the pre-#375 "
+            "bare-threshold trigger must reproduce BASE's digest exactly"
+        )
+        assert head != base, (
+            "the mutant control is meaningless if head already matched "
+            "base without it"
+        )
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_best_and_consume_first_digest_identical_against_this_rounds_base(
+        self, tmp_path, strategy
+    ):
+        fleets, stale_by_fleet, head_results = self._base._head(tmp_path, strategy)
+        base_results = _base_engine_results(
+            tmp_path, strategy, self._base._DIGEST_SEED, self._base._N_FLEETS,
+            base_sha=_ROUND_375_BASE_SHA,
+        )
+        assert head_results == base_results, (
+            f"{strategy} must be byte-identical against this round's own "
+            f"base — #375 touches `dynamic` only"
+        )
+        mutant_results = self._base._mutant(tmp_path, fleets, strategy)
+        assert mutant_results != head_results, (
+            "the existing stale-candidate mutant control must still move "
+            "the digest — a no-op injection proves nothing"
+        )
 
 
 class TestApiKeyAccounts:
@@ -4724,8 +4866,11 @@ class TestModelAwareSwitch:
             "seven_day": {"pct": 0.0},
             "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": fable_reset}],
         }
+        # Active headroom 3 (#375's `about_to_wall` bar — its own 5h/7d
+        # windows are otherwise wide open too, same as #2/#3, so this is
+        # about the model-window retry, not about being genuinely spent).
         outcome = h.tick_with_usage({
-            "1": _model_usage(95, 10), "2": blocked, "3": blocked,
+            "1": _model_usage(97, 10), "2": blocked, "3": blocked,
         })
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — #2/#3's only over-bar window is Fable, with "
@@ -5607,10 +5752,12 @@ class TestDynamicStrategy:
         model-gated axis with headroom clearing account 5's UNWIDENED
         headroom (10) by more than the hysteresis (10) — so WITHOUT the
         re-pick, trigger reads "proactive" and account 7 is admitted on
-        plain hysteresis, a real departure. WITH the re-pick, trigger reads
-        "dynamic" (below threshold) and account 7's reset (100h) loses to
-        account 5's own (14h) under consume-first-style reset ordering, so
-        it is never admitted.
+        plain hysteresis, a real departure. WITH the re-pick, the widened
+        basis (38) is nowhere near `about_to_wall` (#375), so `dynamic`'s
+        proactive arm never fires at all and account 7 (never active, cold)
+        is not an alternation partner either — the hold is `below-threshold`
+        either way, but only the re-pick keeps account 5 the ACTIVE one at
+        the widened 38 rather than misreading it as blocked at 10.
         """
         from claude_swap.autoswitch import _dynamic_active_headroom
 
@@ -5655,27 +5802,29 @@ class TestDynamicStrategy:
             "7's later-resetting weekly window must not admit it either"
         )
         assert h.active_number() == 5
-        # The trigger the tick actually used: every hold reads as the
-        # dynamic below-threshold path (consume-first-style reset
-        # ordering), never the plain-hysteresis "proactive" a dropped
-        # re-pick would have taken (which would have switched to 7, not
-        # held).
-        assert all(r == "already-consuming-soonest" for r in reasons), reasons
+        # Every hold reads as `below-threshold` (#375: `dynamic`'s proactive
+        # arm needs `about_to_wall`, and account 5's widened headroom (38)
+        # is nowhere near it) — never the plain-hysteresis "proactive" a
+        # dropped re-pick would have taken (which would have switched to 7,
+        # not held).
+        assert all(r == "below-threshold" for r in reasons), reasons
 
     def test_owner_fixture_account_5_is_the_target(self, temp_home):
-        """Starting from account 2 (the account nothing can use), the
-        engine must land on account 5 — soonest 7-day reset among the
-        candidates that actually have room on the basis in force. NOT #2
-        (no room anywhere) and NOT #6 (no room anywhere) — both sides of
-        the reset-ordering bar are present in this fleet, so the assertion
-        is not decided by headroom alone."""
+        """#375 superseded this fixture's premise: starting on account 2
+        (headroom 6) used to land on account 5 by soonest-7d-reset
+        ordering while account 2 was merely below the ordinary threshold,
+        never genuinely `about_to_wall` (headroom 6 > SPENT_HEADROOM_PCT's
+        3). Under #375 `dynamic`'s proactive arm does not fire there, and
+        no candidate is a warm alternation partner (none has ever been
+        active) — so the engine now holds on account 2."""
         h = self._owner_harness(temp_home, active_num=2)
         fleet_usage = self._owner_fleet(h.clock.now)
         outcome = h.tick_with_usage(fleet_usage)
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 5, (
-            f"landed on {h.active_number()} instead of account 5"
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — account 2's headroom (6) is not "
+            "`about_to_wall`, so #375's `dynamic` must not move"
         )
+        assert h.active_number() == 2
 
     def test_the_model_basis_re_pick_is_what_makes_the_trigger_voluntary(
         self, temp_home
@@ -5718,21 +5867,15 @@ class TestDynamicStrategy:
     def test_primary_pass_ranks_active_and_candidate_headroom_on_one_basis(
         self, temp_home
     ):
-        """The hysteresis leg (``h - active_headroom``) must compare two
-        headrooms from the SAME window basis. `:1508`'s widening puts
-        `active_headroom` on the unmodeled 5h/7d axis while `headroom` (and
-        `h`, read from it) stays model-gated — mixing the two understates
-        the bar and can admit the account that resets LAST over one that
-        resets soonest.
-
-        Active #1 is blocked on Fable alone (model-gated headroom 2,
-        widened/unmodeled 8, utilization 92 -> `proactive`). #2 and #3 are
-        both healthy candidates with the SAME model-gated headroom bar
-        (25 and 15); #3 resets far sooner (5h vs 60h). Mixing bases lets
-        the widened 8 admit #2 (25-8=17>=10) while refusing #3 (15-8=7<10)
-        -- landing on the account that resets LAST. On one basis both
-        clear the model-gated bar (25-2=23, 15-2=13, both >=10) and #3's
-        soonest reset wins.
+        """#375 replaced dynamic's `proactive`-arm admission with an
+        ABSOLUTE floor (`cold_switch_cost_pct`) instead of a hysteresis
+        MARGIN against the active — so this is no longer a "which basis"
+        question (the floor does not read `active_headroom` at all). What
+        it still pins: the floor itself must read the SAME axis the retry
+        rescued a candidate on. Active #1 is blocked on Fable alone
+        (model-gated headroom 1, widened/unmodeled 3 -- `about_to_wall`).
+        #2 and #3 are both healthy candidates that clear the floor (25 and
+        30); #3 resets far sooner (5h vs 60h) and must win.
         """
         h = EngineHarness(
             temp_home, model="Fable", threshold=90.0, strategy="dynamic",
@@ -5753,15 +5896,14 @@ class TestDynamicStrategy:
             }
 
         outcome = h.tick_with_usage({
-            "1": acct(50, 92, 98, 30),
+            "1": acct(50, 97, 99, 30),
             "2": acct(10, 10, 75, 60),
-            "3": acct(10, 10, 85, 5),
+            "3": acct(10, 10, 70, 5),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3, (
             f"landed on {h.active_number()} instead of account 3 — the "
-            "soonest-resetting healthy candidate, not the one that merely "
-            "cleared a hysteresis bar mixed across two window bases"
+            "soonest-resetting candidate that clears the floor"
         )
 
 
@@ -5789,6 +5931,17 @@ class TestDynamicAdmitsACandidateBeyondTheOrdinaryThreshold:
     def test_lands_on_the_soonest_resetting_account_with_real_headroom(
         self, temp_home
     ):
+        """#375 superseded this fixture's own premise: a HEALTHY active
+        (headroom 39, nowhere near `about_to_wall`'s 3-point bar) moving
+        proactively purely on soonest-weekly-reset ordering is exactly the
+        motivating bug #375 fixes (the analyzer's Account-3, headroom 22,
+        switched to a 4%-headroom peer the same way). `dynamic`'s proactive
+        arm no longer fires here at all; only `alternation` could move a
+        healthy active, and it needs a WARM partner (none exists — neither
+        candidate has ever been active). The admission bar this class is
+        named for (`DYNAMIC_ADMIT_PCT`, past the ordinary threshold) still
+        applies unchanged on the `at-limit`/`failover` escape.
+        """
         h = EngineHarness(
             temp_home, model="Fable", threshold=90.0, strategy="dynamic",
         )
@@ -5803,41 +5956,215 @@ class TestDynamicAdmitsACandidateBeyondTheOrdinaryThreshold:
             "1": self._acct(h, 90, 63, 50, 48),  # at the ordinary bar, resets middle
         }
         outcome = h.tick_with_usage(usage_map)
-        assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome} — dynamic's whole purpose is spending a window "
-            "to 100%; a candidate at 90% utilization with 10 points of real "
-            "headroom left must be admitted, not read as 'full' at the same "
-            "bar the ACTIVE leaves at"
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — active headroom 39 is not `about_to_wall`, so "
+            "#375's `dynamic` must not move (no warm partner for "
+            "alternation either)"
         )
+        assert h.active_number() == 6
+
+
+class TestWarmthAndAlternation375:
+    """#375 (event #375, owner 2026-09-07): `dynamic` drops the bare
+    threshold (its proactive arm now needs `about_to_wall`) and gains a
+    reset-TTL-aware, warm-preferred admission (item 3) plus a healthy-
+    active alternation arm (item 4) so a healthy fleet spends quota by
+    rotating between accounts whose cached context is still warm, rather
+    than by chasing whichever weekly window resets soonest regardless of
+    cost.
+    """
+
+    def _harness(self, temp_home, **kwargs):
+        h = EngineHarness(temp_home, strategy="dynamic", **kwargs)
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(3, "acct3@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+        return h
+
+    @staticmethod
+    def _seed_last_active_at(h, mapping):
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        raw = json.loads(path.read_text()) if path.exists() else {"schemaVersion": 1}
+        raw["lastActiveAt"] = mapping
+        path.write_text(json.dumps(raw))
+
+    # -- F1: warm-preferred admission ----------------------------------
+
+    def test_f1_warm_ranks_ahead_of_a_higher_headroom_cold_candidate(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        self._seed_last_active_at(h, {"2": h.clock.now - 600.0})
+        outcome = h.tick_with_usage({
+            "1": _usage(97.0),  # active, about_to_wall (headroom 3)
+            "2": _usage(90.0),  # warm, headroom 10 -- less
+            "3": _usage(10.0),  # cold, headroom 90 -- more, clears the floor
+        })
+        assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2, (
-            f"landed on {h.active_number()} — of the two candidates past "
-            "the ordinary threshold, #2 resets soonest and must win"
+            f"landed on {h.active_number()} — the warm candidate (less "
+            "headroom) must rank ahead of the cold one (more headroom)"
+        )
+
+    # -- F2: cold refused until the active is walled --------------------
+
+    def test_f2_healthy_active_cold_candidate_below_floor_refused(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(78.0, resets_at=None) | {"seven_day": {"pct": 56.0}},
+            "2": _usage(96.0),  # cold, headroom 4 -- below the floor (20)
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_f2_healthy_active_cold_candidate_above_floor_still_refused(
+        self, temp_home
+    ):
+        """Active not `about_to_wall` -- the floor never even gets
+        consulted; a cold candidate never pulls a healthy active away."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(78.0) | {"seven_day": {"pct": 56.0}},
+            "2": _usage(50.0),  # cold, headroom 50 -- clears the floor easily
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_f2_walled_active_admits_the_cold_candidate_above_floor(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+            "2": _usage(50.0),  # cold, headroom 50
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_f2_walled_active_refuses_the_cold_candidate_below_floor(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+            "2": _usage(96.0),  # cold, headroom 4 -- below the floor
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_f2_at_limit_escapes_to_a_below_floor_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(100.0) | {"seven_day": {"pct": 0.0}},  # headroom 0
+            "2": _usage(96.0),  # cold, headroom 4 -- below the floor
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.active_number() == 2
+
+    # -- F3: alternation fires at the chunk boundary and returns ---------
+
+    def test_f3_alternation_fires_at_the_chunk_boundary_and_returns(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        start = h.clock.now
+        self._seed_last_active_at(h, {
+            "1": start - (chunk - 1.0),
+            "2": start - 10.0,  # warm, real headroom
+        })
+        usage = {"1": _usage(50.0), "2": _usage(30.0)}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, f"got {outcome} at chunk - 1s"
+        assert h.active_number() == 1
+
+        h.clock.advance(1.0)  # now exactly at the chunk boundary
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+
+        state = h.state()
+        assert state["lastActiveAt"]["1"] == h.clock.now, (
+            "the departed account must be stamped warm on departure"
+        )
+
+        h.clock.advance(chunk)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — must alternate back once the next chunk "
+            "elapses on the still-warm departed account"
+        )
+        assert h.active_number() == 1
+
+    # -- F4: TTL expiry makes a partner cold -----------------------------
+
+    def test_f4_a_partner_past_the_ttl_is_cold_not_a_warm_alternation_pick(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        ttl = h.engine.settings.cache_ttl_seconds
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,       # past the chunk boundary already
+            "2": h.clock.now - ttl - 1.0,   # just past the TTL -- cold
+        })
+        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a partner past the cache TTL is cold, never "
+            "a warm alternation pick"
+        )
+        assert h.active_number() == 1
+
+    def test_the_default_chunk_stays_well_under_half_the_ttl(self, temp_home):
+        """Item 4's own precondition: `alternation_chunk_seconds` must stay
+        well under `cache_ttl_seconds / 2`, so a partner alternated away
+        from never goes cold before the NEXT chunk boundary alternates
+        back to it (F3's "next chunk -> returns")."""
+        defaults = AutoSwitchSettings()
+        assert defaults.alternation_chunk_seconds * 2 < defaults.cache_ttl_seconds, (
+            f"chunk={defaults.alternation_chunk_seconds} "
+            f"ttl={defaults.cache_ttl_seconds} — the chunk must clear "
+            "twice over before the TTL, with real margin"
         )
 
 
 class TestDynamicDrainStateDoesNotRotate:
-    """Widening the landing bar alone (`DYNAMIC_ADMIT_PCT`) is not a fix: the
-    admit bar and the departure bar (`settings.threshold`) are two functions of one
-    axis with no gap between them, so any account landed on with utilization
-    in ``[threshold, DYNAMIC_ADMIT_PCT)`` is simultaneously a valid landing
-    AND immediately departure-eligible next tick — a 3+ account ROTATION
-    (measured: 48 switches in 48 ticks on a synthetic 6-account fleet),
-    which the one-hop no-return bar cannot catch by construction (it only
-    refuses a return to the IMMEDIATELY prior account).
+    """Pre-#375 this class reproduced a rotation: widening the landing bar
+    alone (`DYNAMIC_ADMIT_PCT`) let `dynamic`'s bare below-threshold
+    trigger land on an at-bar candidate and then depart it again next
+    tick, a 3+ account ROTATION (measured: 48 switches in 48 ticks on a
+    synthetic 6-account fleet) the one-hop no-return bar cannot catch by
+    construction. DRAIN STATE (`_perform` marking `state["draining"]`, and
+    `_tick_inner`'s departure gate honouring it) closed the gap.
 
-    DRAIN STATE closes the gap for exactly the one account `dynamic`
-    deliberately lands on past the ordinary threshold: `_perform` marks it
-    `draining` (`state["draining"]`/`state["drainingResetAt"]`), and while
-    that holds `_tick_inner`'s departure gate uses the SAME widened bar the
-    landing gate admitted it at, so admit and depart agree for that one
-    account and disagree for nobody else.
+    #375 dropped that bare below-threshold trigger outright (`dynamic`'s
+    proactive arm now needs `about_to_wall`, headroom <= 3) — the accounts
+    below sit at headroom 6-48, all healthy by that bar, so the engine
+    never leaves #6 at all any more and the rotation this class reproduced
+    cannot occur (a stronger property than DRAIN STATE bought: nothing to
+    protect against). `TestDynamicDrainBarLiveness` covers DRAIN STATE's
+    own mechanics directly (seeded, since a live tick can no longer write
+    the mark for `dynamic` either — see that class's docstring), including
+    a mark-matters proof (held while seeded and not yet past reset,
+    departs once it is) that supersedes this class's own mutant test.
 
     Six accounts, real weekly-reset ORDER (synthetic relative offsets, never
     real timestamps — ORIGIN IS PUBLIC): `2 < 1 < 6 < 5 < 4 < 3`. `#2`/`#1`/
     `#4` sit exactly at the ordinary bar (headroom 10, the shape that used to
-    flap); `#5` is genuinely healthy (headroom 69) — the ordinary "proactive"
-    escape's real pick when the active is itself near its own wall; `#3` is
-    nearly fully spent (headroom 1) and never a target either way.
+    flap); `#5` is genuinely healthy (headroom 69); `#3` is nearly fully
+    spent (headroom 1) — none of them a target any more.
     """
 
     _RESET_HOURS = {"2": 24, "1": 48, "6": 72, "5": 96, "4": 120, "3": 240}
@@ -5886,61 +6213,31 @@ class TestDynamicDrainStateDoesNotRotate:
             h.clock.advance(300.0)
         return switches, trace
 
-    def test_healthy_active_lands_once_and_holds(self, temp_home):
-        """#6 starts well below the threshold (52% used, "dynamic" trigger)."""
+    def test_healthy_active_never_leaves_for_an_at_bar_candidate(self, temp_home):
+        """#6 starts well below `about_to_wall` (52% used, headroom 48) —
+        #375's `dynamic` proactive arm does not fire, and no candidate is
+        a warm alternation partner (none has ever been active), so the
+        engine never leaves #6 at all: zero switches over the whole run."""
         h = self._harness(temp_home)
         fleet = self._fleet(h, active_util=52.0)
-        switches, trace = self._run(h, fleet)
-        assert switches == 1, (
-            f"got {switches} switches, trace {trace} — DRAIN STATE must "
-            "hold the account it lands on past the ordinary threshold, "
-            "not rotate through every other at-bar candidate"
+        switches, _trace = self._run(h, fleet)
+        assert switches == 0, (
+            f"got {switches} switches — a healthy active (headroom 48) "
+            "must never move for an at-bar candidate's soonest reset"
         )
-        assert h.active_number() == 2, (
-            f"ended on {h.active_number()} — must park on #2"
-        )
+        assert h.switcher.current_account_number() == "6"
 
-    def test_near_limit_active_takes_the_extra_hop_and_holds(self, temp_home):
-        """#6 starts ITSELF over the ordinary threshold (94% used) — the
-        departure classifies `proactive`, which ranks by headroom and picks
-        the genuinely healthy #5 first; only from #5 does the widened
-        landing gate reach #2. One extra hop, not a bug — the brief this
-        round replaced explicitly says so."""
+    def test_near_limit_active_still_holds_below_about_to_wall(self, temp_home):
+        """#6 at 94% used (headroom 6) is over the OLD ordinary threshold
+        but still short of #375's `about_to_wall` bar (headroom <= 3) — no
+        switch, same as the plainly-healthy case above."""
         h = self._harness(temp_home)
         fleet = self._fleet(h, active_util=94.0)
-        switches, trace = self._run(h, fleet)
-        assert switches == 2, (
-            f"got {switches} switches, trace {trace} — expected exactly "
-            "one proactive hop (6->5) then one dynamic landing (5->2), "
-            "then held"
+        switches, _trace = self._run(h, fleet)
+        assert switches == 0, (
+            f"got {switches} switches — headroom 6 is not `about_to_wall`"
         )
-        assert trace[-1] == 2, f"ended on {trace[-1]} — must park on #2"
-
-    def test_mutant_suppressing_the_drain_mark_reopens_the_rotation(
-        self, temp_home, monkeypatch
-    ):
-        """Not a vacuous pin: seam 3 (`_perform` writing `state["draining"]`)
-        is what this test protects. Suppressing it must reopen the
-        rotation the healthy-active case above holds against."""
-        import claude_swap.autoswitch as autoswitch
-
-        real_read_state = autoswitch.AutoSwitchEngine._read_state
-
-        def stripped(self):
-            state = real_read_state(self)
-            state.pop("draining", None)
-            state.pop("drainingResetAt", None)
-            return state
-
-        monkeypatch.setattr(autoswitch.AutoSwitchEngine, "_read_state", stripped)
-        h = self._harness(temp_home)
-        fleet = self._fleet(h, active_util=52.0)
-        switches, trace = self._run(h, fleet)
-        assert switches > 1, (
-            f"got {switches} switches, trace {trace} — suppressing the "
-            "drain mark must reopen the rotation (measured elsewhere: "
-            "1 -> 24 on a comparable fleet)"
-        )
+        assert h.switcher.current_account_number() == "6"
 
 
 class TestDynamicDrainBarLiveness:
@@ -5949,6 +6246,17 @@ class TestDynamicDrainBarLiveness:
     typo'd condition) produces a plausible-looking trace with the real
     mechanism dead. These assert the OUTCOME can only be explained by the
     intended bar, not by coincidence.
+
+    #375 narrowed `dynamic`'s proactive arm to `about_to_wall` (headroom
+    <= 3, `SPENT_HEADROOM_PCT`) and dropped the bare below-threshold
+    trigger that used to LAND on a drain candidate live (reset-ordering
+    admission, no hysteresis margin). `_pick_drain_candidate`'s own
+    admission mechanics stay covered directly (`TestDrainDoesNotSurviveA
+    StaleCall` et al, which call `_rank_candidates` with `trigger=
+    "dynamic"`); this class is about `_tick_inner`'s READ of the mark —
+    `protected_by_drain` — which a live tick can still reach once the mark
+    itself is seeded directly (`_seed_draining`), same as this file's
+    other `autoswitch_state.json`-seeding helpers.
     """
 
     _RESET_HOURS = TestDynamicDrainStateDoesNotRotate._RESET_HOURS
@@ -5956,37 +6264,39 @@ class TestDynamicDrainBarLiveness:
 
     def _harness(self, temp_home):
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
-        h.seed(6, "acct6@example.invalid")
         h.seed(2, "acct2@example.invalid")
+        h.seed(6, "acct6@example.invalid")
         h.seed(1, "acct1@example.invalid")
-        h.make_live("acct6@example.invalid", 6)
+        h.make_live("acct2@example.invalid", 2)
         return h
 
-    def _land_on_2(self, h):
-        """Drives the healthy-active landing (6->2) so #2 carries
-        `state["draining"]` for the assertions below."""
-        fleet = {
-            "6": self._peer(h, "6", 52.0, 40.0, 30.0),
-            "2": self._peer(h, "2", 0.0, 90.0, 78.0),
-            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
-        }
-        outcome = h.tick_with_usage(fleet)
-        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2
-        h.clock.advance(300.0)  # clear cooldown before the next tick
-        return fleet
+    def _seed_draining(self, h, *, reset_hours: float = 24.0):
+        """Directly seed `state["draining"]`/`drainingResetAt` for #2, the
+        mark `_perform` would have written after a live drain landing —
+        unreachable through a live tick under #375 (see the class
+        docstring)."""
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        path.write_text(json.dumps({
+            "schemaVersion": 1,
+            "draining": "2",
+            "drainingResetAt": h.clock.now + reset_hours * 3600.0,
+        }))
 
     def test_active_headroom_at_zero_clears_the_drain_bar(self, temp_home):
         """Fully spent (100% used, headroom 0) must escape via `at-limit`,
         never wait on a drain bar nothing can still satisfy."""
         h = self._harness(temp_home)
-        fleet = self._land_on_2(h)
-        fleet["2"]["seven_day"]["pct"] = 100.0
-        n0 = len(h.events)
+        self._seed_draining(h)
+        fleet = {
+            "2": self._peer(h, "2", 100.0, 100.0, 100.0),
+            "6": self._peer(h, "6", 52.0, 40.0, 30.0),
+            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
+        }
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a fully spent draining account must escape"
         )
-        sw = next(e for e in h.events[n0:] if isinstance(e, SwitchEvent))
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit", (
             f"got trigger={sw.trigger!r} — headroom 0 must clear the drain "
             "bar and classify at-limit, not stay pinned on a bar nothing "
@@ -5994,36 +6304,41 @@ class TestDynamicDrainBarLiveness:
         )
 
     def test_the_reset_deadline_clears_the_drain_bar(self, temp_home):
-        """95% is >= the ordinary threshold (90) and < the drain bar (99.9)
-        — held while draining, with the reason naming the branch that
-        actually held it (if the departure gate silently used
-        `settings.threshold` instead, this would depart as `proactive`).
-        Once #2's OWN weekly reset — the fact that made it a drain
-        candidate — passes, the ordinary bar must apply again and depart
-        it, with nothing else about the fleet having changed."""
+        """98% (headroom 2, inside #375's `about_to_wall` band) held while
+        draining and the reset has not passed — `protected_by_drain` is
+        what is under test, naming the branch that actually held it (if
+        the departure gate silently ignored the drain mark, this would
+        depart as `proactive`). Once #2's OWN weekly reset — the fact that
+        made it a drain candidate — passes, the hold releases and the
+        engine departs via the ordinary `proactive` arm."""
         h = self._harness(temp_home)
-        fleet = self._land_on_2(h)
-        fleet["2"]["seven_day"]["pct"] = 95.0
-        n0 = len(h.events)
+        self._seed_draining(h)
+        fleet = {
+            "2": self._peer(h, "2", 0.0, 98.0, 78.0),
+            "6": self._peer(h, "6", 100.0, 100.0, 100.0),
+            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
+        }
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.NO_ACTION, (
-            f"got {outcome} — a draining account at 95% must not be read "
-            "as departure-eligible against the ordinary 90% bar"
+            f"got {outcome} — a draining account at 98% must still be held "
+            "by the drain widening, not depart early"
         )
-        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["already-consuming-soonest"], (
-            f"got {reasons} — must hold via the dynamic (below-drain-bar) "
-            "branch, not some other accidental NO_ACTION"
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], (
+            f"got {reasons} — must hold via the drain bar specifically "
+            "(`about_to_wall` fires, but `protected_by_drain` keeps the "
+            "trigger from becoming `proactive`), not some other accidental "
+            "NO_ACTION"
         )
-        # Past #2's own reset (it was +24h from the harness's start; the
-        # landing tick has already advanced the clock once via tick_with_
-        # usage's caller convention — advance well past it either way).
+        # Past #2's own reset. #6 recovers real headroom in the meantime,
+        # so there is somewhere to go once the hold releases.
         h.clock.advance(25 * 3600.0)
-        n0 = len(h.events)
+        fleet["6"] = self._peer(h, "6", 52.0, 40.0, 30.0)
+        h.events.clear()
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — past its own reset the drain bar must clear "
-            "and the ordinary 90% bar must depart a still-95%-used account"
+            "and `about_to_wall` must depart a still-98%-used account"
         )
 
     def test_the_own_five_hour_wall_clears_the_drain_bar_even_before_reset(
@@ -6046,53 +6361,65 @@ class TestDynamicDrainBarLiveness:
         hold does not apply regardless of how much headroom is left.
         """
         h = self._harness(temp_home)
-        fleet = self._land_on_2(h)
-        fleet["2"]["five_hour"]["pct"] = 98.0  # 7d untouched at 90, deadline untouched
-        n0 = len(h.events)
+        self._seed_draining(h)
+        fleet = {
+            "2": self._peer(h, "2", 98.0, 90.0, 78.0),  # 5h binds (98 > 90)
+            "6": self._peer(h, "6", 52.0, 40.0, 30.0),  # real headroom to land on
+            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
+        }
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.SWITCHED and h.active_number() == 6, (
             f"got {outcome}, active={h.active_number()} — #2's own 5h wall "
-            "binds (95 < 98), clearing the drain bar and letting the "
+            "binds (90 < 98), clearing the drain bar and letting the "
             "engine move to #6's real headroom, not park on a sliver"
         )
 
     def test_the_five_hour_window_binding_clears_the_hold_at_any_headroom(
         self, temp_home
     ):
-        """The exact fleet the finding used to illustrate the shape (5h
-        95%, 7d 90% — headroom 5, which a headroom-floor fix left broken
-        regardless of the floor's value): the FIVE-hour window binds
-        (95 > 90), so the hold must not apply no matter how much headroom
-        is left. #6 holds ~48 points and resets later; the engine must
-        move there rather than park on #2's five-hour sliver."""
+        """The exact shape the finding used to illustrate (5h binding, 7d
+        untouched — a headroom-floor fix left broken regardless of the
+        floor's value): the FIVE-hour window binds (97 > 90), so the hold
+        must not apply no matter how much headroom is left. 97 also clears
+        #375's `about_to_wall` bar (headroom 3), which is what makes
+        `dynamic`'s proactive arm consider leaving at all. #6 holds real
+        headroom and resets later; the engine must move there rather than
+        park on #2's five-hour sliver."""
         h = self._harness(temp_home)
-        fleet = self._land_on_2(h)
-        fleet["2"]["five_hour"]["pct"] = 95.0  # 7d untouched at 90, deadline untouched
-        n0 = len(h.events)
+        self._seed_draining(h)
+        fleet = {
+            "2": self._peer(h, "2", 97.0, 90.0, 78.0),  # 5h binds (97 > 90)
+            "6": self._peer(h, "6", 52.0, 40.0, 30.0),
+            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
+        }
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.SWITCHED and h.active_number() == 6, (
             f"got {outcome}, active={h.active_number()} — #2's five-hour "
-            "window binds (95 > 90); the drain hold must not apply, and "
+            "window binds (97 > 90); the drain hold must not apply, and "
             "the engine must move to #6's real headroom"
         )
 
     def test_a_tie_between_five_hour_and_weekly_counts_as_binding(self, temp_home):
-        """At 5h 90 / 7d 90 every point spent is weekly quota — a tie must
-        count as the seven-day window binding, not fall to whichever label
-        `relevant_windows` happens to append first (5h). Not measure-zero:
-        a draining account's 5h climbs THROUGH its 7d by construction and
-        lands on equality on the way."""
+        """At 5h 97 / 7d 97 (headroom 3 — #375's `about_to_wall` bar) every
+        point spent is weekly quota — a tie must count as the seven-day
+        window binding, not fall to whichever label `relevant_windows`
+        happens to append first (5h). Not measure-zero: a draining
+        account's 5h climbs THROUGH its 7d by construction and lands on
+        equality on the way."""
         h = self._harness(temp_home)
-        fleet = self._land_on_2(h)
-        fleet["2"]["five_hour"]["pct"] = 90.0  # ties #2's own 7d (90)
-        n0 = len(h.events)
+        self._seed_draining(h)
+        fleet = {
+            "2": self._peer(h, "2", 97.0, 97.0, 78.0),  # ties #2's own 7d
+            "6": self._peer(h, "6", 100.0, 100.0, 100.0),
+            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
+        }
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — a tie between 5h and 7d must count as the "
             "weekly window binding; the drain hold must still apply"
         )
-        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["already-consuming-soonest"], (
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], (
             f"got {reasons} — must hold via the drain bar specifically"
         )
 
@@ -6100,21 +6427,25 @@ class TestDynamicDrainBarLiveness:
         """A pinned model's window climbing above the weekly one must NOT
         release the hold — that is exactly the departure
         `_dynamic_active_headroom` exists to prevent for the account
-        `dynamic` deliberately chose to sit on. On the ADR's own observed
-        fleet (Fable 91-94 against 7d 62-69) a model-gated binding check
-        would hold for one tick and then depart on almost every draining
-        account; this is the shape that regression guards against."""
+        `dynamic` deliberately chose to sit on. #2's own 7d sits at 97
+        (headroom, unmodeled, 3 — #375's `about_to_wall` bar) so the drain
+        widening's protection is actually exercised; Fable climbing to 99
+        (above the weekly 97) must not by itself unprotect it — the hold's
+        `seven_day_binds` check reads the UNMODELED windows only."""
         h = self._harness(temp_home)
-        fleet = self._land_on_2(h)
-        fleet["2"]["scoped"][0]["pct"] = 95.0  # Fable climbs above #2's own 7d (90)
-        n0 = len(h.events)
+        self._seed_draining(h)
+        fleet = {
+            "2": self._peer(h, "2", 0.0, 97.0, 99.0),  # Fable above #2's own 7d (97)
+            "6": self._peer(h, "6", 100.0, 100.0, 100.0),
+            "1": self._peer(h, "1", 90.0, 63.0, 50.0),
+        }
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — a pinned model binding must not release the "
             "drain hold; only the weekly window's own binding status may"
         )
-        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["already-consuming-soonest"], (
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], (
             f"got {reasons} — must hold via the drain bar specifically"
         )
 
@@ -6123,51 +6454,56 @@ class TestDynamicDrainStateResumesAfterRestart:
     """`state["draining"]` rides the persisted `autoswitch_state.json`, so a
     second engine reading the SAME file (a TUI restart mid-drain) must
     resume holding the drain bar, not silently drop back to the ordinary
-    one because the mark lived only in the first engine's memory."""
+    one because the mark lived only in the first engine's memory.
+
+    #375 made the live-tick path that used to WRITE this mark (a `dynamic`
+    proactive landing via the bare below-threshold trigger) unreachable
+    (`TestDynamicDrainBarLiveness`'s class docstring); seeded directly
+    here, same as that class, since this test is about the mark
+    SURVIVING a restart, not about how it was written.
+    """
 
     def test_a_fresh_engine_over_the_same_state_resumes_the_drain(self, temp_home):
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
-        h.seed(6, "acct6@example.invalid")
         h.seed(2, "acct2@example.invalid")
+        h.seed(6, "acct6@example.invalid")
         h.seed(1, "acct1@example.invalid")
-        h.make_live("acct6@example.invalid", 6)
+        h.make_live("acct2@example.invalid", 2)
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "draining": "2",
+            "drainingResetAt": h.clock.now + 24 * 3600.0,
+        }))
         peer = TestDynamicDrainStateDoesNotRotate._peer
         fleet = {
-            "6": peer(h, "6", 52.0, 40.0, 30.0),
-            "2": peer(h, "2", 0.0, 90.0, 78.0),
+            "2": peer(h, "2", 0.0, 98.0, 78.0),  # headroom 2 — about_to_wall, still draining
+            "6": peer(h, "6", 100.0, 100.0, 100.0),
             "1": peer(h, "1", 90.0, 63.0, 50.0),
         }
-        outcome = h.tick_with_usage(fleet)
-        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2
-        assert h.state().get("draining") == "2", "the first engine must persist the mark"
-
-        fleet["2"]["seven_day"]["pct"] = 95.0
         # "Across instances" means a restart: the old engine is gone before
-        # the new one exists. Stopping it releases the LIVE lock, so the
+        # the new one exists. Stopping `h.engine` releases the LIVE lock
+        # (it never ticked, so it never held anything to persist) so the
         # successor comes up LIVE — a fresh engine that silently demoted
-        # itself would return NO_ACTION for that reason alone
-        # (`_perform`'s dry-run short-circuit), proving nothing about the
-        # persisted mark (see TestQuarantineLifecycle for the same pattern).
+        # itself would return NO_ACTION for that reason alone, proving
+        # nothing about the persisted mark.
         h.engine.stop()
-        h.clock.advance(300.0)  # clear cooldown — the resumed trigger needs it too
         fresh = h._make_engine()
         assert not fresh.dry_run
-        n0 = len(h.events)
         with patch.object(h.switcher, "usage_entries_by_account", return_value={
             num: _entry_for(value, h.clock.now) for num, value in fleet.items()
         }):
             outcome = fresh.tick()
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — a fresh engine reading the same state file "
-            "must resume holding #2's drain bar, not depart it at 95% "
-            "against a freshly-forgotten ordinary bar"
+            "must resume holding #2's drain bar, not depart it at 98% "
+            "against a freshly-forgotten `about_to_wall` bar"
         )
         # THE DISCRIMINATING CHECK: NO_ACTION alone is also what a live
         # lock demotion or an unexpired cooldown produces, neither of which
-        # says anything about `state["draining"]`. Only the dynamic
-        # (below-drain-bar) branch reads this exact reason.
-        reasons = [e.reason for e in h.events[n0:] if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["already-consuming-soonest"], (
+        # says anything about `state["draining"]`. Only `protected_by_
+        # drain` reads this exact reason for an `about_to_wall` active.
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], (
             f"got {reasons} — must hold via the resumed drain bar "
             "specifically, not a demotion or a cooldown that would read "
             "NO_ACTION regardless of whether the mark was ever resumed"
@@ -6367,24 +6703,54 @@ class TestDrainCandidateIsScopedToExactlyOne:
     ):
         """#2 and #4 both sit exactly at the ordinary bar (headroom 10);
         #2 resets sooner. #4 must stay excluded even though it is ALSO
-        in-band — the safety property draining exactly one exists to buy."""
+        in-band — the safety property draining exactly one exists to buy.
+
+        Direct `_rank_candidates` call (`trigger="dynamic"`, the literal
+        the pre-#375 below-threshold branch used to classify), not
+        `h.tick_with_usage`: #375 narrowed `dynamic`'s LIVE proactive
+        trigger to `about_to_wall` (headroom <= 3), and the drain bar's
+        widening only relaxes the FIRST admission filter — a candidate at
+        the ordinary bar (headroom 10) still needs `h - active_headroom >=
+        hysteresis_pct` (10) afterward, which no `about_to_wall` active
+        (headroom <= 3) can ever grant (`10 - 3 = 7 < 10`, and it only
+        gets worse approaching 0, where `at-limit` bypasses the gate
+        without needing drain at all). So a live tick can no longer reach
+        this mechanism; `_rank_candidates` itself is untouched by #375 and
+        still reachable directly, same as `TestDrainDoesNotSurviveA
+        StaleCall`."""
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
         h.seed(6, "acct6@example.invalid")
         h.seed(2, "acct2@example.invalid")
         h.seed(4, "acct4@example.invalid")
         h.make_live("acct6@example.invalid", 6)
         peer = TestDynamicDrainStateDoesNotRotate._peer
-        fleet = {
+        usage = {
             "6": peer(h, "6", 52.0, 40.0, 30.0),
             "2": peer(h, "2", 0.0, 90.0, 78.0),   # in-band, resets soonest
             "4": peer(h, "4", 20.0, 90.0, 55.0),  # in-band, resets later
         }
-        outcome = h.tick_with_usage(fleet)
-        assert outcome is TickOutcome.SWITCHED and h.active_number() == 2, (
-            f"got {outcome}, active {h.active_number()} — the sooner-"
-            "resetting in-band account must be the one drained"
+        headroom = {"6": 48.0, "2": 10.0, "4": 10.0}
+        ordered, *_ = h.engine._rank_candidates(
+            trigger="dynamic",
+            consume_first=True,
+            no_return=None,
+            oauth_candidates=["2", "4"],
+            usage=usage,
+            headroom=headroom,
+            current="6",
+            active_headroom=48.0,
+            settings=h.engine.settings,
+            now=h.clock.now,
         )
-        assert h.state().get("draining") == "2", "must mark #2, not #4"
+        assert ordered and ordered[0] == "2", (
+            f"got {ordered} — the sooner-resetting in-band account must be "
+            "the one drained"
+        )
+        # `_rank_candidates` is pure — `self._drain` (not `state["draining"]`,
+        # which only `_perform` writes) is what it records for the caller.
+        assert h.engine._drain is not None and h.engine._drain[0] == "2", (
+            f"got {h.engine._drain!r} — must mark #2, not #4"
+        )
 
 
 class TestConsumeFirstStrategy:
@@ -7008,13 +7374,21 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
 class TestPhase2RefetchKeepsTheDynamicModelBasis:
     """`dynamic`'s model-basis widening (the re-pick that turns a pinned
     model's own window into "not a blackout" for the ACTIVE, above) must
-    still be in force after the consume-first two-phase commit's refetch
-    re-derives `active_headroom` from fresh usage -- the trigger is
-    classified on one basis and the refetch must not silently switch the
-    tick to a narrower one. Two accounts, `--model all`: both read
-    model-gated headroom 0 (Fable pinned at 100%) but real 5h/7d room, so
-    the widened basis is the only thing that tells the engine it is not
-    genuinely at the wall.
+    still be the basis `_perform` records into `state["leftHeadroom"]" on
+    a real switch. Two accounts, `--model all`: both read model-gated
+    headroom 0 (Fable pinned at 100%) but real 5h/7d room, so the widened
+    basis is the only thing that tells the engine it is not genuinely at
+    the wall.
+
+    #375 dropped the bare below-threshold trigger (`trigger =
+    settings.strategy`) `dynamic` used to classify with, so a live tick
+    never produces the literal `"dynamic"` any more and the consume-first
+    two-phase commit's refetch (gated on `trigger in
+    CONSUME_FIRST_STRATEGIES`) is consume-first-only in practice now.
+    These fixtures reach `about_to_wall` (headroom <= 3) instead, so the
+    trigger is `proactive` and the ordinary hysteresis-margin admission
+    (unchanged) is what a real candidate must clear — the widened basis
+    still has to be what `_perform` records, refetch or not.
     """
 
     def test_leftHeadroom_is_recorded_on_the_widened_basis_not_the_model_gated_one(
@@ -7039,17 +7413,17 @@ class TestPhase2RefetchKeepsTheDynamicModelBasis:
             }
 
         out = h.tick_with_usage({
-            "1": acct(5, 90, 100, 14),   # model-gated headroom 0, unmodeled 10
-            "2": acct(20, 92, 100, 8),   # model-gated headroom 0, unmodeled 8; sooner reset
+            "1": acct(5, 97, 100, 14),   # model-gated headroom 0, unmodeled 3 (about_to_wall)
+            "2": acct(10, 10, 100, 8),   # model-gated headroom 0, unmodeled 90 -- real room
         })
         assert out is TickOutcome.SWITCHED
         assert h.active_number() == 2
         state = h.engine._read_state()
-        assert state.get("leftHeadroom") == 10.0, (
-            f"leftHeadroom={state.get('leftHeadroom')!r} — the phase-2 "
-            "refetch must record the SAME widened basis (10.0, account 1's "
-            "unmodeled 5h/7d headroom) the trigger was classified on, not "
-            "the narrower model-gated 0.0"
+        assert state.get("leftHeadroom") == 3.0, (
+            f"leftHeadroom={state.get('leftHeadroom')!r} — must record the "
+            "SAME widened basis (3.0, account 1's unmodeled 5h/7d "
+            "headroom) the trigger was classified on, not the narrower "
+            "model-gated 0.0"
         )
 
     def test_a_wrong_leftHeadroom_of_zero_does_not_cause_a_two_tick_ping_pong_back(
@@ -7060,8 +7434,8 @@ class TestPhase2RefetchKeepsTheDynamicModelBasis:
         1's very next model-gated headroom (`h >= min(0+3, 100)`, i.e. any
         h >= 3), for essentially free -- and the engine switches straight
         back, the two-tick ping-pong the landing rule exists to stop. With
-        the widened basis (10.0) that same leg needs `h >= 13`, which
-        account 1's 3.0 does not clear."""
+        the widened basis (3.0) that same leg needs `h >= 6`, which
+        account 1's model-gated 3.0 does not clear."""
         h = EngineHarness(
             temp_home, model="all", threshold=95.0, hysteresis_pct=20.0,
             strategy="dynamic",
@@ -7081,21 +7455,16 @@ class TestPhase2RefetchKeepsTheDynamicModelBasis:
             }
 
         out1 = h.tick_with_usage({
-            "1": acct(5, 90, 100, 14),
-            "2": acct(20, 92, 100, 8),
+            "1": acct(5, 97, 100, 14),
+            "2": acct(10, 10, 100, 8),
         })
         assert out1 is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
         h.clock.advance(301.0)  # past cooldown_seconds (default 300)
         out2 = h.tick_with_usage({
-            # Account 1 resets SOONER than account 2 here (5h vs 30h), so
-            # consume-first's reset-ordering gate alone does not exclude it
-            # as a candidate -- isolates the no-return bar / recovered
-            # check as the only thing standing between account 1 and a
-            # switch back.
             "1": acct(20, 5, 97, 5),    # model-gated headroom 3.0
-            "2": acct(92, 20, 90, 30),
+            "2": acct(92, 20, 90, 30),  # holds real headroom, well over 3
         })
         assert out2 is TickOutcome.NO_ACTION, (
             f"got {out2}, active now {h.active_number()!r} — account 1's "
@@ -14170,3 +14539,19 @@ class TestTheBindingRecoveryAgreesWithWhenTheAccountIsUsable:
             "ranking read the 5-hour reset the account is not waiting for"
         )
         assert harness.active_number() == 2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
