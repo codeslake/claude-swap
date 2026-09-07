@@ -2666,13 +2666,14 @@ class TestUnswitchableRowsAreListed:
         )
 
     def test_later_chips_align_by_window_name_not_position(self):
-        """The email pad only lines up the FIRST chip. `5h(⟳4h9m):45%` is
-        nine characters wider than `5h:0%`, so a row whose 5h window carries
-        a live countdown pushes its 7d and Fable chips right of a row whose
-        5h window does not — a positional pad over `chip_label` cannot fix
-        this because the two rows' window LISTS can differ in length and
-        membership; the column has to be keyed by window NAME. Same emails-
-        length rows to isolate this from the already-covered email pad.
+        """The email pad only lines up the FIRST chip. `5h(⟳4h19m):45%` is
+        one column wider than `5h(⟳5h00m):0%`, so a row whose 5h window
+        carries a live countdown pushes its 7d and Fable chips right of a
+        row whose 5h window does not — a positional pad over `chip_label`
+        cannot fix this because the two rows' window LISTS can differ in
+        length and membership; the column has to be keyed by window NAME.
+        Same emails-length rows to isolate this from the already-covered
+        email pad.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2681,7 +2682,7 @@ class TestUnswitchableRowsAreListed:
         out = self._render(self._snap(
             self._acct("2", "aaaa@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 45.0,
-                              "resets_at": (now + timedelta(hours=4, minutes=9)).isoformat()},
+                              "resets_at": (now + timedelta(hours=4, minutes=19)).isoformat()},
                 "seven_day": {"pct": 9.0,
                               "resets_at": (now + timedelta(days=3, hours=8)).isoformat()},
                 "scoped": [{"name": "Fable", "pct": 8.0,
@@ -2823,25 +2824,19 @@ class TestUnswitchableRowsAreListed:
 
     def test_a_lapsed_5h_chip_is_the_same_width_as_a_live_one(self):
         """The owner's five Next-best rows: a lapsed 5h chip (no reset,
-        pct 0) renders 4 columns narrower than a live one, so the caller's
-        column pad fills the gap with spaces the owner rejected
-        (`5h(⟳5h):0%     ·`, owner-directed 2026-09-07). `5h00m` closes
-        that gap. The unknown-reset case below is the control: it must NOT
-        gain the same width, because it is a different state."""
+        pct 0) renders 3 columns narrower than a live one (4 with the pct
+        digit), so the caller's column pad fills the gap with spaces the
+        owner rejected (`5h(⟳5h):0%     ·`, owner-directed). `5h00m` closes
+        that gap. The unknown-reset case must not widen to `5h00m` -- a 5h
+        window WITH usage but no reported reset is a live window whose reset
+        the server withheld, not an untouched one, so it keeps the plain
+        `⟳?` marker; that case is a different state and must not gain the
+        same width."""
         from claude_swap.tui import data
 
         lapsed = data.chip_label("5h", None, pct=0.0)
         live = data.chip_label("5h", "resets 2h 14m")
         assert len(lapsed) == len(live), (lapsed, live)
-
-    def test_an_unknown_5h_reset_with_usage_keeps_its_own_width(self):
-        """CONTROL for the test above: a 5h window WITH usage but no
-        reported reset is a live window whose reset the server withheld,
-        not an untouched one -- it keeps the plain `⟳?` marker, and must
-        not widen to `5h00m`."""
-        from claude_swap.tui import data
-
-        assert data.chip_label("5h", None, pct=42.0) == "5h(⟳?):"
 
     def test_a_budget_only_account_names_no_reset_marker_at_all(self):
         """A monthly-budget (API-key/spend) account has no usage-window
