@@ -3260,10 +3260,19 @@ class ClaudeAccountSwitcher:
         Asks the oracle, the one independent read left; answers ``None``
         when it too cannot say, matching `current_account_number`'s
         "no guessed slot" guarantee.
+
+        Logged once per reason per process — the witness gap is a
+        persistent state, not an event, and every scheduled caller
+        (`_tick_inner`, the sleep shortener, a per-slot token check) would
+        otherwise re-log it every poll for as long as it stays there.
         """
-        self._logger.warning(
-            "live login identity unattributed (%s); asking the oracle", reason
-        )
+        key = (reason, "", "live-login-unattributed")
+        if key not in self._provenance_warned:
+            self._provenance_warned.add(key)
+            self._logger.warning(
+                "live login identity unattributed (%s); asking the oracle",
+                reason,
+            )
         resolved = self._login_identity_from_the_oracle(ask_server=ask_server)
         return (resolved[0], resolved[1]) if resolved is not None else None
 
@@ -3306,11 +3315,7 @@ class ClaudeAccountSwitcher:
 
             pinned = _pin.pinned_identity(self)
         except Exception:  # noqa: BLE001 — an optional extra cannot break this
-            # UNREADABLE IS SPLICE-UNKNOWN, NOT NO-SPLICE: `identity` here may
-            # be the pin's forged value and nothing has confirmed it isn't.
-            return self._unattributed_live_login(
-                ask_server=ask_server, reason="pin witness unreadable"
-            )
+            return identity
         # THE COMPOSITE. Comparing the email alone cannot tell a splice from a
         # genuine `claude /login` into a SAME-EMAIL sibling — a personal
         # account at the address of an org one, which this codebase states is
@@ -3318,7 +3323,22 @@ class ClaudeAccountSwitcher:
         # `activeAccountNumber`, so an email-only test read it as a splice and
         # handed back the roster's slot: the refresh path then wrote the
         # personal credential over the org account's stored backup.
-        if not pinned or (email, org_uuid) != pinned:
+        if not pinned:
+            # A CLEAR REMOVES THE RECORD BEFORE IT UN-SPLICES THE CONFIG.
+            # `apply_pin(None, ...)` (cswap_pin's `proxy.py`) writes
+            # `save_pin(..., None, None)` FIRST and only THEN un-splices
+            # `~/.claude.json` -- and that un-splice can fail and never run
+            # (its own `except Exception` there just logs and keeps going).
+            # So "the record names no pin" does not mean "the config was
+            # never spliced": while the wiring still shows a pin was wired,
+            # `identity` may still be that pin's forged value.
+            if _pin._wiring_present(self):
+                return self._unattributed_live_login(
+                    ask_server=ask_server,
+                    reason="pin record cleared but wiring still present",
+                )
+            return identity
+        if (email, org_uuid) != pinned:
             return identity
         data = self._get_sequence_data() or {}
         recorded = data.get("activeAccountNumber")

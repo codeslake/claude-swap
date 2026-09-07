@@ -12965,12 +12965,20 @@ class TestTheLiveCredentialIsReadThroughTheStore:
 
 
 class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
-    """A witness gap (the pin unreadable, no recorded active slot, or a
-    recorded slot with no stored email) must not fall back to the raw config
-    identity: under a splice that value IS the pin's. Each exit asks the
-    oracle instead and answers ``None`` when it too cannot say -- never the
-    pin (the same class `test_the_resolver_keeps_the_recorded_slot...`
-    already fixed, above)."""
+    """A witness gap (the record silent while the wiring is still present,
+    no recorded active slot, or a recorded slot with no stored email) must
+    not fall back to the raw config identity: under a splice that value IS
+    the pin's. Each exit asks the oracle instead and answers ``None`` when
+    it too cannot say -- never the pin (the same class
+    `test_the_resolver_keeps_the_recorded_slot...` already fixed, above).
+
+    `pinned_identity` itself never raises (`pin.py`'s `_pinned_email_now`
+    degrades every read failure to ``None``, and `pinned_identity` wraps it
+    in its own ``except Exception: return None``), so there is no case
+    where `_live_login_identity`'s ``except Exception`` around the call is
+    reachable; that arm keeps its original `return identity` untested, the
+    same as any other unreachable defensive branch.
+    """
 
     PIN = ("pinned@example.com", "org-pin")
 
@@ -12981,25 +12989,69 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
         s._init_sequence_file()
         return s
 
-    def test_a_pin_witness_that_raises_never_answers_the_pin(
+    def test_record_cleared_but_wiring_still_present_never_answers_the_pin(
         self, temp_home: Path, monkeypatch
     ):
+        """MEASURED shape: `cswap_pin.proxy.apply_pin`'s clear path writes
+        `save_pin(..., None, None)` (the record gone) BEFORE it un-splices
+        `~/.claude.json` -- and that un-splice can fail and never run. In
+        that window the config still names the just-cleared pin while
+        `pinned_identity()` already answers None."""
         from claude_swap import pin as _pin
 
         s = self._switcher(temp_home)
         monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
-
-        def _raises(_s):
-            raise RuntimeError("pin state unreadable")
-
-        monkeypatch.setattr(_pin, "pinned_identity", _raises)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+        monkeypatch.setattr(_pin, "_wiring_present", lambda _s: True)
         monkeypatch.setattr(
             s, "_login_identity_from_the_oracle",
             lambda **kw: ("other@example.com", "org-other", "u-other"))
         assert s._live_login_identity() == ("other@example.com", "org-other"), (
-            "the pin witness raised and the answer was the raw config "
-            "identity, which under a splice is the pin's"
+            "the record was silent but the wiring was still present, and "
+            "the answer was the raw config identity, which is the "
+            "just-cleared pin's forged value"
         )
+
+    def test_a_repeated_witness_gap_logs_once_per_reason(
+        self, temp_home: Path, monkeypatch, caplog
+    ):
+        """The gap is a persistent state, not an event: a scheduled caller
+        (`_tick_inner`, the sleep shortener, a per-slot token check) asks on
+        every poll for as long as it stays there, and must not re-log it
+        every time."""
+        import logging as _logging
+
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account", lambda: self.PIN)
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        monkeypatch.setattr(s, "_get_sequence_data", lambda: {"accounts": {}})
+        monkeypatch.setattr(
+            s, "_login_identity_from_the_oracle", lambda **kw: None)
+        with caplog.at_level(_logging.WARNING):
+            s._live_login_identity()
+            s._live_login_identity()
+        warnings = [r for r in caplog.records if r.levelno == _logging.WARNING
+                    and "unattributed" in r.message]
+        assert len(warnings) == 1, (
+            f"the witness gap logged {len(warnings)} times across two calls "
+            f"instead of once: {[r.message for r in warnings]}"
+        )
+
+    def test_CONTROL_no_pin_and_no_wiring_still_answers_the_config(
+        self, temp_home: Path, monkeypatch
+    ):
+        """The overwhelmingly common case: nothing was ever pinned. Both
+        witnesses agree, and the honest config identity ships unchanged."""
+        from claude_swap import pin as _pin
+
+        s = self._switcher(temp_home)
+        monkeypatch.setattr(s, "_get_current_account",
+                             lambda: ("plain@example.com", ""))
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: None)
+        monkeypatch.setattr(_pin, "_wiring_present", lambda _s: False)
+        assert s._live_login_identity() == ("plain@example.com", "")
 
     def test_no_recorded_active_slot_never_answers_the_pin(
         self, temp_home: Path, monkeypatch
@@ -13110,6 +13162,41 @@ class TestTheResolverAsksTheServerOnlyOutsideTheLocks:
         assert s._live_identity_matches("other@example.com", "org-other")
         assert not s._live_identity_matches("login@example.com", "org-login")
         assert asked == ["at-live"], "asked again with the memo warm"
+
+    def test_the_witness_gap_fallback_asks_nobody_under_the_lock(
+        self, monkeypatch
+    ):
+        """The `no recorded active slot` exit reaches the oracle through the
+        same seam and must honour the same rule: `_live_identity_matches`
+        (``ask_server=False``) must not touch the network for it either.
+        Without this a mutant dropping ``ask_server=ask_server`` in
+        `_unattributed_live_login`'s oracle call (a bare
+        `self._login_identity_from_the_oracle()`) survives every other test
+        here, because none of them stub the oracle with `lambda **kw` in a
+        way that can see the keyword go missing."""
+        import logging
+
+        from claude_swap import pin as _pin
+        from claude_swap import switcher as _sw
+
+        asked = []
+        s = ClaudeAccountSwitcher.__new__(ClaudeAccountSwitcher)
+        s._logger = logging.getLogger("test-witness-gap")
+        s._provenance_warned = set()
+        s._get_current_account = lambda: self.PIN
+        s._get_sequence_data = lambda: {"accounts": {}}   # no activeAccountNumber
+        monkeypatch.setattr(_pin, "pinned_identity", lambda _s: self.PIN)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "at-live", "refreshToken": "rt-live"}})
+        s._read_capture_credentials = lambda: live
+        monkeypatch.setattr(_sw.oauth, "fetch_oauth_profile", lambda tok: (
+            asked.append(tok) or {"email": "other@example.com", "uuid": "u-o",
+                                  "organizationUuid": "org-other"}))
+        matched = s._live_identity_matches("other@example.com", "org-other")
+        assert asked == [], (
+            "the witness-gap fallback reached the profile endpoint while "
+            f"Claude Code's credential lock is held: {asked}")
+        assert matched is False, matched
 
 
 class TestThePolicyFetchIsBudgeted:
