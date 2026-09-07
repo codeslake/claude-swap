@@ -2094,16 +2094,17 @@ class AutoSwitchEngine:
                 # loop runs over every candidate.
                 raise _EngineStopped()
             email = self.switcher.account_email(num)
-            if trigger in ("proactive", *CONSUME_FIRST_STRATEGIES):
+            if trigger in ("proactive", "failover", *CONSUME_FIRST_STRATEGIES):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
-                # poller, which then serve their stored entries. Neither
-                # trigger is an escape from that — never act on stale data or
-                # slide to a worse-ranked target; hold and retry next tick.
+                # poller, which then serve their stored entries. No trigger
+                # is an escape from that — never land on stale or provably
+                # dead cached usage; `_freshen_target` cannot close this gap
+                # itself (its own near-expiry fast path returns "ok" without
+                # ever reading the collector's verdict on this candidate).
                 # `proactive` has no phase-2 refetch of its own, so this reads
                 # the same scheduled-collection entry a backed-off or
-                # repeatedly-failing candidate was already serving stale —
-                # the liveness gap `_freshen_target` cannot close (see there).
+                # repeatedly-failing candidate was already serving stale.
                 entry = entries.get(num)
                 # `self.clock()` short-circuited, not eagerly evaluated: a
                 # None entry must call it zero times, matching every other
@@ -2120,7 +2121,16 @@ class AutoSwitchEngine:
                             ),
                         )
                     )
-                    return TickOutcome.NO_ACTION
+                    if trigger in CONSUME_FIRST_STRATEGIES:
+                        # Sliding to a worse-ranked, later-reset candidate
+                        # defeats consume-first's whole point (burn the
+                        # soonest-resetting quota first) — hold instead and
+                        # retry next tick.
+                        return TickOutcome.NO_ACTION
+                    # `proactive`/`failover`: a stale top candidate must not
+                    # park the engine at the wall while a healthy, lower-
+                    # ranked candidate goes untried — skip it.
+                    continue
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.

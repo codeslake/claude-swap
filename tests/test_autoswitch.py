@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import io
 import json
 import logging
 import os
 import random
 import subprocess
 import sys
+import tarfile
 import threading
-import types
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -2474,7 +2475,11 @@ class TestProactiveExcludesStaleUsage:
             trust_extended=True,
         )
         outcome = h.tick_with_entries({"1": active_entry, "2": stale_entry})
-        assert outcome is TickOutcome.NO_ACTION
+        # `proactive` skips a stale candidate rather than holding on it —
+        # with no OTHER candidate in this 2-account fleet, the engine falls
+        # through the loop with nothing landed: BLOCKED ("wanted to switch
+        # but no viable target"), not NO_ACTION.
+        assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert "stale-usage" in reasons
@@ -2510,34 +2515,212 @@ class TestProactiveExcludesStaleUsage:
         )
         assert struck_entry.token_dead()
         outcome = h.tick_with_entries({"1": active_entry, "2": struck_entry})
-        assert outcome is TickOutcome.NO_ACTION
+        # See test_proactive_does_not_admit_a_backed_off_candidate: skipping
+        # the only candidate falls through to BLOCKED, not NO_ACTION.
+        assert outcome is TickOutcome.BLOCKED
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert "stale-usage" in reasons
 
 
+class TestProactiveSkipsAStaleTopCandidateForTheNextRanked:
+    """A stale top-ranked candidate must not park the WHOLE tick: `proactive`
+    (unlike consume-first, see below) tries the next-ranked healthy
+    candidate instead of holding — the fleet-exhaustion `best`'s own
+    two-candidate fixture above cannot see (the only candidate stale IS the
+    whole fleet exhausted; nothing is left to prefer)."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_switches_to_the_healthy_next_ranked_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        # Active over threshold, real headroom (5) -> proactive, not at-limit.
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        # #2 would rank best (headroom 100) but is walled by the collector.
+        stale_top = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now - 1000.0,
+            age_s=1000.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=h.clock.now + 400.0,
+            trust_extended=True,
+        )
+        # #3 ranks second (headroom 90) and is healthy — the fix's target.
+        healthy_next = _entry_for(_usage(10), h.clock.now)
+        outcome = h.tick_with_entries(
+            {"1": active_entry, "2": stale_top, "3": healthy_next}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        # The FAULT this guards: landing on the stale top candidate instead
+        # of skipping to the healthy one — assert the marker directly, not
+        # only the outcome.
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-usage" in reasons
+
+    def test_control_the_same_top_candidate_fresh_is_taken_instead(
+        self, temp_home
+    ):
+        """Mutant control: #2 fresh (not stale) outranks #3 and IS taken —
+        proving the skip above is the staleness gate choosing #3, not #2
+        being unrankable for some other reason."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        fresh_top = _entry_for(_usage(0), h.clock.now)
+        healthy_next = _entry_for(_usage(10), h.clock.now)
+        outcome = h.tick_with_entries(
+            {"1": active_entry, "2": fresh_top, "3": healthy_next}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+
+class TestFailoverSkipsAStaleTopCandidate:
+    """m1: `failover` (active usage unreadable) reaches the same per-
+    candidate freshen loop as `proactive` — a struck/token-dead top-ranked
+    candidate must be skipped for a healthy next-ranked one, never landed
+    on via `_freshen_target`'s near-expiry fast path (which returns "ok"
+    without ever reading the collector's stale/struck verdict on this
+    candidate — see `_freshen_target`'s own docstring)."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _drive_to_failover(self, h, entries_after):
+        """`unhealthy_ticks` (3, default) consecutive unreadable-active
+        ticks are spent before failover is even considered."""
+        blank = {"1": UsageEntry(), "2": UsageEntry(), "3": UsageEntry()}
+        for _ in range(h.settings.unhealthy_ticks - 1):
+            outcome = h.tick_with_entries(blank)
+            assert outcome is TickOutcome.NO_ACTION
+        return h.tick_with_entries(entries_after)
+
+    def test_skips_a_token_dead_top_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        struck_top = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert struck_top.token_dead()
+        healthy_next = _entry_for(_usage(10), h.clock.now)
+        outcome = self._drive_to_failover(
+            h, {"1": UsageEntry(), "2": struck_top, "3": healthy_next}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        # The FAULT this guards: failover landing on the dead top candidate.
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+    def test_control_the_same_top_candidate_healthy_is_taken_instead(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        healthy_top = _entry_for(_usage(0), h.clock.now)
+        other = _entry_for(_usage(10), h.clock.now)
+        outcome = self._drive_to_failover(
+            h, {"1": UsageEntry(), "2": healthy_top, "3": other}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+
 _PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
 
 
-def _load_base_autoswitch():
-    """The pre-fix `autoswitch.py` as an independent module — same
-    `switcher`/`usage_store`/`settings` (untouched by this fix), a
-    different `AutoSwitchEngine`. Loaded once per process and cached in
-    `sys.modules`."""
-    mod_name = f"claude_swap._autoswitch_base_{_PR_321_BASE_SHA}"
-    if mod_name in sys.modules:
-        return sys.modules[mod_name]
+def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int):
+    """`n_fleets` fleets generated from `seed` (the same generator
+    `TestOutcomeDigestAgainstBase._fleet` uses), run through the pre-#321
+    `AutoSwitchEngine` in a fresh subprocess against `_PR_321_BASE_SHA`'s own
+    `claude_swap` package — a different `usage_store`/`switcher`/`settings`/
+    `autoswitch`, not merely a fresh module namespace sharing this process's
+    `sys.modules`. Same technique as `test_dynamic_isolation.py`'s
+    `_digests_at_base_rev`: guard-and-skip, `git archive` + `tarfile`, a
+    driver subprocess, a positive control on where `claude_swap` resolved
+    from.
+
+    SKIPPED, not failed, when `_PR_321_BASE_SHA` is not in the object
+    database — CI checks out at `refs/pull/N/merge` with fetch-depth 1, so
+    this branch's own pre-PR base is never in that checkout, and a bare
+    `git show` there would redden every job today and every run forever
+    once the branch is deleted post-merge.
+    """
     repo_root = Path(__file__).resolve().parents[1]
-    src = subprocess.run(
-        ["git", "-C", str(repo_root), "show",
-         f"{_PR_321_BASE_SHA}:src/claude_swap/autoswitch.py"],
-        capture_output=True, text=True, check=True,
-    ).stdout
-    mod = types.ModuleType(mod_name)
-    mod.__file__ = f"<git show {_PR_321_BASE_SHA}:src/claude_swap/autoswitch.py>"
-    sys.modules[mod_name] = mod
-    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
-    return mod
+    probe = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{_PR_321_BASE_SHA}^{{commit}}"],
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"{_PR_321_BASE_SHA} is not in this checkout's object database")
+    old_root = tmp_path / "base_src"
+    old_root.mkdir()
+    archive = subprocess.run(
+        ["git", "-C", str(repo_root), "archive", "--format=tar", _PR_321_BASE_SHA, "src"],
+        capture_output=True, check=True,
+    )
+    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
+        tf.extractall(old_root, filter="data")  # trusted: our own repo's history
+    module_dir = tmp_path / "base_driver"
+    module_dir.mkdir()
+    (module_dir / "test_autoswitch.py").write_text(Path(__file__).read_text())
+    homes_dir = tmp_path / f"base_homes_{strategy}"
+    homes_dir.mkdir()
+    driver = module_dir / "_zz_base_engine_driver.py"
+    driver.write_text(
+        "import sys, json, random\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(old_root / 'src')!r})\n"
+        f"sys.path.insert(0, {str(module_dir)!r})\n"
+        "import claude_swap\n"
+        "import test_autoswitch as ta\n"
+        f"rng = random.Random({seed})\n"
+        "fleets = []\n"
+        f"for _ in range({n_fleets}):\n"
+        "    entries, _ = ta.TestOutcomeDigestAgainstBase._fleet(None, rng, 1_000_000.0)\n"
+        "    fleets.append(entries)\n"
+        "results = ta.TestOutcomeDigestAgainstBase._run(\n"
+        f"    None, ta.AutoSwitchEngine, Path(sys.argv[1]), 'base', fleets, {strategy!r}\n"
+        ")\n"
+        "print(json.dumps({'_claude_swap_file': claude_swap.__file__, "
+        "'results': results}))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(driver), str(homes_dir)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, (
+        f"base-engine driver failed: rc={result.returncode}\n"
+        f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
+    )
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+    # POSITIVE CONTROL, per test_dynamic_isolation.py: an editable install
+    # could resolve `claude_swap` to the working tree regardless of
+    # `sys.path` order, which would compare HEAD against itself.
+    assert out["_claude_swap_file"].startswith(str(old_root)), (
+        f"the subprocess imported claude_swap from outside {old_root} — "
+        f"this compared HEAD against itself, not against {_PR_321_BASE_SHA}"
+    )
+    return [
+        (name, active, tuple(tuple(e) for e in events))
+        for name, active, events in out["results"]
+    ]
 
 
 class TestOutcomeDigestAgainstBase:
@@ -2551,6 +2734,7 @@ class TestOutcomeDigestAgainstBase:
     """
 
     _N_FLEETS = 40
+    _DIGEST_SEED = 20260321
 
     def _fleet(self, rng: random.Random, now: float):
         resets = (_R_SOON, _R_LATER, _R_LATEST)   # module globals, late-bound
@@ -2615,8 +2799,7 @@ class TestOutcomeDigestAgainstBase:
 
     @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
     def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
-        base_mod = _load_base_autoswitch()
-        rng = random.Random(20260321)
+        rng = random.Random(self._DIGEST_SEED)
         now = 1_000_000.0
         fleets: list[dict] = []
         stale_by_fleet: list[set] = []
@@ -2626,8 +2809,8 @@ class TestOutcomeDigestAgainstBase:
             stale_by_fleet.append(stale_nums)
 
         head_results = self._run(AutoSwitchEngine, tmp_path, "head", fleets, strategy)
-        base_results = self._run(
-            base_mod.AutoSwitchEngine, tmp_path, "base", fleets, strategy
+        base_results = _base_engine_results(
+            tmp_path, strategy, self._DIGEST_SEED, self._N_FLEETS
         )
 
         head_digest = hashlib.sha256(repr(head_results).encode()).hexdigest()
@@ -2641,9 +2824,27 @@ class TestOutcomeDigestAgainstBase:
             "strengthen it before trusting the digest"
         )
         for i in diffs:
+            # "The fleet carried a stale candidate somewhere" alone does not
+            # exclude a ranking change on that same fleet for an unrelated
+            # reason — pin it to the mechanism: HEAD itself must have hit
+            # the exclusion (a `stale-usage` event), and BASE's landing
+            # account must be one this fixture actually marked stale.
             assert stale_by_fleet[i], (
                 f"fleet {i} differs with NO stale candidate — a scope error, "
                 f"not the intended exclusion: head={head_results[i]!r} "
+                f"base={base_results[i]!r}"
+            )
+            assert ("no-switch", "stale-usage") in head_results[i][2], (
+                f"fleet {i} differs and carries a stale candidate, but "
+                f"head's own events never cite stale-usage — the "
+                f"divergence traces to something else, not the exclusion: "
+                f"head={head_results[i]!r}"
+            )
+            assert str(base_results[i][1]) in stale_by_fleet[i], (
+                f"fleet {i}: base landed on account {base_results[i][1]!r}, "
+                f"which this fixture never marked stale "
+                f"({stale_by_fleet[i]!r}) — a ranking change, not base "
+                f"landing on the candidate head correctly excluded: "
                 f"base={base_results[i]!r}"
             )
 
@@ -9253,18 +9454,24 @@ class TestHorizonAxisDoesNotFlap:
 
         ranking_now = 1_000_000.0
         reset_at = self._iso_at(ranking_now + 100.0)   # future at ranking_now
-        stale_reread = ranking_now + 200.0             # past reset_at
+        # Past `reset_at` (a real re-read regression must show), but within
+        # `SERVE_TTL_S` (180) of candidate #2's `fetched_at` (== ranking_now)
+        # — one value that exposes a stray re-read wherever in the call
+        # order it lands, without also tripping the UNRELATED stale-usage
+        # admission gate (which reads `self.clock()` too, at a position
+        # that shifts by one call between the two code paths below).
+        late_reread = ranking_now + 150.0
 
-        # Enough values for the OLD code's clock() call order (pre-tick
-        # check, ranking now, the proactive admission gate's own freshness
-        # read — real elapsed time since a candidate fetched THIS ranking
-        # pass, unrelated to the re-read bug this test targets, so it gets
-        # a ranking-time value rather than `stale_reread` — left_snapshot
-        # re-read, freshen expiry check, _perform's lastSwitchAt) with a
-        # couple of spares so neither code path can exhaust the sequence.
+        # Measured call order: pre-tick usage collection, ranking's own
+        # `decided_now`, THEN — only on the pre-#321 code this guards
+        # against — `left_snapshot`'s own re-read, then the stale-usage
+        # admission gate's freshness read, freshen's expiry check, and
+        # `_perform`'s `lastSwitchAt`. `late_reread` covers every position
+        # from the admission gate onward so the same list works whether or
+        # not the extra re-read call is present, with spares left over.
         clock_values = iter([
-            ranking_now, ranking_now, ranking_now, stale_reread,
-            stale_reread, stale_reread, stale_reread,
+            ranking_now, ranking_now, late_reread, late_reread,
+            late_reread, late_reread, late_reread,
         ])
         with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
             outcome = h.tick_with_usage({
