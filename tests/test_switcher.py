@@ -13093,6 +13093,80 @@ class TestLiveLoginIdentityNeverAnswersUnattributedAsThePin:
         )
 
 
+class TestALeftoverWiringWithADeadPortAndAForgedConfigIsStillASplice:
+    """A rejected fix for the R11 "leftover wiring, no serving pin" refusal
+    proposed `_config_names_the_pin`'s `pinned is None` branch fall back to
+    ``_wiring_present(self) and _wired_port_is_serving(self)`` instead of
+    ``_wiring_present(self)`` alone. That reopens R11's own
+    never-answer-the-forged-pin guarantee on a state none of R11's existing
+    fixtures reach: those write the wiring marker only via the sidecar
+    ledger with no ``CSWAP_PIN_PORT`` in the config's own ``env`` block, so
+    ``_wired_ports()`` is empty for them and the carve-out never fires.
+
+    Here the marker and the port are REAL, written into the config file
+    itself (what `apply_pin`'s wiring actually looks like), the port is
+    confirmed dead by binding then closing it, and ``oauthAccount`` already
+    holds what a splice caught mid-teardown would leave behind: the pin's
+    own forged identity, with the record cleared first (`clear_pin`'s own
+    ordering) and no recorded active slot yet. The two invariants must hold
+    on this state exactly as they do on the sidecar-only ones: the config
+    still names the pin, and the live login identity is never the forged
+    pair.
+    """
+
+    PIN_EMAIL = "pinned@example.com"
+    PIN_ORG = "org-pin"
+
+    def _dead_port(self) -> int:
+        import socket
+
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()  # nothing listens on it from here on: confirmed dead
+        return port
+
+    def _switcher_with_leftover_wiring(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.MACOS
+        s._setup_directories()
+        s._init_sequence_file()  # activeAccountNumber: None -- no recorded slot
+        port = self._dead_port()
+        config = {
+            "oauthAccount": {
+                "emailAddress": self.PIN_EMAIL,
+                "organizationUuid": self.PIN_ORG,
+                "accountUuid": "acct-pin",
+            },
+            "env": {
+                "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+                "CSWAP_PIN_PORT": port,
+            },
+            "_cswapPinWiredKeys": ["HTTPS_PROXY", "CSWAP_PIN_PORT"],
+        }
+        (temp_home / ".claude.json").write_text(json.dumps(config))
+        # No settings.json `remoteControl` section: the pin record is silent,
+        # exactly as `clear_pin`'s clear-record-before-unsplice ordering
+        # leaves it when the unsplice itself fails or never runs.
+        return s
+
+    def test_config_names_the_pin_true_on_a_dead_wired_port_with_a_forged_config(
+        self, temp_home: Path
+    ):
+        s = self._switcher_with_leftover_wiring(temp_home)
+        assert s._config_names_the_pin(self.PIN_EMAIL, self.PIN_ORG) is True
+
+    def test_live_login_identity_never_answers_the_forged_pin_on_a_dead_wired_port(
+        self, temp_home: Path
+    ):
+        s = self._switcher_with_leftover_wiring(temp_home)
+        assert s._live_login_identity(ask_server=False) is None, (
+            "a dead wired port, a silent record and no recorded active slot "
+            "answered the pin's own forged config identity literally, which "
+            "is exactly the leak R11 exists to close"
+        )
+
+
 class TestConfigNamesThePinNeverAsksWiringWhenTheRecordAnswers:
     """`_config_names_the_pin`'s `pinned is None` branch is load-bearing:
     `_wiring_present` must never run while the record already names an
