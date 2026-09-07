@@ -574,7 +574,7 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def block_real_switch_target_probe(monkeypatch):
+def block_real_switch_target_probe(request, monkeypatch):
     """Safety net: no test may make a live switch-target liveness probe.
 
     ``_probe_target_credential`` (the switch-time guard against activating a
@@ -585,7 +585,13 @@ def block_real_switch_target_probe(monkeypatch):
     documented "transport failure — no verdict" answer, which the guard
     already treats as "proceed as before") so the suite stays hermetic; a
     test exercising the guard itself patches this explicitly.
+    ``@pytest.mark.no_probe_oauth_profile_live_fake`` opts out for
+    ``TestProbeOauthProfileLive``, which mocks ``urlopen`` beneath it — the
+    same escape hatch ``no_oauth_profile_fake`` gives its sibling stub above.
     """
+    if request.node.get_closest_marker("no_probe_oauth_profile_live_fake"):
+        yield
+        return
     monkeypatch.setattr(
         "claude_swap.oauth.probe_oauth_profile_live",
         lambda token, timeout_s=5.0: None,

@@ -25,6 +25,7 @@ from claude_swap.exceptions import (
     SessionError,
     SwitchError,
     TargetCredentialDead,
+    TargetCredentialUnconfirmed,
     ValidationError,
 )
 from claude_swap import oauth, pace
@@ -6075,6 +6076,7 @@ class ClaudeAccountSwitcher:
         models: tuple[str, ...] = (),
         usage: dict | None = None,
         current_at_limit: bool = False,
+        exclude: frozenset[str] | set[str] = frozenset(),
     ) -> tuple[str | None, str]:
         """Decide the ``best`` strategy target relative to the current account.
 
@@ -6085,7 +6087,12 @@ class ClaudeAccountSwitcher:
         can't be proven beneficial, it stays put; bare ``cswap --switch``
         remains the way to force a plain rotation. ``models`` folds the named
         per-model weekly windows into every headroom comparison (see
-        ``oauth.account_headroom``). Returns ``(target, note)``:
+        ``oauth.account_headroom``). ``exclude`` drops candidates this same
+        call already struck: ``_slot_token_dead`` needs a second strike
+        before it agrees (``_strike_is_suspected_race`` doubts the first one
+        whenever the row carries a prior success), so without this a
+        just-struck candidate is picked right back up next pass. Returns
+        ``(target, note)``:
 
         - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
         - ``(None, "current-unavailable")`` — current account's usage is unknown,
@@ -6106,6 +6113,7 @@ class ClaudeAccountSwitcher:
         others = [
             str(n) for n in data.get("sequence", [])
             if str(n) != str(current_num)
+            and str(n) not in exclude
             and self._account_is_switchable(str(n))
             and not self._disabled_from_data(data, str(n))
             and not self._slot_token_dead(
@@ -6650,6 +6658,12 @@ class ClaudeAccountSwitcher:
         """
         strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
         warnings: list[str] = []
+        # Struck THIS call, independent of `_slot_token_dead`: that filter
+        # needs a second strike before it agrees (see
+        # `_select_best_switchable`'s `exclude` docstring), so without a
+        # local memory a candidate this same call just proved dead is
+        # eligible again on the very next pass.
+        struck: set[str] = set()
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
         if models and not json_output:
@@ -6685,11 +6699,16 @@ class ClaudeAccountSwitcher:
                 # Skip a slot already known dead the same way the "best"
                 # ranking does (`_select_best_switchable`) — the live probe
                 # below still runs on whatever this leaves, catching a
-                # credential that has died since the last strike.
+                # credential that has died since the last strike. `struck`
+                # excludes a candidate THIS call already proved dead,
+                # independent of `_slot_token_dead` (see its exclude
+                # docstring).
                 email = data.get("accounts", {}).get(num, {}).get("email", "")
-                return self._account_is_switchable(
-                    num
-                ) and not self._slot_token_dead(num, email)
+                return (
+                    num not in struck
+                    and self._account_is_switchable(num)
+                    and not self._slot_token_dead(num, email)
+                )
 
             target = str(preferred)
             target_disabled = self._disabled_from_data(data, target)
@@ -6741,6 +6760,7 @@ class ClaudeAccountSwitcher:
                         candidate, emit_output=not json_output
                     )
                 except TargetCredentialDead:
+                    struck.add(candidate)
                     continue
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
@@ -6816,24 +6836,30 @@ class ClaudeAccountSwitcher:
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
             target, note = self._select_best_switchable(
-                current_num, models, best_usage, current_at_limit
+                current_num, models, best_usage, current_at_limit, exclude=struck
             )
             # Bounded by the candidate count: a struck candidate is excluded
-            # from the NEXT `_select_best_switchable` call (its own
-            # `_slot_token_dead` filter), so this can loop at most once per
-            # slot before landing on "none"/"stay"/a live target. A dead
-            # verdict from `_perform_switch`'s own pre-lock liveness probe
-            # (issue #199) advances the same way — it is the one place that
-            # probes, strikes, and activates, so a struck top candidate can
-            # never be the one this call ends up switching onto.
+            # from the NEXT `_select_best_switchable` call via `struck`
+            # (`_slot_token_dead` alone is not enough here — it needs a
+            # SECOND strike before it agrees a row is dead, so within one
+            # call it would pick the same just-struck candidate right back
+            # up; see `_select_best_switchable`'s `exclude` docstring), so
+            # this can loop at most once per slot before landing on
+            # "none"/"stay"/a live target. A dead verdict from
+            # `_perform_switch`'s own pre-lock liveness probe (issue #199)
+            # advances the same way — it is the one place that probes,
+            # strikes, and activates, so a struck top candidate can never be
+            # the one this call ends up switching onto.
             for _ in range(len(sequence)):
                 if target is None:
                     break
                 try:
                     op = self._perform_switch(target, emit_output=not json_output)
                 except TargetCredentialDead:
+                    struck.add(target)
                     target, note = self._select_best_switchable(
-                        current_num, models, best_usage, current_at_limit
+                        current_num, models, best_usage, current_at_limit,
+                        exclude=struck,
                     )
                     continue
                 return (
@@ -6931,9 +6957,11 @@ class ClaudeAccountSwitcher:
         #
         # The whole scan is retried, bounded by the candidate count, when
         # `_perform_switch`'s own liveness probe (issue #199) proves a
-        # selected candidate dead: the strike it records makes the same scan
-        # skip that slot on the next pass (`_slot_token_dead` below), so the
-        # retry always makes progress rather than reselecting it.
+        # selected candidate dead: `struck` (below) makes the same scan skip
+        # that slot on the next pass, so the retry always makes progress
+        # rather than reselecting it. `_slot_token_dead` alone cannot carry
+        # this within one call — it needs a SECOND strike before it agrees a
+        # row is dead (see `_select_best_switchable`'s `exclude` docstring).
         for _ in range(len(sequence)):
             anchor = current_num if strategy == "next-available" else active_account
             try:
@@ -6973,7 +7001,7 @@ class ClaudeAccountSwitcher:
                             f"cswap --add-account --slot {candidate})"
                         )
                     continue
-                if self._slot_token_dead(
+                if candidate in struck or self._slot_token_dead(
                     candidate,
                     data.get("accounts", {}).get(candidate, {}).get("email", ""),
                 ):
@@ -7083,6 +7111,7 @@ class ClaudeAccountSwitcher:
                     next_account, emit_output=not json_output, provenance=provenance
                 )
             except TargetCredentialDead:
+                struck.add(next_account)
                 continue
             return (
                 self._switch_result_from_op(op, strategy_label, warnings)
@@ -7205,7 +7234,9 @@ class ClaudeAccountSwitcher:
         # The switch-time liveness guard (issue #199) lives in
         # `_perform_switch` itself — the one choke point every activation
         # routes through — so this call gets it for free; a dead verdict
-        # raises `TargetCredentialDead` after striking the slot.
+        # raises `TargetCredentialDead` after striking the slot, and an
+        # undetermined one (a real 401, no verdict from the escalation)
+        # raises `TargetCredentialUnconfirmed` without striking it.
         try:
             op = self._perform_switch(
                 target_account,
@@ -7224,12 +7255,17 @@ class ClaudeAccountSwitcher:
             else:
                 cur_ref = None
             message = str(exc)
+            reason = (
+                "target-credential-unconfirmed"
+                if isinstance(exc, TargetCredentialUnconfirmed)
+                else "target-credential-dead"
+            )
             if not json_output:
                 warning(message)
                 return None
             return self._switch_noop(
                 strategy="direct",
-                reason="target-credential-dead",
+                reason=reason,
                 from_ref=cur_ref,
                 to_ref=cur_ref,
                 message=message,
@@ -8050,7 +8086,7 @@ class ClaudeAccountSwitcher:
 
     def _probe_target_credential(
         self, num: str, email: str, creds: str
-    ) -> tuple[bool | None, str | None]:
+    ) -> tuple[bool | None, str | None, bool]:
         """Confirm a switch target's stored credential is actually accepted
         by the API before it is ever activated — called BEFORE any lock (see
         `_perform_switch`'s "no network while locks are held" invariant).
@@ -8065,35 +8101,67 @@ class ClaudeAccountSwitcher:
         the profile GET already answers "is this token good right now", so
         the escalation fires only on an ACTUAL 401, never on a clock guess.
 
-        Returns ``(live, creds_to_activate)``:
+        `outcome.error is None` from the gate is NOT "the API accepted it" —
+        it also covers two shapes that never POST at all (the world already
+        moved past the caller's snapshot with a fresh generation; a CAS
+        conflict that adopts a racing writer's lineage), either of which may
+        itself carry a revoked grant. So a success from the gate is
+        RE-PROBED here with its own profile GET before it is trusted.
 
-        - ``(True, creds)`` — confirmed live: a profile 200, or a 401
-          followed by a successful refresh, in which case ``creds`` is the
-          REFRESHED blob, not the input.
-        - ``(False, None)`` — dead: a 401 followed by a refresh that
-          answered a permanent auth error. Already struck, through the same
-          writer the collector uses (see `_strike_dead_target`).
-        - ``(None, creds)`` — transport failure, or nothing to probe (a
-          non-OAuth blob): no verdict, proceed as before.
+        Returns ``(live, creds_to_activate, proven_401)``:
+
+        - ``(True, creds, False)`` — confirmed live: a profile 200, or a 401
+          whose escalation (refresh or re-probe of a freshened credential)
+          confirmed a live token, in which case ``creds`` is that credential,
+          not the input.
+        - ``(False, None, True)`` — dead: a 401 followed by a refresh (or a
+          re-probe of a freshened credential) that came back dead. Already
+          struck, through the same writer the collector uses (see
+          `_strike_dead_target`).
+        - ``(None, creds, False)`` — transport failure on the profile GET
+          itself, or nothing to probe (a non-OAuth blob): no verdict at all,
+          proceed as before.
+        - ``(None, creds, True)`` — the access token got a REAL 401, but the
+          escalation could not confirm it dead or alive (consume-lock
+          contention, a transient refresh failure, or a transport failure
+          re-probing a freshened credential): not proven dead, so nothing is
+          struck — but a proven refusal, so it must not be activated blind
+          either (`TargetCredentialUnconfirmed`).
         """
         oauth_data = oauth.extract_oauth_data(creds) or {}
         access_token = oauth_data.get("accessToken")
         if not access_token:
-            return None, creds  # nothing to probe (non-OAuth blob)
+            return None, creds, False  # nothing to probe (non-OAuth blob)
         live = oauth.probe_oauth_profile_live(access_token)
         if live is True:
-            return True, creds
+            return True, creds, False
         if live is None:
-            return None, creds  # transport failure — no verdict
+            return None, creds, False  # transport failure — no verdict
+        # A real 401 from here on: every return below is `proven_401=True`.
         outcome = self.consume_backup_grant(num, email, creds)
         if outcome.error is None and outcome.credentials:
-            return True, outcome.credentials
+            reprobe_oauth = oauth.extract_oauth_data(outcome.credentials) or {}
+            reprobe_token = reprobe_oauth.get("accessToken")
+            reprobe_live = (
+                oauth.probe_oauth_profile_live(reprobe_token)
+                if reprobe_token else None
+            )
+            if reprobe_live is True:
+                return True, outcome.credentials, False
+            if reprobe_live is False:
+                self._strike_dead_target(
+                    num, email,
+                    outcome.consumed_fp
+                    or oauth.credential_fingerprint(outcome.credentials),
+                )
+                return False, None, True
+            return None, creds, True  # re-probe gave no verdict
         if outcome.error in PERMANENT_AUTH_ERRORS:
             self._strike_dead_target(
                 num, email, outcome.consumed_fp or oauth.credential_fingerprint(creds)
             )
-            return False, None
-        return None, creds  # transient (network trouble, lock contention, ...)
+            return False, None, True
+        return None, creds, True  # consume-busy/transient after a confirmed 401
 
     def _refuse_session_shell(self) -> None:
         """Refuse live-store mutation from inside a ``cswap run`` shell.
@@ -8153,9 +8221,12 @@ class ClaudeAccountSwitcher:
         routes activation through here, so probing here — pre-lock, after the
         session check, before ``_prefetch_live_identity`` — reaches all of
         them from one place. A dead verdict raises ``TargetCredentialDead``
-        (after striking the slot through ``_probe_target_credential``); a
-        multi-candidate caller catches it and advances, `switch_to` converts
-        it to the existing ``target-credential-dead`` noop. Skipped when
+        (after striking the slot through ``_probe_target_credential``); an
+        undetermined one (a real 401 whose escalation gave no verdict) raises
+        ``TargetCredentialUnconfirmed`` without striking it. A multi-candidate
+        caller catches either (the latter subclasses the former) and
+        advances; `switch_to` tells them apart to report a distinct
+        reason/message. Skipped when
         ``provenance`` is already set: that only happens on the reconcile
         self-switch, where the "target" is the active slot's own stored
         backup — by definition the older generation the live session has
@@ -8235,7 +8306,7 @@ class ClaudeAccountSwitcher:
                 target_account, pre_email
             )
             if target_creds_probe:
-                live, probed_creds = self._probe_target_credential(
+                live, probed_creds, proven_401 = self._probe_target_credential(
                     target_account, pre_email, target_creds_probe
                 )
                 if live is False:
@@ -8243,6 +8314,14 @@ class ClaudeAccountSwitcher:
                         f"Account-{target_account} ({pre_email})'s stored "
                         "credential was rejected by the API; nothing was "
                         "activated. Log in as it and run: cswap add"
+                    )
+                if live is None and proven_401:
+                    raise TargetCredentialUnconfirmed(
+                        f"Account-{target_account} ({pre_email})'s stored "
+                        "credential got a 401 and the refresh check could not "
+                        "confirm it dead or alive right now (busy or a "
+                        "transient failure); nothing was activated. Try again "
+                        "shortly."
                     )
                 if live is True:
                     probed_fp = oauth.credential_fingerprint(probed_creds)

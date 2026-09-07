@@ -1460,6 +1460,78 @@ class TestFetchOauthProfile:
         )
 
 
+@pytest.mark.no_probe_oauth_profile_live_fake
+class TestProbeOauthProfileLive:
+    """``probe_oauth_profile_live`` — the switch-time liveness oracle (issue
+    #199): unlike ``fetch_oauth_profile`` it must tell a proven 401 apart
+    from an unresolvable failure, since only a proven 401 may ever escalate
+    to spending a refresh token. No test exercised it directly before this
+    one — the autouse ``block_real_switch_target_probe`` stub replaced it in
+    every other test, so a change to its 401/other-4xx/5xx split would have
+    passed the whole suite silently."""
+
+    def _response(self):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"{}"
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+
+    def test_200_is_live(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._response(),
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is True
+
+    def test_401_is_dead(self):
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/profile", 401,
+            "Unauthorized", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is False
+
+    def test_403_is_no_verdict(self):
+        """A 403 is not a 401: this credential may still be alive with a
+        scope/permission problem, and misclassifying it as dead would
+        strike a live account (the defect this test exists to catch)."""
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/profile", 403,
+            "Forbidden", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+    def test_500_is_no_verdict(self):
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/profile", 500,
+            "Internal Server Error", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+    def test_timeout_is_no_verdict(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+    def test_url_error_is_no_verdict(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("down"),
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+
 class TestInvalidGrantTaxonomy:
     """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
     parse — top-level error == "invalid_grant" in the JSON body. Substring
