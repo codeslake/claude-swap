@@ -167,12 +167,38 @@ def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
     Unreadable, past ``UsageEntry.fresh``'s TTL (the collector could not
     refresh it this tick — backoff or a concurrent poller), or a
     collector-struck (``invalid_grant``) token (``token_dead()``, unqualified
-    — the same unbound call ``due_candidate`` uses). The ONE definition of
-    "stale-usage": `_tick_inner`'s proactive/consume-first admission gate.
+    — the same unbound call ``due_candidate`` uses). `_tick_inner`'s
+    consume-first admission HOLD only — sliding to a worse-ranked candidate
+    defeats consume-first's point, so it holds on anything less than fresh.
+    `proactive` has its own, looser bar: ``candidate_is_untrustworthy``.
     `failover` gates on ``token_dead()`` alone (a backed-off peer is a fine
     target when the ACTIVE credential is the one failing).
     """
     return entry is None or not entry.fresh(now) or entry.token_dead()
+
+
+def candidate_is_untrustworthy(entry: UsageEntry | None, now: float) -> bool:
+    """Whether a candidate carries the INCIDENT'S OWN SIGNATURE, `proactive`'s
+    admission bar — the same one the TUI panel already keys on to mark a row
+    "stale" (``autoview.py``'s ``in_backoff``/``consecutive_failures``
+    check), plus ``token_dead()``.
+
+    Deliberately NOT ``candidate_usage_is_stale``: a merely-old poll
+    (``not entry.fresh(now)``) is not disqualifying on its own —
+    ``decision_value()`` already trusts a row well past ``fresh()``'s TTL
+    (``STALE_OK_S``), and refusing on staleness alone blocks a healthy row a
+    live claim just hasn't re-aged yet exactly as hard as a genuinely bad
+    one. It also refuses the API-key last-resort sentinel forever: that slot
+    is never fetched, so ``fetched_at`` never advances and ``fresh()`` is
+    permanently False. ``entry is None`` is not a ranked OAuth candidate
+    (``_rank`` drops headroom-``None``) and is skipped defensively.
+    """
+    return (
+        entry is None
+        or entry.token_dead()
+        or entry.in_backoff(now)
+        or entry.consecutive_failures > 0
+    )
 
 
 # `dynamic`'s own candidate-admission bar. `settings.threshold` decides when
@@ -2120,6 +2146,18 @@ class AutoSwitchEngine:
                     # whose credentials are all fine — only a struck
                     # credential disqualifies a failover target.
                     unusable = entry is not None and entry.token_dead()
+                elif trigger == "proactive":
+                    # `candidate_usage_is_stale`'s full staleness bar (a
+                    # merely-old `fetched_at`) permanently refuses the
+                    # API-key last-resort sentinel (never fetched, so never
+                    # fresh) and a decision-trusted row a live claim just
+                    # hasn't re-aged yet. `proactive` never has a phase-2
+                    # refetch of its own to escape a stale-but-fine row with
+                    # (see the comment above), so it gates on the incident's
+                    # own signature instead — see `candidate_is_untrustworthy`.
+                    unusable = entry is None or candidate_is_untrustworthy(
+                        entry, self.clock()
+                    )
                 else:
                     unusable = entry is None or candidate_usage_is_stale(
                         entry, self.clock()
@@ -2153,9 +2191,9 @@ class AutoSwitchEngine:
                         NoSwitchEvent(
                             reason="stale-candidate-skipped",
                             detail=(
-                                f"account {num} skipped this tick (usage not "
-                                "refreshable, or its credential is struck); "
-                                "trying the next-ranked candidate"
+                                f"account {num} skipped for admission this "
+                                "tick (usage not refreshable, or its "
+                                "credential is struck)"
                             ),
                         )
                     )

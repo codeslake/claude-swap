@@ -2497,6 +2497,44 @@ class TestProactiveExcludesStaleUsage:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "proactive"
 
+    def test_proactive_admits_a_stale_but_decision_trusted_candidate(
+        self, temp_home
+    ):
+        """m-1: past `fresh()`'s SERVE_TTL_S (180 s) is not "cannot be
+        trusted" on its own -- `decision_value()` already trusts this row
+        (well inside STALE_OK_S, 300 s), and nothing about it carries the
+        incident's own signature (no backoff, no failures, no strike). The
+        full staleness predicate refused it; `proactive`'s own bar must
+        admit it."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        trusted_stale = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now - 200.0, age_s=200.0,
+        )
+        outcome = h.tick_with_entries({"1": active_entry, "2": trusted_stale})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_control_the_same_age_with_a_failure_is_still_skipped(
+        self, temp_home
+    ):
+        """Mutant control: identical age, but a recorded failure IS the
+        incident's own signature -- still skipped, proving the admission
+        above is not simply "any entry is now let through"."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        failing_stale = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now - 200.0, age_s=200.0,
+            consecutive_failures=3,
+        )
+        outcome = h.tick_with_entries({"1": active_entry, "2": failing_stale})
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-candidate-skipped" in reasons
+
     def test_proactive_does_not_admit_a_struck_candidate_even_when_fresh(
         self, temp_home
     ):
@@ -2877,10 +2915,21 @@ class TestOutcomeDigestAgainstBase:
         return fleets, stale_by_fleet, head_results
 
     def _mutant(self, tmp_path, fleets, strategy):
-        # Neutralize ONLY the new exclusion (the admission gate always reads
-        # "not stale") on the SAME fleets.
-        with patch(
-            "claude_swap.autoswitch.candidate_usage_is_stale", return_value=False
+        # Neutralize ONLY the exclusions the admission gate can reach (the
+        # gate always reads "not stale"/"not untrustworthy") on the SAME
+        # fleets. `trigger == "proactive"` is reachable under ANY strategy
+        # setting (utilization over threshold with real headroom, regardless
+        # of `settings.strategy`), so its own predicate needs neutralizing
+        # too, not only the consume-first-literal HOLD's.
+        with (
+            patch(
+                "claude_swap.autoswitch.candidate_usage_is_stale",
+                return_value=False,
+            ),
+            patch(
+                "claude_swap.autoswitch.candidate_is_untrustworthy",
+                return_value=False,
+            ),
         ):
             return self._run(AutoSwitchEngine, tmp_path, "mutant", fleets, strategy)
 
@@ -3036,6 +3085,29 @@ class TestApiKeyAccounts:
         self._mark_api_key(h, 2)
         outcome = h.tick_with_usage({
             "1": _usage(100), "2": "api key", "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_api_key_used_on_proactive_when_no_oauth_peer_lands(self, temp_home):
+        """PR #321 gate fix: `_usage(100)` above drives `at-limit`
+        (headroom<=0), which never reaches `_tick_inner`'s admission gate at
+        all -- so it cannot see the full `candidate_usage_is_stale` predicate
+        this test targets. Real headroom (5) with the active over threshold
+        drives `proactive` instead, and the API-key slot's sentinel entry is
+        never fetched (`fetched_at` stays None forever) -- the full staleness
+        bar refuses it permanently even though nothing about it is actually
+        untrustworthy (no backoff, no failures, no strike)."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        outcome = h.tick_with_usage({
+            # #3 fails the landing/hysteresis gate: same utilization as the
+            # active, no improvement to offer.
+            "1": _usage(95), "2": "api key", "3": _usage(95),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
