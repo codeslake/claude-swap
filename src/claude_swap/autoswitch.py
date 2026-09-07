@@ -1970,6 +1970,13 @@ class AutoSwitchEngine:
         # it replaces that gate rather than layering onto it. `at-limit`/
         # `failover` keep the unchanged function entirely (their own
         # trigger literals never reach this block).
+        # ponytail: this block does not carry over `_rank_candidates_pass`'s
+        # no-return bar (never bounce back to the account just left) or the
+        # consume-first two-phase refetch — neither is in #375's own scope,
+        # and a `proactive`/`alternation` switch's own freshness gate
+        # (`_FRESHEN_GATED_TRIGGERS`, unchanged) still refuses a stale
+        # candidate. Add the no-return bar here if a `proactive`/
+        # `alternation` ping-pong is ever measured.
         dynamic_ordered: list[str] | None = None
         if settings.strategy == "dynamic" and trigger == "proactive":
             now = self.clock()
