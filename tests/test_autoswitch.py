@@ -6049,6 +6049,25 @@ class TestWarmthAndAlternation375:
         assert reasons == ["cold"], reasons
         assert h.active_number() == 1
 
+    def test_m1_dynamic_healthy_hold_detail_has_no_false_comparison(
+        self, temp_home
+    ):
+        """m1: utilization (95) can sit ABOVE `settings.threshold` (90)
+        here -- the old `f"{utilization}% < {threshold}%"` detail printed
+        a false "95% < 90%". No comparison glyph; state what the hold
+        means instead."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(95.0),  # active, headroom 5 -- healthy, > threshold
+            "2": _usage(94.0),  # cold, headroom 6 -- below the floor
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        detail = next(
+            e.detail for e in h.events if isinstance(e, NoSwitchEvent)
+        )
+        assert "<" not in detail, detail
+        assert "healthy" in detail, detail
+
     def test_f2_walled_active_admits_the_cold_candidate_above_floor(
         self, temp_home
     ):
@@ -6124,22 +6143,39 @@ class TestWarmthAndAlternation375:
 
     # -- F4: TTL expiry makes a partner cold -----------------------------
 
-    def test_f4_a_partner_past_the_ttl_is_cold_not_a_warm_alternation_pick(
-        self, temp_home
-    ):
+    def test_f4_a_partner_exactly_at_the_ttl_boundary_is_cold(self, temp_home):
+        """m3: pin `_is_warm`'s `<`, not `<=` -- exactly `now - ttl` reads
+        cold. A mutant flipping the comparison must fail this."""
+        h = self._harness(temp_home)
+        ttl = h.engine.settings.cache_ttl_seconds
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,   # past the chunk boundary already
+            "2": h.clock.now - ttl,     # exactly at the TTL -- cold
+        })
+        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a partner exactly at the TTL boundary is "
+            "cold, never a warm alternation pick"
+        )
+        assert h.active_number() == 1
+
+    def test_f4_a_partner_one_second_inside_the_ttl_is_warm(self, temp_home):
+        """m3's other half: one second inside the boundary must still be
+        warm -- pins the same `<` from the other side."""
         h = self._harness(temp_home)
         ttl = h.engine.settings.cache_ttl_seconds
         chunk = h.engine.settings.alternation_chunk_seconds
         self._seed_last_active_at(h, {
             "1": h.clock.now - chunk,       # past the chunk boundary already
-            "2": h.clock.now - ttl - 1.0,   # just past the TTL -- cold
+            "2": h.clock.now - ttl + 1.0,   # one second inside -- warm
         })
         outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
-        assert outcome is TickOutcome.NO_ACTION, (
-            f"got {outcome} — a partner past the cache TTL is cold, never "
-            "a warm alternation pick"
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a partner one second inside the TTL must "
+            "still be a warm alternation pick"
         )
-        assert h.active_number() == 1
+        assert h.active_number() == 2
 
     def test_a_pre_deploy_stray_draining_key_loads_and_ticks_normally(
         self, temp_home
@@ -6175,9 +6211,15 @@ class TestWarmthAndAlternation375:
         though headroom says nothing changed. Without the warm floor
         (`h > SPENT_HEADROOM_PCT`, not `h > 0`) the no-return bar's own
         "barred list is empty and recovered -- retry unbarred" fallback
-        re-admits A anyway. NOT `_usage()`'s bare form for either tick: the
-        reset comparison needs the SAME (5h) window closer at tick 2 than
-        at tick 1, and `_usage()` alone reports no reset at all."""
+        re-admits A anyway (the mutant control below). NOT `_usage()`'s
+        bare form for either tick: the reset comparison needs the SAME (5h)
+        window closer at tick 2 than at tick 1, and `_usage()` alone
+        reports no reset at all.
+
+        I1: with the warm floor intact, A (h=2) is genuinely inadmissible
+        even fully unbarred -- both accounts are now exhausted, so this
+        falls through to the shared exhausted-fleet handling (BLOCKED),
+        not the bar's own NO_ACTION hold."""
         h = self._harness(temp_home)
         self._seed_last_active_at(h, {"2": h.clock.now - 10.0})
         far = _iso_at(h.clock.now + 500 * 3600)
@@ -6193,9 +6235,10 @@ class TestWarmthAndAlternation375:
             "2": _usage(97.0),                    # active, about_to_wall (h=3)
             "1": _usage(98.0, resets_at=near),    # h=2 -- still spent
         })
-        assert outcome is TickOutcome.NO_ACTION, (
+        assert outcome is TickOutcome.BLOCKED, (
             f"got {outcome} — account 1 is still spent (h=2); its reset "
-            "'recovering' alone must not re-admit it"
+            "'recovering' alone must not re-admit it, and with nothing "
+            "else viable this is I1's exhausted-fleet fallthrough"
         )
         assert h.active_number() == 2
 
@@ -6250,6 +6293,105 @@ class TestWarmthAndAlternation375:
         )
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "at-limit", sw.trigger
+        assert h.active_number() == 1
+
+    # -- I1: a genuinely exhausted fleet falls through, not NO_ACTION forever --
+
+    def test_i1_a_genuinely_exhausted_fleet_falls_through_to_blocked_and_sleeps(
+        self, temp_home
+    ):
+        """No prior switch (`no_return is None`) -- the proactive arm's
+        own "nothing cleared even the warm floor" case must fall through
+        to the shared exhausted-fleet handling (BLOCKED, the sleep armed),
+        exactly as best/consume-first do, not return NO_ACTION forever."""
+        h = self._harness(temp_home)
+        soon = _iso_at(h.clock.now + 3600.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0, resets_at=soon),   # active, about_to_wall (h=2)
+            "2": _usage(100.0, resets_at=soon),  # candidate, truly exhausted
+            "3": _usage(100.0, resets_at=soon),
+        })
+        assert outcome is TickOutcome.BLOCKED, (
+            f"got {outcome} — a genuinely exhausted fleet must fall "
+            "through to BLOCKED, not return NO_ACTION early"
+        )
+        assert h.engine._sleep_until_ts is not None, (
+            "the earliest-reset sleep must be armed, exactly as best/"
+            "consume-first do on a truly exhausted fleet"
+        )
+        assert h.active_number() == 1
+
+    def test_i1_the_api_key_last_resort_is_reached_when_configured(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home, strategy="dynamic", include_api_key_accounts=True,
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "key@token.local")
+        h.make_live("acct1@example.invalid", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0),  # active, about_to_wall (h=2), no oauth peer
+            "2": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — with no oauth candidate at all, the api-key "
+            "last resort must be reached exactly as best/consume-first do"
+        )
+        assert h.active_number() == 2
+
+    # -- I2: the incoming stamp is alternation's own chunk-timer origin --
+
+    def test_i2_the_incoming_stamp_gates_alternations_own_chunk_timer(
+        self, temp_home
+    ):
+        """A landing target for a PROACTIVE switch can already be warm
+        from an earlier cycle -- arrival must OVERWRITE that stale
+        `lastActiveAt` entry with the fresh arrival time, or alternation's
+        own chunk timer reads it as dwelt-on far longer than it has been,
+        and fires on the very next post-cooldown tick instead of waiting a
+        full chunk."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        start = h.clock.now
+        # "2" warm from an earlier cycle -- stale enough that, left
+        # un-overwritten, `now - since` clears a full chunk within one
+        # cooldown of arriving.
+        self._seed_last_active_at(h, {"2": start - (chunk - 250.0)})
+
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0),  # active, about_to_wall (h=2)
+            "2": _usage(50.0),  # warm, real headroom -- proactive landing
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 2
+
+        h.clock.advance(301.0)  # past cooldown, short of a full chunk
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "2": _usage(50.0),  # active, healthy -- dynamic-healthy now
+            "1": _usage(30.0),  # warm partner (just departed)
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — the incoming stamp must reset 2's dwell "
+            "clock on arrival; alternation must not fire before a full "
+            "chunk has elapsed since the actual arrival"
+        )
+
+        h.clock.advance(chunk - 301.0)
+        outcome = h.tick_with_usage({"2": _usage(50.0), "1": _usage(30.0)})
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — alternation must fire once a full chunk "
+            "has elapsed since the actual arrival"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
         assert h.active_number() == 1
 
     def test_the_default_chunk_stays_well_under_half_the_ttl(self, temp_home):

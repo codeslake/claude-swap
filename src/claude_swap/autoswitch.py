@@ -1810,17 +1810,20 @@ class AutoSwitchEngine:
                 barred, hroom, usage, at_now, last_active_at,
                 settings.cache_ttl_seconds,
             )
+            bar_active = no_return is not None
             if no_return is not None and not warm and not cold and recovered:
                 warm, cold = _rank_dynamic_candidates(
                     cands, hroom, usage, at_now, last_active_at,
                     settings.cache_ttl_seconds,
                 )
-            return warm, cold
+                bar_active = False
+            return warm, cold, bar_active
 
         dynamic_ordered: list[str] | None = None
+        dynamic_any_known = True
         if settings.strategy == "dynamic" and trigger == "proactive":
             now = self.clock()
-            warm_ordered, cold_ordered = _dynamic_rank(
+            warm_ordered, cold_ordered, bar_active = _dynamic_rank(
                 oauth_candidates, headroom, now, active_headroom,
             )
             floor_headroom = headroom
@@ -1832,7 +1835,7 @@ class AutoSwitchEngine:
                 # candidates`'s own model retry applies, before calling it
                 # a real blackout.
                 unmodeled = _headroom_by_account(usage, ())
-                warm_ordered, cold_ordered = _dynamic_rank(
+                warm_ordered, cold_ordered, bar_active = _dynamic_rank(
                     oauth_candidates, unmodeled, now, unmodeled.get(current),
                 )
                 floor_headroom = unmodeled
@@ -1844,13 +1847,41 @@ class AutoSwitchEngine:
                 n for n in cold_ordered
                 if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
             ]
-            if not dynamic_ordered:
+            if not dynamic_ordered and cold_ordered:
+                # Real headroom exists but none of it clears the floor
+                # (item 3c: below-floor cold is for at-limit/failover only)
+                # -- a deliberate refusal, stay on the normal poll cadence.
                 self._emit(
                     NoSwitchEvent(
-                        reason="below-floor" if cold_ordered else "no-viable-target"
+                        reason="below-floor",
+                        detail=(
+                            f"{len(cold_ordered)} cold candidate(s) below "
+                            f"the {pct_label(settings.cold_switch_cost_pct)}% "
+                            "floor"
+                        ),
                     )
                 )
                 return TickOutcome.NO_ACTION
+            if not dynamic_ordered and bar_active:
+                # The no-return bar (item 2) is holding this, not a
+                # genuinely viable-free fleet -- a deliberate hold pending
+                # recovery, same as before I1.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-viable-target",
+                        detail="the only candidate is barred pending recovery",
+                    )
+                )
+                return TickOutcome.NO_ACTION
+            if not dynamic_ordered:
+                # I1: nothing cleared even the warm floor, and no bar is
+                # holding it -- fall through to the shared exhausted-fleet
+                # handling below (BLOCKED, the sleep, the api-key last
+                # resort) exactly as best/consume-first do, instead of
+                # returning early.
+                dynamic_any_known = any(
+                    floor_headroom.get(n) is not None for n in oauth_candidates
+                )
         elif settings.strategy == "dynamic" and trigger == "dynamic-healthy":
             now = self.clock()
             # NOT `_dynamic_rank`: the no-return bar would permanently
@@ -1885,12 +1916,18 @@ class AutoSwitchEngine:
                     reason = "below-floor"
                 else:
                     reason = "below-threshold"
+                # m1: the active is healthy (not about to wall) here on
+                # EITHER side of `settings.threshold` -- no `< threshold`
+                # comparison, which can print a false "95% < 90%".
+                # m1: the active is healthy (not about to wall) here on
+                # EITHER side of `settings.threshold` -- no `< threshold`
+                # comparison, which can print a false "95% < 90%".
                 self._emit(
                     NoSwitchEvent(
                         reason=reason,
                         detail=(
-                            f"{pct_label(utilization)}% < "
-                            f"{pct_label(settings.threshold)}%"
+                            f"active account is healthy ({pct_label(active_headroom)}"
+                            "% headroom, not about to wall)"
                         ),
                     )
                 )
@@ -2011,7 +2048,7 @@ class AutoSwitchEngine:
             # Already admitted+ranked above (item 3/4) — never re-enter
             # `_rank_candidates_pass`.
             ordered, any_known, active_reset_ts, waiting_for_recovery = (
-                dynamic_ordered, True, None, False
+                dynamic_ordered, dynamic_any_known, None, False
             )
         else:
             ordered, any_known, active_reset_ts, waiting_for_recovery = _rank(
@@ -2319,7 +2356,12 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.ERROR
-        self._emit(NoSwitchEvent(reason="no-viable-target"))
+        self._emit(
+            NoSwitchEvent(
+                reason="no-viable-target",
+                detail=f"{len(ordered)} ranked candidate(s), none freshened",
+            )
+        )
         return TickOutcome.BLOCKED
 
     def _no_return_account(
