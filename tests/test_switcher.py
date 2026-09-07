@@ -7453,6 +7453,270 @@ class TestUsageAwareSwitch:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
 
+class TestSwitchTargetLivenessGuard:
+    """A switch must never activate a credential the API has already
+    revoked: the chosen target is probed (or, near expiry, refreshed)
+    BEFORE any lock, and a dead verdict strikes the slot through the same
+    writer the collector uses rather than being activated."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": f"sk-{num}",
+                    "refreshToken": f"rt-{num}",
+                },
+            }),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({
+                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+            }),
+        )
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+        }))
+
+    @staticmethod
+    def _usage(pct: float) -> dict:
+        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+
+    def _identity(self, email: str) -> tuple[str, str]:
+        return (email, "")
+
+    def test_ranked_switch_strikes_dead_top_candidate_and_lands_on_next(
+        self, temp_home: Path
+    ):
+        """current_at_limit zeroes the current account's headroom, so any
+        positive-headroom candidate wins. Account 2 ranks first (most
+        headroom) but its probe answers 401 and its refresh-token grant is
+        also dead: it must be struck and NOT activated, and the next-best
+        (account 3, a plain profile 200) activated instead — with the live
+        credential file holding account 3's own blob."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(50), "2": self._usage(5), "3": self._usage(30)}
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-2": False, "sk-3": True}.get(token)
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch(
+                 "claude_swap.oauth.probe_oauth_profile_live",
+                 side_effect=fake_probe,
+             ), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+             ), \
+             patch.object(s, "list_accounts"):
+            result = s.switch(
+                strategy="best", json_output=True, current_at_limit=True
+            )
+
+        assert result["switched"] is True
+        assert result["to"]["number"] == 3
+        assert result.get("validated") is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+        assert s._usage_store.entries(
+            {"2": self._identity("b@example.com")}
+        )["2"].token_dead()
+        live = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        assert live["claudeAiOauth"]["accessToken"] == "sk-3"
+
+    def test_explicit_target_dead_credential_is_refused_not_activated(
+        self, temp_home: Path
+    ):
+        """A profile 401 alone is refused only once the refresh token also
+        fails to mint a new access token — the same disambiguation
+        `_freshen_target` relies on for a routine near-expiry rotation."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        creds_path = temp_home / ".claude" / ".credentials.json"
+        before = creds_path.read_bytes()
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=False
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is False
+        assert result["reason"] == "target-credential-dead"
+        assert "Account-2" in result["message"]
+        assert creds_path.read_bytes() == before  # nothing written live
+        assert s._usage_store.entries(
+            {"2": self._identity("b@example.com")}
+        )["2"].token_dead()
+
+    def test_profile_401_but_refresh_token_still_good_activates_refreshed(
+        self, temp_home: Path
+    ):
+        """A profile 401 on an access token that is merely due for its
+        normal rotation must NOT be treated as dead: the refresh disambiguates
+        it, and the switch activates the REFRESHED blob."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+        refreshed = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-2-fresh", "refreshToken": "rt-2-fresh",
+            },
+        })
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=False
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(refreshed, None),
+        ):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is True
+        assert result.get("validated") is True
+        live = json.loads(
+            (temp_home / ".claude" / ".credentials.json").read_text()
+        )
+        assert live["claudeAiOauth"]["accessToken"] == "sk-2-fresh"
+
+    def test_transport_failure_activates_as_before_with_no_validated_key(
+        self, temp_home: Path
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=None
+        ):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is True
+        assert "validated" not in result
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_selection_skips_already_dead_slot_without_probing_it(
+        self, temp_home: Path
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        identity2 = self._identity("b@example.com")
+        s._usage_store.record(
+            {"2": FetchRecord(error="invalid_grant")}, {"2": identity2}
+        )
+        assert s._usage_store.entries({"2": identity2})["2"].token_dead()
+
+        usage = {"1": self._usage(50), "2": self._usage(5), "3": self._usage(30)}
+        probed_tokens: list[str] = []
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            probed_tokens.append(token)
+            return True
+
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch(
+                 "claude_swap.oauth.probe_oauth_profile_live",
+                 side_effect=fake_probe,
+             ), \
+             patch.object(s, "list_accounts"):
+            result = s.switch(
+                strategy="best", json_output=True, current_at_limit=True
+            )
+
+        assert "sk-2" not in probed_tokens  # never probed: already known dead
+        assert result["to"]["number"] == 3
+
+    def test_probe_runs_before_any_lock_is_acquired(self, temp_home: Path):
+        from claude_swap.locking import FileLock
+
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        acquired: list[bool] = []
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            probe_lock = FileLock(s.lock_file)
+            got = probe_lock.acquire(timeout=0)
+            acquired.append(got)
+            if got:
+                probe_lock.release()
+            return True
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ):
+            s.switch_to("2", json_output=True)
+
+        assert acquired == [True]  # the switch's own lock was free at probe time
+
+    def test_control_live_target_activates_and_reports_validated(
+        self, temp_home: Path
+    ):
+        """A live probe (200) activates exactly as it did before this guard
+        existed, plus the new advisory ``validated`` key."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        with patch(
+            "claude_swap.oauth.probe_oauth_profile_live", return_value=True
+        ):
+            result = s.switch_to("2", json_output=True)
+
+        assert result["switched"] is True
+        assert result.get("validated") is True
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
     (~/.claude.lock and ~/.claude.json.lock) while mutating credentials/config,
@@ -11286,6 +11550,7 @@ class TestSwitchRemoveGatesAcceptAlias:
             switcher.switch_to("dev")
         perform.assert_called_once_with(
             "2", emit_output=True, force_activate=False, provenance=None,
+            validated_creds=None,
         )
 
     def test_switch_to_unknown_alias_raises_account_not_found_not_validation(

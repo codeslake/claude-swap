@@ -89,6 +89,7 @@ from claude_swap import poll_policy
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
+    PERMANENT_AUTH_ERRORS,
     UsageEntry,
     UsageStore,
     with_sentinel,
@@ -6106,6 +6107,9 @@ class ClaudeAccountSwitcher:
             if str(n) != str(current_num)
             and self._account_is_switchable(str(n))
             and not self._disabled_from_data(data, str(n))
+            and not self._slot_token_dead(
+                str(n), data.get("accounts", {}).get(str(n), {}).get("email", "")
+            )
         ]
         if not others:
             return None, "none"
@@ -6540,6 +6544,13 @@ class ClaudeAccountSwitcher:
         ``switched`` is derived from whether the live identity actually changed
         (``from != to``) — covering recorded/live drift in plain rotation, not just
         ``switch_to`` onto the already-active account.
+
+        ``validated``: True only when the caller's own pre-lock liveness probe
+        (`_probe_target_credential`) confirmed the activated credential live
+        in THIS call (a 200, or a successful refresh) — absent (not False)
+        whenever no probe ran or it hit a transport failure, so a consumer
+        checking ``result.get("validated")`` can't mistake "didn't check" for
+        "checked and failed".
         """
         from_ref = op["from"]
         to_ref = op["to"]
@@ -6560,6 +6571,8 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if op.get("validated"):
+            result["validated"] = True
         if op.get("needsLogin"):
             # Landing on a slot with no stored login leaves the machine logged
             # out on purpose; callers (TUI, --json consumers) need to say so
@@ -6767,8 +6780,40 @@ class ClaudeAccountSwitcher:
             target, note = self._select_best_switchable(
                 current_num, models, best_usage, current_at_limit
             )
+            # Bounded by the candidate count: a struck candidate is excluded
+            # from the NEXT `_select_best_switchable` call (its own
+            # `_slot_token_dead` filter), so this can loop at most once per
+            # slot before landing on "none"/"stay"/a live target.
+            validated_creds: str | None = None
+            validated: bool | None = None
+            for _ in range(len(sequence)):
+                if target is None:
+                    break
+                accts = self._get_sequence_data() or {}
+                target_email = (
+                    accts.get("accounts", {}).get(target, {}).get("email", "")
+                )
+                probe_creds = self._read_target_credentials(target, target_email)
+                if not probe_creds:
+                    break  # let _perform_switch's own empty-slot handling run
+                live, validated_creds = self._probe_target_credential(
+                    target, target_email, probe_creds
+                )
+                if live is False:
+                    target, note = self._select_best_switchable(
+                        current_num, models, best_usage, current_at_limit
+                    )
+                    continue
+                validated = live  # True (confirmed), or None (transport failure)
+                break
             if target is not None:
-                op = self._perform_switch(target, emit_output=not json_output)
+                op = self._perform_switch(
+                    target,
+                    emit_output=not json_output,
+                    validated_creds=validated_creds,
+                )
+                if validated:
+                    op["validated"] = True
                 return (
                     self._switch_result_from_op(op, strategy_label, warnings)
                     if json_output else None
@@ -7095,12 +7140,50 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
+        target_email = data.get("accounts", {}).get(target_account, {}).get("email", "")
+        probe_creds = self._read_target_credentials(target_account, target_email)
+        validated_creds: str | None = None
+        validated: bool | None = None
+        if probe_creds:
+            live, validated_creds = self._probe_target_credential(
+                target_account, target_email, probe_creds
+            )
+            if live is False:
+                identity = self._get_current_account()
+                if identity is not None:
+                    cur_num = self._find_account_slot(data, identity[0], identity[1])
+                    cur_ref = (
+                        account_ref(int(cur_num), identity[0])
+                        if cur_num else account_ref(None, identity[0])
+                    )
+                else:
+                    cur_ref = None
+                message = (
+                    f"Account-{target_account} ({target_email})'s stored "
+                    "credential was rejected by the API; nothing was "
+                    "activated. Log in as it and run: cswap add"
+                )
+                if not json_output:
+                    warning(message)
+                    return None
+                return self._switch_noop(
+                    strategy="direct",
+                    reason="target-credential-dead",
+                    from_ref=cur_ref,
+                    to_ref=cur_ref,
+                    message=message,
+                )
+            validated = live
+
         op = self._perform_switch(
             target_account,
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            validated_creds=validated_creds,
         )
+        if validated:
+            op["validated"] = True
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
@@ -7898,6 +7981,70 @@ class ClaudeAccountSwitcher:
         # The UNREADABLE raise above stays: that one must not become a re-add.
         return ""
 
+    def _strike_dead_target(
+        self, num: str, email: str, struck_fp: str | None
+    ) -> None:
+        """Record a switch-time DEAD verdict through the same writer the
+        collector uses, so the panel, the collector and `_slot_token_dead`
+        all see it — a strike this call didn't produce must still heal it.
+        """
+        data = self._get_sequence_data() or {}
+        org = (
+            (data.get("accounts", {}).get(num) or {})
+            .get("organizationUuid", "") or ""
+        )
+        self._usage_store.record(
+            {num: FetchRecord(error="invalid_grant", struck_fp=struck_fp)},
+            {num: (email, org)},
+        )
+
+    def _probe_target_credential(
+        self, num: str, email: str, creds: str
+    ) -> tuple[bool | None, str | None]:
+        """Confirm a switch target's stored credential is actually accepted
+        by the API before it is ever activated — called BEFORE any lock (see
+        `_perform_switch`'s "no network while locks are held" invariant).
+
+        A profile 401 alone cannot tell "this access token is merely due for
+        its normal rotation" from "the whole grant is dead" — only the
+        refresh token can, so a 401 escalates to a refresh attempt through
+        `consume_backup_grant`, the SAME one-time-use consume gate
+        `_freshen_target` uses, rather than a raw refresh POST: a grant a
+        racing freshen already consumed is adopted, never spent twice.
+        Deliberately not time-gated (no ``is_oauth_token_expired`` check) —
+        the profile GET already answers "is this token good right now", so
+        the escalation fires only on an ACTUAL 401, never on a clock guess.
+
+        Returns ``(live, creds_to_activate)``:
+
+        - ``(True, creds)`` — confirmed live: a profile 200, or a 401
+          followed by a successful refresh, in which case ``creds`` is the
+          REFRESHED blob, not the input.
+        - ``(False, None)`` — dead: a 401 followed by a refresh that
+          answered a permanent auth error. Already struck, through the same
+          writer the collector uses (see `_strike_dead_target`).
+        - ``(None, creds)`` — transport failure, or nothing to probe (a
+          non-OAuth blob): no verdict, proceed as before.
+        """
+        oauth_data = oauth.extract_oauth_data(creds) or {}
+        access_token = oauth_data.get("accessToken")
+        if not access_token:
+            return None, creds  # nothing to probe (non-OAuth blob)
+        live = oauth.probe_oauth_profile_live(access_token)
+        if live is True:
+            return True, creds
+        if live is None:
+            return None, creds  # transport failure — no verdict
+        outcome = self.consume_backup_grant(num, email, creds)
+        if outcome.error is None and outcome.credentials:
+            return True, outcome.credentials
+        if outcome.error in PERMANENT_AUTH_ERRORS:
+            self._strike_dead_target(
+                num, email, outcome.consumed_fp or oauth.credential_fingerprint(creds)
+            )
+            return False, None
+        return None, creds  # transient (network trouble, lock contention, ...)
+
     def _refuse_session_shell(self) -> None:
         """Refuse live-store mutation from inside a ``cswap run`` shell.
 
@@ -7935,6 +8082,7 @@ class ClaudeAccountSwitcher:
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        validated_creds: str | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -7949,6 +8097,11 @@ class ClaudeAccountSwitcher:
         managed live login exists: the stored backup is written over the live
         credentials without backing the live ones up first (post-import recovery
         when the live login is stale).
+
+        ``validated_creds``, when set, is what a caller's own pre-lock
+        ``_probe_target_credential`` confirmed live (or refreshed) — used in
+        place of a fresh ``_read_target_credentials`` so the activated bytes
+        are exactly the ones the probe checked, not a second, unchecked read.
 
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
@@ -8060,7 +8213,7 @@ class ClaudeAccountSwitcher:
                     from_ref = account_ref(None, current_identity[0])
                 else:
                     from_ref = account_ref(int(current_account), current_identity[0])
-                target_creds = self._read_target_credentials(
+                target_creds = validated_creds or self._read_target_credentials(
                     target_account, target_email
                 )
                 if not target_creds:
@@ -8422,7 +8575,7 @@ class ClaudeAccountSwitcher:
                     self._logger.info(f"Backed up account {current_account}")
 
                 # Step 2: Retrieve target account
-                target_creds = self._read_target_credentials(
+                target_creds = validated_creds or self._read_target_credentials(
                     target_account, target_email
                 )
                 if not target_creds:
