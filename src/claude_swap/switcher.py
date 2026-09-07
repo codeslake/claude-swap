@@ -7344,6 +7344,7 @@ class ClaudeAccountSwitcher:
         reason: str,
         current_account: str,
         resolved: dict | None,
+        consumed_fp: str | None = None,
     ) -> str:
         """Preserve an unowned live credential before it is overwritten.
 
@@ -7351,6 +7352,16 @@ class ClaudeAccountSwitcher:
         live store (the bytes may be the only live copy of some account's
         refresh token). The logged evidence doubles as the instrumentation for
         identifying what wrote the credential (#117's writer is unidentified).
+
+        ``consumed_fp``, when given, is the fingerprint of the SLOT'S OWN
+        stored backup at stash time — the generation this stash supersedes.
+        It lets `_adopt_stashed_successor` install the stash back into that
+        slot once its own backup grant is next consumed, the way an ordinary
+        `own-rotated` resync would have. Only pass it when the stash IS a
+        candidate for that slot's own next generation (the "unresolved" arm,
+        which is indistinguishable from a routine rotation) — never for a
+        positively foreign/alien credential, where doing so would let this
+        slot adopt someone else's bytes.
         """
         creds_mtime: str | None = None
         try:
@@ -7374,6 +7385,7 @@ class ClaudeAccountSwitcher:
             {
                 "reason": reason,
                 "configSlot": current_account,
+                "consumedFp": consumed_fp,
                 "fingerprint": oauth.credential_fingerprint(original_creds),
                 "liveOauthAccount": live_oauth_account,
                 "resolvedIdentity": resolved,
@@ -7988,25 +8000,43 @@ class ClaudeAccountSwitcher:
                         warnings_out.append(msg)
                 elif kind == "unresolved":
                     # Ownership could not be established (offline, endpoint
-                    # failure, malformed response, non-OAuth blob). Fail
-                    # open: exact pre-fix backup. Most such divergences are
-                    # the account's own rotation — skipping the backup would
-                    # leave the slot holding a consumed token — and the
-                    # .prev retention inside the write gives even a wrong
-                    # call a best-effort recovery cushion. Log only:
-                    # indistinguishable from a legitimate rotation, so a
-                    # warning would cry wolf.
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
+                    # failure, malformed response, non-OAuth blob). No longer
+                    # fail-open: an incident on 2026-09-07 traced a wrong
+                    # active slot resolving to slot 1 while the live bytes
+                    # were slot 6's; the old pre-fix backup here wrote slot
+                    # 6's refresh token into slot 1's backup, and the pin
+                    # later consumed slot 6's grant under slot 1, forcing a
+                    # re-login. Same as the sibling foreign/alien arms:
+                    # never into a slot, always preserved.
+                    #
+                    # This IS the routine-rotation shape though, so the stash
+                    # carries `consumed_fp` (the slot's own stored backup,
+                    # read now under this same lock) so a later
+                    # `_adopt_stashed_successor` can install it back into
+                    # this slot as its own next generation, rather than
+                    # leaving it stranded until a manual `cswap add`.
+                    self._stash_live_credential(
+                        original_creds, "unresolved", current_account,
+                        provenance.get("resolved"),
+                        consumed_fp=oauth.credential_fingerprint(
+                            self._read_account_credentials(
+                                current_account, current_email
+                            )
+                        ),
                     )
-                    self._write_account_config(
-                        current_account, current_email, original_config
+                    msg = (
+                        "The live credential diverges from Account-"
+                        f"{current_account}'s stored backup and its "
+                        "ownership could not be verified (offline or "
+                        "endpoint failure). It was preserved and not "
+                        f"written into Account-{current_account}. If "
+                        f"Account-{current_account} later cannot "
+                        "authenticate, log in as it and run: cswap add"
                     )
-                    self._logger.info(
-                        f"Backed up account {current_account} (lineage "
-                        "differs from the stored backup and ownership could "
-                        "not be verified — pre-fix backup)"
-                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
                     # these bytes. Refresh only the config backup. (Rare since
