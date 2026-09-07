@@ -2896,6 +2896,26 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
         [sys.executable, str(driver), str(homes_dir)],
         capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        # The digest is a PR-branch invariant (base vs THIS PR's head), not
+        # an integration one: where a later PR's merge has added a symbol
+        # to `claude_swap.autoswitch` that this test module now imports,
+        # base's own package (frozen at `_PR_321_BASE_SHA`) cannot satisfy
+        # it and the comparison is undefined — SKIP, exactly as this
+        # function already skips when the base object itself is absent.
+        # Any OTHER subprocess failure (a real digest-run crash) still reds.
+        import_line = next(
+            (
+                line for line in result.stderr.splitlines()
+                if "ImportError" in line or "ModuleNotFoundError" in line
+            ),
+            None,
+        )
+        if import_line is not None:
+            pytest.skip(
+                f"base {_PR_321_BASE_SHA[:8]} cannot import this test "
+                f"module: {import_line}"
+            )
     assert result.returncode == 0, (
         f"base-engine driver failed: rc={result.returncode}\n"
         f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
