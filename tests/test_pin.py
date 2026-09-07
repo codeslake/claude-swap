@@ -7081,6 +7081,31 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "was condemned on one dead probe alone"
         )
 
+    def test_a_live_daemon_on_a_different_port_does_not_spare_this_config(
+        self, tmp_path, monkeypatch
+    ):
+        """THE SPARE IS MACHINE-WIDE otherwise: an alive pid recorded behind
+        port A must not excuse a config wired to a different, dead port B --
+        a rewire that lost `.claude.json.lock` mid-heal can leave B stranded
+        while a respawned daemon on A is what the record actually names."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead_b = _dead_port()
+        live_a = _dead_port()
+        while live_a == dead_b:
+            live_a = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead_b)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        self._record(sw, port=live_a, pid=os.getpid(), fingerprint="fp")
+
+        assert bool(pin._dead_wired_configs(sw)) is True, (
+            "a config wired to a dead port the daemon's record never named "
+            "was spared because SOME other port's daemon is alive"
+        )
+
     def test_ensure_leaves_the_env_wired_when_the_daemon_record_is_alive(
         self, tmp_path, monkeypatch
     ):
@@ -7185,8 +7210,15 @@ class TestPidIsAliveIsPortableAcrossOS:
         self, monkeypatch, *, open_returns, last_error=0,
         exit_code=259, get_exit_code_succeeds=True,  # 259 == STILL_ACTIVE
     ):
+        """Fakes the `WinDLL("kernel32", use_last_error=True)` handle, not
+        `ctypes.windll.kernel32`: a bare `windll` handle reads `GetLastError`
+        through an intervening ctypes attribute lookup that can clobber the
+        thread's real error value between the failing call and the read, so
+        production goes through `use_last_error=True` + `ctypes.get_last_error()`
+        instead, and the fake must be reachable the same way or it would pin
+        the very shape it exists to catch.
+        """
         import ctypes
-        import types
 
         calls = {"open": [], "close": [], "exit_code": []}
 
@@ -7199,9 +7231,6 @@ class TestPidIsAliveIsPortableAcrossOS:
                 calls["close"].append(handle)
                 return 1
 
-            def GetLastError(self):
-                return last_error
-
             def GetExitCodeProcess(self, handle, out):
                 calls["exit_code"].append(handle)
                 if not get_exit_code_succeeds:
@@ -7210,9 +7239,10 @@ class TestPidIsAliveIsPortableAcrossOS:
                 return 1
 
         monkeypatch.setattr(
-            ctypes, "windll",
-            types.SimpleNamespace(kernel32=_Kernel32()), raising=False,
+            ctypes, "WinDLL",
+            lambda name, use_last_error=False: _Kernel32(), raising=False,
         )
+        monkeypatch.setattr(ctypes, "get_last_error", lambda: last_error, raising=False)
         return calls
 
     def _no_os_kill(self, monkeypatch):
@@ -7293,6 +7323,78 @@ class TestPidIsAliveIsPortableAcrossOS:
         assert pin._pid_is_alive(999) is True, (
             "GetExitCodeProcess failing must not read as confirmed dead"
         )
+
+
+class TestPidIsAliveIsRangeChecked:
+    """`_pid_is_alive`'s own docstring is "Never raises" -- `_port_of_config`
+    range-checks a value before it reaches `socket.connect` for exactly this
+    reason, and this copy dropped that. `pid=0` is not "no pid": on POSIX
+    `os.kill(0, 0)` signals the CALLER's own process group, which is always
+    alive, so a corrupt record naming pid 0 would spare every dead wiring
+    forever. A pid outside the platform's range (`10**30`) makes `os.kill`
+    raise `OverflowError`, not `OSError` -- uncaught by every branch here,
+    and by `heal`'s own try/except too, which reports "Could not heal the
+    cloud pin" and leaves the stranding wiring in place.
+    """
+
+    def test_pid_zero_never_reaches_os_kill(self, monkeypatch):
+        def _boom(*a, **k):
+            raise AssertionError(
+                "os.kill must not be called for pid 0 -- it signals the "
+                "caller's own process group, not 'process 0'"
+            )
+        monkeypatch.setattr(os, "kill", _boom)
+
+        from claude_swap import pin
+
+        assert pin._pid_is_alive(0) is True, (
+            "an out-of-range pid is unknowable, not confirmed dead -- fail closed"
+        )
+
+    def test_a_pid_beyond_the_platform_range_does_not_raise(self):
+        from claude_swap import pin
+
+        assert pin._pid_is_alive(10**30) is True, (
+            "a pid outside the platform's range must fail closed, not raise"
+        )
+
+    def test_heal_survives_an_out_of_range_pid_in_the_daemon_record(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: `heal` must not surface `OverflowError` as 'Could not
+        heal the cloud pin'. An out-of-range pid fails closed exactly like an
+        unreadable one (`TestADaemonRecordCorroboratesAOneShotProbe`'s T3),
+        so the record still corroborates and `heal` reports the same
+        all-clear it would for any other unfalsifiable record."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        import types
+
+        backup = tmp_path / "b"
+        backup.mkdir()
+        (backup / "settings.json").write_text(json.dumps({}))
+        sw = types.SimpleNamespace(
+            backup_dir=backup,
+            _write_json=lambda p, d: p.write_text(json.dumps(d), encoding="utf-8"),
+        )
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        certdir = backup / "pin-proxy"
+        certdir.mkdir(parents=True, exist_ok=True)
+        (certdir / "proxy.json").write_text(
+            json.dumps({"port": dead, "pid": 10**30, "fingerprint": "fp"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(pin, "_live_impl", lambda: None)  # package removed
+
+        changed, message = pin.heal(sw)
+        assert message == "Nothing to heal", (
+            f"an OverflowError from an out-of-range recorded pid was surfaced as: {message!r}"
+        )
+        assert changed is False, message
 
 
 class TestTheDeadPortCanBeInTheOtherConfig:

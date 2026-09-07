@@ -138,18 +138,33 @@ def _pid_is_alive(pid: int) -> bool:
     on `test-windows (pin-cli)` the run after the broadcast fix. So a
     successful open is followed by `GetExitCodeProcess`: only `STILL_ACTIVE`
     means the process itself, not merely its handle, is still running.
+
+    RANGE-CHECKED FIRST, like `_port_of_config` range-checks a port before it
+    reaches `socket.connect`: pid 0 is not "no pid" -- on POSIX `os.kill(0, 0)`
+    signals the CALLER's own process group, which is always alive, not the
+    process this call means to ask about. A pid outside the platform's range
+    (e.g. `10**30`) makes `os.kill` raise `OverflowError`, not `OSError`,
+    which would break this docstring's own "never raises" promise.
     """
     import sys
+
+    if pid <= 0 or pid > 2**31 - 1:
+        return True  # out of range: not a probeable pid, fail closed
 
     if sys.platform == "win32":
         import ctypes
 
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        # `use_last_error=True` + `ctypes.get_last_error()`, not the bare
+        # `ctypes.windll` handle's `GetLastError()`: an intervening ctypes
+        # attribute lookup between the failing call and reading the error can
+        # clobber the real thread error, turning an ACCESS_DENIED (alive)
+        # into a false "dead" that unwires a live pin.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         STILL_ACTIVE = 259
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            return kernel32.GetLastError() == 5  # ERROR_ACCESS_DENIED: exists, alive
+            return ctypes.get_last_error() == 5  # ERROR_ACCESS_DENIED: exists, alive
         try:
             exit_code = ctypes.c_ulong()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
@@ -196,6 +211,29 @@ def _wired_daemon_is_alive(_switcher) -> bool:
     return _pid_is_alive(pid)
 
 
+def _wired_daemon_port(_switcher) -> int | None:
+    """The port a CONFIRMED-alive recorded daemon serves, or None.
+
+    `_wired_daemon_is_alive` answers whether ANY dead wiring may be spared at
+    all; this narrows WHICH one, because the record names one port and a
+    daemon alive on that port says nothing about a wired config on another.
+    Returns None on anything short of "a valid port behind a pid confirmed
+    alive" -- including an unreadable record -- so a caller that cannot
+    narrow keeps its prior, more conservative (machine-wide) behaviour rather
+    than silently narrowing the spare to nothing.
+    """
+    try:
+        certdir = _certdir(_switcher)
+        raw = json.loads((certdir / "proxy.json").read_text(encoding="utf-8"))
+        pid = int(raw["pid"])
+        port = int(raw["port"])
+    except Exception:  # noqa: BLE001 — unreadable/missing: caller falls back
+        return None
+    if not (0 < port <= 65535) or not _pid_is_alive(pid):
+        return None
+    return port
+
+
 def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     """Every wired config whose OWN port is not answering -- and no more.
 
@@ -229,7 +267,14 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     # Only asked when the probe already condemns something: an idle machine
     # (nothing dead) never touches the daemon record.
     if dead and _wired_daemon_is_alive(_switcher):
-        return []
+        # THE SPARE MUST NOT BE MACHINE-WIDE EITHER: one recorded pid alive
+        # says nothing about a config wired to a DIFFERENT port. Narrowed to
+        # the port the record actually names; an unreadable/portless record
+        # keeps the old, more conservative machine-wide spare (`None`).
+        rec_port = _wired_daemon_port(_switcher)
+        if rec_port is None:
+            return []
+        dead = [d for d in dead if _port_of_config(d) != rec_port]
     return dead
 
 
