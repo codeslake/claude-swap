@@ -2870,7 +2870,9 @@ def _base_engine_results(tmp_path: Path, strategy: str, seed: int, n_fleets: int
     # HEAD's test module runs against BASE's package: a name this file imports
     # from `claude_swap` that post-dates the base sha reddens the driver
     # (ImportError) instead of skipping.
-    (module_dir / "test_autoswitch.py").write_text(Path(__file__).read_text())
+    (module_dir / "test_autoswitch.py").write_text(
+        Path(__file__).read_text(encoding="utf-8"), encoding="utf-8"
+    )
     homes_dir = tmp_path / f"base_homes_{strategy}"
     homes_dir.mkdir()
     driver = module_dir / "_zz_base_engine_driver.py"

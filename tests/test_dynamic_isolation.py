@@ -215,7 +215,7 @@ class TestDynamicLeavesTheBaseRevisionAlone:
             "print(_json.dumps(out))\n"
         )
         (tmp_path / "test_dynamic_isolation.py").write_text(
-            Path(__file__).read_text()
+            Path(__file__).read_text(encoding="utf-8"), encoding="utf-8"
         )
         driver_path = tmp_path / "_zz_cross_rev_driver.py"
         driver_path.write_text(driver)
