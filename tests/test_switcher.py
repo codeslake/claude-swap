@@ -7281,9 +7281,8 @@ class TestProvenanceGuard:
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
         """A response missing email/organization that matches no slot is
-        indistinguishable from schema drift → unresolved, never alien
-        (preserve-and-skip stays unavailable to a partial response) — but
-        unresolved is itself preserve-and-skip now, never a slot write."""
+        indistinguishable from schema drift → unresolved (pre-fix backup),
+        never alien (preserve-and-skip)."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7303,11 +7302,9 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
-        entries = switcher.list_unclaimed_credentials()
-        assert len(entries) == 1
-        assert next(iter(entries.values()))["reason"] == "unresolved"
-        assert any("could not be verified" in w for w in op["warnings"])
+        assert creds_store[("1", "test@example.com")] == mystery
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
 
     def test_foreign_attribution_survives_missing_email(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7342,11 +7339,12 @@ class TestProvenanceGuard:
     def test_unresolvable_mismatch_backs_up_pre_fix(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """Offline / endpoint failure means the identity oracle is silent.
-        No longer fail-open: an unresolvable divergence is preserved as
-        unclaimed and never backed into the outgoing slot (2026-09-07
-        incident: a foreign refresh token consumed under the wrong slot
-        forced a re-login)."""
+        """The fail-open core: offline / endpoint failure means the identity
+        oracle is silent, and the switch behaves exactly pre-fix — the
+        divergent bytes are backed into the outgoing slot (most such
+        divergences are the account's own rotation; skipping would leave the
+        slot holding a consumed token), with no safety copy and no
+        user-facing warning."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7363,15 +7361,10 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        # Outgoing slot's backup is untouched; the mystery bytes are stashed.
-        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
-        entries = switcher.list_unclaimed_credentials()
-        assert len(entries) == 1
-        (entry_id,) = entries
-        assert _read_safety_copy(switcher, entry_id) == mystery
-        assert entries[entry_id]["reason"] == "unresolved"
-        assert any("could not be verified" in w for w in op["warnings"])
-        # The switch itself proceeded, onto the target's stored backup.
+        # Pre-fix backup happened; the switch completed quietly.
+        assert creds_store[("1", "test@example.com")] == mystery
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
     def test_unresolvable_mismatch_with_wrong_active_slot_never_poisons_it(
@@ -7381,8 +7374,14 @@ class TestProvenanceGuard:
         the un-spliced identity file names slot 1's email. Two independent
         guards must both hold: the roster's active slot (2) is not
         overridden by the unverified identity-file claim (never attributed
-        to slot 1), and even if it were, an unresolved divergence is never
-        backed into whichever slot is named."""
+        to slot 1) -- but the fail-open backup that follows still writes
+        under `current_email` (the identity file's claim, "test@example.com"),
+        never under slot 2's OWN registered email
+        ("account2@example.com"). So the write lands on an ORPHAN key the
+        roster never reads back: not poisoning, but not capturing slot 2's
+        rotation either -- a live tracked gap, not a passing property. See
+        the docstring on `_write_account_credentials`'s caller here for the
+        open question this leaves."""
         sample_sequence_data["activeAccountNumber"] = 2
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
@@ -7403,24 +7402,20 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
+        # Never poisoned: slot 1 (the identity file's unverified claim)
+        # never receives the write.
         assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        # NOT YET a positive control: slot 2's REAL backup (keyed on its own
+        # registered email) is left untouched -- the write actually lands
+        # under current_identity's email (an orphan the roster never reads
+        # back), so slot 2's rotation is silently lost rather than captured.
+        # This is the coverage gap: FIX 2 stops the wrong-slot write, but
+        # does not yet make the right-slot write actually land.
         assert creds_store[("2", "account2@example.com")] == a2_backup
-        entries = switcher.list_unclaimed_credentials()
-        assert len(entries) == 1
-        (entry_id, entry) = next(iter(entries.items()))
-        assert _read_safety_copy(switcher, entry_id) == live_bytes
-        # The attribution guard: the outgoing slot named is the roster's
-        # real active slot (2), never the identity file's unverified claim
-        # (1) — an unverified identity override cannot mask which account
-        # the switch left, so a re-login gets pointed at the right slot.
-        assert entry["configSlot"] == "2", (
-            f"outgoing slot misattributed to {entry['configSlot']!r} instead "
-            "of the roster's real active slot 2"
-        )
-        assert any(
-            "could not be verified" in w and "Account-2" in w
-            for w in op["warnings"]
-        )
+        assert ("2", "test@example.com") in creds_store
+        assert creds_store[("2", "test@example.com")] == live_bytes
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
 
     def test_cached_foreign_verdict_survives_a_failed_switch_time_probe(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7465,8 +7460,7 @@ class TestProvenanceGuard:
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
         """A raising profile call must be indistinguishable from None: the
-        switch completes, and the divergent bytes are stashed rather than
-        backed into the outgoing slot."""
+        switch completes with the pre-fix backup."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7487,18 +7481,16 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
-        entries = switcher.list_unclaimed_credentials()
-        assert len(entries) == 1
-        assert next(iter(entries.values()))["reason"] == "unresolved"
-        assert any("could not be verified" in w for w in op["warnings"])
+        assert creds_store[("1", "test@example.com")] == mystery
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
 
     def test_safety_copy_failure_aborts_before_live_overwrite(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """Preservation is the safety boundary for positively-foreign bytes
-        (and, since the unresolved arm now stashes too, for those as well):
-        no safety copy, no switch."""
+        """Preservation is the safety boundary for positively-foreign bytes:
+        no safety copy, no switch. (Never reachable from endpoint failure —
+        the unresolved path writes no safety copy.)"""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7595,8 +7587,7 @@ class TestProvenanceGuard:
     ):
         """A pre-lock resolution only binds to the bytes it resolved: when
         the live store moved in between, the stale answer is discarded and
-        the switch falls back to unresolved — stashed, never backed into
-        the outgoing slot."""
+        the switch falls back to the pre-fix backup of the current bytes."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7621,12 +7612,10 @@ class TestProvenanceGuard:
         finally:
             for p in patches:
                 p.stop()
-        # Stale resolution rejected → unresolved → stashed, slot untouched.
-        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
-        entries = switcher.list_unclaimed_credentials()
-        assert len(entries) == 1
-        assert next(iter(entries.values()))["reason"] == "unresolved"
-        assert any("could not be verified" in w for w in op["warnings"])
+        # Stale resolution rejected → unresolved → pre-fix backup, no copy.
+        assert creds_store[("1", "test@example.com")] == moved
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
 
 
 class TestSelfSwitchProvenance:
@@ -13475,22 +13464,14 @@ class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
         switcher, creds_store, slot2_live = self._witness_gap_switch_harness(
             temp_home, monkeypatch
         )
-        slot2_backup_before = creds_store[("2", "slot2@example.com")]
         with patch.object(switcher, "list_accounts"):
             result = switcher._perform_switch("3", emit_output=False)
 
-        # No longer fail-open: an unverifiable divergence is stashed, never
-        # backed into the outgoing slot -- the direct-activation path was
-        # correctly NOT taken (this is the ordinary rotation path, proven
-        # by `from` below), but the divergent live bytes are unclaimed
-        # rather than written over slot 2's own backup.
-        assert creds_store[("2", "slot2@example.com")] == slot2_backup_before, (
-            "the unresolved live bytes were backed into the outgoing slot "
-            "instead of being stashed"
+        assert creds_store[("2", "slot2@example.com")] == slot2_live, (
+            "the outgoing slot's backup was not updated with the live bytes "
+            "-- the direct-activation path skipped the backup-current step "
+            "and slot 2's rotated generation was lost"
         )
-        entries = switcher.list_unclaimed_credentials()
-        assert len(entries) == 1
-        assert next(iter(entries.values()))["reason"] == "unresolved"
         assert result["from"] == {"number": 2, "email": "slot2@example.com"}, (
             f"the switch could not attribute who it left: {result['from']!r}"
         )

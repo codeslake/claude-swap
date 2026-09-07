@@ -2443,14 +2443,7 @@ class TestTokenIdentity:
         q = harness.state().get("quarantine", {})
         assert q.get("2", {}).get("reason") == "invalid_grant"
         # The safety copy was not consumed, and the switch landed elsewhere.
-        # (The switch itself also stashes its own outgoing slot 1, whose
-        # divergence the oracle can't resolve in this harness -- no longer
-        # a fail-open backup, so it adds its own unclaimed entry rather
-        # than reusing or displacing the pre-seeded one.)
-        entries = harness.switcher.list_unclaimed_credentials()
-        assert len(entries) == 2
-        reasons = {e.get("reason") for e in entries.values()}
-        assert reasons == {None, "unresolved"}, reasons
+        assert len(harness.switcher.list_unclaimed_credentials()) == 1
         assert outcome is TickOutcome.SWITCHED
         assert harness.active_number() == 3
 
