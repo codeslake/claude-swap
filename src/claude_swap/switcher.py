@@ -7596,9 +7596,25 @@ class ClaudeAccountSwitcher:
             current_identity = self._live_login_identity(ask_server=False)
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = self._find_account_slot(
+                candidate_slot = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
+                # AN IDENTITY FILE CLAIM IS NOT A VERIFICATION. An incident
+                # on 2026-09-07 traced a re-login-forcing credential wipe to
+                # exactly this line: the config's oauthAccount named slot 1
+                # while the roster's real active slot (6) still held the
+                # live credential, and this override took slot 1's word for
+                # it uncontested. Only trust the override when either the
+                # pre-lock oracle actually resolved the live bytes' owner
+                # (`provenance["resolved"]`), or the candidate slot's own
+                # stored backup already matches the live bytes (byte or
+                # refresh-token lineage) — an unmanaged/unresolved candidate
+                # is left as `None` unchanged, which already routes to the
+                # direct-activation path's own stash.
+                if candidate_slot is None or provenance.get("resolved") is not None or (
+                    self._live_matches_slot_backup(candidate_slot, current_email)
+                ):
+                    current_account = candidate_slot
 
             config_path = self._get_claude_config_path()
 
@@ -7972,25 +7988,31 @@ class ClaudeAccountSwitcher:
                         warnings_out.append(msg)
                 elif kind == "unresolved":
                     # Ownership could not be established (offline, endpoint
-                    # failure, malformed response, non-OAuth blob). Fail
-                    # open: exact pre-fix backup. Most such divergences are
-                    # the account's own rotation — skipping the backup would
-                    # leave the slot holding a consumed token — and the
-                    # .prev retention inside the write gives even a wrong
-                    # call a best-effort recovery cushion. Log only:
-                    # indistinguishable from a legitimate rotation, so a
-                    # warning would cry wolf.
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
+                    # failure, malformed response, non-OAuth blob). No longer
+                    # fail-open: an incident on 2026-09-07 traced a wrong
+                    # active slot resolving to slot 1 while the live bytes
+                    # were slot 6's; the old pre-fix backup here wrote slot
+                    # 6's refresh token into slot 1's backup, and the pin
+                    # later consumed slot 6's grant under slot 1, forcing a
+                    # re-login. Same as the sibling foreign/alien arms:
+                    # never into a slot, always preserved.
+                    self._stash_live_credential(
+                        original_creds, "unresolved", current_account,
+                        provenance.get("resolved"),
                     )
-                    self._write_account_config(
-                        current_account, current_email, original_config
+                    msg = (
+                        "The live credential diverges from Account-"
+                        f"{current_account}'s stored backup and its "
+                        "ownership could not be verified (offline or "
+                        "endpoint failure). It was preserved and not "
+                        f"written into Account-{current_account}. If "
+                        f"Account-{current_account} later cannot "
+                        "authenticate, log in as it and run: cswap add"
                     )
-                    self._logger.info(
-                        f"Backed up account {current_account} (lineage "
-                        "differs from the stored backup and ownership could "
-                        "not be verified — pre-fix backup)"
-                    )
+                    if emit_output:
+                        warning(msg)
+                    else:
+                        warnings_out.append(msg)
                 elif kind == "own-bytes":
                     # Untouched since cswap wrote it — the slot already holds
                     # these bytes. Refresh only the config backup. (Rare since
