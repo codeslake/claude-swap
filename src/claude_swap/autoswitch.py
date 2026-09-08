@@ -2002,6 +2002,7 @@ class AutoSwitchEngine:
                 settings.cache_ttl_seconds,
             )
             floor_headroom = headroom
+            model_window_dropped = False
             if (
                 not warm_ordered
                 and not cold_ordered
@@ -2021,6 +2022,7 @@ class AutoSwitchEngine:
                     settings.cache_ttl_seconds,
                 )
                 floor_headroom = unmodeled
+                model_window_dropped = True
             # Alternation: a warm partner past the floor, once we've sat
             # on the active for a full chunk.
             partner = next(
@@ -2046,15 +2048,41 @@ class AutoSwitchEngine:
             # merely idle 5h/7d nobody can spend while every account is
             # Fable-walled alike — is never mistaken for an escape (measured:
             # `floor_headroom`'s unmodeled reading let a peer no better than
-            # the active off the model bar and churned every tick).
+            # the active off the model bar and churned every tick). That
+            # reasoning only holds while the active ITSELF has nothing to
+            # show on the unmodeled axis either: `blackout_escape` requires
+            # BOTH `model_window_dropped` (the retry above fired — a
+            # genuine fleet-wide blackout) AND the active's own
+            # `floor_headroom` failing the same `cold_switch_cost_pct` bar
+            # a candidate must clear — an active that already holds real
+            # unmodeled headroom (own floor_headroom clears the floor) is
+            # not a genuine blackout victim, only walled on the (dropped)
+            # model axis, and admitting a same-or-worse unmodeled peer
+            # there is exactly the swap-for-nothing churn this guards
+            # against (measured: a 3-account fleet all Fable-walled but
+            # holding real, DIFFERING 5h headroom round-robinned onto the
+            # WORSE of the two every tick). Genuinely stranded (own
+            # unmodeled floor_headroom also below the floor, #321's F7) is
+            # the only case that needs the unmodeled axis at all.
+            blackout_escape = (
+                model_window_dropped
+                and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
+            )
             walled_escape = None
             if partner is None and _about_to_wall(raw_active_headroom):
-                escapees = sorted(
-                    (
+                if blackout_escape:
+                    escape_candidates = (
+                        n for n in cold_ordered
+                        if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                    )
+                else:
+                    escape_candidates = (
                         n for n in oauth_candidates
                         if (h := headroom.get(n)) is not None
                         and h > SPENT_HEADROOM_PCT
-                    ),
+                    )
+                escapees = sorted(
+                    escape_candidates,
                     # Soonest-reset first; warmth only breaks an exact tie
                     # (item 4/D) — it never outranks a candidate that comes
                     # back sooner, and it never keeps the active walled.
@@ -2070,7 +2098,13 @@ class AutoSwitchEngine:
                     self._emit(NoSwitchEvent(reason="cooldown"))
                     return TickOutcome.NO_ACTION
                 trigger = "alternation"
-                dynamic_ordered = [walled_escape]
+                # I1: the full ranked list, not just its head — a top
+                # escapee whose credential turns out to be struck/backed-
+                # off must not strand the tick when a lower-ranked one is
+                # admissible (the `proactive` arm's own `dynamic_ordered`
+                # is already `warm_ordered + [floor-clearing cold]` for the
+                # same reason).
+                dynamic_ordered = escapees
             elif (
                 partner is None
                 or since is None
@@ -2107,7 +2141,13 @@ class AutoSwitchEngine:
                     self._emit(NoSwitchEvent(reason="cooldown"))
                     return TickOutcome.NO_ACTION
                 trigger = "alternation"
-                dynamic_ordered = [partner]
+                # I1: the full floor-clearing warm list, not just `partner`
+                # — an untrustworthy top pick must not strand the tick when
+                # a lower-ranked warm candidate is admissible.
+                dynamic_ordered = [
+                    n for n in warm_ordered
+                    if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                ]
 
         if (
             trigger in CONSUME_FIRST_STRATEGIES

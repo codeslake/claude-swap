@@ -6276,6 +6276,36 @@ class TestWarmthAndAlternation375:
         )
         assert h.active_number() == 1
 
+    def test_an_untrustworthy_partner_does_not_strand_the_tick(self, temp_home):
+        """I1's mirror on the ordinary (non-escape) alternation path:
+        `dynamic_ordered` used to be `[partner]` alone, so a struck top-
+        ranked warm partner stranded the tick instead of falling through
+        to the next floor-clearing warm candidate. #2 outranks #3 (more
+        headroom, same untiered 7d reset) so it is `partner`; struck this
+        time — #3 must still be reached.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,
+            "2": h.clock.now - 10.0,
+            "3": h.clock.now - 10.0,
+        })
+        usage = {"1": _usage(50.0), "2": _usage(30.0), "3": _usage(60.0)}
+        entries = {num: _entry_for(value, h.clock.now) for num, value in usage.items()}
+        entries["2"] = UsageEntry(
+            last_good=usage["2"], fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert entries["2"].token_dead()
+        outcome = h.tick_with_entries(entries)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a struck top partner (#2) must not "
+            "strand the tick while a healthy, lower-ranked one (#3) is "
+            "available"
+        )
+        assert h.active_number() == 3
+
     # -- F4: TTL expiry makes a partner cold -----------------------------
 
     def test_f4_a_partner_exactly_at_the_ttl_boundary_is_cold(self, temp_home):
@@ -14603,8 +14633,15 @@ class TestTheModelWindowBindsUnlessItBindsEverywhere:
         candidates on the still-model-gated `headroom` dict with no retry
         of its own, so every real candidate (also Fable-walled) read as
         spent and the tick held below-threshold forever instead of
-        dropping the model set and alternating to #3 (7d 79%, open once
+        dropping the model set and switching to #3 (7d 79%, open once
         Fable drops), exactly as `_rank_candidates`'s own retry does.
+
+        NO account is seeded warm: a genuine fleet-wide blackout must not
+        presuppose a WARM partner (the alternation arm's ordinary partner
+        search only ever considers `warm_ordered`) — the walled-escape
+        must admit a COLD candidate once the model set has legitimately
+        been dropped fleet-wide, ranked on the unmodeled floor headroom
+        (#1 stays below `cold_switch_cost_pct` at 8; #3 clears it at 21).
         """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
         for num, email in (
@@ -14614,18 +14651,6 @@ class TestTheModelWindowBindsUnlessItBindsEverywhere:
         ):
             h.seed(num, email)
         h.make_live("a4@example.invalid", 4)
-        # #4 past the alternation dwell chunk (the ordinary pacing, item 4,
-        # is not what is under test here); #3 warm (inside the cache TTL),
-        # since the healthy arm alternates only onto a WARM partner —
-        # never a cold one, retry or not.
-        h.engine._mutate_state(
-            lambda s: s.update(
-                lastActiveAt={
-                    "4": h.clock.now - h.engine.settings.alternation_chunk_seconds - 1.0,
-                    "3": h.clock.now - 100.0,
-                }
-            )
-        )
         fleet = {
             "4": self._u(8, 86, 100, 100),
             "1": self._u(0, 92, 100, 4),
@@ -14636,7 +14661,8 @@ class TestTheModelWindowBindsUnlessItBindsEverywhere:
             f"got {outcome!r} — a true fleet-wide Fable blackout must "
             "still retry on 5h/7d and switch to #3, not hold "
             "below-threshold forever because the active's widened "
-            "headroom reads healthy"
+            "headroom reads healthy, and it must not require a warm "
+            "partner to do it"
         )
         assert h.active_number() == 3
 
@@ -14829,4 +14855,52 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "fleet"
         )
         assert h.active_number() == 1
+
+    def test_an_untrustworthy_top_escapee_does_not_strand_the_tick(
+        self, temp_home
+    ):
+        """I1: the escape handed the freshen loop a SINGLE candidate
+        (`dynamic_ordered = [walled_escape]`), so a struck top escapee
+        stranded the whole tick instead of falling through to the next
+        admissible one — exactly the defect the `proactive` arm does not
+        have, because its own `dynamic_ordered` is the full ranked list
+        (`warm_ordered + [floor-clearing cold]`). Owner-specimen fixture
+        (``test_the_owners_specimen_switches_to_7``), #7 (soonest binding
+        reset) struck this time — #1 (next by recovery time) must still
+        be reached instead of the tick stranding BLOCKED.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (4, "a4@example.invalid"), (3, "a3@example.invalid"),
+            (2, "a2@example.invalid"), (7, "a7@example.invalid"),
+            (1, "a1@example.invalid"), (6, "a6@example.invalid"),
+            (5, "a5@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        fleet = {
+            "4": self._u(18, 90, 100, days_out=4),
+            "3": self._u(10, 81, 100, days_out=3),
+            "2": self._u(57, 68, 90, days_out=2),
+            "7": self._u(91, 18, 10, days_out=5, five_h_resets=2 * 3600 + 41 * 60),
+            "1": self._u(0, 95, 0, days_out=4),
+            "6": self._u(0, 96, 0, days_out=4),
+            "5": self._u(0, 97, 0, days_out=4),
+        }
+        entries = {num: _entry_for(value, h.clock.now) for num, value in fleet.items()}
+        entries["7"] = UsageEntry(
+            last_good=fleet["7"], fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert entries["7"].token_dead()
+        outcome = h.tick_with_entries(entries)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a struck top escapee (#7) must not "
+            "strand the tick while a healthy, later-ranked one is "
+            "available"
+        )
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} — with #7 struck, the next "
+            "admissible escapee by recovery time must be reached"
+        )
 
