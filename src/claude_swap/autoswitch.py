@@ -156,6 +156,18 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# The engine's own wake floor while the active is within two margins of that
+# bar (adr/0010 R2). The fleet runs `intervalSeconds` 360, so the engine can
+# read 96% at one tick and a wall at the next, never seeing the 3-point band
+# it is supposed to act in. Set to `poll_policy.URGENT_INTERVAL_S`, the
+# tightest cadence the planner will fetch a burning active at, because a wake
+# inside `poll_policy.SERVE_TTL_S` (180s) of the last read is served from the
+# store with no API call: looking this often is nearly free, and it lets the
+# engine act on each urgent fetch the tick it lands instead of up to
+# `interval_seconds` later. This and SPENT_HEADROOM_PCT are the calibration
+# knobs if the fleet is ever measured walling from inside the band.
+DANGER_INTERVAL_S = poll_policy.URGENT_INTERVAL_S
+
 
 def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
     """The used-% a panel should display as "where the proactive arm fires".
@@ -215,6 +227,41 @@ def _about_to_wall(active_headroom: float | None) -> bool:
     for once (see ``_dynamic_active_headroom``'s docstring).
     """
     return (active_headroom or 0.0) <= SPENT_HEADROOM_PCT
+
+
+def _cooldown_yields_to_the_wall(
+    strategy: str, active_headroom: float | None
+) -> bool:
+    """Whether the anti-flap cooldown must stand aside (adr/0010 R1).
+
+    The land bar and the hold bar are the same number. `_rank_dynamic_
+    candidates` drops every candidate at `h <= SPENT_HEADROOM_PCT` and the
+    landing-healthy gate needs `h > SPENT_HEADROOM_PCT`, so the engine
+    REFUSES to land on an account down here — while
+    `_classify_dynamic_trigger` still calls the whole band `proactive`,
+    which is in `_COOLDOWN_GATED_TRIGGERS`, so a `dynamic` active sits
+    unservable for the full `cooldown_seconds`. An account the engine
+    would refuse to land on is one it must be free to leave.
+
+    IT CANNOT FLAP, BY CONSTRUCTION, and that is the check the tests make
+    rather than a scenario: landing requires `h > SPENT_HEADROOM_PCT` and
+    this departure requires `h <= SPENT_HEADROOM_PCT`. The two conditions
+    are disjoint, so the account just left can never be the one next
+    landed on; the bypass can only produce a chain of departures onto
+    accounts with room, bounded by the roster.
+
+    NOT the exemption `_in_cooldown`'s docstring records as reverted: that
+    one lived inside `_in_cooldown` on its own fresh, unwidened `h <= 0`
+    store read, at a trigger (`at-limit`) no cooldown-gated caller reaches.
+    This reads the tick's own already-widened `active_headroom` at the call
+    site, and `dynamic` only — `best` and `consume-first` keep the cooldown
+    they have (adr/0009's fence).
+    """
+    return (
+        strategy == "dynamic"
+        and active_headroom is not None
+        and _about_to_wall(active_headroom)
+    )
 
 
 def _walled_may_take_any_room(about_to_wall: bool, candidate_headroom: float) -> bool:
@@ -1372,6 +1419,9 @@ class AutoSwitchEngine:
         # longer than the normal interval.
         self._sleep_until_ts: float | None = None
         self._blocked_wait_long = False
+        # Per tick too: whether the active is inside the danger band, which
+        # bounds `_next_delay`'s sleep (adr/0010 R2).
+        self._danger_band = False
         # Idle-hold: when the active token expired while Claude Code owns it
         # (and is therefore idle), crawl instead of counting unhealthy ticks.
         # ``_idle_hold_since`` survives across ticks (elapsed-time cap);
@@ -2199,6 +2249,23 @@ class AutoSwitchEngine:
         active_headroom = _dynamic_active_headroom(
             settings, self._models, usage, current, active_headroom
         )
+        # adr/0010 R2: two margins of the bar, on the SAME widened reading
+        # the trigger is classified from. `dynamic` only, so `best` and
+        # `consume-first` keep their sleep byte for byte.
+        #
+        # RECOMPUTED HERE AND DELIBERATELY NOT CLEARED with the other
+        # per-tick flags above: every path that leaves this method earlier
+        # (an unreadable store, a raised collector, an API-key active)
+        # would otherwise report "not in band" for an active the LAST tick
+        # measured in it, and the engine would sleep the full interval for
+        # exactly the tick whose reading failed. A carried-over True costs
+        # one extra wake, served from the store inside SERVE_TTL_S; a
+        # carried-over False costs the observation this rule exists for.
+        self._danger_band = (
+            settings.strategy == "dynamic"
+            and active_headroom is not None
+            and active_headroom <= 2 * SPENT_HEADROOM_PCT
+        )
         # A DISABLED ACTIVE IS NOT A LANDING SPOT. `disable` withdraws a slot
         # from automatic selection and `switchable_account_numbers()` honours
         # that for CANDIDATES, but nothing applied it to the slot the engine is
@@ -2296,7 +2363,11 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in _COOLDOWN_GATED_TRIGGERS and self._in_cooldown(state):
+        if (
+            trigger in _COOLDOWN_GATED_TRIGGERS
+            and not _cooldown_yields_to_the_wall(settings.strategy, active_headroom)
+            and self._in_cooldown(state)
+        ):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -4511,8 +4582,16 @@ class AutoSwitchEngine:
             # "probe" included: it is a consume-first admission (just of an
             # unknown-reset candidate), and must back off under the same
             # concurrent-engine race the ordinary consume-first recheck does.
+            #
+            # `left[0]` is the tick's own widened `active_headroom`, taken
+            # from the same pass the ranking decided on — the recheck must
+            # yield to the wall on the SAME reading the gate above did, or
+            # the bypass is undone here under the lock.
             if (
                 trigger in (*_COOLDOWN_GATED_TRIGGERS, "probe")
+                and not _cooldown_yields_to_the_wall(
+                    self.settings.strategy, left[0]
+                )
                 and self._in_cooldown(state)
             ):
                 self._emit(NoSwitchEvent(reason="cooldown"))
@@ -4953,9 +5032,17 @@ class AutoSwitchEngine:
         precedent — the TUI mutates its own in-memory copy and hands it
         here; nothing here touches disk."""
         self.settings = replace(self.settings, strategy=strategy)
+        # `_danger_band` is deliberately not cleared per tick, so it would
+        # otherwise outlive the strategy it was measured under and cap a
+        # `best`/`consume-first` sleep on the next tick that raises before
+        # the recompute — the one path where a non-dynamic tick reads this
+        # flag at all (adr/0009's fence).
+        self._danger_band = False
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
+        if self._danger_band:
+            interval = min(interval, DANGER_INTERVAL_S)
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
                 delay = self._sleep_until_ts - self.clock()

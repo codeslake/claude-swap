@@ -42,6 +42,7 @@ from claude_swap.autoswitch import (
     classify_candidate_block,
     pct_label,
 )
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import SERVE_TTL_S, STALE_OK_S, FetchRecord, UsageEntry
 from claude_swap.models import Platform
@@ -17044,4 +17045,129 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
             f"got {outcome!r} — with no genuine model-only wall left in "
             "the roster the retry must not fire and the engine must not "
             "invent a candidate"
+        )
+
+
+class TestDynamicNeverWalls0010:
+    """adr/0010: `dynamic` must never wall while any account can serve.
+
+    R1 the cooldown yields once the active is at or under the spent bar,
+    R2 the sleep is bounded while the active is within two margins of that
+    bar. Both gated at ``strategy == "dynamic"``;
+    ``tests/test_dynamic_isolation.py`` holds the fence for the other two
+    strategies.
+    """
+
+    def _harness(self, temp_home, **kwargs):
+        kwargs.setdefault("strategy", "dynamic")
+        kwargs.setdefault("interval_seconds", 360.0)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(3, "acct3@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+        return h
+
+    # -- R1: never hold where you would not land ------------------------
+
+    def test_r1_the_bypass_leaves_a_spent_active_and_cannot_two_cycle(
+        self, temp_home
+    ):
+        """Tick 1: h=2 is below the bar `_rank_dynamic_candidates` refuses
+        to land on, so the account cannot serve — one second into a 300s
+        cooldown the engine must still leave it.
+
+        Tick 2 is the anti-flap argument, not a scenario: landing needs
+        `h > SPENT_HEADROOM_PCT` and this departure needs
+        `h <= SPENT_HEADROOM_PCT`, so the account just left can never be
+        the one next landed on. Still well inside the same cooldown
+        window, where a bypassed tick is free to re-decide.
+        """
+        h = self._harness(temp_home)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 1.0))
+        fleet = {
+            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+            "2": _usage(50.0),                                # headroom 50
+            "3": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+        }
+        outcome = h.tick_with_usage(fleet)
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} ({reasons}) — an account the engine would "
+            "refuse to LAND on must not be held by the cooldown"
+        )
+        assert h.active_number() == 2
+        h.clock.advance(30.0)
+        h.tick_with_usage(fleet)
+        assert h.active_number() == 2, (
+            f"landed back on {h.active_number()} — a spent account must "
+            "never be returned to"
+        )
+
+    # -- R2: look ahead by looking more often ---------------------------
+
+    def test_r2_the_sleep_is_bounded_inside_the_danger_band(self, temp_home):
+        """One branch per assertion, merged because they differ only in the
+        active's headroom and the strategy: in-band under `dynamic` is
+        capped, out-of-band is not, and `consume-first` never is."""
+        from claude_swap.autoswitch import DANGER_INTERVAL_S
+
+        # `_respect_poll_plan` shortens a sleep to the store's own next-poll
+        # time — orthogonal, best-effort, and it would mask the upper bounds
+        # the two control assertions below rest on.
+        cap = DANGER_INTERVAL_S * 1.1
+        # ONE harness, re-engined for the last case: `Path.home()` is patched
+        # to `temp_home` for the whole test, so a second harness rooted at a
+        # SUBDIRECTORY would read this one's live account (see
+        # `EngineHarness.__init__`).
+        in_band_fleet = {
+            "1": _usage(95.0) | {"seven_day": {"pct": 0.0}},  # headroom 5
+            "2": _usage(50.0),
+            "3": _usage(50.0),
+        }
+        h = self._harness(temp_home)
+        with patch.object(AutoSwitchEngine, "_respect_poll_plan", lambda self, d: d):
+            h.tick_with_usage(in_band_fleet)
+            in_band = h.engine._next_delay(TickOutcome.NO_ACTION)
+
+            # A tick that dies before the widening must keep the band it
+            # last measured: the full interval is exactly wrong for the
+            # tick whose reading failed, and the next observation can be
+            # the wall.
+            with patch.object(
+                h.switcher, "usage_entries_by_account",
+                side_effect=ClaudeSwitchError("collector down"),
+            ):
+                assert h.engine.tick() is TickOutcome.ERROR
+            after_error = h.engine._next_delay(TickOutcome.ERROR)
+            # …but it must not outlive the strategy it was measured under.
+            h.engine.apply_strategy("consume-first")
+            after_flip = h.engine._next_delay(TickOutcome.ERROR)
+            h.engine.apply_strategy("dynamic")
+
+            h.tick_with_usage({
+                "1": _usage(50.0), "2": _usage(50.0), "3": _usage(50.0),
+            })
+            healthy = h.engine._next_delay(TickOutcome.NO_ACTION)
+
+            h.settings = replace(h.settings, strategy="consume-first")
+            h.engine = h._make_engine()
+            h.tick_with_usage(in_band_fleet)
+            consume_first = h.engine._next_delay(TickOutcome.NO_ACTION)
+
+        assert in_band <= cap, (
+            f"{in_band}s inside the danger band — the margin is "
+            f"{SPENT_HEADROOM_PCT} points and the tick is 360s"
+        )
+        assert after_error <= cap, (
+            f"{after_error}s after a failed tick — the band the last good "
+            "reading measured must survive an errored one"
+        )
+        assert after_flip > cap, (
+            f"{after_flip}s after flipping to `consume-first` — the band "
+            "must not outlive the strategy it was measured under"
+        )
+        assert healthy > cap, f"{healthy}s — a healthy active keeps the interval"
+        assert consume_first > cap, (
+            f"{consume_first}s — `consume-first` must keep its own sleep"
         )
