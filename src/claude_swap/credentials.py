@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
 
-from claude_swap import macos_keychain
+from claude_swap import macos_keychain, oauth
 from claude_swap.exceptions import (
     ConfigError,
     CredentialError,
@@ -276,6 +276,22 @@ def approved_form(api_key: str) -> str:
     check miss and re-prompt the user to approve the key.
     """
     return api_key.strip()[-20:]
+
+
+def _credential_generation(credentials: str) -> float:
+    """Sort key for picking the NEWEST of several same-slot copies.
+
+    Never-delete means multiple same-email backups can legitimately coexist
+    on disk; "newest wins" is decided the same way ``switcher.py``'s session-
+    vs-backup drift check decides it: by ``expiresAt`` (every refresh and
+    every login issues a token that expires later than the last). Anything
+    that doesn't parse sorts as the oldest rather than raising.
+    """
+    try:
+        data = oauth.extract_oauth_data(credentials) or {}
+        return float(data.get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class _StoreHost(Protocol):
@@ -1180,7 +1196,9 @@ class CredentialStore:
         merely unreadable — see ``_read_account_credentials_ex``), retry the
         same email under every OTHER slot number up to a bound — exact
         lookups only, never a wildcard scan (neither backend supports one).
-        A hit is mirrored under ``account_num`` — the source slot is never
+        Never-delete means several hits can legitimately exist; the NEWEST
+        generation (by ``expiresAt`` — see ``_credential_generation``) is the
+        one mirrored under ``account_num`` — the source slot is never
         touched — so the next read is direct.
 
         Guarding on "is account_num this email's current slot" matters: a
@@ -1224,21 +1242,33 @@ class CredentialStore:
             return ""
         if accounts.get(account_num) != email:
             return ""
+        if not account_num.isdigit():
+            # `accounts.get(account_num) == email` above only proves
+            # `account_num` is a roster KEY, not that it's numeric — a read
+            # must not raise here any more than the comprehension below,
+            # which guards the same `int()` with the same check.
+            return ""
         # The stale number itself is gone from `accounts` (that IS the
         # renumber), so the candidates are a bounded integer sweep, not
-        # `accounts`' own keys. `account_num` is already known to be a key
-        # of `accounts` (the check above), so `int(account_num)` and every
-        # `int(n)` below (guarded by `isdigit`) cannot raise.
+        # `accounts`' own keys.
         #
-        # The dotfiles roster is edited and then synced as ONE wholesale
-        # file write, so N removals land as a single renumber, not just
-        # one: every account in the roster could in principle have shifted
-        # past a bound sized for a single removal, so the ceiling adds one
-        # slot of headroom per account rather than a flat +1.
+        # This ceiling is a HEURISTIC, not a guarantee: the dotfiles roster
+        # is edited and synced as one wholesale file write, so N removals
+        # can land as a single renumber, and `+ len(accounts)` covers that
+        # only while N does not exceed the number of accounts that SURVIVE
+        # the edit (a survivor's leftover shifts down by at most N, and this
+        # adds N slots of headroom per current account). A wholesale write
+        # dropping MORE accounts than remain — e.g. 6 of 8 — can still leave
+        # a leftover past this ceiling (2 survivors give a ceiling of only
+        # +2, not +6). No SOUND bound exists at all on the Keychain backend
+        # (it cannot enumerate, so there is no way to glob for "anything
+        # left over" either) — this is the best available approximation,
+        # not a proof of coverage.
         bound = (
             max([int(account_num)] + [int(n) for n in accounts if n.isdigit()])
             + len(accounts)
         )
+        candidates: list[tuple[str, str]] = []
         for n in range(1, bound + 1):
             other_num = str(n)
             if other_num == account_num:
@@ -1249,7 +1279,7 @@ class CredentialStore:
             if other_email is not None and not probe_reassigned_slots:
                 continue  # occupied by a different identity; see docstring
             sub_failed: list = []
-            value = self._read_account_credentials_direct(other_num, email, sub_failed)
+            candidate = self._read_account_credentials_direct(other_num, email, sub_failed)
             if sub_failed:
                 # The sibling slot is unreadable too (e.g. a locked Keychain
                 # would refuse every slot alike) — stop rather than probing
@@ -1258,19 +1288,35 @@ class CredentialStore:
                 if failed is not None:
                     failed.append(True)
                 return ""
-            if value:
-                try:
-                    if self._host.platform == Platform.MACOS and self._use_keychain():
-                        self._kc_write_backup(account_num, email, value)
-                    else:
-                        self._write_backup_enc(account_num, email, value)
-                except Exception as e:
-                    self._host._logger.warning(
-                        f"Found account {account_num}'s backup relocated under "
-                        f"{other_num}, but could not mirror it back: {e}"
-                    )
-                return value
-        return ""
+            if candidate:
+                candidates.append((other_num, candidate))
+        if not candidates:
+            return ""
+        # Never-delete means every one of these candidates can be a
+        # legitimate, still-live copy — the newest GENERATION wins, not the
+        # first one found by ascending slot number (see `_credential_
+        # generation`).
+        other_num, value = max(candidates, key=lambda c: _credential_generation(c[1]))
+        # Re-read the slot being mirrored into, right before writing it: the
+        # sweep above can run up to `bound` unrelated reads (a locked
+        # Keychain costs 10-50ms each) with no lock held, so a concurrent
+        # writer (e.g. `cswap add`) may have filled `account_num` while it
+        # ran. Never clobber something that landed with an equally-or-more
+        # current generation than what the sweep found.
+        current = self._read_account_credentials_direct(account_num, email)
+        if current and _credential_generation(current) >= _credential_generation(value):
+            return current
+        try:
+            if self._host.platform == Platform.MACOS and self._use_keychain():
+                self._kc_write_backup(account_num, email, value)
+            else:
+                self._write_backup_enc(account_num, email, value)
+        except Exception as e:
+            self._host._logger.warning(
+                f"Found account {account_num}'s backup relocated under "
+                f"{other_num}, but could not mirror it back: {e}"
+            )
+        return value
 
     def _read_account_credentials_direct(
         self, account_num: str, email: str, failed: list | None = None

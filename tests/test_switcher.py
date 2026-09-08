@@ -7885,6 +7885,150 @@ class TestStashAndRetentionStore:
         # The plain read (general-purpose, default) is allowed to.
         assert store._read_account_credentials("1", email_c) == "foreign-leftover"
 
+    @staticmethod
+    def _oauth_creds(expires_at):
+        return json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-x", "refreshToken": "rt-x",
+                "expiresAt": expires_at,
+            }
+        })
+
+    def test_renumber_fallback_converges_on_the_newest_generation_not_the_lowest_slot(
+        self, temp_home,
+    ):
+        """CRITICAL: never-delete means several same-email copies legitimately
+        coexist on disk; the sweep must pick the NEWEST generation, not the
+        first hit by ascending slot number. Concrete failure this reproduces:
+        E at slot 3 (B1) -> a roster edit moves E to 5 (leftover B1 stays at
+        3, a converge read mirrors B1 into 5) -> a re-login writes 5 = B2 ->
+        a later edit moves E to 4. The direct read of 4 is absent; slots 3
+        (B1, older) and 5 (B2, newer) are both reachable by the sweep. Slot 3
+        sorts first, so a lowest-slot-wins sweep would mirror the SPENT B1
+        into 4 while the live B2 sits unread at 5.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        b1 = self._oauth_creds(1000)
+        b2 = self._oauth_creds(2000)
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"3": {"email": email, "uuid": "uuid-e"}},
+            },
+        )
+        store._write_account_credentials("3", email, b1)
+
+        # Roster edit: E moves from 3 to 5. Bare renumber — the backup stays
+        # under 3. A converge read mirrors B1 into 5.
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"5": {"email": email, "uuid": "uuid-e"}},
+            },
+        )
+        assert store._read_account_credentials("5", email) == b1
+
+        # A re-login refreshes the backup at 5 to a newer generation.
+        store._write_account_credentials("5", email, b2)
+
+        # Another roster edit: E moves from 5 to 4. Neither 3 nor 5 remain
+        # roster keys; the direct read of 4 is genuinely absent.
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"4": {"email": email, "uuid": "uuid-e"}},
+            },
+        )
+
+        assert store._read_account_credentials("4", email) == b2, (
+            "DEFECT: the sweep converged on the older generation at the "
+            "lower slot number instead of the newer one"
+        )
+
+    def test_renumber_fallback_never_clobbers_a_fresh_write_that_lands_mid_sweep(
+        self, temp_home,
+    ):
+        """IMPORTANT: the converge write is an unconditional overwrite with
+        no re-read of the slot it's about to fill. A collect worker can read
+        a slot absent and start sweeping while a concurrent writer (e.g.
+        ``cswap add``) writes a fresh login into that same slot; if the
+        converge write lands last it must not replace the fresh login with
+        the stale copy the sweep found.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        stale = self._oauth_creds(1000)
+        fresh = self._oauth_creds(9000)
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"1": {"email": email, "uuid": "uuid-1"}},
+            },
+        )
+        # A stale leftover the sweep will find at slot 2 (freed, off-roster).
+        store._write_account_credentials("2", email, stale)
+
+        orig_direct = store._read_account_credentials_direct
+
+        def racing_direct_read(account_num, email_, failed=None):
+            result = orig_direct(account_num, email_, failed)
+            if account_num == "2":
+                # A concurrent writer lands a fresh login in slot 1 right
+                # after the sweep finds the stale copy at 2, but before the
+                # converge write runs. Writes the raw backup directly (not
+                # via ``_write_account_credentials``) so the racing write
+                # itself doesn't re-enter this patched read.
+                store._write_backup_enc("1", email_, fresh)
+            return result
+
+        with patch.object(
+            store, "_read_account_credentials_direct", side_effect=racing_direct_read,
+        ):
+            store._read_account_credentials("1", email)
+
+        assert store._read_account_credentials_direct("1", email) == fresh, (
+            "DEFECT: the converge write clobbered a fresh login that landed "
+            "mid-sweep with the stale copy the sweep found"
+        )
+
+    def test_renumber_fallback_never_raises_on_a_non_digit_roster_key(
+        self, temp_home,
+    ):
+        """minor, same class as C1: the bound computation's `int(account_num)`
+        was unguarded even though the roster comprehension six lines below
+        guards its own `int(n)` with `isdigit()`. A non-digit roster key
+        must not raise out of a read path."""
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": ["primary"],
+                "accounts": {"primary": {"email": email, "uuid": "uuid-1"}},
+            },
+        )
+        assert store._read_account_credentials("primary", email) == ""
+
 
 class TestActiveRefreshProvenance:
     """_fetch_active_usage must not rotate-and-persist an unattributed
