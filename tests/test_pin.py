@@ -22,8 +22,10 @@ def _fast_default_lock_timeout(monkeypatch):
     every contended-lock scenario here just needs the budget to elapse, and
     9s real wall time paid three times over is what made this file's own
     suite 27.6% of the fork's whole-suite cost. Shrunk once, for every test,
-    rather than per-test: a case that DOES need a specific value (the
-    doubled-deadline arithmetic below) still sets its own on top of this."""
+    rather than per-test: a case that DOES need a specific value — the
+    doubled-deadline arithmetic below, and two mutant-detection budgets that
+    would otherwise land inside this fixture's own 0.3s — still sets its own
+    on top of this."""
     from claude_swap import claude_locks
 
     monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
@@ -1659,8 +1661,15 @@ class TestTheWiringCanAlwaysBeRemoved:
         refreshing credentials, so an unbounded wait stalls the launch."""
         import time
 
+        import claude_swap.claude_locks as claude_locks
         import claude_swap.paths as paths
         from claude_swap import pin
+
+        # Above the 3.0s bar below: the module default (0.3s) is now faster
+        # than `wire_launch_env`'s own explicit budget, so a mutant dropping
+        # that `timeout=` kwarg would fall back to the default and still
+        # clear this assertion. Only the mutant pays this value.
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 4.0)
 
         cfg = self._wired(tmp_path)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
@@ -4841,9 +4850,17 @@ class TestTheLockProbeActuallyProbes:
     def test_a_held_lock_answers_false_within_the_budget(self, tmp_path, monkeypatch):
         import time as _time
 
+        import claude_swap.claude_locks as claude_locks
         import claude_swap.paths as paths
         from claude_swap import pin
         from claude_swap.claude_locks import proper_lockfile
+
+        # Above the 2.0s bar below: the module default (0.3s) now equals this
+        # test's own 0.3s budget, so a mutant dropping `_config_lock_is_free`'s
+        # `timeout=budget` and falling back to the default would land inside
+        # the window too. Only the mutant pays this value; the probe below
+        # always passes its own explicit budget.
+        monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 4.0)
 
         cfg = tmp_path / ".claude.json"
         cfg.write_text("{}")
