@@ -2009,7 +2009,11 @@ class TestActiveAccountRefresh:
         """This is the SECOND POST call site (the consume gate is the
         first) — the bytes gate lives once, inside
         ``oauth.try_refresh_oauth_credentials`` itself, so this site
-        inherits it for free rather than needing its own duplicate check."""
+        inherits it for free rather than needing its own duplicate check.
+        The verdict must also reach the store AS ``foreign-lineage``, not
+        the generic ``refresh-failed`` this site's own error-collapse used
+        to fall back to (2026-09-08 breadth review, F3) — same subject as
+        the consume-gate path, same identity."""
         switcher = self._switcher(sample_sequence_data)
         switcher._probe_verdicts[
             switcher._lineage_key(
@@ -2028,7 +2032,7 @@ class TestActiveAccountRefresh:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
-        assert result.error not in ("invalid_grant", "no_refresh_token")  # no strike
+        assert result.error == "foreign-lineage"  # not the generic "refresh-failed"
 
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -10267,6 +10271,45 @@ class TestConsumeGate:
         mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
         assert result.error == "foreign-lineage"
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_an_unreadable_sequence_file_at_consume_time_never_raises_through_the_pass(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review): the `condemned` check
+        sits OUTSIDE any handler in `_consume_backup_grant_locked` (between
+        the pre-consume window's own `except` and the next `try`), and
+        OUTSIDE `try_refresh_oauth_credentials`'s own POST `try`. Its
+        `_lineage_key` -> `account_identity` -> `_get_sequence_data()` reads
+        `sequence.json` with `strict=True`, which raises `ConfigError` on a
+        torn/unreadable file — and `consume_backup_grant` is try/**finally**,
+        no except, so an uncaught raise here would kill the whole collect
+        pass for every account. R1: unreadable is absence of evidence, never
+        a refusal, and never a raise — the POST must proceed."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        fault_fired = []
+
+        def raises(*a, **kw):
+            fault_fired.append(True)
+            raise ConfigError("sequence.json exists but could not be read")
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "sk-new", "refresh_token": "rt-new",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda self_: self_
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(s, "_lineage_key", side_effect=raises), \
+             patch(
+                 "claude_swap.oauth.urllib.request.urlopen",
+                 return_value=mock_response,
+             ):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.error is None      # absence of evidence -> proceeded, not refused
 
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict
