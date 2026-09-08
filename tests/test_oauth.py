@@ -524,6 +524,43 @@ class TestTryRefreshOAuthCredentials:
         outcome = oauth.try_refresh_oauth_credentials(creds)
         assert outcome.error == "no_refresh_token"
 
+    def test_condemned_true_refuses_before_any_network_call(self):
+        """R1's polarity, proven at the chokepoint itself: a CONFIRMED
+        mismatch refuses without a single byte on the wire."""
+        with patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            outcome = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), condemned=lambda fp: True,
+            )
+        mock_urlopen.assert_not_called()
+        assert outcome.error == "foreign-lineage"
+        assert outcome.credentials is None
+
+    def test_CONTROL_condemned_false_or_absent_still_posts(self):
+        """Positive control: without this, the RED test above would pass
+        just as well for a guard that refuses every refresh. Absence of
+        evidence (``condemned`` returning False, or not passed at all) must
+        never refuse — that is the harm R1 exists to prevent."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            no_condemned = oauth.try_refresh_oauth_credentials(
+                self._make_credentials()
+            )
+            not_condemned = oauth.try_refresh_oauth_credentials(
+                self._make_credentials(), condemned=lambda fp: False,
+            )
+        assert no_condemned.error is None
+        assert not_condemned.error is None
+
     def test_invalid_json_is_transient(self):
         # Changed contract (stale-credential robustness): an unparseable blob
         # is more likely a torn read than a credential shape — it must not

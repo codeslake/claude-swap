@@ -2605,7 +2605,12 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        result = oauth.try_refresh_oauth_credentials(
+            refresh_input,
+            condemned=lambda fp: self._probe_verdicts.get(
+                self._lineage_key(account_num, email, fp)
+            ) is False,
+        )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
@@ -5392,7 +5397,10 @@ class ClaudeAccountSwitcher:
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                            refresh_input, timeout_s=6.0,
+                            condemned=lambda fp: self._probe_verdicts.get(
+                                self._lineage_key(account_num, email, fp)
+                            ) is False,
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"

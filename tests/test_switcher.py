@@ -1818,6 +1818,33 @@ class TestActiveAccountRefresh:
             "1", "test@example.com", self._REFRESHED, attributed=True
         )
 
+    def test_a_condemned_lineage_is_never_posted_by_this_recovery_branch(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """This is the SECOND POST call site (the consume gate is the
+        first) — the bytes gate lives once, inside
+        ``oauth.try_refresh_oauth_credentials`` itself, so this site
+        inherits it for free rather than needing its own duplicate check."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._EXPIRED),
+            )
+        ] = False
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
+        assert result.error not in ("invalid_grant", "no_refresh_token")  # no strike
+
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -10020,6 +10047,42 @@ class TestConsumeGate:
             s.consume_backup_grant("1", "test@example.com", self._OLD)
 
         assert posted["creds"] == profile_newer
+
+    def test_a_lineage_already_condemned_as_foreign_is_never_posted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The bytes gate this chokepoint was missing (2026-09-08 audit): a
+        lineage the oracle already condemned as another account's must
+        never be POSTed here — the elsewhere-checked
+        ``_probe_verdicts.get(_lineage_key(...)) is False`` verdict
+        attaches to THIS slot's re-read bytes too, not only to the `live`
+        adopt branch `_fetch_active_usage` already refuses on. Refusing
+        must not strike the account: a confirmed-foreign lineage is not
+        evidence this slot's OWN grant is dead.
+
+        ``try_refresh_oauth_credentials`` itself runs (not mocked away): the
+        guard lives INSIDE it (the one chokepoint every POST call site
+        shares), so mocking the function wholesale would hide whether the
+        guard fired. ``urlopen`` is mocked instead — the network is the
+        thing that must never see these bytes."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._probe_verdicts[
+            s._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._OLD),
+            )
+        ] = False
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen"
+        ) as mock_urlopen:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
+        assert result.error == "foreign-lineage"
+        assert result.error not in ("invalid_grant", "no_refresh_token")
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict
