@@ -430,6 +430,15 @@ CROSS_PR_WRITE_SITES: dict[tuple[str, str], int] = {
     ("credentials.py", "_read_account_credentials"): 1,
 }
 
+# The union below (`{**EXPECTED_WRITE_SITE_ROSTER, **CROSS_PR_WRITE_SITES}`) lets a
+# CROSS_PR key silently OVERRIDE a reviewed count on collision — a future
+# CROSS_PR_WRITE_SITES entry sharing a key with the reviewed roster would replace its
+# count instead of adding a distinct site, letting an unreviewed second write in that
+# function pass. Keys are disjoint today; keep them that way.
+assert EXPECTED_WRITE_SITE_ROSTER.keys().isdisjoint(CROSS_PR_WRITE_SITES), (
+    "a CROSS_PR site may not override a reviewed roster count"
+)
+
 
 class TestWriteSiteRosterIsReviewed:
     """Every caller of the write chokepoint, derived from the AST rather
