@@ -13220,7 +13220,10 @@ class TestConsumeGate:
 
         mock_refresh.assert_not_called()
         assert result.credentials is None
-        assert result.error == "transient"
+        # Own kind, not "transient": a condemned lineage is deterministic
+        # and local, and must not render as "(network?)" (autoswitch.py's
+        # TestFreshenRoutesThroughGate::test_a_condemned_lineage_is_not_reported_as_network_trouble).
+        assert result.error == "lineage-condemned"
         # nothing consumed; the backup is exactly as it was
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 

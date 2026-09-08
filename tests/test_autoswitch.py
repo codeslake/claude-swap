@@ -10796,6 +10796,36 @@ class TestFreshenRoutesThroughGate:
             status = harness.engine._freshen_target("2", "b@example.com")
         assert status == "store-unmirrored"
 
+    def test_a_condemned_lineage_is_not_reported_as_network_trouble(
+        self, temp_home
+    ):
+        """A slot whose stored backup grant was already condemned as another
+        account's (`_probe_verdicts[...] is False`, set by the active path's
+        own oracle probe) must not fall into "transient": that renders as
+        "could not freshen any candidate (network?)" and the slot silently
+        stops refreshing until the daemon restarts, pointing the operator at
+        the network when the real condition is a foreign credential in the
+        slot's backup. Drives the real gate (no mock on
+        ``consume_backup_grant``) so the deferral this pins is the one
+        `switcher.py`'s condemned-lineage check actually takes.
+        """
+        harness = EngineHarness(temp_home)
+        harness.seed(2, "b@example.com", expires_at=1)
+        stored = harness.switcher._read_account_credentials("2", "b@example.com")
+        harness.switcher._probe_verdicts[
+            harness.switcher._lineage_key(
+                "2", "b@example.com",
+                oauth.credential_fingerprint(stored) or "",
+            )
+        ] = False
+
+        status = harness.engine._freshen_target("2", "b@example.com")
+
+        assert status != "transient", (
+            f"got {status!r}: a condemned lineage read as network trouble"
+        )
+        assert status == "lineage-condemned"
+
     def test_an_actionable_cause_is_not_hidden_by_a_self_clearing_one(
         self, temp_home
     ):

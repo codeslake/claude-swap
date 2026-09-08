@@ -254,9 +254,11 @@ def _parse_token_account(resp_data: dict) -> dict | None:
     }
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
+def refresh_oauth_credentials(
+    credentials: str, slot: str | None = None
+) -> str | None:
     """Refresh an OAuth access token; None on any failure (see RefreshOutcome)."""
-    return try_refresh_oauth_credentials(credentials).credentials
+    return try_refresh_oauth_credentials(credentials, slot=slot).credentials
 
 
 def fetch_oauth_profile(access_token: str) -> dict | None:

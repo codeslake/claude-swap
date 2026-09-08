@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -472,6 +473,28 @@ class TestRefreshOAuthCredentials:
         assert seen_body["refresh_token"] == "old-refresh"
         assert seen_body["client_id"] == oauth.OAUTH_CLIENT_ID
         assert "scope" not in seen_body
+
+    def test_wrapper_attributes_its_post_to_the_caller_slot(self, caplog):
+        """The wrapper still called `try_refresh_oauth_credentials` with no
+        `slot`, so this was the one refresh POST left logging "for account
+        None" — the only one of the two entry points into the refresh POST
+        that a caller with a known slot could not date."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen",
+                   return_value=mock_response), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            oauth.refresh_oauth_credentials(self._make_credentials(), slot="7")
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert "Refresh POST for account 7: ok" in messages, messages
 
 
 class TestTryRefreshOAuthCredentials:

@@ -82,6 +82,8 @@ _SYSTEMIC_MESSAGES = {
                         "keychain or fix the file, then retry; "
                         "`cswap unclaimed` inspects it",
     "consume-busy": "another cswap surface holds the slot — retries next pass",
+    "lineage-condemned": "the slot's stored credential was condemned as "
+                        "another account's — `cswap add` replaces it",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
 # drift apart.

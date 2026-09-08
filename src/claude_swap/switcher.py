@@ -2311,7 +2311,14 @@ class ClaudeAccountSwitcher:
                         "condemned as another account's; deferring rather "
                         "than consuming it.", account_num,
                     )
-                    return oauth.RefreshOutcome(None, "transient")
+                    # Distinct kind, like `stash-unreadable`: deterministic
+                    # and local (a foreign credential in this slot's own
+                    # backup), not network trouble — a bare "transient"
+                    # renders as "(network?)" and the slot silently stops
+                    # refreshing until something outside this process
+                    # replaces the credential (`cswap add`), which is
+                    # exactly the re-login window this gate exists to close.
+                    return oauth.RefreshOutcome(None, "lineage-condemned")
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
             # the slot; defer cleanly rather than raise through callers
