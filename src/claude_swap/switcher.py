@@ -2404,6 +2404,41 @@ class ClaudeAccountSwitcher:
                         "may still be using.", account_num,
                     )
                     return oauth.RefreshOutcome(None, "live-store-current")
+
+                # A Claude Code self-rotation never dates as a newer login
+                # (`_refresh_expiry`'s own docstring: a refresh does not
+                # extend it), so `_adopt_login_into_slot`'s `newer_login`
+                # check refuses to update this slot's backup for it (#408).
+                # The fingerprint check above then stops matching -- backup
+                # fp is the pre-rotation grant, live fp is the rotated one
+                # -- even though the live store is still THIS slot's own
+                # account. POSTing the stale grant then risks the token
+                # endpoint's refresh-token-reuse detection revoking the
+                # whole family, including the live copy Claude Code is
+                # actively using (the 2026-09-07 shape). Widen the same
+                # rule from lineage to account ownership: never POST a
+                # grant for the account the live store currently holds,
+                # regardless of which generation. Fail closed on this read
+                # too, same reasoning as the credential read above.
+                try:
+                    live_is_this_account = self._live_identity_matches(
+                        email, org_uuid, strict=True
+                    )
+                except ConfigError:
+                    self._logger.info(
+                        "Live identity unreadable while gating account "
+                        "%s's backup refresh; deferring rather than risk "
+                        "consuming a grant it still holds.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "live-store-unreadable")
+                if live_is_this_account:
+                    self._logger.info(
+                        "Account %s's backup grant is for the account the "
+                        "live credential store currently holds; deferring "
+                        "rather than consuming a grant Claude Code itself "
+                        "may still be using.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "live-store-current")
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
             # the slot; defer cleanly rather than raise through callers
@@ -3152,16 +3187,20 @@ class ClaudeAccountSwitcher:
         account_nums = [int(k) for k in data["accounts"].keys()]
         return max(account_nums, default=0) + 1
 
-    def _get_current_account(self) -> tuple[str, str] | None:
+    def _get_current_account(
+        self, *, strict: bool = False
+    ) -> tuple[str, str] | None:
         """Current ``(email, organization_uuid)`` from ``.claude.json``.
 
         Delegates so there is ONE reader: two copies of this drifted apart
         once already, over whether a null ``accountUuid`` normalises to "".
         """
-        triple = self._get_current_identity_triple()
+        triple = self._get_current_identity_triple(strict=strict)
         return None if triple is None else triple[:2]
 
-    def _get_current_identity_triple(self) -> tuple[str, str, str] | None:
+    def _get_current_identity_triple(
+        self, *, strict: bool = False
+    ) -> tuple[str, str, str] | None:
         """``(email, org_uuid, account_uuid)`` from ONE read of ``.claude.json``.
 
         ``add_account`` used to read the config for its identity and again
@@ -3169,11 +3208,18 @@ class ClaudeAccountSwitcher:
         token with another's metadata -- the exact class
         ``_reject_foreign_credential_capture`` exists to close, so the guard
         must not widen it.
+
+        ``strict`` passes through to ``_read_json``: default False reads a
+        genuinely-absent file the same as an unreadable one (None either
+        way), which is right for every existing caller here. A caller that
+        must not treat "could not tell" as "logged out" -- the consume
+        gate's own live-identity guard -- passes ``strict=True`` and takes
+        the ``ConfigError`` instead.
         """
         config_path = self._get_claude_config_path()
         if not config_path.exists():
             return None
-        data = self._read_json(config_path)
+        data = self._read_json(config_path, strict=strict)
         if not data:
             return None
         oauth_account = data.get("oauthAccount", {})
@@ -3186,7 +3232,9 @@ class ClaudeAccountSwitcher:
             oauth_account.get("accountUuid", "") or "",
         )
 
-    def _live_identity_matches(self, email: str, org_uuid: str) -> bool:
+    def _live_identity_matches(
+        self, email: str, org_uuid: str, *, strict: bool = False
+    ) -> bool:
         """Whether the live config identity is (email, org_uuid) right now.
 
         The under-lock TOCTOU identity re-check shared by the locked refresh
@@ -3196,7 +3244,7 @@ class ClaudeAccountSwitcher:
         — nothing there is its to adopt, consume, or overwrite. Compares the
         organization too: two managed slots may share an email across orgs.
         """
-        identity = self._get_current_account()
+        identity = self._get_current_account(strict=strict)
         return identity is not None and identity == (email, org_uuid or "")
 
     def _resolved_matches_slot_identity(

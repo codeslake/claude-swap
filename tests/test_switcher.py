@@ -13548,6 +13548,101 @@ class TestConsumeGate:
         assert result.credentials is None
         assert result.error == "live-store-unreadable"
 
+    def test_live_store_holding_this_account_under_a_rotated_lineage_is_never_consumed(
+        self, temp_home: Path, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        """Task #408: a Claude Code self-rotation never dates as a newer
+        login (`_refresh_expiry`'s own docstring), so `_adopt_login_into_slot`
+        refuses to update this INACTIVE slot's backup for it -- the backup
+        stays on the pre-rotation grant while the live store moves to the
+        rotated one. The fingerprint guard above no longer matches (two
+        different generations), but the live store is still THIS slot's own
+        account (``mock_claude_config``'s identity == this slot's email) --
+        POSTing the stale grant risks the token endpoint's refresh-token-reuse
+        detection revoking the whole family, including the live copy Claude
+        Code is using. Defer on account ownership, not just lineage."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        rotated_live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-rotated", "refreshToken": "rt-rotated",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=rotated_live), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-current"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_live_store_holding_a_different_account_under_a_rotated_lineage_still_consumes(
+        self, temp_home: Path, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        """The control for the guard above: ``mock_claude_config`` names
+        test@example.com, not slot 2's account2@example.com -- a live store
+        on a different lineage AND a different account must still be
+        reachable, or the identity arm defers on every mismatch and usage
+        polling silently stops for the whole fleet."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("2", "account2@example.com", self._OLD)
+        rotated_live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-rotated", "refreshToken": "rt-rotated",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=rotated_live), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("2", "account2@example.com", self._OLD)
+
+        mock_refresh.assert_called_once()
+        assert result.credentials == self._NEW
+
+    def test_an_unreadable_live_identity_refuses_rather_than_posts(
+        self, temp_home: Path, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        """Fail closed on the identity read too: an unreadable
+        ``.claude.json`` is not proof the live account differs from this
+        slot's -- refuse the POST rather than treat unreadable as logged
+        out."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        mock_claude_config.write_text("not json")
+        rotated_live = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-rotated", "refreshToken": "rt-rotated",
+                "expiresAt": 9999999999000,
+            }
+        })
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=rotated_live), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-unreadable"
+
     def test_gate_survives_a_roster_read_that_raises_after_the_lock_releases(
         self, temp_home: Path, sample_sequence_data: dict
     ):
