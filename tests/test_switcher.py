@@ -9409,7 +9409,7 @@ class TestProvenanceGuard:
         real_write = switcher._write_account_credentials
         refused = []
 
-        def refusing(num, email, creds):
+        def refusing(num, email, creds, **_kw):
             if str(num) == "2":
                 refused.append(num)
                 raise OSError(errno.EACCES, "the slot's store is read-only")
@@ -9482,7 +9482,7 @@ class TestProvenanceGuard:
         real_write = switcher._write_account_credentials
         refused = []
 
-        def refusing(num, email, creds):
+        def refusing(num, email, creds, **_kw):
             if str(num) == "2":
                 refused.append(num)
                 raise _conftest.RealStoreWriteBlocked(
@@ -15832,7 +15832,7 @@ class TestGateUltraReviewFixes:
             wrote = {}
             sw._store = type("S", (), {
                 "_write_account_credentials":
-                    lambda self, n, e, c: wrote.__setitem__("creds", c),
+                    lambda self, n, e, c, **_kw: wrote.__setitem__("creds", c),
             })()
             sess = tmp_path / f"sess-{invalidation_raises}"
             sess.mkdir()
