@@ -223,10 +223,12 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
         def spying_check(*a, **kw):
             marker = []
             real_read_ex = store._read_account_credentials_ex
-            store._read_account_credentials_ex = lambda *ra, **rkw: (
-                marker.append(getattr(store, "_in_attribution_read", False)),
-                real_read_ex(*ra, **rkw),
-            )[1]
+
+            def spying_read_ex(*ra, **rkw):
+                marker.append(getattr(store, "_in_attribution_read", False))
+                return real_read_ex(*ra, **rkw)
+
+            store._read_account_credentials_ex = spying_read_ex
             try:
                 return real_check(*a, **kw)
             finally:
@@ -249,6 +251,29 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
         assert getattr(store, "_in_attribution_read", False) is False, (
             "the mark must not outlive the read it was taken for"
         )
+
+    def test_the_marks_restore_does_not_clobber_an_outer_holder(self, tmp_path):
+        """The mark's ``finally`` must restore whatever it found, not a
+        literal ``False``. Not live with the single setter this branch ships
+        today, but the moment a second one nests (a merge partner's own read
+        setting the same flag around a call that reaches this guard again)
+        the inner ``finally`` unmarks the OUTER holder early, and the
+        converge write it exists to suppress fires for the rest of the outer
+        read."""
+        store = CredentialStore(_Host(tmp_path))
+        store._write_account_credentials("1", "test@example.com", ACCOUNT_1_BACKUP)
+
+        store._in_attribution_read = True  # an outer holder, already marked
+        try:
+            store._check_attribution(
+                "1", "test@example.com", ACCOUNT_1_BACKUP, False,
+            )
+            assert store._in_attribution_read is True, (
+                "the guard's own read cleared an OUTER caller's mark instead "
+                "of restoring what it found"
+            )
+        finally:
+            store._in_attribution_read = False
 
 
 def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tuple[str | None, int, str]]:
@@ -431,10 +456,14 @@ class TestWriteSiteRosterIsReviewed:
                 )
                 derived[(filename, enclosing)] += 1
 
-        assert dict(derived) in (
-            EXPECTED_WRITE_SITE_ROSTER,
-            {**EXPECTED_WRITE_SITE_ROSTER, **CROSS_PR_WRITE_SITES},
-        ), (
+        admissible = [EXPECTED_WRITE_SITE_ROSTER]
+        # CROSS_PR_WRITE_SITES is admissible only where the suppression it
+        # names (CredentialStore._in_attribution_read) actually exists — on
+        # #210 alone the flag is absent and that site cannot appear for real;
+        # widening the roster unconditionally would admit it anyway.
+        if hasattr(CredentialStore, "_in_attribution_read"):
+            admissible.append({**EXPECTED_WRITE_SITE_ROSTER, **CROSS_PR_WRITE_SITES})
+        assert dict(derived) in admissible, (
             "the derived write-site roster no longer matches what this round "
             "reviewed — a writer was added, removed, or duplicated; review "
             "whether it may pass attributed=True and update the roster above "

@@ -1326,13 +1326,14 @@ class CredentialStore:
         slot this guard's caller is already writing, re-entering this write
         path from inside the read that verifies it.
         """
+        prev_in_attribution_read = getattr(self, "_in_attribution_read", False)
         self._in_attribution_read = True
         try:
             existing, unreadable = self._read_account_credentials_ex(
                 account_num, email
             )
         finally:
-            self._in_attribution_read = False
+            self._in_attribution_read = prev_in_attribution_read
         if unreadable and not attributed:
             self._host._logger.error(
                 "Refusing to write Account-%s-%s's backup: the existing "
