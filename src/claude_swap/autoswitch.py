@@ -152,6 +152,23 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+
+def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
+    """The used-% a panel should display as "where the proactive arm fires".
+
+    Under ``dynamic`` this is NOT ``settings.threshold`` — the proactive arm
+    is gated on ``_about_to_wall`` (headroom <= SPENT_HEADROOM_PCT), measured
+    against the dynamic-widened headroom (``_dynamic_active_headroom``), so
+    the true bar is ``100 - SPENT_HEADROOM_PCT`` regardless of the configured
+    threshold. `best`/`consume-first` still gate on the raw threshold, so
+    they get it back unchanged (#321 follow-up: a panel printing
+    ``settings.threshold`` under dynamic misreports the engine's real bar).
+    """
+    if strategy == "dynamic":
+        return 100.0 - SPENT_HEADROOM_PCT
+    return threshold
+
+
 # How much headroom a healthy-active ALTERNATION move may hand back (#321
 # follow-up). NOT `settings.hysteresis_pct`, despite the same units and the
 # same default: that setting means "a proactive candidate must BEAT the active
@@ -533,6 +550,9 @@ class PollEvent(AutoSwitchEvent):
     active: dict | None  # account_ref shape, or None
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
+    # The used-% the proactive arm actually fires at (`proactive_switch_bar_pct`).
+    # Additive field: absent (None) callers fall back to `threshold` below.
+    switch_bar: float | None = None
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
@@ -554,6 +574,9 @@ class PollEvent(AutoSwitchEvent):
             "active": self.active,
             "headroomPct": self.headroom,
             "threshold": self.threshold,
+            "switchBarPct": self.switch_bar
+            if self.switch_bar is not None
+            else self.threshold,
         }
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
@@ -606,7 +629,9 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"(switch at "
+            f"{pct_label(self.switch_bar if self.switch_bar is not None else self.threshold)}"
+            f"%){tail}"
         )
 
 
@@ -1708,7 +1733,14 @@ class AutoSwitchEngine:
         current = self.switcher.current_account_number()
         if current is None:
             self._emit(
-                PollEvent(active=None, headroom={}, threshold=settings.threshold)
+                PollEvent(
+                    active=None,
+                    headroom={},
+                    threshold=settings.threshold,
+                    switch_bar=proactive_switch_bar_pct(
+                        settings.strategy, settings.threshold
+                    ),
+                )
             )
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
@@ -1751,6 +1783,9 @@ class AutoSwitchEngine:
                 active=active_ref,
                 headroom=headroom,
                 threshold=settings.threshold,
+                switch_bar=proactive_switch_bar_pct(
+                    settings.strategy, settings.threshold
+                ),
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()

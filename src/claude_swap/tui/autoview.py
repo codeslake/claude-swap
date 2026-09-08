@@ -35,6 +35,7 @@ from claude_swap.autoswitch import (
     consume_first_rank_key,
     model_block_label,
     pct_label,
+    proactive_switch_bar_pct,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.models import AccountsSnapshot
@@ -131,7 +132,9 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = self._settings.threshold
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            self._settings.strategy, self._settings.threshold
+        )
         self._configured_strategy = self._settings.strategy
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -151,7 +154,9 @@ class AutoScreen(Screen):
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
         if self._configured_threshold is not None:
-            self.app.threshold_pct = self._configured_threshold
+            self.app.threshold_pct = proactive_switch_bar_pct(
+                self._configured_strategy, self._configured_threshold
+            )
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -216,7 +221,9 @@ class AutoScreen(Screen):
         self._settings = replace(self._settings, threshold=value)
         if self._engine is not None:
             self._engine.apply_threshold(value)
-        self.app.threshold_pct = value
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            self._settings.strategy, value
+        )
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
@@ -226,6 +233,9 @@ class AutoScreen(Screen):
         current = _STRATEGY_CYCLE.index(self._settings.strategy)
         value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
         self._settings = replace(self._settings, strategy=value)
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            value, self._settings.threshold
+        )
         if self._engine is not None:
             self._engine.apply_strategy(value)
             self._engine.wake()  # show a decision under the new strategy now
@@ -242,8 +252,11 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
+        bar = proactive_switch_bar_pct(
+            self._settings.strategy, self._settings.threshold
+        )
         text.append(
-            f"threshold {pct_label(self._settings.threshold)}%",
+            f"threshold {pct_label(bar)}%",
             style=palette.accent if self._adjusting else "",
         )
         if self._settings.threshold != self._configured_threshold:

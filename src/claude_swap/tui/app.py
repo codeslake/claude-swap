@@ -18,6 +18,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
+from claude_swap.autoswitch import proactive_switch_bar_pct
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import load_settings, load_ui_settings, set_setting
@@ -73,9 +74,10 @@ class CswapApp(App):
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            _settings = load_settings(switcher.backup_dir)
+            self.threshold_pct: float | None = proactive_switch_bar_pct(
+                _settings.strategy, _settings.threshold
+            )
         except Exception:
             self.threshold_pct = None
         try:
