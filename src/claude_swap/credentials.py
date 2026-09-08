@@ -290,7 +290,7 @@ def _credential_generation(credentials: str) -> float:
     try:
         data = oauth.extract_oauth_data(credentials) or {}
         return float(data.get("expiresAt") or 0)
-    except (TypeError, ValueError, AttributeError):
+    except (TypeError, ValueError):
         return 0.0
 
 
@@ -1226,22 +1226,28 @@ class CredentialStore:
         if value or failed:
             return value
         try:
-            accounts = {
-                num: account.get("email", "")
-                for num, account in (
-                    self._host._get_sequence_data() or {}
-                ).get("accounts", {}).items()
-            }
-        except (ConfigError, AttributeError):
+            sequence_data = self._host._get_sequence_data()
+        except ConfigError:
             # A torn/unreadable roster (`_get_sequence_data` is
             # `_read_json(strict=True)`) means no fallback is available —
             # never an exception out of a read. `session.py`'s `_bootstrap`
             # and the collect pass call through here with no handler for
             # one; this fallback must not be able to raise where the plain
-            # direct read above never could. `_read_json` only validates
-            # the TOP-LEVEL payload is a dict, so a malformed "accounts"
-            # shape (a list, or an entry that isn't itself a dict) raises
-            # AttributeError from `.items()`/`.get()` below, not ConfigError.
+            # direct read above never could.
+            return ""
+        try:
+            accounts = {
+                num: account.get("email", "")
+                for num, account in (sequence_data or {}).get("accounts", {}).items()
+            }
+        except AttributeError:
+            # `_read_json` only validates the TOP-LEVEL payload is a dict, so
+            # a malformed "accounts" shape (a list, or an entry that isn't
+            # itself a dict) raises AttributeError from `.items()`/`.get()`
+            # here, not ConfigError — same fail-open rule as above. This is
+            # scoped to the SHAPE, not the lookup above: a renamed or removed
+            # `_get_sequence_data`, or a host double lacking it, must raise
+            # loudly rather than being mistaken for a malformed roster.
             return ""
         if accounts.get(account_num) != email:
             return ""
@@ -1664,12 +1670,25 @@ class CredentialStore:
         succeeding. No ``.prev`` is written in that case (see the WITHDRAWN
         comment below for why a checkpoint of the incoming bytes was tried
         and reverted).
+
+        Reads with ``_read_account_credentials_direct``, never the renumber-
+        fallback wrapper (``_read_account_credentials`` / ``_ex``): this asks
+        "what is in THIS slot's own key right now", the same DIRECT question
+        ``delete_account_credentials_strict``'s final belt asks. The fallback
+        answers a different question ("can this account's login be found
+        somewhere") and, on a converge write into a genuinely empty slot,
+        would re-enter the very sweep that is calling this write —
+        `_write_account_credentials` -> here -> the fallback reader -> the
+        sweep -> `_write_account_credentials` again — an unbounded mutual
+        recursion that only stops at Python's recursion limit.
         """
+        failed: list = []
         try:
-            current, unreadable = self._read_account_credentials_ex(account_num, email)
+            current = self._read_account_credentials_direct(account_num, email, failed)
         except Exception as e:  # pragma: no cover - _read swallows its own errors
             self._host._logger.warning(f"Could not read backup for retention: {e}")
             return False
+        unreadable = bool(failed)
         if unreadable:
             # WITHDRAWN (round 10): rounds 8 and 9 tried to salvage this path by
             # checkpointing the INCOMING bytes as `.prev`. Both attempts shipped

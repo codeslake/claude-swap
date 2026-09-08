@@ -7898,18 +7898,67 @@ class TestStashAndRetentionStore:
         self, temp_home,
     ):
         """CRITICAL: never-delete means several same-email copies legitimately
-        coexist on disk; the sweep must pick the NEWEST generation, not the
-        LAST one found by ascending slot number — the newer copy sits at the
-        LOWER slot here so the two implementations disagree (candidates are
-        appended in ascending slot order, so "last found" would pick the
-        HIGHER slot). Concrete failure this reproduces: E at slot 3 (B1) ->
-        a roster edit moves E to 2 (leftover B1 stays at 3, a converge read
-        mirrors B1 into 2) -> a re-login writes 2 = B2 -> a later edit moves
-        E to 4, leaving BOTH 2 (B2, newer) and 3 (B1, older) as leftovers.
-        The direct read of 4 is absent; slot 3 sorts LAST, so a last-found
-        sweep would mirror the SPENT B1 into 4 while the live B2 sits unread
-        at 2.
+        coexist on disk; the sweep must pick the NEWEST generation — never
+        the first or last candidate found by ascending slot number, and
+        never the lowest or highest SLOT number either. THREE leftovers with
+        the newest in the MIDDLE (by both slot and discovery order) is the
+        minimum fixture that separates all four wrong implementations from
+        the correct one: with only two leftovers, "newest" and "first
+        found"/"lowest slot" can coincide, letting `candidates[0]` or
+        `min(by slot)` pass by accident (as this fixture once did — see the
+        mutation note below).
         """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        oldest = self._oauth_creds(1000)   # slot 2 — oldest, lowest slot
+        newest = self._oauth_creds(3000)   # slot 3 — newest, MIDDLE slot
+        middle_gen = self._oauth_creds(2000)  # slot 5 — middle gen, highest slot
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"6": {"email": email, "uuid": "uuid-e"}},
+            },
+        )
+        # Three same-email leftovers, off-roster, discovered in ascending
+        # slot order by the sweep: 2, 3, 5. Newest sits at 3 — neither the
+        # first nor the last candidate the sweep appends, and neither the
+        # lowest nor the highest slot number.
+        store._write_account_credentials("2", email, oldest)
+        store._write_account_credentials("3", email, newest)
+        store._write_account_credentials("5", email, middle_gen)
+
+        assert store._read_account_credentials("6", email) == newest, (
+            "DEFECT: the sweep did not converge on the newest generation "
+            "(mutation check: candidates[0], candidates[-1], "
+            "max(by slot) and min(by slot) must all die against this "
+            "fixture; a two-leftover fixture cannot separate them from the "
+            "correct max(by generation))"
+        )
+
+    def test_renumber_fallback_converge_write_does_not_recurse(
+        self, temp_home, caplog,
+    ):
+        """CRITICAL: the converge write is routed through
+        ``_write_account_credentials`` (so it retains the generation it
+        displaces, like every other writer in this file), but that function
+        calls ``_retain_previous_backup``, which reads the slot being
+        written through ``_read_account_credentials_ex`` — the FULL
+        renumber-fallback reader, not a direct one. On a genuinely empty
+        target slot (no concurrent writer), that inner read sees the exact
+        same empty state the outer sweep did and re-converges, which calls
+        ``_write_account_credentials`` again, which reads again ... an
+        unbounded mutual recursion that only stops at Python's recursion
+        limit, caught by a broad ``except Exception`` and logged as "could
+        not mirror it back" — the assertion on the returned value still
+        passes, hiding the defect behind a green suite.
+        """
+        import logging
+
         switcher = self._switcher(temp_home)
         store = switcher._store
         email = "user@example.com"
@@ -7926,9 +7975,6 @@ class TestStashAndRetentionStore:
             },
         )
         store._write_account_credentials("3", email, b1)
-
-        # Roster edit: E moves from 3 to 2. Bare renumber — the backup stays
-        # under 3. A converge read mirrors B1 into 2.
         switcher._write_json(
             switcher.sequence_file,
             {
@@ -7938,14 +7984,8 @@ class TestStashAndRetentionStore:
                 "accounts": {"2": {"email": email, "uuid": "uuid-e"}},
             },
         )
-        assert store._read_account_credentials("2", email) == b1
-
-        # A re-login refreshes the backup at 2 to a newer generation. Slot 3
-        # still holds B1 (never-delete).
+        store._read_account_credentials("2", email)
         store._write_account_credentials("2", email, b2)
-
-        # Another roster edit: E moves from 2 to 4. Neither 2 nor 3 remain
-        # roster keys; the direct read of 4 is genuinely absent.
         switcher._write_json(
             switcher.sequence_file,
             {
@@ -7956,9 +7996,28 @@ class TestStashAndRetentionStore:
             },
         )
 
-        assert store._read_account_credentials("4", email) == b2, (
-            "DEFECT: the sweep converged on the older generation at the "
-            "higher slot number instead of the newer one"
+        orig_write_backend = store._write_backup_enc
+        write_calls = []
+
+        def counting_write(account_num, email_, credentials):
+            write_calls.append(account_num)
+            return orig_write_backend(account_num, email_, credentials)
+
+        caplog.clear()
+        with patch.object(store, "_write_backup_enc", side_effect=counting_write), \
+                caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert store._read_account_credentials("4", email) == b2
+
+        assert not any(
+            "maximum recursion depth" in r.getMessage() for r in caplog.records
+        ), (
+            "DEFECT: the converge write re-entered its own reader and "
+            "recursed until Python's recursion limit, caught and logged as "
+            "'could not mirror it back'"
+        )
+        assert write_calls.count("4") == 1, (
+            "DEFECT: unwound recursion performed a redundant real write for "
+            f"every level instead of exactly one; writes to '4': {write_calls}"
         )
 
     def test_renumber_fallback_never_clobbers_a_fresh_write_that_lands_mid_sweep(
@@ -8168,6 +8227,56 @@ class TestStashAndRetentionStore:
             },
         )
         assert store._read_account_credentials("primary", email) == ""
+
+    def test_renumber_fallback_does_not_swallow_a_missing_get_sequence_data(
+        self, temp_home,
+    ):
+        """minor: the roster read used to be one ``try/except (ConfigError,
+        AttributeError)`` around both the ``_get_sequence_data()`` call AND
+        the shape-parsing below it. That also caught an ``AttributeError``
+        from the ATTRIBUTE LOOKUP itself (a renamed/removed method, or a
+        host double lacking it) and returned ``""``, indistinguishable from
+        a torn roster. Only the shape-parsing AttributeError (a malformed
+        ``"accounts"``) should read as "no fallback available"; a missing
+        method must raise loudly.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"1": {"email": email, "uuid": "uuid-1"}},
+            },
+        )
+        with patch.object(
+            type(switcher), "_get_sequence_data",
+            side_effect=AttributeError("'ClaudeAccountSwitcher' object has no attribute"),
+        ):
+            with pytest.raises(AttributeError):
+                store._read_account_credentials("1", email)
+
+    def test_credential_generation_does_not_swallow_a_bug_inside_extract_oauth_data(
+        self, temp_home,
+    ):
+        """minor: ``_credential_generation`` caught ``AttributeError`` around
+        the WHOLE call to ``oauth.extract_oauth_data``, but that function
+        returns dict-or-None and never raises it — the only remaining effect
+        was to swallow an ``AttributeError`` raised by a bug INSIDE it,
+        silently scoring that credential ``0.0`` (picking an arbitrary
+        "newest") instead of surfacing the bug.
+        """
+        from claude_swap.credentials import _credential_generation
+
+        with patch.object(
+            oauth, "extract_oauth_data",
+            side_effect=AttributeError("boom"),
+        ):
+            with pytest.raises(AttributeError):
+                _credential_generation("irrelevant")
 
 
 class TestActiveRefreshProvenance:
