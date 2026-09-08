@@ -2166,6 +2166,7 @@ class ClaudeAccountSwitcher:
             read_session_credentials,
             session_dir_for,
             session_identity_drifted,
+            session_identity_unreadable,
         )
 
         try:
@@ -2249,6 +2250,21 @@ class ClaudeAccountSwitcher:
                     sdir = session_dir_for(self.backup_dir, account_num, email)
                     profile = read_session_credentials(sdir)
                     if (
+                        profile
+                        and not is_session_stale(sdir)
+                        and session_identity_unreadable(sdir)
+                    ):
+                        # Present but unparseable/corrupt .claude.json: a
+                        # real window (Claude Code rewrites it on every
+                        # login), and "unknown" is not "trust it" — refuse
+                        # rather than let an unverifiable identity supersede
+                        # the backup.
+                        self._logger.info(
+                            "Account %s's session profile identity could "
+                            "not be read; refusing to let it supersede the "
+                            "backup.", account_num,
+                        )
+                    elif (
                         profile
                         # A marked profile's credentials are presumed stale
                         # (backup changed under the live session — e.g. a
@@ -2908,13 +2924,25 @@ class ClaudeAccountSwitcher:
             is_session_stale,
             read_session_credentials,
             session_identity_drifted,
+            session_identity_unreadable,
         )
 
         session_dir = self._session_dir(account_num, email)
         if is_session_stale(session_dir):
             return None
         profile = read_session_credentials(session_dir)
-        if not profile or session_identity_drifted(session_dir, email, org_uuid):
+        if not profile:
+            return None
+        if session_identity_unreadable(session_dir):
+            # Present but unparseable/corrupt .claude.json: unknown is not
+            # "trust it" — refuse the adoption rather than write a profile
+            # whose identity could not be verified.
+            self._logger.info(
+                "Account %s's session profile identity could not be read; "
+                "refusing to adopt it.", account_num,
+            )
+            return None
+        if session_identity_drifted(session_dir, email, org_uuid):
             return None
         backup, unreadable = self._read_account_credentials_ex(account_num, email)
         if unreadable:

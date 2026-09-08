@@ -1062,6 +1062,23 @@ class TestAdoptSessionCredential:
         assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
+    def test_profile_with_unreadable_identity_is_not_adopted(self, temp_home: Path):
+        """A `.claude.json` Claude Code is mid-rewrite of (or one simply
+        corrupted) is UNKNOWN, not "trust it": `session_identity_drifted`
+        used to collapse "never wrote one" and "wrote one, now corrupt" to
+        the same `None`, so a corrupt identity read as NOT drift and this
+        profile's newer generation was adopted anyway."""
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        session_dir = switcher._session_dir("2", self.EMAIL)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        (session_dir / ".credentials.json").write_text(profile)
+        (session_dir / ".claude.json").write_text("not json")
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
 
 class TestLiveSessionGuardOnAnUnreadableRecord:
     """A session record we could not READ must not answer "nobody there".
@@ -13189,6 +13206,41 @@ class TestConsumeGate:
 
         assert posted["creds"] == profile_newer
 
+    def test_gate_resyncs_a_newer_profile_with_a_matching_identity(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The positive control for the identity checks above: a profile
+        whose `.claude.json` names THIS slot's own account must still
+        resync — the unreadable/foreign refusals must not also catch a
+        well-formed, matching identity."""
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        profile_newer = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-prof", "refreshToken": "rt-prof",
+                "expiresAt": 5000,   # newer generation than backup's 1000
+            }
+        })
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(profile_newer)
+        s._write_json(sdir / ".claude.json", {"oauthAccount": {
+            "emailAddress": "test@example.com", "organizationUuid": "",
+        }})
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert posted["creds"] == profile_newer
+
     def test_a_lineage_already_condemned_as_foreign_is_never_consumed(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -15149,6 +15201,49 @@ class TestGateUltraReviewFixes:
         assert "rt-foreign" not in s._read_account_credentials(
             "1", "test@example.com"
         ), "a foreign lineage was written into the slot"
+
+    def test_an_unreadable_identity_never_supersedes_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A `.claude.json` that is present but unparseable is UNKNOWN, not
+        "not drift": Claude Code rewrites the file on every login, so there
+        is a real window in which a foreign profile's newer generation would
+        pass this gate with an identity that simply could not be read yet.
+
+        Measured with the guard off:
+            POSTed rt       = rt-corrupt   (baseline: rt-bk)
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # A profile on a NEWER generation, with an unreadable identity file.
+        corrupt = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-corrupt", "refreshToken": "rt-corrupt",
+            "expiresAt": 999999}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(corrupt)
+        (sdir / ".claude.json").write_text("not json")
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert posted["creds"] == backup, (
+            "the gate POSTed a profile whose identity could not be read"
+        )
+        assert "rt-corrupt" not in s._read_account_credentials(
+            "1", "test@example.com"
+        ), "an unverifiable lineage was written into the slot"
 
     def test_an_older_profile_never_supersedes_the_backup(
         self, temp_home: Path, sample_sequence_data: dict
