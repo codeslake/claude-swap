@@ -13,6 +13,8 @@ from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    USAGE_NO_CREDENTIALS,
+    USAGE_TOKEN_EXPIRED,
     account_row,
     error_envelope,
     usage_fields,
@@ -324,6 +326,9 @@ class TestListJson:
             assert row["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
             assert row["lastGoodAgeSeconds"] >= age_s
             assert row["lastGoodFetchedAt"].endswith("Z")
+            # The failed refetch is why the row is unavailable, so it says so.
+            assert row["usageError"] == "timeout"
+            assert row["usageRetryAt"].endswith("Z")
 
 
 # --------------------------------------------------------------------------- #
@@ -386,6 +391,8 @@ class TestStatusJson:
             last_good={"five_hour": {"pct": 25.0}},
             fetched_at=fetched_at,
             age_s=4000.0,
+            last_error="http-429",
+            backoff_until=time_mod.time() + 3600,
         )
 
         with patch.object(switcher, "_read_active_credentials",
@@ -398,6 +405,8 @@ class TestStatusJson:
         assert active["usage"] is None
         assert active["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
         assert active["lastGoodAgeSeconds"] == 4000.0
+        assert active["usageError"] == "http-429"
+        assert active["usageRetryAt"].endswith("Z")
 
     def test_status_managed_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,
@@ -655,6 +664,43 @@ class TestSwitchJson:
         assert result["switched"] is False
         assert result["reason"] == "unmanaged-account"
         assert result["from"] == {"number": None, "email": "test@example.com"}
+
+
+class TestAccountRowFailure:
+    """The additive ``usageError``/``usageRetryAt`` fields on --list rows."""
+
+    def test_unavailable_row_names_its_failure_and_retry(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            last_error="http-429", backoff_until=1_800_000_000.0,
+        )
+        assert row["usageStatus"] == "unavailable"
+        assert row["usageError"] == "http-429"
+        assert row["usageRetryAt"] == "2027-01-15T08:00:00Z"
+
+    def test_lapsed_backoff_leaves_only_the_error(self):
+        row = account_row(2, "b@example.com", "", "", False, None, last_error="timeout")
+        assert row["usageError"] == "timeout"
+        assert "usageRetryAt" not in row
+
+    def test_no_failure_adds_nothing(self):
+        row = account_row(2, "b@example.com", "", "", False, None)
+        assert "usageError" not in row
+        assert "usageRetryAt" not in row
+
+    @pytest.mark.parametrize(
+        "entry", [{"five_hour": {"pct": 5.0}}, USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS]
+    )
+    def test_explained_rows_do_not_repeat_an_old_failure(self, entry):
+        """A served measurement or a sentinel already says what the row is;
+        a failure left over from an earlier pass would only contradict it."""
+        row = account_row(
+            2, "b@example.com", "", "", False, entry,
+            usage_fetched_at=1_800_000_000.0,
+            last_error="http-429", backoff_until=1_800_000_000.0,
+        )
+        assert "usageError" not in row
+        assert "usageRetryAt" not in row
 
 
 class TestAccountRowDisabled:
