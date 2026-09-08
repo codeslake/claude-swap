@@ -15,6 +15,20 @@ import pytest
 
 from claude_swap.exceptions import ClaudeSwitchError
 
+
+@pytest.fixture(autouse=True)
+def _fast_default_lock_timeout(monkeypatch):
+    """No case in this module depends on the real 9.0s `DEFAULT_TIMEOUT_S` —
+    every contended-lock scenario here just needs the budget to elapse, and
+    9s real wall time paid three times over is what made this file's own
+    suite 27.6% of the fork's whole-suite cost. Shrunk once, for every test,
+    rather than per-test: a case that DOES need a specific value (the
+    doubled-deadline arithmetic below) still sets its own on top of this."""
+    from claude_swap import claude_locks
+
+    monkeypatch.setattr(claude_locks, "DEFAULT_TIMEOUT_S", 0.3)
+
+
 def _pinwiring():
     """The module the wiring helpers actually live in: `claude_swap.pin`.
 
