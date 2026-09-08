@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -799,7 +800,10 @@ def _persist(
             email,
             e,
         )
+        # stderr, not stdout: this runs inside ``cswap list --json`` and the
+        # other ``--json`` commands, whose stdout is one machine-readable object.
         print_warning(
             f"Warning: failed to save refreshed token for account {account_num} ({email}). "
-            f"If the next refresh fails, re-run `cswap --add-account` after logging in."
+            f"If the next refresh fails, re-run `cswap --add-account` after logging in.",
+            file=sys.stderr,
         )
