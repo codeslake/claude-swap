@@ -7478,21 +7478,6 @@ class TestConsumeFirstStrategy:
             "below-threshold"
         ]
 
-    def test_candidate_with_past_reset_is_not_selected(self, temp_home):
-        # A stale snapshot whose resets_at has already elapsed means the
-        # weekly window just rolled over — the LEAST perishable quota. It
-        # must rank as unknown, never as "soonest".
-        h = self._harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _usage7(20, 20, _R_LATER),
-            "2": _usage7(10, 10, _R_PAST),     # inverted pick pre-fix
-            "3": _usage7(10, 10, _R_SOON),
-        })
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.to_ref == {"number": 3, "email": "c@example.com"}
-
     def test_active_past_reset_holds_reset_unknown(self, temp_home):
         # The active account's own reset can be stale too: past == unknown,
         # which lands on the existing reset-unknown hold.
@@ -7736,24 +7721,44 @@ class TestConsumeFirstProbesAnUnknownReset:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "probe"
 
-    def test_an_elapsed_reset_is_not_treated_as_a_probe_candidate(
+    def test_an_elapsed_reset_is_treated_as_a_probe_candidate(
         self, temp_home
     ):
-        # A stale snapshot whose reset has since elapsed is a fact already
-        # in hand (it refreshes on the ordinary polling cadence) -- not the
-        # gap a probe exists to close. Reusing the same `None` here would
-        # re-introduce the exact inversion `_seven_day_reset_ts`'s own
-        # "past == unknown" rule exists to prevent.
+        # A stale snapshot whose reset has since ELAPSED is not "a fact
+        # already in hand" -- it carries no information about the NEW
+        # window, and nothing about the account's ordinary polling cadence
+        # corrects the stale value on its own; only activating the account
+        # does. Treated the same as a never-reported reset, so it must jump
+        # the queue the same way.
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage7(20, 20, _R_LATER),
-            "2": _usage7(10, 10, _R_PAST),   # elapsed, NOT a probe target
+            "2": _usage7(10, 10, _R_PAST),   # elapsed -- IS a probe target
             "3": _usage7(10, 10, _R_SOON),
         })
         assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 3, (
-            f"got {h.active_number()} — an elapsed reset must not jump the "
-            "queue the way a genuinely unmeasured one does"
+        assert h.active_number() == 2, (
+            f"got {h.active_number()} — an elapsed reset must jump the "
+            "queue the same way a genuinely unmeasured one does"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "probe"
+
+    def test_a_future_reset_at_full_usage_is_never_a_probe_candidate(
+        self, temp_home
+    ):
+        # The control: a reset that has NOT elapsed is a genuinely known
+        # fact, however little headroom the account currently reports, and
+        # must never be admitted past the reset-unknown gate -- the fix for
+        # the elapsed case above must not also swallow this one.
+        active = _usage7(20.0, 97.0, _R_LATER)
+        usage = {"3": _usage7(20.0, 100.0, _R_LATEST)}
+        target = autoswitch_mod.select_probe_target(
+            usage, ["3"], (), active, {}, 1_000_000.0
+        )
+        assert target is None, (
+            f"got {target!r} — a future, known reset must never be "
+            "admitted as a probe target"
         )
 
     def test_at_most_one_unknown_reset_candidate_is_admitted(self, temp_home):

@@ -886,21 +886,23 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
-def _seven_day_reset_unmeasured(usage: dict | str | None) -> bool:
-    """True only when the weekly reset has never been REPORTED at all —
-    narrower than ``_seven_day_reset_ts``'s ``None``, which also covers a
-    stale snapshot whose ``resets_at`` has since elapsed. The two need
-    different answers from the probe gate: an elapsed reset is a fact
-    already in hand that refreshes on the account's ordinary polling
-    cadence with no need to activate it, while a reset that was never in the
-    payload at all is exactly the gap a probe exists to close.
+def _seven_day_reset_unmeasured(usage: dict | str | None, now: float) -> bool:
+    """True whenever the weekly reset is not a usable fact for the probe
+    gate to skip on — the same ``None`` ``_seven_day_reset_ts`` computes,
+    read here under its own name since this is the probe gate's own
+    question, not a ranking one.
+
+    A stale snapshot whose ``resets_at`` has since ELAPSED is NOT "a fact
+    already in hand" — it describes the window that just ended, and carries
+    no information about the new one, and nothing on the engine's ordinary
+    polling cadence corrects it: a fetch keeps refreshing ``fetchedAt``
+    while the account is merely a peer, but the *value* it reports for a
+    window that has already rolled over is stale until the account is
+    activated. So an elapsed reset is exactly the gap a probe exists to
+    close, same as a reset that was never reported at all — only a reset
+    that has NOT yet elapsed is a genuine fact to defer to.
     """
-    if not isinstance(usage, dict):
-        return True
-    window = usage.get("seven_day")
-    if not isinstance(window, dict):
-        return True
-    return _parse_reset_ts(window.get("resets_at")) is None
+    return _seven_day_reset_ts(usage, now) is None
 
 
 def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
@@ -950,8 +952,8 @@ def select_probe_target(
 ) -> str | None:
     """Which account (if any) this fleet admits as this tick's probe
     target: the readable candidate with the most headroom whose weekly
-    reset has never been reported, and which is not cooling down from a
-    previous probe.
+    reset is unknown or has already elapsed, and which is not cooling down
+    from a previous probe.
 
     ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
     narrowed to candidates that cleared its own servability/no-return/
@@ -981,7 +983,7 @@ def select_probe_target(
         h = oauth.account_headroom(value if isinstance(value, dict) else None, models)
         if h is None:
             continue
-        if not _seven_day_reset_unmeasured(value):
+        if not _seven_day_reset_unmeasured(value, now):
             continue
         if probe_cooldown.get(num, 0.0) > now:
             continue
@@ -4096,13 +4098,12 @@ class AutoSwitchEngine:
                             #
                             # `select_probe_target` re-applies
                             # `_seven_day_reset_unmeasured` and the cooldown
-                            # (the same reset-vs-past distinction as the
-                            # comment this replaced, and the shared function
-                            # both this pass and the panel now call) --
-                            # membership here only needs the two conditions
-                            # that ARE this loop's own: not on the
-                            # recovery axis, and fresh enough to admit
-                            # without risking the stale-usage abort below.
+                            # (the shared function both this pass and the
+                            # panel now call) -- membership here only needs
+                            # the two conditions that ARE this loop's own:
+                            # not on the recovery axis, and fresh enough to
+                            # admit without risking the stale-usage abort
+                            # below.
                             if not by_recovery_axis and _probe_source_fresh(
                                 entries, num, now
                             ):
