@@ -8158,19 +8158,34 @@ class TestStashAndRetentionStore:
         inner_done = threading.Event()
         result: dict = {}
 
+        # `threading.Thread` swallows an exception raised inside its target
+        # (it only prints a traceback), so a timed-out handoff below would
+        # otherwise leave `result` half-populated and the assertions after
+        # `join()` would fail on `None is ...`, reporting the WRONG defect —
+        # "the inner thread saw the outer's mark" for a setup that never got
+        # that far. Record any exception and assert its absence explicitly.
         def outer() -> None:
-            store._in_attribution_read = True
-            outer_entered.set()
-            inner_done.wait(timeout=5)
-            result["outer_after_inner"] = store._in_attribution_read
-            store._in_attribution_read = False
+            try:
+                store._in_attribution_read = True
+                outer_entered.set()
+                if not inner_done.wait(timeout=5):
+                    raise AssertionError("inner thread never signalled done")
+                result["outer_after_inner"] = store._in_attribution_read
+                store._in_attribution_read = False
+            except Exception as e:
+                result["outer_exc"] = e
 
         def inner() -> None:
-            assert outer_entered.wait(timeout=5), "outer thread never entered"
-            result["inner_saw_at_entry"] = store._in_attribution_read
-            store._in_attribution_read = True
-            store._in_attribution_read = False
-            inner_done.set()
+            try:
+                if not outer_entered.wait(timeout=5):
+                    raise AssertionError("outer thread never entered")
+                result["inner_saw_at_entry"] = store._in_attribution_read
+                store._in_attribution_read = True
+                store._in_attribution_read = False
+            except Exception as e:
+                result["inner_exc"] = e
+            finally:
+                inner_done.set()  # unblocks outer() even on failure above
 
         t_outer = threading.Thread(target=outer)
         t_inner = threading.Thread(target=inner)
@@ -8182,6 +8197,8 @@ class TestStashAndRetentionStore:
         assert not t_outer.is_alive() and not t_inner.is_alive(), (
             "a thread did not finish within its budget"
         )
+        assert result.get("outer_exc") is None, f"outer thread failed: {result.get('outer_exc')!r}"
+        assert result.get("inner_exc") is None, f"inner thread failed: {result.get('inner_exc')!r}"
         assert result.get("inner_saw_at_entry") is False, (
             "DEFECT: the inner thread saw the OUTER thread's own mark -- "
             "_in_attribution_read is one instance attribute shared across "
