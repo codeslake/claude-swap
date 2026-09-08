@@ -17418,6 +17418,88 @@ class TestALoginLandsInItsOwnSlot:
         assert got, "slot 1 has no credential — the login was discarded"
         assert json.loads(got)["claudeAiOauth"]["refreshToken"] == "rt-live"
 
+    def test_a_login_for_another_managed_slot_never_moves_the_active_pointer(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A `/login` is not a request to move the fleet onto that account.
+        Adopting the credential into its real owner's slot (Account-1) must
+        not touch `activeAccountNumber`, whatever account was active before
+        -- that is precisely how a live cross-wire incident was created: an
+        automatic resync moving the roster onto the account someone merely
+        logged into."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        sample_sequence_data["activeAccountNumber"] = 2
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        live = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-live", "refreshToken": "rt-live",
+            "expiresAt": 99_999_999_999_999}})
+        s._write_credentials(live)
+        s._write_account_credentials("2", "b@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-2", "refreshToken": "rt-2",
+                               "expiresAt": 99_999_999_999_999}}))
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-1", "email": "c@example.com",
+                                 "organizationUuid": "o-1"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", live)
+        assert json.loads(s._read_account_credentials(
+            "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            "premise: the login must still land in its real owner's slot"
+        )
+        assert s._get_sequence_data()["activeAccountNumber"] == 2, (
+            "DEFECT: adopting a login into a DIFFERENT managed slot moved "
+            "the roster's active pointer there"
+        )
+
+    def test_a_newer_generation_of_this_slot_also_leaves_the_active_pointer_alone(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """CONTROL for the other arm named alongside it: a rotation the
+        oracle confirms is THIS slot's own identity (no cross-wire at all)
+        must land here, and must not move the active pointer onto it either
+        -- the resync's slot need not be the roster's active one."""
+        accs = sample_sequence_data["accounts"]
+        accs["2"].update(email="b@example.com", uuid="u-2",
+                         organizationUuid="o-2")
+        accs["1"].update(email="c@example.com", uuid="u-1",
+                         organizationUuid="o-1")
+        sample_sequence_data["activeAccountNumber"] = 1
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {
+                "emailAddress": "b@example.com", "accountUuid": "u-2",
+                "organizationUuid": "o-2",
+            },
+        }))
+        s._write_account_credentials("2", "b@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-old", "refreshToken": "rt-old",
+                               "expiresAt": 99_999_999_999_999}}))
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-new", "refreshToken": "rt-new",
+            "expiresAt": 99_999_999_999_999}})
+        s._write_credentials(rotated)
+        with patch("claude_swap.oauth.fetch_oauth_profile",
+                   return_value={"uuid": "u-2", "email": "b@example.com",
+                                 "organizationUuid": "o-2"}):
+            s._resync_rotated_backup("2", "b@example.com", "o-2", rotated)
+        assert json.loads(s._read_account_credentials(
+            "2", "b@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-new", (
+            "premise: the rotation must still land in this slot"
+        )
+        assert s._get_sequence_data()["activeAccountNumber"] == 1, (
+            "a newer generation of a slot's own credential moved the "
+            "roster's active pointer onto it"
+        )
+
     def test_an_older_login_does_not_overwrite_a_fresher_stored_one(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict, monkeypatch
@@ -18146,25 +18228,29 @@ class TestALoginLandsInItsOwnSlot:
             "_row_eligible refuses to fetch it"
         )
 
-    def test_an_adopted_login_becomes_the_active_slot(
+    def test_an_adopted_login_lands_in_its_slot_without_moving_active(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
     ):
-        """THE ROSTER FOLLOWS THE LOGIN. The live store holds slot 1's
-        credential, so slot 1 is the active account. Until the roster says
-        so, `_live_login_identity` falls back to the config's account the
-        moment the pin splice returns the config to the pin.
+        """THE CREDENTIAL FOLLOWS THE LOGIN; THE ACTIVE POINTER DOES NOT.
+        The live store holds slot 1's credential, so slot 1's backup must
+        hold it too. Moving `activeAccountNumber` onto it is a separate,
+        now-refused step (see `TestALoginLandsInItsOwnSlot`'s
+        `..._never_moves_the_active_pointer`): a `/login` is not a request
+        to move the fleet, and the earlier fix that made the roster follow
+        it here is exactly how a live cross-wire incident was created.
 
         Measured on both Macs 2026-09-02 06:15-06:24Z after a /login as
         slot 2 with slot 3 recorded: nine minutes of "Account-1: usage
         unknown", the old stored token struck again, and the login reached
-        its slot only through the failover's stash."""
+        its slot only through the failover's stash. That healed the
+        BACKUP; it should never have healed the roster's active mark too."""
         sample_sequence_data["activeAccountNumber"] = 2
         s = self._owner_slot_fixture(sample_sequence_data)
         live = self._blob("rt-live")
         s._write_credentials(live)
         self._resync_as_slot_2(s, live)
-        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
         assert json.loads(s._read_account_credentials(
             "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live"
 
@@ -18354,13 +18440,14 @@ class TestALoginLandsInItsOwnSlot:
         assert "3" not in data["accounts"], data["accounts"].keys()
         assert data["activeAccountNumber"] == 2
 
-    def test_a_restored_credential_the_slot_already_holds_still_becomes_active(
+    def test_a_restored_credential_the_slot_already_holds_writes_nothing(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
     ):
-        """The slot already holds this exact lineage, so nothing is written,
-        but the live store holds it and the roster does not say so. A restore
-        that moved nothing else is a login for this purpose."""
+        """The slot already holds this exact lineage, so nothing is written
+        -- and the active pointer, tracked separately, is never moved by
+        this adopt path either (see the sibling class's
+        `..._never_moves_the_active_pointer`)."""
         sample_sequence_data["activeAccountNumber"] = 2
         s = self._owner_slot_fixture(sample_sequence_data)
         same = self._blob("rt-same")
@@ -18369,7 +18456,7 @@ class TestALoginLandsInItsOwnSlot:
         with patch.object(s, "_write_account_credentials") as write:
             self._resync_as_slot_2(s, same)
         write.assert_not_called()
-        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
 
 
 class TestLineageJitterNeverAdoptsIntoAHealthySlot:

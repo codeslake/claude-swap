@@ -3445,10 +3445,11 @@ class ClaudeAccountSwitcher:
                 oauth.credential_fingerprint(stored)
                 == oauth.credential_fingerprint(creds)
             ):
-                # Already there; re-writing only shifts .prev. The roster may
-                # still lag it: a restore of the slot's own credential that
-                # moved nothing else is a login for this purpose.
-                self._make_active_if_live(data, owner, owner_email, creds)
+                # Already there; re-writing only shifts .prev. Never moves
+                # `activeAccountNumber`: a `/login` is not a request to move
+                # the fleet onto ``owner`` -- only `cswap switch`/`add_account`
+                # are, and writing this slot's own bytes into the CONFIG's
+                # slot is exactly how a cross-wire gets created.
                 return True
             # A LATER LOGIN DOES NOT WAIT FOR THE SLOT TO DIE, the rule
             # `_adopt_into_dead_slot` applies at a switch: `_refresh_expiry`
@@ -3488,7 +3489,8 @@ class ClaudeAccountSwitcher:
                     "quarantine (%s); it stays out of collect passes until "
                     "one observes the new credential.", owner, e,
                 )
-            self._make_active_if_live(data, owner, owner_email, creds)
+            # Never moves `activeAccountNumber` here either -- see the
+            # comment on the identical-bytes branch above.
         self._logger.info(
             "Adopted a login into Account-%s (%s): the live credential "
             "resolves to that account, so it was stored there rather than "
