@@ -2463,7 +2463,7 @@ class TestABareLoginHealsItsSlotThroughTheEngineTick:
         # defect this whole class is about).
         h.switcher._write_account_credentials("2", "n@example.com", json.dumps(
             {"claudeAiOauth": {"accessToken": "sk-wrong", "refreshToken": "rt-wrong"}}
-        ))
+        ), attributed=True)
         assert h.active_number() == 1, "premise: an unrelated account is active"
 
         # A bare /login as slot N's OWN roster identity -- no cswap add, no
@@ -2506,7 +2506,7 @@ class TestABareLoginHealsItsSlotThroughTheEngineTick:
         h.switcher._write_account_credentials("3", "p@example.com", json.dumps(
             {"claudeAiOauth": {"accessToken": "sk-3-old", "refreshToken": "rt-3-old",
                                "refreshTokenExpiresAt": 1_000_000}}
-        ))
+        ), attributed=True)
         assert h.active_number() == 1
 
         # A bare /login: label says slot 2, but the live bytes (a LATER
@@ -2980,6 +2980,7 @@ class TestQuarantineLifecycle:
             json.dumps({"claudeAiOauth": {
                 "accessToken": "sk-recovered", "refreshToken": "rt-recovered",
             }}),
+            attributed=True,
         )
         data = harness.switcher._get_sequence_data()
         data["accounts"]["2"]["added"] = "2099-01-01T00:00:00Z"

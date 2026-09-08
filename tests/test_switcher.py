@@ -7968,6 +7968,7 @@ class TestSwitchTargetLivenessGuard:
                         "refreshToken": "rt-2-rotated",
                     },
                 }),
+                attributed=True,
             )
             return True
 
@@ -8210,7 +8211,7 @@ class TestSwitchTargetLivenessGuard:
 
         def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
             if token == "sk-2-stashed":
-                s._write_account_credentials("2", "b@example.com", freshened)
+                s._write_account_credentials("2", "b@example.com", freshened, attributed=True)
             return {"sk-2": False, "sk-2-stashed": False}.get(token)
 
         with patch(
@@ -8253,7 +8254,7 @@ class TestSwitchTargetLivenessGuard:
 
         def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
             if token == "sk-2":
-                s._write_account_credentials("2", "b@example.com", freshened)
+                s._write_account_credentials("2", "b@example.com", freshened, attributed=True)
                 return False
             return {"sk-2-stashed": True}.get(token)
 
@@ -13963,7 +13964,7 @@ class TestStrikeUnbindsInCollector:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
-        s._write_account_credentials("2", "b@example.com", fresh)
+        s._write_account_credentials("2", "b@example.com", fresh, attributed=True)
 
         engine_claims: dict[str, str] = {}
         real_clear = s._usage_store.clear_dead_token
@@ -14063,7 +14064,7 @@ class TestStrikeUnbindsInCollector:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
-        s._write_account_credentials("2", "b@example.com", fresh)
+        s._write_account_credentials("2", "b@example.com", fresh, attributed=True)
 
         info = [(2, "b@example.com", "", "", False, fresh, "")]
         s._collect_usage_entries(info, fetch=set())
@@ -14119,7 +14120,7 @@ class TestStrikeUnbindsInCollector:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
-        s._write_account_credentials("2", "b@example.com", fresh)
+        s._write_account_credentials("2", "b@example.com", fresh, attributed=True)
 
         # Between the collector's decision (made on its own lock-free
         # `entries()` read, captured above) and its write, A DIFFERENT
@@ -14237,7 +14238,7 @@ class TestStrikeUnbindsInCollector:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
-        s._write_account_credentials("2", "b@example.com", fresh)
+        s._write_account_credentials("2", "b@example.com", fresh, attributed=True)
 
         for advance_s, label in (
             (120.0, "+120s (still inside SERVE_TTL_S)"),
@@ -16538,7 +16539,7 @@ class TestActiveSlotStrikeParity:
         # CONTROL: the backup DOES match the struck generation, so the
         # strike is confirmed by a source that was actually read. A blanket
         # refusal on an empty live value would lose this.
-        s._write_account_credentials("2", "b@example.com", struck_gen)
+        s._write_account_credentials("2", "b@example.com", struck_gen, attributed=True)
         assert s._slot_token_dead("2", "b@example.com") is True, (
             "control: a matching backup must still confirm dead"
         )
