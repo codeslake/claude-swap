@@ -199,13 +199,14 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
         self, tmp_path,
     ):
         """PR 286's renumber-fallback read (``_read_account_credentials``,
-        which this guard does not call on this branch alone) mirrors a
-        same-email backup it finds under another slot number back under the
-        slot it was asked for -- a write of its own. Once the two PRs merge,
-        this guard's verification read (``_read_account_credentials_ex`` ->
-        ``_read_account_credentials``) can reach that mirror-write, which
-        re-enters the guard that asked for the read: unbounded recursion on
-        a genuinely empty target slot.
+        which this guard's own verification read no longer reaches -- see
+        ``_check_attribution``'s docstring) mirrors a same-email backup it
+        finds under another slot number back under the slot it was asked
+        for -- a write of its own. The guard's own read now goes through
+        ``_read_account_credentials_direct``, which stays a leaf read and
+        never reaches that mirror-write, so the mark below is defense in
+        depth rather than the only thing standing between the two PRs and
+        recursion.
 
         ``CredentialStore._in_attribution_read`` (PR 286's own suppression
         flag, defined on ITS branch: ``False`` unless a caller marks a read
@@ -222,17 +223,17 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
 
         def spying_check(*a, **kw):
             marker = []
-            real_read_ex = store._read_account_credentials_ex
+            real_read_direct = store._read_account_credentials_direct
 
-            def spying_read_ex(*ra, **rkw):
+            def spying_read_direct(*ra, **rkw):
                 marker.append(getattr(store, "_in_attribution_read", False))
-                return real_read_ex(*ra, **rkw)
+                return real_read_direct(*ra, **rkw)
 
-            store._read_account_credentials_ex = spying_read_ex
+            store._read_account_credentials_direct = spying_read_direct
             try:
                 return real_check(*a, **kw)
             finally:
-                store._read_account_credentials_ex = real_read_ex
+                store._read_account_credentials_direct = real_read_direct
                 seen_during_check.extend(marker)
 
         store._check_attribution = spying_check
@@ -274,6 +275,42 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
             )
         finally:
             store._in_attribution_read = False
+
+
+class TestAttributionGuardReadsOnlyThisSlotsOwnKey:
+    def test_a_same_email_leftover_under_another_slot_does_not_block_an_empty_slots_first_write(
+        self, tmp_path, monkeypatch,
+    ):
+        """PR 286's renumber-fallback sweep (folded into
+        ``_read_account_credentials`` once that PR merges, not present on
+        this branch) can answer a DIFFERENT slot's leftover credential for
+        the same email. The guard's own verification read must ask "is
+        THIS slot's own key populated" (``_read_account_credentials_direct``),
+        never the sweep-carrying wrapper — or a leftover parked under
+        another slot number makes a genuinely empty destination slot look
+        populated, and the guard wrongly raises "Refusing cross-identity
+        write" against the contract that an empty slot is always allowed.
+
+        The sweep itself ships on PR 286's branch, not this one, so it is
+        simulated here by monkeypatching the wrapper
+        (``_read_account_credentials``) to answer as it would: nothing
+        under slot 3's own key, but a leftover under a different slot for
+        this email.
+        """
+        store = CredentialStore(_Host(tmp_path))
+
+        def simulated_sweep(account_num, email, failed=None):
+            return ACCOUNT_1_BACKUP  # "found" under some other slot number
+
+        monkeypatch.setattr(store, "_read_account_credentials", simulated_sweep)
+
+        store._write_account_credentials(
+            "3", "leftover@example.com", ACCOUNT_2_LIVE,
+        )
+
+        assert store._read_account_credentials_direct(
+            "3", "leftover@example.com"
+        ) == ACCOUNT_2_LIVE
 
 
 def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tuple[str | None, int, str]]:

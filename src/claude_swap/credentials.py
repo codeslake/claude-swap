@@ -1164,6 +1164,17 @@ class CredentialStore:
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
 
+        Forwards to ``_read_account_credentials_direct``: this name is the
+        one a caller that wants "this slot's own key, and nothing found
+        under any other slot" reaches for.
+        """
+        return self._read_account_credentials_direct(account_num, email, failed)
+
+    def _read_account_credentials_direct(
+        self, account_num: str, email: str, failed: list | None = None
+    ) -> str:
+        """Read account credentials from backup. ``""`` when missing.
+
         macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
         copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
         Linux/WSL/Windows read the ``.enc`` only.
@@ -1310,14 +1321,19 @@ class CredentialStore:
         macOS-keyring-to-security migration's Keychain-only write) — see
         ``_write_account_credentials``'s docstring for what the guard means.
 
-        Reads with ``_read_account_credentials_ex`` rather than the plain
-        form: the plain read returns ``""`` for an UNREADABLE populated slot
-        (a locked/denied Keychain, an EIO'd ``.enc``) exactly as it does for
-        a genuinely absent one, and treating those alike disables the guard
-        on any host where a process can't read its own Keychain (ssh/launchd
-        on macOS, per CONTEXT.md) — precisely where the incident this guard
-        exists for lives. Unreadable is "cannot verify", which refuses like
-        a mismatch, not "empty", which would permit like an absent slot.
+        Reads with ``_read_account_credentials_direct`` — this slot's own
+        key, never a merge partner's renumber-fallback sweep for the same
+        email under a DIFFERENT slot number, which would make a genuinely
+        empty destination slot look populated by a same-email leftover
+        parked elsewhere. The unreadable-vs-absent distinction is kept via
+        this read's own ``failed`` list: the plain read returns ``""`` for
+        an UNREADABLE populated slot (a locked/denied Keychain, an EIO'd
+        ``.enc``) exactly as it does for a genuinely absent one, and
+        treating those alike disables the guard on any host where a
+        process can't read its own Keychain (ssh/launchd on macOS, per
+        CONTEXT.md) — precisely where the incident this guard exists for
+        lives. Unreadable is "cannot verify", which refuses like a
+        mismatch, not "empty", which would permit like an absent slot.
 
         Marks ``self._in_attribution_read`` around the read. Nothing on this
         branch alone defines or reads that attribute, so the mark is inert
@@ -1329,9 +1345,11 @@ class CredentialStore:
         prev_in_attribution_read = getattr(self, "_in_attribution_read", False)
         self._in_attribution_read = True
         try:
-            existing, unreadable = self._read_account_credentials_ex(
-                account_num, email
+            failed: list = []
+            existing = self._read_account_credentials_direct(
+                account_num, email, failed
             )
+            unreadable = bool(failed) and not existing
         finally:
             self._in_attribution_read = prev_in_attribution_read
         if unreadable and not attributed:
