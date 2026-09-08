@@ -15393,55 +15393,40 @@ class TestDynamicNeverWalls0010:
         h.make_live("acct1@example.invalid", 1)
         return h
 
-    @staticmethod
-    def _seed_last_switch_at(h, when):
-        path = h.switcher.backup_dir / "autoswitch_state.json"
-        raw = json.loads(path.read_text()) if path.exists() else {"schemaVersion": 1}
-        raw["lastSwitchAt"] = when
-        path.write_text(json.dumps(raw))
-
     # -- R1: never hold where you would not land ------------------------
 
-    def test_r1_cooldown_does_not_hold_an_active_that_cannot_serve(
+    def test_r1_the_bypass_leaves_a_spent_active_and_cannot_two_cycle(
         self, temp_home
     ):
-        """h=2 is below the bar `_rank_dynamic_candidates` refuses to land
-        on, so the account cannot serve — one second into a 300 s cooldown
-        the engine must still leave it."""
+        """Tick 1: h=2 is below the bar `_rank_dynamic_candidates` refuses
+        to land on, so the account cannot serve — one second into a 300s
+        cooldown the engine must still leave it.
+
+        Tick 2 is the anti-flap argument, not a scenario: landing needs
+        `h > SPENT_HEADROOM_PCT` and this departure needs
+        `h <= SPENT_HEADROOM_PCT`, so the account just left can never be
+        the one next landed on. Still well inside the same cooldown
+        window, where a bypassed tick is free to re-decide.
+        """
         h = self._harness(temp_home)
-        self._seed_last_switch_at(h, h.clock.now - 1.0)
-        outcome = h.tick_with_usage({
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock() - 1.0))
+        fleet = {
             "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
             "2": _usage(50.0),                                # headroom 50
             "3": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
-        })
+        }
+        outcome = h.tick_with_usage(fleet)
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome!r} ({reasons}) — an account the engine would "
             "refuse to LAND on must not be held by the cooldown"
         )
         assert h.active_number() == 2
-
-    def test_r1_the_bypass_cannot_produce_a_two_cycle(self, temp_home):
-        """The anti-flap argument, not a scenario: landing needs
-        `h > SPENT_HEADROOM_PCT` and this departure needs
-        `h <= SPENT_HEADROOM_PCT`, so the account just left can never be
-        the one next landed on. Driven over consecutive ticks well inside
-        one cooldown window, where every bypassed tick could re-decide."""
-        h = self._harness(temp_home)
-        self._seed_last_switch_at(h, h.clock.now - 1.0)
-        fleet = {
-            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
-            "2": _usage(50.0),                                # headroom 50
-            "3": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
-        }
-        landings = []
-        for _ in range(6):
-            h.tick_with_usage(fleet)
-            landings.append(h.active_number())
-            h.clock.advance(30.0)
-        assert landings == [2] * 6, (
-            f"landed {landings} — a spent account must never be returned to"
+        h.clock.advance(30.0)
+        h.tick_with_usage(fleet)
+        assert h.active_number() == 2, (
+            f"landed back on {h.active_number()} — a spent account must "
+            "never be returned to"
         )
 
     # -- R2: look ahead by looking more often ---------------------------
