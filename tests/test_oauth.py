@@ -1502,3 +1502,23 @@ class TestConsumeBusyIsDeterministic:
             k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
         ]
         assert not missing, missing
+
+
+class TestLoginExpiresAtIso:
+    def test_refresh_token_expiry_is_reported_as_iso_utc(self):
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-x", "refreshTokenExpiresAt": 1791421596865,
+        }})
+        assert oauth.login_expires_at_iso(creds) == "2026-10-08T01:06:36Z"
+
+    @pytest.mark.parametrize("creds", [
+        "",
+        "not json",
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": "soon"}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": True}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": 0}}),
+        json.dumps({"other": {}}),
+    ])
+    def test_anything_but_a_positive_epoch_is_unknown(self, creds):
+        assert oauth.login_expires_at_iso(creds) is None

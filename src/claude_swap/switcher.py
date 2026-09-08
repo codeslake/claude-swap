@@ -5437,7 +5437,7 @@ class ClaudeAccountSwitcher:
         accounts = []
         seq_data = self._get_sequence_data() or {}
         now = self._usage_store.clock()
-        for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
+        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -5458,6 +5458,7 @@ class ClaudeAccountSwitcher:
                     ),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
+                    login_expires_at=oauth.login_expires_at_iso(creds),
                 )
             )
         payload = {
