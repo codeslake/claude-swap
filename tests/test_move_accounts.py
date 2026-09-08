@@ -347,6 +347,80 @@ class TestMoveAccount:
         assert switcher._read_account_credentials("2", "account2@example.com") == ""
         assert switcher._read_account_config("2", "account2@example.com") == ""
 
+    def test_bare_renumber_still_finds_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A renumber that only rewrites ``sequence.json`` (no ``move``) leaves
+        the backup keyed under the OLD slot number. The read for the roster's
+        NEW number must still find it, converge a copy under the new number,
+        and never delete the old one."""
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials("2", "account2@example.com", "creds-two")
+
+        data = switcher._get_sequence_data()
+        data["accounts"]["5"] = data["accounts"].pop("2")
+        switcher._write_json(switcher.sequence_file, data)
+
+        assert (
+            switcher._read_account_credentials("5", "account2@example.com")
+            == "creds-two"
+        )
+        # Converged: a DIRECT read (no fallback) now finds slot 5's own
+        # copy, on whichever backend this platform actually writes to...
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "5", "account2@example.com"
+            )
+            == "creds-two"
+        )
+        # ...and the old slot's item was never touched.
+        assert (
+            switcher._store._read_account_credentials_direct(
+                "2", "account2@example.com"
+            )
+            == "creds-two"
+        )
+
+    def test_compaction_renumber_above_the_new_max_still_finds_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A compaction shifts every slot above the removed one down by one.
+
+        The stale backup then sits ONE PAST the new roster max (removing
+        slot 1 of {1,2,3} shifts 2->1 and 3->2, leaving account3's backup
+        keyed under the old "3" while the roster's own max is now 2) — a
+        probe bound that never looks above the CURRENT max misses it, and
+        the account is forced to re-login for nothing.
+        """
+        switcher = ClaudeAccountSwitcher()
+        data = dict(sample_sequence_data)
+        data["accounts"] = {
+            "1": {"email": "account1@example.com", "uuid": "uuid-1"},
+            "2": {"email": "account2@example.com", "uuid": "uuid-2"},
+            "3": {"email": "account3@example.com", "uuid": "uuid-3"},
+        }
+        data["sequence"] = [1, 2, 3]
+        self._write(switcher, data)
+        switcher._write_account_credentials(
+            "3", "account3@example.com", "creds-three"
+        )
+
+        # Bare renumber (sequence.json only, no move_account): slot 1 is
+        # removed, 2 and 3 shift down to 1 and 2.
+        seq = switcher._get_sequence_data()
+        seq["accounts"] = {
+            "1": seq["accounts"]["2"],
+            "2": seq["accounts"]["3"],
+        }
+        seq["sequence"] = [1, 2]
+        switcher._write_json(switcher.sequence_file, seq)
+
+        assert (
+            switcher._read_account_credentials("2", "account3@example.com")
+            == "creds-three"
+        )
+
     def test_move_relocates_session_profile(
         self, temp_home: Path, sample_sequence_data: dict
     ):
