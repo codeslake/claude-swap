@@ -34,6 +34,7 @@ from claude_swap.autoswitch import (
     classify_candidate_block,
     consume_first_rank_key,
     pct_label,
+    select_probe_target,
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
@@ -423,6 +424,52 @@ class AutoScreen(Screen):
             default=0,
         )
         now = time.time()
+        # THE SAME PROBE TARGET THE ENGINE WOULD ADMIT, never re-derived --
+        # `select_probe_target` (autoswitch.py) is the one function both
+        # this panel and `_rank_candidates_pass` call, so an unknown-reset
+        # candidate cannot sort last here while the engine ranks it first.
+        probe_num = None
+        if consume_first:
+            usage_by_account = {
+                acc.number: (
+                    acc.usage.sentinel
+                    if acc.usage.sentinel is not None
+                    else acc.usage.last_good
+                )
+                for acc in snap.accounts
+            }
+            oauth_candidates = [
+                acc.number
+                for acc in snap.accounts
+                if acc.number != active_number
+                and acc.switchable
+                and acc.kind != "api_key"
+            ]
+            # `decision_value()`, not `usage_by_account`'s sentinel-or-
+            # last_good: the engine's own gate (`select_probe_target`'s
+            # `active_reset_ts is None` guard) runs on `decision_value()`,
+            # which drops a `last_good` older than `STALE_OK_S` -- reading
+            # the raw `last_good` here instead let the panel see an active
+            # reset the engine had already stopped trusting, and jump an
+            # unknown-reset candidate to the top of a probe the engine would
+            # never run.
+            active_acc_usage = next(
+                (acc.usage for acc in snap.accounts if acc.number == active_number),
+                None,
+            )
+            active_value = (
+                active_acc_usage.decision_value()
+                if active_acc_usage is not None
+                else None
+            )
+            probe_num = select_probe_target(
+                usage_by_account,
+                oauth_candidates,
+                rank_models,
+                active_value,
+                self._engine._last_probe_cooldown if self._engine is not None else None,
+                now,
+            )
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
         # own payload (`relevant_windows`), so "chip 1" is not the same
@@ -430,6 +477,7 @@ class AutoScreen(Screen):
         # exactly the accounts that will reach the chip branch below
         # (switchable, no sentinel, a known binding pct).
         row_windows: dict[str, list[tuple[str, float, str | None]]] = {}
+        chip_width: dict[str, int] = {}
         for acc in snap.accounts:
             if (
                 acc.number == active_number
@@ -438,12 +486,17 @@ class AutoScreen(Screen):
                 or binding_pct(acc.usage.last_good, models) is None
             ):
                 continue
-            row_windows[acc.number] = oauth.relevant_windows(acc.usage.last_good, models)
-        chip_width: dict[str, int] = {}
-        for windows in row_windows.values():
+            windows = oauth.relevant_windows(acc.usage.last_good, models)
+            row_windows[acc.number] = windows
             for label, wpct, resets_at in windows:
                 width = len(
-                    data.chip_label(label, data.reset_text({"resets_at": resets_at}, now))
+                    data.chip_label(
+                        label,
+                        data.reset_text(
+                            {"resets_at": resets_at}, now, acc.usage.fetched_at
+                        ),
+                        wpct,
+                    )
                 ) + len(f"{wpct:.0f}%")
                 chip_width[label] = max(chip_width.get(label, 0), width)
         for acc in snap.accounts:
@@ -492,7 +545,7 @@ class AutoScreen(Screen):
                 # axis from a rate-limit window), so this row was the only
                 # place the same account read two different ways.
                 spend = spend_row(
-                    usage_rows(acc.usage.last_good, time.time())
+                    usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
                 )
                 if spend is not None:
                     _label, spend_pct, spend_suffix, _full = spend
@@ -513,11 +566,17 @@ class AutoScreen(Screen):
                 # chips and the label can never disagree on which windows
                 # exist for this account.
                 windows = row_windows[acc.number]
-                for i, (label, wpct, resets_at) in enumerate(windows):
+                fetched_at = acc.usage.fetched_at
+                # Computed once per window so the chip and the block label
+                # below read the exact same reset, never two separate calls
+                # that could drift.
+                chips = [
+                    (label, wpct, data.reset_text({"resets_at": resets_at}, now, fetched_at))
+                    for label, wpct, resets_at in windows
+                ]
+                for i, (label, wpct, reset) in enumerate(chips):
                     entry.append("  " if i == 0 else " · ", style=palette.muted)
-                    label_text = data.chip_label(
-                        label, data.reset_text({"resets_at": resets_at}, now)
-                    )
+                    label_text = data.chip_label(label, reset, wpct)
                     entry.append(label_text, style=palette.muted)
                     pct_text = f"{wpct:.0f}%"
                     entry.append(pct_text, style=palette.severity(wpct))
@@ -540,8 +599,17 @@ class AutoScreen(Screen):
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
                 if self._settings:
+                    # A window whose chip just read data.REFETCHING has no
+                    # opinion to contribute -- its pct provably predates its
+                    # own reset -- so it is dropped rather than zeroed: a
+                    # zeroed pct would still be a fabricated measurement,
+                    # never one the window actually reported (#325).
                     kind, blocked_model = classify_candidate_block(
-                        ((label, p) for label, p, _ in windows), self._settings.threshold
+                        (
+                            (label, p) for label, p, reset in chips
+                            if reset != data.REFETCHING
+                        ),
+                        self._settings.threshold,
                     )
                     if kind == "model":
                         entry.append(f"  {blocked_model}-only", style=palette.muted)
@@ -550,7 +618,8 @@ class AutoScreen(Screen):
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
                 key = (
                     consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, rank_models
+                        acc.usage.last_good, self._settings.threshold, now,
+                        rank_models, probe=(acc.number == probe_num),
                     )
                     if consume_first
                     else (pct if rank_pct is None else rank_pct,)

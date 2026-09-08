@@ -94,15 +94,22 @@ def usage_bar(
     return text
 
 
-def _reset_parts(window: dict, now: float) -> tuple[str | None, str | None]:
+def _reset_parts(
+    window: dict, now: float, fetched_at: float | None = None
+) -> tuple[str, str]:
     """Countdown suffix and its clock-extended variant for one window.
 
     ``("resets 2h 13m", "resets 2h 13m · 20:39")`` — the second form is what
     a row shows when it has the width for it. Equal when no clock is known.
+
+    An unknown reset used to return ``(None, None)`` and this row's suffix
+    then went blank — the same "nothing to report" reading that hid it in
+    the chips, on the account's OWN detail card this time. Named instead, so
+    the reset column never disappears merely because it is unmeasured.
     """
-    reset = data.reset_text(window, now)
+    reset = data.reset_text(window, now, fetched_at)
     if not reset:
-        return None, None
+        return "reset unknown", "reset unknown"
     clock = data.reset_clock(window, now)
     return reset, f"{reset} · {clock}" if clock else reset
 
@@ -134,14 +141,23 @@ def usage_rows(
     spend = last_good.get("spend")
     if spend:
         amounts = f"${spend['used']:,.2f} / ${spend['limit']:,.2f}"
-        reset, reset_full = _reset_parts(spend, now)
-        suffix = f"{reset}  {amounts}" if reset else amounts
-        suffix_full = f"{reset_full}  {amounts}" if reset_full else amounts
+        # A monthly budget the server never reported a reset for has no
+        # usage-window reset to name at all -- unlike 5h/7d/scoped, this
+        # is not a gap in a real countdown, so it reads its own truth
+        # (the amounts alone) instead of borrowing "reset unknown".
+        suffix = suffix_full = amounts
+        if spend.get("resets_at"):
+            reset, reset_full = _reset_parts(spend, now, fetched_at)
+            suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
         rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
-            reset, reset_full = _reset_parts(window, now)
+            reset, reset_full = _reset_parts(window, now, fetched_at)
+            # A lapsed 5h window (no reported reset, no usage) has nothing
+            # withheld -- "reset unknown" would assert a gap that isn't one.
+            if key == "five_hour" and not window.get("resets_at") and window["pct"] == 0:
+                reset = reset_full = "resets 5h"
             suffix, suffix_full = reset or "", reset_full or ""
             if key == "seven_day":
                 marker = _pace_suffix(window, fetched_at)
@@ -151,7 +167,7 @@ def usage_rows(
             rows.append((label, float(window["pct"]), suffix, suffix_full))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
-        suffix, suffix_full = _reset_parts(window, now)
+        suffix, suffix_full = _reset_parts(window, now, fetched_at)
         suffix, suffix_full = suffix or "", suffix_full or ""
         if pct >= 100:
             suffix = f"{suffix}  (!)" if suffix else "(!)"
@@ -355,7 +371,11 @@ def mini_account_text(
         # Same chip the auto view's Next-best rows draw, from the same
         # helper — one account must not read two ways on two screens.
         text.append(
-            data.chip_label(label, data.reset_text(window, now)), style=palette.muted
+            data.chip_label(
+                label, data.reset_text(window, now, fetched_at),
+                pct,
+            ),
+            style=palette.muted,
         )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
         if key == "seven_day":
@@ -372,7 +392,7 @@ def mini_account_text(
         # the same way whether it is the account's only window or sits
         # beside 5h/7d.
         text.append(
-            data.chip_label(window["name"], data.reset_text(window, now)),
+            data.chip_label(window["name"], data.reset_text(window, now, fetched_at)),
             style=palette.muted,
         )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
