@@ -29,6 +29,7 @@ from typing import NamedTuple, Protocol
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import (
+    ConfigError,
     CredentialError,
     CredentialReadError,
     CredentialWriteError,
@@ -1163,7 +1164,12 @@ class CredentialStore:
         self._write_backup_enc(account_num, email, credentials)
 
     def _read_account_credentials(
-        self, account_num: str, email: str, failed: list | None = None
+        self,
+        account_num: str,
+        email: str,
+        failed: list | None = None,
+        *,
+        probe_reassigned_slots: bool = True,
     ) -> str:
         """Read account credentials from backup, following a bare renumber.
 
@@ -1172,54 +1178,76 @@ class CredentialStore:
         number. When the roster confirms ``account_num`` *is* this email's
         current slot and the direct read comes back genuinely absent (not
         merely unreadable — see ``_read_account_credentials_ex``), retry the
-        same email under every OTHER slot number up to the roster's current
-        highest — bounded and exact, never a wildcard scan (neither backend
-        supports one). A hit is mirrored under ``account_num`` — the source
-        slot is never touched — so the next read is direct.
+        same email under every OTHER slot number up to a bound — exact
+        lookups only, never a wildcard scan (neither backend supports one).
+        A hit is mirrored under ``account_num`` — the source slot is never
+        touched — so the next read is direct.
 
         Guarding on "is account_num this email's current slot" matters: a
         slot number the roster has since FREED (``move_account`` relocates
         the backup file itself, so the old number should read empty, not
-        borrow its new home's copy) must not trigger this fallback. So does
-        skipping any candidate still PRESENT in the roster: two slots can
-        legitimately share one email (same login, different org), each with
-        its own backup — including a deliberately empty one — and only a
-        number the roster no longer lists at all is a stale leftover rather
-        than a sibling account's own key.
+        borrow its new home's copy) must not trigger this fallback. A
+        candidate the roster still lists under the SAME email is a sibling
+        with its own backup (two slots can legitimately share one email —
+        same login, different org) and is never borrowed from either.
+
+        ``probe_reassigned_slots`` (default ``True``) governs a candidate the
+        roster lists under a DIFFERENT email: the dotfiles roster is edited
+        and synced as one wholesale write, so a slot a renumber freed can be
+        reused for an unrelated new account in the SAME edit, and items are
+        keyed (num, email) — that reuse doesn't erase this email's own claim
+        on the number. But the two are indistinguishable from a file leaked
+        by an earlier crash at a slot some OTHER account has always owned, so
+        a pre-mutation snapshot read (``_read_backup_or_abort``, which cannot
+        tell "orphaned by a renumber" from "foreign leftover" either, and
+        would otherwise adopt it as this account's own committed material)
+        passes ``False`` to keep that class of candidate out of reach, the
+        same way it always was before this fallback existed.
         """
         value = self._read_account_credentials_direct(account_num, email, failed)
         if value or failed:
             return value
-        accounts = {
-            num: account.get("email", "")
-            for num, account in (
-                self._host._get_sequence_data() or {}
-            ).get("accounts", {}).items()
-        }
+        try:
+            accounts = {
+                num: account.get("email", "")
+                for num, account in (
+                    self._host._get_sequence_data() or {}
+                ).get("accounts", {}).items()
+            }
+        except ConfigError:
+            # A torn/unreadable roster (`_get_sequence_data` is
+            # `_read_json(strict=True)`) means no fallback is available —
+            # never an exception out of a read. `session.py`'s `_bootstrap`
+            # and the collect pass call through here with no handler for
+            # one; this fallback must not be able to raise where the plain
+            # direct read above never could.
+            return ""
         if accounts.get(account_num) != email:
             return ""
         # The stale number itself is gone from `accounts` (that IS the
-        # renumber), so the candidates are a bounded integer sweep up to the
-        # highest slot number the roster currently uses, not `accounts`'
-        # own keys — exact lookups only, never a wildcard scan. `account_num`
-        # is already known to be a key of `accounts` (the check above), so
-        # `int(account_num)` and every `int(n)` below (guarded by `isdigit`)
-        # cannot raise.
+        # renumber), so the candidates are a bounded integer sweep, not
+        # `accounts`' own keys. `account_num` is already known to be a key
+        # of `accounts` (the check above), so `int(account_num)` and every
+        # `int(n)` below (guarded by `isdigit`) cannot raise.
         #
-        # +1: a single bare renumber (one slot removed, every account above
-        # it shifts down by exactly one position) can leave the stale item
-        # exactly ONE past the new roster max — remove slot 3 of 9, slots
-        # 4..9 become 3..8, and the old top slot's backup stays keyed under
-        # 9, one above the new max of 8. Without the +1 that slot is never
-        # probed and the roster's own bound (never above its current max)
-        # forces a re-login the fallback exists to avoid.
+        # The dotfiles roster is edited and then synced as ONE wholesale
+        # file write, so N removals land as a single renumber, not just
+        # one: every account in the roster could in principle have shifted
+        # past a bound sized for a single removal, so the ceiling adds one
+        # slot of headroom per account rather than a flat +1.
         bound = (
-            max([int(account_num)] + [int(n) for n in accounts if n.isdigit()]) + 1
+            max([int(account_num)] + [int(n) for n in accounts if n.isdigit()])
+            + len(accounts)
         )
         for n in range(1, bound + 1):
             other_num = str(n)
-            if other_num == account_num or other_num in accounts:
+            if other_num == account_num:
                 continue
+            other_email = accounts.get(other_num)
+            if other_email == email:
+                continue  # sibling with its own backup, not ours to borrow
+            if other_email is not None and not probe_reassigned_slots:
+                continue  # occupied by a different identity; see docstring
             sub_failed: list = []
             value = self._read_account_credentials_direct(other_num, email, sub_failed)
             if sub_failed:
@@ -1322,7 +1350,11 @@ class CredentialStore:
         return ""
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self,
+        account_num: str,
+        email: str,
+        *,
+        probe_reassigned_slots: bool = True,
     ) -> tuple[str, bool]:
         """Backup read with an unreadable-vs-absent verdict.
 
@@ -1337,9 +1369,13 @@ class CredentialStore:
         into an unnecessary re-add/re-login. The ``.enc`` is the ONLY backend
         on Linux/WSL/Windows, so its own read failure must reach this verdict
         there too, not only on macOS.
+
+        ``probe_reassigned_slots`` — see ``_read_account_credentials``.
         """
         failed: list = []
-        value = self._read_account_credentials(account_num, email, failed)
+        value = self._read_account_credentials(
+            account_num, email, failed, probe_reassigned_slots=probe_reassigned_slots
+        )
         if value:
             return value, False
         if self._host.platform != Platform.MACOS:

@@ -1128,8 +1128,19 @@ class ClaudeAccountSwitcher:
         Nothing has moved yet at the call sites, so an unreadable verdict
         aborts here rather than committing a swap/move that silently drops
         the slot's live refresh token in favor of an empty destination.
+
+        ``probe_reassigned_slots=False``: this snapshot cannot tell a backup
+        genuinely orphaned by a renumber from a file leaked at some OTHER
+        account's slot by an earlier crash — the same ambiguity a plain
+        read is allowed to resolve in favor of recovery, but which this
+        commit-bound read must not, since it would adopt the sibling's
+        possibly-foreign material as this account's own about to be moved.
+        The renumber recovery this fallback exists for still applies to a
+        slot the roster has since freed entirely.
         """
-        creds, unreadable = self._read_account_credentials_ex(account_num, email)
+        creds, unreadable = self._read_account_credentials_ex(
+            account_num, email, probe_reassigned_slots=False
+        )
         if unreadable:
             raise ConfigError(
                 f"Account-{account_num}'s stored credential could not be "
@@ -3083,9 +3094,11 @@ class ClaudeAccountSwitcher:
         return self._active_verdict().degraded
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self, account_num: str, email: str, *, probe_reassigned_slots: bool = True
     ) -> tuple[str, bool]:
-        return self._store._read_account_credentials_ex(account_num, email)
+        return self._store._read_account_credentials_ex(
+            account_num, email, probe_reassigned_slots=probe_reassigned_slots
+        )
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
         """Internal safety copies preserved at switch time (diagnostics only).

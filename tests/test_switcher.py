@@ -7657,6 +7657,234 @@ class TestStashAndRetentionStore:
             == "stale-leftover"
         )
 
+    def test_renumber_fallback_survives_a_torn_roster(self, temp_home):
+        """CRITICAL: ``_get_sequence_data()`` is ``_read_json(strict=True)``
+        and RAISES ``ConfigError`` on a torn/unreadable ``sequence.json`` —
+        the exact state a wholesale roster overwrite (``deploy.sh``'s
+        ``sync_cswap_roster.py --deploy``) can leave mid-write. Before the
+        renumber-fallback existed, ``_read_account_credentials`` and
+        ``_read_account_credentials_ex`` could never raise at all; two
+        callers (``session.py``'s ``_bootstrap``, which holds the lock, and
+        ``switcher.py``'s collect pass) have no handler for one. The
+        fallback's own roster read must not be able to raise out of a read —
+        an unreadable roster means "no fallback available", not an
+        exception.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"1": {"email": email, "uuid": "uuid-1"}},
+            },
+        )
+        # No backup at slot 1: the direct read comes back genuinely absent,
+        # so the fallback's own roster read runs next — and that is the one
+        # made to raise here.
+        with patch.object(
+            switcher,
+            "_get_sequence_data",
+            side_effect=ConfigError("sequence.json exists but could not be parsed"),
+        ):
+            assert store._read_account_credentials("1", email) == ""
+            assert store._read_account_credentials_ex("1", email) == ("", False)
+
+    def test_renumber_fallback_probes_a_slot_still_present_under_another_email(
+        self, temp_home,
+    ):
+        """CRITICAL: items are keyed (num, email), not num alone. A roster
+        slot number being a CURRENT roster key does not mean that number
+        can't ALSO be a DIFFERENT account's own stale leftover — skipping a
+        candidate on its number alone, regardless of which email the roster
+        lists it under, silently costs a re-login. One roster edit that
+        removes a slot (shifting the rest down) and adds a new account can
+        reuse the freed number for someone else while that same number is
+        still a stale sibling's own leftover.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email_b = "b@example.com"
+        email_c = "c@example.com"
+        email_d = "d@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2, 3],
+                "accounts": {
+                    "1": {"email": "a@example.com", "uuid": "uuid-a"},
+                    "2": {"email": email_b, "uuid": "uuid-b"},
+                    "3": {"email": email_c, "uuid": "uuid-c"},
+                },
+            },
+        )
+        store._write_account_credentials("3", email_c, "creds-c")
+
+        # One edit: remove slot 1 (2->1, 3->2) and add a new account, which
+        # takes the freed number "3".
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2, 3],
+                "accounts": {
+                    "1": {"email": email_b, "uuid": "uuid-b"},
+                    "2": {"email": email_c, "uuid": "uuid-c"},
+                    "3": {"email": email_d, "uuid": "uuid-d"},
+                },
+            },
+        )
+
+        assert store._read_account_credentials("2", email_c) == "creds-c"
+
+    def test_renumber_fallback_finds_a_stale_backup_after_two_removals_in_one_edit(
+        self, temp_home,
+    ):
+        """IMPORTANT: the dotfiles roster is edited and then synced as ONE
+        wholesale file write, so N removals land as a SINGLE renumber — not
+        the one-removal-per-generation the ``+1`` bound assumed. Two
+        removals in one edit shift every account above them down by two,
+        leaving the stale backup two past the new roster max — the raised
+        ceiling (``+len(accounts)`` instead of a flat ``+1``) must reach it
+        on the file (``.enc``) backend, exercised here on the default
+        (non-macOS) platform.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        emails = {n: f"acct{n}@example.com" for n in range(1, 6)}
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2, 3, 4, 5],
+                "accounts": {
+                    str(n): {"email": emails[n], "uuid": f"uuid-{n}"}
+                    for n in range(1, 6)
+                },
+            },
+        )
+        store._write_account_credentials("5", emails[5], "creds-five")
+
+        # One wholesale edit removes slots 1 and 2; 3,4,5 shift to 1,2,3.
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2, 3],
+                "accounts": {
+                    "1": {"email": emails[3], "uuid": "uuid-3"},
+                    "2": {"email": emails[4], "uuid": "uuid-4"},
+                    "3": {"email": emails[5], "uuid": "uuid-5"},
+                },
+            },
+        )
+
+        assert store._read_account_credentials("3", emails[5]) == "creds-five"
+
+    def test_renumber_fallback_keychain_ceiling_survives_two_removals(
+        self, temp_home, block_real_keychain,
+    ):
+        """Same shape as the test above, on the macOS Keychain backend —
+        the raised ceiling (``max(account_num, roster_max) + len(accounts)``)
+        must cover N removals landing as one wholesale edit, not just one,
+        regardless of which backend actually stores the material."""
+        switcher = self._switcher(temp_home)
+        switcher.platform = Platform.MACOS
+        store = switcher._store
+        emails = {n: f"acct{n}@example.com" for n in range(1, 6)}
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2, 3, 4, 5],
+                "accounts": {
+                    str(n): {"email": emails[n], "uuid": f"uuid-{n}"}
+                    for n in range(1, 6)
+                },
+            },
+        )
+        store._write_account_credentials("5", emails[5], "creds-five")
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2, 3],
+                "accounts": {
+                    "1": {"email": emails[3], "uuid": "uuid-3"},
+                    "2": {"email": emails[4], "uuid": "uuid-4"},
+                    "3": {"email": emails[5], "uuid": "uuid-5"},
+                },
+            },
+        )
+
+        assert store._read_account_credentials("3", emails[5]) == "creds-five"
+
+    def test_renumber_fallback_pre_mutation_read_never_adopts_a_reassigned_slot(
+        self, temp_home,
+    ):
+        """``_read_backup_or_abort`` (swap/move's pre-mutation snapshot,
+        via ``probe_reassigned_slots=False``) must NOT reach the same
+        candidate the plain read above is allowed to: it cannot tell a
+        backup genuinely orphaned by a renumber from a file leaked at some
+        OTHER account's slot by an earlier crash, and adopting the wrong
+        one would commit foreign material as this account's own. The
+        renumber recovery still applies to a slot the roster has since
+        freed entirely (``probe_reassigned_slots`` only gates a slot the
+        roster still lists, under a different email)."""
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email_b = "b@example.com"
+        email_c = "c@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2],
+                "accounts": {
+                    "1": {"email": "a@example.com", "uuid": "uuid-a"},
+                    "2": {"email": email_b, "uuid": "uuid-b"},
+                },
+            },
+        )
+        # A file under slot 2 with account1's OWN would-be email — from the
+        # store's point of view, indistinguishable from a genuine renumber
+        # leftover, but here it is a foreign leftover: slot 2 has always
+        # been email_b's, never email_c's.
+        store._write_account_credentials("2", email_c, "foreign-leftover")
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2],
+                "accounts": {
+                    "1": {"email": email_c, "uuid": "uuid-c"},
+                    "2": {"email": email_b, "uuid": "uuid-b"},
+                },
+            },
+        )
+
+        # The pre-mutation snapshot path must NOT adopt it, checked before
+        # anything else has a chance to mirror a copy into slot 1.
+        creds, unreadable = switcher._read_account_credentials_ex(
+            "1", email_c, probe_reassigned_slots=False
+        )
+        assert (creds, unreadable) == ("", False)
+        # The plain read (general-purpose, default) is allowed to.
+        assert store._read_account_credentials("1", email_c) == "foreign-leftover"
+
 
 class TestActiveRefreshProvenance:
     """_fetch_active_usage must not rotate-and-persist an unattributed
