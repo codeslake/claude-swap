@@ -449,13 +449,52 @@ class UsageEntry:
             return False
         return True
 
-    def decision_value(self) -> dict | str | None:
+    def decision_value(self, models: tuple[str, ...] = ()) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
 
         Sentinel wins; else last-good while it is recent enough to trust
-        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness);
-        else None (unknown). Display code reads ``last_good``/``age_s``
-        directly instead — it may show older data, annotated with its age.
+        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness) —
+        but the two arms disagree on what a rolled window means, because
+        only one of them has a fresh poll behind it.
+
+        A FRESH read (age ≤ ``STALE_OK_S``) has each window whose own
+        ``resets_at`` has already elapsed DROPPED from it — a fetch that
+        SUCCEEDED, inside its trust window, whose server-reported
+        ``resets_at`` has already elapsed describes a window that has
+        ended, and freshness alone is no evidence about the new one. The
+        rest of the reading (a window that has not rolled) is still a fact
+        in hand, so only the rolled window is removed, not the whole
+        reading (``_drop_rolled_windows``, reusing the same relevant-window
+        enumeration ``_earliest_reset`` sorts, rather than a second
+        predicate). A reading with nothing left once every relevant window
+        is dropped is None (unknown), same as before.
+
+        A ``trust_extended`` read past ``STALE_OK_S`` (consecutive
+        failures, a live claim, a scheduled next poll) has no such poll: a
+        rolled window there is not "reset, real headroom on the rest" but
+        "unmeasured since before the reset, and nothing has looked since" —
+        dropping it would manufacture headroom from data nobody has
+        reconfirmed. The whole reading nulls instead, same as pre-#325 (the
+        429 arm already enforces this itself, refusing ``trust_extended``
+        outright once any relevant window's reset has passed —
+        ``_rate_limited_trust_ok`` — so it never reaches this branch with a
+        rolled window in the first place; this is the non-429 arm, which
+        has no such reset test).
+
+        This CAN null a healthy account too — the scheduled-next-poll
+        disjunct (``now < next_poll_at``) is true for a row simply not due
+        yet, with zero failures. Bounded, though: ``poll_policy`` sets
+        ``nextPollAt`` at or before the earliest future reset plus
+        ``RESET_SLACK_S``, so once a reset passes the row is due within
+        about ``RESET_SLACK_S`` and that disjunct falls away; the
+        live-claim disjunct is capped at ``CLAIM_TTL_S`` (90s). A narrow,
+        deliberate re-opening of the failover-flapping window an earlier
+        pass closed, not a regression of it.
+
+        ``models`` selects the per-model scoped windows too, matching
+        ``_drop_rolled_windows``'s reuse. Display code reads
+        ``last_good``/``age_s`` directly instead — it may show older data,
+        annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
@@ -464,6 +503,14 @@ class UsageEntry:
             and self.age_s is not None
             and (self.age_s <= STALE_OK_S or self.trust_extended)
         ):
+            if self.fetched_at is None:
+                return self.last_good  # hand-built-entry fallback (entries() ties age_s to fetched_at)
+            now = self.fetched_at + self.age_s
+            if self.age_s <= STALE_OK_S:
+                return _drop_rolled_windows(self.last_good, now, models)
+            soonest = _earliest_reset(self.last_good, models)
+            if soonest is not None and soonest <= now:
+                return None
             return self.last_good
         return None
 
@@ -567,6 +614,44 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
         if (ts := parse_reset_ts(resets_at)) is not None
     ]
     return min(resets) if resets else None
+
+
+def _drop_rolled_windows(
+    last_good: dict, now: float, models: tuple[str, ...] = ()
+) -> dict | None:
+    """A copy of ``last_good`` with each RELEVANT window whose own
+    ``resets_at`` has already elapsed removed.
+
+    A rolled window describes a window that just ended and carries no
+    information about the new one — but the REST of the reading is not
+    stale just because one window rolled (an account reading ``5h 0% ·
+    7d 100%(rolled)`` is a healthy account with real 5h headroom, not an
+    unknown one). Reuses ``oauth.relevant_windows`` — the same enumeration
+    ``_earliest_reset`` sorts — rather than a second notion of which
+    windows matter. Returns ``None`` only when every relevant window has
+    rolled: the reading is then genuinely unusable, same as before.
+    """
+    rolled = {
+        label
+        for label, _pct, resets_at in oauth.relevant_windows(last_good, models)
+        if (ts := parse_reset_ts(resets_at)) is not None and ts <= now
+    }
+    if not rolled:
+        return last_good
+    result = dict(last_good)
+    if "5h" in rolled:
+        result.pop("five_hour", None)
+    if "7d" in rolled:
+        result.pop("seven_day", None)
+    scoped = result.get("scoped")
+    if isinstance(scoped, list):
+        kept = [
+            s for s in scoped
+            if not (isinstance(s, dict) and s.get("name") in rolled)
+        ]
+        if len(kept) != len(scoped):
+            result["scoped"] = kept
+    return result if oauth.relevant_windows(result, models) else None
 
 
 def _rate_limited_trust_ok(

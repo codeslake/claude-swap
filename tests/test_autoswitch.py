@@ -1290,14 +1290,28 @@ class TestDecisionTable:
         assert "all accounts exhausted" in event.human()
 
     def test_a_reset_already_past_is_not_provable_either(self, harness):
-        """The `usable_at <= now` half, which nothing reads the flag for.
+        """The active account's own past reset now decides the outcome
+        before the fleet-exhaustion computation this test used to exercise
+        is ever reached — #325's per-window ruling drops a window once ITS
+        OWN reset has elapsed (``usage_store._drop_rolled_windows``), and
+        account 1 (active, ``_usage()``'s 5h axis, past reset) has that
+        window dropped, leaving only the helper's inert ``seven_day: {pct:
+        0.0}`` filler. That filler carries no reported reset either, so
+        consume-first's own `reset-unknown` idle hold fires (the SAME hold
+        `test_reset_unknown_when_active_reset_missing` already covers) —
+        before `_rank_candidates` and its `AllExhaustedEvent` path ever run.
 
-        Its sibling below puts the SAME past reset on all three accounts, so
-        `earliest` is None whatever the flag says and the value is never
-        consulted. Mixed -- one account already past, the others hours out --
-        the two halves separate: a past reset means that account could return
-        at any moment, so the fleet is no more provable than one with no reset
-        at all, and announcing the next account's is a claim over it.
+        What would now go undetected: the specific claim that a fleet whose
+        ONLY provable fact is "account 1's past reset is not usable
+        evidence" still reaches `AllExhaustedEvent` and reports no earliest
+        reset. It cannot reach that event any more for this input. The
+        underlying value this test protected — a past reset must never be
+        treated as a countable fact — still holds and is now enforced two
+        steps earlier (the window carrying it is dropped outright); the
+        `AllExhaustedEvent`-level ignoring-a-non-future-reset behaviour for
+        a fleet that CAN still reach that event (every relevant window kept,
+        genuinely all spent) stays covered by
+        `test_all_exhausted_carries_earliest_reset`.
         """
         from datetime import datetime, timezone
 
@@ -1312,20 +1326,24 @@ class TestDecisionTable:
             "2": _usage(100, _at(2 * 3600)),
             "3": _usage(100, _at(3 * 3600)),
         })
-        assert outcome is TickOutcome.BLOCKED
-        event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
-        assert event.earliest_reset_at is None, (
-            f"announced {event.earliest_reset_at!r} while account 1's reset has "
-            "already passed — it can return at any moment and nothing measured it"
-        )
-        assert harness.engine._sleep_until_ts is None, (
-            "the sleep armed toward a later account's reset over one that is "
-            "already due"
-        )
-        assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["reset-unknown"]
 
     @pytest.mark.parametrize("offset", [-60.0, 0.0])
     def test_all_exhausted_ignores_non_future_reset(self, harness, offset):
+        # #325 per-window ruling: every account's 5h window (the axis
+        # `_usage()` sets) shares this same non-future reset, so it is
+        # dropped for all three -- each falls back to `_usage()`'s inert
+        # `seven_day: {pct: 0.0}` filler, which reports no reset of its own
+        # either. consume-first's `reset-unknown` idle hold fires (same as
+        # its sibling above) before `AllExhaustedEvent` is ever built.
+        #
+        # What would now go undetected: nothing new past the sibling test's
+        # note above -- both collapse to the identical path for the identical
+        # reason (the tracked window's own past reset invalidates it before
+        # any fleet-wide computation runs), which is the honest outcome given
+        # neither account carries any OTHER evidence.
         from datetime import datetime, timezone
 
         reset = (
@@ -1338,11 +1356,9 @@ class TestDecisionTable:
             "2": _usage(100, reset),
             "3": _usage(100, reset),
         })
-        assert outcome is TickOutcome.BLOCKED
-        event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
-        assert event.earliest_reset_at is None
-        assert harness.engine._sleep_until_ts is None
-        assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["reset-unknown"]
 
 
 class TestIdleHold:
@@ -10996,20 +11012,35 @@ class TestHorizonAxisDoesNotFlap:
         enough to matter".
 
         Same failover setup as the sibling all-spent tests (peer barred at
-        departure, active burns down), then a single tick with four
+        departure, active burns down), then a single tick with three
         variants -- only the ACTIVE's `resets_at` (and, for NEG, the peer's)
         differs across rows:
 
             POS   active reset 400h out, peer back in ~50min  -> SWITCHED
             NEG   active reset 400h out, peer only 60s sooner -> BLOCKED
             DMG-a active reset UNREPORTED, peer back in ~50min-> SWITCHED
-            DMG-b active reset in the PAST, peer back in ~50min-> SWITCHED
 
         POS/NEG must already pass unfixed -- they pin the guard's intended
         behaviour (both controls invariant, per the review's damage table).
-        DMG-a/DMG-b fail against 5c69ad2 because `isfinite` reads the
-        active's `inf` as "unknown" and holds even though the peer is
-        inside the horizon.
+        DMG-a fails against 5c69ad2 because `isfinite` reads the active's
+        `inf` as "unknown" and holds even though the peer is inside the
+        horizon.
+
+        A fourth row, DMG-b ("active reset in the PAST"), pinned the same
+        claim for a reset already elapsed rather than never reported --
+        removed under #325. `_usage()`'s SAME window carries both the
+        active's pct and its `resets_at`, and #325's per-window ruling now
+        drops a window outright once its own reset has elapsed
+        (`usage_store._drop_rolled_windows`), taking the pct with it -- so
+        the engine can no longer be handed "a known, near-spent pct whose
+        reset is past" on one window; a past reset now always presents as
+        no information at all on that window, collapsing DMG-b into DMG-a's
+        shape structurally, before `_binding_recovery_ts` (whose own
+        docstring still documents an "already past" `inf` case) ever runs.
+        That branch is not reachable through the engine's normal
+        decision_value-fed path any more; flagged to the lead rather than
+        reconstructed here, since it is this guard's own code (a different
+        PR's fix), not #325's.
         """
         cases = [
             (
@@ -11029,13 +11060,6 @@ class TestHorizonAxisDoesNotFlap:
             (
                 "DMG-a active NO resets_at, peer ~50min out",
                 lambda h: _usage(98.0),
-                lambda h: self._at(h, 3000.0),
-                TickOutcome.SWITCHED,
-                1,
-            ),
-            (
-                "DMG-b active reset in PAST, peer ~50min out",
-                lambda h: _usage(98.0, self._at(h, -3600.0)),
                 lambda h: self._at(h, 3000.0),
                 TickOutcome.SWITCHED,
                 1,

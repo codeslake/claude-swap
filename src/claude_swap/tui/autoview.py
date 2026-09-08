@@ -446,12 +446,19 @@ class AutoScreen(Screen):
         # candidate cannot sort last here while the engine ranks it first.
         probe_num = None
         if consume_first:
+            # `decision_value(rank_models)`, not a raw sentinel-or-last_good
+            # read: the engine's own gate (`select_probe_target`'s
+            # `active_reset_ts is None` guard, and `_rank_candidates_pass`'s
+            # admission loop) runs on `decision_value()`, which drops a
+            # `last_good` older than `STALE_OK_S` AND (#325) a window whose
+            # own reset has elapsed -- reading the raw `last_good` here
+            # instead let the panel disagree with the engine on exactly what
+            # :417-420 assumes cannot happen: a candidate the engine reads
+            # as unknown-reset (its rolled window dropped) could still show
+            # here with the pre-drop reading, sorting differently than the
+            # engine would ever rank it.
             usage_by_account = {
-                acc.number: (
-                    acc.usage.sentinel
-                    if acc.usage.sentinel is not None
-                    else acc.usage.last_good
-                )
+                acc.number: acc.usage.decision_value(rank_models)
                 for acc in snap.accounts
             }
             oauth_candidates = [
@@ -461,20 +468,12 @@ class AutoScreen(Screen):
                 and acc.switchable
                 and acc.kind != "api_key"
             ]
-            # `decision_value()`, not `usage_by_account`'s sentinel-or-
-            # last_good: the engine's own gate (`select_probe_target`'s
-            # `active_reset_ts is None` guard) runs on `decision_value()`,
-            # which drops a `last_good` older than `STALE_OK_S` -- reading
-            # the raw `last_good` here instead let the panel see an active
-            # reset the engine had already stopped trusting, and jump an
-            # unknown-reset candidate to the top of a probe the engine would
-            # never run.
             active_acc_usage = next(
                 (acc.usage for acc in snap.accounts if acc.number == active_number),
                 None,
             )
             active_value = (
-                active_acc_usage.decision_value()
+                active_acc_usage.decision_value(rank_models)
                 if active_acc_usage is not None
                 else None
             )

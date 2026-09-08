@@ -886,23 +886,26 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     return None
 
 
-def _seven_day_reset_unmeasured(usage: dict | str | None, now: float) -> bool:
-    """True whenever the weekly reset is not a usable fact for the probe
-    gate to skip on — the same ``None`` ``_seven_day_reset_ts`` computes,
-    read here under its own name since this is the probe gate's own
-    question, not a ranking one.
+def _seven_day_reset_unmeasured(usage: dict | str | None) -> bool:
+    """True only when the weekly reset has never been REPORTED at all —
+    narrower than ``_seven_day_reset_ts``'s ``None``, which also covers a
+    stale snapshot whose ``resets_at`` has since elapsed.
 
-    A stale snapshot whose ``resets_at`` has since ELAPSED is NOT "a fact
-    already in hand" — it describes the window that just ended, and carries
-    no information about the new one, and nothing on the engine's ordinary
-    polling cadence corrects it: a fetch keeps refreshing ``fetchedAt``
-    while the account is merely a peer, but the *value* it reports for a
-    window that has already rolled over is stale until the account is
-    activated. So an elapsed reset is exactly the gap a probe exists to
-    close, same as a reset that was never reported at all — only a reset
-    that has NOT yet elapsed is a genuine fact to defer to.
+    The elapsed case does not need a separate branch here: a decision value
+    whose own earliest relevant-window reset has already elapsed is null
+    before it ever reaches this function (``UsageEntry.decision_value``), so
+    it already answers True at the ``not isinstance(usage, dict)`` line
+    below, same as a reset that was never reported at all. This predicate
+    only needs to add the ONE case that isn't already null: a present,
+    still-current ``seven_day`` block whose ``resets_at`` key is simply
+    absent from the payload.
     """
-    return _seven_day_reset_ts(usage, now) is None
+    if not isinstance(usage, dict):
+        return True
+    window = usage.get("seven_day")
+    if not isinstance(window, dict):
+        return True
+    return _parse_reset_ts(window.get("resets_at")) is None
 
 
 def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
@@ -980,11 +983,15 @@ def select_probe_target(
     pool: list[tuple[float, str]] = []
     for num in oauth_candidates:
         value = usage.get(num)
+        if not _seven_day_reset_unmeasured(value):
+            continue
         h = oauth.account_headroom(value if isinstance(value, dict) else None, models)
+        # Resolving unknown headroom is what a probe is FOR -- unlike every
+        # other reader of headroom, this one must not refuse a candidate for
+        # not having it. Same substitute `consume_first_rank_key` already
+        # uses for the identical "no number to rank on" problem.
         if h is None:
-            continue
-        if not _seven_day_reset_unmeasured(value, now):
-            continue
+            h = 0.0
         if probe_cooldown.get(num, 0.0) > now:
             continue
         pool.append((h, num))
@@ -1081,6 +1088,11 @@ def _binding_recovery_ts(
     stamps = [ts for ts in
               (_parse_reset_ts(w[2]) for w in windows if blocking(w[1]))
               if ts is not None]
+    # #325: `usage` here is decision_value()-fed, which already drops any
+    # window whose own reset had elapsed (_drop_rolled_windows) -- so a
+    # `stamps` entry already past cannot reach this `max(stamps) > now`
+    # check any more. No caller does this today: every call site in this
+    # module passes a decision_value()-fed `usage` dict.
     return max(stamps) if stamps and max(stamps) > now else float("inf")
 
 
@@ -2895,7 +2907,9 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = {
+                num: entry.decision_value(self._models) for num, entry in entries.items()
+            }
             headroom = _headroom_by_account(usage, self._models)
             active_headroom = _dynamic_active_headroom(
                 settings, self._models, usage, current, headroom.get(current)
@@ -3865,11 +3879,14 @@ class AutoSwitchEngine:
                 trigger == "at-limit"
                 # A KNOWABLE RETURN FOR THE ACCOUNT WE ARE LEAVING, or there
                 # is nothing to rank against. `_binding_recovery_ts` answers
-                # `inf` for unknown AND for already past, so a fleet whose
-                # rows have gone stale makes every recovery `inf` --
-                # `inf >= inf - RECOVERY_HYSTERESIS_S` then refuses every
-                # candidate, and no state this branch can reach clears it.
-                # Waiting is only a choice when something can say what for.
+                # `inf` for a reset never reported (the reachable case here;
+                # #325 drops a window whose own reset has already elapsed
+                # before this ever sees it, so "already past" cannot reach
+                # this call any more), so a fleet whose rows have gone stale
+                # makes every recovery `inf` -- `inf >= inf -
+                # RECOVERY_HYSTERESIS_S` then refuses every candidate, and no
+                # state this branch can reach clears it. Waiting is only a
+                # choice when something can say what for.
                 and active_recovery_ts != float("inf")
                 # ONLY THE CANDIDATE SIDE IS ASKED. The active's own headroom
                 # was tested too, and it cannot be False here: `at-limit` is
@@ -3920,9 +3937,11 @@ class AutoSwitchEngine:
                 # spent candidate while a usable peer exists is what breaks it.
                 #
                 # BOTH RETURNS MUST BE PROVABLE. `_binding_recovery_ts` answers
-                # `inf` for unknown AND for already past, which are opposite
-                # facts: an active whose reset has passed can return at any
-                # moment and must not lose to a peer hours out.
+                # `inf` for a reset never reported -- the reachable case here;
+                # #325 drops a window whose own reset has already elapsed
+                # before this ever sees it, so an active whose reset has
+                # merely passed (and could return at any moment) cannot reach
+                # this call with a known-but-past reset any more.
                 #
                 # `all_above` FIRST, and it is what makes the rest safe to
                 # read: it is False whenever the active is unmeasured, which is
@@ -4385,7 +4404,9 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        usage = {
+            num: entry.decision_value(self._models) for num, entry in entries.items()
+        }
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -4434,7 +4455,9 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = {
+                num: entry.decision_value(self._models) for num, entry in entries.items()
+            }
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom

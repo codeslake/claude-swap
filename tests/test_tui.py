@@ -3110,6 +3110,56 @@ class TestUnswitchableRowsAreListed:
             f"panel out:\n{rendered}"
         )
 
+    def test_the_panel_ranks_a_probe_candidate_on_its_surviving_window_not_its_rolled_one(
+        self,
+    ):
+        """#325's per-window ruling: a candidate whose 7-day window has
+        rolled keeps its real 5-hour headroom (``_drop_rolled_windows``
+        only removes the rolled window, not the whole reading). The panel's
+        own probe ranking (`select_probe_target`'s pool, ``oauth
+        .account_headroom`` over ``decision_value(rank_models)``) must see
+        that surviving headroom too, or it ranks the rolled candidate as
+        spent (its stale 100% 7-day pct still counted) and probes a
+        genuinely lower-headroom peer instead — disagreeing with the engine,
+        which reads the same dropped value.
+        """
+        from tests.test_autoswitch import _iso_at
+        from claude_swap.settings import AutoSwitchSettings
+
+        real_now = time.time()
+        later = _iso_at(real_now + 8 * 86400)
+        rolled = _iso_at(real_now - 3600)
+
+        active = {
+            "five_hour": {"pct": 20.0}, "seven_day": {"pct": 20.0, "resets_at": later},
+        }
+        # Real 90-point headroom (5h alone survives, 7d's own reset has
+        # elapsed and is dropped). Read raw (undropped) it is only 85 --
+        # still below account "3"'s 87, which would win the probe race on
+        # headroom alone if the roll were not dropped.
+        rolled_window = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 15.0, "resets_at": rolled},
+        }
+        # Genuinely 87-point headroom, unmeasured reset -- must lose the
+        # probe race once account "2"'s real (dropped) 90-point headroom is
+        # seen, but WINS it if "2" is read raw (85 < 87).
+        genuinely_lower = {"five_hour": {"pct": 13.0}, "seven_day": {"pct": 13.0}}
+
+        settings = AutoSwitchSettings(strategy="consume-first")
+        rendered = self._render(self._snap(
+            self._acct("1", "a@x.invalid", switchable=True, last_good=active),
+            self._acct("2", "b@x.invalid", switchable=True, last_good=rolled_window),
+            self._acct("3", "c@x.invalid", switchable=True, last_good=genuinely_lower),
+        ), active="1", settings=settings)
+        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
+        positions = {n: rendered.index(e) for n, e in emails.items()}
+        panel_top = min(positions, key=positions.get)
+        assert panel_top == "2", (
+            f"panel probed {panel_top!r} instead of the rolled-window "
+            f"account with real 5h headroom -- panel out:\n{rendered}"
+        )
+
     def test_the_panel_never_probes_an_account_the_engine_has_put_on_cooldown(
         self,
     ):
