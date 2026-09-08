@@ -14639,3 +14639,194 @@ class TestTheModelWindowBindsUnlessItBindsEverywhere:
             "headroom reads healthy"
         )
         assert h.active_number() == 3
+
+
+
+
+
+class TestBoundedWalledEscapeUnderDynamicHealthy:
+    """#403 (owner, 2026-09-08): the owner's live specimen — a Fable-
+    walled active whose OWN 5h/7d widen it to `dynamic-healthy` (#375's
+    widening is untouched, and correctly reads it that way: this active's
+    5h/7d genuinely have room) — but every real peer is ALSO blocked on
+    some axis, so #375's alternation arm (which only ever considers a WARM
+    partner) held forever with real quota sitting idle. `dynamic-healthy`
+    gains a bounded escape: when no warm partner qualifies AND the active
+    is genuinely walled on its own (never-widened) model-gated axis, land
+    on whichever admissible peer (real headroom, no fixed percentage bar)
+    recovers soonest — cold or warm, ranked by time-to-reset, warmth
+    breaking only an exact tie. Never reachable while the active has real
+    room (the owner-fixture tests in ``TestTheModelWindowBindsUnlessIt
+    BindsEverywhere`` and ``TestWarmthAndAlternation375`` pin exactly that
+    boundary and must stay green).
+    """
+
+    @staticmethod
+    def _u(five_h, seven_d, fable, days_out=3, five_h_resets=None, fable_resets=None):
+        now = 1_000_000.0
+        d = {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": seven_d, "resets_at": _iso_at(now + days_out * 86400)},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+        if five_h_resets is not None:
+            d["five_hour"]["resets_at"] = _iso_at(now + five_h_resets)
+        if fable_resets is not None:
+            d["scoped"][0]["resets_at"] = _iso_at(now + fable_resets)
+        return d
+
+    def test_the_owners_specimen_switches_to_7(self, temp_home):
+        """The reported fleet, exactly as measured: active #4 walled on
+        Fable (100%) and effectively spent on 7d (90%) — #375's widen
+        reads it `dynamic-healthy` off its real 18% 5h room, correctly.
+        Every real peer is ALSO blocked on some axis (#3/#2 on Fable,
+        #7 on its own 5h, #1/#5/#6 on 7d) so no WARM partner exists and
+        the fleet held on a dead account. #7's 5h resets in under 3
+        hours; #2's Fable (its own binding window) has no known reset at
+        all in this fixture — #7 must win either way, and first-tick
+        (this harness has no prior `autoswitch_state.json`) must still
+        decide, not hold pending a rate sample that does not exist yet.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (4, "a4@example.invalid"), (3, "a3@example.invalid"),
+            (2, "a2@example.invalid"), (7, "a7@example.invalid"),
+            (1, "a1@example.invalid"), (6, "a6@example.invalid"),
+            (5, "a5@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        assert not h.state(), "must decide on the very first tick, no prior state"
+        fleet = {
+            "4": self._u(18, 90, 100, days_out=4),
+            "3": self._u(10, 81, 100, days_out=3),
+            "2": self._u(57, 68, 90, days_out=2),
+            "7": self._u(91, 18, 10, days_out=5, five_h_resets=2 * 3600 + 41 * 60),
+            "1": self._u(0, 95, 0, days_out=4),
+            "6": self._u(0, 96, 0, days_out=4),
+            "5": self._u(0, 97, 0, days_out=4),
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a Fable-walled active with every real peer "
+            "also blocked must escape, not hold on a dead account"
+        )
+        assert h.active_number() == 7, (
+            f"landed on {h.active_number()} instead of #7 — the peer whose "
+            "own binding window (5h) resets soonest"
+        )
+
+    def test_time_to_reset_caps_time_to_exhaustion_small_headroom_soon_wins(
+        self, temp_home
+    ):
+        """Isolated pair, both walled on some axis (so neither is simply
+        'more healthy' than the other by the ordinary tiering): SOON has
+        LESS headroom (5) but its binding 5h resets in an hour; FAR has
+        MORE headroom (10) but its binding Fable window resets six days
+        out. SOON must win — a window that recycles soon is not a wall
+        worth avoiding, however little room it leaves right now.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"),
+            (2, "soon@example.invalid"),
+            (3, "far@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        fleet = {
+            "1": self._u(18, 90, 100, days_out=4),  # active, walled on Fable
+            "2": self._u(95, 10, 5, days_out=4, five_h_resets=3600),   # SOON: headroom 5
+            "3": self._u(5, 10, 90, days_out=4, fable_resets=6 * 86400),  # FAR: headroom 10
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — the sooner-resetting, "
+            "smaller-headroom candidate (#2) must beat the larger-"
+            "headroom candidate whose own binding window is days out (#3)"
+        )
+
+    def test_warmth_breaks_an_exact_tie_between_admissible_escapees(self, temp_home):
+        """Two escapees with the IDENTICAL binding reset — warmth (never
+        touched) picks the warm one over the cold one."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"),
+            (2, "cold@example.invalid"),
+            (3, "warm@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"3": h.clock.now - 100.0})
+        )
+        fleet = {
+            "1": self._u(18, 90, 100, days_out=4),
+            "2": self._u(10, 10, 95, days_out=4, fable_resets=3600),  # cold, model-walled
+            "3": self._u(10, 10, 95, days_out=4, fable_resets=3600),  # warm, same reset
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} — an exact tie on binding "
+            "reset must go to the warm candidate (#3), never the cold "
+            "one (#2)"
+        )
+
+    def test_warmth_never_overrides_a_strictly_sooner_cold_candidate(
+        self, temp_home
+    ):
+        """Warmth is a tie-break, never a veto in the OTHER direction
+        either: a warm candidate whose own reset is later must still lose
+        to a cold candidate that comes back sooner."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"),
+            (2, "cold_soon@example.invalid"),
+            (3, "warm_later@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"3": h.clock.now - 100.0})
+        )
+        fleet = {
+            "1": self._u(18, 90, 100, days_out=4),
+            "2": self._u(95, 10, 5, days_out=4, five_h_resets=3600),       # cold, soon
+            "3": self._u(5, 10, 90, days_out=4, fable_resets=6 * 86400),  # warm, far
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — warmth must not override a "
+            "candidate that genuinely recovers sooner (#2)"
+        )
+
+    def test_the_escape_never_fires_while_the_active_has_real_room(self, temp_home):
+        """The active's OWN (never-widened) model-gated headroom is real
+        (Fable at 50%, not 100%) — not walled — so the escape must not
+        engage even though no warm partner exists and every peer is
+        blocked on some axis. Mirrors the pinned owner-fixture holds in
+        ``TestWarmthAndAlternation375``/``TestTheModelWindowBindsUnless
+        ItBindsEverywhere``, scoped to this class so a regression here is
+        caught beside the new arm it could otherwise silently override.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"), (2, "a@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        fleet = {
+            "1": self._u(18, 20, 50, days_out=4),   # real Fable room -- not walled
+            "2": self._u(95, 10, 5, days_out=4, five_h_resets=3600),  # blocked on 5h
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome!r} — the active has real headroom on every "
+            "axis; the walled-escape must never fire for a merely-cold "
+            "fleet"
+        )
+        assert h.active_number() == 1
+

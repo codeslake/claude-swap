@@ -1730,6 +1730,14 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        # THE ACTUAL (never-widened) MODEL-GATED READING, kept alongside the
+        # widened one below for the dynamic-healthy arm's own walled-escape
+        # (#403): the widen can call an active "healthy" on its 5h/7d while
+        # it is genuinely at 100% on the model this host runs — correct for
+        # trigger classification (a real non-model candidate must not be
+        # abandoned for a false blackout), wrong for "is there really
+        # nothing wrong with sitting here", which is what the escape needs.
+        raw_active_headroom = active_headroom
         # THE MODEL BASIS, RE-PICKED EACH TICK (dynamic only). `headroom` is
         # always model-gated (folds `self._models` in), so a pinned model's
         # own window can read the ACTIVE as blocked while its 5h/7d have
@@ -2020,7 +2028,50 @@ class AutoSwitchEngine:
                 None,
             )
             since = last_active_at.get(current)
-            if (
+            # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
+            # NEVER-widened model-gated reading — the widen above can call
+            # this active "healthy" (dynamic-healthy, not at-limit) purely
+            # because its 5h/7d have room, even while it sits at 100% on the
+            # model this host actually runs. Correct for trigger
+            # classification; wrong for "is it fine to keep sitting here",
+            # which is what decides whether to hold for warmth or escape.
+            # Fires only when the alternation arm found no warm partner AND
+            # the active is genuinely at its own wall — never a veto on a
+            # warm pick, never taken while the active has real room. Lands
+            # on whichever admissible candidate (real headroom, no fixed
+            # percentage line) recovers soonest, cold or warm alike.
+            #
+            # `headroom` (never `floor_headroom`), so a candidate blocked on
+            # the SAME model window as the active — no real improvement,
+            # merely idle 5h/7d nobody can spend while every account is
+            # Fable-walled alike — is never mistaken for an escape (measured:
+            # `floor_headroom`'s unmodeled reading let a peer no better than
+            # the active off the model bar and churned every tick).
+            walled_escape = None
+            if partner is None and _about_to_wall(raw_active_headroom):
+                escapees = sorted(
+                    (
+                        n for n in oauth_candidates
+                        if (h := headroom.get(n)) is not None
+                        and h > SPENT_HEADROOM_PCT
+                    ),
+                    # Soonest-reset first; warmth only breaks an exact tie
+                    # (item 4/D) — it never outranks a candidate that comes
+                    # back sooner, and it never keeps the active walled.
+                    key=lambda n: (
+                        _binding_recovery_ts(usage.get(n), self._models, now),
+                        0 if _is_warm(n, last_active_at, now, settings.cache_ttl_seconds) else 1,
+                    ),
+                )
+                if escapees:
+                    walled_escape = escapees[0]
+            if walled_escape is not None:
+                if self._in_cooldown(state):
+                    self._emit(NoSwitchEvent(reason="cooldown"))
+                    return TickOutcome.NO_ACTION
+                trigger = "alternation"
+                dynamic_ordered = [walled_escape]
+            elif (
                 partner is None
                 or since is None
                 or now - since < settings.alternation_chunk_seconds
@@ -2051,11 +2102,12 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
-            if self._in_cooldown(state):
-                self._emit(NoSwitchEvent(reason="cooldown"))
-                return TickOutcome.NO_ACTION
-            trigger = "alternation"
-            dynamic_ordered = [partner]
+            else:
+                if self._in_cooldown(state):
+                    self._emit(NoSwitchEvent(reason="cooldown"))
+                    return TickOutcome.NO_ACTION
+                trigger = "alternation"
+                dynamic_ordered = [partner]
 
         if (
             trigger in CONSUME_FIRST_STRATEGIES
