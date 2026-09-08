@@ -8020,6 +8020,62 @@ class TestStashAndRetentionStore:
             f"every level instead of exactly one; writes to '4': {write_calls}"
         )
 
+    def test_converge_write_is_suppressed_during_an_attribution_read(
+        self, temp_home,
+    ):
+        """A read taken to VERIFY a slot's lineage (``_in_attribution_read``)
+        must not converge-write: the write it would make re-enters the write
+        path that asked for the read in the first place. This flag has no
+        setter on this branch alone (nothing sets it here); it exists so a
+        merge with the write path's own attribution guard can set it around
+        the verification read without reopening the recursion the sibling
+        test above already closed.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        b1 = self._oauth_creds(1000)
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"3": {"email": email, "uuid": "uuid-e"}},
+            },
+        )
+        store._write_account_credentials("3", email, b1)
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"4": {"email": email, "uuid": "uuid-e"}},
+            },
+        )
+
+        write_calls = []
+        orig_write_backend = store._write_backup_enc
+
+        def counting_write(account_num, email_, credentials):
+            write_calls.append(account_num)
+            return orig_write_backend(account_num, email_, credentials)
+
+        store._in_attribution_read = True
+        try:
+            with patch.object(store, "_write_backup_enc", side_effect=counting_write):
+                result = store._read_account_credentials("4", email)
+        finally:
+            store._in_attribution_read = False
+
+        assert result == b1
+        assert write_calls == [], (
+            "DEFECT: the converge write ran during an attribution read; "
+            f"writes: {write_calls}"
+        )
+
     def test_renumber_fallback_never_clobbers_a_fresh_write_that_lands_mid_sweep(
         self, temp_home,
     ):

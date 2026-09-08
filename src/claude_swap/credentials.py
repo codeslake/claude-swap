@@ -317,6 +317,11 @@ class CredentialStore:
     ``security`` calls, and a fresh process re-evaluates from scratch.
     """
 
+    #: Set by the write path while it verifies a slot's stored lineage. A read
+    #: taken for verification must not converge-write: the write it would make
+    #: re-enters the write path that asked for the read.
+    _in_attribution_read = False
+
     def __init__(self, host: _StoreHost):
         self._host = host
         # macOS Keychain usability, learned per-process from real `security`
@@ -1323,6 +1328,11 @@ class CredentialStore:
             return value
         if current and _credential_generation(current) >= _credential_generation(value):
             return current
+        if self._in_attribution_read:
+            # This read was taken to verify a slot's lineage, not to serve a
+            # caller — the converge write below would re-enter the write
+            # path that asked for the read. See `_in_attribution_read`.
+            return value
         try:
             # Routed through `_write_account_credentials` (not the raw
             # backend calls) so this write retains the generation it

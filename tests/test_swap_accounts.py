@@ -991,8 +991,8 @@ class TestSwapUnreadableSourceIsNotAbsent:
             data["accounts"][num]["uuid"] = f"uuid-{num}"
         self._write(switcher, data)
         for num, email in emails.items():
-            switcher._write_account_credentials(num, email, f"gen1-{num}")
-            switcher._write_account_credentials(num, email, f"gen2-{num}")
+            switcher._write_account_credentials(num, email, _gen(num, "gen1"))
+            switcher._write_account_credentials(num, email, _gen(num, "gen2"))
 
         prev = {
             num: switcher._store._prev_backup_path(num, email)
@@ -1118,8 +1118,8 @@ class TestSwapUnreadableSourceIsNotAbsent:
         self._write(switcher, sample_sequence_data_with_org)
         email = "user@example.com"
         for num in ("1", "2"):
-            switcher._write_account_credentials(num, email, f"gen1-{num}")
-            switcher._write_account_credentials(num, email, f"gen2-{num}")
+            switcher._write_account_credentials(num, email, _gen(num, "gen1"))
+            switcher._write_account_credentials(num, email, _gen(num, "gen2"))
 
         prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
         assert all(p.exists() for p in prev.values()), (
@@ -1207,7 +1207,7 @@ class TestSwapUnreadableSourceIsNotAbsent:
         self._write(switcher, sample_sequence_data_with_org)
         email = "user@example.com"
         for num in ("1", "2"):
-            switcher._write_account_credentials(num, email, f"gen1-{num}")
+            switcher._write_account_credentials(num, email, _gen(num, "gen1"))
 
         seeded = {}
         for num in ("1", "2"):
@@ -1265,8 +1265,8 @@ class TestSwapUnreadableSourceIsNotAbsent:
         self._write(switcher, sample_sequence_data_with_org)
         email = "user@example.com"
         for num in ("1", "2"):
-            switcher._write_account_credentials(num, email, f"gen1-{num}")
-            switcher._write_account_credentials(num, email, f"gen2-{num}")
+            switcher._write_account_credentials(num, email, _gen(num, "gen1"))
+            switcher._write_account_credentials(num, email, _gen(num, "gen2"))
             switcher._store.delete_previous_backup(num, email)
         prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
         assert not any(p.exists() for p in prev.values()), (
@@ -1331,8 +1331,8 @@ class TestSwapUnreadableSourceIsNotAbsent:
         self._write(switcher, sample_sequence_data_with_org)
         email = "user@example.com"
         for num in ("1", "2"):
-            switcher._write_account_credentials(num, email, f"gen1-{num}")
-            switcher._write_account_credentials(num, email, f"gen2-{num}")
+            switcher._write_account_credentials(num, email, _gen(num, "gen1"))
+            switcher._write_account_credentials(num, email, _gen(num, "gen2"))
 
         prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
         assert all(p.exists() for p in prev.values()), (
@@ -1345,14 +1345,14 @@ class TestSwapUnreadableSourceIsNotAbsent:
         real_write = switcher._write_account_credentials
         rolling_back = {"yet": False}
 
-        def fail_second(num, mail, creds):
+        def fail_second(num, mail, creds, **kw):
             calls["n"] += 1
             if calls["n"] == 2:
                 rolling_back["yet"] = True
                 raise OSError(errno.EIO, "the second forward write failed")
             if not rolling_back["yet"]:
                 forward.add(num)
-            return real_write(num, mail, creds)
+            return real_write(num, mail, creds, **kw)
 
         switcher._write_account_credentials = fail_second
         try:
@@ -1429,8 +1429,8 @@ class TestSwapUnreadableSourceIsNotAbsent:
         self._write(switcher, sample_sequence_data_with_org)
         email = "user@example.com"
         for num in ("1", "2"):
-            switcher._write_account_credentials(num, email, f"gen1-{num}")
-            switcher._write_account_credentials(num, email, f"gen2-{num}")
+            switcher._write_account_credentials(num, email, _gen(num, "gen1"))
+            switcher._write_account_credentials(num, email, _gen(num, "gen2"))
 
         prev = {n: switcher._store._prev_backup_path(n, email) for n in ("1", "2")}
         assert all(p.exists() for p in prev.values()), "no .prev to drop"
@@ -1449,8 +1449,8 @@ class TestSwapUnreadableSourceIsNotAbsent:
         assert alive == {"1": False, "2": False}, (
             f"a generation the rollback itself contaminated was kept: {alive}"
         )
-        assert switcher._read_account_credentials("1", email) == "gen2-1"
-        assert switcher._read_account_credentials("2", email) == "gen2-2"
+        assert switcher._read_account_credentials("1", email) == _gen("1", "gen2")
+        assert switcher._read_account_credentials("2", email) == _gen("2", "gen2")
 
 
 def _session_token_of(num: str) -> str:
@@ -1595,13 +1595,15 @@ class TestTheRetentionVerdictIsTheOneReader:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         email = "user@example.com"
-        assert switcher._write_account_credentials("1", email, "gen-1") is False, (
+        gen1 = _gen("1", "a")
+        gen2 = _gen("1", "b")
+        assert switcher._write_account_credentials("1", email, gen1) is False, (
             "premise: the FIRST write has nothing to displace"
         )
-        assert switcher._write_account_credentials("1", email, "gen-2") is True, (
+        assert switcher._write_account_credentials("1", email, gen2) is True, (
             "positive control: replacing a different value must retain a .prev"
         )
-        assert switcher._write_account_credentials("1", email, "gen-2") is False, (
+        assert switcher._write_account_credentials("1", email, gen2) is False, (
             "a write of the value already stored claimed it displaced "
             "something, so the rollback purge would delete a .prev this "
             "write never created -- the user's only recovery generation"
@@ -1801,11 +1803,11 @@ class TestTheRollbackDecidesPerKey:
         real = switcher._write_account_credentials
         seen: list[str] = []
 
-        def one_lands_then_one_raises(num, email, creds):
+        def one_lands_then_one_raises(num, email, creds, **kw):
             seen.append(num)
             if len(seen) > 1:
                 raise CredentialError("injected: every later restore fails")
-            return real(num, email, creds)
+            return real(num, email, creds, **kw)
 
         staged = {"creds-1": switcher.credentials_dir / ".swap-staging-creds-1.json"}
         staged["creds-1"].parent.mkdir(parents=True, exist_ok=True)
@@ -1897,9 +1899,9 @@ class TestTheRollbackDecidesPerKey:
         wrote: list[str] = []
         real = switcher._write_account_credentials
 
-        def record(num, mail, creds):
+        def record(num, mail, creds, **kw):
             wrote.append(num)
-            return real(num, mail, creds)
+            return real(num, mail, creds, **kw)
 
         switcher._write_account_credentials = record
         try:
@@ -1940,7 +1942,7 @@ class TestTheRollbackDecidesPerKey:
 
         attempted: list[str] = []
 
-        def die(num, mail, creds):
+        def die(num, mail, creds, **kw):
             attempted.append(num)
             raise CredentialError("injected: the restore cannot land")
 
