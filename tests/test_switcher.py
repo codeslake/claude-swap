@@ -13504,17 +13504,20 @@ class TestConsumeGate:
         # nothing consumed; the backup is exactly as it was
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    @pytest.mark.parametrize("live_creds", [_NEW, ""], ids=["different", "absent"])
     def test_live_store_holding_a_different_lineage_still_consumes(
-        self, temp_home: Path, sample_sequence_data: dict
+        self, temp_home: Path, sample_sequence_data: dict, live_creds: str
     ):
         """The control for the guard above: a live store on a DIFFERENT
         lineage (the ordinary shape -- some other slot is active) must not
-        block this slot's own usage refresh."""
+        block this slot's own usage refresh -- and neither must a live store
+        with nothing in it at all (no second holder to collide with), the
+        other arm of the same `if live_creds and ...` short-circuit."""
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         with patch.object(s, "_read_capture_credentials",
-                           return_value=self._NEW), \
+                           return_value=live_creds), \
              patch(
                  "claude_swap.oauth.try_refresh_oauth_credentials",
                  return_value=oauth.RefreshOutcome(self._NEW, None),

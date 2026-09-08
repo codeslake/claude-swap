@@ -207,6 +207,14 @@ ERROR_NOTES = {
         "the slot's stored lineage was condemned as another account's — "
         "`cswap add` re-adopts the live login"
     ),
+    "live-store-unreadable": (
+        "the live credential store could not be read — unlock the keychain "
+        "or fix the file, then retry"
+    ),
+    "live-store-current": (
+        "the live credential store already holds this slot's lineage — "
+        "refreshes once another account is switched to"
+    ),
 }
 
 SENTINEL_NOTES = {

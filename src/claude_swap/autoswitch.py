@@ -90,6 +90,11 @@ _SYSTEMIC_MESSAGES = {
     "identity-unreadable": "the slot's session profile identity could not "
                         "be read — a login rewrites it, or `cswap add` "
                         "replaces the stored credential",
+    "live-store-unreadable": "the live credential store could not be read "
+                        "— unlock the keychain or fix the file, then retry",
+    "live-store-current": "the live credential store already holds this "
+                        "slot's lineage — clears once another account is "
+                        "switched to",
     "consume-busy": "another cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
