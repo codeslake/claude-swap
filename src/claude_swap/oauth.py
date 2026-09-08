@@ -60,6 +60,28 @@ def credential_fingerprint(credentials: str) -> str | None:
     return "sha256-full:" + hashlib.sha256(credentials.encode()).hexdigest()
 
 
+def login_expires_at_iso(credentials: str) -> str | None:
+    """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
+
+    Claude Code stores ``refreshTokenExpiresAt`` (epoch milliseconds) next to the
+    access token's ``expiresAt``. The two age differently: the access token is
+    renewed from the refresh token on its own, while the refresh token is only
+    ever replaced by a fresh ``/login``. Once it lapses the slot reports
+    ``relogin_required`` and nothing short of logging in again fixes it, so this
+    is the date worth showing *before* that happens. Logins issued before Claude
+    Code recorded the field carry nothing, which means "unknown", never "now".
+    """
+    data = extract_oauth_data(credentials)
+    value = data.get("refreshTokenExpiresAt") if data else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return (
+        datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):
