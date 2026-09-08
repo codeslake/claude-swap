@@ -10266,7 +10266,6 @@ class TestConsumeGate:
 
         mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
         assert result.error == "foreign-lineage"
-        assert result.error not in ("invalid_grant", "no_refresh_token")
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
     def test_gate_invalid_grant_returns_error_without_persist(

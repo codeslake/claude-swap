@@ -2011,6 +2011,34 @@ class TestConsumeBusyIsDeterministic:
         assert out.error == "consume-busy", out.error
         usage.assert_not_called()
 
+    def test_a_condemned_lineage_does_not_spend_a_doomed_request_either(self):
+        """The consume-gate path's own refusal (`condemned=` returning True,
+        via `consume_backup_grant` as `refresh_via`) must reach the store as
+        `foreign-lineage`, not the generic `refresh-failed` a fallthrough-then-
+        401-then-retry would produce, and must not re-enter the gate a second
+        time to learn the same thing."""
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        calls = []
+
+        def refusing_gate(*a):
+            calls.append(a)
+            return oauth.RefreshOutcome(None, "foreign-lineage")
+
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=refusing_gate,
+            )
+        assert out.error == "foreign-lineage", out.error
+        usage.assert_not_called()          # no doomed GET with the dead token
+        assert len(calls) == 1             # no second gate round
+
     def test_every_deterministic_kind_has_a_note(self):
         """The reason these kinds stay distinct is the note they carry.
 

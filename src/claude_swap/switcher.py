@@ -202,6 +202,10 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "foreign-lineage": (
+        "this slot's stored grant is confirmed another account's — a switch "
+        "restores the slot's own backup"
+    ),
 }
 
 SENTINEL_NOTES = {

@@ -187,7 +187,7 @@ def try_refresh_oauth_credentials(
     if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
         return RefreshOutcome(None, "no_refresh_token")
 
-    if condemned is not None and condemned(credential_fingerprint(credentials) or ""):
+    if condemned is not None and condemned(credential_fingerprint(credentials)):
         return RefreshOutcome(None, "foreign-lineage")
 
     try:
@@ -671,6 +671,7 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
+    "foreign-lineage",
 )
 
 
