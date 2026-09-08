@@ -2346,10 +2346,11 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None):
+              sentinel=None, disabled=False):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
+        a.disabled = disabled
         a.usage.last_good = last_good
         a.usage.sentinel = sentinel
         return a
@@ -2478,6 +2479,36 @@ class TestUnswitchableRowsAreListed:
         assert out.index("busy@x.com") < out.index("cheap@x.com"), (
             f"spend entered the ranking — a barely-spent account outranked a "
             f"95%-used one: {out!r}"
+        )
+
+    def test_a_disabled_spend_only_account_names_why_it_is_never_chosen(self):
+        """Every other Next-best row says why it is excluded (no login,
+        API key, blocked window); a spend-only account held out of auto
+        rotation was the one silent exception — nothing next to it said
+        why it never gets picked."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("8", "credit@x.com", switchable=True, disabled=True,
+                       last_good={
+                           "spend": {"pct": 45.0, "used": 207.69, "limit": 466.0},
+                       }),
+        ), active="1")
+        assert "auto-swap disabled" in out, (
+            f"a disabled spend-only account gave no reason it is never "
+            f"chosen: {out!r}"
+        )
+
+    def test_CONTROL_an_enabled_spend_only_account_names_no_reason(self):
+        """CONTROL: an ENABLED spend-only account must not gain the label —
+        it is spend-only that keeps it out of ranking, not `disabled`."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "cheap@x.com", switchable=True, last_good={
+                "spend": {"pct": 1.0, "used": 0.2, "limit": 20.0},
+            }),
+        ), active="1")
+        assert "auto-swap disabled" not in out, (
+            f"CONTROL BROKEN: an enabled account was labeled disabled: {out!r}"
         )
 
     def test_CONTROL_an_account_with_no_usage_at_all_still_says_unknown(self):

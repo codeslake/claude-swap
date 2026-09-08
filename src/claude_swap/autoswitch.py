@@ -493,6 +493,13 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # account number → its spend (pay-as-you-go credit) reading, when it has
+    # one: {"pct", "used", "limit"}. A spend-only account reports no 5h/7d/
+    # model window at all, so `windows`/`headroom` are structurally empty for
+    # it — exactly the shape `_describe` otherwise reads as "genuinely
+    # unreadable" and prints a bare "?" for, collapsing "no windows by
+    # design" into "could not read". Additive field.
+    spend: dict[str, dict] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -504,6 +511,8 @@ class PollEvent(AutoSwitchEvent):
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
             fields["windowsPct"] = self.windows
+        if self.spend:
+            fields["spend"] = self.spend
         return fields
 
     def _describe(self, num: str) -> str:
@@ -522,6 +531,12 @@ class PollEvent(AutoSwitchEvent):
         h = self.headroom.get(num)
         if h is not None:
             return f"{100 - h:.0f}%"
+        spend = self.spend.get(num)
+        if spend is not None:
+            return (
+                f"$$ {spend['pct']:.0f}% "
+                f"(${spend['used']:,.2f}/${spend['limit']:,.2f})"
+            )
         err = self.fetch_errors.get(num)
         return f"? ({err})" if err else "?"
 
@@ -1683,6 +1698,11 @@ class AutoSwitchEngine:
                     if (pcts := _window_pcts(
                         value if isinstance(value, dict) else None, self._models
                     ))
+                },
+                spend={
+                    num: value["spend"]
+                    for num, value in usage.items()
+                    if isinstance(value, dict) and isinstance(value.get("spend"), dict)
                 },
             )
         )
@@ -3378,8 +3398,25 @@ class AutoSwitchEngine:
                 # weekly outranks one holding forty on both, walls on the next
                 # request, and the tick after pays a second swap to correct it.
                 # `SPENT_HEADROOM_PCT` is the module's own "can this serve".
+                #
+                # `dynamic` ONLY (never excluded, only re-ranked, so a true
+                # emergency where nothing clears the threshold still lands
+                # somewhere): `escape_h` ranks by the axis that blocked the
+                # ACTIVE, not this candidate's OWN worst window, so a peer
+                # that is itself over `settings.threshold` on a different
+                # axis (its own 5h, say) can outrank one with real headroom
+                # everywhere purely because it happens to be clear on the
+                # window the active is walled on -- landing there re-triggers
+                # the very next tick (measured live, #321 follow-up: a
+                # Fable-100 active passed over a Fable-89/5h-40/7d-65
+                # candidate for a Fable-10/5h-91 one).
+                dynamic_self_walled = (
+                    dynamic_landing
+                    and h > SPENT_HEADROOM_PCT
+                    and (100.0 - h) >= settings.threshold
+                )
                 key = (
-                    0 if h > SPENT_HEADROOM_PCT else 1,
+                    1 if dynamic_self_walled else (0 if h > SPENT_HEADROOM_PCT else 1),
                     -max(escape_h if escape_h is not None else h, 0.0),
                     recovery_ts,
                 )

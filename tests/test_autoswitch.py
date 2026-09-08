@@ -5268,6 +5268,110 @@ class TestAModelWindowIsNotABlackout:
         assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
 
+    def test_a_spend_only_account_prints_its_credit_figure_not_a_bare_mark(
+        self,
+    ):
+        """A credit (pay-as-you-go) account has no 5h/7d/model window at
+        all -- `windows`/`headroom` are structurally empty for it, exactly
+        the same shape `_describe` used to read as "genuinely unreadable"
+        and print a bare ``?`` for. That collapses two different facts (no
+        windows BY DESIGN vs. could-not-READ) into one mark, and it is the
+        same contradiction the panel and this decision log showed on the
+        same account: the panel prints the credit figure, this printed
+        ``?``."""
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "8": None},
+            threshold=90.0,
+            spend={"8": {"pct": 45.0, "used": 207.69, "limit": 466.0}},
+        )
+        text = event.human()
+        assert "#8: ?" not in text, text
+        assert "#8: $$ 45% ($207.69/$466.00)" in text, text
+
+    def test_a_genuinely_unreadable_account_still_prints_a_bare_mark(self):
+        """The discrimination must survive: an account with no windows, no
+        spend figure and no named fetch error is still ``?`` -- backoff, a
+        poll failure, a struck token. Never collapsed the other way either."""
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "9": None},
+            threshold=90.0,
+        )
+        text = event.human()
+        assert "#9: ?" in text, text
+
+
+class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
+    """The owner's own fleet (lmd42, 2026-09-08 ~01:2xZ, `dynamic`,
+    threshold 90, Fable pinned): active #3 is Fable-100 (walled on the
+    model axis), and #7 clears the Fable axis (10%) but is ITSELF over the
+    departure threshold on its own 5h (91%) -- genuinely unusable, would
+    re-trigger the very next tick. #2 is the only account below threshold
+    on every axis (5h 40, 7d 65, Fable 89) and is the only correct target.
+    1/5/6 are 7d-walled, #4 is Fable-walled with nothing else open.
+
+    Reproduces the escape-axis ranking bug: `_rank_candidates_pass`'s
+    at-limit escape ranked candidates by `escape_h` (headroom on the SAME
+    axis that blocked the ACTIVE) alone, so #7's huge Fable headroom (90)
+    beat #2's real, well-rounded headroom (11) even though #7's own
+    binding window (5h) was already past the switch bar.
+    """
+
+    def _usage(self, now, **kw):
+        def iso(days=0, hours=0, minutes=0):
+            return _iso_at(now + days * 86400 + hours * 3600 + minutes * 60)
+
+        return {
+            "3": {  # active: Fable-walled, 5h/7d have room
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 79.0, "resets_at": iso(days=3)},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": iso(days=6, hours=5)}],
+            },
+            "2": {  # the only account open on every axis
+                "five_hour": {"pct": 40.0, "resets_at": iso(hours=2, minutes=33)},
+                "seven_day": {"pct": 65.0, "resets_at": iso(days=6, hours=5)},
+                "scoped": [{"name": "Fable", "pct": 89.0, "resets_at": iso(days=6, hours=5)}],
+            },
+            "7": {  # clear on Fable, but genuinely walled on its OWN 5h
+                "five_hour": {"pct": 91.0, "resets_at": iso(hours=3, minutes=13)},
+                "seven_day": {"pct": 18.0, "resets_at": iso(days=3, hours=20)},
+                "scoped": [{"name": "Fable", "pct": 10.0}],
+            },
+            "1": {  # 7d-walled
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 5.0}],
+            },
+            "6": {  # 7d-walled
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 5.0}],
+            },
+            "5": {  # 7d-walled (and Fable-walled too)
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],
+            },
+            "4": {  # Fable-walled, nothing else open
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],
+            },
+        }
+
+    def test_the_owners_fleet_switches_to_2_never_3_or_4(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num in (1, 2, 3, 4, 5, 6, 7):
+            h.seed(num, f"acct{num}@example.invalid")
+        h.make_live("acct3@example.invalid", 3)
+
+        outcome = h.tick_with_usage(self._usage(h.clock.now))
+
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — #2 is the only account below "
+            "threshold on every axis; #7 clears only the axis that blocked "
+            "the active and is itself over threshold on its own 5h, #3 is "
+            "the active itself, #4 has nothing open but the model axis"
+        )
+
 
 class TestTheRetryAdmitsOnlyAnImprovement:
     """The 5h/7d retry (``_rank_candidates``'s second pass) must compare a

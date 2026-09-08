@@ -462,6 +462,12 @@ class AutoScreen(Screen):
                     entry.append(f" · {spend_suffix}", style=palette.muted)
                 else:
                     entry.append("  usage unknown", style=palette.muted)
+                # A spend-axis account is never a ranking target regardless
+                # of `acc.disabled` (`relevant_windows` excludes spend, so
+                # `_rank` can't see it) -- but every OTHER row here says why
+                # it is never chosen, and this was the one silent exception.
+                if acc.disabled:
+                    entry.append("  auto-swap disabled", style=palette.muted)
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
                 # into the sort key would change which account the engine
                 # picks, and the ranking axis is not this row's to move.
