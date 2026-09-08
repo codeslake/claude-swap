@@ -2124,11 +2124,25 @@ class AutoSwitchEngine:
                 floor_headroom = unmodeled
                 model_window_dropped = True
             # Alternation: a warm partner past the floor, once we've sat
-            # on the active for a full chunk.
-            partner = next(
-                (n for n in warm_ordered if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct),
-                None,
-            )
+            # on the active for a full chunk -- and, #321 follow-up, one
+            # that does not MATERIALLY REGRESS headroom. The floor is an
+            # ABSOLUTE bar with no reference to `active_headroom` at all,
+            # so it admitted a 90-headroom active departing for a warm
+            # partner at 25; the landing rule refuses that move when asked
+            # directly, but this arm never reaches it (`dynamic_ordered is
+            # not None` short-circuits `_rank_candidates_pass`). ONE-SIDED
+            # (giveback only), never that function's two-sided margin
+            # (`h - active_headroom < hysteresis_pct: continue`): an
+            # alternating move is a downgrade by construction, so the
+            # two-sided form would repeal alternation entirely. One list,
+            # shared with `dynamic_ordered` below, so the fallback past an
+            # untrustworthy top pick lands under the same two bars.
+            alternation_admissible = [
+                n for n in warm_ordered
+                if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                and active_headroom - floor_headroom.get(n, 0.0) <= settings.hysteresis_pct
+            ]
+            partner = next(iter(alternation_admissible), None)
             since = last_active_at.get(current)
             # #403 BOUNDED WALLED-ESCAPE: `raw_active_headroom` is the
             # NEVER-widened model-gated reading — the widen above can call
@@ -2304,13 +2318,10 @@ class AutoSwitchEngine:
                     self._emit(NoSwitchEvent(reason="cooldown"))
                     return TickOutcome.NO_ACTION
                 trigger = "alternation"
-                # I1: the full floor-clearing warm list, not just `partner`
+                # I1: the full admissible warm list, not just `partner`
                 # — an untrustworthy top pick must not strand the tick when
                 # a lower-ranked warm candidate is admissible.
-                dynamic_ordered = [
-                    n for n in warm_ordered
-                    if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
-                ]
+                dynamic_ordered = alternation_admissible
 
         if (
             trigger in CONSUME_FIRST_STRATEGIES

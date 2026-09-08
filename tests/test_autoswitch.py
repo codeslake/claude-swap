@@ -6250,7 +6250,13 @@ class TestWarmthAndAlternation375:
             "1": start - (chunk - 1.0),
             "2": start - 10.0,  # warm, real headroom
         })
-        usage = {"1": _usage(50.0), "2": _usage(30.0)}
+        # Within one `hysteresis_pct` of each other in BOTH directions --
+        # the round trip this test is about is only alternation while it
+        # gives nothing material back (#321 follow-up). The old pair (50
+        # vs 70) handed back 20 points on the return leg, which the
+        # giveback bar now refuses; the engine consumes the richer account
+        # until the two converge and alternation resumes.
+        usage = {"1": _usage(50.0), "2": _usage(45.0)}
 
         outcome = h.tick_with_usage(usage)
         assert outcome is TickOutcome.NO_ACTION, f"got {outcome} at chunk - 1s"
@@ -6548,6 +6554,82 @@ class TestWarmthAndAlternation375:
             f"ttl={defaults.cache_ttl_seconds} — the chunk must clear "
             "twice over before the TTL, with real margin"
         )
+
+    # -- the alternation giveback bar ------------------------------------
+
+    def test_alternation_refuses_a_partner_that_gives_back_the_headroom(
+        self, temp_home
+    ):
+        """Warmth may cost headroom, never a MATERIAL regression of it:
+        the arm's only admission bar was the absolute `cold_switch_cost_
+        pct` floor, with no reference to `active_headroom` at all, so a
+        90-headroom active departed for a 25-headroom warm partner. The
+        landing rule refuses the same move when asked directly; this arm
+        never reaches it (`dynamic_ordered is not None` short-circuits
+        `_rank_candidates_pass`), so the bar belongs here.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,   # dwell elapsed
+            "2": h.clock.now - 10.0,    # warm
+        })
+        outcome = h.tick_with_usage({
+            "1": _usage(10.0),  # active, headroom 90
+            "2": _usage(75.0),  # warm, headroom 25 -- clears the floor (20)
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a 65-point giveback is not alternation; "
+            "the warm partner clears the absolute floor but hands back "
+            "far more headroom than `hysteresis_pct`"
+        )
+        assert h.active_number() == 1
+
+    def test_alternation_still_fires_for_a_near_equal_warm_partner(
+        self, temp_home
+    ):
+        """The anti-repeal control: an alternating move is a downgrade by
+        construction, so the bar is ONE-SIDED (giveback only), never
+        `_rank_candidates_pass`'s two-sided margin. Green before and
+        after the fix -- if it goes red, the two-sided form was written.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,
+            "2": h.clock.now - 10.0,
+        })
+        outcome = h.tick_with_usage({
+            "1": _usage(65.0),  # active, headroom 35
+            "2": _usage(72.0),  # warm, headroom 28 -- giveback 7 <= 10
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a near-equal warm partner is exactly the "
+            "alternation #375 asked for"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+
+    def test_alternation_admits_a_giveback_of_exactly_the_hysteresis_pct(
+        self, temp_home
+    ):
+        """The boundary is `<=`: exactly `hysteresis_pct` is admitted."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        give = h.engine.settings.hysteresis_pct
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,
+            "2": h.clock.now - 10.0,
+        })
+        outcome = h.tick_with_usage({
+            "1": _usage(60.0),          # active, headroom 40
+            "2": _usage(60.0 + give),   # warm, giveback exactly `give`
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a giveback of exactly {give} is admitted"
+        )
+        assert h.active_number() == 2
 
 
 class TestConsumeFirstStrategy:
