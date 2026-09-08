@@ -40,6 +40,7 @@ from claude_swap.autoswitch import (
     classify_candidate_block,
     pct_label,
 )
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
@@ -15455,6 +15456,17 @@ class TestDynamicNeverWalls0010:
             h.tick_with_usage(in_band_fleet)
             in_band = h.engine._next_delay(TickOutcome.NO_ACTION)
 
+            # A tick that dies before the widening must keep the band it
+            # last measured: the full interval is exactly wrong for the
+            # tick whose reading failed, and the next observation can be
+            # the wall.
+            with patch.object(
+                h.switcher, "usage_entries_by_account",
+                side_effect=ClaudeSwitchError("collector down"),
+            ):
+                assert h.engine.tick() is TickOutcome.ERROR
+            after_error = h.engine._next_delay(TickOutcome.ERROR)
+
             h.tick_with_usage({
                 "1": _usage(50.0), "2": _usage(50.0), "3": _usage(50.0),
             })
@@ -15469,6 +15481,10 @@ class TestDynamicNeverWalls0010:
             f"{in_band}s inside the danger band — the margin is "
             f"{SPENT_HEADROOM_PCT} points and the tick is 360s"
         )
+        assert after_error <= cap, (
+            f"{after_error}s after a failed tick — the band the last good "
+            "reading measured must survive an errored one"
+        )
         assert healthy > cap, f"{healthy}s — a healthy active keeps the interval"
         assert consume_first > cap, (
             f"{consume_first}s — `consume-first` must keep its own sleep"
@@ -15478,21 +15494,45 @@ class TestDynamicNeverWalls0010:
 
     def test_r3_a_rank_tie_is_broken_per_host(self, temp_home):
         """Same tied candidate set, two hostnames, two orders — and the
-        same hostname twice, one order."""
+        same hostname twice, one order.
+
+        TWO WORLDS, because the first one alone is a world the fleet is
+        not in. `resets_at` absent puts every candidate at `inf` on the
+        ranking key's first element, which reaches the tie-break for free;
+        the endpoint actually stamps a DISTINCT reset on every account, so
+        the second fleet is the one that proves the tie-break is reachable
+        at all. Both are one case: they differ only in the usage dict.
+        """
         from claude_swap.autoswitch import _rank_dynamic_candidates
 
+        now = 1_000_000.0
         nums = [str(n) for n in range(1, 8)]
         headroom = {n: 50.0 for n in nums}
-        usage = {n: _usage(50.0) for n in nums}
+        # Measured on the fleet's own cache 2026-09-08: the endpoint stamps
+        # whole hours with sub-second jitter (…T20:00:00.500232Z,
+        # …T20:59:59.998867Z) and two of seven accounts sat inside one hour
+        # of each other.
+        real = {
+            n: _usage7(0.0, 50.0, _iso_at(now + 3600.0 + 90.0 * i))
+            for i, n in enumerate(nums)
+        }
 
-        def order(host):
+        def order(host, usage):
             with patch("socket.gethostname", return_value=host):
                 warm, cold = _rank_dynamic_candidates(
-                    nums, headroom, usage, 1_000_000.0, {}, 600.0
+                    nums, headroom, usage, now, {}, 600.0
                 )
             return warm + cold
 
-        a, b = order("lmd42"), order("pmac")
+        ra, rb = order("lmd42", real), order("pmac", real)
+        assert ra != rb, (
+            f"both hosts ranked distinct-but-equivalent resets the same "
+            f"way ({ra}) — the tie-break never runs on real data"
+        )
+        assert ra == order("lmd42", real)
+
+        degenerate = {n: _usage(50.0) for n in nums}
+        a, b = order("lmd42", degenerate), order("pmac", degenerate)
         assert a != b, f"both hosts ranked the tie the same way ({a})"
-        assert a == order("lmd42"), "the same host must be stable across calls"
-        assert sorted(a) == sorted(b) == sorted(nums)
+        assert a == order("lmd42", degenerate), "one host, one order"
+        assert sorted(a) == sorted(b) == sorted(ra) == sorted(nums)

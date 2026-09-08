@@ -172,6 +172,25 @@ DANGER_INTERVAL_S = poll_policy.URGENT_INTERVAL_S
 # engine has no business reaching another host, so candidates this close on
 # merit are indistinguishable and their order is a per-host hash instead of
 # the fleet-wide one every host computes identically (adr/0010 R3).
+#
+# BOTH ranking elements are quantized, or the tie-break never runs: the
+# endpoint stamps a DISTINCT `resets_at` on every account, so an exact epoch
+# in the sort key separates every pair and nothing downstream is ever
+# consulted. An hour is the grain because that is what the data has --
+# measured on the fleet's own cache 2026-09-08, all seven resets land on a
+# whole hour with sub-second jitter (`...T20:00:00.500232Z`,
+# `...T20:59:59.998867Z`) and two of the seven sat inside one hour of each
+# other. It is also a tenth of the shortest window ranked here (5h) and 0.6%
+# of the longest (7d), so "drain the soonest-resetting account first" still
+# means what it says, while a 360s tick could not act on a finer difference
+# anyway.
+#
+# ROUNDED, never floored, in both cases -- that is what keeps a grid from
+# splitting a real near-tie. Rounding puts the bucket edge at the half-point,
+# and the data lands on the whole unit: resets on whole hours (so the edge is
+# at :30, where none sit) and percentages as integers (so the edge is at x.5).
+# A floor would have put the edge exactly where `...T08:59:59.746869Z` sits.
+RANK_TIE_TOLERANCE_S = 3600.0
 RANK_TIE_TOLERANCE_PCT = 1.0
 
 
@@ -351,12 +370,15 @@ def _rank_dynamic_candidates(
         if h is None or h <= SPENT_HEADROOM_PCT:
             continue
         reset_ts = _seven_day_reset_ts(usage.get(num), now)
-        # Headroom quantized to RANK_TIE_TOLERANCE_PCT, then a per-host
-        # hash: two candidates this close are indistinguishable on merit,
-        # and ordering them identically on every host is what put two of
-        # them onto one peer (adr/0010 R3).
+        # Reset and headroom each quantized to their tolerance, then a
+        # per-host hash: two candidates this close are indistinguishable on
+        # merit, and ordering them identically on every host is what put
+        # two of them onto one peer (adr/0010 R3). `inf` stays out of the
+        # division -- `round(inf)` raises.
         key = (
-            reset_ts if reset_ts is not None else float("inf"),
+            round(reset_ts / RANK_TIE_TOLERANCE_S)
+            if reset_ts is not None
+            else float("inf"),
             -round(h / RANK_TIE_TOLERANCE_PCT),
             _host_tiebreak(num),
         )
@@ -1786,7 +1808,6 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
-        self._danger_band = False
         if self._stop.is_set():
             # BEFORE the mutators, not among them. `stop()` releases the LIVE
             # lock synchronously and no caller joins the worker, so the
@@ -1931,6 +1952,15 @@ class AutoSwitchEngine:
         # adr/0010 R2: two margins of the bar, on the SAME widened reading
         # the trigger is classified from. `dynamic` only, so `best` and
         # `consume-first` keep their sleep byte for byte.
+        #
+        # RECOMPUTED HERE AND DELIBERATELY NOT CLEARED with the other
+        # per-tick flags above: every path that leaves this method earlier
+        # (an unreadable store, a raised collector, an API-key active)
+        # would otherwise report "not in band" for an active the LAST tick
+        # measured in it, and the engine would sleep the full interval for
+        # exactly the tick whose reading failed. A carried-over True costs
+        # one extra wake, served from the store inside SERVE_TTL_S; a
+        # carried-over False costs the observation this rule exists for.
         self._danger_band = (
             settings.strategy == "dynamic"
             and active_headroom is not None
