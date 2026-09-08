@@ -158,7 +158,7 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
 def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tuple[str | None, int, str]]:
     """Every call to one of ``target_names`` in ``path``, with its innermost
     enclosing function (``None`` at module scope) and line number."""
-    tree = ast.parse(path.read_text(), filename=str(path))
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     class Visitor(ast.NodeVisitor):
         def __init__(self) -> None:
