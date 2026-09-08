@@ -2323,7 +2323,7 @@ class TestForceOverwriteNarratesTheStrikeClear:
         # HEALED: the backup was rewritten to the new generation (Keychain
         # write, since the Keychain is currently usable) -- the struck
         # fingerprint now matches nothing.
-        s._write_account_credentials("2", "bob@example.com", new_gen)
+        s._write_account_credentials("2", "bob@example.com", new_gen, attributed=True)
         assert s.current_account_number() != "2"  # genuinely idle
 
         out = temp_home / "bob.cswap"
