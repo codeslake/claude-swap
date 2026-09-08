@@ -3316,9 +3316,10 @@ class ClaudeAccountSwitcher:
     def _register_login_as_new_slot(
         self, data: dict, creds: str, resolved: dict
     ) -> bool:
-        """Give a /login for an account no slot owns a slot of its own, and
-        make it the active account. Called under ``lock_file`` with the
-        roster in hand, from the adopt path.
+        """Give a /login for an account no slot owns a slot of its own.
+        Called under ``lock_file`` with the roster in hand, from the adopt
+        path. Never moves ``activeAccountNumber``: enrolling a slot is not
+        a switch.
 
         The credential must still be the live one: a switch that landed
         while the server was asked has moved the live store on, and a slot
@@ -3353,7 +3354,11 @@ class ClaudeAccountSwitcher:
         if int(num) not in order:
             order.append(int(num))
             order.sort()
-        data["activeAccountNumber"] = int(num)
+        # Never moves `activeAccountNumber` here either -- same rule as the
+        # other automatic-resync sites (`fc3f288b`): a bare `/login` is
+        # enrolment, not a switch, whatever the active slot currently is.
+        # `current_account_number()` already reads the live identity
+        # directly and needs no help from this bookkeeping field.
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
         # THE CONFIG A SWITCH WOULD REBUILD, built from the roster row above
@@ -3381,7 +3386,7 @@ class ClaudeAccountSwitcher:
             )
         self._logger.info(
             "Registered a login as Account-%s (%s): no slot owned it, so it "
-            "was given one and made the active account.", num, email,
+            "was given one. The active account is unchanged.", num, email,
         )
         return True
 

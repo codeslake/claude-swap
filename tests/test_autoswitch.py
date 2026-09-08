@@ -2547,6 +2547,67 @@ class TestABareLoginHealsItsSlotThroughTheEngineTick:
         )
 
 
+class TestABareLoginToAnUnownedIdentityGetsItsOwnSlotThroughTheEngineTick:
+    """The `_register_login_as_new_slot` sibling of the healing class above:
+    the oracle resolves the live login to an identity NO slot owns at all
+    (no matching uuid, no matching (email, org) pair anywhere in the
+    roster) -- `_adopt_login_into_slot` registers it a brand-new slot.
+
+    Same rule as the healing arms (`fc3f288b`): a bare ``/login``, no
+    ``cswap add``, no ``cswap switch``, must never move the roster's
+    ``activeAccountNumber``. Creating the slot is enrolment; only a switch
+    activates one, and nobody asked for a switch.
+    """
+
+    def _harness(self, temp_home, monkeypatch):
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home)
+        h.seed(1, "m@example.com")   # some unrelated account, already active
+        h.seed(2, "n@example.com")   # the slot the CONFIG label claims
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        return h
+
+    def test_an_unowned_login_gets_its_own_slot_without_moving_active(
+        self, temp_home, monkeypatch,
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        assert h.active_number() == 1, "premise: an unrelated account is active"
+
+        # A bare /login: the CONFIG label claims slot 2's identity (so the
+        # engine fetches usage for slot 2), but the server resolves the live
+        # bytes to an account NO slot owns at all -- a personal account, or
+        # one whose uuid/org no longer resolves to anything in the roster.
+        h.make_live("n@example.com", 2)
+
+        def fake_fetch(num, email, creds, is_active=False, **kwargs):
+            return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+        with (
+            patch("claude_swap.oauth.try_fetch_usage_for_account",
+                  side_effect=fake_fetch),
+            patch("claude_swap.oauth.fetch_oauth_profile",
+                  return_value={"uuid": "uuid-new", "email": "new@example.com",
+                                "organizationUuid": ""}),
+        ):
+            h.engine.tick()
+
+        data = h.switcher._get_sequence_data()
+        new_num = next(
+            (num for num, acc in data["accounts"].items()
+             if acc.get("email") == "new@example.com"),
+            None,
+        )
+        assert new_num is not None, "the unowned identity was never given a slot"
+        got_new = h.switcher._read_account_credentials(new_num, "new@example.com")
+        assert json.loads(got_new)["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            f"the new slot did not receive the live login's credential: {got_new!r}"
+        )
+        assert h.active_number() == 1, (
+            "a bare /login to an account no slot owned moved the roster's "
+            "active pointer onto the newly-registered slot"
+        )
+
+
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
         data = harness.switcher._get_sequence_data()

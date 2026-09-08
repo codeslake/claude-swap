@@ -18362,13 +18362,15 @@ class TestALoginLandsInItsOwnSlot:
                    return_value=profile):
             s._resync_rotated_backup("2", "b@example.com", "o-2", live)
 
-    def test_a_login_for_an_unmanaged_account_gets_a_slot_and_becomes_active(
+    def test_a_login_for_an_unmanaged_account_gets_a_slot_without_moving_active(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
     ):
-        """A /login is the whole registration. An account no slot owns used
-        to be logged as "no managed slot owns it; backup left untouched" and
-        the login survived only until the next switch replaced it."""
+        """A /login is the whole registration -- an account no slot owns
+        used to be logged as "no managed slot owns it; backup left
+        untouched" and the login survived only until the next switch
+        replaced it. Registering the slot is enrolment, not a switch:
+        `activeAccountNumber` must stay whatever it already was."""
         sample_sequence_data["activeAccountNumber"] = 2
         s = self._owner_slot_fixture(sample_sequence_data)
         live = self._blob("rt-new")
@@ -18379,7 +18381,9 @@ class TestALoginLandsInItsOwnSlot:
         row = data["accounts"].get("3")
         assert row and row["email"] == "z@example.com" and row["uuid"] == "u-9", data
         assert 3 in data["sequence"]
-        assert data["activeAccountNumber"] == 3
+        assert data["activeAccountNumber"] == 2, (
+            "registering a new slot for an unowned login moved the active "
+            "pointer onto it")
         assert json.loads(s._read_account_credentials(
             "3", "z@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-new"
         assert s._read_account_config("3", "z@example.com"), (
