@@ -1684,17 +1684,6 @@ class CredentialStore:
     ) -> str:
         """Read account credentials from backup. ``""`` when missing.
 
-        Forwards to ``_read_account_credentials_direct``: this name is the
-        one a caller that wants "this slot's own key, and nothing found
-        under any other slot" reaches for.
-        """
-        return self._read_account_credentials_direct(account_num, email, failed)
-
-    def _read_account_credentials_direct(
-        self, account_num: str, email: str, failed: list | None = None
-    ) -> str:
-        """Read account credentials from backup. ``""`` when missing.
-
         macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
         copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
         Linux/WSL/Windows read the ``.enc`` only.
