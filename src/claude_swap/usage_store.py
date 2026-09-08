@@ -481,6 +481,16 @@ class UsageEntry:
         rolled window in the first place; this is the non-429 arm, which
         has no such reset test).
 
+        This CAN null a healthy account too — the scheduled-next-poll
+        disjunct (``now < next_poll_at``) is true for a row simply not due
+        yet, with zero failures. Bounded, though: ``poll_policy`` sets
+        ``nextPollAt`` at or before the earliest future reset plus
+        ``RESET_SLACK_S``, so once a reset passes the row is due within
+        about ``RESET_SLACK_S`` and that disjunct falls away; the
+        live-claim disjunct is capped at ``CLAIM_TTL_S`` (90s). A narrow,
+        deliberate re-opening of the failover-flapping window an earlier
+        pass closed, not a regression of it.
+
         ``models`` selects the per-model scoped windows too, matching
         ``_drop_rolled_windows``'s reuse. Display code reads
         ``last_good``/``age_s`` directly instead — it may show older data,
@@ -494,7 +504,7 @@ class UsageEntry:
             and (self.age_s <= STALE_OK_S or self.trust_extended)
         ):
             if self.fetched_at is None:
-                return self.last_good
+                return self.last_good  # hand-built-entry fallback (entries() ties age_s to fetched_at)
             now = self.fetched_at + self.age_s
             if self.age_s <= STALE_OK_S:
                 return _drop_rolled_windows(self.last_good, now, models)

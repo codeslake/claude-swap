@@ -6064,8 +6064,7 @@ class ClaudeAccountSwitcher:
         as "rolled" or "spent". Widening these to a model needs resolving one
         from settings at a single default-resolution site (the way
         ``cli.py``'s CLI-merged-model resolution already does), not a new
-        parameter threaded through every caller — see ``pr-subjects.md``
-        #199's `models=()` finding for the sibling gap in ``switch()``.
+        parameter threaded through every caller.
         """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info)
@@ -6315,9 +6314,12 @@ class ClaudeAccountSwitcher:
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
             # A relevant window whose own reset has already elapsed is also
-            # dropped from a fresh reading (#325, usage_store._drop_rolled_
-            # windows); if that leaves nothing (every relevant window rolled),
-            # the status is not "ok" either, even for a just-fetched row.
+            # dropped from a FRESH reading (#325, usage_store._drop_rolled_
+            # windows); if that leaves nothing (every relevant window
+            # rolled), the status is not "ok" either, even for a
+            # just-fetched row. On an older, deliberately-stale reading ANY
+            # rolled window nulls the whole thing outright, not just the
+            # window that rolled.
             # models=() — see `_usage_by_account`; `--list` shows the
             # account-wide picture, never a model-pinned one.
             accounts.append(

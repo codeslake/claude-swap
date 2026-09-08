@@ -198,6 +198,32 @@ class TestExtendedTrust:
         assert entry.trust_extended
         assert entry.decision_value() is None
 
+    def test_a_rolled_window_nulls_a_healthy_scheduled_row_too(self, store, clock):
+        # The `now < next_poll_at` disjunct grants trust_extended with NO
+        # failure at all -- a perfectly healthy account whose next poll
+        # simply is not due yet. Same reasoning as the failure-flavoured
+        # sibling above: no poll has confirmed anything since the window
+        # rolled, so the reading nulls rather than surfacing a dropped
+        # window's partial pct as unconfirmed headroom.
+        from datetime import datetime, timezone
+
+        reset_at = (
+            datetime.fromtimestamp(clock.now + 100.0, tz=timezone.utc)
+            .isoformat().replace("+00:00", "Z")
+        )
+        usage = {
+            "five_hour": {"pct": 98.0, "resets_at": reset_at},
+            "seven_day": {"pct": 30.0},
+        }
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        store.set_poll_plan({"1": (clock.now + 1000.0, 1000.0)}, IDENT)
+        clock.advance(310.0)  # past the 5h reset AND past STALE_OK_S; not due
+        entry = store.entries(IDENT)["1"]
+        assert entry.consecutive_failures == 0
+        assert entry.age_s > STALE_OK_S
+        assert entry.trust_extended
+        assert entry.decision_value() is None
+
     def _usage_resetting_at(self, clock, seconds_ahead):
         from datetime import datetime, timezone
 
