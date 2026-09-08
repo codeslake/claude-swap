@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -8130,6 +8131,66 @@ class TestStashAndRetentionStore:
             "Python's limit"
         )
         assert store._read_account_credentials_direct("4", email) == incoming
+
+    def test_in_attribution_read_is_per_thread_not_one_shared_instance_flag(
+        self, temp_home,
+    ):
+        """CRITICAL: one ``CredentialStore`` is shared by the TUI's worker
+        threads (``switcher.py:405``, ``tui/app.py``'s
+        ``run_worker(thread=True)`` groups), and ``_build_accounts_info``
+        (``switcher.py:5388``) reaches this seam UNLOCKED. An instance
+        attribute one thread's marked region clears can clobber a DIFFERENT
+        thread that is still inside its own marked region -- and the
+        opposite is just as real: a thread that finishes marked can leave
+        the flag stuck True for a thread that never asked for it, silently
+        suppressing every converge write from then on with no error, only a
+        "could not mirror it back" warning nobody reads.
+
+        Two real ``threading.Thread``s, handed off with ``threading.Event``s
+        (no sleep): the OUTER thread sets the mark and holds it while the
+        INNER thread enters and fully leaves its own marked region, then
+        the outer thread checks its own mark is untouched.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+
+        outer_entered = threading.Event()
+        inner_done = threading.Event()
+        result: dict = {}
+
+        def outer() -> None:
+            store._in_attribution_read = True
+            outer_entered.set()
+            inner_done.wait(timeout=5)
+            result["outer_after_inner"] = store._in_attribution_read
+            store._in_attribution_read = False
+
+        def inner() -> None:
+            assert outer_entered.wait(timeout=5), "outer thread never entered"
+            result["inner_saw_at_entry"] = store._in_attribution_read
+            store._in_attribution_read = True
+            store._in_attribution_read = False
+            inner_done.set()
+
+        t_outer = threading.Thread(target=outer)
+        t_inner = threading.Thread(target=inner)
+        t_outer.start()
+        t_inner.start()
+        t_outer.join(timeout=5)
+        t_inner.join(timeout=5)
+
+        assert not t_outer.is_alive() and not t_inner.is_alive(), (
+            "a thread did not finish within its budget"
+        )
+        assert result.get("inner_saw_at_entry") is False, (
+            "DEFECT: the inner thread saw the OUTER thread's own mark -- "
+            "_in_attribution_read is one instance attribute shared across "
+            "threads, not per-thread"
+        )
+        assert result.get("outer_after_inner") is True, (
+            "DEFECT: the inner thread's own marked region clobbered the "
+            "outer thread's still-active mark"
+        )
 
     def test_renumber_fallback_never_clobbers_a_fresh_write_that_lands_mid_sweep(
         self, temp_home,

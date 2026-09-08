@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -310,6 +311,15 @@ class _StoreHost(Protocol):
     def _get_sequence_data(self) -> dict | None: ...
 
 
+#: Backs ``CredentialStore._in_attribution_read``. One store is shared by the
+#: TUI's worker threads (``switcher.py``'s ``self._store = CredentialStore(self)``,
+#: ``tui/app.py``'s ``run_worker(thread=True)`` groups), and
+#: ``_build_accounts_info`` reaches this seam UNLOCKED — so a plain instance
+#: attribute one thread clears is a mark another thread is still relying on,
+#: and can be left stuck True by whichever thread's own restore runs last.
+_ATTRIBUTION_READ = threading.local()
+
+
 class CredentialStore:
     """Owns the active and per-account backup credential stores.
 
@@ -317,10 +327,18 @@ class CredentialStore:
     ``security`` calls, and a fresh process re-evaluates from scratch.
     """
 
-    #: Set by the write path while it verifies a slot's stored lineage. A read
-    #: taken for verification must not converge-write: the write it would make
-    #: re-enters the write path that asked for the read.
-    _in_attribution_read = False
+    @property
+    def _in_attribution_read(self) -> bool:
+        """True while THIS THREAD is inside a write-path verification read.
+
+        Thread-local rather than an instance attribute — see
+        ``_ATTRIBUTION_READ`` above for why an instance flag is unsafe here.
+        """
+        return getattr(_ATTRIBUTION_READ, "active", False)
+
+    @_in_attribution_read.setter
+    def _in_attribution_read(self, value: bool) -> None:
+        _ATTRIBUTION_READ.active = bool(value)
 
     def __init__(self, host: _StoreHost):
         self._host = host
