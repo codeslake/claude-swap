@@ -699,7 +699,12 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, proactive_switch_bar_pct
+    from claude_swap.autoswitch import (
+        AutoSwitchEngine,
+        AutoSwitchEvent,
+        pct_label,
+        proactive_switch_bar_pct,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -762,13 +767,13 @@ Defaults live in settings.json in the backup root; flags override them.
                 settings.strategy, settings.threshold
             )
             switch_at = (
-                f", switch at {switch_bar:.0f}%"
-                if switch_bar != settings.threshold
+                f", switch at {pct_label(switch_bar)}%"
+                if pct_label(switch_bar) != pct_label(settings.threshold)
                 else ""
             )
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%"
+                    f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
                     f"{switch_at}, "
                     f"every {settings.interval_seconds:.0f}s"
                     # THE ENGINE, NOT THE REQUEST. A demoted engine has

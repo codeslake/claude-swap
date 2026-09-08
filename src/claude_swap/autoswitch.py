@@ -1734,9 +1734,6 @@ class AutoSwitchEngine:
                     active=None,
                     headroom={},
                     threshold=settings.threshold,
-                    switch_bar=proactive_switch_bar_pct(
-                        settings.strategy, settings.threshold
-                    ),
                 )
             )
             if self.switcher.has_live_login():
