@@ -2026,12 +2026,24 @@ class TestActiveAccountRefresh:
         held by another process, this path still POSTed the shared grant —
         one of the two POSTs wins, the loser gets invalid_grant, and the
         strike lands on a live account.
+
+        The deferral is decided by FileLock's own 10s acquire timeout, which
+        this test does not need to pay for real: like the sibling
+        `test_a_held_consume_lock_defers_the_grant_post` below, every
+        FileLock built during the call gets a 0.05s timeout instead — the
+        contended lock still times out and defers, just almost instantly.
         """
         from claude_swap.locking import FileLock
 
         switcher = self._switcher(sample_sequence_data)
         holder = FileLock(switcher.credentials_dir / ".consume-1.lock")
         assert holder.acquire(), "could not seed the contended lock"
+
+        real_init = FileLock.__init__
+
+        def fast_init(self, lock_path, timeout=0.05):
+            real_init(self, lock_path, timeout)
+
         try:
             with patch.object(
                 switcher, "_read_credentials", return_value=self._EXPIRED
@@ -2041,7 +2053,7 @@ class TestActiveAccountRefresh:
                 "claude_swap.oauth.try_refresh_oauth_credentials"
             ) as mock_refresh, patch(
                 "claude_swap.oauth.try_fetch_usage_for_account"
-            ):
+            ), patch.object(FileLock, "__init__", fast_init):
                 result = switcher._fetch_active_usage(
                     "1", "test@example.com", self._EXPIRED
                 )
