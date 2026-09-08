@@ -30,12 +30,10 @@ read-modify-write under a dedicated file lock.
 from __future__ import annotations
 
 import enum
-import hashlib
 import json
 import logging
 import math
 import random
-import socket
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -166,44 +164,6 @@ SPENT_HEADROOM_PCT = 3.0
 # knobs if the fleet is ever measured walling from inside the band.
 DANGER_INTERVAL_S = poll_policy.URGENT_INTERVAL_S
 
-# Two hosts ranking the same fleet agree, so they land on the same peer
-# (measured 2026-09-08: lmd42 10:30:39Z and pmac 10:31:44Z both onto slot 1,
-# 66s apart). No fleet-visible channel exists to coordinate through and the
-# engine has no business reaching another host, so candidates this close on
-# merit are indistinguishable and their order is a per-host hash instead of
-# the fleet-wide one every host computes identically (adr/0010 R3).
-#
-# BOTH ranking elements are quantized, or the tie-break never runs: the
-# endpoint stamps a DISTINCT `resets_at` on every account, so an exact epoch
-# in the sort key separates every pair and nothing downstream is ever
-# consulted. An hour is the grain because that is what the data has --
-# measured on the fleet's own cache 2026-09-08, all seven resets land on a
-# whole hour with sub-second jitter (`...T20:00:00.500232Z`,
-# `...T20:59:59.998867Z`) and two of the seven sat inside one hour of each
-# other. It is also a tenth of the shortest window ranked here (5h) and 0.6%
-# of the longest (7d), so "drain the soonest-resetting account first" still
-# means what it says, while a 360s tick could not act on a finer difference
-# anyway.
-#
-# ROUNDED, never floored, in both cases -- that is what keeps a grid from
-# splitting a real near-tie. Rounding puts the bucket edge at the half-point,
-# and the data lands on the whole unit: resets on whole hours (so the edge is
-# at :30, where none sit) and percentages as integers (so the edge is at x.5).
-# A floor would have put the edge exactly where `...T08:59:59.746869Z` sits.
-RANK_TIE_TOLERANCE_S = 3600.0
-RANK_TIE_TOLERANCE_PCT = 1.0
-
-
-def _host_tiebreak(number: str) -> int:
-    """A stable, host-specific order for candidates that tie on merit.
-
-    Not `random`: a seeded permutation would still be deterministic per host,
-    but this needs no state and is testable by naming the host. Not `hash()`
-    either — PYTHONHASHSEED randomizes it per process, so the same host would
-    re-order across restarts and the tie would stop being a tie-break.
-    """
-    seed = f"{socket.gethostname()}:{number}".encode()
-    return int.from_bytes(hashlib.blake2b(seed, digest_size=8).digest(), "big")
 
 
 def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
@@ -370,18 +330,7 @@ def _rank_dynamic_candidates(
         if h is None or h <= SPENT_HEADROOM_PCT:
             continue
         reset_ts = _seven_day_reset_ts(usage.get(num), now)
-        # Reset and headroom each quantized to their tolerance, then a
-        # per-host hash: two candidates this close are indistinguishable on
-        # merit, and ordering them identically on every host is what put
-        # two of them onto one peer (adr/0010 R3). `inf` stays out of the
-        # division -- `round(inf)` raises.
-        key = (
-            round(reset_ts / RANK_TIE_TOLERANCE_S)
-            if reset_ts is not None
-            else float("inf"),
-            -round(h / RANK_TIE_TOLERANCE_PCT),
-            _host_tiebreak(num),
-        )
+        key = (reset_ts if reset_ts is not None else float("inf"), -h)
         bucket = warm if _is_warm(num, last_active_at, now, cache_ttl_seconds) else cold
         bucket.append((key, num))
     warm.sort(key=lambda t: t[0])

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
 import sys
 import tempfile
 import types
@@ -722,27 +721,6 @@ def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""
     monkeypatch.setattr("claude_swap.poll_policy.JITTER_FRAC", 0.0)
-
-
-@pytest.fixture(autouse=True)
-def _deterministic_hostname(monkeypatch):
-    """The machine's name must not decide whether the suite passes.
-
-    `autoswitch._host_tiebreak` orders candidates that tie on merit by a
-    hash of `(socket.gethostname(), account id)`, deliberately, so two
-    hosts do not land on one peer. That makes the ambient hostname an
-    input to every `dynamic` ranking, and any assertion naming WHICH of
-    two equal candidates was landed on would then be green on one machine
-    and red on another nobody can reproduce on.
-
-    Measured before pinning it: the whole suite is byte-identical under two
-    forced hostnames (2871 passed / 3 skipped each, junit-xml diff empty),
-    while the same two names order seven tied candidates three different
-    ways — so nothing depends on it TODAY and the control had discriminating
-    power. This keeps it that way. `_host_tiebreak`'s own guard patches
-    `socket.gethostname` itself and overrides this.
-    """
-    monkeypatch.setattr(socket, "gethostname", lambda: "test-host")
 
 
 @pytest.fixture(autouse=True)
