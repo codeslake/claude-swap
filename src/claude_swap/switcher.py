@@ -3337,7 +3337,11 @@ class ClaudeAccountSwitcher:
         ):
             return True
         num = str(self._get_next_account_number())
-        self._write_account_credentials(num, email, creds)
+        # attributed=True: `creds` was just matched against `live` (the
+        # active session's own credential) by fingerprint above, and `email`/
+        # `uuid` come from `resolved` -- the same identity resolution the
+        # sibling adopt methods verify against.
+        self._write_account_credentials(num, email, creds, attributed=True)
         data.setdefault("accounts", {})[num] = {
             "email": email,
             "uuid": uuid,

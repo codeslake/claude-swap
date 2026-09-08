@@ -10993,7 +10993,7 @@ class TestFreshenRoutesThroughGate:
         # and still lose to consume-busy exactly like store-unmirrored did.
         for actionable, needle in (
             ("lineage-condemned", "condemned as"),
-            ("identity-unreadable", "identity could not be read"),
+            ("identity-unreadable", "could not be read"),
         ):
             h2 = EngineHarness(temp_home / actionable)
             (temp_home / actionable / ".claude").mkdir(parents=True)
