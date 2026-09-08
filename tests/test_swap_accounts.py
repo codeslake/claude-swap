@@ -3,6 +3,7 @@
 import contextlib
 import errno
 import copy
+import json
 import os
 import sys
 from pathlib import Path
@@ -20,9 +21,33 @@ from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
-def _refuse_write(self, num, email, creds):
+def _refuse_write(self, num, email, creds, **kw):
     raise OSError("disk full (injected)")
 
+
+def test_refuse_write_tolerates_an_unknown_keyword():
+    """``_refuse_write`` stands in for the real
+    ``_write_account_credentials`` across this file. A caller that gains a
+    new keyword-only argument this fixture's hand-written signature does not
+    know about must still reach the injected failure, not a ``TypeError``
+    from the fixture itself -- which would be indistinguishable, in this
+    file's own asserts, from a real regression in the code under test.
+    """
+    with pytest.raises(OSError, match="disk full"):
+        _refuse_write(object(), "1", "a@example.com", "creds", extra=True)
+
+
+def _gen(num: str, generation: str) -> str:
+    """OAuth credential JSON for slot ``num``'s ``generation`` (e.g.
+    "gen1"/"gen2"). Successive generations for the same slot share one
+    ``refreshToken`` (a routine refresh) so the attribution guard's
+    fingerprint comparison treats them as the same lineage, needing no
+    attestation -- an opaque bare string has no refresh token at all and
+    reads as a foreign identity instead.
+    """
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": f"{generation}-{num}", "refreshToken": f"rt-{num}",
+    }})
 
 
 @contextlib.contextmanager
@@ -1105,11 +1130,11 @@ class TestSwapUnreadableSourceIsNotAbsent:
         calls = {"n": 0}
         real_write = switcher._write_account_credentials
 
-        def fail_first(num, mail, creds):
+        def fail_first(num, mail, creds, **kw):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise OSError(errno.EIO, "the first forward write failed")
-            return real_write(num, mail, creds)
+            return real_write(num, mail, creds, **kw)
 
         switcher._write_account_credentials = fail_first
         try:
@@ -1196,14 +1221,14 @@ class TestSwapUnreadableSourceIsNotAbsent:
         calls = {"n": 0}
         real_write = switcher._write_account_credentials
 
-        def fail_first(num, mail, creds):
+        def fail_first(num, mail, creds, **kw):
             # ONLY THE FORWARD WRITE. Replacing the method outright would
             # intercept the four RESTORE writes too, which is the behaviour
             # under test.
             calls["n"] += 1
             if calls["n"] == 1:
                 raise OSError(errno.EIO, "the first forward write failed")
-            return real_write(num, mail, creds)
+            return real_write(num, mail, creds, **kw)
 
         switcher._write_account_credentials = fail_first
         try:
@@ -1474,11 +1499,11 @@ class TestTheReverseCanFailAndTheSkipMustSeeIt:
         calls = {"n": 0}
         real_write = switcher._write_account_credentials
 
-        def fail_the_first(num, mail, creds):
+        def fail_the_first(num, mail, creds, **kw):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise CredentialError("injected: the swap dies on its first write")
-            return real_write(num, mail, creds)
+            return real_write(num, mail, creds, **kw)
 
         switcher._write_account_credentials = fail_the_first
         with pytest.raises((CredentialError, ConfigError)):
@@ -1608,7 +1633,7 @@ class TestTheRollbackSummaryReportsWhatRan:
 
         real_write = switcher._write_account_credentials
 
-        def die_on_the_first(num, mail, creds):
+        def die_on_the_first(num, mail, creds, **kw):
             raise CredentialError("injected: the swap dies on its first write")
 
         switcher._write_account_credentials = die_on_the_first
