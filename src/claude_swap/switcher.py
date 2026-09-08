@@ -872,9 +872,17 @@ class ClaudeAccountSwitcher:
         return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
-        self, account_num: str, email: str, credentials: str
+        self, account_num: str, email: str, credentials: str,
+        *, attributed: bool = False,
     ) -> None:
         """Write account credentials to backup, then invalidate the slot's session.
+
+        ``attributed`` is a merge seam for feat/pin-package-seam's write-time
+        attribution guard (not yet present on this branch alone): pass it only
+        when THIS call site has independently established that ``credentials``
+        belongs to ``(account_num, email)``, never as a blanket default. Inert
+        here — nothing on this branch reads it yet — so it round-trips harmless
+        until the two branches merge and the store side starts enforcing it.
 
         The store performs the pure write and raises on failure *before* returning,
         so ``_post_backup_write`` (the session-invalidation chokepoint) runs exactly
@@ -3441,7 +3449,13 @@ class ClaudeAccountSwitcher:
                     owner, owner_email,
                 )
                 return True
-            self._write_account_credentials(owner, owner_email, creds)
+            # attributed=True: `owner` came from `_slot_owning_resolved_identity`
+            # (a uuid-verified oracle resolution) above, and the newer-login
+            # ordering check just above this line already refused an older
+            # or equal-dated login for a healthy slot.
+            self._write_account_credentials(
+                owner, owner_email, creds, attributed=True
+            )
             # The strike condemned the generation this write just replaced.
             # `_row_eligible` gates the fetch on the RAW count, so a strike
             # left standing keeps a slot that now holds a working login out of
@@ -5698,7 +5712,14 @@ class ClaudeAccountSwitcher:
                 if stored_fp is not None and creds_fp == stored_fp:
                     continue
                 try:
-                    self._write_account_credentials(num, email, creds)
+                    # attributed=True: `r_uuid`/`r_email` were just matched
+                    # above against this slot's OWN recorded identity
+                    # (`uuid`/`want_email`, read from the roster under the
+                    # lock) — a uuid match when both sides carry one, an
+                    # exact email match otherwise.
+                    self._write_account_credentials(
+                        num, email, creds, attributed=True
+                    )
                 except (OSError, LockError) as e:
                     self._logger.warning(
                         "Could not adopt the stashed login into Account-%s: "
@@ -5798,8 +5819,12 @@ class ClaudeAccountSwitcher:
         # nothing left to go wrong, and escape as an OSError the CLI renders
         # as a traceback rather than an error envelope.
         try:
+            # attributed=True: the caller only reaches here with `kind ==
+            # "foreign"` (see `_classify_outgoing_credential`'s docstring),
+            # which is a uuid-positive oracle resolution of these bytes to
+            # `foreign_slot`'s identity — not an external claim.
             self._write_account_credentials(
-                str(foreign_slot), email, credentials)
+                str(foreign_slot), email, credentials, attributed=True)
             self._usage_store.clear_dead_token(
                 [str(foreign_slot)],
                 {str(foreign_slot): (email,

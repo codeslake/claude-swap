@@ -3484,7 +3484,7 @@ class TestPerformSwitchPostDisplay:
             # double and reads the real (empty) store instead.
             return creds_store.get((str(num), email), ""), False
 
-        def write_creds(num, email, creds):
+        def write_creds(num, email, creds, **_kw):
             creds_store[(str(num), email)] = creds
 
         def read_cfg(num, email):
