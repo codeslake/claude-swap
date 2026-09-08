@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -28,6 +29,22 @@ class TestExtractAccessToken:
 
     def test_empty_string(self):
         assert oauth.extract_access_token("") is None
+
+
+class TestIsOauthTokenExpired:
+    """A non-finite numeric stamp must answer like a missing one, not raise."""
+
+    def test_infinity_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(float("inf")) is False
+
+    def test_negative_infinity_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(float("-inf")) is False
+
+    def test_nan_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(float("nan")) is False
+
+    def test_oversized_int_is_not_expired(self):
+        assert oauth.is_oauth_token_expired(10**400) is False
 
 
 class TestAccountHeadroom:
@@ -456,6 +473,28 @@ class TestRefreshOAuthCredentials:
         assert seen_body["refresh_token"] == "old-refresh"
         assert seen_body["client_id"] == oauth.OAUTH_CLIENT_ID
         assert "scope" not in seen_body
+
+    def test_wrapper_attributes_its_post_to_the_caller_slot(self, caplog):
+        """The wrapper still called `try_refresh_oauth_credentials` with no
+        `slot`, so this was the one refresh POST left logging "for account
+        None" — the only one of the two entry points into the refresh POST
+        that a caller with a known slot could not date."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("claude_swap.oauth.urllib.request.urlopen",
+                   return_value=mock_response), \
+             caplog.at_level(logging.INFO, logger="claude-swap"):
+            oauth.refresh_oauth_credentials(self._make_credentials(), slot="7")
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert "Refresh POST for account 7: ok" in messages, messages
 
 
 class TestTryRefreshOAuthCredentials:
@@ -1055,37 +1094,76 @@ class TestInvalidGrantPropagation:
     from a transient 'refresh-failed', so the store can quarantine the account."""
 
     @staticmethod
-    def _expired_credentials() -> str:
+    def _expired_credentials(refresh_token_expires_at=None) -> str:
         from datetime import timedelta
         past_ms = int(
             (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
         )
-        return json.dumps({"claudeAiOauth": {
+        blob = {"claudeAiOauth": {
             "accessToken": "old-access", "refreshToken": "dead-refresh",
             "expiresAt": past_ms,
-        }})
+        }}
+        if refresh_token_expires_at is not None:
+            blob["claudeAiOauth"]["refreshTokenExpiresAt"] = refresh_token_expires_at
+        return json.dumps(blob)
 
     @staticmethod
-    def _valid_credentials() -> str:
+    def _valid_credentials(refresh_token_expires_at=None) -> str:
         from datetime import timedelta
         future_ms = int(
             (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
         )
-        return json.dumps({"claudeAiOauth": {
+        blob = {"claudeAiOauth": {
             "accessToken": "good-access", "refreshToken": "dead-refresh",
             "expiresAt": future_ms,
-        }})
+        }}
+        if refresh_token_expires_at is not None:
+            blob["claudeAiOauth"]["refreshTokenExpiresAt"] = refresh_token_expires_at
+        return json.dumps(blob)
 
     def test_proactive_refresh_invalid_grant_short_circuits(self):
-        """Expired token + dead refresh: report invalid_grant without hitting usage."""
+        """No refreshTokenExpiresAt field: unknown is not expired, so refresh
+        is still attempted; the dead refresh reports invalid_grant without
+        hitting usage."""
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh, \
              patch("claude_swap.oauth.request_usage_data") as usage:
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._expired_credentials(), is_active=False,
             )
+        refresh.assert_called_once()
         assert outcome.error == "invalid_grant"
         usage.assert_not_called()  # no pointless 401/429 on a lost cause
+
+    def test_proactive_refresh_skips_post_when_grant_genuinely_expired(self):
+        """Access token AND refresh grant both past expiry: no refresh POST,
+        but the outcome still carries invalid_grant and still strikes."""
+        creds = self._expired_credentials(refresh_token_expires_at=1)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh, \
+             patch("claude_swap.oauth.request_usage_data") as usage:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=False,
+            )
+        refresh.assert_not_called()
+        usage.assert_not_called()
+        assert outcome.error == "invalid_grant"
+        assert outcome.struck_fp == oauth.credential_fingerprint(creds)
+
+    def test_proactive_refresh_still_posts_inside_expiry_buffer(self):
+        """Grant expiring in 60s, inside the 5-minute buffer: refresh is still
+        attempted — it can still mint an access token good for hours."""
+        from datetime import timedelta
+        soon_ms = int(
+            (datetime.now(timezone.utc) + timedelta(seconds=60)).timestamp() * 1000
+        )
+        creds = self._expired_credentials(refresh_token_expires_at=soon_ms)
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh:
+            oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=False,
+            )
+        refresh.assert_called_once()
 
     def test_401_retry_invalid_grant_is_permanent(self):
         """Valid-looking token, server 401, dead refresh → invalid_grant."""
@@ -1100,6 +1178,24 @@ class TestInvalidGrantPropagation:
                 "1", "a@b.c", self._valid_credentials(), is_active=False,
             )
         assert outcome.error == "invalid_grant"
+
+    def test_401_retry_skips_post_when_grant_genuinely_expired(self):
+        """Valid-looking access token, server 401, but the refresh grant is
+        already past expiry: the 401-retry refresh must not POST either."""
+        creds = self._valid_credentials(refresh_token_expires_at=1)
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")) as refresh:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", creds, is_active=False,
+            )
+        refresh.assert_not_called()
+        assert outcome.error == "invalid_grant"
+        assert outcome.struck_fp == oauth.credential_fingerprint(creds)
 
     def test_transient_refresh_failure_is_not_permanent(self):
         """A transient refresh failure stays 'refresh-failed', not invalid_grant."""
@@ -1389,6 +1485,78 @@ class TestFetchOauthProfile:
         )
 
 
+@pytest.mark.no_probe_oauth_profile_live_fake
+class TestProbeOauthProfileLive:
+    """``probe_oauth_profile_live`` — the switch-time liveness oracle (issue
+    #199): unlike ``fetch_oauth_profile`` it must tell a proven 401 apart
+    from an unresolvable failure, since only a proven 401 may ever escalate
+    to spending a refresh token. No test exercised it directly before this
+    one — the autouse ``block_real_switch_target_probe`` stub replaced it in
+    every other test, so a change to its 401/other-4xx/5xx split would have
+    passed the whole suite silently."""
+
+    def _response(self):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"{}"
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+
+    def test_200_is_live(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._response(),
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is True
+
+    def test_401_is_dead(self):
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/profile", 401,
+            "Unauthorized", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is False
+
+    def test_403_is_no_verdict(self):
+        """A 403 is not a 401: this credential may still be alive with a
+        scope/permission problem, and misclassifying it as dead would
+        strike a live account (the defect this test exists to catch)."""
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/profile", 403,
+            "Forbidden", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+    def test_500_is_no_verdict(self):
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/profile", 500,
+            "Internal Server Error", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+    def test_timeout_is_no_verdict(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=TimeoutError("timed out"),
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+    def test_url_error_is_no_verdict(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("down"),
+        ):
+            assert oauth.probe_oauth_profile_live("sk-live") is None
+
+
 class TestInvalidGrantTaxonomy:
     """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
     parse — top-level error == "invalid_grant" in the JSON body. Substring
@@ -1486,6 +1654,30 @@ class TestConsumeBusyIsDeterministic:
                 refresh_via=lambda *_: oauth.RefreshOutcome(None, "consume-busy"),
             )
         assert out.error == "consume-busy", out.error
+        usage.assert_not_called()
+
+    def test_an_unreadable_identity_does_not_spend_a_doomed_request(self):
+        """`identity-unreadable` (the consume gate's own deferral for a
+
+        corrupt session `.claude.json`) reaches this function the same as
+        `consume-busy` does: the token in hand is known-expired, so falling
+        through to the usage endpoint 401s for nothing.
+        """
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(
+                    None, "identity-unreadable"
+                ),
+            )
+        assert out.error == "identity-unreadable", out.error
         usage.assert_not_called()
 
     def test_every_deterministic_kind_has_a_note(self):
