@@ -14904,6 +14904,64 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "admissible escapee by recovery time must be reached"
         )
 
+    def test_an_absolute_floor_never_holds_a_real_rescue_forever(
+        self, temp_home
+    ):
+        """[C], the 396/375 round's correctness gate: the walled-escape's
+        admission bar was `cold_switch_cost_pct` (20) applied ABSOLUTELY —
+        so a genuine fleet-wide blackout held forever whenever every real
+        candidate's unmodeled headroom happened to fall under 20, even one
+        holding more than twice the active's own reading. Active is walled
+        on Fable (raw model-gated headroom 0, `_about_to_wall`) but its own
+        unmodeled 5h/7d floor is a real 5 (`_dynamic_active_headroom`
+        widens it to `dynamic-healthy`); #3's unmodeled floor is 12 — more
+        than double the active's — but the old absolute 20-point bar
+        refused it and the tick held `below-floor`/NO_ACTION forever
+        instead of landing there.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
+            "3": self._u(0, 88, 100, days_out=3),  # unmodeled headroom 12
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3 holds more than twice the active's own "
+            "unmodeled headroom (12 vs 5); an absolute floor must not "
+            "hold this fleet forever"
+        )
+        assert h.active_number() == 3
+
+    def test_a_peer_barely_above_the_active_is_still_not_an_escape(
+        self, temp_home
+    ):
+        """The churn case the absolute bar used to protect against, still
+        protected once the bar is relative: a candidate merely level with,
+        or barely above, the active's own unmodeled reading is not a real
+        rescue and must not be taken — only a margin of at least
+        `SPENT_HEADROOM_PCT` counts. Both readings sit ABOVE the old
+        absolute `cold_switch_cost_pct` (20) floor (18 and 20) so a naive
+        revert to that absolute bar would wrongly ADMIT this candidate —
+        the discriminating fixture against a plain revert.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        fleet = {
+            "1": self._u(0, 82, 100, days_out=4),  # active: unmodeled headroom 18
+            "3": self._u(0, 80, 100, days_out=3),  # unmodeled headroom 20 -- barely above
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3's unmodeled headroom (20) is only 2 "
+            "points above the active's own (18), well under the "
+            "SPENT_HEADROOM_PCT churn margin; it must not be taken"
+        )
+        assert h.active_number() == 1
 
 
 class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
@@ -15003,6 +15061,19 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
         assert _model_window_binds_everywhere(usage, ("Fable",), 90.0) is False, (
             "no account in this roster is model-only-walled once #3's 7d "
             "is spent too — the predicate must not fire"
+        )
+        # #8's empty window list short-circuits `_model_window_binds_
+        # everywhere` (`continue` on no windows) before the rest of the
+        # roster is even read, so the assertion above reads False on BOTH
+        # a fixed and a broken predicate, for different reasons, and
+        # cannot discriminate them. Dropping #8 forces the verdict to come
+        # from the roster itself (every real account is "full") — it must
+        # read the SAME False, or the assertion above was never testing
+        # what its name claims.
+        without_8 = {k: v for k, v in usage.items() if k != "8"}
+        assert _model_window_binds_everywhere(without_8, ("Fable",), 90.0) is False, (
+            "with #8 removed the verdict must still come from the "
+            "roster's own windows, not from #8's short-circuit"
         )
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
         for num, email in (

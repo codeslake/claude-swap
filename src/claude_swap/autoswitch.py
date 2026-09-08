@@ -259,6 +259,26 @@ def _rank_dynamic_candidates(
     return [num for _, num in warm], [num for _, num in cold]
 
 
+def _blackout_retry_admission_bar(
+    floor_headroom: dict[str, float | None], current: str
+) -> float:
+    """The candidate admission bar once ``dynamic``'s unmodeled-retry has
+    legitimately dropped the model set for ranking (#321), shared by the
+    `proactive` arm's `cold_floor` and the `dynamic-healthy` arm's
+    walled-escape admission -- the SAME retry, the same question, in both
+    places it is asked.
+
+    An ABSOLUTE bar cannot answer it: 12% unmodeled headroom is a real
+    rescue against an active genuinely pinned at 5%, and worthless noise
+    against one already holding 60% (both routed through this retry, only
+    one is a genuine improvement). The bar is therefore a margin over what
+    the active ALREADY reads on this same axis -- ``SPENT_HEADROOM_PCT``,
+    the same churn margin `_rank_dynamic_candidates` already applies to
+    drop a candidate with nothing worth taking.
+    """
+    return floor_headroom.get(current, 0.0) + SPENT_HEADROOM_PCT
+
+
 def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
     """Whether a candidate's cached usage cannot be trusted for admission.
 
@@ -1966,21 +1986,34 @@ class AutoSwitchEngine:
             # below it here — item 3c reserves a below-floor cold candidate
             # for the at-limit/failover escape, which never sets this
             # trigger. ONLY on the unmodeled-retry path above
-            # (`model_window_dropped`), the floor drops to
-            # `SPENT_HEADROOM_PCT`: `cold_switch_cost_pct` is priced for an
-            # ordinary cold switch away from a healthy active, but here the
-            # active is genuinely fleet-wide model-walled with nothing
-            # better to hold out for — refusing a real, merely-modest
-            # unmodeled candidate (owner specimen: #3 at 12%) and sleeping
-            # ten minutes instead is worse than landing on it (measured
-            # 2026-09-08). Never widens the ordinary (non-retry) floor.
-            cold_floor = (
-                SPENT_HEADROOM_PCT if model_window_dropped else settings.cold_switch_cost_pct
-            )
-            dynamic_ordered = warm_ordered + [
-                n for n in cold_ordered
-                if floor_headroom.get(n, 0.0) >= cold_floor
-            ]
+            # (`model_window_dropped`) does the floor change at all:
+            # `cold_switch_cost_pct` is priced for an ordinary cold switch
+            # away from a healthy active, but here the active is genuinely
+            # fleet-wide model-walled with nothing better to hold out for.
+            # A flat `SPENT_HEADROOM_PCT` floor there is not lower, it is NO
+            # floor: `_rank_dynamic_candidates` already drops every entry at
+            # or under that value before `cold_ordered` exists, so every
+            # survivor already clears it and the comparison never refuses
+            # anything (measured: this round's own gate). The floor that
+            # question actually needs is relative to what the active itself
+            # already reads on this axis — a real but modest unmodeled
+            # candidate (owner specimen: #3 at 12%, active at 5%) is a
+            # genuine rescue and must clear it; a peer merely level with, or
+            # barely above, the active's own reading is not (measured
+            # 2026-09-08).
+            if model_window_dropped:
+                cold_floor = _blackout_retry_admission_bar(floor_headroom, current)
+                cold_clears_floor = [
+                    n for n in cold_ordered
+                    if floor_headroom.get(n, 0.0) > cold_floor
+                ]
+            else:
+                cold_floor = settings.cold_switch_cost_pct
+                cold_clears_floor = [
+                    n for n in cold_ordered
+                    if floor_headroom.get(n, 0.0) >= cold_floor
+                ]
+            dynamic_ordered = warm_ordered + cold_clears_floor
             if not dynamic_ordered and cold_ordered:
                 # Real headroom exists but none of it clears the floor
                 # (item 3c: below-floor cold is for at-limit/failover only)
@@ -2094,9 +2127,19 @@ class AutoSwitchEngine:
             walled_escape = None
             if partner is None and _about_to_wall(raw_active_headroom):
                 if blackout_escape:
+                    # Relative, not `cold_switch_cost_pct` (#321): an
+                    # absolute bar held a genuine fleet-wide blackout
+                    # forever whenever every real candidate's unmodeled
+                    # headroom happened to fall under it, even one holding
+                    # more than twice the active's own reading (measured:
+                    # 12% refused against an active pinned at 5%). The
+                    # question here is only whether a candidate is a real
+                    # improvement over what the active ALREADY reads on
+                    # this same axis — see `_blackout_retry_admission_bar`.
+                    bar = _blackout_retry_admission_bar(floor_headroom, current)
                     escape_candidates = (
                         n for n in cold_ordered
-                        if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                        if floor_headroom.get(n, 0.0) > bar
                     )
                 else:
                     escape_candidates = (
