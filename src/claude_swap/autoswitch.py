@@ -574,9 +574,6 @@ class PollEvent(AutoSwitchEvent):
             "active": self.active,
             "headroomPct": self.headroom,
             "threshold": self.threshold,
-            "switchBarPct": self.switch_bar
-            if self.switch_bar is not None
-            else self.threshold,
         }
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors

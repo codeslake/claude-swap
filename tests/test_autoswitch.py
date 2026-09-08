@@ -39,7 +39,6 @@ from claude_swap.autoswitch import (
     _seven_day_reset_ts,
     classify_candidate_block,
     pct_label,
-    proactive_switch_bar_pct,
 )
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
@@ -4543,16 +4542,14 @@ class TestPctLabel:
             threshold=99.9,
         )
         assert "switch at 99.9%" in poll.human()
-        # #321 follow-up: under `dynamic` the printed bar is the derived
-        # proactive trigger (100 - SPENT_HEADROOM_PCT), never the raw
-        # threshold — reattaching `settings.threshold` here must go red.
-        dynamic_poll = PollEvent(
-            active={"number": 1, "email": "a@example.com"},
-            headroom={"1": 40.0},
-            threshold=90.0,
-            switch_bar=proactive_switch_bar_pct("dynamic", 90.0),
-        )
-        assert "switch at 97%" in dynamic_poll.human() and "90%" not in dynamic_poll.human()
+
+    def test_poll_event_under_dynamic_shows_the_derived_switch_bar(self, temp_home):
+        h = EngineHarness(temp_home, threshold=90.0, strategy="dynamic")
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage(60)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "switch at 97%" in poll.human()
 
     def test_below_threshold_detail_shows_fractional_threshold(self, temp_home):
         h = EngineHarness(temp_home, threshold=99.9, strategy="best")

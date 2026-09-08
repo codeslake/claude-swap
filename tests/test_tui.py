@@ -1728,10 +1728,8 @@ class TestAutoScreen:
             assert engine.applied_strategies == ["dynamic"]
             assert engine.wakes == 1  # a forced tick shows the new strategy
             assert "dynamic (session)" in summary.render().plain
-            # #321 follow-up: under `dynamic` the header's threshold number
-            # is the derived proactive bar (100 - SPENT_HEADROOM_PCT), never
-            # the raw 90% setting — reattaching it here must go red.
-            assert "threshold 97%" in summary.render().plain and "threshold 90%" not in summary.render().plain
+            assert "switch at 97%" in summary.render().plain
+            assert app.threshold_pct == 97.0
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "best"

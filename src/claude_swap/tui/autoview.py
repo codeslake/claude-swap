@@ -252,15 +252,17 @@ class AutoScreen(Screen):
         palette = Palette.from_theme(self.app.current_theme)
         text = Text()
         text.append("auto-switch · ")
-        bar = proactive_switch_bar_pct(
-            self._settings.strategy, self._settings.threshold
-        )
         text.append(
-            f"threshold {pct_label(bar)}%",
+            f"threshold {pct_label(self._settings.threshold)}%",
             style=palette.accent if self._adjusting else "",
         )
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
+        bar = proactive_switch_bar_pct(
+            self._settings.strategy, self._settings.threshold
+        )
+        if bar != self._settings.threshold:
+            text.append(f" · switch at {pct_label(bar)}%")
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
