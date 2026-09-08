@@ -809,7 +809,41 @@ class TestFetchAccountUsageSessionProfile:
 
         assert record.sentinel == USAGE_TOKEN_EXPIRED
         assert record.error is None
+        assert record.rejected_fp == oauth.access_token_fingerprint(session)
         assert switcher.read_account_credentials("2", "test@example.com") == backup
+
+    def test_stamped_session_credential_is_not_requested_again(self, temp_home: Path):
+        """Once refused, the same credential draws no request: the live
+        claude renews it, and only a rotated token is worth asking about."""
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        stamp = oauth.access_token_fingerprint(session)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup), stamp)
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_rotated_session_credential_after_a_stamp_is_requested(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session-2", 7200)
+        stamp = oauth.access_token_fingerprint(_oauth_creds("sk-session", 7200))
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 3}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup), stamp)
+
+        assert record.usage == {"five_hour": {"pct": 3}}
+        mock_fetch.assert_called_once()
 
     def test_live_session_without_profile_credentials_serves_backup_read_only(
         self, temp_home: Path
@@ -861,6 +895,45 @@ class TestFetchAccountUsageSessionProfile:
 
         assert record.sentinel == USAGE_TOKEN_EXPIRED
         assert record.error is None
+        assert record.rejected_fp == oauth.access_token_fingerprint(backup)
+
+    def test_stamped_backup_under_live_session_is_not_requested_again(
+        self, temp_home: Path
+    ):
+        switcher = ClaudeAccountSwitcher()
+        backup = _oauth_creds("sk-backup", 7200)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=None), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+            record = switcher._fetch_account_usage(
+                self._info(backup), oauth.access_token_fingerprint(backup)
+            )
+
+        assert record.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_not_called()
+
+    def test_refused_credential_is_requested_once_across_passes(self, temp_home: Path):
+        """The collect pass carries the stamp: a live session whose
+        credential the server refuses costs one request, not one per pass."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        info = self._info(backup)
+
+        with patch.object(switcher, "_live_session_pids", return_value=[123]), \
+             patch("claude_swap.session.read_session_credentials",
+                   return_value=session), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome(None, error="http-401")) as mock_fetch:
+            first = switcher._collect_usage_entries([info])["2"]
+            second = switcher._collect_usage_entries([info])["2"]
+
+        assert first.sentinel == USAGE_TOKEN_EXPIRED
+        assert second.sentinel == USAGE_TOKEN_EXPIRED
+        mock_fetch.assert_called_once()
 
     def test_live_session_other_errors_keep_their_identity(self, temp_home: Path):
         """A 429 is the account's budget, not the credential: it must keep
