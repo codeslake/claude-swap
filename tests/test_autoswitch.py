@@ -14911,13 +14911,16 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
         admission bar was `cold_switch_cost_pct` (20) applied ABSOLUTELY —
         so a genuine fleet-wide blackout held forever whenever every real
         candidate's unmodeled headroom happened to fall under 20, even one
-        holding more than twice the active's own reading. Active is walled
-        on Fable (raw model-gated headroom 0, `_about_to_wall`) but its own
+        holding many times the active's own reading. Active is walled on
+        Fable (raw model-gated headroom 0, `_about_to_wall`) but its own
         unmodeled 5h/7d floor is a real 5 (`_dynamic_active_headroom`
-        widens it to `dynamic-healthy`); #3's unmodeled floor is 12 — more
-        than double the active's — but the old absolute 20-point bar
-        refused it and the tick held `below-floor`/NO_ACTION forever
-        instead of landing there.
+        widens it to `dynamic-healthy`); #3's unmodeled floor is 60 — a
+        genuine rescue clearing both the relative margin over the active's
+        own reading AND the real cold-switch cost (`cold_switch_cost_pct`,
+        #321 follow-up) -- but the old absolute 20-point bar (applied with
+        no relative term at all) refused any reading under 20 outright and
+        the tick held `below-floor`/NO_ACTION forever instead of landing
+        there.
         """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
         for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
@@ -14925,13 +14928,14 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
         h.make_live("a1@example.invalid", 1)
         fleet = {
             "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
-            "3": self._u(0, 88, 100, days_out=3),  # unmodeled headroom 12
+            "3": self._u(0, 40, 100, days_out=3),  # unmodeled headroom 60
         }
         outcome = h.tick_with_usage(fleet)
         assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome!r} — #3 holds more than twice the active's own "
-            "unmodeled headroom (12 vs 5); an absolute floor must not "
-            "hold this fleet forever"
+            f"got {outcome!r} — #3 holds a genuine rescue (60 vs the "
+            "active's 5) clearing both the relative margin and the real "
+            "cold-switch cost; an absolute no-relative-term floor must "
+            "not hold this fleet forever"
         )
         assert h.active_number() == 3
 
@@ -14960,6 +14964,103 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             f"got {outcome!r} — #3's unmodeled headroom (20) is only 2 "
             "points above the active's own (18), well under the "
             "SPENT_HEADROOM_PCT churn margin; it must not be taken"
+        )
+        assert h.active_number() == 1
+
+    def test_a_warm_rescue_is_not_invisible_to_the_blackout_escape(
+        self, temp_home
+    ):
+        """[C]: the blackout escape only ever drew candidates from
+        `cold_ordered`, so a WARM peer whose unmodeled headroom clears the
+        relative bar but sits under the absolute `cold_switch_cost_pct`
+        (20) was invisible to it -- `partner` (only sees warm at >= 20)
+        refuses it too, and the tick held `below-threshold`/NO_ACTION even
+        though #3 holds more than double the active's own unmodeled
+        headroom, warm, right now. Held up to an hour, and the engine
+        would then take #3 the moment it goes COLD -- refusing the cheap
+        rescue and buying the expensive one.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"3": h.clock.now - 600.0})
+        )
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
+            "3": self._u(0, 88, 100, days_out=3),  # warm, unmodeled headroom 12
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3 is a WARM rescue holding more than "
+            "double the active's own unmodeled headroom; the escape must "
+            "not be blind to a warm candidate merely because it sits "
+            "under the absolute cold-switch bar"
+        )
+        assert h.active_number() == 3
+
+    def test_a_warm_partner_does_not_veto_an_immediate_walled_escape(
+        self, temp_home
+    ):
+        """[I]: `if partner is None and _about_to_wall(...)` skipped the
+        walled escape entirely whenever ANY warm peer cleared the ordinary
+        `cold_switch_cost_pct` (20) bar -- even when the active is
+        genuinely walled RIGHT NOW. Control then fell to the plain
+        partner/dwell path, which held for a full `alternation_chunk_
+        seconds` (600s) before taking the very candidate the escape would
+        have picked immediately. A partner's existence is a ranking fact,
+        never a veto on an urgent escape.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "b@example.invalid"), (2, "a@example.invalid")):
+            h.seed(num, email)
+        h.make_live("b@example.invalid", 1)
+        t0 = h.clock.now
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"1": t0, "2": t0})
+        )
+        h.clock.advance(60.0)
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # B, active: unmodeled headroom 5
+            "2": self._u(0, 40, 100, days_out=4),  # A, warm: unmodeled headroom 60
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — the active is walled right now (raw "
+            "headroom 0) and an admissible warm partner exists; the "
+            "escape must fire immediately, not wait out a 600s dwell"
+        )
+        assert h.active_number() == 2
+
+    def test_the_blackout_bar_never_drops_below_the_real_switch_cost(
+        self, temp_home
+    ):
+        """[I]: `_blackout_retry_admission_bar` was `floor_headroom[current]
+        + SPENT_HEADROOM_PCT` with no floor of its own -- so as the
+        active's own unmodeled reading gets smaller, the bar for a COLD
+        candidate (which genuinely costs ~19 5h-points to land on,
+        settings.py's own `cold_switch_cost_pct`) shrinks with it. Active
+        at unmodeled 5, #3 COLD at unmodeled 15 (7d 85%, still below the
+        90% threshold so it reads model-only-walled, not exhausted)
+        cleared the old relative-only bar (8) for a nominal gain of 10
+        against a real cold-switch cost of ~19 -- a net loss the escape
+        must refuse.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
+            "3": self._u(0, 85, 100, days_out=3),  # cold: unmodeled headroom 15
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3's unmodeled headroom (15) clears the "
+            "old relative-only bar (8) but not the real cold-switch cost "
+            "(~19-worth, `cold_switch_cost_pct`); a cold escapee must "
+            "clear both"
         )
         assert h.active_number() == 1
 
@@ -15062,18 +15163,22 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
             "no account in this roster is model-only-walled once #3's 7d "
             "is spent too — the predicate must not fire"
         )
-        # #8's empty window list short-circuits `_model_window_binds_
-        # everywhere` (`continue` on no windows) before the rest of the
-        # roster is even read, so the assertion above reads False on BOTH
-        # a fixed and a broken predicate, for different reasons, and
-        # cannot discriminate them. Dropping #8 forces the verdict to come
-        # from the roster itself (every real account is "full") — it must
-        # read the SAME False, or the assertion above was never testing
-        # what its name claims.
+        # #8 is skipped via a plain `continue`, never a `return` -- it
+        # costs the loop nothing about the rest of the roster, before or
+        # after it in iteration order. This assertion does not discriminate
+        # the fix from the pre-fix predicate: with no genuine model-only
+        # wall left in the roster, BOTH read False whether #8 is present or
+        # not, since #8 sits last in this fixture's iteration order and
+        # nothing earlier in the roster sets the verdict either way. It
+        # only pins that dropping #8 from an already-open roster is a
+        # no-op. The discriminating case -- #8 sitting where its old
+        # "read as open" behaviour would have masked a REAL model-only
+        # wall -- is this class's `test_a_spend_only_account_cannot_
+        # disarm_the_predicate`'s `with_8 is True` assertion.
         without_8 = {k: v for k, v in usage.items() if k != "8"}
         assert _model_window_binds_everywhere(without_8, ("Fable",), 90.0) is False, (
-            "with #8 removed the verdict must still come from the "
-            "roster's own windows, not from #8's short-circuit"
+            "dropping #8 from an already-open roster must not change the "
+            "verdict"
         )
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
         for num, email in (

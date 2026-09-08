@@ -234,8 +234,13 @@ def _rank_dynamic_candidates(
     candidate, warm or cold, is filtered here at ``SPENT_HEADROOM_PCT``
     (the `peer_can_serve` idiom `_rank_candidates_pass` already uses for the
     same question) — item 3b's floor (`cold_switch_cost_pct`) is a
-    separate, HIGHER bar the caller applies on top, since it differs
-    between a walled admission and an alternation partner: a bare
+    separate, HIGHER bar the caller applies on top for an ORDINARY cold
+    admission (a walled candidate against a still-healthy active, or an
+    alternation partner). NOT true once `model_window_dropped` fires
+    (#321): there the caller's bar is `_blackout_retry_admission_bar`'s
+    relative margin over what the active already reads on this axis,
+    because the question is a genuine rescue against a dead active, not an
+    ordinary departure — a bare
     ``headroom > 0`` let the no-return bar's own
     "barred list is empty and the account recovered [on the RESET axis, not
     headroom] — retry unbarred" fallback re-admit a candidate sitting at the
@@ -260,7 +265,9 @@ def _rank_dynamic_candidates(
 
 
 def _blackout_retry_admission_bar(
-    floor_headroom: dict[str, float | None], current: str
+    floor_headroom: dict[str, float | None],
+    current: str,
+    cold_floor: float | None = None,
 ) -> float:
     """The candidate admission bar once ``dynamic``'s unmodeled-retry has
     legitimately dropped the model set for ranking (#321), shared by the
@@ -268,15 +275,26 @@ def _blackout_retry_admission_bar(
     walled-escape admission -- the SAME retry, the same question, in both
     places it is asked.
 
-    An ABSOLUTE bar cannot answer it: 12% unmodeled headroom is a real
-    rescue against an active genuinely pinned at 5%, and worthless noise
-    against one already holding 60% (both routed through this retry, only
-    one is a genuine improvement). The bar is therefore a margin over what
-    the active ALREADY reads on this same axis -- ``SPENT_HEADROOM_PCT``,
-    the same churn margin `_rank_dynamic_candidates` already applies to
-    drop a candidate with nothing worth taking.
+    An ABSOLUTE bar cannot answer it on its own: 12% unmodeled headroom is
+    a real rescue against an active genuinely pinned at 5%, and worthless
+    noise against one already holding 60% (both routed through this
+    retry, only one is a genuine improvement). So the bar is, first, a
+    margin over what the active ALREADY reads on this same axis --
+    ``SPENT_HEADROOM_PCT``, the same churn margin `_rank_dynamic_
+    candidates` already applies to drop a candidate with nothing worth
+    taking.
+
+    ``cold_floor``, passed only for a COLD candidate (never a warm one --
+    a warm switch has no re-write cost to price), also floors the bar at
+    ``settings.cold_switch_cost_pct``: that constant prices the real cost
+    of a cold landing (~19 5h-points, settings.py), which does not shrink
+    just because the active's own reading is low. Without it, a chain of
+    cold rewrites each barely clearing the PREVIOUS active's margin nets
+    a real loss every time it fires, however small the active's own
+    reading gets.
     """
-    return floor_headroom.get(current, 0.0) + SPENT_HEADROOM_PCT
+    relative = floor_headroom.get(current, 0.0) + SPENT_HEADROOM_PCT
+    return max(relative, cold_floor) if cold_floor is not None else relative
 
 
 def candidate_usage_is_stale(entry: UsageEntry | None, now: float) -> bool:
@@ -1916,7 +1934,13 @@ class AutoSwitchEngine:
         # through it) — item 3's floor is an ABSOLUTE bar, not a margin, so
         # it replaces that gate rather than layering onto it. `at-limit`/
         # `failover` keep the unchanged function entirely (their own
-        # trigger literals never reach this block).
+        # trigger literals never reach this block). NOT true once
+        # `model_window_dropped` fires below (#321): on that path the
+        # floor becomes `_blackout_retry_admission_bar`'s RELATIVE margin
+        # (plus a cold-only absolute floor) over what the active already
+        # reads on the unmodeled axis, precisely because the question there
+        # is a genuine rescue against a dead active, not an ordinary
+        # departure from a healthy one.
         #
         # `_no_return_account` applies here exactly as `_rank`'s own
         # closure applies it: rank with the account just left barred, and
@@ -2093,11 +2117,16 @@ class AutoSwitchEngine:
             # model this host actually runs. Correct for trigger
             # classification; wrong for "is it fine to keep sitting here",
             # which is what decides whether to hold for warmth or escape.
-            # Fires only when the alternation arm found no warm partner AND
-            # the active is genuinely at its own wall — never a veto on a
-            # warm pick, never taken while the active has real room. Lands
-            # on whichever admissible candidate (real headroom, no fixed
-            # percentage line) recovers soonest, cold or warm alike.
+            # Fires whenever the active is genuinely at its own wall —
+            # `partner` is a RANKING fact folded into the one candidate
+            # list below, never a veto that defers an urgent escape to the
+            # ordinary dwell/alternation path (measured: a warm partner
+            # clearing the ordinary `cold_switch_cost_pct` bar held a
+            # genuinely-walled-right-now active for a full `alternation_
+            # chunk_seconds` before taking the very candidate this escape
+            # would have picked immediately). Lands on whichever admissible
+            # candidate (real headroom, no fixed percentage line) recovers
+            # soonest, cold or warm alike.
             #
             # `headroom` (never `floor_headroom`), so a candidate blocked on
             # the SAME model window as the active — no real improvement,
@@ -2125,28 +2154,39 @@ class AutoSwitchEngine:
                 and floor_headroom.get(current, 0.0) < settings.cold_switch_cost_pct
             )
             walled_escape = None
-            if partner is None and _about_to_wall(raw_active_headroom):
+            if _about_to_wall(raw_active_headroom):
                 if blackout_escape:
-                    # Relative, not `cold_switch_cost_pct` (#321): an
-                    # absolute bar held a genuine fleet-wide blackout
-                    # forever whenever every real candidate's unmodeled
-                    # headroom happened to fall under it, even one holding
-                    # more than twice the active's own reading (measured:
-                    # 12% refused against an active pinned at 5%). The
-                    # question here is only whether a candidate is a real
-                    # improvement over what the active ALREADY reads on
-                    # this same axis — see `_blackout_retry_admission_bar`.
-                    bar = _blackout_retry_admission_bar(floor_headroom, current)
-                    escape_candidates = (
-                        n for n in cold_ordered
-                        if floor_headroom.get(n, 0.0) > bar
+                    # ONE list, warm and cold together — never `cold_
+                    # ordered` alone (that left a WARM rescue invisible to
+                    # this escape whenever its unmodeled headroom sat under
+                    # `cold_switch_cost_pct`, and `partner`, above, only
+                    # ever looks at warm; a candidate in that gap was
+                    # refused by both). Warm carries no re-write cost, so
+                    # it clears the plain relative margin
+                    # (`_blackout_retry_admission_bar`, #321); a COLD
+                    # candidate still pays `cold_switch_cost_pct` to land
+                    # and must ALSO clear that absolute floor, or a chain
+                    # of merely-relative cold rewrites nets a real loss
+                    # every time it fires (measured: three consecutive
+                    # such rewrites netting +10.5 points of nominal
+                    # headroom for roughly 57 points of real switch cost).
+                    warm_bar = _blackout_retry_admission_bar(floor_headroom, current)
+                    cold_bar = _blackout_retry_admission_bar(
+                        floor_headroom, current, settings.cold_switch_cost_pct
                     )
+                    escape_candidates = [
+                        n for n in warm_ordered
+                        if floor_headroom.get(n, 0.0) > warm_bar
+                    ] + [
+                        n for n in cold_ordered
+                        if floor_headroom.get(n, 0.0) > cold_bar
+                    ]
                 else:
-                    escape_candidates = (
+                    escape_candidates = [
                         n for n in oauth_candidates
                         if (h := headroom.get(n)) is not None
                         and h > SPENT_HEADROOM_PCT
-                    )
+                    ]
                 escapees = sorted(
                     escape_candidates,
                     # Soonest-reset first; warmth only breaks an exact tie
