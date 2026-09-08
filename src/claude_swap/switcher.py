@@ -42,6 +42,7 @@ from claude_swap.json_output import (
     account_ref,
     account_row,
     last_good_usage_fields,
+    usage_failure_fields,
     usage_fields,
     usage_freshness_fields,
 )
@@ -5799,6 +5800,7 @@ class ClaudeAccountSwitcher:
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
+        now = self._usage_store.clock()
         for num, email, org_name, org_uuid, is_active, _, alias in accounts_info:
             if is_active:
                 active_num = num
@@ -5814,6 +5816,10 @@ class ClaudeAccountSwitcher:
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
                     last_good_usage=entry.last_good,
+                    last_error=entry.last_error,
+                    backoff_until=(
+                        entry.backoff_until if entry.in_backoff(now) else None
+                    ),
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                 )
@@ -6001,6 +6007,11 @@ class ClaudeAccountSwitcher:
                     entry.last_good, entry.fetched_at, entry.age_s
                 )
             )
+            now = self._usage_store.clock()
+            active.update(usage_failure_fields(
+                status, entry.last_error,
+                entry.backoff_until if entry.in_backoff(now) else None,
+            ))
         return {
             "schemaVersion": SCHEMA_VERSION,
             "active": active,
