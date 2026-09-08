@@ -140,7 +140,8 @@ def usage_fields(
     A collected entry is one of: a usage dict, the ``USAGE_TOKEN_EXPIRED`` sentinel
     (active token expired and the refresh was deferred this pass — lock
     contention, unattributable lineage, or a failed persist; retried
-    automatically), the ``USAGE_API_KEY`` sentinel
+    automatically — or a live session's credential refused, which only that
+    session may renew), the ``USAGE_API_KEY`` sentinel
     (managed API-key account, no subscription quota), the
     ``USAGE_KEYCHAIN_UNAVAILABLE`` sentinel (active Keychain unreadable), the
     ``USAGE_FOREIGN_CREDENTIAL`` sentinel (live credential proven to belong to

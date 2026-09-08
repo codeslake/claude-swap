@@ -63,6 +63,16 @@ def credential_fingerprint(credentials: str) -> str | None:
     return "sha256-full:" + hashlib.sha256(credentials.encode()).hexdigest()
 
 
+def access_token_fingerprint(credentials: str) -> str | None:
+    """Hash of the access token alone: the part that rotates within a
+    lineage, so a refused token and its replacement compare unequal."""
+    data = extract_oauth_data(credentials)
+    token = data.get("accessToken") if data else None
+    if not isinstance(token, str) or not token:
+        return None
+    return "sha256-at:" + hashlib.sha256(token.encode()).hexdigest()
+
+
 def login_expires_at_iso(credentials: str) -> str | None:
     """When the stored *login* itself lapses, as ISO-8601 UTC, or ``None``.
 
