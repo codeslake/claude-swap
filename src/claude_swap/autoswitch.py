@@ -995,6 +995,15 @@ def _model_window_binds_everywhere(
     2026-09-07: a fleet stuck switching onto, and then pinned on, a
     Fable-100% wall while a real Fable-82% candidate sat idle) is what
     happens when they don't.
+
+    An account with NO readable 5h/7d window at all — an unreadable fetch,
+    or a spend-only credit slot — is SKIPPED, never read as "open":
+    ``classify_candidate_block([], threshold)`` returns ``"open"`` for that
+    empty window list exactly as it would for a genuinely open account, so
+    one such account in the fleet silently disarmed this predicate for
+    every genuinely model-only-walled account (measured 2026-09-08: a
+    spend-only slot #8 held `all accounts exhausted` while a real Fable
+    candidate's 5h/7d sat open).
     """
     if not models:
         return False
@@ -1006,6 +1015,8 @@ def _model_window_binds_everywhere(
                 value if isinstance(value, dict) else None, models
             )
         ]
+        if not windows:
+            continue
         outcome, _ = classify_candidate_block(windows, threshold)
         if outcome == "open":
             return False
@@ -1930,6 +1941,7 @@ class AutoSwitchEngine:
                 oauth_candidates, headroom, now, active_headroom,
             )
             floor_headroom = headroom
+            model_window_dropped = False
             if (
                 not warm_ordered
                 and not cold_ordered
@@ -1949,13 +1961,25 @@ class AutoSwitchEngine:
                     oauth_candidates, unmodeled, now, unmodeled.get(current),
                 )
                 floor_headroom = unmodeled
+                model_window_dropped = True
             # Item 3b/3c: cold admissible only past the floor, and never
             # below it here — item 3c reserves a below-floor cold candidate
             # for the at-limit/failover escape, which never sets this
-            # trigger.
+            # trigger. ONLY on the unmodeled-retry path above
+            # (`model_window_dropped`), the floor drops to
+            # `SPENT_HEADROOM_PCT`: `cold_switch_cost_pct` is priced for an
+            # ordinary cold switch away from a healthy active, but here the
+            # active is genuinely fleet-wide model-walled with nothing
+            # better to hold out for — refusing a real, merely-modest
+            # unmodeled candidate (owner specimen: #3 at 12%) and sleeping
+            # ten minutes instead is worse than landing on it (measured
+            # 2026-09-08). Never widens the ordinary (non-retry) floor.
+            cold_floor = (
+                SPENT_HEADROOM_PCT if model_window_dropped else settings.cold_switch_cost_pct
+            )
             dynamic_ordered = warm_ordered + [
                 n for n in cold_ordered
-                if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                if floor_headroom.get(n, 0.0) >= cold_floor
             ]
             if not dynamic_ordered and cold_ordered:
                 # Real headroom exists but none of it clears the floor
@@ -1966,8 +1990,7 @@ class AutoSwitchEngine:
                         reason="below-floor",
                         detail=(
                             f"{len(cold_ordered)} cold candidate(s) below "
-                            f"the {pct_label(settings.cold_switch_cost_pct)}% "
-                            "floor"
+                            f"the {pct_label(cold_floor)}% floor"
                         ),
                     )
                 )

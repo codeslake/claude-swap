@@ -14904,3 +14904,118 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "admissible escapee by recovery time must be reached"
         )
 
+
+
+class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
+    """The 2026-09-08 01:45Z specimen (owner): active #2 reads 97% used
+    (headroom 3, `proactive` trigger). Every real peer is ALSO blocked —
+    #1/#4/#5/#6/#7 on 5h/7d itself, #3 on Fable alone (5h 43%/7d 88%, real
+    unmodeled headroom 12) — and #8 is spend-only (no 5h/7d/model window at
+    all). `_model_window_binds_everywhere` folded #8's empty window list
+    into the SAME "open" outcome a genuinely-open account produces
+    (`classify_candidate_block([], threshold)` always returns "open"), so
+    one unreadable/spend-only account in the fleet disarmed the retry for
+    every genuinely model-only-walled account, `all accounts exhausted`
+    fired with Opus (the 5h/7d axis) open on #3 the whole time, and the
+    engine slept ten minutes instead of landing there.
+    """
+
+    @staticmethod
+    def _u(five_h, seven_d, fable, days_out=3):
+        now = 1_000_000.0
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": seven_d, "resets_at": _iso_at(now + days_out * 86400)},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    @staticmethod
+    def _spend_only():
+        # A credit (pay-as-you-go) slot: no five_hour/seven_day/scoped keys
+        # at all, exactly the shape `oauth.relevant_windows` reads as "no
+        # window to report" (`test_a_spend_only_account_prints_its_credit_
+        # figure_not_a_bare_mark` pins the same shape at the panel layer).
+        return {"spend": {"pct": 10.0, "used": 1.0, "limit": 10.0}}
+
+    def _specimen_usage(self, *, account_3_seven_day=88):
+        return {
+            "2": self._u(97, 50, 50, days_out=3),  # active: headroom 3, proactive
+            "1": self._u(0, 100, 92, days_out=4),
+            "3": self._u(43, account_3_seven_day, 100, days_out=2),
+            "4": self._u(34, 93, 100, days_out=4),
+            "5": self._u(0, 100, 100, days_out=4),
+            "6": self._u(0, 100, 90, days_out=4),
+            "7": self._u(100, 20, 10, days_out=5),
+            "8": self._spend_only(),
+        }
+
+    def test_the_owners_specimen_switches_to_3(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (2, "a2@example.invalid"), (1, "a1@example.invalid"),
+            (3, "a3@example.invalid"), (4, "a4@example.invalid"),
+            (5, "a5@example.invalid"), (6, "a6@example.invalid"),
+            (7, "a7@example.invalid"), (8, "a8@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a2@example.invalid", 2)
+        fleet = self._specimen_usage()
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3 is open on the unmodeled (5h/7d) axis "
+            "(12% headroom) and the spend-only #8 must not disarm the "
+            "fleet-wide-blackout retry that would rescue it; events="
+            f"{[e.kind for e in h.events]}"
+        )
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} instead of #3 — the only "
+            "account with real 5h/7d headroom once the Fable wall is "
+            "correctly dropped fleet-wide"
+        )
+
+    def test_a_spend_only_account_cannot_disarm_the_predicate(self, temp_home):
+        """The predicate, pinned on its own: with #8 present in the fleet
+        it must read exactly as it would with #8 removed — an unreadable
+        or spend-only account carries no window to be "open" on."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = self._specimen_usage()
+        with_8 = _model_window_binds_everywhere(usage, ("Fable",), 90.0)
+        without_8 = _model_window_binds_everywhere(
+            {k: v for k, v in usage.items() if k != "8"}, ("Fable",), 90.0
+        )
+        assert with_8 is True, (
+            "a spend-only account (#8) must not disarm the predicate — "
+            f"got {with_8!r} with #8 present, {without_8!r} without it"
+        )
+        assert without_8 is True
+
+    def test_control_no_model_only_wall_left_reads_false_and_invents_nothing(
+        self, temp_home
+    ):
+        """Same roster, but #3's 7d is bumped to 100 too — no account is
+        model-only-walled any more (every real account is "full", #8 is
+        spend-only). The predicate must correctly read False, and the
+        engine must not manufacture a landing that was never there."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = self._specimen_usage(account_3_seven_day=100)
+        assert _model_window_binds_everywhere(usage, ("Fable",), 90.0) is False, (
+            "no account in this roster is model-only-walled once #3's 7d "
+            "is spent too — the predicate must not fire"
+        )
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (2, "a2@example.invalid"), (1, "a1@example.invalid"),
+            (3, "a3@example.invalid"), (4, "a4@example.invalid"),
+            (5, "a5@example.invalid"), (6, "a6@example.invalid"),
+            (7, "a7@example.invalid"), (8, "a8@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a2@example.invalid", 2)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — with no genuine model-only wall left in "
+            "the roster the retry must not fire and the engine must not "
+            "invent a candidate"
+        )
