@@ -14904,40 +14904,45 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "admissible escapee by recovery time must be reached"
         )
 
-    def test_an_absolute_floor_never_holds_a_real_rescue_forever(
+    def test_a_relative_margin_above_the_cold_floor_still_governs_admission(
         self, temp_home
     ):
-        """[C], the 396/375 round's correctness gate: the walled-escape's
-        admission bar was `cold_switch_cost_pct` (20) applied ABSOLUTELY —
-        so a genuine fleet-wide blackout held forever whenever every real
-        candidate's unmodeled headroom happened to fall under 20, even one
-        holding many times the active's own reading. Active is walled on
-        Fable (raw model-gated headroom 0, `_about_to_wall`) but its own
-        unmodeled 5h/7d floor is a real 5 (`_dynamic_active_headroom`
-        widens it to `dynamic-healthy`); #3's unmodeled floor is 60 — a
-        genuine rescue clearing both the relative margin over the active's
-        own reading AND the real cold-switch cost (`cold_switch_cost_pct`,
-        #321 follow-up) -- but the old absolute 20-point bar (applied with
-        no relative term at all) refused any reading under 20 outright and
-        the tick held `below-floor`/NO_ACTION forever instead of landing
-        there.
+        """[I2]: this test (formerly ``test_an_absolute_floor_never_holds_
+        a_real_rescue_forever``) pinned its subject with a candidate at
+        unmodeled 60 -- nowhere near the absolute `cold_switch_cost_pct`
+        (20) floor either bar could produce, so it passed unchanged
+        whether or not `_blackout_retry_admission_bar`'s RELATIVE term
+        (`floor_headroom[current] + SPENT_HEADROOM_PCT`) was even applied
+        to a cold candidate at all; it could no longer fail for its
+        stated subject once `cold_floor` shipped. `max(relative,
+        cold_floor)`'s relative half only ever BINDS (exceeds the
+        absolute 20) when the active's own unmodeled headroom is in
+        `[17, 20)` -- below 17 the absolute 20 wins outright, at or above
+        20 `blackout_escape` itself disarms. Active at 18 puts the bar at
+        21 (relative, strictly above the absolute floor): #3 at 20.5
+        clears the absolute floor alone but not the actual (relative)
+        bar, and must still be refused -- proving the relative term, not
+        just the absolute 20, decides admission in this band. (A genuine
+        cold rescue clearing BOTH bars stays pinned by
+        ``test_f7_dynamic_healthy_arm_retries_a_true_fleet_wide_
+        blackout``.)
         """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
         for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
             h.seed(num, email)
         h.make_live("a1@example.invalid", 1)
         fleet = {
-            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
-            "3": self._u(0, 40, 100, days_out=3),  # unmodeled headroom 60
+            "1": self._u(0, 82, 100, days_out=4),    # active: unmodeled headroom 18
+            "3": self._u(0, 79.5, 100, days_out=3),  # cold: unmodeled headroom 20.5
         }
         outcome = h.tick_with_usage(fleet)
-        assert outcome is TickOutcome.SWITCHED, (
-            f"got {outcome!r} — #3 holds a genuine rescue (60 vs the "
-            "active's 5) clearing both the relative margin and the real "
-            "cold-switch cost; an absolute no-relative-term floor must "
-            "not hold this fleet forever"
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3's unmodeled headroom (20.5) clears "
+            "the absolute cold floor (20) but not the relative bar "
+            "(active 18 + SPENT_HEADROOM_PCT = 21); the relative term "
+            "must still govern admission in this band"
         )
-        assert h.active_number() == 3
+        assert h.active_number() == 1
 
     def test_a_peer_barely_above_the_active_is_still_not_an_escape(
         self, temp_home
@@ -15063,6 +15068,53 @@ class TestBoundedWalledEscapeUnderDynamicHealthy:
             "clear both"
         )
         assert h.active_number() == 1
+
+    def test_the_non_blackout_escape_still_prices_a_cold_landing(
+        self, temp_home
+    ):
+        """[I1]: the `_about_to_wall(raw_active_headroom)`-alone gate
+        (#321's collapse) also widened THIS branch's reach -- the plain
+        `_about_to_wall`/`SPENT_HEADROOM_PCT` escape that fires when
+        `blackout_escape` is False (no genuine fleet-wide model blackout,
+        `model_window_dropped` stays False because the model-gated ranking
+        already has a warm candidate). That branch has no cold cost term
+        at all, so a cold candidate whose binding window merely resets
+        SOONER can be taken over a qualified warm partner, paying the
+        real `cold_switch_cost_pct` rewrite for nothing. Active #1 is
+        walled on Fable right now (model-gated headroom 0); #2 is a warm
+        partner at model-gated headroom 25; #3 is a COLD peer at
+        model-gated headroom 15 -- below `cold_switch_cost_pct` (20) --
+        whose own Fable window happens to reset in an hour, while #2's has
+        no known reset at all. The old code sorted purely on recovery
+        time and landed on #3; a cold escapee must clear the cold-switch
+        floor too, same as the blackout escape already requires.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=70.0, strategy="dynamic")
+        for num, email in (
+            (1, "a1@example.invalid"), (2, "a2@example.invalid"),
+            (3, "a3@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"2": h.clock.now - 600.0})
+        )
+        fleet = {
+            "1": self._u(30, 40, 100, days_out=4),  # active: model-gated headroom 0
+            "2": self._u(20, 25, 75, days_out=4),   # warm: model-gated headroom 25
+            "3": self._u(5, 10, 85, days_out=3, fable_resets=3600),  # cold: headroom 15
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a walled active with a qualified warm "
+            "partner must escape"
+        )
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — #3's headroom (15) is below "
+            "the real cold-switch cost (20) and must not be taken over "
+            "the qualified warm partner (#2) merely because it resets "
+            "sooner"
+        )
 
 
 class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:

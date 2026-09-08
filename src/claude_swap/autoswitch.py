@@ -238,9 +238,10 @@ def _rank_dynamic_candidates(
     admission (a walled candidate against a still-healthy active, or an
     alternation partner). NOT true once `model_window_dropped` fires
     (#321): there the caller's bar is `_blackout_retry_admission_bar`'s
-    relative margin over what the active already reads on this axis,
-    because the question is a genuine rescue against a dead active, not an
-    ordinary departure — a bare
+    relative margin over what the active already reads on this axis (a
+    cold candidate ALSO still floored at `cold_switch_cost_pct`, never
+    lower — see that function's own docstring), because the question is a
+    genuine rescue against a dead active, not an ordinary departure — a bare
     ``headroom > 0`` let the no-return bar's own
     "barred list is empty and the account recovered [on the RESET axis, not
     headroom] — retry unbarred" fallback re-admit a candidate sitting at the
@@ -1937,10 +1938,19 @@ class AutoSwitchEngine:
         # trigger literals never reach this block). NOT true once
         # `model_window_dropped` fires below (#321): on that path the
         # floor becomes `_blackout_retry_admission_bar`'s RELATIVE margin
-        # (plus a cold-only absolute floor) over what the active already
-        # reads on the unmodeled axis, precisely because the question there
-        # is a genuine rescue against a dead active, not an ordinary
-        # departure from a healthy one.
+        # over what the active already reads on the unmodeled axis,
+        # precisely because the question there is a genuine rescue against
+        # a dead active, not an ordinary departure from a healthy one.
+        # Deliberately no `cold_floor` at this call site (below, #321
+        # follow-up), unlike the dynamic-healthy arm's own cold bucket: the
+        # `proactive` trigger is only reachable at a widened active headroom
+        # in `(0, SPENT_HEADROOM_PCT]`, where staying put is not an
+        # alternative — there is nothing to price a real cold-switch cost
+        # against, and a literal `cold_switch_cost_pct` floor here refuses
+        # the owner's own pinned rescue
+        # (`test_the_owners_specimen_switches_to_3`, #3 at unmodeled 12
+        # against an active at 3: `max(3 + 3, 20) = 20` would hold it
+        # forever). A next author "restoring" it here breaks that test.
         #
         # `_no_return_account` applies here exactly as `_rank`'s own
         # closure applies it: rank with the account just left barred, and
@@ -2081,6 +2091,16 @@ class AutoSwitchEngine:
                 oauth_candidates, headroom, usage, now, last_active_at,
                 settings.cache_ttl_seconds,
             )
+            # Kept alongside `warm_ordered`/`cold_ordered` (which the
+            # retry below may re-rank on the UNMODELED axis): the
+            # non-blackout escape (below, `else`) must stay on the
+            # model-gated axis regardless of whether the retry fires --
+            # same reason `headroom` (never `floor_headroom`) is used
+            # there, so a candidate blocked on the SAME dropped model
+            # window as the active is never mistaken for an escape when
+            # the active still holds real unmodeled headroom of its own
+            # (`blackout_escape` False despite `model_window_dropped`).
+            model_gated_warm, model_gated_cold = warm_ordered, cold_ordered
             floor_headroom = headroom
             model_window_dropped = False
             if (
@@ -2118,15 +2138,18 @@ class AutoSwitchEngine:
             # classification; wrong for "is it fine to keep sitting here",
             # which is what decides whether to hold for warmth or escape.
             # Fires whenever the active is genuinely at its own wall —
-            # `partner` is a RANKING fact folded into the one candidate
-            # list below, never a veto that defers an urgent escape to the
-            # ordinary dwell/alternation path (measured: a warm partner
-            # clearing the ordinary `cold_switch_cost_pct` bar held a
-            # genuinely-walled-right-now active for a full `alternation_
+            # `partner`'s existence is no longer a VETO on this escape gate
+            # (the collapse removed it from here only, measured: a warm
+            # partner clearing the ordinary `cold_switch_cost_pct` bar held
+            # a genuinely-walled-right-now active for a full `alternation_
             # chunk_seconds` before taking the very candidate this escape
-            # would have picked immediately). Lands on whichever admissible
-            # candidate (real headroom, no fixed percentage line) recovers
-            # soonest, cold or warm alike.
+            # would have picked immediately). It is still a hard gate on
+            # the ordinary dwell/alternation branch below (`elif partner is
+            # None or ...`) -- an admissible warm partner not yet dwelt on
+            # still holds there; only THIS escape, urgent by definition,
+            # bypasses it. Lands on whichever admissible candidate (real
+            # headroom, no fixed percentage line) recovers soonest, cold or
+            # warm alike.
             #
             # `headroom` (never `floor_headroom`), so a candidate blocked on
             # the SAME model window as the active — no real improvement,
@@ -2178,14 +2201,48 @@ class AutoSwitchEngine:
                         n for n in warm_ordered
                         if floor_headroom.get(n, 0.0) > warm_bar
                     ] + [
+                        # `>=`, matching every other plain
+                        # `cold_switch_cost_pct` comparison in this file
+                        # (:2038, :2109, :2224/the reason label below) --
+                        # a strict `>` here disagreed with the reason
+                        # label about a candidate sitting at exactly the
+                        # floor (measured: active unmodeled 5, a cold peer
+                        # at exactly 20.0 -- the escape refused it while
+                        # the label below called it "cold" [clearing the
+                        # floor, merely dwelling]).
                         n for n in cold_ordered
-                        if floor_headroom.get(n, 0.0) > cold_bar
+                        if floor_headroom.get(n, 0.0) >= cold_bar
                     ]
                 else:
-                    escape_candidates = [
-                        n for n in oauth_candidates
-                        if (h := headroom.get(n)) is not None
-                        and h > SPENT_HEADROOM_PCT
+                    # I1: the widened `_about_to_wall`-alone gate above
+                    # also widened THIS branch's reach (no genuine
+                    # fleet-wide blackout, `blackout_escape` False) — it
+                    # had no cold cost term at all, so a cold candidate
+                    # merely resetting sooner could be taken over a
+                    # QUALIFIED warm partner, paying the real
+                    # `cold_switch_cost_pct` rewrite for nothing.
+                    # `model_gated_warm`/`model_gated_cold`, not
+                    # `warm_ordered`/`cold_ordered`/`partner` (which can
+                    # be re-ranked on the UNMODELED axis by the retry
+                    # above): this escape stays on `headroom` always, same
+                    # as the rest of this branch. Only gated on a
+                    # qualified warm alternative's existence, never an
+                    # absolute floor on its own: with none (the #403
+                    # owner specimen — every peer cold, none clearing the
+                    # ordinary bar) this is still the rescue of last
+                    # resort and must admit whatever cold headroom is
+                    # real rather than hold a dead account forever.
+                    model_gated_partner = next(
+                        (
+                            n for n in model_gated_warm
+                            if headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
+                        ),
+                        None,
+                    )
+                    escape_candidates = model_gated_warm + [
+                        n for n in model_gated_cold
+                        if model_gated_partner is None
+                        or headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
                     ]
                 escapees = sorted(
                     escape_candidates,
