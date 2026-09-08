@@ -426,15 +426,38 @@ _WRAPPER_BODIES = {"_write_account_credentials", "write_account_credentials"}
 #   the source slot is never deleted). NOT admitted with attributed=True: it is a write
 #   taken from inside a read that the write path's own verification reaches, so PR 286
 #   suppresses it for a verification read (CredentialStore._in_attribution_read).
+#
+#   switcher.py::_register_login_as_new_slot/_adopt_login_into_slot/
+#   _adopt_stashed_login_for_slot/_adopt_into_dead_slot — PR 199's bare-login-heals-
+#   its-slot engine tick, in functions this round never saw. Each writes only after
+#   independently matching the live login's identity against the roster (the
+#   `attributed=True` comment at each call site names which read established it) —
+#   admitted with attributed=True.
 CROSS_PR_WRITE_SITES: dict[tuple[str, str], int] = {
     ("credentials.py", "_read_account_credentials"): 1,
+    ("switcher.py", "_register_login_as_new_slot"): 1,
+    ("switcher.py", "_adopt_login_into_slot"): 1,
+    ("switcher.py", "_adopt_stashed_login_for_slot"): 1,
+    ("switcher.py", "_adopt_into_dead_slot"): 1,
+}
+
+# A SECOND call PR 199 added inside a function this round DID review
+# (_fetch_active_usage, reviewed at count 2 above): the retry six lines below its
+# sibling write, both already carrying attributed=True (see switcher.py). Keyed
+# separately from CROSS_PR_WRITE_SITES, which is asserted disjoint from the
+# reviewed roster below, and ADDED to that key's count rather than replacing it —
+# an override could silently absorb an unreviewed second write; addition cannot.
+CROSS_PR_WRITE_SITE_DELTAS: dict[tuple[str, str], int] = {
+    ("switcher.py", "_fetch_active_usage"): 1,
 }
 
 # The union below (`{**EXPECTED_WRITE_SITE_ROSTER, **CROSS_PR_WRITE_SITES}`) lets a
 # CROSS_PR key silently OVERRIDE a reviewed count on collision — a future
 # CROSS_PR_WRITE_SITES entry sharing a key with the reviewed roster would replace its
 # count instead of adding a distinct site, letting an unreviewed second write in that
-# function pass. Keys are disjoint today; keep them that way.
+# function pass. Keys are disjoint today; keep them that way. A count that
+# genuinely needs to grow on an EXISTING key goes in CROSS_PR_WRITE_SITE_DELTAS
+# instead, which is added, never used to override.
 assert EXPECTED_WRITE_SITE_ROSTER.keys().isdisjoint(CROSS_PR_WRITE_SITES), (
     "a CROSS_PR site may not override a reviewed roster count"
 )
@@ -471,7 +494,12 @@ class TestWriteSiteRosterIsReviewed:
         # #210 alone the flag is absent and that site cannot appear for real;
         # widening the roster unconditionally would admit it anyway.
         if hasattr(CredentialStore, "_in_attribution_read"):
-            admissible.append({**EXPECTED_WRITE_SITE_ROSTER, **CROSS_PR_WRITE_SITES})
+            merged = dict(
+                Counter(EXPECTED_WRITE_SITE_ROSTER)
+                + Counter(CROSS_PR_WRITE_SITES)
+                + Counter(CROSS_PR_WRITE_SITE_DELTAS)
+            )
+            admissible.append(merged)
         assert dict(derived) in admissible, (
             "the derived write-site roster no longer matches what this round "
             "reviewed — a writer was added, removed, or duplicated; review "
