@@ -195,6 +195,61 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
         finally:
             enc.chmod(0o600)
 
+    def test_the_verification_read_is_marked_for_a_merge_partner_to_see(
+        self, tmp_path,
+    ):
+        """PR 286's renumber-fallback read (``_read_account_credentials``,
+        which this guard does not call on this branch alone) mirrors a
+        same-email backup it finds under another slot number back under the
+        slot it was asked for -- a write of its own. Once the two PRs merge,
+        this guard's verification read (``_read_account_credentials_ex`` ->
+        ``_read_account_credentials``) can reach that mirror-write, which
+        re-enters the guard that asked for the read: unbounded recursion on
+        a genuinely empty target slot.
+
+        ``CredentialStore._in_attribution_read`` (PR 286's own suppression
+        flag, defined on ITS branch: ``False`` unless a caller marks a read
+        as verification-only) is the merge partner's half of the fix; this
+        half is marking the guard's read as exactly that, so the two halves
+        only do anything once both are present. Nothing on this branch reads
+        the flag today -- this spies on it directly, the only way to pin the
+        contract from this side alone.
+        """
+        store = CredentialStore(_Host(tmp_path))
+        store._write_account_credentials("1", "test@example.com", ACCOUNT_1_BACKUP)
+        seen_during_check = []
+        real_check = store._check_attribution
+
+        def spying_check(*a, **kw):
+            marker = []
+            real_read_ex = store._read_account_credentials_ex
+            store._read_account_credentials_ex = lambda *ra, **rkw: (
+                marker.append(getattr(store, "_in_attribution_read", False)),
+                real_read_ex(*ra, **rkw),
+            )[1]
+            try:
+                return real_check(*a, **kw)
+            finally:
+                store._read_account_credentials_ex = real_read_ex
+                seen_during_check.extend(marker)
+
+        store._check_attribution = spying_check
+        try:
+            store._write_account_credentials(
+                "1", "test@example.com", ACCOUNT_1_BACKUP,
+            )
+        finally:
+            del store._check_attribution
+
+        assert seen_during_check == [True], (
+            "the guard's own verification read must be marked "
+            "_in_attribution_read=True for the duration of the read, so a "
+            "merge partner's converge write can suppress itself for it"
+        )
+        assert getattr(store, "_in_attribution_read", False) is False, (
+            "the mark must not outlive the read it was taken for"
+        )
+
 
 def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tuple[str | None, int, str]]:
     """Every call to one of ``target_names`` in ``path``, with its innermost

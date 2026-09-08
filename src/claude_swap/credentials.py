@@ -1318,8 +1318,21 @@ class CredentialStore:
         on macOS, per CONTEXT.md) — precisely where the incident this guard
         exists for lives. Unreadable is "cannot verify", which refuses like
         a mismatch, not "empty", which would permit like an absent slot.
+
+        Marks ``self._in_attribution_read`` around the read. Nothing on this
+        branch alone defines or reads that attribute, so the mark is inert
+        here — it exists for a merge partner whose own read (reached
+        transitively through this one) would otherwise write back into the
+        slot this guard's caller is already writing, re-entering this write
+        path from inside the read that verifies it.
         """
-        existing, unreadable = self._read_account_credentials_ex(account_num, email)
+        self._in_attribution_read = True
+        try:
+            existing, unreadable = self._read_account_credentials_ex(
+                account_num, email
+            )
+        finally:
+            self._in_attribution_read = False
         if unreadable and not attributed:
             self._host._logger.error(
                 "Refusing to write Account-%s-%s's backup: the existing "
