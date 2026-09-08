@@ -1895,6 +1895,7 @@ class TestQuarantineLifecycle:
             json.dumps({
                 "claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"},
             }),
+            attributed=True,
         )
         harness.events.clear()
         outcome = harness.tick_with_usage({
@@ -1969,6 +1970,7 @@ class TestDryRunAndNoOp:
         h.switcher._write_account_credentials(
             "2", "b@example.com",
             json.dumps({"claudeAiOauth": {"accessToken": "n", "refreshToken": "n"}}),
+            attributed=True,
         )
         h.events.clear()
         h.engine = h._make_engine(dry_run=True)
@@ -2425,6 +2427,7 @@ class TestTokenIdentity:
                 "accessToken": "sk-2-dead", "refreshToken": "rt-2-dead",
                 "expiresAt": 0,
             }}),
+            attributed=True,
         )
 
         def refresh(creds):

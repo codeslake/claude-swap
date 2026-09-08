@@ -547,7 +547,7 @@ class TestAddAccountRefresh:
         # Track what was written to credential storage
         stored = {}
 
-        def mock_write_creds(num, email, creds):
+        def mock_write_creds(num, email, creds, attributed=None):
             stored["creds"] = creds
 
         def mock_read_creds(num, email):
@@ -1813,7 +1813,9 @@ class TestActiveAccountRefresh:
             "primary": True, "legacy": True, "config": False,
         }
         write_live.assert_called_once_with(self._REFRESHED)
-        write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", self._REFRESHED, attributed=True
+        )
 
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -2518,7 +2520,7 @@ class TestActiveAccountRefresh:
             result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
 
         write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
         # Live store still holds the consumed token → report expired, not usage.
         assert result.sentinel == USAGE_TOKEN_EXPIRED
@@ -2586,8 +2588,8 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()   # nothing consumed — pure resync
         mock_probe.assert_called_once()
         assert write_backup.call_args_list == [
-            call("1", "test@example.com", self._REFRESHED),
-            call("1", "test@example.com", self._REFRESHED),
+            call("1", "test@example.com", self._REFRESHED, attributed=True),
+            call("1", "test@example.com", self._REFRESHED, attributed=True),
         ]
 
     def test_fresh_fetch_same_lineage_skips_the_resync(
@@ -2695,7 +2697,7 @@ class TestActiveAccountRefresh:
         # Next pass re-probes; a matching answer licenses the resync.
         mock_probe2.assert_called_once()
         write_backup2.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
 
     def test_fresh_probe_unverifiable_not_cached(
@@ -2790,7 +2792,7 @@ class TestActiveAccountRefresh:
 
         assert first.usage == {"five_hour": {"pct": 3}}
         write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
         assert switcher.account_identity("1")["uuid"] == "uuid-resolved"
 
@@ -2942,7 +2944,7 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_called_once()
         assert mock_refresh.call_args[0][0] == live_b   # B, never A
         write_backup.assert_called_once_with(
-            "1", "test@example.com", self._REFRESHED
+            "1", "test@example.com", self._REFRESHED, attributed=True
         )
         write_live.assert_called_once_with(self._REFRESHED)
         assert mock_fetch.call_args[0][2] == self._REFRESHED
@@ -3243,7 +3245,7 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()          # adopted, not consumed
         write_live.assert_not_called()            # live already correct
         write_backup.assert_called_once_with(     # lineage continuity restored
-            "1", "test@example.com", self._CC_ROTATED
+            "1", "test@example.com", self._CC_ROTATED, attributed=True
         )
 
     def test_adopting_a_known_foreign_credential_defers(
@@ -3352,7 +3354,7 @@ class TestPerformSwitchPostDisplay:
             # double and reads the real (empty) store instead.
             return creds_store.get((str(num), email), ""), False
 
-        def write_creds(num, email, creds):
+        def write_creds(num, email, creds, attributed=None):
             creds_store[(str(num), email)] = creds
 
         def read_cfg(num, email):
@@ -5135,7 +5137,7 @@ class TestAddAccountFromToken:
         switcher = self._make_switcher(temp_home)
         stored_creds = None
 
-        def capture_creds(num, email, creds):
+        def capture_creds(num, email, creds, attributed=None):
             nonlocal stored_creds
             stored_creds = creds
 
@@ -5199,7 +5201,7 @@ class TestAddAccountFromToken:
 
         stored_creds = None
 
-        def capture_creds(num, email, creds):
+        def capture_creds(num, email, creds, attributed=None):
             nonlocal stored_creds
             stored_creds = creds
 
@@ -6653,7 +6655,9 @@ class TestMacosKeychainFallback:
         s._write_backup_enc("1", "a@example.com", "OLD-FILE")
         p1, p2 = self._no_session(s)
         with p1, p2:
-            s._write_account_credentials("1", "a@example.com", "NEW-KC")
+            s._write_account_credentials(
+                "1", "a@example.com", "NEW-KC", attributed=True
+            )
         assert not s._backup_enc_path("1", "a@example.com").exists()
         assert s._read_account_credentials("1", "a@example.com") == "NEW-KC"
 
@@ -6674,7 +6678,9 @@ class TestMacosKeychainFallback:
         monkeypatch.setattr(Path, "unlink", flaky_unlink)
         p1, p2 = self._no_session(s)
         with p1, p2:
-            s._write_account_credentials("1", "a@example.com", "NEW-KC")
+            s._write_account_credentials(
+                "1", "a@example.com", "NEW-KC", attributed=True
+            )
         monkeypatch.setattr(Path, "unlink", orig_unlink)
 
         # Could not delete the .enc → it was rewritten fresh, so .enc-wins reads
@@ -6690,7 +6696,9 @@ class TestMacosKeychainFallback:
         monkeypatch.setattr(macos_keychain, "set_password", _raise_locked)
         p1, p2 = self._no_session(s)
         with p1, p2:
-            s._write_account_credentials("1", "a@example.com", "FILE-CREDS")
+            s._write_account_credentials(
+                "1", "a@example.com", "FILE-CREDS", attributed=True
+            )
         assert s._read_account_credentials("1", "a@example.com") == "FILE-CREDS"
         # Stale keychain copy cleared (best-effort) so it can't resurface.
         assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
@@ -6727,7 +6735,9 @@ class TestMacosKeychainFallback:
         baseline against which the unreadable-path probe below is judged."""
         s = self._macos_switcher()
         s._kc_write_backup("1", "a@example.com", "gen-1")
-        s._write_account_credentials("1", "a@example.com", "gen-2")
+        s._write_account_credentials(
+            "1", "a@example.com", "gen-2", attributed=True
+        )
         assert (SECURITY_SERVICE, "account-1-a@example.com.prev") in block_real_keychain.data
         assert s._store._read_previous_backup("1", "a@example.com") == "gen-1"
 
@@ -7979,7 +7989,7 @@ class TestStashAndRetentionStore:
         switcher = self._switcher(temp_home)
         store = switcher._store
         store._write_account_credentials("1", "a@b.c", "gen-1")
-        store._write_account_credentials("1", "a@b.c", "gen-2")
+        store._write_account_credentials("1", "a@b.c", "gen-2", attributed=True)
         assert store._read_account_credentials("1", "a@b.c") == "gen-2"
         assert store._read_previous_backup("1", "a@b.c") == "gen-1"
         # Same-value rewrite doesn't clobber the retained generation.
@@ -7990,7 +8000,7 @@ class TestStashAndRetentionStore:
         switcher = self._switcher(temp_home)
         store = switcher._store
         store._write_account_credentials("1", "a@b.c", "gen-1")
-        store._write_account_credentials("1", "a@b.c", "gen-2")
+        store._write_account_credentials("1", "a@b.c", "gen-2", attributed=True)
         store._delete_account_credentials("1", "a@b.c")
         assert store._read_previous_backup("1", "a@b.c") == ""
 
@@ -8154,7 +8164,9 @@ class TestActiveRefreshProvenance:
 
         assert result.usage == {"five_hour": {"pct": 10}}
         write_live.assert_called_once_with(refreshed)
-        write_backup.assert_called_once_with("1", "test@example.com", refreshed)
+        write_backup.assert_called_once_with(
+            "1", "test@example.com", refreshed, attributed=True
+        )
 
 
 class TestDirectActivationPreservation:
@@ -9909,7 +9921,7 @@ class TestConsumeGate:
         def mock_refresh(credentials, **kw):
             # while the POST is in flight, another writer replaces the backup
             s._store._write_account_credentials(
-                "1", "test@example.com", racer
+                "1", "test@example.com", racer, attributed=True
             )
             return oauth.RefreshOutcome(self._NEW, None)
 
@@ -10393,7 +10405,7 @@ class TestInactiveRefreshRoutesThroughGate:
 
         def mock_gate(num, email, snapshot):
             gate["args"] = (num, email)
-            s._store._write_account_credentials(num, email, fresh)
+            s._store._write_account_credentials(num, email, fresh, attributed=True)
             return oauth.RefreshOutcome(fresh, None)
 
         monkeypatch.setattr(s, "consume_backup_grant", mock_gate)
@@ -10454,7 +10466,9 @@ class TestStrikeUnbindsInCollector:
         fresh = json.dumps({
             "claudeAiOauth": {"accessToken": "b", "refreshToken": "rt-new",
                               "expiresAt": 1000}})
-        s._write_account_credentials("2", "b@example.com", fresh)
+        s._write_account_credentials(
+            "2", "b@example.com", fresh, attributed=True
+        )
         info = [(2, "b@example.com", "", "", False, fresh, "")]
         entries = s._collect_usage_entries(info, fetch=set())
         assert entries["2"].sentinel != USAGE_RELOGIN_REQUIRED
@@ -10911,7 +10925,9 @@ class TestGateUltraReviewFixes:
         s._write_account_credentials("1", "test@example.com", self._OLD)
 
         def refresh_then_lose_the_race(credentials, **kw):
-            s._store._write_account_credentials("1", "test@example.com", racer)
+            s._store._write_account_credentials(
+                "1", "test@example.com", racer, attributed=True
+            )
             return oauth.RefreshOutcome(self._NEW, None)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
@@ -13477,7 +13493,7 @@ class TestAWitnessGapWithARealMarkerStillAttributesTheBackup:
         def read_creds_ex(num, email):
             return creds_store.get((str(num), email), ""), False
 
-        def write_creds(num, email, creds):
+        def write_creds(num, email, creds, attributed=None):
             creds_store[(str(num), email)] = creds
 
         def read_cfg(num, email):

@@ -224,7 +224,12 @@ def migrate_windows_keyring_to_files(switcher: "ClaudeAccountSwitcher") -> bool:
 
         # --- write + verify before deleting the only other copy -----------
         try:
-            switcher._write_account_credentials(account_num, email, creds)
+            # attributed=True: `creds` was just read from this exact
+            # (account_num, email) key's own Windows keyring entry above —
+            # a backend move, never a different account's bytes.
+            switcher._write_account_credentials(
+                account_num, email, creds, attributed=True
+            )
             readback = switcher._read_account_credentials(account_num, email)
         except Exception as e:  # noqa: BLE001
             switcher._logger.warning(

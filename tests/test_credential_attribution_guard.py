@@ -1,0 +1,278 @@
+"""The write-time attribution guard: no write may replace a populated slot's
+stored backup with a different account's bytes.
+
+Incident (2026-09-07): an unverified switch-time claim (an identity file's
+account number, never itself confirmed against the roster) let account N's
+live credential get written under slot M's key. The pin later consumed slot
+N's grant while it believed it held slot M's, the server killed that
+generation, and the account read as needing a fresh login inside its
+documented 30-day grace window.
+
+The chokepoint is ``CredentialStore._write_account_credentials``
+(``credentials.py``): every write, from any caller (directly, or via the
+switcher's own ``_write_account_credentials`` wrapper), passes through it
+before either backend (``_kc_write_backup`` on macOS, ``_write_backup_enc``
+elsewhere) ever sees the bytes. The guard refuses to replace a *populated*
+slot's stored backup with a different OAuth lineage (a differing
+``oauth.credential_fingerprint``) unless the caller attests
+``attributed=True`` — an explicit, per-call-site claim that it independently
+verified the new bytes belong to that slot (a uuid-verified identity
+resolution, or a structural move/rotation of that same account's own
+record). A first-ever write into an empty slot has nothing stored to
+contradict it and is never refused by this alone.
+
+Two tests below DERIVE their subject from the AST rather than naming it, per
+the project's own lesson that a container-level or member-listing check goes
+blind the day a new member (a new writer, or a new backend call) is added
+without review:
+
+- ``TestBackendWritersHaveExactlyOneCaller`` walks ``credentials.py`` for
+  every call to the two backend writers and asserts each one is textually
+  inside ``_write_account_credentials`` — the guard cannot be routed around
+  by a new private method that reaches the Keychain or the ``.enc`` file
+  directly.
+- ``TestWriteSiteRosterIsReviewed`` walks ``switcher.py``, ``transfer.py``
+  and ``migrations.py`` for every call into the write chokepoint and asserts
+  the derived (file, enclosing function) roster matches exactly what this
+  round reviewed — a new call site (or a second call added to an existing
+  one) changes the count and fails the test, forcing the same review this
+  round gave the other twenty.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import logging
+from collections import Counter
+from pathlib import Path
+
+import pytest
+
+from claude_swap.credentials import CredentialStore
+from claude_swap.exceptions import CredentialWriteError
+from claude_swap.models import Platform
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC = REPO_ROOT / "src" / "claude_swap"
+
+
+class _Host:
+    """Minimal ``_StoreHost``: data only, same shape as test_credentials.py's."""
+
+    def __init__(self, credentials_dir: Path):
+        self.platform = Platform.LINUX
+        self.credentials_dir = credentials_dir
+        self._logger = logging.getLogger("test")
+
+
+def _creds(refresh_token: str) -> str:
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-" + refresh_token, "refreshToken": refresh_token,
+    }})
+
+
+ACCOUNT_1_BACKUP = _creds("rt-account-1")
+ACCOUNT_2_LIVE = _creds("rt-account-2")
+
+
+class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
+    def test_refuses_a_populated_slot_overwritten_by_a_different_lineage(
+        self, tmp_path, caplog,
+    ):
+        """RED for the guard: without it, this write silently replaces
+        Account-1's stored backup with Account-2's live bytes — the exact
+        cross-slot poisoning shape from the incident. Fail-closed: the
+        original backup must survive the refusal untouched, and the log
+        must name the slot, the email and the recovery command."""
+        store = CredentialStore(_Host(tmp_path))
+        store._write_account_credentials("1", "test@example.com", ACCOUNT_1_BACKUP)
+
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(CredentialWriteError, match="cross-identity"):
+                store._write_account_credentials(
+                    "1", "test@example.com", ACCOUNT_2_LIVE,
+                )
+
+        assert store._read_account_credentials("1", "test@example.com") == (
+            ACCOUNT_1_BACKUP
+        )
+        assert any(
+            "Refusing to write Account-1-test@example.com" in r.message
+            and "cswap add --slot 1" in r.message
+            for r in caplog.records
+        )
+
+    def test_CONTROL_a_routine_refresh_needs_no_attribution(self, tmp_path):
+        """Positive control: an access-token-only refresh (the refresh token
+        — and so the fingerprint — unchanged) is the routine case and must
+        still succeed with no attestation at all. Without this control, the
+        RED test above would pass just as well for a guard that refuses
+        every write."""
+        store = CredentialStore(_Host(tmp_path))
+        store._write_account_credentials("1", "test@example.com", ACCOUNT_1_BACKUP)
+        rotated_access_token = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-fresh", "refreshToken": "rt-account-1",
+        }})
+
+        store._write_account_credentials(
+            "1", "test@example.com", rotated_access_token,
+        )
+
+        assert store._read_account_credentials("1", "test@example.com") == (
+            rotated_access_token
+        )
+
+    def test_attributed_true_is_honored_even_on_a_full_rotation(self, tmp_path):
+        """A caller that independently verified the new lineage (a
+        uuid-resolved identity, or a CAS against the exact bytes a grant was
+        requested for) may pass ``attributed=True`` to write a full
+        rotation — a differing fingerprint the guard cannot otherwise
+        distinguish from a foreign credential."""
+        store = CredentialStore(_Host(tmp_path))
+        store._write_account_credentials("1", "test@example.com", ACCOUNT_1_BACKUP)
+
+        store._write_account_credentials(
+            "1", "test@example.com", ACCOUNT_2_LIVE, attributed=True,
+        )
+
+        assert store._read_account_credentials("1", "test@example.com") == (
+            ACCOUNT_2_LIVE
+        )
+
+    def test_a_first_ever_write_into_an_empty_slot_needs_no_attribution(
+        self, tmp_path,
+    ):
+        """Absence of evidence is not a match, but it is not a refusal
+        either: an empty slot has nothing stored to contradict a first
+        write (add / add-token / import / migrate all rely on this)."""
+        store = CredentialStore(_Host(tmp_path))
+
+        store._write_account_credentials("1", "test@example.com", ACCOUNT_1_BACKUP)
+
+        assert store._read_account_credentials("1", "test@example.com") == (
+            ACCOUNT_1_BACKUP
+        )
+
+
+def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tuple[str | None, int, str]]:
+    """Every call to one of ``target_names`` in ``path``, with its innermost
+    enclosing function (``None`` at module scope) and line number."""
+    tree = ast.parse(path.read_text(), filename=str(path))
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.func_stack: list[str] = []
+            self.hits: list[tuple[str | None, int, str]] = []
+
+        def _visit_def(self, node):
+            self.func_stack.append(node.name)
+            self.generic_visit(node)
+            self.func_stack.pop()
+
+        visit_FunctionDef = _visit_def
+        visit_AsyncFunctionDef = _visit_def
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else (
+                func.id if isinstance(func, ast.Name) else None
+            )
+            if name in target_names:
+                enclosing = self.func_stack[-1] if self.func_stack else None
+                self.hits.append((enclosing, node.lineno, name))
+            self.generic_visit(node)
+
+    Visitor_ = Visitor()
+    Visitor_.visit(tree)
+    return Visitor_.hits
+
+
+class TestBackendWritersHaveExactlyOneCaller:
+    """The chokepoint itself: nothing but the guarded method may reach the
+    Keychain or the ``.enc`` file for a backup write."""
+
+    def test_kc_write_backup_and_write_backup_enc_are_only_called_from_the_guard(self):
+        hits = _calls_by_enclosing_function(
+            SRC / "credentials.py", {"_kc_write_backup", "_write_backup_enc"},
+        )
+        # Derived, not named: whatever calls exist, every one of them must
+        # be inside `_write_account_credentials` (the reconcile helper it
+        # calls is itself only reached from there too).
+        assert hits, "expected at least the guard's own backend calls"
+        stray = [h for h in hits if h[0] not in (
+            "_write_account_credentials", "_reconcile_enc_after_keychain_write",
+        )]
+        assert stray == [], (
+            f"a backend writer is reachable outside the attribution guard: {stray}"
+        )
+        # And the reconcile helper (the only other legitimate caller of
+        # `_write_backup_enc`) is itself only called from the guard.
+        reconcile_callers = _calls_by_enclosing_function(
+            SRC / "credentials.py", {"_reconcile_enc_after_keychain_write"},
+        )
+        stray_reconcile = [
+            h for h in reconcile_callers if h[0] != "_write_account_credentials"
+        ]
+        assert stray_reconcile == [], (
+            f"the .enc reconcile helper is reachable outside the guard: {stray_reconcile}"
+        )
+
+
+# Reviewed 2026-09-08 (PR 210 round 4): every call into the write chokepoint,
+# from any module, with its enclosing function. Excludes the chokepoint's own
+# two wrapper bodies (switcher.py's `_write_account_credentials` and
+# `write_account_credentials`, which only forward into the store/private
+# method and carry no reasoning of their own).
+EXPECTED_WRITE_SITE_ROSTER: dict[tuple[str, str], int] = {
+    ("switcher.py", "_swap_accounts_locked"): 2,
+    ("switcher.py", "_rollback_swap"): 1,
+    ("switcher.py", "_relocate_locked"): 1,
+    ("switcher.py", "persist_backup_credentials"): 1,
+    ("switcher.py", "_consume_backup_grant_locked"): 2,
+    ("switcher.py", "_adopt_stashed_successor"): 1,
+    ("switcher.py", "_adopt_session_credential"): 1,
+    ("switcher.py", "add_account"): 2,
+    ("switcher.py", "add_account_from_token"): 2,
+    ("switcher.py", "_fetch_active_usage"): 2,
+    ("switcher.py", "_resync_rotated_backup"): 1,
+    ("switcher.py", "_perform_switch_locked"): 1,
+    ("transfer.py", "import_accounts"): 1,
+    ("migrations.py", "migrate_windows_keyring_to_files"): 1,
+}
+
+# The chokepoint's own forwarding bodies: present in the AST but not
+# independent writers, so they are excluded from the roster above.
+_WRAPPER_BODIES = {"_write_account_credentials", "write_account_credentials"}
+
+
+class TestWriteSiteRosterIsReviewed:
+    """Every caller of the write chokepoint, derived from the AST rather
+    than hand-listed, must match a roster this round actually reviewed for
+    whether it may pass ``attributed=True`` and why (see switcher.py's
+    inline comments at each site). A new call site — or a second call added
+    to an existing one — changes the derived roster and fails this test,
+    the same review gate every site already on it went through."""
+
+    def test_every_writer_is_on_the_reviewed_roster(self):
+        derived: Counter[tuple[str, str]] = Counter()
+        for filename in ("switcher.py", "transfer.py", "migrations.py"):
+            hits = _calls_by_enclosing_function(
+                SRC / filename,
+                {"_write_account_credentials", "write_account_credentials"},
+            )
+            is_switcher = filename == "switcher.py"
+            for enclosing, _lineno, _name in hits:
+                if is_switcher and enclosing in _WRAPPER_BODIES:
+                    continue  # the guard's own forwarding, not a writer
+                assert enclosing is not None, (
+                    f"a module-scope call to the write chokepoint appeared in "
+                    f"{filename}; give it a reviewed enclosing function"
+                )
+                derived[(filename, enclosing)] += 1
+
+        assert dict(derived) == EXPECTED_WRITE_SITE_ROSTER, (
+            "the derived write-site roster no longer matches what this round "
+            "reviewed — a writer was added, removed, or duplicated; review "
+            "whether it may pass attributed=True and update the roster above"
+        )
