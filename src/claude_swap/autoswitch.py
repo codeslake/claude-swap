@@ -663,20 +663,6 @@ def _probe_source_fresh(entries: dict | None, num: str, now: float) -> bool:
     return entry is not None and entry.fresh(now)
 
 
-def _raw_probe_reading(entries: dict | None, num: str) -> dict | str | None:
-    """``num``'s raw store reading, ignoring ``decision_value()``'s
-    reset-elapsed nulling.
-
-    A probe candidate's ``decision_value()`` is null precisely because its
-    own weekly reset has elapsed (or was never reported) -- ranking it needs
-    the RAW headroom that nulling discarded, not a second, un-nulled 0.0.
-    ``entries=None`` (a caller with no store-entry data) answers ``None``,
-    same as a missing entry.
-    """
-    entry = entries.get(num) if entries is not None else None
-    return entry.last_good if entry is not None else None
-
-
 def _numeric_probe_cooldown(raw: object) -> dict[str, float]:
     """``state["probeCooldown"]``, TYPE-GUARDED to a fresh dict of numeric
     values only -- every writer of ``self._last_probe_cooldown`` (the
@@ -841,6 +827,11 @@ def _binding_recovery_ts(
     stamps = [ts for ts in
               (_parse_reset_ts(w[2]) for w in windows if blocking(w[1]))
               if ts is not None]
+    # #325: `usage` here is decision_value()-fed, which already drops any
+    # window whose own reset had elapsed (_drop_rolled_windows) -- so a
+    # `stamps` entry already past cannot reach this `max(stamps) > now`
+    # check from that path any more; it stays live only for a caller that
+    # hands this a raw, undropped reading.
     return max(stamps) if stamps and max(stamps) > now else float("inf")
 
 
@@ -2833,28 +2824,6 @@ class AutoSwitchEngine:
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
-                # A null headroom is either no reading at all (never
-                # fetched, a failure) or a reading whose OWN weekly reset
-                # has already elapsed -- `decision_value()` nulls both the
-                # same way (usage_store.py), but only the second is a
-                # probe's business: the raw store entry still HAS a
-                # reading, it is just not fit to rank on. Resolving that is
-                # what a probe exists for, same as a reset that was never
-                # reported at all -- reuses `_seven_day_reset_ts` on the RAW
-                # reading rather than a second predicate. None of the
-                # ranking/landing checks below run: they all need a known
-                # h, which this candidate does not have.
-                entry = entries.get(num) if entries is not None else None
-                raw = entry.last_good if entry is not None else None
-                if (
-                    trigger in CONSUME_FIRST_STRATEGIES
-                    and isinstance(raw, dict)
-                    and _seven_day_reset_ts(raw, now) is None
-                    and num != no_return
-                    and not by_recovery_axis
-                    and _probe_source_fresh(entries, num, now)
-                ):
-                    probe_candidates.append(num)
                 continue
             any_known = True          # it EXISTS and is readable either way
             recovery_ts = (
@@ -3188,18 +3157,9 @@ class AutoSwitchEngine:
             usage, probe_candidates, models, usage.get(current), probe_cooldown, now
         )
         if probe_num is not None:
-            # `usage.get(probe_num)` is the very reading `decision_value()`
-            # nulled to admit this account as a probe in the first place --
-            # ranking it needs the RAW headroom that nulling discarded, same
-            # substitute `select_probe_target` makes for the identical
-            # reason, or a probe with real headroom in hand loses its own
-            # tier to a spent-account's key of `(1, ...)` and never lands.
-            probe_usage = usage.get(probe_num)
-            if probe_usage is None:
-                probe_usage = _raw_probe_reading(entries, probe_num)
             qualifying.append((
                 consume_first_rank_key(
-                    probe_usage, settings.threshold, now, models, probe=True
+                    usage.get(probe_num), settings.threshold, now, models, probe=True
                 ),
                 probe_num,
             ))

@@ -453,18 +453,20 @@ class UsageEntry:
         """The ``dict | sentinel | None`` value switch decisions run on.
 
         Sentinel wins; else last-good while it is recent enough to trust
-        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness)
-        AND its own earliest relevant-window reset is not already in the
-        past — a fetch that SUCCEEDED, inside its trust window, whose
-        server-reported ``resets_at`` has already elapsed describes a window
-        that has ended, and freshness alone is no evidence about the new
-        one. Reuses ``_earliest_reset`` (the same predicate the 429 arm's
-        ``_rate_limited_trust_ok`` already applies) rather than a second
-        one, so a fresh read and a deliberately-stale one answer the past-
-        reset question the same way. ``models`` selects the per-model scoped
-        windows too, matching that same reuse. Else None (unknown). Display
-        code reads ``last_good``/``age_s`` directly instead — it may show
-        older data, annotated with its age.
+        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness),
+        with each window whose own ``resets_at`` has already elapsed
+        DROPPED from it — a fetch that SUCCEEDED, inside its trust window,
+        whose server-reported ``resets_at`` has already elapsed describes a
+        window that has ended, and freshness alone is no evidence about the
+        new one. The rest of the reading (a window that has not rolled) is
+        still a fact in hand, so only the rolled window is removed, not the
+        whole reading (``_drop_rolled_windows``, reusing the same relevant-
+        window enumeration ``_earliest_reset`` sorts, rather than a second
+        predicate). ``models`` selects the per-model scoped windows too,
+        matching that same reuse. A reading with nothing left once every
+        relevant window is dropped is None (unknown), same as before. Else
+        None (unknown). Display code reads ``last_good``/``age_s`` directly
+        instead — it may show older data, annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
@@ -475,9 +477,7 @@ class UsageEntry:
         ):
             if self.fetched_at is not None:
                 now = self.fetched_at + self.age_s
-                soonest = _earliest_reset(self.last_good, models)
-                if soonest is not None and soonest <= now:
-                    return None
+                return _drop_rolled_windows(self.last_good, now, models)
             return self.last_good
         return None
 
@@ -581,6 +581,44 @@ def _earliest_reset(last_good: dict | None, models: tuple[str, ...] = ()) -> flo
         if (ts := parse_reset_ts(resets_at)) is not None
     ]
     return min(resets) if resets else None
+
+
+def _drop_rolled_windows(
+    last_good: dict, now: float, models: tuple[str, ...] = ()
+) -> dict | None:
+    """A copy of ``last_good`` with each RELEVANT window whose own
+    ``resets_at`` has already elapsed removed.
+
+    A rolled window describes a window that just ended and carries no
+    information about the new one — but the REST of the reading is not
+    stale just because one window rolled (an account reading ``5h 0% ·
+    7d 100%(rolled)`` is a healthy account with real 5h headroom, not an
+    unknown one). Reuses ``oauth.relevant_windows`` — the same enumeration
+    ``_earliest_reset`` sorts — rather than a second notion of which
+    windows matter. Returns ``None`` only when every relevant window has
+    rolled: the reading is then genuinely unusable, same as before.
+    """
+    rolled = {
+        label
+        for label, _pct, resets_at in oauth.relevant_windows(last_good, models)
+        if (ts := parse_reset_ts(resets_at)) is not None and ts <= now
+    }
+    if not rolled:
+        return last_good
+    result = dict(last_good)
+    if "5h" in rolled:
+        result.pop("five_hour", None)
+    if "7d" in rolled:
+        result.pop("seven_day", None)
+    scoped = result.get("scoped")
+    if isinstance(scoped, list):
+        kept = [
+            s for s in scoped
+            if not (isinstance(s, dict) and s.get("name") in rolled)
+        ]
+        if len(kept) != len(scoped):
+            result["scoped"] = kept
+    return result if oauth.relevant_windows(result, models) else None
 
 
 def _rate_limited_trust_ok(

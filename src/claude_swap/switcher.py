@@ -6050,7 +6050,20 @@ class ClaudeAccountSwitcher:
             )
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
-        """Map account number → decision-grade usage value for managed accounts."""
+        """Map account number → decision-grade usage value for managed accounts.
+
+        ``models=()`` (account-wide 5h/7d only), deliberately, and every
+        other ``decision_value()`` call in this file (the CLI's
+        ``--list``/``--status`` JSON, the lockstep-usage duplicate-account
+        heuristic) matches it: a pinned model's scoped window is a property
+        of `cswap auto`'s ``AutoSwitchSettings.model``, which lives on the
+        ENGINE, not on ``ClaudeAccountSwitcher`` — this class has no model
+        to scope by. A manual `cswap switch`/`--list`/`--status` shows the
+        account-wide picture; only the auto-switch engine (which holds
+        ``self._models``) folds a pinned model's window into what it reads
+        as "rolled" or "spent". Widening these to a model would need a new
+        parameter this class has nowhere to source from a real caller.
+        """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info)
         return {num: entry.decision_value() for num, entry in entries.items()}
@@ -6253,6 +6266,8 @@ class ClaudeAccountSwitcher:
         for num, _email, _org_name, _org_uuid, _is_active, _creds, _alias in accounts_info:
             snum = str(num)
             entry = entries.get(snum)
+            # models=() — see `_usage_by_account`; this compares only the
+            # account-wide 5h/7d windows anyway (below), not a scoped one.
             usage = entry.decision_value() if entry else None
             if not isinstance(usage, dict):
                 continue
@@ -6296,6 +6311,8 @@ class ClaudeAccountSwitcher:
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
+            # models=() — see `_usage_by_account`; `--list` shows the
+            # account-wide picture, never a model-pinned one.
             accounts.append(
                 account_row(
                     num, email, org_name, org_uuid, is_active,
@@ -6477,6 +6494,8 @@ class ClaudeAccountSwitcher:
         entry = self._active_account_usage(account_num, current_email, org_uuid)
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
+        # models=() — see `_usage_by_account`; `--status` shows the
+        # account-wide picture, never a model-pinned one.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
