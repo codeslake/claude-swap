@@ -68,8 +68,12 @@ _logger = logging.getLogger("claude-swap")
 # and the order decides which, because reporting the wrong one is how a cause
 # needing a human hides behind one that clears itself. store-unmirrored and
 # invalid_client stay until somebody unsets an env var or fixes a client
-# registration, and stash-unreadable until they unlock a keychain, fix a mode,
-# or purge the row; consume-busy is gone by the next pass. stash-unreadable is
+# registration, stash-unreadable until they unlock a keychain or fix the
+# file, lineage-condemned until a re-add replaces the credential, and
+# identity-unreadable until `.claude.json` is readable again (a login) or a
+# re-add — consume-busy alone clears itself on the next pass, so it ranks
+# LAST: hiding any of the other four behind it is the same misattribution
+# stash-unreadable was split out of "transient" to escape. stash-unreadable is
 # the one that is per-SLOT rather than global, which costs nothing here: this
 # message is only ever emitted when NO candidate freshened, so naming the real
 # cause of the only slot that had one beats "(network?)".
@@ -81,9 +85,12 @@ _SYSTEMIC_MESSAGES = {
     "stash-unreadable": "a stashed successor is unreadable — unlock the "
                         "keychain or fix the file, then retry; "
                         "`cswap unclaimed` inspects it",
-    "consume-busy": "another cswap surface holds the slot — retries next pass",
     "lineage-condemned": "the slot's stored credential was condemned as "
                         "another account's — `cswap add` replaces it",
+    "identity-unreadable": "the slot's session profile identity could not "
+                        "be read — a login rewrites it, or `cswap add` "
+                        "replaces the stored credential",
+    "consume-busy": "another cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
 # drift apart.

@@ -2264,6 +2264,15 @@ class ClaudeAccountSwitcher:
                             "not be read; refusing to let it supersede the "
                             "backup.", account_num,
                         )
+                        # Refusing supersession is not "safe to consume the
+                        # backup instead": if this corrupt-identity session
+                        # is actually THIS slot's own self-rotation, the
+                        # backup is already the spent predecessor and POSTing
+                        # it 400s invalid_grant -- a strike with no way to
+                        # clear (the only writer that could refresh the
+                        # fingerprint refuses on this same corrupt file).
+                        # Defer, like every other "unknown" in this method.
+                        return oauth.RefreshOutcome(None, "identity-unreadable")
                     elif (
                         profile
                         # A marked profile's credentials are presumed stale

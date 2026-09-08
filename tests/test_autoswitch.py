@@ -10864,6 +10864,42 @@ class TestFreshenRoutesThroughGate:
             f"got {msg!r}: the self-clearing cause hid the one needing a human"
         )
 
+        # lineage-condemned and identity-unreadable are likewise NOT
+        # self-clearing (both need `cswap add` or a login) — asserting only
+        # the STATUS elsewhere (test_a_condemned_lineage_is_not_reported_as_
+        # network_trouble) does not pin the RANKING, so a status could exist
+        # and still lose to consume-busy exactly like store-unmirrored did.
+        for actionable, needle in (
+            ("lineage-condemned", "condemned as"),
+            ("identity-unreadable", "identity could not be read"),
+        ):
+            h2 = EngineHarness(temp_home / actionable)
+            (temp_home / actionable / ".claude").mkdir(parents=True)
+            h2.seed(1, "a@example.com")
+            h2.seed(2, "b@example.com", expires_at=1)
+            h2.seed(3, "c@example.com", expires_at=1)
+            h2.make_live("a@example.com", 1)
+
+            def by_slot2(num, email, *a, **kw):
+                return actionable if num == "2" else "consume-busy"
+
+            with patch.object(
+                h2.engine, "_freshen_target", side_effect=by_slot2
+            ):
+                h2.tick_with_usage({
+                    "1": _usage7(95, 95, _R_LATER),
+                    "2": _usage7(10, 10, _R_SOON),
+                    "3": _usage7(10, 10, _R_LATEST),
+                })
+
+            errors2 = [e for e in h2.events if getattr(e, "message", None)]
+            assert errors2, f"no error event for {actionable}; got {h2.kinds()}"
+            msg2 = errors2[-1].message
+            assert needle in msg2, (
+                f"got {msg2!r}: consume-busy hid {actionable!r}, the "
+                "misattribution this ranking exists to prevent"
+            )
+
     def test_a_real_transient_still_reads_transient(self, temp_home):
         from claude_swap import oauth as oauth_mod
 

@@ -15210,8 +15210,15 @@ class TestGateUltraReviewFixes:
         is a real window in which a foreign profile's newer generation would
         pass this gate with an identity that simply could not be read yet.
 
+        Not knowing whether the profile is this slot's own account cuts both
+        ways: the gate must not adopt the profile (below), but it must also
+        not fall back to POSTing the BACKUP it holds — that backup may be the
+        already-consumed predecessor of a live self-rotation this corrupt
+        file just can't confirm (see the deferral test right after this one).
+        So the correct move on "unknown" is neither: defer, POST nothing.
+
         Measured with the guard off:
-            POSTed rt       = rt-corrupt   (baseline: rt-bk)
+            POSTed rt       = rt-corrupt   (baseline: nothing posted)
         """
         from claude_swap.session import session_dir_for
         s = self._switcher(sample_sequence_data)
@@ -15227,23 +15234,82 @@ class TestGateUltraReviewFixes:
         sdir.mkdir(parents=True, exist_ok=True)
         (sdir / ".credentials.json").write_text(corrupt)
         (sdir / ".claude.json").write_text("not json")
-        posted = {}
+        posted = []
 
         def mock_refresh(credentials, **kw):
-            posted["creds"] = credentials
+            posted.append(credentials)
             return oauth.RefreshOutcome(self._NEW, None)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
                    side_effect=mock_refresh), \
              patch.object(s, "_live_session_pids", return_value=[]):
-            s.consume_backup_grant("1", "test@example.com", backup)
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
 
-        assert posted["creds"] == backup, (
-            "the gate POSTed a profile whose identity could not be read"
+        assert not posted, (
+            f"the gate POSTed while the identity could not be read: {posted!r}"
+        )
+        assert outcome.error == "identity-unreadable", (
+            f"got {outcome.error!r}: must defer with its own status, not "
+            "consume and not fail as invalid_grant"
         )
         assert "rt-corrupt" not in s._read_account_credentials(
             "1", "test@example.com"
         ), "an unverifiable lineage was written into the slot"
+
+    def test_an_unreadable_identity_defers_rather_than_posting_a_stale_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The refusal above is not enough on its own: if the corrupt-identity
+        session is actually THIS slot's own live session having self-rotated
+        its tokens (unprovable from a corrupt `.claude.json` alone), the
+        backup on file is the already-consumed predecessor generation.
+        Falling through to POST it 400s `invalid_grant`, which the tick
+        quarantines on the FIRST occurrence (autoswitch.py) and never
+        releases -- the only writer that could refresh the fingerprint
+        (`_adopt_session_credential` -> `_session_profile_ahead`) refuses on
+        the very same corrupt file. A forced re-login with no way out.
+
+        The gate must return early with its own status here, exactly like
+        every other "unknown" in this method (`transient`,
+        `stash-unreadable`, `lineage-condemned`) -- never reach the POST.
+
+        Measured with the bug (fall-through) in place: the POST helper WAS
+        called with the stale backup and outcome.error was None (a "success"
+        that ships a stale grant) or `invalid_grant` once the fake POST
+        modeled the real rejection.
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # The self-rotated successor: newer generation, corrupt identity file.
+        successor = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-successor", "refreshToken": "rt-successor",
+            "expiresAt": 999999}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(successor)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            # The real server's answer to a consumed generation.
+            return oauth.RefreshOutcome(None, "invalid_grant")
+
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            side_effect=mock_refresh,
+        ) as posted, patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert not posted.called, (
+            "the gate POSTed a backup it could not confirm was fresh"
+        )
+        assert outcome.error not in (None, "invalid_grant"), (
+            f"got {outcome.error!r}: a corrupt identity must defer, not "
+            "burn a strike"
+        )
 
     def test_an_older_profile_never_supersedes_the_backup(
         self, temp_home: Path, sample_sequence_data: dict
