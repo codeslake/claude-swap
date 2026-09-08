@@ -2348,12 +2348,14 @@ class TestTheRollbackDecidesPerKey:
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data_with_org)
         mail_a, mail_b = "a@example.com", "b@example.com"
+        creds_b1 = _gen("2", "a")
+        creds_b2 = _gen("2", "b")
         switcher._write_account_credentials("1", mail_a, "creds-a")
-        switcher._write_account_credentials("2", mail_b, "creds-b")
+        switcher._write_account_credentials("2", mail_b, creds_b1)
         # A SECOND WRITE, so a `.prev` generation exists for the restore to
         # displace. Without it `displaced` stays empty and the purge is inert
         # whatever the counter says.
-        switcher._write_account_credentials("2", mail_b, "creds-b-HALFWRITTEN")
+        switcher._write_account_credentials("2", mail_b, creds_b2)
         prev = switcher._store._prev_backup_path("2", mail_b)
         assert prev.exists(), (
             "premise: no retained generation exists, so the purge below has "
@@ -2375,7 +2377,7 @@ class TestTheRollbackDecidesPerKey:
             with caplog_at_error() as records:
                 switcher._rollback_swap(
                     "1", mail_a, "creds-a", "{}",
-                    "2", mail_b, "creds-b", "{}",
+                    "2", mail_b, creds_b1, "{}",
                     staging={}, moved=moved, wrote_backups=True,
                 )
         finally:
@@ -2799,8 +2801,10 @@ class TestTheRollbackDecidesPerKey:
         switcher = ClaudeAccountSwitcher()
         self._write(switcher, sample_sequence_data_with_org)
         mail_a, mail_b = "a@example.com", "b@example.com"
-        switcher._write_account_credentials("1", mail_a, "creds-a")
-        switcher._write_account_credentials("1", mail_a, "creds-a-DRIFTED")
+        creds_a1 = _gen("1", "a")
+        creds_a2 = _gen("1", "b")
+        switcher._write_account_credentials("1", mail_a, creds_a1)
+        switcher._write_account_credentials("1", mail_a, creds_a2)
         switcher._write_account_credentials("2", mail_b, "creds-b")
         prev = switcher._store._prev_backup_path("1", mail_a)
         assert prev.exists(), "premise: no retained generation to preserve"
@@ -2818,7 +2822,7 @@ class TestTheRollbackDecidesPerKey:
         moved = self._one_crossed_one_home(switcher, mail_a, mail_b)
         with caplog_at_error() as records:
             switcher._rollback_swap(
-                "1", mail_a, "creds-a", "{}",
+                "1", mail_a, creds_a1, "{}",
                 "2", mail_b, "creds-b", "{}",
                 staging={}, moved=moved, wrote_backups=True,
             )
