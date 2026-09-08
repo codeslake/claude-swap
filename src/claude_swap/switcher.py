@@ -6057,12 +6057,15 @@ class ClaudeAccountSwitcher:
         ``--list``/``--status`` JSON, the lockstep-usage duplicate-account
         heuristic) matches it: a pinned model's scoped window is a property
         of `cswap auto`'s ``AutoSwitchSettings.model``, which lives on the
-        ENGINE, not on ``ClaudeAccountSwitcher`` — this class has no model
-        to scope by. A manual `cswap switch`/`--list`/`--status` shows the
-        account-wide picture; only the auto-switch engine (which holds
+        ENGINE, not on ``ClaudeAccountSwitcher`` — this class holds no model
+        to scope by TODAY. A manual `cswap switch`/`--list`/`--status` shows
+        the account-wide picture; only the auto-switch engine (which holds
         ``self._models``) folds a pinned model's window into what it reads
-        as "rolled" or "spent". Widening these to a model would need a new
-        parameter this class has nowhere to source from a real caller.
+        as "rolled" or "spent". Widening these to a model needs resolving one
+        from settings at a single default-resolution site (the way
+        ``cli.py``'s CLI-merged-model resolution already does), not a new
+        parameter threaded through every caller — see ``pr-subjects.md``
+        #199's `models=()` finding for the sibling gap in ``switch()``.
         """
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info)
@@ -6311,6 +6314,10 @@ class ClaudeAccountSwitcher:
             # recent enough to act on (≤ STALE_OK_S), else unavailable. Showing
             # older measurements is a human-display affordance only — scripts
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
+            # A relevant window whose own reset has already elapsed is also
+            # dropped from a fresh reading (#325, usage_store._drop_rolled_
+            # windows); if that leaves nothing (every relevant window rolled),
+            # the status is not "ok" either, even for a just-fetched row.
             # models=() — see `_usage_by_account`; `--list` shows the
             # account-wide picture, never a model-pinned one.
             accounts.append(

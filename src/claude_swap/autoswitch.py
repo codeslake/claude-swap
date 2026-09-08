@@ -830,8 +830,8 @@ def _binding_recovery_ts(
     # #325: `usage` here is decision_value()-fed, which already drops any
     # window whose own reset had elapsed (_drop_rolled_windows) -- so a
     # `stamps` entry already past cannot reach this `max(stamps) > now`
-    # check from that path any more; it stays live only for a caller that
-    # hands this a raw, undropped reading.
+    # check any more. No caller does this today: every call site in this
+    # module passes a decision_value()-fed `usage` dict.
     return max(stamps) if stamps and max(stamps) > now else float("inf")
 
 
@@ -2793,11 +2793,14 @@ class AutoSwitchEngine:
                 trigger == "at-limit"
                 # A KNOWABLE RETURN FOR THE ACCOUNT WE ARE LEAVING, or there
                 # is nothing to rank against. `_binding_recovery_ts` answers
-                # `inf` for unknown AND for already past, so a fleet whose
-                # rows have gone stale makes every recovery `inf` --
-                # `inf >= inf - RECOVERY_HYSTERESIS_S` then refuses every
-                # candidate, and no state this branch can reach clears it.
-                # Waiting is only a choice when something can say what for.
+                # `inf` for a reset never reported (the reachable case here;
+                # #325 drops a window whose own reset has already elapsed
+                # before this ever sees it, so "already past" cannot reach
+                # this call any more), so a fleet whose rows have gone stale
+                # makes every recovery `inf` -- `inf >= inf -
+                # RECOVERY_HYSTERESIS_S` then refuses every candidate, and no
+                # state this branch can reach clears it. Waiting is only a
+                # choice when something can say what for.
                 and active_recovery_ts != float("inf")
                 # ONLY THE CANDIDATE SIDE IS ASKED. The active's own headroom
                 # was tested too, and it cannot be False here: `at-limit` is
@@ -2846,9 +2849,11 @@ class AutoSwitchEngine:
                 # spent candidate while a usable peer exists is what breaks it.
                 #
                 # BOTH RETURNS MUST BE PROVABLE. `_binding_recovery_ts` answers
-                # `inf` for unknown AND for already past, which are opposite
-                # facts: an active whose reset has passed can return at any
-                # moment and must not lose to a peer hours out.
+                # `inf` for a reset never reported -- the reachable case here;
+                # #325 drops a window whose own reset has already elapsed
+                # before this ever sees it, so an active whose reset has
+                # merely passed (and could return at any moment) cannot reach
+                # this call with a known-but-past reset any more.
                 #
                 # `all_above` FIRST, and it is what makes the rest safe to
                 # read: it is False whenever the active is unmeasured, which is

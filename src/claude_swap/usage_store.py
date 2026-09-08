@@ -453,20 +453,38 @@ class UsageEntry:
         """The ``dict | sentinel | None`` value switch decisions run on.
 
         Sentinel wins; else last-good while it is recent enough to trust
-        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness),
-        with each window whose own ``resets_at`` has already elapsed
-        DROPPED from it — a fetch that SUCCEEDED, inside its trust window,
-        whose server-reported ``resets_at`` has already elapsed describes a
-        window that has ended, and freshness alone is no evidence about the
-        new one. The rest of the reading (a window that has not rolled) is
-        still a fact in hand, so only the rolled window is removed, not the
-        whole reading (``_drop_rolled_windows``, reusing the same relevant-
-        window enumeration ``_earliest_reset`` sorts, rather than a second
-        predicate). ``models`` selects the per-model scoped windows too,
-        matching that same reuse. A reading with nothing left once every
-        relevant window is dropped is None (unknown), same as before. Else
-        None (unknown). Display code reads ``last_good``/``age_s`` directly
-        instead — it may show older data, annotated with its age.
+        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness) —
+        but the two arms disagree on what a rolled window means, because
+        only one of them has a fresh poll behind it.
+
+        A FRESH read (age ≤ ``STALE_OK_S``) has each window whose own
+        ``resets_at`` has already elapsed DROPPED from it — a fetch that
+        SUCCEEDED, inside its trust window, whose server-reported
+        ``resets_at`` has already elapsed describes a window that has
+        ended, and freshness alone is no evidence about the new one. The
+        rest of the reading (a window that has not rolled) is still a fact
+        in hand, so only the rolled window is removed, not the whole
+        reading (``_drop_rolled_windows``, reusing the same relevant-window
+        enumeration ``_earliest_reset`` sorts, rather than a second
+        predicate). A reading with nothing left once every relevant window
+        is dropped is None (unknown), same as before.
+
+        A ``trust_extended`` read past ``STALE_OK_S`` (consecutive
+        failures, a live claim, a scheduled next poll) has no such poll: a
+        rolled window there is not "reset, real headroom on the rest" but
+        "unmeasured since before the reset, and nothing has looked since" —
+        dropping it would manufacture headroom from data nobody has
+        reconfirmed. The whole reading nulls instead, same as pre-#325 (the
+        429 arm already enforces this itself, refusing ``trust_extended``
+        outright once any relevant window's reset has passed —
+        ``_rate_limited_trust_ok`` — so it never reaches this branch with a
+        rolled window in the first place; this is the non-429 arm, which
+        has no such reset test).
+
+        ``models`` selects the per-model scoped windows too, matching
+        ``_drop_rolled_windows``'s reuse. Display code reads
+        ``last_good``/``age_s`` directly instead — it may show older data,
+        annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
@@ -475,9 +493,14 @@ class UsageEntry:
             and self.age_s is not None
             and (self.age_s <= STALE_OK_S or self.trust_extended)
         ):
-            if self.fetched_at is not None:
-                now = self.fetched_at + self.age_s
+            if self.fetched_at is None:
+                return self.last_good
+            now = self.fetched_at + self.age_s
+            if self.age_s <= STALE_OK_S:
                 return _drop_rolled_windows(self.last_good, now, models)
+            soonest = _earliest_reset(self.last_good, models)
+            if soonest is not None and soonest <= now:
+                return None
             return self.last_good
         return None
 

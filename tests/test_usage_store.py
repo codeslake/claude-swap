@@ -168,6 +168,36 @@ class TestExtendedTrust:
         assert entry.consecutive_failures == 2
         assert entry.decision_value() is None
 
+    def test_a_rolled_window_nulls_the_whole_reading_once_polling_has_stopped(
+        self, store, clock
+    ):
+        # #325's per-window drop only applies to a FRESH read: dropping a
+        # rolled window and keeping the rest is safe when a poll just
+        # confirmed it, but the non-429 failure arm (unlike the 429 arm's
+        # own `_rate_limited_trust_ok`) grants trust_extended with no reset
+        # test at all -- so a row whose fetches are timing out, last polled
+        # before its 5-hour window rolled over, must not have that window
+        # dropped and its stale 30% 7-day reading surface as 70 points of
+        # headroom nobody has reconfirmed. The whole reading nulls instead,
+        # same as pre-#325.
+        from datetime import datetime, timezone
+
+        reset_at = (
+            datetime.fromtimestamp(clock.now + 100.0, tz=timezone.utc)
+            .isoformat().replace("+00:00", "Z")
+        )
+        usage = {
+            "five_hour": {"pct": 98.0, "resets_at": reset_at},
+            "seven_day": {"pct": 30.0},
+        }
+        store.record({"1": FetchRecord(usage=usage)}, IDENT)
+        clock.advance(310.0)  # past the 5h reset AND past STALE_OK_S
+        store.record({"1": FetchRecord(error="timeout")}, IDENT)
+        entry = store.entries(IDENT)["1"]
+        assert entry.age_s > STALE_OK_S
+        assert entry.trust_extended
+        assert entry.decision_value() is None
+
     def _usage_resetting_at(self, clock, seconds_ahead):
         from datetime import datetime, timezone
 
