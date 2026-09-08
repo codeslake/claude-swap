@@ -15377,9 +15377,9 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
 class TestDynamicNeverWalls0010:
     """adr/0010: `dynamic` must never wall while any account can serve.
 
-    R1 the cooldown yields at the unservable band, R2 the sleep is bounded
-    while the active is within two margins of the bar, R3 two hosts break a
-    rank tie differently. All three gated at ``strategy == "dynamic"``;
+    R1 the cooldown yields once the active is at or under the spent bar,
+    R2 the sleep is bounded while the active is within two margins of that
+    bar. Both gated at ``strategy == "dynamic"``;
     ``tests/test_dynamic_isolation.py`` holds the fence for the other two
     strategies.
     """
@@ -15466,6 +15466,10 @@ class TestDynamicNeverWalls0010:
             ):
                 assert h.engine.tick() is TickOutcome.ERROR
             after_error = h.engine._next_delay(TickOutcome.ERROR)
+            # …but it must not outlive the strategy it was measured under.
+            h.engine.apply_strategy("consume-first")
+            after_flip = h.engine._next_delay(TickOutcome.ERROR)
+            h.engine.apply_strategy("dynamic")
 
             h.tick_with_usage({
                 "1": _usage(50.0), "2": _usage(50.0), "3": _usage(50.0),
@@ -15484,6 +15488,10 @@ class TestDynamicNeverWalls0010:
         assert after_error <= cap, (
             f"{after_error}s after a failed tick — the band the last good "
             "reading measured must survive an errored one"
+        )
+        assert after_flip > cap, (
+            f"{after_flip}s after flipping to `consume-first` — the band "
+            "must not outlive the strategy it was measured under"
         )
         assert healthy > cap, f"{healthy}s — a healthy active keeps the interval"
         assert consume_first > cap, (

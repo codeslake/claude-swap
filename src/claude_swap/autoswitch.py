@@ -165,7 +165,6 @@ SPENT_HEADROOM_PCT = 3.0
 DANGER_INTERVAL_S = poll_policy.URGENT_INTERVAL_S
 
 
-
 def proactive_switch_bar_pct(strategy: str, threshold: float) -> float:
     """The used-% a panel should display as "where the proactive arm fires".
 
@@ -4448,6 +4447,12 @@ class AutoSwitchEngine:
         precedent — the TUI mutates its own in-memory copy and hands it
         here; nothing here touches disk."""
         self.settings = replace(self.settings, strategy=strategy)
+        # `_danger_band` is deliberately not cleared per tick, so it would
+        # otherwise outlive the strategy it was measured under and cap a
+        # `best`/`consume-first` sleep on the next tick that raises before
+        # the recompute — the one path where a non-dynamic tick reads this
+        # flag at all (adr/0009's fence).
+        self._danger_band = False
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
