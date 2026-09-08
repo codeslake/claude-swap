@@ -198,6 +198,14 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "identity-unreadable": (
+        "the session's identity file could not be read — the slot is not "
+        "refreshed until it is readable"
+    ),
+    "lineage-condemned": (
+        "the slot's stored lineage was condemned as another account's — "
+        "`cswap add` re-adopts the live login"
+    ),
 }
 
 SENTINEL_NOTES = {

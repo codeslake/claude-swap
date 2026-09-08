@@ -15306,7 +15306,7 @@ class TestGateUltraReviewFixes:
         assert not posted.called, (
             "the gate POSTed a backup it could not confirm was fresh"
         )
-        assert outcome.error not in (None, "invalid_grant"), (
+        assert outcome.error == "identity-unreadable", (
             f"got {outcome.error!r}: a corrupt identity must defer, not "
             "burn a strike"
         )
