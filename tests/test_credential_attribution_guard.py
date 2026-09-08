@@ -8,16 +8,21 @@ N's grant while it believed it held slot M's, the server killed that
 generation, and the account read as needing a fresh login inside its
 documented 30-day grace window.
 
-The chokepoint is ``CredentialStore._write_account_credentials``
-(``credentials.py``): every write, from any caller (directly, or via the
-switcher's own ``_write_account_credentials`` wrapper), passes through it
-before either backend (``_kc_write_backup`` on macOS, ``_write_backup_enc``
-elsewhere) ever sees the bytes. The guard refuses to replace a *populated*
-slot's stored backup with a different OAuth lineage (a differing
-``oauth.credential_fingerprint``) unless the caller attests
-``attributed=True`` — an explicit, per-call-site claim that it independently
-verified the new bytes belong to that slot (a uuid-verified identity
-resolution, or a structural move/rotation of that same account's own
+The check itself is ``CredentialStore._check_attribution``, shared by the
+main chokepoint (``CredentialStore._write_account_credentials``, reached by
+every caller directly or via the switcher's own ``_write_account_credentials``
+wrapper) and by the two backend-only forwarders the switcher exposes for the
+macOS-keyring-to-security migration's Keychain-only write
+(``switcher.py``'s ``_kc_write_backup``/``_write_backup_enc``, PR 210 round 5
+— these used to be a straight, unguarded pass-through to the store's raw
+backend writers, which is exactly how ``migrations.py`` reached the Keychain
+unattributed). Either path refuses to replace a *populated* slot's stored
+backup with a different OAuth lineage (a differing
+``oauth.credential_fingerprint``, or a backup that could not be read at all —
+"unreadable" refuses like a mismatch, never permits like absent) unless the
+caller attests ``attributed=True`` — an explicit, per-call-site claim that it
+independently verified the new bytes belong to that slot (a uuid-verified
+identity resolution, or a structural move/rotation of that same account's own
 record). A first-ever write into an empty slot has nothing stored to
 contradict it and is never refused by this alone.
 
@@ -26,11 +31,12 @@ the project's own lesson that a container-level or member-listing check goes
 blind the day a new member (a new writer, or a new backend call) is added
 without review:
 
-- ``TestBackendWritersHaveExactlyOneCaller`` walks ``credentials.py`` for
-  every call to the two backend writers and asserts each one is textually
-  inside ``_write_account_credentials`` — the guard cannot be routed around
-  by a new private method that reaches the Keychain or the ``.enc`` file
-  directly.
+- ``TestBackendWritersHaveExactlyOneCaller`` walks EVERY module under
+  ``src/claude_swap`` (not just ``credentials.py`` — a single-file scan is
+  blind to a caller anywhere else in the package) for every call to the two
+  backend writers and asserts each one is textually inside a known guard —
+  the guard cannot be routed around by a new private method that reaches the
+  Keychain or the ``.enc`` file directly.
 - ``TestWriteSiteRosterIsReviewed`` walks ``switcher.py``, ``transfer.py``
   and ``migrations.py`` for every call into the write chokepoint and asserts
   the derived (file, enclosing function) roster matches exactly what this
@@ -44,6 +50,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -154,6 +161,33 @@ class TestAttributionGuardRefusesUnattributedCrossIdentityWrite:
             ACCOUNT_1_BACKUP
         )
 
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_refuses_an_unattested_write_when_the_existing_backup_is_unreadable(
+        self, tmp_path,
+    ):
+        """UNREADABLE must refuse like a mismatch, not permit like absent.
+
+        The plain read the guard used to call returns ``""`` for a populated
+        slot it merely could not read (permission denied, EIO) exactly as it
+        does for a genuinely empty slot — so on any host where a process
+        cannot read its own Keychain (ssh/launchd on macOS, per CONTEXT.md)
+        the guard was silently off for every such write, precisely where
+        the incident it exists for lives."""
+        store = CredentialStore(_Host(tmp_path))
+        store._write_account_credentials("1", "test@example.com", ACCOUNT_1_BACKUP)
+        enc = store._backup_enc_path("1", "test@example.com")
+        enc.chmod(0o000)
+        try:
+            with pytest.raises(CredentialWriteError, match="unreadable"):
+                store._write_account_credentials(
+                    "1", "test@example.com", ACCOUNT_2_LIVE,
+                )
+        finally:
+            enc.chmod(0o600)
+
 
 def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tuple[str | None, int, str]]:
     """Every call to one of ``target_names`` in ``path``, with its innermost
@@ -189,30 +223,78 @@ def _calls_by_enclosing_function(path: Path, target_names: set[str]) -> list[tup
 
 
 class TestBackendWritersHaveExactlyOneCaller:
-    """The chokepoint itself: nothing but the guarded method may reach the
-    Keychain or the ``.enc`` file for a backup write."""
+    """The chokepoint itself: nothing but a guarded method may reach the
+    Keychain or the ``.enc`` file for a backup write.
 
-    def test_kc_write_backup_and_write_backup_enc_are_only_called_from_the_guard(self):
-        hits = _calls_by_enclosing_function(
-            SRC / "credentials.py", {"_kc_write_backup", "_write_backup_enc"},
-        )
-        # Derived, not named: whatever calls exist, every one of them must
-        # be inside `_write_account_credentials` (the reconcile helper it
-        # calls is itself only reached from there too).
-        assert hits, "expected at least the guard's own backend calls"
-        stray = [h for h in hits if h[0] not in (
-            "_write_account_credentials", "_reconcile_enc_after_keychain_write",
-        )]
+    Scanned over EVERY module under ``src/claude_swap`` — a single-file scan
+    (``credentials.py`` alone) is blind to a caller anywhere else in the
+    package, which is exactly how ``migrations.py`` and ``switcher.py``'s own
+    ``_kc_write_backup``/``_write_backup_enc`` forwarders reached the backend
+    writers unguarded (PR 210 round 5).
+
+    What this derivation still cannot see, named rather than left implicit:
+
+    - it matches on ``node.func``'s attribute/name text only, so a call
+      reached through ``getattr(obj, "_kc_write_backup")(...)``, a bound
+      alias (``fn = store._kc_write_backup; fn(...)``), or
+      ``functools.partial`` is invisible to it; and it does not follow
+      control flow, so a stray call behind an ``if`` that never runs today
+      would still fail this test (a false positive, not a false negative —
+      the miss is only ever in the "invisible caller" direction).
+    - it cannot tell WHICH object a matched call targets — the STORE's raw
+      backend writer, or switcher.py's identically-named guarded forwarder
+      calling the store's writer one level down. That is why
+      ``migrate_macos_keyring_to_security`` (which calls the switcher's
+      guarded ``_kc_write_backup``, not the store's) has to be allow-listed
+      by name below rather than derived: this test can prove a call site is
+      reachable, not which method resolution it took. The attribution
+      itself is still enforced at runtime by ``_check_attribution``.
+    """
+
+    ALLOWED_ENCLOSING = frozenset({
+        # credentials.py's own guarded chokepoint and the helper it calls.
+        "_write_account_credentials", "_reconcile_enc_after_keychain_write",
+        # switcher.py's forwarders: each runs the same attribution check
+        # before reaching the backend writer, making them guarded
+        # chokepoints in their own right (their own bodies call the
+        # identically-named store method one level down).
+        "_kc_write_backup", "_write_backup_enc",
+        # migrations.py's one reviewed caller of the switcher's guarded
+        # `_kc_write_backup` (attributed=True; see its own inline comment
+        # for why the source key already establishes the slot's identity).
+        "migrate_macos_keyring_to_security",
+    })
+
+    def test_kc_write_backup_and_write_backup_enc_are_only_called_from_a_guard(self):
+        py_files = sorted(SRC.rglob("*.py"))
+        assert len(py_files) > 3, "expected the whole package, not one file"
+        hits: list[tuple[str, str | None, int, str]] = []
+        for path in py_files:
+            for enclosing, lineno, name in _calls_by_enclosing_function(
+                path, {"_kc_write_backup", "_write_backup_enc"},
+            ):
+                hits.append((path.name, enclosing, lineno, name))
+        # Derived, not named: whatever calls exist anywhere in the package,
+        # every one of them must be inside an allowed guard — never inside
+        # the two forwarder DEFINITIONS' own bodies calling the STORE's
+        # backend writer a second level down (that inner call is exactly
+        # what "the forwarder is itself a guard now" means), and never a
+        # bare caller elsewhere in the tree (migrations.py's old bypass).
+        assert hits, "expected at least the guards' own backend calls"
+        stray = [h for h in hits if h[1] not in self.ALLOWED_ENCLOSING]
         assert stray == [], (
-            f"a backend writer is reachable outside the attribution guard: {stray}"
+            f"a backend writer is reachable outside every known guard: {stray}"
         )
-        # And the reconcile helper (the only other legitimate caller of
+        # The reconcile helper (the only other legitimate caller of
         # `_write_backup_enc`) is itself only called from the guard.
-        reconcile_callers = _calls_by_enclosing_function(
-            SRC / "credentials.py", {"_reconcile_enc_after_keychain_write"},
-        )
+        reconcile_callers: list[tuple[str, str | None, int, str]] = []
+        for path in py_files:
+            for enclosing, lineno, name in _calls_by_enclosing_function(
+                path, {"_reconcile_enc_after_keychain_write"},
+            ):
+                reconcile_callers.append((path.name, enclosing, lineno, name))
         stray_reconcile = [
-            h for h in reconcile_callers if h[0] != "_write_account_credentials"
+            h for h in reconcile_callers if h[1] != "_write_account_credentials"
         ]
         assert stray_reconcile == [], (
             f"the .enc reconcile helper is reachable outside the guard: {stray_reconcile}"

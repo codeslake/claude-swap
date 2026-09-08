@@ -1301,6 +1301,55 @@ class CredentialStore:
         # the single-thread case was never actually safe either.
         return "", bool(failed)
 
+    def _check_attribution(
+        self, account_num: str, email: str, credentials: str, attributed: bool,
+    ) -> None:
+        """Raise unless a populated slot's stored lineage is preserved or
+        attested. Shared by ``_write_account_credentials`` and by any other
+        guarded entry point that reaches a backend writer directly (the
+        macOS-keyring-to-security migration's Keychain-only write) — see
+        ``_write_account_credentials``'s docstring for what the guard means.
+
+        Reads with ``_read_account_credentials_ex`` rather than the plain
+        form: the plain read returns ``""`` for an UNREADABLE populated slot
+        (a locked/denied Keychain, an EIO'd ``.enc``) exactly as it does for
+        a genuinely absent one, and treating those alike disables the guard
+        on any host where a process can't read its own Keychain (ssh/launchd
+        on macOS, per CONTEXT.md) — precisely where the incident this guard
+        exists for lives. Unreadable is "cannot verify", which refuses like
+        a mismatch, not "empty", which would permit like an absent slot.
+        """
+        existing, unreadable = self._read_account_credentials_ex(account_num, email)
+        if unreadable and not attributed:
+            self._host._logger.error(
+                "Refusing to write Account-%s-%s's backup: the existing "
+                "backup could not be read to verify it, and nothing "
+                "attributed this write to this slot. Retry once it is "
+                "readable, or run: cswap add --slot %s",
+                account_num, email, account_num,
+            )
+            raise CredentialWriteError(
+                f"Refusing write into Account-{account_num} ({email}): its "
+                "stored backup is unreadable, so its lineage cannot be "
+                "verified and no attribution was given"
+            )
+        if existing and not attributed and (
+            oauth.credential_fingerprint(existing)
+            != oauth.credential_fingerprint(credentials)
+        ):
+            self._host._logger.error(
+                "Refusing to write Account-%s-%s's backup: the new credential "
+                "does not match what is already stored there, and nothing "
+                "attributed it to this slot. If this account's login "
+                "changed, run: cswap add --slot %s",
+                account_num, email, account_num,
+            )
+            raise CredentialWriteError(
+                f"Refusing cross-identity write into Account-{account_num} "
+                f"({email}): the stored backup's lineage does not match the "
+                "new credential and no attribution was given"
+            )
+
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str,
         *, attributed: bool = False,
@@ -1338,23 +1387,7 @@ class CredentialStore:
         giving a misclassified overwrite a best-effort chance of recovery without
         a /login.
         """
-        existing = self._read_account_credentials(account_num, email)
-        if existing and not attributed and (
-            oauth.credential_fingerprint(existing)
-            != oauth.credential_fingerprint(credentials)
-        ):
-            self._host._logger.error(
-                "Refusing to write Account-%s-%s's backup: the new credential "
-                "does not match what is already stored there, and nothing "
-                "attributed it to this slot. If this account's login "
-                "changed, run: cswap add --slot %s",
-                account_num, email, account_num,
-            )
-            raise CredentialWriteError(
-                f"Refusing cross-identity write into Account-{account_num} "
-                f"({email}): the stored backup's lineage does not match the "
-                "new credential and no attribution was given"
-            )
+        self._check_attribution(account_num, email, credentials, attributed)
         self._retain_previous_backup(account_num, email, credentials)
         if self._use_keychain():
             try:

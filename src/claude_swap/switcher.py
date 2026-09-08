@@ -944,13 +944,31 @@ class ClaudeAccountSwitcher:
     def _backup_enc_path(self, account_num: str, email: str) -> Path:
         return self._store._backup_enc_path(account_num, email)
 
-    def _write_backup_enc(self, account_num: str, email: str, credentials: str) -> None:
+    def _write_backup_enc(
+        self, account_num: str, email: str, credentials: str,
+        *, attributed: bool = False,
+    ) -> None:
+        """Backend-only write (no session invalidation, no dispatch): used
+        to seed a slot's ``.enc`` directly and by the macOS-keyring-to-
+        security migration, which must not fall through to a different
+        backend. Routes through the same attribution guard as
+        ``_write_account_credentials`` so a caller here cannot bypass it —
+        pass ``attributed=True`` only with the same independent proof that
+        method requires.
+        """
+        self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._write_backup_enc(account_num, email, credentials)
 
     def _kc_read_backup(self, account_num: str, email: str) -> str:
         return self._store._kc_read_backup(account_num, email)
 
-    def _kc_write_backup(self, account_num: str, email: str, credentials: str) -> None:
+    def _kc_write_backup(
+        self, account_num: str, email: str, credentials: str,
+        *, attributed: bool = False,
+    ) -> None:
+        """Backend-only write (no session invalidation, no dispatch): see
+        ``_write_backup_enc``, same guard and same reason it exists."""
+        self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._kc_write_backup(account_num, email, credentials)
 
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
@@ -2254,9 +2272,19 @@ class ClaudeAccountSwitcher:
         For inactive accounts only — never routes to the active store. Mirrors
         the persist callback ``_fetch_account_usage`` uses. The caller must NOT
         hold ``self.lock_file`` (FileLock is non-reentrant).
+
+        attributed=True: this is the cswap-pin compat path for a pin running
+        against a cswap that predates ``consume_backup_grant`` — the caller
+        already POSTed the refresh for THIS slot's own grant and is
+        persisting the successor it got back, the same shape as
+        ``_fetch_active_usage``'s attributed resync. Every genuine rotation
+        changes the refresh token (and so the fingerprint), so leaving this
+        unattested would refuse the routine call this method exists for.
         """
         with FileLock(self.lock_file):
-            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_credentials(
+                account_num, email, credentials, attributed=True,
+            )
 
     def account_identity(self, account_num: str) -> dict:
         """Stored identity for a slot: ``{"email", "organizationUuid", "uuid"}``."""
@@ -8103,20 +8131,18 @@ class ClaudeAccountSwitcher:
                     # re-login. Same as the sibling foreign/alien arms:
                     # never into a slot, always preserved.
                     #
-                    # This IS the routine-rotation shape though, so the stash
-                    # carries `consumed_fp` (the slot's own stored backup,
-                    # read now under this same lock) so a later
-                    # `_adopt_stashed_successor` can install it back into
-                    # this slot as its own next generation, rather than
-                    # leaving it stranded until a manual `cswap add`.
+                    # `unresolved` means ownership could not be verified (the
+                    # oracle was offline or failing) — never confirmed. No
+                    # `consumed_fp`: setting it here made the row match
+                    # `_adopt_stashed_successor`'s gate by construction the
+                    # instant it was written (nothing else need happen to the
+                    # slot in between), so a later grant-consume would
+                    # silently adopt these unverified bytes — the wmac
+                    # cross-wire incident one step later. Left stranded until
+                    # a manual `cswap add` confirms it.
                     self._stash_live_credential(
                         original_creds, "unresolved", current_account,
                         provenance.get("resolved"),
-                        consumed_fp=oauth.credential_fingerprint(
-                            self._read_account_credentials(
-                                current_account, current_email
-                            )
-                        ),
                     )
                     msg = (
                         "The live credential diverges from Account-"

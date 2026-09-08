@@ -19,6 +19,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    CredentialWriteError,
     SessionError,
     SwitchError,
     ValidationError,
@@ -6644,9 +6645,35 @@ class TestMacosKeychainFallback:
         self, temp_home: Path, block_real_keychain
     ):
         s = self._macos_switcher()
-        s._kc_write_backup("1", "a@example.com", "STALE-KC")
-        s._write_backup_enc("1", "a@example.com", "FRESH-FILE")
+        # Raw backend seeding (not through the write-time attribution
+        # guard): the point of this test is which BACKEND wins on read when
+        # the two disagree, not the guard's own business logic.
+        s._store._kc_write_backup("1", "a@example.com", "STALE-KC")
+        s._store._write_backup_enc("1", "a@example.com", "FRESH-FILE")
         assert s._read_account_credentials("1", "a@example.com") == "FRESH-FILE"
+
+    def test_kc_write_backup_and_write_backup_enc_route_through_the_guard(
+        self, temp_home: Path, block_real_keychain
+    ):
+        """The switcher's backend-only forwarders (used by the macOS-
+        keyring-to-security migration and by tests to seed a backend
+        directly) must not let a caller bypass the attribution guard —
+        each was, until PR 210 round 5, a straight pass-through to the
+        store's raw backend writer."""
+        s = self._macos_switcher()
+        s._kc_write_backup("1", "a@example.com", "gen-1")
+        with pytest.raises(CredentialWriteError, match="cross-identity"):
+            s._kc_write_backup("1", "a@example.com", "gen-2-unattested")
+        assert s._read_account_credentials("1", "a@example.com") == "gen-1"
+
+        s._write_backup_enc("2", "b@example.com", "gen-1")
+        with pytest.raises(CredentialWriteError, match="cross-identity"):
+            s._write_backup_enc("2", "b@example.com", "gen-2-unattested")
+        assert s._read_account_credentials("2", "b@example.com") == "gen-1"
+
+        # attributed=True still gets through, same as the store's own guard.
+        s._kc_write_backup("1", "a@example.com", "gen-2", attributed=True)
+        assert s._read_account_credentials("1", "a@example.com") == "gen-2"
 
     def test_backup_keychain_write_deletes_enc(
         self, temp_home: Path, block_real_keychain
@@ -6719,8 +6746,9 @@ class TestMacosKeychainFallback:
         self, temp_home: Path, block_real_keychain
     ):
         s = self._macos_switcher()
-        s._kc_write_backup("1", "a@example.com", "KC")
-        s._write_backup_enc("1", "a@example.com", "FILE")
+        # Raw backend seeding — see test_backup_read_enc_wins_over_stale_keychain.
+        s._store._kc_write_backup("1", "a@example.com", "KC")
+        s._store._write_backup_enc("1", "a@example.com", "FILE")
         s._delete_account_credentials("1", "a@example.com")
         assert not s._backup_enc_path("1", "a@example.com").exists()
         assert (SECURITY_SERVICE, "account-1-a@example.com") not in block_real_keychain.data
@@ -6767,6 +6795,28 @@ class TestMacosKeychainFallback:
         s._last_active_credentials_backend = "keychain"
         s._print_switch_followup()
         assert "30 seconds" in capsys.readouterr().out
+
+
+class TestPersistBackupCredentials:
+    """``persist_backup_credentials`` is a public entry point for an
+    external caller that already refreshed a slot's own grant (the
+    cswap-pin compat path used against a cswap predating
+    ``consume_backup_grant``) and is persisting the rotated successor back
+    to that same slot — not a foreign lineage. Every genuine Claude Code
+    refresh rotates the refresh token, so the routine call always differs
+    from the stored fingerprint; an unattested write here would refuse the
+    very rotation this method exists to persist."""
+
+    def test_persists_a_rotation_without_attribution_error(self, temp_home: Path):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_account_credentials("2", "test@example.com", "gen-1")
+
+        switcher.persist_backup_credentials("2", "test@example.com", "gen-2")
+
+        assert switcher._read_account_credentials("2", "test@example.com") == (
+            "gen-2"
+        )
 
 
 class TestFormatUsageLines:
@@ -7384,19 +7434,22 @@ class TestProvenanceGuard:
         # The switch itself proceeded, onto the target's stored backup.
         assert json.loads(live_state["creds"])["claudeAiOauth"]["accessToken"] == "sk-stale-2"
 
-    def test_unresolved_stash_is_adoptable_back_into_its_slot(
+    def test_unresolved_stash_is_not_adoptable_back_into_its_slot(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """An unresolved-arm stash must be adoptable back into its own slot.
+        """An unresolved-arm stash must NOT be adoptable back into its slot.
 
-        Every Claude Code refresh rotates the refresh token, so this arm
-        fires on the ordinary offline rotation far more often than on a
-        genuine cross-account divergence — the stash is usually the slot's
-        own next generation. `_adopt_stashed_successor` (the same gate
-        `consume_backup_grant` uses) only matches a row whose `consumedFp`
-        equals the slot's currently-stored backup; without it the stash can
-        never be adopted and the slot is stuck holding an already-consumed
-        refresh token until a manual `cswap add`."""
+        `unresolved` means ownership could not be verified — the oracle was
+        offline or failing, not that it confirmed the bytes are this slot's
+        own next generation. Setting `consumedFp` from the slot's own stored
+        backup made the row match `_adopt_stashed_successor`'s gate BY
+        CONSTRUCTION the instant it was written (the gate is only
+        `configSlot == account_num AND consumedFp == the slot's current
+        stored backup`), so the next `consume_backup_grant` on that slot
+        would silently adopt genuinely foreign bytes into it — the wmac
+        cross-wire incident one step later. The CAS proves the slot has not
+        moved since the stash; it never proves ownership, and for
+        `unresolved` ownership is unknown by definition."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
             temp_home, sample_sequence_data,
         )
@@ -7416,9 +7469,10 @@ class TestProvenanceGuard:
         adopted = switcher._adopt_stashed_successor(
             "1", "test@example.com", creds_store[("1", "test@example.com")],
         )
-        assert adopted == mystery, (
-            "the unresolved stash's consumedFp never matched the outgoing "
-            "slot's own stored backup, so it could never be adopted back"
+        assert adopted is None, (
+            "an unresolved stash was adoptable back into its own slot; "
+            "ownership was never verified, so a later grant-consume could "
+            "adopt genuinely foreign bytes into this slot"
         )
 
     def test_unresolvable_mismatch_with_wrong_active_slot_never_poisons_it(
