@@ -2034,6 +2034,57 @@ class TestActiveAccountRefresh:
         mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
         assert result.error == "foreign-lineage"  # not the generic "refresh-failed"
 
+    def test_an_unreadable_sequence_file_at_this_recovery_post_never_defers(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review), at this site's own
+        `condemned` callback: `_lineage_key` reads `sequence.json` with
+        `strict=True` and raises `ConfigError` on a torn/unreadable file.
+        Before the fix that escaped to this call's own blanket `except
+        Exception`, which answers `_defer(force_refresh)` — an unreadable
+        store deferring a live refresh on no evidence at all (the softest
+        form of R1's violation: bounded to one pass, no strike, no
+        `/login`, but still a refusal `_condemned`'s own wrapping was meant
+        to end). Wrapped the same way, the POST must proceed instead."""
+        switcher = self._switcher(sample_sequence_data)
+        fault_fired = []
+        real_lineage_key = switcher._lineage_key
+
+        def raise_once(*a, **kw):
+            if not fault_fired:
+                fault_fired.append(True)
+                raise ConfigError(
+                    "sequence.json exists but could not be read"
+                )
+            return real_lineage_key(*a, **kw)
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "sk-new", "refresh_token": "rt-new",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda self_: self_
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_lineage_key", side_effect=raise_once), \
+             patch(
+                 "claude_swap.oauth.urllib.request.urlopen",
+                 return_value=mock_response,
+             ):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._EXPIRED
+            )
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.sentinel is None      # not deferred
+        assert result.error is None
+
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -2892,6 +2943,38 @@ class TestActiveAccountRefresh:
             if "resolves to a different account" in r.getMessage()
         ]
         assert len(warnings) == 1
+
+    def test_an_unreadable_sequence_file_at_the_served_credential_check_never_raises(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review), at this site's own
+        foreign-lineage check: it sits OUTSIDE the locked `try` further
+        down in this method, and `_lineage_key` reads `sequence.json` with
+        `strict=True`, raising `ConfigError` on a torn/unreadable file.
+        Uncaught here it would escape `_fetch_active_usage` entirely and
+        (via `_fetch_account_usage`'s `executor.map`) kill the whole
+        collect pass — the exact defect the consume-gate's own
+        `_condemned` was wrapped for. Wrapped the same way, an unreadable
+        store must not even raise, let alone refuse to serve usage."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts["seed"] = True  # non-empty: reaches the check
+        fault_fired = []
+
+        def raise_fault(*a, **kw):
+            fault_fired.append(True)
+            raise ConfigError("sequence.json exists but could not be read")
+
+        with patch.object(switcher, "_lineage_key", side_effect=raise_fault), \
+             patch.object(switcher, "_resync_rotated_backup"), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}})):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.sentinel is None      # absence of evidence -> served, not refused
+        assert result.usage == {"five_hour": {"pct": 7}}
 
     def test_fresh_probe_failure_skips_resync_and_retries_next_pass(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
