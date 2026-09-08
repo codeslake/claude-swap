@@ -7479,11 +7479,20 @@ class ClaudeAccountSwitcher:
         stored backup at stash time — the generation this stash supersedes.
         It lets `_adopt_stashed_successor` install the stash back into that
         slot once its own backup grant is next consumed, the way an ordinary
-        `own-rotated` resync would have. Only pass it when the stash IS a
-        candidate for that slot's own next generation (the "unresolved" arm,
-        which is indistinguishable from a routine rotation) — never for a
-        positively foreign/alien credential, where doing so would let this
-        slot adopt someone else's bytes.
+        `own-rotated` resync would have.
+
+        No call site passes it today, including the "unresolved" arm: a CAS
+        match on `configSlot`+`consumedFp` only proves the slot has not moved
+        since the stash, never that the bytes belong to it, and `unresolved`
+        means ownership was never verified in the first place. Passing it
+        there made an unresolved stash adoptable by construction the instant
+        it was written — the exact incident this stash exists to prevent,
+        one step later. An unresolved stash must never be made adoptable; it
+        is left stranded until a manual `cswap add` confirms it. A future
+        caller must independently re-verify ownership at ADOPTION time
+        (inside `_adopt_stashed_successor`, under the slot's lock, against a
+        fresh oracle call or a fresh CAS against the ACTIVE store) before
+        this parameter is used for anything.
         """
         creds_mtime: str | None = None
         try:

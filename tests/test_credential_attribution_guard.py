@@ -37,12 +37,13 @@ without review:
   backend writers and asserts each one is textually inside a known guard —
   the guard cannot be routed around by a new private method that reaches the
   Keychain or the ``.enc`` file directly.
-- ``TestWriteSiteRosterIsReviewed`` walks ``switcher.py``, ``transfer.py``
-  and ``migrations.py`` for every call into the write chokepoint and asserts
-  the derived (file, enclosing function) roster matches exactly what this
-  round reviewed — a new call site (or a second call added to an existing
-  one) changes the count and fails the test, forcing the same review this
-  round gave the other twenty.
+- ``TestWriteSiteRosterIsReviewed`` walks EVERY module under
+  ``src/claude_swap`` (not three named files — a hand-named list is blind to
+  a caller in a module nobody named) for every call into the write
+  chokepoint and asserts the derived (file, enclosing function) roster
+  matches exactly what this round reviewed — a new call site (or a second
+  call added to an existing one, in ANY module) changes the count and fails
+  the test, forcing the same review this round gave the other twenty.
 """
 
 from __future__ import annotations
@@ -338,10 +339,10 @@ class TestWriteSiteRosterIsReviewed:
 
     def test_every_writer_is_on_the_reviewed_roster(self):
         derived: Counter[tuple[str, str]] = Counter()
-        for filename in ("switcher.py", "transfer.py", "migrations.py"):
+        for path in sorted(SRC.rglob("*.py")):
+            filename = path.name
             hits = _calls_by_enclosing_function(
-                SRC / filename,
-                {"_write_account_credentials", "write_account_credentials"},
+                path, {"_write_account_credentials", "write_account_credentials"},
             )
             is_switcher = filename == "switcher.py"
             for enclosing, _lineno, _name in hits:
