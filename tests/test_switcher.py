@@ -28,7 +28,7 @@ from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform, normalize_alias
 from claude_swap.paths import get_backup_root, get_credentials_path
 from claude_swap.session import mark_session_stale
-from claude_swap.credentials import ActiveCredentials
+from claude_swap.credentials import ActiveCredentials, CredentialStore
 from claude_swap.switcher import (
     CLAUDE_CODE_KEYCHAIN_SERVICE,
     ClaudeAccountSwitcher,
@@ -8075,6 +8075,61 @@ class TestStashAndRetentionStore:
             "DEFECT: the converge write ran during an attribution read; "
             f"writes: {write_calls}"
         )
+
+    @pytest.mark.skipif(
+        not hasattr(CredentialStore, "_check_attribution"),
+        reason="the write-time attribution guard is #210's; only real once merged",
+    )
+    def test_a_guarded_write_into_a_renumbered_slot_does_not_recurse(
+        self, temp_home, caplog,
+    ):
+        """CRITICAL — the one path the two branches never exercise apart: a
+        REAL guarded write (``_write_account_credentials``, not a hand-set
+        ``_in_attribution_read``) into a slot the roster claims but that is
+        genuinely empty, with the real backup sitting under a sibling slot
+        the roster no longer lists. ``_check_attribution``'s own
+        verification read reaches the renumber-fallback sweep, which finds
+        the sibling and would converge-write it back — from inside the read
+        the guarded write is still waiting on. Without
+        ``_in_attribution_read`` suppressing that converge write, this
+        recurses until Python's limit, caught by the sweep's own broad
+        ``except Exception`` and logged as "could not mirror it back" — an
+        assertion on the return value alone would not see it.
+        """
+        import logging
+
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        leftover = self._oauth_creds(1000)
+        incoming = self._oauth_creds(9000)  # same refreshToken, later generation
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"4": {"email": email, "uuid": "uuid-e"}},
+            },
+        )
+        # Slot "2" is off-roster (a renumber's leftover) but still holds
+        # this email's real backup; slot "4" — what the roster claims — is
+        # genuinely empty.
+        store._write_account_credentials("2", email, leftover)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            store._write_account_credentials("4", email, incoming)
+
+        assert not any(
+            "maximum recursion depth" in r.getMessage() for r in caplog.records
+        ), (
+            "DEFECT: the attribution guard's verification read re-entered "
+            "the renumber-fallback's converge write, recursing until "
+            "Python's limit"
+        )
+        assert store._read_account_credentials_direct("4", email) == incoming
 
     def test_renumber_fallback_never_clobbers_a_fresh_write_that_lands_mid_sweep(
         self, temp_home,
