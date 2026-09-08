@@ -1278,14 +1278,23 @@ class TestDecisionTable:
         assert "all accounts exhausted" in event.human()
 
     def test_a_reset_already_past_is_not_provable_either(self, harness):
-        """The `usable_at <= now` half, which nothing reads the flag for.
+        """The active account's own reset can be past too — and #325
+        changed what that means: ``decision_value()`` now nulls the WHOLE
+        reading once its own reset has elapsed, not just the reset field, so
+        the active's usage reads unknown before this tick ever reaches the
+        fleet-exhaustion / earliest-reset computation this test used to
+        exercise. NO_ACTION / active-usage-unknown is the same path a
+        genuine fetch failure takes — an honest "we do not know", not a
+        provable exhaustion.
 
-        Its sibling below puts the SAME past reset on all three accounts, so
-        `earliest` is None whatever the flag says and the value is never
-        consulted. Mixed -- one account already past, the others hours out --
-        the two halves separate: a past reset means that account could return
-        at any moment, so the fleet is no more provable than one with no reset
-        at all, and announcing the next account's is a claim over it.
+        What would now go undetected: nothing new. The premise this test
+        checked (a past reset must never be announced as the fleet's
+        earliest, nor scheduled toward) cannot arise for THIS input any
+        more, because it never reaches `AllExhaustedEvent` at all; the
+        distinction it drew against its sibling below (mixed vs. uniformly
+        past resets) has collapsed since both now take this same path — the
+        two tests observe identical behaviour, which is honest given the
+        active's own past reset decides the outcome before any peer is read.
         """
         from datetime import datetime, timezone
 
@@ -1300,20 +1309,24 @@ class TestDecisionTable:
             "2": _usage(100, _at(2 * 3600)),
             "3": _usage(100, _at(3 * 3600)),
         })
-        assert outcome is TickOutcome.BLOCKED
-        event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
-        assert event.earliest_reset_at is None, (
-            f"announced {event.earliest_reset_at!r} while account 1's reset has "
-            "already passed — it can return at any moment and nothing measured it"
-        )
-        assert harness.engine._sleep_until_ts is None, (
-            "the sleep armed toward a later account's reset over one that is "
-            "already due"
-        )
-        assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["active-usage-unknown"]
 
     @pytest.mark.parametrize("offset", [-60.0, 0.0])
     def test_all_exhausted_ignores_non_future_reset(self, harness, offset):
+        # #325: every account shares the same non-future reset, so every
+        # reading nulls under `decision_value()`'s WIDE rule -- the tick
+        # reads this fleet the same way it reads three simultaneous fetch
+        # failures (NO_ACTION / active-usage-unknown), not as a provable
+        # exhaustion whose earliest reset must be ignored.
+        #
+        # What would now go undetected: nothing. An `AllExhaustedEvent`
+        # ignoring a non-future reset cannot occur for an all-non-future
+        # fleet any more (every reading nulls before that event is ever
+        # built); the same ignoring-a-non-future-reset behaviour for a
+        # REACHABLE fleet (at least one account's reset still future) stays
+        # covered by `test_all_exhausted_carries_earliest_reset`.
         from datetime import datetime, timezone
 
         reset = (
@@ -1326,11 +1339,9 @@ class TestDecisionTable:
             "2": _usage(100, reset),
             "3": _usage(100, reset),
         })
-        assert outcome is TickOutcome.BLOCKED
-        event = next(e for e in harness.events if isinstance(e, AllExhaustedEvent))
-        assert event.earliest_reset_at is None
-        assert harness.engine._sleep_until_ts is None
-        assert harness.engine._next_delay(outcome) == NO_RESET_FALLBACK_S
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["active-usage-unknown"]
 
 
 class TestIdleHold:
@@ -5330,8 +5341,21 @@ class TestConsumeFirstStrategy:
         ]
 
     def test_active_past_reset_holds_reset_unknown(self, temp_home):
-        # The active account's own reset can be stale too: past == unknown,
-        # which lands on the existing reset-unknown hold.
+        # The active account's own reset can be stale too: past == unknown.
+        # #325 changed WHICH hold that lands on -- `decision_value()` now
+        # nulls the WHOLE reading (not just the reset field) once its own
+        # reset has elapsed, so the active's usage/headroom reads unknown
+        # before the tick ever reaches `_rank_candidates`'s own
+        # reset-unknown check; it takes the earlier, coarser
+        # active-usage-unknown hold instead -- the same one a genuine fetch
+        # failure takes.
+        #
+        # What would now go undetected: the claim that a PAST active reset
+        # is treated identically ("reset-unknown") to a NEVER-reported one --
+        # that is no longer true, and this test is what would have caught a
+        # regression back to it. The `reset-unknown` NoSwitchEvent itself
+        # stays covered, via a genuinely-missing reset, by
+        # `test_reset_unknown_when_active_reset_missing`.
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage7(20, 20, _R_PAST),
@@ -5341,7 +5365,7 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["reset-unknown"]
+        assert reasons == ["active-usage-unknown"]
 
     def _two_phase_tick(
         self, h: EngineHarness, stored: dict, fresh: dict

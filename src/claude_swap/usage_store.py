@@ -449,13 +449,22 @@ class UsageEntry:
             return False
         return True
 
-    def decision_value(self) -> dict | str | None:
+    def decision_value(self, models: tuple[str, ...] = ()) -> dict | str | None:
         """The ``dict | sentinel | None`` value switch decisions run on.
 
         Sentinel wins; else last-good while it is recent enough to trust
-        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness);
-        else None (unknown). Display code reads ``last_good``/``age_s``
-        directly instead — it may show older data, annotated with its age.
+        (≤ ``STALE_OK_S``, or ``trust_extended`` for deliberate staleness)
+        AND its own earliest relevant-window reset is not already in the
+        past — a fetch that SUCCEEDED, inside its trust window, whose
+        server-reported ``resets_at`` has already elapsed describes a window
+        that has ended, and freshness alone is no evidence about the new
+        one. Reuses ``_earliest_reset`` (the same predicate the 429 arm's
+        ``_rate_limited_trust_ok`` already applies) rather than a second
+        one, so a fresh read and a deliberately-stale one answer the past-
+        reset question the same way. ``models`` selects the per-model scoped
+        windows too, matching that same reuse. Else None (unknown). Display
+        code reads ``last_good``/``age_s`` directly instead — it may show
+        older data, annotated with its age.
         """
         if self.sentinel is not None:
             return self.sentinel
@@ -464,6 +473,11 @@ class UsageEntry:
             and self.age_s is not None
             and (self.age_s <= STALE_OK_S or self.trust_extended)
         ):
+            if self.fetched_at is not None:
+                now = self.fetched_at + self.age_s
+                soonest = _earliest_reset(self.last_good, models)
+                if soonest is not None and soonest <= now:
+                    return None
             return self.last_good
         return None
 
