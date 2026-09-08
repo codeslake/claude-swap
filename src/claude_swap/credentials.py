@@ -290,7 +290,7 @@ def _credential_generation(credentials: str) -> float:
     try:
         data = oauth.extract_oauth_data(credentials) or {}
         return float(data.get("expiresAt") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         return 0.0
 
 
@@ -1232,13 +1232,16 @@ class CredentialStore:
                     self._host._get_sequence_data() or {}
                 ).get("accounts", {}).items()
             }
-        except ConfigError:
+        except (ConfigError, AttributeError):
             # A torn/unreadable roster (`_get_sequence_data` is
             # `_read_json(strict=True)`) means no fallback is available —
             # never an exception out of a read. `session.py`'s `_bootstrap`
             # and the collect pass call through here with no handler for
             # one; this fallback must not be able to raise where the plain
-            # direct read above never could.
+            # direct read above never could. `_read_json` only validates
+            # the TOP-LEVEL payload is a dict, so a malformed "accounts"
+            # shape (a list, or an entry that isn't itself a dict) raises
+            # AttributeError from `.items()`/`.get()` below, not ConfigError.
             return ""
         if accounts.get(account_num) != email:
             return ""
@@ -1303,14 +1306,22 @@ class CredentialStore:
         # writer (e.g. `cswap add`) may have filled `account_num` while it
         # ran. Never clobber something that landed with an equally-or-more
         # current generation than what the sweep found.
-        current = self._read_account_credentials_direct(account_num, email)
+        #
+        # C1: a `failed` list is required here — without one, a transient
+        # read denial (a locked Keychain) comes back indistinguishable from
+        # "nothing there" and this write proceeds anyway, clobbering the
+        # fresh material this re-read exists to protect.
+        current_failed: list = []
+        current = self._read_account_credentials_direct(account_num, email, current_failed)
+        if current_failed:
+            return value
         if current and _credential_generation(current) >= _credential_generation(value):
             return current
         try:
-            if self._host.platform == Platform.MACOS and self._use_keychain():
-                self._kc_write_backup(account_num, email, value)
-            else:
-                self._write_backup_enc(account_num, email, value)
+            # Routed through `_write_account_credentials` (not the raw
+            # backend calls) so this write retains the generation it
+            # displaces, same as every other writer in this file.
+            self._write_account_credentials(account_num, email, value)
         except Exception as e:
             self._host._logger.warning(
                 f"Found account {account_num}'s backup relocated under "

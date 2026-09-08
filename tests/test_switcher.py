@@ -7899,13 +7899,16 @@ class TestStashAndRetentionStore:
     ):
         """CRITICAL: never-delete means several same-email copies legitimately
         coexist on disk; the sweep must pick the NEWEST generation, not the
-        first hit by ascending slot number. Concrete failure this reproduces:
-        E at slot 3 (B1) -> a roster edit moves E to 5 (leftover B1 stays at
-        3, a converge read mirrors B1 into 5) -> a re-login writes 5 = B2 ->
-        a later edit moves E to 4. The direct read of 4 is absent; slots 3
-        (B1, older) and 5 (B2, newer) are both reachable by the sweep. Slot 3
-        sorts first, so a lowest-slot-wins sweep would mirror the SPENT B1
-        into 4 while the live B2 sits unread at 5.
+        LAST one found by ascending slot number — the newer copy sits at the
+        LOWER slot here so the two implementations disagree (candidates are
+        appended in ascending slot order, so "last found" would pick the
+        HIGHER slot). Concrete failure this reproduces: E at slot 3 (B1) ->
+        a roster edit moves E to 2 (leftover B1 stays at 3, a converge read
+        mirrors B1 into 2) -> a re-login writes 2 = B2 -> a later edit moves
+        E to 4, leaving BOTH 2 (B2, newer) and 3 (B1, older) as leftovers.
+        The direct read of 4 is absent; slot 3 sorts LAST, so a last-found
+        sweep would mirror the SPENT B1 into 4 while the live B2 sits unread
+        at 2.
         """
         switcher = self._switcher(temp_home)
         store = switcher._store
@@ -7924,23 +7927,24 @@ class TestStashAndRetentionStore:
         )
         store._write_account_credentials("3", email, b1)
 
-        # Roster edit: E moves from 3 to 5. Bare renumber — the backup stays
-        # under 3. A converge read mirrors B1 into 5.
+        # Roster edit: E moves from 3 to 2. Bare renumber — the backup stays
+        # under 3. A converge read mirrors B1 into 2.
         switcher._write_json(
             switcher.sequence_file,
             {
                 "activeAccountNumber": 1,
                 "lastUpdated": "2024-01-01T00:00:00Z",
                 "sequence": [1],
-                "accounts": {"5": {"email": email, "uuid": "uuid-e"}},
+                "accounts": {"2": {"email": email, "uuid": "uuid-e"}},
             },
         )
-        assert store._read_account_credentials("5", email) == b1
+        assert store._read_account_credentials("2", email) == b1
 
-        # A re-login refreshes the backup at 5 to a newer generation.
-        store._write_account_credentials("5", email, b2)
+        # A re-login refreshes the backup at 2 to a newer generation. Slot 3
+        # still holds B1 (never-delete).
+        store._write_account_credentials("2", email, b2)
 
-        # Another roster edit: E moves from 5 to 4. Neither 3 nor 5 remain
+        # Another roster edit: E moves from 2 to 4. Neither 2 nor 3 remain
         # roster keys; the direct read of 4 is genuinely absent.
         switcher._write_json(
             switcher.sequence_file,
@@ -7954,7 +7958,7 @@ class TestStashAndRetentionStore:
 
         assert store._read_account_credentials("4", email) == b2, (
             "DEFECT: the sweep converged on the older generation at the "
-            "lower slot number instead of the newer one"
+            "higher slot number instead of the newer one"
         )
 
     def test_renumber_fallback_never_clobbers_a_fresh_write_that_lands_mid_sweep(
@@ -8007,6 +8011,142 @@ class TestStashAndRetentionStore:
             "DEFECT: the converge write clobbered a fresh login that landed "
             "mid-sweep with the stale copy the sweep found"
         )
+
+    def test_renumber_fallback_never_clobbers_a_fresh_write_masked_by_a_denied_reread(
+        self, temp_home,
+    ):
+        """CRITICAL: the re-read of ``account_num`` right before the mirror
+        write passes NO ``failed`` list, so "could not read" (a transient
+        Keychain denial) is indistinguishable from "genuinely absent" —
+        exactly the C1 class this file already fixed for a plain read, now
+        guarding a WRITE. A fresh login that lands mid-sweep and is then
+        masked by one denied re-read must still survive.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        stale = self._oauth_creds(1000)
+        fresh = self._oauth_creds(9000)
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"1": {"email": email, "uuid": "uuid-1"}},
+            },
+        )
+        # A stale leftover the sweep will find at slot 2 (freed, off-roster).
+        store._write_account_credentials("2", email, stale)
+
+        orig_direct = store._read_account_credentials_direct
+        calls_to_target = [0]
+
+        def racing_direct_read(account_num, email_, failed=None):
+            if account_num == "2":
+                result = orig_direct(account_num, email_, failed)
+                # A concurrent writer lands a fresh login in slot 1 while
+                # the sweep is reading slot 2.
+                store._write_backup_enc("1", email_, fresh)
+                return result
+            if account_num == "1":
+                calls_to_target[0] += 1
+                if calls_to_target[0] == 1:
+                    # The initial direct read, before the sweep starts:
+                    # genuinely absent.
+                    return orig_direct(account_num, email_, failed)
+                # The pre-write re-read. A transient Keychain denial masks
+                # the fresh write that just landed — exactly what the
+                # `failed` list exists to report, and the buggy call site
+                # passes none.
+                if failed is not None:
+                    failed.append(True)
+                return ""
+            return orig_direct(account_num, email_, failed)
+
+        with patch.object(
+            store, "_read_account_credentials_direct", side_effect=racing_direct_read,
+        ):
+            store._read_account_credentials("1", email)
+
+        assert store._read_account_credentials_direct("1", email) == fresh, (
+            "DEFECT: a denied re-read read as 'nothing there' instead of "
+            "'could not tell', so the converge write clobbered a fresh "
+            "login the sweep never actually saw"
+        )
+
+    def test_renumber_fallback_converge_write_retains_the_generation_it_displaces(
+        self, temp_home,
+    ):
+        """IMPORTANT: the converge write bypassed ``_write_account_credentials``,
+        so it was the only writer in this file that skipped
+        ``_retain_previous_backup`` — a generation it displaces was gone
+        with no ``.prev`` recovery copy, unlike every other writer here.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        older_racing = self._oauth_creds(500)
+        stale_swept = self._oauth_creds(1000)
+
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"1": {"email": email, "uuid": "uuid-1"}},
+            },
+        )
+        store._write_account_credentials("2", email, stale_swept)
+
+        orig_direct = store._read_account_credentials_direct
+
+        def racing_direct_read(account_num, email_, failed=None):
+            result = orig_direct(account_num, email_, failed)
+            if account_num == "2":
+                # A concurrent writer lands an OLDER generation into slot 1
+                # mid-sweep — the sweep still supersedes it (newer wins)
+                # but must not do so by throwing the displaced generation
+                # away with no recovery copy.
+                store._write_backup_enc("1", email_, older_racing)
+            return result
+
+        with patch.object(
+            store, "_read_account_credentials_direct", side_effect=racing_direct_read,
+        ):
+            store._read_account_credentials("1", email)
+
+        assert store._read_account_credentials_direct("1", email) == stale_swept
+        assert store._read_previous_backup("1", email) == older_racing, (
+            "DEFECT: the converge write bypassed _write_account_credentials "
+            "and threw away the generation it displaced with no .prev "
+            "recovery copy"
+        )
+
+    def test_renumber_fallback_survives_a_malformed_roster_shape(self, temp_home):
+        """minor, same class as C1: ``_get_sequence_data`` (``_read_json``)
+        validates only that the top-level payload is a dict — ``"accounts"``
+        being a list, or an account entry being a bare string instead of a
+        dict, is valid JSON that still isn't the shape this fallback
+        assumes. ``.items()``/``.get()`` on the wrong shape raised
+        ``AttributeError`` out of a read path exactly like the
+        ``ConfigError`` case above.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "user@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {"1": email},  # malformed: not a dict entry
+            },
+        )
+        assert store._read_account_credentials("1", email) == ""
 
     def test_renumber_fallback_never_raises_on_a_non_digit_roster_key(
         self, temp_home,
