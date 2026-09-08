@@ -15371,3 +15371,143 @@ class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
             "the roster the retry must not fire and the engine must not "
             "invent a candidate"
         )
+
+
+class TestDynamicNeverWalls0010:
+    """adr/0010: `dynamic` must never wall while any account can serve.
+
+    R1 the cooldown yields at the unservable band, R2 the sleep is bounded
+    while the active is within two margins of the bar, R3 two hosts break a
+    rank tie differently. All three gated at ``strategy == "dynamic"``;
+    ``tests/test_dynamic_isolation.py`` holds the fence for the other two
+    strategies.
+    """
+
+    def _harness(self, temp_home, **kwargs):
+        kwargs.setdefault("strategy", "dynamic")
+        kwargs.setdefault("interval_seconds", 360.0)
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(3, "acct3@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+        return h
+
+    @staticmethod
+    def _seed_last_switch_at(h, when):
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        raw = json.loads(path.read_text()) if path.exists() else {"schemaVersion": 1}
+        raw["lastSwitchAt"] = when
+        path.write_text(json.dumps(raw))
+
+    # -- R1: never hold where you would not land ------------------------
+
+    def test_r1_cooldown_does_not_hold_an_active_that_cannot_serve(
+        self, temp_home
+    ):
+        """h=2 is below the bar `_rank_dynamic_candidates` refuses to land
+        on, so the account cannot serve — one second into a 300 s cooldown
+        the engine must still leave it."""
+        h = self._harness(temp_home)
+        self._seed_last_switch_at(h, h.clock.now - 1.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+            "2": _usage(50.0),                                # headroom 50
+            "3": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+        })
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} ({reasons}) — an account the engine would "
+            "refuse to LAND on must not be held by the cooldown"
+        )
+        assert h.active_number() == 2
+
+    def test_r1_the_bypass_cannot_produce_a_two_cycle(self, temp_home):
+        """The anti-flap argument, not a scenario: landing needs
+        `h > SPENT_HEADROOM_PCT` and this departure needs
+        `h <= SPENT_HEADROOM_PCT`, so the account just left can never be
+        the one next landed on. Driven over consecutive ticks well inside
+        one cooldown window, where every bypassed tick could re-decide."""
+        h = self._harness(temp_home)
+        self._seed_last_switch_at(h, h.clock.now - 1.0)
+        fleet = {
+            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+            "2": _usage(50.0),                                # headroom 50
+            "3": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+        }
+        landings = []
+        for _ in range(6):
+            h.tick_with_usage(fleet)
+            landings.append(h.active_number())
+            h.clock.advance(30.0)
+        assert landings == [2] * 6, (
+            f"landed {landings} — a spent account must never be returned to"
+        )
+
+    # -- R2: look ahead by looking more often ---------------------------
+
+    def test_r2_the_sleep_is_bounded_inside_the_danger_band(self, temp_home):
+        """One branch per assertion, merged because they differ only in the
+        active's headroom and the strategy: in-band under `dynamic` is
+        capped, out-of-band is not, and `consume-first` never is."""
+        from claude_swap.autoswitch import DANGER_INTERVAL_S
+
+        # `_respect_poll_plan` shortens a sleep to the store's own next-poll
+        # time — orthogonal, best-effort, and it would mask the upper bounds
+        # the two control assertions below rest on.
+        cap = DANGER_INTERVAL_S * 1.1
+        # ONE harness, re-engined for the last case: `Path.home()` is patched
+        # to `temp_home` for the whole test, so a second harness rooted at a
+        # SUBDIRECTORY would read this one's live account (see
+        # `EngineHarness.__init__`).
+        in_band_fleet = {
+            "1": _usage(95.0) | {"seven_day": {"pct": 0.0}},  # headroom 5
+            "2": _usage(50.0),
+            "3": _usage(50.0),
+        }
+        h = self._harness(temp_home)
+        with patch.object(AutoSwitchEngine, "_respect_poll_plan", lambda self, d: d):
+            h.tick_with_usage(in_band_fleet)
+            in_band = h.engine._next_delay(TickOutcome.NO_ACTION)
+
+            h.tick_with_usage({
+                "1": _usage(50.0), "2": _usage(50.0), "3": _usage(50.0),
+            })
+            healthy = h.engine._next_delay(TickOutcome.NO_ACTION)
+
+            h.settings = replace(h.settings, strategy="consume-first")
+            h.engine = h._make_engine()
+            h.tick_with_usage(in_band_fleet)
+            consume_first = h.engine._next_delay(TickOutcome.NO_ACTION)
+
+        assert in_band <= cap, (
+            f"{in_band}s inside the danger band — the margin is "
+            f"{SPENT_HEADROOM_PCT} points and the tick is 360s"
+        )
+        assert healthy > cap, f"{healthy}s — a healthy active keeps the interval"
+        assert consume_first > cap, (
+            f"{consume_first}s — `consume-first` must keep its own sleep"
+        )
+
+    # -- R3: two hosts must not land on one peer ------------------------
+
+    def test_r3_a_rank_tie_is_broken_per_host(self, temp_home):
+        """Same tied candidate set, two hostnames, two orders — and the
+        same hostname twice, one order."""
+        from claude_swap.autoswitch import _rank_dynamic_candidates
+
+        nums = [str(n) for n in range(1, 8)]
+        headroom = {n: 50.0 for n in nums}
+        usage = {n: _usage(50.0) for n in nums}
+
+        def order(host):
+            with patch("socket.gethostname", return_value=host):
+                warm, cold = _rank_dynamic_candidates(
+                    nums, headroom, usage, 1_000_000.0, {}, 600.0
+                )
+            return warm + cold
+
+        a, b = order("lmd42"), order("pmac")
+        assert a != b, f"both hosts ranked the tie the same way ({a})"
+        assert a == order("lmd42"), "the same host must be stable across calls"
+        assert sorted(a) == sorted(b) == sorted(nums)
