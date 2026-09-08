@@ -2972,7 +2972,18 @@ class TestOutcomeDigestAgainstBase:
     that one function and nothing else moved.
     """
 
-    _N_FLEETS = 40
+    # EIGHT, not forty (#414, the owner's suite-time bar). Every control in
+    # this class and in `TestOutcomeDigest375` still holds on the first eight
+    # fleets of this seed, MEASURED rather than assumed: head/base diverge on
+    # fleet 1 for `best` (5 of 40 at the old count) and on fleets 0/1/4/7 for
+    # `consume-first` (6 of 40), and the stale-exclusion mutant still diverges
+    # from base on fleet 6 (4 of 40) and still moves the head digest for every
+    # strategy. Those are exactly what `assert diffs`, `assert mutant_diffs`
+    # and `assert mutant_results != head_results` below check, so a seed or a
+    # ranking change that empties them fails loudly instead of passing
+    # vacuously -- raise this number then, and say what stopped being caught.
+    # Cost: the two digest classes went 12.1s -> 4.8s run alone.
+    _N_FLEETS = 8
     _DIGEST_SEED = 20260321
 
     def _fleet(self, rng: random.Random, now: float):
