@@ -152,6 +152,14 @@ HORIZON_HEADROOM_RATIO = 2.0
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
 
+# How much headroom a healthy-active ALTERNATION move may hand back (#321
+# follow-up). NOT `settings.hysteresis_pct`, despite the same units and the
+# same default: that setting means "a proactive candidate must BEAT the active
+# by >= X", the OPPOSITE direction — so an operator raising it to damp
+# ping-pong would LOOSEN this bar and buy MORE downgrade-alternation. A module
+# constant, not a setting: no config key, no CLI flag, nothing to mis-tune.
+ALTERNATION_MAX_GIVEBACK_PCT = 10.0
+
 # Strategies that rank by soonest weekly reset rather than most headroom.
 # `dynamic` shares consume-first's ranking key (and every gate keyed on the
 # below-threshold "consume-first" trigger, which this literal also drives —
@@ -2140,7 +2148,8 @@ class AutoSwitchEngine:
             alternation_admissible = [
                 n for n in warm_ordered
                 if floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
-                and active_headroom - floor_headroom.get(n, 0.0) <= settings.hysteresis_pct
+                and floor_headroom.get(current, 0.0) - floor_headroom.get(n, 0.0)
+                <= ALTERNATION_MAX_GIVEBACK_PCT
             ]
             partner = next(iter(alternation_admissible), None)
             since = last_active_at.get(current)

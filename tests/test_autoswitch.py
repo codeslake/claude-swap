@@ -6250,7 +6250,8 @@ class TestWarmthAndAlternation375:
             "1": start - (chunk - 1.0),
             "2": start - 10.0,  # warm, real headroom
         })
-        # Within one `hysteresis_pct` of each other in BOTH directions --
+        # Within one `ALTERNATION_MAX_GIVEBACK_PCT` of each other in BOTH
+        # directions --
         # the round trip this test is about is only alternation while it
         # gives nothing material back (#321 follow-up). The old pair (50
         # vs 70) handed back 20 points on the return leg, which the
@@ -6581,7 +6582,7 @@ class TestWarmthAndAlternation375:
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — a 65-point giveback is not alternation; "
             "the warm partner clears the absolute floor but hands back "
-            "far more headroom than `hysteresis_pct`"
+            "far more headroom than `ALTERNATION_MAX_GIVEBACK_PCT`"
         )
         assert h.active_number() == 1
 
@@ -6611,13 +6612,19 @@ class TestWarmthAndAlternation375:
         assert sw.trigger == "alternation", sw.trigger
         assert h.active_number() == 2
 
-    def test_alternation_admits_a_giveback_of_exactly_the_hysteresis_pct(
+    def test_alternation_admits_a_giveback_of_exactly_the_bar(
         self, temp_home
     ):
-        """The boundary is `<=`: exactly `hysteresis_pct` is admitted."""
+        """The boundary is `<=`: exactly the bar is admitted."""
+        # Imported HERE, never at module scope: `_base_engine_results`
+        # (:2944) runs this whole module against the base commit's
+        # package, and a top-level import of a symbol base does not carry
+        # SKIPS all seven base-digest comparisons in silence.
+        from claude_swap.autoswitch import ALTERNATION_MAX_GIVEBACK_PCT
+
         h = self._harness(temp_home)
         chunk = h.engine.settings.alternation_chunk_seconds
-        give = h.engine.settings.hysteresis_pct
+        give = ALTERNATION_MAX_GIVEBACK_PCT
         self._seed_last_active_at(h, {
             "1": h.clock.now - chunk,
             "2": h.clock.now - 10.0,
