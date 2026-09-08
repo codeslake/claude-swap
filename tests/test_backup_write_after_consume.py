@@ -58,7 +58,7 @@ def test_a_failed_backup_write_does_not_strand_the_spent_token(gate, monkeypatch
         calls.append(creds)
         if len(calls) == 1:
             raise OSError("transient")
-        return real(num, email, creds)
+        return real(num, email, creds, **_kw)
 
     monkeypatch.setattr(gate, "_write_account_credentials", flaky)
     monkeypatch.setattr(gate, "_write_credentials", lambda c: None)
@@ -82,7 +82,7 @@ def test_CONTROL_a_backup_write_that_succeeds_is_not_retried(gate, monkeypatch):
     real = gate._write_account_credentials
     monkeypatch.setattr(
         gate, "_write_account_credentials",
-        lambda n, e, c, **_kw: (calls.append(c), real(n, e, c))[1],
+        lambda n, e, c, **_kw: (calls.append(c), real(n, e, c, **_kw))[1],
     )
     monkeypatch.setattr(gate, "_write_credentials", lambda c: None)
     gate._fetch_active_usage("1", "a@example.com", SPENT)
