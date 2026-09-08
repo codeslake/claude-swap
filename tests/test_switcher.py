@@ -13564,15 +13564,9 @@ class TestConsumeGate:
         Code is using. Defer on account ownership, not just lineage."""
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
-        rotated_live = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-rotated", "refreshToken": "rt-rotated",
-                "expiresAt": 9999999999000,
-            }
-        })
 
         with patch.object(s, "_read_capture_credentials",
-                           return_value=rotated_live), \
+                           return_value=self._NEW), \
              patch(
                  "claude_swap.oauth.try_refresh_oauth_credentials",
                  return_value=oauth.RefreshOutcome(self._NEW, None),
@@ -13584,26 +13578,25 @@ class TestConsumeGate:
         assert result.error == "live-store-current"
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    @pytest.mark.parametrize("identity", ["different-account", "absent"])
     def test_live_store_holding_a_different_account_under_a_rotated_lineage_still_consumes(
         self, temp_home: Path, sample_sequence_data: dict,
-        mock_claude_config: Path,
+        mock_claude_config: Path, identity: str,
     ):
-        """The control for the guard above: ``mock_claude_config`` names
-        test@example.com, not slot 2's account2@example.com -- a live store
-        on a different lineage AND a different account must still be
+        """The control for the guard above: a live store on a different
+        lineage AND a different (or absent) account must still be
         reachable, or the identity arm defers on every mismatch and usage
-        polling silently stops for the whole fleet."""
+        polling silently stops for the whole fleet. ``mock_claude_config``
+        names test@example.com, not slot 2's account2@example.com; the
+        "absent" case removes it entirely -- no live login at all, which
+        must behave like a different account, not like "unreadable"."""
+        if identity == "absent":
+            mock_claude_config.unlink()
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("2", "account2@example.com", self._OLD)
-        rotated_live = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-rotated", "refreshToken": "rt-rotated",
-                "expiresAt": 9999999999000,
-            }
-        })
 
         with patch.object(s, "_read_capture_credentials",
-                           return_value=rotated_live), \
+                           return_value=self._NEW), \
              patch(
                  "claude_swap.oauth.try_refresh_oauth_credentials",
                  return_value=oauth.RefreshOutcome(self._NEW, None),
@@ -13624,15 +13617,9 @@ class TestConsumeGate:
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
         mock_claude_config.write_text("not json")
-        rotated_live = json.dumps({
-            "claudeAiOauth": {
-                "accessToken": "sk-rotated", "refreshToken": "rt-rotated",
-                "expiresAt": 9999999999000,
-            }
-        })
 
         with patch.object(s, "_read_capture_credentials",
-                           return_value=rotated_live), \
+                           return_value=self._NEW), \
              patch(
                  "claude_swap.oauth.try_refresh_oauth_credentials",
                  return_value=oauth.RefreshOutcome(self._NEW, None),
