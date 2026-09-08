@@ -631,15 +631,15 @@ def _seven_day_reset_unmeasured(usage: dict | str | None, now: float) -> bool:
     read here under its own name since this is the probe gate's own
     question, not a ranking one.
 
-    Owner order #401 (measured on wmac, 2026-09-08): a stale snapshot whose
-    ``resets_at`` has since ELAPSED is NOT "a fact already in hand" — it
-    describes the window that just ended, and carries no information about
-    the new one. The engine's ordinary polling cadence does not correct it
-    either: the account read a stale ``7d 100%`` for 191 minutes as an
-    unprobed peer, corrected only because it happened to become active for
-    an unrelated reason. So an elapsed reset is exactly the gap a probe
-    exists to close, same as a reset that was never reported at all — only
-    a reset that has NOT yet elapsed is a genuine fact to defer to.
+    A stale snapshot whose ``resets_at`` has since ELAPSED is NOT "a fact
+    already in hand" — it describes the window that just ended, and carries
+    no information about the new one, and nothing on the engine's ordinary
+    polling cadence corrects it: a fetch keeps refreshing ``fetchedAt``
+    while the account is merely a peer, but the *value* it reports for a
+    window that has already rolled over is stale until the account is
+    activated. So an elapsed reset is exactly the gap a probe exists to
+    close, same as a reset that was never reported at all — only a reset
+    that has NOT yet elapsed is a genuine fact to defer to.
     """
     return _seven_day_reset_ts(usage, now) is None
 
@@ -691,8 +691,8 @@ def select_probe_target(
 ) -> str | None:
     """Which account (if any) this fleet admits as this tick's probe
     target: the readable candidate with the most headroom whose weekly
-    reset has never been reported, and which is not cooling down from a
-    previous probe.
+    reset is unknown or has already elapsed, and which is not cooling down
+    from a previous probe.
 
     ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
     narrowed to candidates that cleared its own servability/no-return/

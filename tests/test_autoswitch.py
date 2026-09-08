@@ -5329,29 +5329,6 @@ class TestConsumeFirstStrategy:
             "below-threshold"
         ]
 
-    def test_candidate_with_past_reset_is_probed_not_ranked_as_soonest(
-        self, temp_home
-    ):
-        # A stale snapshot whose resets_at has already elapsed means the
-        # weekly window just rolled over: on the raw reset-ordering axis it
-        # still ranks as unknown, never as "soonest" (`_seven_day_reset_ts`'s
-        # own past==unknown rule, unchanged). But per owner order #401 that
-        # elapsed reset is also a probe candidate now (see
-        # TestConsumeFirstProbesAnUnknownReset), and a probe outranks every
-        # known reset however soon — so it, not the known-soonest peer, is
-        # what wins the tick.
-        h = self._harness(temp_home)
-        outcome = h.tick_with_usage({
-            "1": _usage7(20, 20, _R_LATER),
-            "2": _usage7(10, 10, _R_PAST),     # elapsed -- probed, not ranked
-            "3": _usage7(10, 10, _R_SOON),
-        })
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 2
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
-        assert sw.trigger == "probe"
-
     def test_active_past_reset_holds_reset_unknown(self, temp_home):
         # The active account's own reset can be stale too: past == unknown,
         # which lands on the existing reset-unknown hold.
@@ -5517,13 +5494,12 @@ class TestConsumeFirstProbesAnUnknownReset:
     def test_an_elapsed_reset_is_treated_as_a_probe_candidate(
         self, temp_home
     ):
-        # Owner order #401 (measured on wmac, 2026-09-08): a stale snapshot
-        # whose reset has since ELAPSED is not "a fact already in hand" --
-        # it carries no information about the NEW window, and the ordinary
-        # polling cadence does not refresh it on its own (measured: 191
-        # minutes as an unprobed peer, corrected only by the account
-        # happening to become active). Treated the same as a never-reported
-        # reset, so it must jump the queue the same way.
+        # A stale snapshot whose reset has since ELAPSED is not "a fact
+        # already in hand" -- it carries no information about the NEW
+        # window, and nothing about the account's ordinary polling cadence
+        # corrects the stale value on its own; only activating the account
+        # does. Treated the same as a never-reported reset, so it must jump
+        # the queue the same way.
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage7(20, 20, _R_LATER),
