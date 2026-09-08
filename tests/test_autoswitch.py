@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import functools
+import hashlib
+import io
 import json
 import logging
 import os
+import random
+import subprocess
+import sys
+import tarfile
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -32,6 +38,7 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    _seven_day_reset_ts,
     classify_candidate_block,
     pct_label,
 )
@@ -106,8 +113,13 @@ def _blind_quarantine(h, num, email, reason="identity-conflict"):
 class EngineHarness:
     """Seeded switcher + engine + captured events, on the Linux file backend."""
 
-    def __init__(self, temp_home: Path, **settings_kwargs):
+    def __init__(self, temp_home: Path, *, engine_cls=None, **settings_kwargs):
         self.temp_home = temp_home
+        # Base-vs-head comparison (TestOutcomeDigestAgainstBase) drives the
+        # SAME switcher/settings/clock through a different `AutoSwitchEngine`
+        # class (a pre-fix source loaded separately) — this is the one hook
+        # that needs, so the harness itself stays a single implementation.
+        self._engine_cls = engine_cls or AutoSwitchEngine
         # get_backup_root() (switcher.py) resolves via Path.home() on every
         # platform (both its XDG branch and its legacy
         # get_legacy_backup_root() fallback honour it, paths.py:101-108) —
@@ -139,7 +151,7 @@ class EngineHarness:
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
-        return AutoSwitchEngine(
+        return self._engine_cls(
             self.switcher,
             self.settings,
             self.events.append,
@@ -2611,6 +2623,997 @@ class TestABareLoginToAnUnownedIdentityGetsItsOwnSlotThroughTheEngineTick:
         )
 
 
+class TestProactiveExcludesStaleUsage:
+    """The `proactive` trigger (strategy `best`, above threshold) must refuse
+    a candidate the same way `consume-first`'s phase-2 refetch already does:
+    a cached usage row that is stale/unreadable (active backoff, a run of
+    poll failures, a failure `lastError`) is never admitted as a landing
+    spot, even when its `last_good` figures rank it best. Without this, a
+    candidate walled off by the collector (repeated 429s) gets consumed as
+    if its cached headroom were live."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_proactive_does_not_admit_a_backed_off_candidate(self, temp_home):
+        """The Account-6 shape: `lastGood` genuinely too old (past even the
+        collector's own extended trust, not merely `fresh()`'s TTL —
+        `trust_extended=False`, unlike the decision-trusted backoff a peer
+        stays a target on, see `test_proactive_admits_a_throttled_but_fresh_
+        candidate`), a run of failures and an active backoff. `decision_
+        value()` no longer trusts this reading -- and BEFORE
+        `candidate_is_untrustworthy` is ever consulted, ranking's own
+        headroom-None filter has already dropped it (`usage[num] =
+        entry.decision_value()`, `headroom.get(num) is None: continue` in
+        `_rank_candidates_pass`) -- so the tick reads "no candidate has
+        readable usage", not the per-candidate skip. Either way the
+        candidate is never landed on."""
+        from claude_swap.autoswitch import candidate_is_untrustworthy
+
+        h = self._harness(temp_home)
+        # Active over threshold (headroom 5 < hysteresis floor) -> must move.
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        # #2's cached figures (headroom 100) would rank it best, but the
+        # entry is exactly what a walled, failing candidate looks like: old
+        # `fetched_at` well past decision trust, repeated failures, an
+        # active backoff and a failure `lastError`.
+        stale_entry = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now - 7200.0,
+            age_s=7200.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=h.clock.now + 400.0,
+        )
+        assert stale_entry.decision_value() is None
+        assert candidate_is_untrustworthy(stale_entry, h.clock.now)
+        outcome = h.tick_with_entries({"1": active_entry, "2": stale_entry})
+        # No OTHER candidate in this 2-account fleet, and #2's usage is
+        # unreadable (decision-untrusted) -> BLOCKED ("wanted to switch but
+        # no viable target"), not NO_ACTION.
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "no-comparison" in reasons
+
+    def test_control_the_same_candidate_fresh_is_admitted(self, temp_home):
+        """Mutant control: the same candidate, freshly fetched, IS switched
+        to — proving #2 was otherwise rank-eligible and the hold above is the
+        staleness gate firing, not some other refusal."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        fresh_entry = _entry_for(_usage(0), h.clock.now)
+        outcome = h.tick_with_entries({"1": active_entry, "2": fresh_entry})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_proactive_admits_a_stale_but_decision_trusted_candidate(
+        self, temp_home
+    ):
+        """m-1: past `fresh()`'s SERVE_TTL_S (180 s) is not "cannot be
+        trusted" on its own -- `decision_value()` already trusts this row
+        (well inside STALE_OK_S, 300 s), and nothing about it carries the
+        incident's own signature (no backoff, no failures, no strike). The
+        full staleness predicate refused it; `proactive`'s own bar must
+        admit it."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        trusted_stale = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now - 200.0, age_s=200.0,
+        )
+        outcome = h.tick_with_entries({"1": active_entry, "2": trusted_stale})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_control_the_same_age_with_a_bare_failure_is_still_admitted(
+        self, temp_home
+    ):
+        """Mutant control: identical age (200s, inside STALE_OK_S), and a
+        recorded failure but no backoff -- a bare failure count is not the
+        incident's signature on its own; `decision_value()` still trusts
+        this reading, so it stays admitted, same as the age-alone case
+        above. Only backoff/failures COMBINED with a reading `decision_
+        value()` no longer trusts refuses (see
+        `test_proactive_does_not_admit_a_backed_off_candidate`)."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        failing_stale = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now - 200.0, age_s=200.0,
+            consecutive_failures=3,
+        )
+        assert failing_stale.decision_value() is not None
+        outcome = h.tick_with_entries({"1": active_entry, "2": failing_stale})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_proactive_does_not_admit_a_struck_candidate_even_when_fresh(
+        self, temp_home
+    ):
+        """A collector-struck (`invalid_grant`, twice — past the race-doubt
+        window) candidate must not be admitted even in the narrow window
+        where its `fetched_at` still reads fresh (the strike landed without
+        a later success reaging it) — the freshness gate alone (previous
+        test) would pass this one through."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        struck_entry = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now,
+            age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert struck_entry.token_dead()
+        outcome = h.tick_with_entries({"1": active_entry, "2": struck_entry})
+        # See test_proactive_does_not_admit_a_backed_off_candidate: skipping
+        # the only candidate falls through to BLOCKED, not NO_ACTION.
+        assert outcome is TickOutcome.BLOCKED
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-candidate-skipped" in reasons
+
+    def test_proactive_admits_a_throttled_but_fresh_candidate(self, temp_home):
+        """The reviewer's own fixture: `fetched_at` moves only on success,
+        `backoffUntil`/`consecutiveFailures` only on failure, so "succeeded
+        30s ago, then one poll 429'd" is fresh (well inside `STALE_OK_S`,
+        300s) and decision-trusted — `in_backoff`/`consecutive_failures`
+        alone is not the incident's signature; only backoff/failures PLUS a
+        reading `decision_value()` no longer trusts is. Today (before the
+        fix) this candidate is refused for the whole backoff and the tick
+        falls through to BLOCKED — see the mutant below, which reproduces
+        that by dropping the reading-stale half of the predicate."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        throttled_but_fresh = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now - 30.0,
+            age_s=30.0,
+            consecutive_failures=1,
+            last_error="http-429",
+            backoff_until=h.clock.now + 3600.0,
+        )
+        outcome = h.tick_with_entries({"1": active_entry, "2": throttled_but_fresh})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_candidate_is_untrustworthy_construction(self):
+        """The predicate itself, on the five cases the fix must classify
+        correctly (`_rank_candidates_pass`'s own headroom-None filter
+        already keeps a decision-untrusted candidate out of the engine's
+        per-candidate loop -- see `test_proactive_does_not_admit_a_backed_
+        off_candidate` -- so this checks the FUNCTION directly rather than
+        only through a reachable tick)."""
+        from claude_swap.autoswitch import candidate_is_untrustworthy
+
+        now = 1_000_000.0
+        # 1. API-key last-resort sentinel: never fetched, no failures.
+        sentinel = UsageEntry(sentinel="api-key")
+        assert not candidate_is_untrustworthy(sentinel, now)
+        # 2. A claimed/still-fresh-enough row, no failures.
+        claimed = UsageEntry(
+            last_good=_usage(0), fetched_at=now - 200.0, age_s=200.0,
+        )
+        assert not candidate_is_untrustworthy(claimed, now)
+        # 3. Throttled but fresh: the reviewer's own shape.
+        throttled_but_fresh = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=now - 30.0,
+            age_s=30.0,
+            consecutive_failures=1,
+            last_error="http-429",
+            backoff_until=now + 3600.0,
+        )
+        assert not candidate_is_untrustworthy(throttled_but_fresh, now)
+        # 4. Account-6 shape: genuinely too old for decision_value() to
+        # trust, on top of the failures/backoff.
+        account_6 = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=now - 7200.0,
+            age_s=7200.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=now + 400.0,
+        )
+        assert candidate_is_untrustworthy(account_6, now)
+        # 5. Struck, even while fresh.
+        struck = UsageEntry(
+            last_good=_usage(0), fetched_at=now, age_s=0.0, auth_dead_strikes=2,
+        )
+        assert candidate_is_untrustworthy(struck, now)
+
+
+class TestProactiveSkipsAStaleTopCandidateForTheNextRanked:
+    """A stale top-ranked candidate must not park the WHOLE tick: `proactive`
+    (unlike consume-first, see below) tries the next-ranked healthy
+    candidate instead of holding — the fleet-exhaustion `best`'s own
+    two-candidate fixture above cannot see (the only candidate stale IS the
+    whole fleet exhausted; nothing is left to prefer)."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_switches_to_the_healthy_next_ranked_candidate(self, temp_home):
+        from claude_swap.autoswitch import candidate_is_untrustworthy
+
+        h = self._harness(temp_home)
+        # Active over threshold, real headroom (5) -> proactive, not at-limit.
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        # #2 would rank best (headroom 100) but is walled by the collector,
+        # and genuinely too old for `decision_value()` to trust any more
+        # (unlike a decision-trusted backoff, which stays a target — see
+        # TestProactiveExcludesStaleUsage.test_proactive_admits_a_throttled_
+        # but_fresh_candidate).
+        stale_top = UsageEntry(
+            last_good=_usage(0),
+            fetched_at=h.clock.now - 7200.0,
+            age_s=7200.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=h.clock.now + 400.0,
+        )
+        assert stale_top.decision_value() is None
+        assert candidate_is_untrustworthy(stale_top, h.clock.now)
+        # #3 ranks second (headroom 90) and is healthy — the fix's target.
+        healthy_next = _entry_for(_usage(10), h.clock.now)
+        outcome = h.tick_with_entries(
+            {"1": active_entry, "2": stale_top, "3": healthy_next}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        # The FAULT this guards: landing on the stale top candidate instead
+        # of skipping to the healthy one — assert the marker directly, not
+        # only the outcome. #2's unreadable usage drops it out of ranking
+        # itself (headroom-None), so no per-candidate skip event fires here
+        # — see test_proactive_does_not_admit_a_backed_off_candidate.
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+    def test_control_the_same_top_candidate_fresh_is_taken_instead(
+        self, temp_home
+    ):
+        """Mutant control: #2 fresh (not stale) outranks #3 and IS taken —
+        proving the skip above is the staleness gate choosing #3, not #2
+        being unrankable for some other reason."""
+        h = self._harness(temp_home)
+        active_entry = _entry_for(_usage(95), h.clock.now)
+        fresh_top = _entry_for(_usage(0), h.clock.now)
+        healthy_next = _entry_for(_usage(10), h.clock.now)
+        outcome = h.tick_with_entries(
+            {"1": active_entry, "2": fresh_top, "3": healthy_next}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive"
+
+
+class TestFailoverSkipsAStaleTopCandidate:
+    """m1: `failover` (active usage unreadable) reaches the same per-
+    candidate freshen loop as `proactive` — a struck/token-dead top-ranked
+    candidate must be skipped for a healthy next-ranked one, never landed
+    on via `_freshen_target`'s near-expiry fast path (which returns "ok"
+    without ever reading the collector's stale/struck verdict on this
+    candidate — see `_freshen_target`'s own docstring)."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def _drive_to_failover(self, h, entries_after):
+        """`unhealthy_ticks` (3, default) consecutive unreadable-active
+        ticks are spent before failover is even considered."""
+        blank = {"1": UsageEntry(), "2": UsageEntry(), "3": UsageEntry()}
+        for _ in range(h.settings.unhealthy_ticks - 1):
+            outcome = h.tick_with_entries(blank)
+            assert outcome is TickOutcome.NO_ACTION
+        return h.tick_with_entries(entries_after)
+
+    def test_skips_a_token_dead_top_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        struck_top = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert struck_top.token_dead()
+        healthy_next = _entry_for(_usage(10), h.clock.now)
+        outcome = self._drive_to_failover(
+            h, {"1": UsageEntry(), "2": struck_top, "3": healthy_next}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        # The FAULT this guards: failover landing on the dead top candidate.
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+    def test_control_the_same_top_candidate_healthy_is_taken_instead(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        healthy_top = _entry_for(_usage(0), h.clock.now)
+        other = _entry_for(_usage(10), h.clock.now)
+        outcome = self._drive_to_failover(
+            h, {"1": UsageEntry(), "2": healthy_top, "3": other}
+        )
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+    @staticmethod
+    def _backed_off(usage, now):
+        """A peer in a 429 backoff: past `fresh()`'s TTL, still decision-
+        trusted (`trust_extended`), credential fine."""
+        return UsageEntry(
+            last_good=usage, fetched_at=now - 1000.0, age_s=1000.0,
+            consecutive_failures=9, last_error="http-429",
+            backoff_until=now + 400.0, trust_extended=True,
+        )
+
+    def test_lands_on_a_backed_off_peer_when_the_active_is_struck(
+        self, temp_home
+    ):
+        """I-a: failover is the ACTIVE credential failing. A peer in a 429
+        backoff is trusted-but-not-fresh by design (usage_store keeps
+        serving a throttled row so it stays a switch target); gating
+        failover on the full staleness predicate refused every such peer
+        and left the engine BLOCKED on a fleet whose credentials were all
+        fine. Only a struck credential may disqualify a failover target."""
+        h = self._harness(temp_home)
+        outcome = self._drive_to_failover(
+            h,
+            {
+                "1": UsageEntry(),
+                "2": self._backed_off(_usage(0), h.clock.now),
+                "3": self._backed_off(_usage(10), h.clock.now),
+            },
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "failover"
+
+    def test_control_a_struck_top_peer_is_still_skipped_for_a_backed_off_one(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        struck_top = UsageEntry(
+            last_good=_usage(0), fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert struck_top.token_dead()
+        outcome = self._drive_to_failover(
+            h,
+            {
+                "1": UsageEntry(),
+                "2": struck_top,
+                "3": self._backed_off(_usage(10), h.clock.now),
+            },
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 3
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert "stale-candidate-skipped" in reasons
+
+
+_PR_321_BASE_SHA = "f227dffb76b1086b05c3e35ba07f275bbc9a41a1"
+
+
+def _base_engine_results(
+    tmp_path: Path, strategy: str, seed: int, n_fleets: int,
+    *, base_sha: str = _PR_321_BASE_SHA, custom_fleets: list[dict] | None = None,
+    settings_kwargs: dict | None = None,
+):
+    """`n_fleets` fleets generated from `seed` (the same generator
+    `TestOutcomeDigestAgainstBase._fleet` uses) — or, when `custom_fleets`
+    is given, those NAMED fleets verbatim instead — run through the
+    `base_sha` `AutoSwitchEngine` in a fresh subprocess against ITS OWN
+    `claude_swap` package — a different `usage_store`/`switcher`/`settings`/
+    `autoswitch`, not merely a fresh module namespace sharing this process's
+    `sys.modules`. Same technique as `test_dynamic_isolation.py`'s
+    `_digests_at_base_rev`: guard-and-skip, `git archive` + `tarfile`, a
+    driver subprocess, a positive control on where `claude_swap` resolved
+    from.
+
+    SKIPPED, not failed, when `base_sha` is not in the object database —
+    CI checks out at `refs/pull/N/merge` with fetch-depth 1, so this
+    branch's own pre-PR base is never in that checkout, and a bare
+    `git show` there would redden every job today and every run forever
+    once the branch is deleted post-merge.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{base_sha}^{{commit}}"],
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"{base_sha} is not in this checkout's object database")
+    old_root = tmp_path / "base_src"
+    old_root.mkdir()
+    archive = subprocess.run(
+        ["git", "-C", str(repo_root), "archive", "--format=tar", base_sha, "src"],
+        capture_output=True, check=True,
+    )
+    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
+        tf.extractall(old_root, filter="data")  # trusted: our own repo's history
+    module_dir = tmp_path / "base_driver"
+    module_dir.mkdir()
+    # HEAD's test module runs against BASE's package: a name this file imports
+    # from `claude_swap` that post-dates the base sha reddens the driver
+    # (ImportError) instead of skipping.
+    (module_dir / "test_autoswitch.py").write_text(
+        Path(__file__).read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    homes_dir = tmp_path / f"base_homes_{strategy}"
+    homes_dir.mkdir()
+    driver = module_dir / "_zz_base_engine_driver.py"
+    if custom_fleets is not None:
+        # `custom_fleets`: raw {account: usage-dict} maps (JSON-friendly);
+        # `_run` wants {account: UsageEntry} same as `_fleet` produces, so
+        # the driver converts via `_entry_for` at the SAME `now` `_fleet`
+        # anchors on.
+        fleets_dir = tmp_path / "custom_fleets"
+        fleets_dir.mkdir()
+        fleets_file = fleets_dir / "fleets.json"
+        fleets_file.write_text(json.dumps(custom_fleets))
+        fleets_setup = (
+            f"raw_fleets = json.loads(Path({str(fleets_file)!r}).read_text())\n"
+            "fleets = [\n"
+            "    {num: ta._entry_for(v, 1_000_000.0) for num, v in raw.items()}\n"
+            "    for raw in raw_fleets\n"
+            "]\n"
+        )
+    else:
+        fleets_setup = (
+            f"rng = random.Random({seed})\n"
+            "fleets = []\n"
+            f"for _ in range({n_fleets}):\n"
+            "    entries, _ = ta.TestOutcomeDigestAgainstBase._fleet(None, rng, 1_000_000.0)\n"
+            "    fleets.append(entries)\n"
+        )
+    driver.write_text(
+        "import sys, json, random\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(old_root / 'src')!r})\n"
+        f"sys.path.insert(0, {str(module_dir)!r})\n"
+        "import claude_swap\n"
+        "import test_autoswitch as ta\n"
+        f"{fleets_setup}"
+        "results = ta.TestOutcomeDigestAgainstBase._run(\n"
+        f"    None, ta.AutoSwitchEngine, Path(sys.argv[1]), 'base', fleets, {strategy!r},\n"
+        f"    **{settings_kwargs or {}!r}\n"
+        ")\n"
+        "print(json.dumps({'_claude_swap_file': claude_swap.__file__, "
+        "'results': results}))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(driver), str(homes_dir)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        # The digest is a PR-branch invariant (base vs THIS PR's head), not
+        # an integration one: where a later PR's merge has added a symbol
+        # to `claude_swap.autoswitch` that this test module now imports,
+        # base's own package (frozen at `base_sha`) cannot satisfy it and
+        # the comparison is undefined — SKIP, exactly as this function
+        # already skips when the base object itself is absent. Any OTHER
+        # subprocess failure (a real digest-run crash) still reds.
+        import_line = next(
+            (
+                line for line in result.stderr.splitlines()
+                if "ImportError" in line or "ModuleNotFoundError" in line
+            ),
+            None,
+        )
+        if import_line is not None:
+            pytest.skip(
+                f"base {base_sha[:8]} cannot import this test "
+                f"module: {import_line}"
+            )
+    assert result.returncode == 0, (
+        f"base-engine driver failed: rc={result.returncode}\n"
+        f"STDOUT={result.stdout}\nSTDERR={result.stderr}"
+    )
+    out = json.loads(result.stdout.strip().splitlines()[-1])
+    # POSITIVE CONTROL, per test_dynamic_isolation.py: an editable install
+    # could resolve `claude_swap` to the working tree regardless of
+    # `sys.path` order, which would compare HEAD against itself.
+    assert out["_claude_swap_file"].startswith(str(old_root)), (
+        f"the subprocess imported claude_swap from outside {old_root} — "
+        f"this compared HEAD against itself, not against {base_sha}"
+    )
+    return [
+        (name, active, tuple(tuple(e) for e in events))
+        for name, active, events in out["results"]
+    ]
+
+
+class TestOutcomeDigestAgainstBase:
+    """The #321 invariant: `best`'s ranking/admission must stay identical to
+    the PR's base commit except the one exclusion this PR adds. Proven by
+    running identical random fleets through the pre-fix and post-fix
+    `AutoSwitchEngine` and diffing the whole per-tick outcome sequence —
+    with a mutant control that reproduces the pre-fix digest exactly by
+    neutralizing only the new exclusion, so the delta is attributable to
+    that one function and nothing else moved.
+    """
+
+    # EIGHT, not forty (#414, the owner's suite-time bar). Every control in
+    # this class and in `TestOutcomeDigest375` still holds on the first eight
+    # fleets of this seed, MEASURED rather than assumed: head/base diverge on
+    # fleet 1 for `best` (5 of 40 at the old count) and on fleets 0/1/4/7 for
+    # `consume-first` (6 of 40), and the stale-exclusion mutant still diverges
+    # from base on fleet 6 (4 of 40) and still moves the head digest for every
+    # strategy. Those are exactly what `assert diffs`, `assert mutant_diffs`
+    # and `assert mutant_results != head_results` below check, so a seed or a
+    # ranking change that empties them fails loudly instead of passing
+    # vacuously -- raise this number then, and say what stopped being caught.
+    # Cost: the two digest classes went 12.1s -> 4.8s run alone.
+    _N_FLEETS = 8
+    _DIGEST_SEED = 20260321
+
+    def _fleet(self, rng: random.Random, now: float):
+        resets = (_R_SOON, _R_LATER, _R_LATEST)   # module globals, late-bound
+        active = _entry_for(
+            _usage7(rng.uniform(80, 99), rng.uniform(0, 50), rng.choice(resets)),
+            now,
+        )
+        entries = {"1": active}
+        stale_nums = set()
+        for num in ("2", "3"):
+            last_good = _usage7(
+                rng.uniform(0, 60), rng.uniform(0, 60), rng.choice(resets)
+            )
+            roll = rng.random()
+            if roll < 0.35:
+                stale_nums.add(num)
+                entries[num] = UsageEntry(
+                    last_good=last_good,
+                    fetched_at=now - rng.uniform(200, 2000),
+                    age_s=rng.uniform(200, 2000),
+                    consecutive_failures=rng.randint(3, 12),
+                    last_error=rng.choice(["http-429", "timeout"]),
+                    backoff_until=now + rng.uniform(50, 500),
+                    trust_extended=True,
+                )
+            elif roll < 0.45:
+                # Collector-struck while still FRESH: the `token_dead()` half
+                # of the exclusion, which the freshness half alone admits.
+                stale_nums.add(num)
+                entries[num] = UsageEntry(
+                    last_good=last_good, fetched_at=now, age_s=0.0,
+                    auth_dead_strikes=2,
+                )
+            elif roll < 0.55:
+                # m-1: FRESH but just failed once -- `fetched_at` moves only
+                # on success, `backoffUntil`/`consecutiveFailures` only on
+                # failure, the reviewer's own shape. Decision-trusted
+                # (well inside `STALE_OK_S`) -- deliberately NOT added to
+                # `stale_nums`, so the assertions below can tell an
+                # authorized exclusion from an over-exclusion: this cell
+                # must never be the one a diff traces to.
+                entries[num] = UsageEntry(
+                    last_good=last_good,
+                    fetched_at=now - rng.uniform(5, 60),
+                    age_s=rng.uniform(5, 60),
+                    consecutive_failures=1,
+                    last_error="http-429",
+                    backoff_until=now + rng.uniform(500, 3600),
+                )
+            else:
+                entries[num] = _entry_for(last_good, now)
+        return entries, stale_nums
+
+    def _run(
+        self,
+        engine_cls,
+        tmp_path: Path,
+        tag: str,
+        fleets: list[dict],
+        strategy: str,
+        **settings_kwargs,
+    ):
+        # `EngineHarness.__init__` only patches `Path.home()` for its own
+        # setup — every OTHER test in this file relies on the `temp_home`
+        # fixture holding that patch for the whole test. This one drives
+        # its own directories, so it holds the same patch itself; without
+        # it `seed`/`make_live`/`current_account_number()` read the REAL
+        # `$HOME` and every tick reads unmanaged-active-account.
+        results = []
+        for i, entries in enumerate(fleets):
+            home = tmp_path / f"{tag}{i}"
+            (home / ".claude").mkdir(parents=True)
+            with (
+                patch("pathlib.Path.home", return_value=home),
+                patch.dict(
+                    os.environ,
+                    {
+                        "HOME": str(home),
+                        "USERPROFILE": str(home),
+                        "XDG_DATA_HOME": str(home / ".local" / "share"),
+                    },
+                ),
+            ):
+                h = EngineHarness(
+                    home,
+                    engine_cls=engine_cls,
+                    strategy=strategy,
+                    **settings_kwargs,
+                )
+                h.seed(1, "a@example.com")
+                h.seed(2, "b@example.com")
+                h.seed(3, "c@example.com")
+                h.make_live("a@example.com", 1)
+                outcome = h.tick_with_entries(entries)
+            events = tuple((e.kind, getattr(e, "reason", None)) for e in h.events)
+            results.append((outcome.name, h.active_number(), events))
+        return results
+
+    def _head(self, tmp_path, strategy, **settings_kwargs):
+        rng = random.Random(self._DIGEST_SEED)
+        now = 1_000_000.0
+        fleets: list[dict] = []
+        stale_by_fleet: list[set] = []
+        for _ in range(self._N_FLEETS):
+            entries, stale_nums = self._fleet(rng, now)
+            fleets.append(entries)
+            stale_by_fleet.append(stale_nums)
+        head_results = self._run(
+            AutoSwitchEngine, tmp_path, "head", fleets, strategy, **settings_kwargs
+        )
+        return fleets, stale_by_fleet, head_results
+
+    def _mutant(self, tmp_path, fleets, strategy, **settings_kwargs):
+        # Neutralize ONLY the exclusions the admission gate can reach (the
+        # gate always reads "not stale"/"not untrustworthy") on the SAME
+        # fleets. `trigger == "proactive"` is reachable under ANY strategy
+        # setting (utilization over threshold with real headroom, regardless
+        # of `settings.strategy`), so its own predicate needs neutralizing
+        # too, not only the consume-first-literal HOLD's.
+        with (
+            patch(
+                "claude_swap.autoswitch.candidate_usage_is_stale",
+                return_value=False,
+            ),
+            patch(
+                "claude_swap.autoswitch.candidate_is_untrustworthy",
+                return_value=False,
+            ),
+        ):
+            return self._run(
+                AutoSwitchEngine, tmp_path, "mutant", fleets, strategy, **settings_kwargs
+            )
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first", "dynamic"])
+    def test_mutant_moves_the_head_digest(self, tmp_path, strategy):
+        """Needs no base checkout, so it runs on CI's shallow clone too."""
+        fleets, _stale, head_results = self._head(tmp_path, strategy)
+        mutant_results = self._mutant(tmp_path, fleets, strategy)
+        assert mutant_results != head_results, (
+            "the mutant must move the digest — a no-op injection proves nothing"
+        )
+
+    # `dynamic` excluded here (#375): this checks base ``_PR_321_BASE_SHA``
+    # (PR #321's OWN base commit) against head, on the invariant "nothing
+    # but the stale-candidate exclusion moved" — true when #321 was the
+    # only round touching `dynamic` since that base. #375 is a further,
+    # separately-authorized round narrowing `dynamic`'s proactive trigger
+    # to `about_to_wall` and adding alternation, so `dynamic` now diverges
+    # from that same old base for many more fleets than the stale
+    # exclusion alone explains — expected, not a regression.
+    # `TestOutcomeDigestAgainstBase375` below re-proves the SAME shape of
+    # invariant against THIS round's own base/head instead.
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_digest_matches_base_except_the_stale_exclusion(self, tmp_path, strategy):
+        fleets, stale_by_fleet, head_results = self._head(tmp_path, strategy)
+        base_results = _base_engine_results(
+            tmp_path, strategy, self._DIGEST_SEED, self._N_FLEETS
+        )
+        # The consume-first HOLD keeps the `stale-usage` literal; a SKIP
+        # (`proactive`, or `failover` on the fleet's own unhealthy-active
+        # path — reachable under ANY strategy, `consume-first`/`dynamic`
+        # included) abandons the candidate and goes on to switch or block,
+        # citing a distinct literal so a log reader never sees a stall's
+        # word ahead of a `Switched` line. Keyed on the OUTCOME, not the
+        # strategy: a consume-first-strategy fleet's active account can
+        # still fail over.
+
+        diffs = [
+            i for i in range(self._N_FLEETS) if head_results[i] != base_results[i]
+        ]
+        assert diffs, (
+            "the fixture never exercised the exclusion on this seed — "
+            "strengthen it before trusting the digest"
+        )
+        for i in diffs:
+            # "The fleet carried a stale candidate somewhere" alone does not
+            # exclude a ranking change on that same fleet for an unrelated
+            # reason — pin it to the mechanism: HEAD itself must have hit
+            # the exclusion, and BASE's landing account must be one this
+            # fixture actually marked stale.
+            assert stale_by_fleet[i], (
+                f"fleet {i} differs with NO stale candidate — a scope error, "
+                f"not the intended exclusion: head={head_results[i]!r} "
+                f"base={base_results[i]!r}"
+            )
+            expected = "stale-usage" if head_results[i][0] == "NO_ACTION" else "stale-candidate-skipped"
+            assert ("no-switch", expected) in head_results[i][2], (
+                f"fleet {i} differs and carries a stale candidate, but "
+                f"head's own events never cite {expected} — the "
+                f"divergence traces to something else, not the exclusion: "
+                f"head={head_results[i]!r}"
+            )
+            assert str(base_results[i][1]) in stale_by_fleet[i], (
+                f"fleet {i}: base landed on account {base_results[i][1]!r}, "
+                f"which this fixture never marked stale "
+                f"({stale_by_fleet[i]!r}) — a ranking change, not base "
+                f"landing on the candidate head correctly excluded: "
+                f"base={base_results[i]!r}"
+            )
+
+        mutant_results = self._mutant(tmp_path, fleets, strategy)
+        if strategy == "best":
+            # `best`'s trigger is never the literal "consume-first"/"dynamic"
+            # string, so pre-fix it never entered this gate at all (the base
+            # engine's `if trigger in CONSUME_FIRST_STRATEGIES:` was False on
+            # every `best` tick). There is no pre-existing freshness check at
+            # this trigger for the blanket mutant to also wipe out, so it
+            # reproduces base byte-for-byte.
+            assert mutant_results == base_results, (
+                f"neutralizing the exclusion should reproduce the pre-fix "
+                f"engine exactly for a `{strategy}`-strategy fleet: "
+                f"diffs={diffs}"
+            )
+        else:
+            # `consume-first`/`dynamic` already ran a freshness check at this
+            # gate BEFORE this PR (`trigger in CONSUME_FIRST_STRATEGIES` was
+            # already true whenever `trigger = settings.strategy`), so this
+            # PR only ADDS the `token_dead()` half — but that half is nested
+            # inside the SAME `candidate_usage_is_stale` this mutant blanks
+            # to `False`, so the mutant also neutralizes the pre-existing
+            # freshness check and cannot reproduce base byte-for-byte here.
+            # Bound it symmetrically to the head/base loop above: on every
+            # fleet where the mutant diverges from BASE, base HELD (the hold
+            # its own freshness check produced) and the mutant LANDED on a
+            # candidate this fixture marked stale — never a ranking-order
+            # change with no attributable cause.
+            mutant_diffs = [
+                i
+                for i in range(self._N_FLEETS)
+                if mutant_results[i] != base_results[i]
+            ]
+            assert mutant_diffs, (
+                "the fixture never exercised the pre-existing freshness "
+                "check this mutant also neutralizes on this seed — "
+                "strengthen it before trusting the bound"
+            )
+            for i in mutant_diffs:
+                assert stale_by_fleet[i], (
+                    f"fleet {i} mutant/base divergence with NO stale "
+                    f"candidate — a scope error, not the pre-existing "
+                    f"freshness check the mutant over-neutralizes: "
+                    f"mutant={mutant_results[i]!r} base={base_results[i]!r}"
+                )
+                assert base_results[i][:2] == ("NO_ACTION", 1), (
+                    f"fleet {i}: base did not hold on its own freshness "
+                    f"check: base={base_results[i]!r}"
+                )
+                assert str(mutant_results[i][1]) in stale_by_fleet[i], (
+                    f"fleet {i}: the mutant landed on account "
+                    f"{mutant_results[i][1]!r}, which this fixture never "
+                    f"marked stale ({stale_by_fleet[i]!r}) — a ranking "
+                    f"change, not the neutralized gate admitting a stale "
+                    f"candidate: mutant={mutant_results[i]!r}"
+                )
+
+
+_ROUND_375_BASE_SHA = "a32a34d779ac5cb2838afe49df1cc41ec801be27"
+
+
+class TestOutcomeDigest375:
+    """F5 (#375): the motivating window, reconstructed as a named fixture
+    from the coordinator/analyzer evidence (10:01:32Z Account-3 at 5h 78% /
+    7d 56%, healthy; Account-5 at 7d 96%) — BASE (this round's own start,
+    `_ROUND_375_BASE_SHA`) must switch Account-3 -> Account-5 exactly as
+    the fleet did live, and HEAD must not (the whole point of #375). A
+    mutant that undoes #375's two admission guards (the trigger's
+    `about_to_wall` bar and the cold floor) must reproduce BASE's digest
+    exactly — the control that the divergence traces to THOSE and nothing
+    else moved. Composes (never subclasses, which would re-collect
+    every one of its own tests under this class too) `TestOutcomeDigest
+    AgainstBase`'s `_fleet`/`_run`/`_mutant`/`_head` machinery unchanged
+    for the second half: `best`/`consume-first` stay byte-identical
+    against THIS round's own base, over the same random fleets, with the
+    same stale-exclusion mutant control still moving them.
+    """
+
+    _base = TestOutcomeDigestAgainstBase()
+
+    @staticmethod
+    def _motivating_fleet(now: float) -> dict:
+        # Account numbers 1/2 (not the incident's own 3/5): `_run`
+        # (`TestOutcomeDigestAgainstBase`, reused verbatim) always seeds
+        # accounts 1/2/3 and makes 1 live — account 3 stays unseeded here.
+        return {
+            "1": {  # active ("Account-3" in the incident): healthy, well
+                     # clear of about_to_wall
+                "five_hour": {"pct": 78.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 56.0, "resets_at": _iso_at(now + 5 * 86400)},
+            },
+            "2": {  # candidate ("Account-5"): near-empty, but resets first
+                "five_hour": {"pct": 0.0, "resets_at": _iso_at(now + 4 * 3600)},
+                "seven_day": {"pct": 96.0, "resets_at": _iso_at(now + 1 * 86400)},
+            },
+        }
+
+    def _run_motivating(self, engine_cls, tmp_path, tag):
+        raw = self._motivating_fleet(1_000_000.0)
+        entries = {num: _entry_for(v, 1_000_000.0) for num, v in raw.items()}
+        return self._base._run(engine_cls, tmp_path, tag, [entries], "dynamic")[0]
+
+    def _run_motivating_mutant(self, tmp_path, tag, **settings_kwargs):
+        """Same fixture as `_run_motivating`, but threads extra
+        `AutoSwitchSettings` kwargs through -- the shared `_run` (never
+        touched, per this class's own docstring) takes none.
+        """
+        raw = self._motivating_fleet(1_000_000.0)
+        entries = {num: _entry_for(v, 1_000_000.0) for num, v in raw.items()}
+        home = tmp_path / tag
+        (home / ".claude").mkdir(parents=True)
+        with (
+            patch("pathlib.Path.home", return_value=home),
+            patch.dict(
+                os.environ,
+                {
+                    "HOME": str(home),
+                    "USERPROFILE": str(home),
+                    "XDG_DATA_HOME": str(home / ".local" / "share"),
+                },
+            ),
+        ):
+            h = EngineHarness(home, strategy="dynamic", **settings_kwargs)
+            h.seed(1, "a@example.com")
+            h.seed(2, "b@example.com")
+            h.seed(3, "c@example.com")
+            h.make_live("a@example.com", 1)
+            outcome = h.tick_with_entries(entries)
+        events = tuple((e.kind, getattr(e, "reason", None)) for e in h.events)
+        return outcome.name, h.active_number(), events
+
+    def test_base_switches_head_does_not_and_the_mutant_restores_base(
+        self, tmp_path
+    ):
+        head = self._run_motivating(AutoSwitchEngine, tmp_path, "head")
+        assert head[0] == "NO_ACTION", (
+            f"got {head!r} — #375's whole point: a healthy active "
+            "(headroom 22) must not move for a soonest-resetting, "
+            "near-empty candidate any more"
+        )
+        base_results = _base_engine_results(
+            tmp_path, "dynamic", seed=0, n_fleets=1,
+            base_sha=_ROUND_375_BASE_SHA,
+            custom_fleets=[self._motivating_fleet(1_000_000.0)],
+        )
+        base = base_results[0]
+        assert base[0] == "SWITCHED" and base[1] == 2, (
+            f"got {base!r} — the reconstructed fixture must reproduce the "
+            "live incident (Switched Account-3 -> Account-5, here "
+            "accounts 1 -> 2) against this round's own start commit"
+        )
+
+        import claude_swap.autoswitch as autoswitch
+
+        old_classify = autoswitch._classify_dynamic_trigger
+
+        def always_proactive(active_headroom):
+            # #375 replaced the bare below-threshold trigger with TWO new
+            # guards, not one: `about_to_wall` deciding whether `proactive`
+            # fires at all, and `cold_switch_cost_pct` (below) deciding
+            # whether a real-headroom candidate is admissible once it
+            # does. Undoing only the trigger still leaves the floor
+            # blocking this fixture (measured) -- the drain mechanism that
+            # used to make a lone-function patch sufficient is deleted
+            # (item 3), so both revert together as the one thing #375's
+            # design actually replaced.
+            return "at-limit" if active_headroom <= 0 else "proactive"
+
+        autoswitch._classify_dynamic_trigger = always_proactive
+        try:
+            mutant = self._run_motivating_mutant(
+                tmp_path, "mutant", cold_switch_cost_pct=0.0
+            )
+        finally:
+            autoswitch._classify_dynamic_trigger = old_classify
+        assert mutant == base, (
+            f"got {mutant!r}, want {base!r} — restoring the pre-#375 "
+            "trigger and admission floor together must reproduce BASE's "
+            "digest exactly"
+        )
+        assert head != base, (
+            "the mutant control is meaningless if head already matched "
+            "base without it"
+        )
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_best_and_consume_first_digest_identical_against_this_rounds_base(
+        self, tmp_path, strategy
+    ):
+        fleets, stale_by_fleet, head_results = self._base._head(tmp_path, strategy)
+        base_results = _base_engine_results(
+            tmp_path, strategy, self._base._DIGEST_SEED, self._base._N_FLEETS,
+            base_sha=_ROUND_375_BASE_SHA,
+        )
+        assert head_results == base_results, (
+            f"{strategy} must be byte-identical against this round's own "
+            f"base — #375 touches `dynamic` only"
+        )
+        mutant_results = self._base._mutant(tmp_path, fleets, strategy)
+        assert mutant_results != head_results, (
+            "the existing stale-candidate mutant control must still move "
+            "the digest — a no-op injection proves nothing"
+        )
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_best_and_consume_first_digest_identical_above_the_walled_threshold(
+        self, tmp_path, strategy
+    ):
+        """The digest above always runs at the DEFAULT departure threshold,
+        so it can never drive an active into ``about_to_wall`` (<=3pt
+        headroom) while ALSO staying below threshold — exactly the band
+        `_walled_may_take_any_room`'s below-threshold `consume-first` gate
+        needs (a threshold above ~97) to be reachable at all. It therefore
+        could not have caught c6db55c4's unauthorized `consume-first`
+        change; this raises the threshold into that band before trusting
+        byte-identity again. At seed ``_DIGEST_SEED``, fleets 1/14/35 land
+        their active in [97, 99) -- the positive control below fails loudly
+        if that ever stops being true.
+        """
+        raised = {"threshold": 99.0}
+        probe_rng = random.Random(self._base._DIGEST_SEED)
+        active_pcts = [
+            self._base._fleet(probe_rng, 1_000_000.0)[0]["1"].last_good[
+                "five_hour"
+            ]["pct"]
+            for _ in range(self._base._N_FLEETS)
+        ]
+        assert any(97.0 <= p < 99.0 for p in active_pcts), (
+            "the fixed-seed fixture no longer drives any fleet's active "
+            "into the about_to_wall-but-below-threshold band — this test "
+            "would pass vacuously without a real fleet to exercise"
+        )
+        fleets, _stale, head_results = self._base._head(
+            tmp_path, strategy, **raised
+        )
+        base_results = _base_engine_results(
+            tmp_path, strategy, self._base._DIGEST_SEED, self._base._N_FLEETS,
+            base_sha=_ROUND_375_BASE_SHA, settings_kwargs=raised,
+        )
+        assert head_results == base_results, (
+            f"{strategy} must be byte-identical against this round's own "
+            f"base even with the departure threshold raised above 97, "
+            f"where _walled_may_take_any_room's consume-first branch "
+            f"would otherwise be reachable"
+        )
+
+
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
         data = harness.switcher._get_sequence_data()
@@ -2650,6 +3653,29 @@ class TestApiKeyAccounts:
         self._mark_api_key(h, 2)
         outcome = h.tick_with_usage({
             "1": _usage(100), "2": "api key", "3": _usage(100),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_api_key_used_on_proactive_when_no_oauth_peer_lands(self, temp_home):
+        """PR #321 gate fix: `_usage(100)` above drives `at-limit`
+        (headroom<=0), which never reaches `_tick_inner`'s admission gate at
+        all -- so it cannot see the full `candidate_usage_is_stale` predicate
+        this test targets. Real headroom (5) with the active over threshold
+        drives `proactive` instead, and the API-key slot's sentinel entry is
+        never fetched (`fetched_at` stays None forever) -- the full staleness
+        bar refuses it permanently even though nothing about it is actually
+        untrustworthy (no backoff, no failures, no strike)."""
+        h = EngineHarness(temp_home, include_api_key_accounts=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "key@token.local")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        self._mark_api_key(h, 2)
+        outcome = h.tick_with_usage({
+            # #3 fails the landing/hysteresis gate: same utilization as the
+            # active, no improvement to offer.
+            "1": _usage(95), "2": "api key", "3": _usage(95),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
@@ -3895,6 +4921,14 @@ class TestPctLabel:
         )
         assert "switch at 99.9%" in poll.human()
 
+    def test_poll_event_under_dynamic_shows_the_derived_switch_bar(self, temp_home):
+        h = EngineHarness(temp_home, threshold=90.0, strategy="dynamic")
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+        h.tick_with_usage({"1": _usage(60)})
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "switch at 97%" in poll.human()
+
     def test_below_threshold_detail_shows_fractional_threshold(self, temp_home):
         h = EngineHarness(temp_home, threshold=99.9, strategy="best")
         h.seed(1, "a@example.com")
@@ -4335,8 +5369,11 @@ class TestModelAwareSwitch:
             "seven_day": {"pct": 0.0},
             "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": fable_reset}],
         }
+        # Active headroom 3 (#375's `about_to_wall` bar — its own 5h/7d
+        # windows are otherwise wide open too, same as #2/#3, so this is
+        # about the model-window retry, not about being genuinely spent).
         outcome = h.tick_with_usage({
-            "1": _model_usage(95, 10), "2": blocked, "3": blocked,
+            "1": _model_usage(97, 10), "2": blocked, "3": blocked,
         })
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — #2/#3's only over-bar window is Fable, with "
@@ -4444,7 +5481,16 @@ class TestAModelWindowIsNotABlackout:
         and 7d both have room — so the model-gated pass empties and the
         retry on 5h/7d alone must both rescue it and rank it (soonest 7-day
         reset first, the consume-first strategy's own key). #2 stays out
-        either way: its OWN 5h sits at the bar with no model involved."""
+        either way: its OWN 5h sits at the bar with no model involved.
+
+        The active (#6) also reports its own over-bar Fable window — every
+        account genuinely pinned to a model reports that model's window,
+        and this round's fix (`_model_window_binds_everywhere`) requires
+        the ACTIVE to be walled too before the retry is allowed to drop the
+        model set (never a candidate-only reading): an active with real
+        Fable headroom must not have the wall dropped just because its
+        candidates all happen to be model-blocked.
+        """
         h = EngineHarness(temp_home, model="Fable", threshold=90.0)
         now = h.clock.now
 
@@ -4464,6 +5510,7 @@ class TestAModelWindowIsNotABlackout:
                 "seven_day": {
                     "pct": 0.0, "resets_at": _iso_at(now + 100 * 86400),
                 },
+                "scoped": [{"name": "Fable", "pct": 95.0}],
             },
             "1": usage(34, 69, 91, 4),
             "2": usage(90, 79, 87, 0.5),
@@ -4696,10 +5743,114 @@ class TestAModelWindowIsNotABlackout:
             },
         )
         text = event.human()
-        assert "#1: 5h 34% · 7d 69% · Fable 91% (Fable-only)" in text, text
+        assert "#1: 5h 34% · 7d 69% · Fable 91% (Fable-walled)" in text, text
         assert "#2: 5h 92% · 7d 10% · Fable 20% (5h full)" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5%" in text, text
         assert "#3: 5h 5% · 7d 5% · Fable 5% (" not in text, text
+
+    def test_a_spend_only_account_prints_its_credit_figure_not_a_bare_mark(
+        self,
+    ):
+        """A credit (pay-as-you-go) account has no 5h/7d/model window at
+        all -- `windows`/`headroom` are structurally empty for it, exactly
+        the same shape `_describe` used to read as "genuinely unreadable"
+        and print a bare ``?`` for. That collapses two different facts (no
+        windows BY DESIGN vs. could-not-READ) into one mark, and it is the
+        same contradiction the panel and this decision log showed on the
+        same account: the panel prints the credit figure, this printed
+        ``?``."""
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "8": None},
+            threshold=90.0,
+            spend={"8": {"pct": 45.0, "used": 207.69, "limit": 466.0}},
+        )
+        text = event.human()
+        assert "#8: ?" not in text, text
+        assert "#8: $$ 45% ($207.69/$466.00)" in text, text
+
+    def test_a_genuinely_unreadable_account_still_prints_a_bare_mark(self):
+        """The discrimination must survive: an account with no windows, no
+        spend figure and no named fetch error is still ``?`` -- backoff, a
+        poll failure, a struck token. Never collapsed the other way either."""
+        event = PollEvent(
+            active={"number": 6, "email": "a@example.com"},
+            headroom={"6": 28.0, "9": None},
+            threshold=90.0,
+        )
+        text = event.human()
+        assert "#9: ?" in text, text
+
+
+class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
+    """The owner's own fleet (lmd42, 2026-09-08 ~01:2xZ, `dynamic`,
+    threshold 90, Fable pinned): active #3 is Fable-100 (walled on the
+    model axis), and #7 clears the Fable axis (10%) but is ITSELF over the
+    departure threshold on its own 5h (91%) -- genuinely unusable, would
+    re-trigger the very next tick. #2 is the only account below threshold
+    on every axis (5h 40, 7d 65, Fable 89) and is the only correct target.
+    1/5/6 are 7d-walled, #4 is Fable-walled with nothing else open.
+
+    Reproduces the escape-axis ranking bug: `_rank_candidates_pass`'s
+    at-limit escape ranked candidates by `escape_h` (headroom on the SAME
+    axis that blocked the ACTIVE) alone, so #7's huge Fable headroom (90)
+    beat #2's real, well-rounded headroom (11) even though #7's own
+    binding window (5h) was already past the switch bar.
+    """
+
+    def _usage(self, now, **kw):
+        def iso(days=0, hours=0, minutes=0):
+            return _iso_at(now + days * 86400 + hours * 3600 + minutes * 60)
+
+        return {
+            "3": {  # active: Fable-walled, 5h/7d have room
+                "five_hour": {"pct": 0.0},
+                "seven_day": {"pct": 79.0, "resets_at": iso(days=3)},
+                "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": iso(days=6, hours=5)}],
+            },
+            "2": {  # the only account open on every axis
+                "five_hour": {"pct": 40.0, "resets_at": iso(hours=2, minutes=33)},
+                "seven_day": {"pct": 65.0, "resets_at": iso(days=6, hours=5)},
+                "scoped": [{"name": "Fable", "pct": 89.0, "resets_at": iso(days=6, hours=5)}],
+            },
+            "7": {  # clear on Fable, but genuinely walled on its OWN 5h
+                "five_hour": {"pct": 91.0, "resets_at": iso(hours=3, minutes=13)},
+                "seven_day": {"pct": 18.0, "resets_at": iso(days=3, hours=20)},
+                "scoped": [{"name": "Fable", "pct": 10.0}],
+            },
+            "1": {  # 7d-walled
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 5.0}],
+            },
+            "6": {  # 7d-walled
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 5.0}],
+            },
+            "5": {  # 7d-walled (and Fable-walled too)
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 100.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],
+            },
+            "4": {  # Fable-walled, nothing else open
+                "five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0},
+                "scoped": [{"name": "Fable", "pct": 100.0}],
+            },
+        }
+
+    def test_the_owners_fleet_switches_to_2_never_3_or_4(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num in (1, 2, 3, 4, 5, 6, 7):
+            h.seed(num, f"acct{num}@example.invalid")
+        h.make_live("acct3@example.invalid", 3)
+
+        outcome = h.tick_with_usage(self._usage(h.clock.now))
+
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — #2 is the only account below "
+            "threshold on every axis; #7 clears only the axis that blocked "
+            "the active and is itself over threshold on its own 5h, #3 is "
+            "the active itself, #4 has nothing open but the model axis"
+        )
 
 
 class TestTheRetryAdmitsOnlyAnImprovement:
@@ -4878,19 +6029,15 @@ class TestDynamicStrategy:
     def test_the_voluntary_arm_never_lands_on_a_candidate_with_no_room(
         self, temp_home
     ):
-        """Below the threshold (the `dynamic`/`consume-first` trigger), a
-        candidate whose weekly window resets sooner than the active's is
-        still not a landing if it has no room at all: `#2` resets sooner
-        (`_R_SOON` < `_R_LATEST`) but sits at 95% on its 5-hour window. The
-        landing bar runs before the reset-ordering filter for every
-        strategy that reaches this trigger, so this arm never needed a
-        `dynamic`-only change — this pins that it still holds."""
+        """Below the threshold, a candidate whose weekly window resets
+        sooner than the active's is still not a landing once its own
+        headroom (0.1) sits under the ordinary threshold bar."""
         h = EngineHarness(temp_home, strategy="dynamic")
         usage = {
             "1": _usage7(10.0, 20.0, _R_LATEST),   # active: headroom 90
-            "2": _usage7(95.0, 5.0, _R_SOON),      # headroom 5, resets sooner
+            "2": _usage7(0.0, 99.9, _R_SOON),      # headroom 0.1, resets sooner
         }
-        headroom = {"1": 90.0, "2": 5.0}
+        headroom = {"1": 90.0, "2": 0.1}
         args = self._args(
             h, usage=usage, current="1", oauth_candidates=["2"],
             headroom=headroom, active_headroom=90.0,
@@ -4898,8 +6045,8 @@ class TestDynamicStrategy:
         )
         ordered, _, _, _ = h.engine._rank_candidates(**args)
         assert ordered == [], (
-            f"got {ordered} — #2 has no room (headroom 5, threshold 90) and "
-            "must never be a landing no matter how soon its reset is"
+            f"got {ordered} — #2 is under the threshold (headroom 0.1) "
+            "and must never be a landing no matter how soon its reset is"
         )
 
     def test_the_proactive_arm_never_lands_on_a_candidate_still_at_the_wall(
@@ -5154,6 +6301,58 @@ class TestDynamicStrategy:
             "dominance is not an improvement"
         )
 
+    def test_a_forced_threshold_return_still_dominance_releases_under_dynamic(
+        self, temp_home
+    ):
+        """The fleet-churn suppression above guards a VOLUNTARY reset-ordering
+        return (nobody had to move). It must not also hold when the ACTIVE
+        has itself burned down to the switch threshold: at that point a
+        return is forced, same as an ordinary departure, and hiding the best
+        candidate just delays the correct switch behind extra cooldown
+        ticks. Exact numbers from a reproduced live trace: #1 was left at
+        62 pts on a `dynamic`-trigger preference departure (reset ordering,
+        not headroom), then #2 (the account we moved to) burned down to the
+        90% threshold while #1 sat essentially unchanged at 61 pts — #1
+        should be released and re-admitted as a candidate."""
+        h = EngineHarness(temp_home, strategy="dynamic")
+        now = h.clock.now
+        state = {
+            "lastSwitchFrom": "1",
+            "lastSwitchTo": "2",
+            "leftHeadroom": 62.0,
+            "leftRecoveryAt": now + 9_000_000,
+            "leftTrigger": "dynamic",
+        }
+        usage = {
+            "1": {
+                "five_hour": {"pct": 39.0, "resets_at": _iso_at(now + 9_000_000)},
+                "seven_day": {"pct": 0.0},
+            },
+            "2": {
+                "five_hour": {"pct": 90.0, "resets_at": _iso_at(now + 300)},
+                "seven_day": {"pct": 0.0},
+            },
+        }
+        headroom = {"1": 61.0, "2": 10.0}
+        settings = AutoSwitchSettings(threshold=90.0, strategy="dynamic")
+        recovered = h.engine._left_account_recovered(
+            state, usage, headroom, 10.0, settings, now, current="2",
+        )
+        assert recovered is True, (
+            "the active is AT the 90% threshold (10 pts headroom left) — "
+            "this is a forced return, not the voluntary reset-ordering "
+            "ping-pong the fleet-churn leg guards against, so #1's "
+            "dominance over the active must still release the bar"
+        )
+        no_return = h.engine._no_return_account(
+            "proactive", state, headroom, 10.0, recovered, settings, current="2",
+        )
+        assert no_return is None, (
+            f"got no_return={no_return!r} — a released bar must also clear "
+            "the ranking loop's exclusion, or the proactive arm still "
+            "cannot land on #1"
+        )
+
     # -- the owner's live acceptance fixture, exact numbers ------------------
     #
     #   acct   5h    7d   Fable   note
@@ -5198,22 +6397,27 @@ class TestDynamicStrategy:
 
     def test_owner_fixture_no_departure_from_account_5(self, temp_home):
         """Account 5's Fable window sits at the switch threshold (90), but
-        its 5h/7d have room — the model basis, re-picked each tick, must
-        not read that as "active at threshold". Ten ticks, static usage
-        (nothing genuinely changes): zero switches.
+        its 5h/7d have room. Ten ticks, static usage (nothing genuinely
+        changes): zero switches — held by a DIFFERENT guard than the one
+        this test used to exercise, and that is the point of the update
+        below.
 
-        The owner's six accounts alone do not DISCRIMINATE this: every one
-        of them is also blocked on the model-gated axis (>=90), so the
-        landing gate refuses them whether or not the re-pick ran, and this
-        test used to pass with the entire re-pick deleted. Account 7 (added
-        here, not one of the owner's six) is open and healthy on the
-        model-gated axis with headroom clearing account 5's UNWIDENED
-        headroom (10) by more than the hysteresis (10) — so WITHOUT the
-        re-pick, trigger reads "proactive" and account 7 is admitted on
-        plain hysteresis, a real departure. WITH the re-pick, trigger reads
-        "dynamic" (below threshold) and account 7's reset (100h) loses to
-        account 5's own (14h) under consume-first-style reset ordering, so
-        it is never admitted.
+        The owner's six accounts alone do not DISCRIMINATE the re-pick:
+        every one of them is also blocked on the model-gated axis (>=90),
+        so the landing gate refuses them whether or not the re-pick ran.
+        Account 7 (added here, not one of the owner's six) is open and
+        healthy on the model-gated axis — which is exactly why, post-fix,
+        the re-pick must NOT widen account 5 here: `_model_window_binds_
+        everywhere` is false the moment any account (7) is open with the
+        model folded in, so widening account 5 past its real 10%-headroom
+        Fable reading would be calling a genuinely near-walled active
+        healthy on the strength of an unrelated account's headroom — the
+        exact bug this round fixed (an active pinned on a real wall while
+        a real Fable-healthy candidate sat idle). Account 5 still does not
+        depart, but now because account 7 is COLD (never active) and its
+        model-gated headroom (25) does not clear `cold_switch_cost_pct`
+        (#375's own floor, orthogonal to this fix) — not because the
+        re-pick manufactured a healthier reading for account 5.
         """
         from claude_swap.autoswitch import _dynamic_active_headroom
 
@@ -5229,15 +6433,18 @@ class TestDynamicStrategy:
             "scoped": [{"name": "Fable", "pct": 75.0}],
         }
 
-        # The active_headroom the tick actually uses: unwidened (model-
-        # gated) 10.0 re-picked to the unmodeled 5h/7d value 38.0.
+        # The active_headroom the tick actually uses: UNCHANGED at the
+        # model-gated 10.0 — account 7's real Fable headroom means the
+        # model window does not bind everywhere, so the re-pick must leave
+        # account 5's reading alone rather than widening it to the
+        # unmodeled 38.
         widened = _dynamic_active_headroom(
             h.engine.settings, h.engine._models, fleet_usage, "5", 10.0,
         )
-        assert widened == 38.0, (
-            f"got {widened!r} — account 5's re-picked basis must be its "
-            "unmodeled 5h/7d headroom (100 - 62 = 38), not the model-gated "
-            "10"
+        assert widened == 10.0, (
+            f"got {widened!r} — account 7 is open on the model-gated axis, "
+            "so the window does not bind everywhere and account 5's real "
+            "10% Fable headroom must stand, not be widened to 38"
         )
 
         switches = 0
@@ -5258,27 +6465,31 @@ class TestDynamicStrategy:
             "7's later-resetting weekly window must not admit it either"
         )
         assert h.active_number() == 5
-        # The trigger the tick actually used: every hold reads as the
-        # dynamic below-threshold path (consume-first-style reset
-        # ordering), never the plain-hysteresis "proactive" a dropped
-        # re-pick would have taken (which would have switched to 7, not
-        # held).
-        assert all(r == "already-consuming-soonest" for r in reasons), reasons
+        # Every hold reads as `cold` (#375: `dynamic`'s proactive arm needs
+        # `about_to_wall` (SPENT_HEADROOM_PCT=3.0), and account 5's
+        # headroom (10, no longer widened by this round's fix) is nowhere
+        # near it either; account 7 is open but never active, so it lands
+        # cold and does not clear `cold_switch_cost_pct`) — never the
+        # plain-hysteresis "proactive" a fully-dropped re-pick would have
+        # taken (which would have switched to 7, not held).
+        assert all(r == "cold" for r in reasons), reasons
 
-    def test_owner_fixture_account_5_is_the_target(self, temp_home):
-        """Starting from account 2 (the account nothing can use), the
-        engine must land on account 5 — soonest 7-day reset among the
-        candidates that actually have room on the basis in force. NOT #2
-        (no room anywhere) and NOT #6 (no room anywhere) — both sides of
-        the reset-ordering bar are present in this fleet, so the assertion
-        is not decided by headroom alone."""
+    def test_owner_fixture_holds_on_account_2_with_no_warm_partner(self, temp_home):
+        """#375 superseded this fixture's premise: starting on account 2
+        (headroom 6) used to land on account 5 by soonest-7d-reset
+        ordering while account 2 was merely below the ordinary threshold,
+        never genuinely `about_to_wall` (headroom 6 > SPENT_HEADROOM_PCT's
+        3). Under #375 `dynamic`'s proactive arm does not fire there, and
+        no candidate is a warm alternation partner (none has ever been
+        active) — so the engine now holds on account 2."""
         h = self._owner_harness(temp_home, active_num=2)
         fleet_usage = self._owner_fleet(h.clock.now)
         outcome = h.tick_with_usage(fleet_usage)
-        assert outcome is TickOutcome.SWITCHED
-        assert h.active_number() == 5, (
-            f"landed on {h.active_number()} instead of account 5"
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — account 2's headroom (6) is not "
+            "`about_to_wall`, so #375's `dynamic` must not move"
         )
+        assert h.active_number() == 2
 
     def test_the_model_basis_re_pick_is_what_makes_the_trigger_voluntary(
         self, temp_home
@@ -5321,21 +6532,15 @@ class TestDynamicStrategy:
     def test_primary_pass_ranks_active_and_candidate_headroom_on_one_basis(
         self, temp_home
     ):
-        """The hysteresis leg (``h - active_headroom``) must compare two
-        headrooms from the SAME window basis. `:1508`'s widening puts
-        `active_headroom` on the unmodeled 5h/7d axis while `headroom` (and
-        `h`, read from it) stays model-gated — mixing the two understates
-        the bar and can admit the account that resets LAST over one that
-        resets soonest.
-
-        Active #1 is blocked on Fable alone (model-gated headroom 2,
-        widened/unmodeled 8, utilization 92 -> `proactive`). #2 and #3 are
-        both healthy candidates with the SAME model-gated headroom bar
-        (25 and 15); #3 resets far sooner (5h vs 60h). Mixing bases lets
-        the widened 8 admit #2 (25-8=17>=10) while refusing #3 (15-8=7<10)
-        -- landing on the account that resets LAST. On one basis both
-        clear the model-gated bar (25-2=23, 15-2=13, both >=10) and #3's
-        soonest reset wins.
+        """#375 replaced dynamic's `proactive`-arm admission with an
+        ABSOLUTE floor (`cold_switch_cost_pct`) instead of a hysteresis
+        MARGIN against the active — so this is no longer a "which basis"
+        question (the floor does not read `active_headroom` at all). What
+        it still pins: the floor itself must read the SAME axis the retry
+        rescued a candidate on. Active #1 is blocked on Fable alone
+        (model-gated headroom 1, widened/unmodeled 3 -- `about_to_wall`).
+        #2 and #3 are both healthy candidates that clear the floor (25 and
+        30); #3 resets far sooner (5h vs 60h) and must win.
         """
         h = EngineHarness(
             temp_home, model="Fable", threshold=90.0, strategy="dynamic",
@@ -5356,15 +6561,14 @@ class TestDynamicStrategy:
             }
 
         outcome = h.tick_with_usage({
-            "1": acct(50, 92, 98, 30),
+            "1": acct(50, 97, 99, 30),
             "2": acct(10, 10, 75, 60),
-            "3": acct(10, 10, 85, 5),
+            "3": acct(10, 10, 70, 5),
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3, (
             f"landed on {h.active_number()} instead of account 3 — the "
-            "soonest-resetting healthy candidate, not the one that merely "
-            "cleared a hysteresis bar mixed across two window bases"
+            "soonest-resetting candidate that clears the floor"
         )
 
     def test_a_probe_admitted_only_by_the_models_dropped_fallback_pass_is_named_probe(
@@ -5415,6 +6619,535 @@ class TestDynamicStrategy:
         )
 
 
+class TestWarmthAndAlternation375:
+    """#375 (event #375, owner 2026-09-07): `dynamic` drops the bare
+    threshold (its proactive arm now needs `about_to_wall`) and gains a
+    reset-TTL-aware, warm-preferred admission (item 3) plus a healthy-
+    active alternation arm (item 4) so a healthy fleet spends quota by
+    rotating between accounts whose cached context is still warm, rather
+    than by chasing whichever weekly window resets soonest regardless of
+    cost.
+    """
+
+    def _harness(self, temp_home, **kwargs):
+        h = EngineHarness(temp_home, strategy="dynamic", **kwargs)
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "acct2@example.invalid")
+        h.seed(3, "acct3@example.invalid")
+        h.make_live("acct1@example.invalid", 1)
+        return h
+
+    @staticmethod
+    def _seed_last_active_at(h, mapping):
+        path = h.switcher.backup_dir / "autoswitch_state.json"
+        raw = json.loads(path.read_text()) if path.exists() else {"schemaVersion": 1}
+        raw["lastActiveAt"] = mapping
+        path.write_text(json.dumps(raw))
+
+    # -- F1: warm-preferred admission ----------------------------------
+
+    def test_f1_warm_ranks_ahead_of_a_higher_headroom_cold_candidate(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        self._seed_last_active_at(h, {"2": h.clock.now - 600.0})
+        outcome = h.tick_with_usage({
+            "1": _usage(97.0),  # active, about_to_wall (headroom 3)
+            "2": _usage(90.0),  # warm, headroom 10 -- less
+            "3": _usage(10.0),  # cold, headroom 90 -- more, clears the floor
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — the warm candidate (less "
+            "headroom) must rank ahead of the cold one (more headroom)"
+        )
+
+    # -- F2: cold refused until the active is walled --------------------
+
+    def test_f2_healthy_active_cold_candidate_below_floor_refused(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(78.0, resets_at=None) | {"seven_day": {"pct": 56.0}},
+            "2": _usage(96.0),  # cold, headroom 4 -- below the floor (20)
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_f2_healthy_active_cold_candidate_above_floor_still_refused(
+        self, temp_home
+    ):
+        """Active not `about_to_wall` -- clearing the floor is not enough;
+        the reason is `cold` (refused: active not walled), distinct from
+        `below-floor` (refused: doesn't even clear the floor)."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(78.0) | {"seven_day": {"pct": 56.0}},
+            "2": _usage(50.0),  # cold, headroom 50 -- clears the floor easily
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["cold"], reasons
+        assert h.active_number() == 1
+
+    def test_m1_dynamic_healthy_hold_detail_has_no_false_comparison(
+        self, temp_home
+    ):
+        """m1: utilization (95) can sit ABOVE `settings.threshold` (90)
+        here -- the old `f"{utilization}% < {threshold}%"` detail printed
+        a false "95% < 90%". No comparison glyph; state what the hold
+        means instead."""
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(95.0),  # active, headroom 5 -- healthy, > threshold
+            "2": _usage(94.0),  # cold, headroom 6 -- below the floor
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        detail = next(
+            e.detail for e in h.events if isinstance(e, NoSwitchEvent)
+        )
+        assert "<" not in detail, detail
+        assert "healthy" in detail, detail
+
+    def test_f2_walled_active_admits_the_cold_candidate_above_floor(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+            "2": _usage(50.0),  # cold, headroom 50
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_f2_walled_active_refuses_the_cold_candidate_below_floor(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0) | {"seven_day": {"pct": 0.0}},  # headroom 2
+            "2": _usage(96.0),  # cold, headroom 4 -- below the floor
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-floor"], reasons
+        assert h.active_number() == 1
+
+    def test_f2_at_limit_escapes_to_a_below_floor_candidate(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage({
+            "1": _usage(100.0) | {"seven_day": {"pct": 0.0}},  # headroom 0
+            "2": _usage(96.0),  # cold, headroom 4 -- below the floor
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit"
+        assert h.active_number() == 2
+
+    # -- F3: alternation fires at the chunk boundary and returns ---------
+
+    def test_f3_alternation_fires_at_the_chunk_boundary_and_returns(
+        self, temp_home
+    ):
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        start = h.clock.now
+        self._seed_last_active_at(h, {
+            "1": start - (chunk - 1.0),
+            "2": start - 10.0,  # warm, real headroom
+        })
+        # Within one `ALTERNATION_MAX_GIVEBACK_PCT` of each other in BOTH
+        # directions --
+        # the round trip this test is about is only alternation while it
+        # gives nothing material back (#321 follow-up). The old pair (50
+        # vs 70) handed back 20 points on the return leg, which the
+        # giveback bar now refuses; the engine consumes the richer account
+        # until the two converge and alternation resumes.
+        usage = {"1": _usage(50.0), "2": _usage(45.0)}
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.NO_ACTION, f"got {outcome} at chunk - 1s"
+        assert h.active_number() == 1
+
+        h.clock.advance(1.0)  # now exactly at the chunk boundary
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+
+        state = h.state()
+        assert state["lastActiveAt"]["1"] == h.clock.now, (
+            "the departed account must be stamped warm on departure"
+        )
+
+        h.clock.advance(chunk)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — must alternate back once the next chunk "
+            "elapses on the still-warm departed account"
+        )
+        assert h.active_number() == 1
+
+    def test_an_untrustworthy_partner_does_not_strand_the_tick(self, temp_home):
+        """I1's mirror on the ordinary (non-escape) alternation path:
+        `dynamic_ordered` used to be `[partner]` alone, so a struck top-
+        ranked warm partner stranded the tick instead of falling through
+        to the next floor-clearing warm candidate. #2 outranks #3 (more
+        headroom, same untiered 7d reset) so it is `partner`; struck this
+        time — #3 must still be reached.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,
+            "2": h.clock.now - 10.0,
+            "3": h.clock.now - 10.0,
+        })
+        usage = {"1": _usage(50.0), "2": _usage(30.0), "3": _usage(60.0)}
+        entries = {num: _entry_for(value, h.clock.now) for num, value in usage.items()}
+        entries["2"] = UsageEntry(
+            last_good=usage["2"], fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert entries["2"].token_dead()
+        outcome = h.tick_with_entries(entries)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a struck top partner (#2) must not "
+            "strand the tick while a healthy, lower-ranked one (#3) is "
+            "available"
+        )
+        assert h.active_number() == 3
+
+    # -- F4: TTL expiry makes a partner cold -----------------------------
+
+    def test_f4_a_partner_exactly_at_the_ttl_boundary_is_cold(self, temp_home):
+        """m3: pin `_is_warm`'s `<`, not `<=` -- exactly `now - ttl` reads
+        cold. A mutant flipping the comparison must fail this."""
+        h = self._harness(temp_home)
+        ttl = h.engine.settings.cache_ttl_seconds
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,   # past the chunk boundary already
+            "2": h.clock.now - ttl,     # exactly at the TTL -- cold
+        })
+        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a partner exactly at the TTL boundary is "
+            "cold, never a warm alternation pick"
+        )
+        assert h.active_number() == 1
+
+    def test_f4_a_partner_one_second_inside_the_ttl_is_warm(self, temp_home):
+        """m3's other half: one second inside the boundary must still be
+        warm -- pins the same `<` from the other side."""
+        h = self._harness(temp_home)
+        ttl = h.engine.settings.cache_ttl_seconds
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,       # past the chunk boundary already
+            "2": h.clock.now - ttl + 1.0,   # one second inside -- warm
+        })
+        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a partner one second inside the TTL must "
+            "still be a warm alternation pick"
+        )
+        assert h.active_number() == 2
+
+    # -- no-return bar on the proactive/about_to_wall arm -----------------
+
+    def test_no_return_bar_blocks_a_spent_peer_even_when_its_reset_recovered(
+        self, temp_home
+    ):
+        """The fable reviewer's flap: A (h=3) -> B (warm, h=10); B burns to
+        h=3; A's own headroom never moves (still 2, spent) but its BINDING
+        RESET alone reads much closer than it did at departure --
+        `_left_account_recovered`'s reset leg alone says "recovered" even
+        though headroom says nothing changed. Without the warm floor
+        (`h > SPENT_HEADROOM_PCT`, not `h > 0`) the no-return bar's own
+        "barred list is empty and recovered -- retry unbarred" fallback
+        re-admits A anyway (the mutant control below). NOT `_usage()`'s
+        bare form for either tick: the reset comparison needs the SAME (5h)
+        window closer at tick 2 than at tick 1, and `_usage()` alone
+        reports no reset at all.
+
+        I1: with the warm floor intact, A (h=2) is genuinely inadmissible
+        even fully unbarred -- both accounts are now exhausted, so this
+        falls through to the shared exhausted-fleet handling (BLOCKED),
+        not the bar's own NO_ACTION hold."""
+        h = self._harness(temp_home)
+        self._seed_last_active_at(h, {"2": h.clock.now - 10.0})
+        far = _iso_at(h.clock.now + 500 * 3600)
+        h.tick_with_usage({
+            "1": _usage(97.0, resets_at=far),    # active, about_to_wall (h=3)
+            "2": _usage(90.0),                    # warm, h=10
+        })
+        assert h.active_number() == 2, "setup: must have switched 1 -> 2"
+
+        h.clock.advance(301.0)  # past cooldown
+        near = _iso_at(h.clock.now + 3600.0)  # much closer than `far` was
+        outcome = h.tick_with_usage({
+            "2": _usage(97.0),                    # active, about_to_wall (h=3)
+            "1": _usage(98.0, resets_at=near),    # h=2 -- still spent
+        })
+        assert outcome is TickOutcome.BLOCKED, (
+            f"got {outcome} — account 1 is still spent (h=2); its reset "
+            "'recovering' alone must not re-admit it, and with nothing "
+            "else viable this is I1's exhausted-fleet fallthrough"
+        )
+        assert h.active_number() == 2
+
+    def test_no_return_bar_blocks_a_return_that_has_not_recovered(
+        self, temp_home
+    ):
+        """Same shape, but account 1's headroom (5, past the warm floor) is
+        what could wrongly look like enough on its own -- the bar must
+        still hold it because NOTHING about it actually improved since
+        departure (no reset info at all on either tick, so the reset leg
+        cannot release it either)."""
+        h = self._harness(temp_home)
+        self._seed_last_active_at(h, {"2": h.clock.now - 10.0})
+        h.tick_with_usage({
+            "1": _usage(97.0),   # active, about_to_wall (h=3)
+            "2": _usage(90.0),   # warm, h=10
+        })
+        assert h.active_number() == 2, "setup: must have switched 1 -> 2"
+
+        h.clock.advance(301.0)  # past cooldown
+        outcome = h.tick_with_usage({
+            "2": _usage(97.0),   # active, about_to_wall (h=3)
+            "1": _usage(95.0),   # h=5 -- clears the warm floor, unrecovered
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — account 1 clears the warm floor but has not "
+            "recovered; the no-return bar must still hold it"
+        )
+        assert h.active_number() == 2
+
+    def test_at_limit_escapes_the_no_return_bar_once(self, temp_home):
+        """`_no_return_account` scopes `at-limit` out by design (unchanged):
+        once the active is genuinely spent, the bar must not strand the
+        engine on it just because the only candidate is the one it left."""
+        h = self._harness(temp_home)
+        self._seed_last_active_at(h, {"2": h.clock.now - 10.0})
+        h.tick_with_usage({
+            "1": _usage(97.0),
+            "2": _usage(90.0),
+        })
+        assert h.active_number() == 2, "setup: must have switched 1 -> 2"
+
+        h.clock.advance(301.0)
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "2": _usage(100.0),  # active, fully spent -- at-limit
+            "1": _usage(95.0),   # the barred account, unrecovered
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — at-limit must escape even to the barred "
+            "account once the active is genuinely spent"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "at-limit", sw.trigger
+        assert h.active_number() == 1
+
+    # -- I1: a genuinely exhausted fleet falls through, not NO_ACTION forever --
+
+    def test_i1_a_genuinely_exhausted_fleet_falls_through_to_blocked_and_sleeps(
+        self, temp_home
+    ):
+        """No prior switch (`no_return is None`) -- the proactive arm's
+        own "nothing cleared even the warm floor" case must fall through
+        to the shared exhausted-fleet handling (BLOCKED, the sleep armed),
+        exactly as best/consume-first do, not return NO_ACTION forever."""
+        h = self._harness(temp_home)
+        soon = _iso_at(h.clock.now + 3600.0)
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0, resets_at=soon),   # active, about_to_wall (h=2)
+            "2": _usage(100.0, resets_at=soon),  # candidate, truly exhausted
+            "3": _usage(100.0, resets_at=soon),
+        })
+        assert outcome is TickOutcome.BLOCKED, (
+            f"got {outcome} — a genuinely exhausted fleet must fall "
+            "through to BLOCKED, not return NO_ACTION early"
+        )
+        assert h.engine._sleep_until_ts is not None, (
+            "the earliest-reset sleep must be armed, exactly as best/"
+            "consume-first do on a truly exhausted fleet"
+        )
+        assert h.active_number() == 1
+
+    def test_i1_the_api_key_last_resort_is_reached_when_configured(
+        self, temp_home
+    ):
+        h = EngineHarness(
+            temp_home, strategy="dynamic", include_api_key_accounts=True,
+        )
+        h.seed(1, "acct1@example.invalid")
+        h.seed(2, "key@token.local")
+        h.make_live("acct1@example.invalid", 1)
+        data = h.switcher._get_sequence_data()
+        data["accounts"]["2"]["kind"] = "api_key"
+        h.switcher._write_json(h.switcher.sequence_file, data)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0),  # active, about_to_wall (h=2), no oauth peer
+            "2": "api key",
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — with no oauth candidate at all, the api-key "
+            "last resort must be reached exactly as best/consume-first do"
+        )
+        assert h.active_number() == 2
+
+    # -- I2: the incoming stamp is alternation's own chunk-timer origin --
+
+    def test_i2_the_incoming_stamp_gates_alternations_own_chunk_timer(
+        self, temp_home
+    ):
+        """A landing target for a PROACTIVE switch can already be warm
+        from an earlier cycle -- arrival must OVERWRITE that stale
+        `lastActiveAt` entry with the fresh arrival time, or alternation's
+        own chunk timer reads it as dwelt-on far longer than it has been,
+        and fires on the very next post-cooldown tick instead of waiting a
+        full chunk."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        start = h.clock.now
+        # "2" warm from an earlier cycle -- stale enough that, left
+        # un-overwritten, `now - since` clears a full chunk within one
+        # cooldown of arriving.
+        self._seed_last_active_at(h, {"2": start - (chunk - 250.0)})
+
+        outcome = h.tick_with_usage({
+            "1": _usage(98.0),  # active, about_to_wall (h=2)
+            "2": _usage(50.0),  # warm, real headroom -- proactive landing
+        })
+        assert outcome is TickOutcome.SWITCHED
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "proactive", sw.trigger
+        assert h.active_number() == 2
+
+        h.clock.advance(301.0)  # past cooldown, short of a full chunk
+        h.events.clear()
+        outcome = h.tick_with_usage({
+            "2": _usage(50.0),  # active, healthy -- dynamic-healthy now
+            "1": _usage(30.0),  # warm partner (just departed)
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — the incoming stamp must reset 2's dwell "
+            "clock on arrival; alternation must not fire before a full "
+            "chunk has elapsed since the actual arrival"
+        )
+
+        h.clock.advance(chunk - 301.0)
+        outcome = h.tick_with_usage({"2": _usage(50.0), "1": _usage(30.0)})
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — alternation must fire once a full chunk "
+            "has elapsed since the actual arrival"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 1
+
+    def test_the_default_chunk_stays_well_under_half_the_ttl(self, temp_home):
+        """Item 4's own precondition: `alternation_chunk_seconds` must stay
+        well under `cache_ttl_seconds / 2`, so a partner alternated away
+        from never goes cold before the NEXT chunk boundary alternates
+        back to it (F3's "next chunk -> returns")."""
+        defaults = AutoSwitchSettings()
+        assert defaults.alternation_chunk_seconds * 2 < defaults.cache_ttl_seconds, (
+            f"chunk={defaults.alternation_chunk_seconds} "
+            f"ttl={defaults.cache_ttl_seconds} — the chunk must clear "
+            "twice over before the TTL, with real margin"
+        )
+
+    # -- the alternation giveback bar ------------------------------------
+
+    def test_alternation_refuses_a_partner_that_gives_back_the_headroom(
+        self, temp_home
+    ):
+        """Warmth may cost headroom, never a MATERIAL regression of it:
+        the arm's only admission bar was the absolute `cold_switch_cost_
+        pct` floor, with no reference to `active_headroom` at all, so a
+        90-headroom active departed for a 25-headroom warm partner. The
+        landing rule refuses the same move when asked directly; this arm
+        never reaches it (`dynamic_ordered is not None` short-circuits
+        `_rank_candidates_pass`), so the bar belongs here.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,   # dwell elapsed
+            "2": h.clock.now - 10.0,    # warm
+        })
+        outcome = h.tick_with_usage({
+            "1": _usage(10.0),  # active, headroom 90
+            "2": _usage(75.0),  # warm, headroom 25 -- clears the floor (20)
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a 65-point giveback is not alternation; "
+            "the warm partner clears the absolute floor but hands back "
+            "far more headroom than `ALTERNATION_MAX_GIVEBACK_PCT`"
+        )
+        assert h.active_number() == 1
+
+    def test_alternation_still_fires_for_a_near_equal_warm_partner(
+        self, temp_home
+    ):
+        """The anti-repeal control: an alternating move is a downgrade by
+        construction, so the bar is ONE-SIDED (giveback only), never
+        `_rank_candidates_pass`'s two-sided margin. Green before and
+        after the fix -- if it goes red, the two-sided form was written.
+        """
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,
+            "2": h.clock.now - 10.0,
+        })
+        outcome = h.tick_with_usage({
+            "1": _usage(65.0),  # active, headroom 35
+            "2": _usage(72.0),  # warm, headroom 28 -- giveback 7 <= 10
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a near-equal warm partner is exactly the "
+            "alternation #375 asked for"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 2
+
+    def test_alternation_admits_a_giveback_of_exactly_the_bar(
+        self, temp_home
+    ):
+        """The boundary is `<=`: exactly the bar is admitted."""
+        # Imported HERE, never at module scope: `_base_engine_results`
+        # (:2944) runs this whole module against the base commit's
+        # package, and a top-level import of a symbol base does not carry
+        # SKIPS all seven base-digest comparisons in silence.
+        from claude_swap.autoswitch import ALTERNATION_MAX_GIVEBACK_PCT
+
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        give = ALTERNATION_MAX_GIVEBACK_PCT
+        self._seed_last_active_at(h, {
+            "1": h.clock.now - chunk,
+            "2": h.clock.now - 10.0,
+        })
+        outcome = h.tick_with_usage({
+            "1": _usage(60.0),          # active, headroom 40
+            "2": _usage(60.0 + give),   # warm, giveback exactly `give`
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a giveback of exactly {give} is admitted"
+        )
+        assert h.active_number() == 2
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
@@ -5460,6 +7193,38 @@ class TestConsumeFirstStrategy:
         })
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2
+
+    def test_walled_consume_first_still_holds_for_a_merely_later_reset(
+        self, temp_home
+    ):
+        """`_walled_may_take_any_room` (c6db55c4) briefly let a WALLED
+        active (headroom 1, ``about_to_wall``) below its own high departure
+        threshold (99.9, still literally the `consume-first` trigger) take
+        ANY real-headroom candidate regardless of reset order — an
+        unauthorized change to `consume-first`'s own admission (pinned
+        byte-identical to base, adr/0009): `consume-first`'s trigger is
+        never produced by `dynamic`'s own classification, so the escape
+        changed only `consume-first`, which this PR has no authorization to
+        move. Reverted by gating that guard to `dynamic_landing`: a walled
+        consume-first active still declines a candidate whose weekly reset
+        is merely later, exactly as base. Prompted by
+        usage-census-2026-09-07 lmd42.md §9's 171-row reset-preference
+        bucket, but NOT a replay of it: that census's own rows, at their
+        annotated threshold (90), already switch on this branch's floor
+        without this guard (`TestUsageCensus20260907Replay`).
+        """
+        h = EngineHarness(temp_home, strategy="consume-first", threshold=99.9)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage7(99.0, 85.0, _R_SOON),    # walled: headroom 1
+            "2": _usage7(0.0, 37.0, _R_LATEST),   # 63 headroom, resets LATER
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
 
     def test_consume_first_is_the_default_strategy(self, temp_home):
         """The owner's order: drain the account whose weekly window resets
@@ -5832,6 +7597,11 @@ class TestConsumeFirstStrategy:
         # mid-tick. When the fresh active is over the threshold with no
         # strictly-sooner candidate, the tick holds; the NEXT tick classifies
         # at-limit and escapes normally (no freshness gate on escapes).
+        # (`_walled_may_take_any_room`'s below-threshold consume-first
+        # override, c6db55c4, briefly made this tick escape immediately
+        # instead — an unauthorized `consume-first` behaviour change per
+        # adr/0009, reverted by gating that guard to `dynamic_landing`,
+        # which `consume-first`'s literal trigger can never satisfy.)
         h = self._harness(temp_home)
         stored = {
             "1": _usage7(20, 20, _R_LATER),
@@ -5853,9 +7623,85 @@ class TestConsumeFirstStrategy:
         h.events.clear()
         outcome = h.tick_with_usage(fresh)
         assert outcome is TickOutcome.SWITCHED
+
+
+class TestUsageCensus20260907Replay:
+    """usage-census-2026-09-07/lmd42.md §9 names 225 "reachable wall" rows
+    and annotates every one "(trig 90)" -- the fleet's own printed
+    threshold. Replayed at that SAME threshold (not the higher one
+    ``test_walled_consume_first_still_holds_for_a_merely_later_reset``
+    needs to reach ``_walled_may_take_any_room`` at all -- a reach this
+    guard no longer has for `consume-first`, gated to `dynamic_landing`),
+    the active's own utilization is already >= 90 in every row, so `tick()`
+    classifies `proactive`/`at-limit` -- not the literal `consume-first`
+    trigger the strict reset-order filter gates on -- and the existing
+    (pre-this-round) admission already switches. Mutation-checked (guard
+    removed, still green): these 3 rows do not exercise THIS round's fix;
+    they confirm 7d5b5d33 + 392172f1 (this branch's floor) already closes
+    the exact numeric shapes the census measured, on the census's own
+    stated threshold. The gap `_walled_may_take_any_room` was built for
+    (`about_to_wall`, <=3pt headroom, literal `consume-first` trigger)
+    needs a departure threshold configured ABOVE ~97% to keep that literal
+    trigger while genuinely walled -- a shape the census's threshold=90
+    fleet cannot produce, and not represented in these 225 rows; it also
+    turned out to be `consume-first`'s own admission, not `dynamic`'s, so
+    the guard now stays inert there. See that test for the history.
+
+    Coverage: 3 of 225 rows (a representative sample of the 171-row
+    reset-preference class: rows 39, 171, 224, its no-model,
+    model-and-walled, and model-and-partial-headroom shapes). The 27-row
+    model-window-as-wall and 1-row stale-usage classes are
+    ``TestTheModelWindowBindsUnlessItBindsEverywhere``'s own territory
+    (392172f1); a 2-account reduction of one of those rows hits
+    `AllExhaustedEvent` before that retry runs (needs the original fleet's
+    account count), so it is not replayed here.
+    """
+
+    @staticmethod
+    def _replay(temp_home, active_windows, peer_windows, *, threshold=90.0, model=None):
+        kwargs = {"strategy": "consume-first", "threshold": threshold}
+        if model:
+            kwargs["model"] = model
+        h = EngineHarness(temp_home, **kwargs)
+        h.seed(1, "active@example.com")
+        h.seed(2, "peer@example.com")
+        h.make_live("active@example.com", 1)
+        active = {"five_hour": {"pct": active_windows[0]},
+                  "seven_day": {"pct": active_windows[1], "resets_at": _R_SOON}}
+        peer = {"five_hour": {"pct": peer_windows[0]},
+                "seven_day": {"pct": peer_windows[1], "resets_at": _R_LATEST}}
+        if len(active_windows) > 2:
+            active["scoped"] = [{"name": "Fable", "pct": active_windows[2],
+                                  "resets_at": _R_SOON}]
+            peer["scoped"] = [{"name": "Fable", "pct": peer_windows[2],
+                                "resets_at": _R_LATEST}]
+        outcome = h.tick_with_usage({"1": active, "2": peer})
+        return outcome, h
+
+    def test_row_39_reset_preference(self, temp_home):
+        # lmd42.md §9 row 39: active #4 91% (0/64/91), best candidate #6
+        # (1/55/77). No candidate resets sooner -> old code declined.
+        outcome, h = self._replay(temp_home, (0.0, 91.0), (1.0, 77.0))
+        assert outcome is TickOutcome.SWITCHED, outcome
         assert h.active_number() == 2
-        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.trigger == "at-limit"
+
+    def test_row_171_reset_preference(self, temp_home):
+        # lmd42.md §9 row 171: active #4 100% (94/85/100), best candidate
+        # #2 (0/37/51).
+        outcome, h = self._replay(
+            temp_home, (94.0, 85.0, 100.0), (0.0, 37.0, 51.0), model="Fable"
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2
+
+    def test_row_224_reset_preference(self, temp_home):
+        # lmd42.md §9 row 224: active #4 100% (8/86/100), best candidate
+        # #2 (15/60/82).
+        outcome, h = self._replay(
+            temp_home, (8.0, 86.0, 100.0), (15.0, 60.0, 82.0), model="Fable"
+        )
+        assert outcome is TickOutcome.SWITCHED, outcome
+        assert h.active_number() == 2
 
 
 class TestConsumeFirstProbesAnUnknownReset:
@@ -6496,13 +8342,21 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
 class TestPhase2RefetchKeepsTheDynamicModelBasis:
     """`dynamic`'s model-basis widening (the re-pick that turns a pinned
     model's own window into "not a blackout" for the ACTIVE, above) must
-    still be in force after the consume-first two-phase commit's refetch
-    re-derives `active_headroom` from fresh usage -- the trigger is
-    classified on one basis and the refetch must not silently switch the
-    tick to a narrower one. Two accounts, `--model all`: both read
-    model-gated headroom 0 (Fable pinned at 100%) but real 5h/7d room, so
-    the widened basis is the only thing that tells the engine it is not
-    genuinely at the wall.
+    still be the basis `_perform` records into `state["leftHeadroom"]" on
+    a real switch. Two accounts, `--model all`: both read model-gated
+    headroom 0 (Fable pinned at 100%) but real 5h/7d room, so the widened
+    basis is the only thing that tells the engine it is not genuinely at
+    the wall.
+
+    #375 dropped the bare below-threshold trigger (`trigger =
+    settings.strategy`) `dynamic` used to classify with, so a live tick
+    never produces the literal `"dynamic"` any more and the consume-first
+    two-phase commit's refetch (gated on `trigger in
+    CONSUME_FIRST_STRATEGIES`) is consume-first-only in practice now.
+    These fixtures reach `about_to_wall` (headroom <= 3) instead, so the
+    trigger is `proactive` and the ordinary hysteresis-margin admission
+    (unchanged) is what a real candidate must clear — the widened basis
+    still has to be what `_perform` records, refetch or not.
     """
 
     def test_leftHeadroom_is_recorded_on_the_widened_basis_not_the_model_gated_one(
@@ -6527,17 +8381,17 @@ class TestPhase2RefetchKeepsTheDynamicModelBasis:
             }
 
         out = h.tick_with_usage({
-            "1": acct(5, 90, 100, 14),   # model-gated headroom 0, unmodeled 10
-            "2": acct(20, 92, 100, 8),   # model-gated headroom 0, unmodeled 8; sooner reset
+            "1": acct(5, 97, 100, 14),   # model-gated headroom 0, unmodeled 3 (about_to_wall)
+            "2": acct(10, 10, 100, 8),   # model-gated headroom 0, unmodeled 90 -- real room
         })
         assert out is TickOutcome.SWITCHED
         assert h.active_number() == 2
         state = h.engine._read_state()
-        assert state.get("leftHeadroom") == 10.0, (
-            f"leftHeadroom={state.get('leftHeadroom')!r} — the phase-2 "
-            "refetch must record the SAME widened basis (10.0, account 1's "
-            "unmodeled 5h/7d headroom) the trigger was classified on, not "
-            "the narrower model-gated 0.0"
+        assert state.get("leftHeadroom") == 3.0, (
+            f"leftHeadroom={state.get('leftHeadroom')!r} — must record the "
+            "SAME widened basis (3.0, account 1's unmodeled 5h/7d "
+            "headroom) the trigger was classified on, not the narrower "
+            "model-gated 0.0"
         )
 
     def test_a_wrong_leftHeadroom_of_zero_does_not_cause_a_two_tick_ping_pong_back(
@@ -6548,8 +8402,8 @@ class TestPhase2RefetchKeepsTheDynamicModelBasis:
         1's very next model-gated headroom (`h >= min(0+3, 100)`, i.e. any
         h >= 3), for essentially free -- and the engine switches straight
         back, the two-tick ping-pong the landing rule exists to stop. With
-        the widened basis (10.0) that same leg needs `h >= 13`, which
-        account 1's 3.0 does not clear."""
+        the widened basis (3.0) that same leg needs `h >= 6`, which
+        account 1's model-gated 3.0 does not clear."""
         h = EngineHarness(
             temp_home, model="all", threshold=95.0, hysteresis_pct=20.0,
             strategy="dynamic",
@@ -6569,21 +8423,16 @@ class TestPhase2RefetchKeepsTheDynamicModelBasis:
             }
 
         out1 = h.tick_with_usage({
-            "1": acct(5, 90, 100, 14),
-            "2": acct(20, 92, 100, 8),
+            "1": acct(5, 97, 100, 14),
+            "2": acct(10, 10, 100, 8),
         })
         assert out1 is TickOutcome.SWITCHED
         assert h.active_number() == 2
 
         h.clock.advance(301.0)  # past cooldown_seconds (default 300)
         out2 = h.tick_with_usage({
-            # Account 1 resets SOONER than account 2 here (5h vs 30h), so
-            # consume-first's reset-ordering gate alone does not exclude it
-            # as a candidate -- isolates the no-return bar / recovered
-            # check as the only thing standing between account 1 and a
-            # switch back.
             "1": acct(20, 5, 97, 5),    # model-gated headroom 3.0
-            "2": acct(92, 20, 90, 30),
+            "2": acct(92, 20, 90, 30),  # holds real headroom, well over 3
         })
         assert out2 is TickOutcome.NO_ACTION, (
             f"got {out2}, active now {h.active_number()!r} — account 1's "
@@ -9237,15 +11086,24 @@ class TestHorizonAxisDoesNotFlap:
 
         ranking_now = 1_000_000.0
         reset_at = self._iso_at(ranking_now + 100.0)   # future at ranking_now
-        stale_reread = ranking_now + 200.0             # past reset_at
+        # Past `reset_at` (a real re-read regression must show), but within
+        # `SERVE_TTL_S` (180) of candidate #2's `fetched_at` (== ranking_now)
+        # — one value that exposes a stray re-read wherever in the call
+        # order it lands, without also tripping the UNRELATED stale-usage
+        # admission gate (which reads `self.clock()` too, at a position
+        # that shifts by one call between the two code paths below).
+        late_reread = ranking_now + 150.0
 
-        # Enough values for the OLD code's clock() call order (pre-tick
-        # check, ranking now, left_snapshot re-read, freshen expiry check,
-        # _perform's lastSwitchAt) with a couple of spares so neither code
-        # path can exhaust the sequence.
+        # Measured call order: pre-tick usage collection, ranking's own
+        # `decided_now`, THEN — only on the pre-#321 code this guards
+        # against — `left_snapshot`'s own re-read, then the stale-usage
+        # admission gate's freshness read, freshen's expiry check, and
+        # `_perform`'s `lastSwitchAt`. `late_reread` covers every position
+        # from the admission gate onward so the same list works whether or
+        # not the extra re-read call is present, with spares left over.
         clock_values = iter([
-            ranking_now, ranking_now, stale_reread,
-            stale_reread, stale_reread, stale_reread,
+            ranking_now, ranking_now, late_reread, late_reread,
+            late_reread, late_reread, late_reread,
         ])
         with patch.object(h.engine, "clock", side_effect=lambda: next(clock_values)):
             outcome = h.tick_with_usage({
@@ -14359,4 +16217,802 @@ class TestOneRemedyPerKindAcrossEverySurface:
             "a kind is systemic on one side and not the other: "
             f"only oauth={sorted(set(_DETERMINISTIC_REFRESH_ERRORS) - set(_SYSTEMIC_KINDS))} "
             f"only autoswitch={sorted(set(_SYSTEMIC_KINDS) - set(_DETERMINISTIC_REFRESH_ERRORS))}"
+        )
+
+
+
+
+
+
+
+class TestTheModelWindowBindsUnlessItBindsEverywhere:
+    """The 2026-09-07 21:37Z incident, reproduced as fixtures: a fleet stuck
+    switching ONTO, and then pinned ON, a Fable-100% wall (account 4) while a
+    real Fable-82% candidate/escape (account 2) sat idle. Root cause: the
+    "a model window is not a blackout" retry (`_rank_candidates`, the
+    proactive/alternation ranker's own copy, and `_dynamic_active_headroom`'s
+    widening) dropped the model criteria whenever ITS OWN pass came back
+    empty, without ever asking whether the ACTIVE was model-walled too — so
+    an active with genuine model headroom got treated as if the whole fleet
+    were blacked out. `_model_window_binds_everywhere` is the one predicate
+    all three now consume: false the moment ANY account (active included) is
+    still open with the model folded in.
+
+    F1/F4/F5 drive `_rank_candidates` directly (an ENGINE method, bound to a
+    real `EngineHarness`'s switcher/settings — not a bare pure-function
+    reimplementation), the same pattern `TestAModelWindowIsNotABlackout`
+    already uses: a `dynamic`/consume-first-shaped trigger only admits a
+    candidate whose weekly reset is SOONER than the active's, so every
+    fixture below gives the active a far-out reset and candidates a sooner
+    one — a fixture that gives every account the same reset date fails for
+    that reason alone, not the one under test (measured while building
+    this: a uniform `days_out` masked every case behind `reset_ts >=
+    active_reset_ts`).
+
+    F2/F3/F6 drive the full `tick()` — reachable there because an active
+    genuinely AT its wall (Fable 100%, model-gated headroom exactly 0)
+    classifies as `dynamic`'s `at-limit` trigger, which bypasses both the
+    alternation machinery and (structurally, by `_COOLDOWN_GATED_TRIGGERS`
+    excluding `at-limit`) the cooldown gate — so F2/F3 land on the SAME
+    widening fix via two different entry points, and F3's cooldown state
+    turns out to be inert for this exact roster (see its own docstring).
+    """
+
+    @staticmethod
+    def _u(five_h, seven_d, fable, days_out):
+        now = 1_000_000.0
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": seven_d, "resets_at": _iso_at(now + days_out * 86400)},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    def test_f1_never_switch_into_a_wall(self, temp_home):
+        """The 21:37:18Z census verbatim: active #2 (5h 15/7d 60/Fable 82,
+        genuinely open on the model axis) must not have #4 (Fable 100)
+        rescued into the ranking just because #4/#1/#3 are all model-walled
+        — the model window does not bind everywhere while #2 is open.
+        """
+        cls = TestAModelWindowIsNotABlackout()
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        usage = {
+            "2": self._u(15, 60, 82, 100),
+            "4": self._u(8, 86, 100, 2),
+            "1": self._u(0, 100, 92, 4),
+            "3": self._u(0, 79, 100, 3),
+        }
+        headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}
+        args = cls._args(
+            h, usage=usage, current="2", oauth_candidates=["1", "3", "4"],
+            headroom=headroom, active_headroom=headroom["2"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == [], (
+            f"got {list(ordered)!r} — account 2 is open on the model axis "
+            "(Fable 82% < the 90% threshold), so the window does not bind "
+            "everywhere and the retry must not rescue #4's model-only wall"
+        )
+
+    def test_f2_leave_a_wall(self, temp_home):
+        """Active #4 fully walled on Fable (100%, model-gated headroom 0,
+        5h/7d otherwise fine); candidate #2 open (Fable 82%). The owner's
+        stated expectation: switch OUT of the wall to the best real-headroom
+        candidate. Pre-fix this held at #4 forever (`_dynamic_active_
+        headroom` widened 0 to the unmodeled 14, so `_classify_dynamic_
+        trigger` never saw the wall)."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((4, "a4@example.invalid"), (2, "a2@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        fleet = {"4": self._u(8, 86, 100, 1), "2": self._u(15, 60, 82, 1)}
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a Fable-100% active with a Fable-82% "
+            "candidate open must switch, not hold"
+        )
+        assert h.active_number() == 2
+
+    def test_f4_control_the_primary_pass_still_lands_it(self, temp_home):
+        """F1's roster with #4's Fable at 50% instead of 100%: #4's own
+        binding window is now 7d (86%, headroom 14), never blocked at the
+        90% threshold — admitted by the PRIMARY (model-gated) pass with no
+        retry involved at all. Identical before and after this round's
+        fix: the predicate only gates the RETRY, never the primary pass.
+        """
+        cls = TestAModelWindowIsNotABlackout()
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        usage = {
+            "2": self._u(15, 60, 82, 100),
+            "4": self._u(8, 86, 50, 2),
+            "1": self._u(0, 100, 92, 4),
+            "3": self._u(0, 79, 100, 3),
+        }
+        headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}
+        args = cls._args(
+            h, usage=usage, current="2", oauth_candidates=["1", "3", "4"],
+            headroom=headroom, active_headroom=headroom["2"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == ["4"], (
+            f"got {list(ordered)!r} — #4 is not model-blocked (Fable 50%) "
+            "and must land via the primary pass alone"
+        )
+
+    def test_f5_control_a_true_fleet_wide_blackout_still_retries(self, temp_home):
+        """The design intent #321 exists for, preserved: active #4 AND
+        every candidate (#1, #3) are Fable-walled (100%) — a genuine
+        fleet-wide model blackout. The retry must still drop the model set
+        and rank on 5h/7d: #1's 7d (92%) still blocks it there, #3's (79%)
+        does not, so #3 is the only admissible landing.
+        """
+        cls = TestAModelWindowIsNotABlackout()
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0)
+        usage = {
+            "4": self._u(8, 86, 100, 100),
+            "1": self._u(0, 92, 100, 4),
+            "3": self._u(0, 79, 100, 3),
+        }
+        headroom = {n: oauth.account_headroom(v, ("Fable",)) for n, v in usage.items()}
+        args = cls._args(
+            h, usage=usage, current="4", oauth_candidates=["1", "3"],
+            headroom=headroom, active_headroom=headroom["4"],
+        )
+        ordered, _, _, _ = h.engine._rank_candidates(**args)
+        assert list(ordered) == ["3"], (
+            f"got {list(ordered)!r} — a true fleet-wide model blackout "
+            "must still retry on 5h/7d and rank #3 (7d 79%), never come "
+            "back empty just because this round bounds the retry"
+        )
+
+    def test_f6_no_flap_back_onto_a_still_walled_account(self, temp_home):
+        """After F2's escape (4 -> 2), the next tick — same fleet, #4 still
+        Fable-walled, #2 still open — must not flap back to #4. Emerges
+        for free from the fix: #2 (active) is open, so `_model_window_
+        binds_everywhere` is false and #4's model-only wall is never
+        dropped back into the ranking.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((4, "a4@example.invalid"), (2, "a2@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        fleet = {"4": self._u(8, 86, 100, 1), "2": self._u(15, 60, 82, 1)}
+        outcome1 = h.tick_with_usage(fleet)
+        assert outcome1 is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        h.clock.advance(301.0)
+        h.events.clear()
+        outcome2 = h.tick_with_usage(fleet)
+        assert outcome2 is not TickOutcome.SWITCHED, (
+            f"got {outcome2!r} — must not flap back onto #4 while it is "
+            "still Fable-walled"
+        )
+        assert h.active_number() == 2
+
+    def test_f7_dynamic_healthy_arm_retries_a_true_fleet_wide_blackout(
+        self, temp_home
+    ):
+        """F5's fixture (active #4 AND every candidate Fable-walled, a
+        genuine fleet-wide model blackout) driven through the FULL
+        `tick()`, not `_rank_candidates` directly: `_dynamic_active_
+        headroom` widens the active's headroom to its unmodeled 14 (5h
+        8%/7d 86%), so `_classify_dynamic_trigger` reads it as HEALTHY
+        (`dynamic-healthy`, not `at-limit`) and the tick falls into the
+        alternation arm instead of `_rank_candidates`'s own retry — which
+        F5 exercises directly and so never catches this. That arm ranked
+        candidates on the still-model-gated `headroom` dict with no retry
+        of its own, so every real candidate (also Fable-walled) read as
+        spent and the tick held below-threshold forever instead of
+        dropping the model set and switching to #3 (7d 79%, open once
+        Fable drops), exactly as `_rank_candidates`'s own retry does.
+
+        NO account is seeded warm: a genuine fleet-wide blackout must not
+        presuppose a WARM partner (the alternation arm's ordinary partner
+        search only ever considers `warm_ordered`) — the walled-escape
+        must admit a COLD candidate once the model set has legitimately
+        been dropped fleet-wide, ranked on the unmodeled floor headroom
+        (#1 stays below `cold_switch_cost_pct` at 8; #3 clears it at 21).
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (4, "a4@example.invalid"),
+            (1, "a1@example.invalid"),
+            (3, "a3@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        fleet = {
+            "4": self._u(8, 86, 100, 100),
+            "1": self._u(0, 92, 100, 4),
+            "3": self._u(0, 79, 100, 3),
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a true fleet-wide Fable blackout must "
+            "still retry on 5h/7d and switch to #3, not hold "
+            "below-threshold forever because the active's widened "
+            "headroom reads healthy, and it must not require a warm "
+            "partner to do it"
+        )
+        assert h.active_number() == 3
+
+
+
+
+
+class TestBoundedWalledEscapeUnderDynamicHealthy:
+    """#403 (owner, 2026-09-08): the owner's live specimen — a Fable-
+    walled active whose OWN 5h/7d widen it to `dynamic-healthy` (#375's
+    widening is untouched, and correctly reads it that way: this active's
+    5h/7d genuinely have room) — but every real peer is ALSO blocked on
+    some axis, so #375's alternation arm (which only ever considers a WARM
+    partner) held forever with real quota sitting idle. `dynamic-healthy`
+    gains a bounded escape: when no warm partner qualifies AND the active
+    is genuinely walled on its own (never-widened) model-gated axis, land
+    on whichever admissible peer (real headroom, no fixed percentage bar)
+    recovers soonest — cold or warm, ranked by time-to-reset, warmth
+    breaking only an exact tie. Never reachable while the active has real
+    room (the owner-fixture tests in ``TestTheModelWindowBindsUnlessIt
+    BindsEverywhere`` and ``TestWarmthAndAlternation375`` pin exactly that
+    boundary and must stay green).
+    """
+
+    @staticmethod
+    def _u(five_h, seven_d, fable, days_out=3, five_h_resets=None, fable_resets=None):
+        now = 1_000_000.0
+        d = {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": seven_d, "resets_at": _iso_at(now + days_out * 86400)},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+        if five_h_resets is not None:
+            d["five_hour"]["resets_at"] = _iso_at(now + five_h_resets)
+        if fable_resets is not None:
+            d["scoped"][0]["resets_at"] = _iso_at(now + fable_resets)
+        return d
+
+    def test_the_owners_specimen_switches_to_7(self, temp_home):
+        """The reported fleet, exactly as measured: active #4 walled on
+        Fable (100%) and effectively spent on 7d (90%) — #375's widen
+        reads it `dynamic-healthy` off its real 18% 5h room, correctly.
+        Every real peer is ALSO blocked on some axis (#3/#2 on Fable,
+        #7 on its own 5h, #1/#5/#6 on 7d) so no WARM partner exists and
+        the fleet held on a dead account. #7's 5h resets in under 3
+        hours; #2's Fable (its own binding window) has no known reset at
+        all in this fixture — #7 must win either way, and first-tick
+        (this harness has no prior `autoswitch_state.json`) must still
+        decide, not hold pending a rate sample that does not exist yet.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (4, "a4@example.invalid"), (3, "a3@example.invalid"),
+            (2, "a2@example.invalid"), (7, "a7@example.invalid"),
+            (1, "a1@example.invalid"), (6, "a6@example.invalid"),
+            (5, "a5@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        assert not h.state(), "must decide on the very first tick, no prior state"
+        fleet = {
+            "4": self._u(18, 90, 100, days_out=4),
+            "3": self._u(10, 81, 100, days_out=3),
+            "2": self._u(57, 68, 90, days_out=2),
+            "7": self._u(91, 18, 10, days_out=5, five_h_resets=2 * 3600 + 41 * 60),
+            "1": self._u(0, 95, 0, days_out=4),
+            "6": self._u(0, 96, 0, days_out=4),
+            "5": self._u(0, 97, 0, days_out=4),
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a Fable-walled active with every real peer "
+            "also blocked must escape, not hold on a dead account"
+        )
+        assert h.active_number() == 7, (
+            f"landed on {h.active_number()} instead of #7 — the peer whose "
+            "own binding window (5h) resets soonest"
+        )
+
+    def test_time_to_reset_caps_time_to_exhaustion_small_headroom_soon_wins(
+        self, temp_home
+    ):
+        """Isolated pair, both walled on some axis (so neither is simply
+        'more healthy' than the other by the ordinary tiering): SOON has
+        LESS headroom (5) but its binding 5h resets in an hour; FAR has
+        MORE headroom (10) but its binding Fable window resets six days
+        out. SOON must win — a window that recycles soon is not a wall
+        worth avoiding, however little room it leaves right now.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"),
+            (2, "soon@example.invalid"),
+            (3, "far@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        fleet = {
+            "1": self._u(18, 90, 100, days_out=4),  # active, walled on Fable
+            "2": self._u(95, 10, 5, days_out=4, five_h_resets=3600),   # SOON: headroom 5
+            "3": self._u(5, 10, 90, days_out=4, fable_resets=6 * 86400),  # FAR: headroom 10
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — the sooner-resetting, "
+            "smaller-headroom candidate (#2) must beat the larger-"
+            "headroom candidate whose own binding window is days out (#3)"
+        )
+
+    def test_warmth_breaks_an_exact_tie_between_admissible_escapees(self, temp_home):
+        """Two escapees with the IDENTICAL binding reset — warmth (never
+        touched) picks the warm one over the cold one."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"),
+            (2, "cold@example.invalid"),
+            (3, "warm@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"3": h.clock.now - 100.0})
+        )
+        fleet = {
+            "1": self._u(18, 90, 100, days_out=4),
+            "2": self._u(10, 10, 95, days_out=4, fable_resets=3600),  # cold, model-walled
+            "3": self._u(10, 10, 95, days_out=4, fable_resets=3600),  # warm, same reset
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} — an exact tie on binding "
+            "reset must go to the warm candidate (#3), never the cold "
+            "one (#2)"
+        )
+
+    def test_warmth_never_overrides_a_strictly_sooner_cold_candidate(
+        self, temp_home
+    ):
+        """Warmth is a tie-break, never a veto in the OTHER direction
+        either: a warm candidate whose own reset is later must still lose
+        to a cold candidate that comes back sooner."""
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"),
+            (2, "cold_soon@example.invalid"),
+            (3, "warm_later@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"3": h.clock.now - 100.0})
+        )
+        fleet = {
+            "1": self._u(18, 90, 100, days_out=4),
+            "2": self._u(95, 10, 5, days_out=4, five_h_resets=3600),       # cold, soon
+            "3": self._u(5, 10, 90, days_out=4, fable_resets=6 * 86400),  # warm, far
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — warmth must not override a "
+            "candidate that genuinely recovers sooner (#2)"
+        )
+
+    def test_the_escape_never_fires_while_the_active_has_real_room(self, temp_home):
+        """The active's OWN (never-widened) model-gated headroom is real
+        (Fable at 50%, not 100%) — not walled — so the escape must not
+        engage even though no warm partner exists and every peer is
+        blocked on some axis. Mirrors the pinned owner-fixture holds in
+        ``TestWarmthAndAlternation375``/``TestTheModelWindowBindsUnless
+        ItBindsEverywhere``, scoped to this class so a regression here is
+        caught beside the new arm it could otherwise silently override.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (1, "active@example.invalid"), (2, "a@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("active@example.invalid", 1)
+        fleet = {
+            "1": self._u(18, 20, 50, days_out=4),   # real Fable room -- not walled
+            "2": self._u(95, 10, 5, days_out=4, five_h_resets=3600),  # blocked on 5h
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome!r} — the active has real headroom on every "
+            "axis; the walled-escape must never fire for a merely-cold "
+            "fleet"
+        )
+        assert h.active_number() == 1
+
+    def test_an_untrustworthy_top_escapee_does_not_strand_the_tick(
+        self, temp_home
+    ):
+        """I1: the escape handed the freshen loop a SINGLE candidate
+        (`dynamic_ordered = [walled_escape]`), so a struck top escapee
+        stranded the whole tick instead of falling through to the next
+        admissible one — exactly the defect the `proactive` arm does not
+        have, because its own `dynamic_ordered` is the full ranked list
+        (`warm_ordered + [floor-clearing cold]`). Owner-specimen fixture
+        (``test_the_owners_specimen_switches_to_7``), #7 (soonest binding
+        reset) struck this time — #1 (next by recovery time) must still
+        be reached instead of the tick stranding BLOCKED.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (4, "a4@example.invalid"), (3, "a3@example.invalid"),
+            (2, "a2@example.invalid"), (7, "a7@example.invalid"),
+            (1, "a1@example.invalid"), (6, "a6@example.invalid"),
+            (5, "a5@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a4@example.invalid", 4)
+        fleet = {
+            "4": self._u(18, 90, 100, days_out=4),
+            "3": self._u(10, 81, 100, days_out=3),
+            "2": self._u(57, 68, 90, days_out=2),
+            "7": self._u(91, 18, 10, days_out=5, five_h_resets=2 * 3600 + 41 * 60),
+            "1": self._u(0, 95, 0, days_out=4),
+            "6": self._u(0, 96, 0, days_out=4),
+            "5": self._u(0, 97, 0, days_out=4),
+        }
+        entries = {num: _entry_for(value, h.clock.now) for num, value in fleet.items()}
+        entries["7"] = UsageEntry(
+            last_good=fleet["7"], fetched_at=h.clock.now, age_s=0.0,
+            auth_dead_strikes=2,
+        )
+        assert entries["7"].token_dead()
+        outcome = h.tick_with_entries(entries)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a struck top escapee (#7) must not "
+            "strand the tick while a healthy, later-ranked one is "
+            "available"
+        )
+        assert h.active_number() == 1, (
+            f"landed on {h.active_number()} — with #7 struck, the next "
+            "admissible escapee by recovery time must be reached"
+        )
+
+    def test_a_relative_margin_above_the_cold_floor_still_governs_admission(
+        self, temp_home
+    ):
+        """[I2]: this test (formerly ``test_an_absolute_floor_never_holds_
+        a_real_rescue_forever``) pinned its subject with a candidate at
+        unmodeled 60 -- nowhere near the absolute `cold_switch_cost_pct`
+        (20) floor either bar could produce, so it passed unchanged
+        whether or not `_blackout_retry_admission_bar`'s RELATIVE term
+        (`floor_headroom[current] + SPENT_HEADROOM_PCT`) was even applied
+        to a cold candidate at all; it could no longer fail for its
+        stated subject once `cold_floor` shipped. `max(relative,
+        cold_floor)`'s relative half only ever BINDS (exceeds the
+        absolute 20) when the active's own unmodeled headroom is in
+        `[17, 20)` -- below 17 the absolute 20 wins outright, at or above
+        20 `blackout_escape` itself disarms. Active at 18 puts the bar at
+        21 (relative, strictly above the absolute floor): #3 at 20.5
+        clears the absolute floor alone but not the actual (relative)
+        bar, and must still be refused -- proving the relative term, not
+        just the absolute 20, decides admission in this band. (A genuine
+        cold rescue clearing BOTH bars stays pinned by
+        ``test_f7_dynamic_healthy_arm_retries_a_true_fleet_wide_
+        blackout``.)
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        fleet = {
+            "1": self._u(0, 82, 100, days_out=4),    # active: unmodeled headroom 18
+            "3": self._u(0, 79.5, 100, days_out=3),  # cold: unmodeled headroom 20.5
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3's unmodeled headroom (20.5) clears "
+            "the absolute cold floor (20) but not the relative bar "
+            "(active 18 + SPENT_HEADROOM_PCT = 21); the relative term "
+            "must still govern admission in this band"
+        )
+        assert h.active_number() == 1
+
+    def test_a_peer_barely_above_the_active_is_still_not_an_escape(
+        self, temp_home
+    ):
+        """The churn case the absolute bar used to protect against, still
+        protected once the bar is relative: a candidate merely level with,
+        or barely above, the active's own unmodeled reading is not a real
+        rescue and must not be taken — only a margin of at least
+        `SPENT_HEADROOM_PCT` counts. Both readings sit ABOVE the old
+        absolute `cold_switch_cost_pct` (20) floor (18 and 20) so a naive
+        revert to that absolute bar would wrongly ADMIT this candidate —
+        the discriminating fixture against a plain revert.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        fleet = {
+            "1": self._u(0, 82, 100, days_out=4),  # active: unmodeled headroom 18
+            "3": self._u(0, 80, 100, days_out=3),  # unmodeled headroom 20 -- barely above
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3's unmodeled headroom (20) is only 2 "
+            "points above the active's own (18), well under the "
+            "SPENT_HEADROOM_PCT churn margin; it must not be taken"
+        )
+        assert h.active_number() == 1
+
+    def test_a_warm_rescue_is_not_invisible_to_the_blackout_escape(
+        self, temp_home
+    ):
+        """[C]: the blackout escape only ever drew candidates from
+        `cold_ordered`, so a WARM peer whose unmodeled headroom clears the
+        relative bar but sits under the absolute `cold_switch_cost_pct`
+        (20) was invisible to it -- `partner` (only sees warm at >= 20)
+        refuses it too, and the tick held `below-threshold`/NO_ACTION even
+        though #3 holds more than double the active's own unmodeled
+        headroom, warm, right now. Held up to an hour, and the engine
+        would then take #3 the moment it goes COLD -- refusing the cheap
+        rescue and buying the expensive one.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"3": h.clock.now - 600.0})
+        )
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
+            "3": self._u(0, 88, 100, days_out=3),  # warm, unmodeled headroom 12
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3 is a WARM rescue holding more than "
+            "double the active's own unmodeled headroom; the escape must "
+            "not be blind to a warm candidate merely because it sits "
+            "under the absolute cold-switch bar"
+        )
+        assert h.active_number() == 3
+
+    def test_a_warm_partner_does_not_veto_an_immediate_walled_escape(
+        self, temp_home
+    ):
+        """[I]: `if partner is None and _about_to_wall(...)` skipped the
+        walled escape entirely whenever ANY warm peer cleared the ordinary
+        `cold_switch_cost_pct` (20) bar -- even when the active is
+        genuinely walled RIGHT NOW. Control then fell to the plain
+        partner/dwell path, which held for a full `alternation_chunk_
+        seconds` (600s) before taking the very candidate the escape would
+        have picked immediately. A partner's existence is a ranking fact,
+        never a veto on an urgent escape.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "b@example.invalid"), (2, "a@example.invalid")):
+            h.seed(num, email)
+        h.make_live("b@example.invalid", 1)
+        t0 = h.clock.now
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"1": t0, "2": t0})
+        )
+        h.clock.advance(60.0)
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # B, active: unmodeled headroom 5
+            "2": self._u(0, 40, 100, days_out=4),  # A, warm: unmodeled headroom 60
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — the active is walled right now (raw "
+            "headroom 0) and an admissible warm partner exists; the "
+            "escape must fire immediately, not wait out a 600s dwell"
+        )
+        assert h.active_number() == 2
+
+    def test_the_blackout_bar_never_drops_below_the_real_switch_cost(
+        self, temp_home
+    ):
+        """[I]: `_blackout_retry_admission_bar` was `floor_headroom[current]
+        + SPENT_HEADROOM_PCT` with no floor of its own -- so as the
+        active's own unmodeled reading gets smaller, the bar for a COLD
+        candidate (which genuinely costs ~19 5h-points to land on,
+        settings.py's own `cold_switch_cost_pct`) shrinks with it. Active
+        at unmodeled 5, #3 COLD at unmodeled 15 (7d 85%, still below the
+        90% threshold so it reads model-only-walled, not exhausted)
+        cleared the old relative-only bar (8) for a nominal gain of 10
+        against a real cold-switch cost of ~19 -- a net loss the escape
+        must refuse.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in ((1, "a1@example.invalid"), (3, "a3@example.invalid")):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        fleet = {
+            "1": self._u(0, 95, 100, days_out=4),  # active: unmodeled headroom 5
+            "3": self._u(0, 85, 100, days_out=3),  # cold: unmodeled headroom 15
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3's unmodeled headroom (15) clears the "
+            "old relative-only bar (8) but not the real cold-switch cost "
+            "(~19-worth, `cold_switch_cost_pct`); a cold escapee must "
+            "clear both"
+        )
+        assert h.active_number() == 1
+
+    def test_the_non_blackout_escape_still_prices_a_cold_landing(
+        self, temp_home
+    ):
+        """[I1]: the `_about_to_wall(raw_active_headroom)`-alone gate
+        (#321's collapse) also widened THIS branch's reach -- the plain
+        `_about_to_wall`/`SPENT_HEADROOM_PCT` escape that fires when
+        `blackout_escape` is False (no genuine fleet-wide model blackout,
+        `model_window_dropped` stays False because the model-gated ranking
+        already has a warm candidate). That branch has no cold cost term
+        at all, so a cold candidate whose binding window merely resets
+        SOONER can be taken over a qualified warm partner, paying the
+        real `cold_switch_cost_pct` rewrite for nothing. Active #1 is
+        walled on Fable right now (model-gated headroom 0); #2 is a warm
+        partner at model-gated headroom 25; #3 is a COLD peer at
+        model-gated headroom 15 -- below `cold_switch_cost_pct` (20) --
+        whose own Fable window happens to reset in an hour, while #2's has
+        no known reset at all. The old code sorted purely on recovery
+        time and landed on #3; a cold escapee must clear the cold-switch
+        floor too, same as the blackout escape already requires.
+        """
+        h = EngineHarness(temp_home, model="Fable", threshold=70.0, strategy="dynamic")
+        for num, email in (
+            (1, "a1@example.invalid"), (2, "a2@example.invalid"),
+            (3, "a3@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a1@example.invalid", 1)
+        h.engine._mutate_state(
+            lambda s: s.update(lastActiveAt={"2": h.clock.now - 600.0})
+        )
+        fleet = {
+            "1": self._u(30, 40, 100, days_out=4),  # active: model-gated headroom 0
+            "2": self._u(20, 25, 75, days_out=4),   # warm: model-gated headroom 25
+            "3": self._u(5, 10, 85, days_out=3, fable_resets=3600),  # cold: headroom 15
+        }
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — a walled active with a qualified warm "
+            "partner must escape"
+        )
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — #3's headroom (15) is below "
+            "the real cold-switch cost (20) and must not be taken over "
+            "the qualified warm partner (#2) merely because it resets "
+            "sooner"
+        )
+
+
+class TestASpendOnlyAccountNeverDisarmsTheBlackoutPredicate:
+    """The 2026-09-08 01:45Z specimen (owner): active #2 reads 97% used
+    (headroom 3, `proactive` trigger). Every real peer is ALSO blocked —
+    #1/#4/#5/#6/#7 on 5h/7d itself, #3 on Fable alone (5h 43%/7d 88%, real
+    unmodeled headroom 12) — and #8 is spend-only (no 5h/7d/model window at
+    all). `_model_window_binds_everywhere` folded #8's empty window list
+    into the SAME "open" outcome a genuinely-open account produces
+    (`classify_candidate_block([], threshold)` always returns "open"), so
+    one unreadable/spend-only account in the fleet disarmed the retry for
+    every genuinely model-only-walled account, `all accounts exhausted`
+    fired with Opus (the 5h/7d axis) open on #3 the whole time, and the
+    engine slept ten minutes instead of landing there.
+    """
+
+    @staticmethod
+    def _u(five_h, seven_d, fable, days_out=3):
+        now = 1_000_000.0
+        return {
+            "five_hour": {"pct": five_h},
+            "seven_day": {"pct": seven_d, "resets_at": _iso_at(now + days_out * 86400)},
+            "scoped": [{"name": "Fable", "pct": fable}],
+        }
+
+    @staticmethod
+    def _spend_only():
+        # A credit (pay-as-you-go) slot: no five_hour/seven_day/scoped keys
+        # at all, exactly the shape `oauth.relevant_windows` reads as "no
+        # window to report" (`test_a_spend_only_account_prints_its_credit_
+        # figure_not_a_bare_mark` pins the same shape at the panel layer).
+        return {"spend": {"pct": 10.0, "used": 1.0, "limit": 10.0}}
+
+    def _specimen_usage(self, *, account_3_seven_day=88):
+        return {
+            "2": self._u(97, 50, 50, days_out=3),  # active: headroom 3, proactive
+            "1": self._u(0, 100, 92, days_out=4),
+            "3": self._u(43, account_3_seven_day, 100, days_out=2),
+            "4": self._u(34, 93, 100, days_out=4),
+            "5": self._u(0, 100, 100, days_out=4),
+            "6": self._u(0, 100, 90, days_out=4),
+            "7": self._u(100, 20, 10, days_out=5),
+            "8": self._spend_only(),
+        }
+
+    def test_the_owners_specimen_switches_to_3(self, temp_home):
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (2, "a2@example.invalid"), (1, "a1@example.invalid"),
+            (3, "a3@example.invalid"), (4, "a4@example.invalid"),
+            (5, "a5@example.invalid"), (6, "a6@example.invalid"),
+            (7, "a7@example.invalid"), (8, "a8@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a2@example.invalid", 2)
+        fleet = self._specimen_usage()
+        outcome = h.tick_with_usage(fleet)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome!r} — #3 is open on the unmodeled (5h/7d) axis "
+            "(12% headroom) and the spend-only #8 must not disarm the "
+            "fleet-wide-blackout retry that would rescue it; events="
+            f"{[e.kind for e in h.events]}"
+        )
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} instead of #3 — the only "
+            "account with real 5h/7d headroom once the Fable wall is "
+            "correctly dropped fleet-wide"
+        )
+
+    def test_a_spend_only_account_cannot_disarm_the_predicate(self, temp_home):
+        """The predicate, pinned on its own: with #8 present in the fleet
+        it must read exactly as it would with #8 removed — an unreadable
+        or spend-only account carries no window to be "open" on."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = self._specimen_usage()
+        with_8 = _model_window_binds_everywhere(usage, ("Fable",), 90.0)
+        without_8 = _model_window_binds_everywhere(
+            {k: v for k, v in usage.items() if k != "8"}, ("Fable",), 90.0
+        )
+        assert with_8 is True, (
+            "a spend-only account (#8) must not disarm the predicate — "
+            f"got {with_8!r} with #8 present, {without_8!r} without it"
+        )
+        assert without_8 is True
+
+    def test_control_no_model_only_wall_left_reads_false_and_invents_nothing(
+        self, temp_home
+    ):
+        """Same roster, but #3's 7d is bumped to 100 too — no account is
+        model-only-walled any more (every real account is "full", #8 is
+        spend-only). The predicate must correctly read False, and the
+        engine must not manufacture a landing that was never there."""
+        from claude_swap.autoswitch import _model_window_binds_everywhere
+
+        usage = self._specimen_usage(account_3_seven_day=100)
+        assert _model_window_binds_everywhere(usage, ("Fable",), 90.0) is False, (
+            "no account in this roster is model-only-walled once #3's 7d "
+            "is spent too — the predicate must not fire"
+        )
+        # #8 is skipped via a plain `continue`, never a `return` -- it
+        # costs the loop nothing about the rest of the roster, before or
+        # after it in iteration order. This assertion does not discriminate
+        # the fix from the pre-fix predicate: with no genuine model-only
+        # wall left in the roster, BOTH read False whether #8 is present or
+        # not, since #8 sits last in this fixture's iteration order and
+        # nothing earlier in the roster sets the verdict either way. It
+        # only pins that dropping #8 from an already-open roster is a
+        # no-op. The discriminating case -- #8 sitting where its old
+        # "read as open" behaviour would have masked a REAL model-only
+        # wall -- is this class's `test_a_spend_only_account_cannot_
+        # disarm_the_predicate`'s `with_8 is True` assertion.
+        without_8 = {k: v for k, v in usage.items() if k != "8"}
+        assert _model_window_binds_everywhere(without_8, ("Fable",), 90.0) is False, (
+            "dropping #8 from an already-open roster must not change the "
+            "verdict"
+        )
+        h = EngineHarness(temp_home, model="Fable", threshold=90.0, strategy="dynamic")
+        for num, email in (
+            (2, "a2@example.invalid"), (1, "a1@example.invalid"),
+            (3, "a3@example.invalid"), (4, "a4@example.invalid"),
+            (5, "a5@example.invalid"), (6, "a6@example.invalid"),
+            (7, "a7@example.invalid"), (8, "a8@example.invalid"),
+        ):
+            h.seed(num, email)
+        h.make_live("a2@example.invalid", 2)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is not TickOutcome.SWITCHED, (
+            f"got {outcome!r} — with no genuine model-only wall left in "
+            "the roster the retry must not fire and the engine must not "
+            "invent a candidate"
         )

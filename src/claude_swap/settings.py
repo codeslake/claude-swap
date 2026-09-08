@@ -58,6 +58,17 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # `dynamic` only (#375): how long a departed account's cached org
+    # context stays "warm" — a candidate never touched inside this window
+    # is "cold" and pays the re-write cost on landing.
+    cache_ttl_seconds: float = 3600.0
+    # `dynamic` only: the least headroom a COLD candidate needs to be worth
+    # the re-write cost (measured: one cold landing cost ~19 5h-points on a
+    # 19-session fleet).
+    cold_switch_cost_pct: float = 20.0
+    # `dynamic` only: how long a healthy active is held before rotating to a
+    # warm partner, so both accounts' caches stay inside `cache_ttl_seconds`.
+    alternation_chunk_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "cacheTtlSeconds", "cache_ttl_seconds", "float", 60.0, 86400.0,
+            help="dynamic: how long a departed account's cache stays warm",
+        ),
+        SettingSpec(
+            "autoswitch", "coldSwitchCostPct", "cold_switch_cost_pct", "float", 0.0, 100.0,
+            help="dynamic: headroom a cold candidate needs to be admitted",
+        ),
+        SettingSpec(
+            "autoswitch", "alternationChunkSeconds", "alternation_chunk_seconds",
+            "float", 60.0, 3600.0,
+            help="dynamic: how long to sit before rotating to a warm partner",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

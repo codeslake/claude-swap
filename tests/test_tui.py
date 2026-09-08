@@ -1918,6 +1918,8 @@ class TestAutoScreen:
             assert engine.applied_strategies == ["dynamic"]
             assert engine.wakes == 1  # a forced tick shows the new strategy
             assert "dynamic (session)" in summary.render().plain
+            assert "switch at 97%" in summary.render().plain
+            assert app.threshold_pct == 97.0
             await pilot.press("s")
             await pilot.pause()
             assert screen._settings.strategy == "best"
@@ -2444,6 +2446,80 @@ class TestTheAutoFlagIsTheOnlyRouteToLive:
                 "--auto did not start a LIVE engine"
             )
 
+class TestNextBestMarksStaleUsage:
+    """The 'Next best' panel must not present a candidate's cached figures
+    as live when its last poll failed (an active backoff, a run of
+    failures) — and must NOT mark a healthy row merely because its
+    `fetched_at` is past the 180 s serve TTL, which is most of every poll
+    cycle."""
+
+    def _render(self, snap, active, *, settings=None):
+        from unittest.mock import MagicMock, patch
+        from claude_swap.tui.autoview import AutoScreen
+        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.tui.theme import CSWAP_DARK
+
+        v = AutoScreen.__new__(AutoScreen)
+        v._settings = settings or AutoSwitchSettings(strategy="best")
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK
+        with patch.object(AutoScreen, "app", property(lambda s: app)):
+            return str(v._candidates_text(snap, active_number=active))
+
+    def test_a_backed_off_candidate_is_marked(self):
+        stale_entry = UsageEntry(
+            last_good=make_entry(0.0, 0.0).last_good,
+            fetched_at=time.time() - 1000.0,
+            age_s=1000.0,
+            consecutive_failures=9,
+            last_error="http-429",
+            backoff_until=time.time() + 400.0,
+            trust_extended=True,
+        )
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=stale_entry),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        out = self._render(snap, active="1")
+        assert "user2@example.com" in out
+        row2 = out[out.index("user2@example.com"):]
+        assert "stale" in row2, f"no stale mark on the backed-off row: {out!r}"
+
+    def test_a_healthy_candidate_past_the_serve_ttl_is_not_marked(self):
+        """I-c: a healthy row at age 300 s (no failures, no backoff) is a
+        row the engine lands on happily; marking it `stale` on the TTL
+        made the panel cry wolf on most candidates most of the time."""
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=make_entry(0.0, 0.0, age_s=300.0)),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        out = self._render(snap, active="1")
+        row2 = out[out.index("user2@example.com"):]
+        assert "stale" not in row2, f"a healthy row was marked stale: {out!r}"
+
+    def test_a_fresh_candidate_is_not_marked(self):
+        """Control: the same panel, no backoff/failures — no mark."""
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True, entry=make_entry(95.0, 20.0)),
+                make_account(2, entry=make_entry(0.0, 0.0)),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        out = self._render(snap, active="1")
+        row2 = out[out.index("user2@example.com"):]
+        assert "stale" not in row2, f"a fresh row was marked stale: {out!r}"
+
+
 class TestUnswitchableRowsAreListed:
     """A slot you cannot switch to must still appear, with the reason.
 
@@ -2462,10 +2538,11 @@ class TestUnswitchableRowsAreListed:
         )
 
     def _acct(self, number, email, *, switchable, kind="oauth", last_good=None,
-              sentinel=None, usage=None):
+              sentinel=None, usage=None, disabled=False):
         from unittest.mock import MagicMock
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
+        a.disabled = disabled
         if usage is not None:
             a.usage = usage
         else:
@@ -2633,6 +2710,36 @@ class TestUnswitchableRowsAreListed:
             f"95%-used one: {out!r}"
         )
 
+    def test_a_disabled_spend_only_account_names_why_it_is_never_chosen(self):
+        """Every other Next-best row says why it is excluded (no login,
+        API key, blocked window); a spend-only account held out of auto
+        rotation was the one silent exception — nothing next to it said
+        why it never gets picked."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("8", "credit@x.com", switchable=True, disabled=True,
+                       last_good={
+                           "spend": {"pct": 45.0, "used": 207.69, "limit": 466.0},
+                       }),
+        ), active="1")
+        assert "auto-swap disabled" in out, (
+            f"a disabled spend-only account gave no reason it is never "
+            f"chosen: {out!r}"
+        )
+
+    def test_CONTROL_an_enabled_spend_only_account_names_no_reason(self):
+        """CONTROL: an ENABLED spend-only account must not gain the label —
+        it is spend-only that keeps it out of ranking, not `disabled`."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "cheap@x.com", switchable=True, last_good={
+                "spend": {"pct": 1.0, "used": 0.2, "limit": 20.0},
+            }),
+        ), active="1")
+        assert "auto-swap disabled" not in out, (
+            f"CONTROL BROKEN: an enabled account was labeled disabled: {out!r}"
+        )
+
     def test_CONTROL_an_account_with_no_usage_at_all_still_says_unknown(self):
         """The control: "usage unknown" is still the right answer when there
         is genuinely nothing to show. A fix that removes the phrase outright
@@ -2741,7 +2848,7 @@ class TestUnswitchableRowsAreListed:
                 "scoped": [{"name": "Fable", "pct": 10.0}],
             }),
         ), active="1", settings=settings)
-        assert "Fable-only" in out, out
+        assert "Fable-walled" in out, out
         assert "  5h full" in out, out
 
     def test_the_panel_never_calls_a_refetching_window_full(self):
@@ -2784,12 +2891,13 @@ class TestUnswitchableRowsAreListed:
         ), active="1")
         assert "5h full" in out, out
 
+
     def test_the_panel_chips_include_the_window_its_label_names(self):
         """A row's chips and its label must read the SAME window set — a
         `model`-blocked row used to name the scoped window in its label
         while the chips, built from a literal 5h/7d pair, never printed it
         at all. Account #4's real values: 5h 28%, 7d 70%, Fable 91%,
-        threshold 90, model Fable — the label already read `Fable-only`;
+        threshold 90, model Fable — the label already read `Fable-walled`;
         the chips must now show `Fable:91%` alongside `5h:28%`/`7d:70%` (none
         of the three windows carry a reset here, so each chip reads its
         explicit unknown-reset marker rather than the bare label)."""
@@ -2803,7 +2911,7 @@ class TestUnswitchableRowsAreListed:
                 "scoped": [{"name": "Fable", "pct": 91.0}],
             }),
         ), active="1", settings=settings)
-        assert "Fable-only" in out, out
+        assert "Fable-walled" in out, out
         assert "Fable(⟳?):91%" in out, out
 
     def test_a_dead_5h_window_reads_its_own_full_countdown_not_unknown(self):

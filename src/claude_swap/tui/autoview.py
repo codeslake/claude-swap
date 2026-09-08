@@ -33,7 +33,9 @@ from claude_swap.autoswitch import (
     binding_pct,
     classify_candidate_block,
     consume_first_rank_key,
+    model_block_label,
     pct_label,
+    proactive_switch_bar_pct,
     select_probe_target,
 )
 from claude_swap import pin
@@ -132,7 +134,9 @@ class AutoScreen(Screen):
         # and remember that value: unmount restores it (only the session
         # adjustment reverts, not this correction).
         self._configured_threshold = self._settings.threshold
-        self.app.threshold_pct = self._settings.threshold
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            self._settings.strategy, self._settings.threshold
+        )
         self._configured_strategy = self._settings.strategy
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -152,7 +156,9 @@ class AutoScreen(Screen):
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
         if self._configured_threshold is not None:
-            self.app.threshold_pct = self._configured_threshold
+            self.app.threshold_pct = proactive_switch_bar_pct(
+                self._configured_strategy, self._configured_threshold
+            )
         self.app.set_store_only(False)
 
     def _on_theme_change(self, _theme: str) -> None:
@@ -217,7 +223,9 @@ class AutoScreen(Screen):
         self._settings = replace(self._settings, threshold=value)
         if self._engine is not None:
             self._engine.apply_threshold(value)
-        self.app.threshold_pct = value
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            self._settings.strategy, value
+        )
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
 
@@ -227,6 +235,9 @@ class AutoScreen(Screen):
         current = _STRATEGY_CYCLE.index(self._settings.strategy)
         value = _STRATEGY_CYCLE[(current + 1) % len(_STRATEGY_CYCLE)]
         self._settings = replace(self._settings, strategy=value)
+        self.app.threshold_pct = proactive_switch_bar_pct(
+            value, self._settings.threshold
+        )
         if self._engine is not None:
             self._engine.apply_strategy(value)
             self._engine.wake()  # show a decision under the new strategy now
@@ -249,6 +260,11 @@ class AutoScreen(Screen):
         )
         if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
+        bar = proactive_switch_bar_pct(
+            self._settings.strategy, self._settings.threshold
+        )
+        if bar != self._settings.threshold:
+            text.append(f" · switch at {pct_label(bar)}%")
         text.append(f" · {self._settings.strategy}")
         if self._settings.strategy != self._configured_strategy:
             text.append(" (session)", style=palette.muted)
@@ -555,6 +571,12 @@ class AutoScreen(Screen):
                     entry.append(f" · {spend_suffix}", style=palette.muted)
                 else:
                     entry.append("  usage unknown", style=palette.muted)
+                # A spend-axis account is never a ranking target regardless
+                # of `acc.disabled` (`relevant_windows` excludes spend, so
+                # `_rank` can't see it) -- but every OTHER row here says why
+                # it is never chosen, and this was the one silent exception.
+                if acc.disabled:
+                    entry.append("  auto-swap disabled", style=palette.muted)
                 # RANKED LAST EITHER WAY. Spend is not headroom: folding it
                 # into the sort key would change which account the engine
                 # picks, and the ranking axis is not this row's to move.
@@ -589,6 +611,13 @@ class AutoScreen(Screen):
                         entry.append(" " * pad, style=palette.muted)
                 if not windows:  # no window data at all — keep the old reading
                     entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
+                # A candidate whose LAST poll failed (an active backoff, a
+                # run of failures; a success clears both) must not present
+                # its cached figures as live. Not `fresh()`'s 180 s TTL: a
+                # healthy row's `fetched_at` is older than that for most of
+                # every poll cycle, and the engine lands on it happily.
+                if acc.usage.in_backoff(now) or acc.usage.consecutive_failures:
+                    entry.append("  stale", style=palette.sev_warn)
                 # WHAT blocks this candidate, not just the raw chips: a 5h/7d
                 # window (no model choice escapes it) reads differently from
                 # a model-only block (the engine's fallback ranks around it),
@@ -612,7 +641,10 @@ class AutoScreen(Screen):
                         self._settings.threshold,
                     )
                     if kind == "model":
-                        entry.append(f"  {blocked_model}-only", style=palette.muted)
+                        entry.append(
+                            f"  {model_block_label(blocked_model)}",
+                            style=palette.muted,
+                        )
                     elif kind == "full":
                         entry.append(f"  {blocked_model} full", style=palette.muted)
                 rank_pct = binding_pct(acc.usage.last_good, rank_models)
