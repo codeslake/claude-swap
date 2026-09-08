@@ -13477,6 +13477,74 @@ class TestConsumeGate:
         # nothing consumed; the backup is exactly as it was
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    def test_live_store_holding_the_same_lineage_is_never_consumed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A bare `/login` into this slot's own account never moves
+        `activeAccountNumber` (95101f58), so the live credential store and
+        this slot's backup can hold the SAME refresh lineage while the
+        roster still routes this slot through the collect pass
+        (`is_active=False`). POSTing the backup grant there retires the
+        generation Claude Code itself is still using -- refuse rather than
+        rotate a lineage the live store currently holds."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=self._OLD), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-current"
+        # nothing consumed; the backup is exactly as it was
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_live_store_holding_a_different_lineage_still_consumes(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The control for the guard above: a live store on a DIFFERENT
+        lineage (the ordinary shape -- some other slot is active) must not
+        block this slot's own usage refresh."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=self._NEW), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_called_once()
+        assert result.credentials == self._NEW
+
+    def test_an_unreadable_live_store_refuses_rather_than_posts(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Fail closed: an unreadable live store is not proof the lineage
+        differs -- refuse the POST rather than treat unreadable as absent."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(
+            s, "_read_capture_credentials",
+            side_effect=CredentialReadError("keychain locked"),
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(self._NEW, None),
+        ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-unreadable"
+
     def test_gate_survives_a_roster_read_that_raises_after_the_lock_releases(
         self, temp_home: Path, sample_sequence_data: dict
     ):

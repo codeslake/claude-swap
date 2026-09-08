@@ -2361,6 +2361,41 @@ class ClaudeAccountSwitcher:
                     # replaces the credential (`cswap add`), which is
                     # exactly the re-login window this gate exists to close.
                     return oauth.RefreshOutcome(None, "lineage-condemned")
+
+                # Never POST a refresh grant the LIVE credential store
+                # currently holds. `_adopt_login_into_slot` never moves
+                # `activeAccountNumber` on a bare login, so after a login
+                # into THIS slot's own account the live store (Claude
+                # Code's own copy) and this slot's backup can hold the SAME
+                # refresh lineage while the roster still routes this slot
+                # through the collect pass (`is_active=False`) -- POSTing
+                # here would retire the generation Claude Code itself is
+                # still using. `credential_fingerprint` hashes only the
+                # refresh token, so it compares lineage and is blind to the
+                # live copy's own access-token rotation. Fail closed: an
+                # unreadable live store is not proof the lineage differs.
+                try:
+                    live_creds = self._read_capture_credentials()
+                except CredentialReadError:
+                    self._logger.info(
+                        "Live credential store unreadable while gating "
+                        "account %s's backup refresh; deferring rather "
+                        "than risk consuming a grant it still holds.",
+                        account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "live-store-unreadable")
+                if (
+                    live_creds
+                    and consumed_fp is not None
+                    and oauth.credential_fingerprint(live_creds) == consumed_fp
+                ):
+                    self._logger.info(
+                        "Account %s's backup grant matches the live "
+                        "credential store's current lineage; deferring "
+                        "rather than consuming a grant Claude Code itself "
+                        "may still be using.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "live-store-current")
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
             # the slot; defer cleanly rather than raise through callers
