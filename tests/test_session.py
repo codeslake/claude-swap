@@ -2913,6 +2913,11 @@ class TestGuards:
         session_dir = session_dir_for(
             seeded_switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
+        # Unexpired, so the read-only request is made; an expired copy under
+        # a live session is not requested at all.
+        seeded_switcher._write_account_credentials(
+            ACCOUNT_NUM, ACCOUNT_EMAIL, ROTATED_CREDS
+        )
         make_live(session_dir)
         seen: dict[str, bool] = {}
 
