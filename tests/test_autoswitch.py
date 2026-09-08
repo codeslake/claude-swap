@@ -2426,6 +2426,127 @@ class TestAdaptiveScheduler:
         assert sw.trigger == "consume-first"
 
 
+class TestABareLoginHealsItsSlotThroughTheEngineTick:
+    """THE ACCEPTANCE TEST: a bare ``/login`` as a managed slot's own roster
+    identity, no ``cswap add``, no ``cswap switch``, some UNRELATED account
+    recorded as active -- driven from ``AutoSwitchEngine.tick()`` itself
+    (never from ``_resync_rotated_backup``/``_adopt_login_into_slot``
+    directly), asserting the STORED BACKUP file changed.
+
+    Call chain this exercises, top to bottom: ``tick()`` -> ``_tick_inner()``
+    -> ``current = switcher.current_account_number()`` (switcher.py:1997 --
+    reads the LIVE LABEL, "deliberately no fallback to the recorded
+    activeAccountNumber", so a `/login` makes this the logged-in slot on the
+    very next tick regardless of the roster's stored field) ->
+    ``_collect_scheduled_usage(current, ...)`` -> ``usage_entries_by_account``
+    -> ``_build_accounts_info()`` (also LIVE-LABEL-based ``is_active``) ->
+    ``_collect_usage_entries`` -> ``_fetch_account_usage`` (is_active=True)
+    -> ``_fetch_active_usage`` -> (network accepts the fresh login) ->
+    ``_resync_rotated_backup`` -> the oracle confirms the live bytes are
+    this slot's own identity -> writes the fresh credential into the slot's
+    stored backup, without touching ``activeAccountNumber``.
+    """
+
+    def _harness(self, temp_home, monkeypatch):
+        monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        h = EngineHarness(temp_home)
+        h.seed(1, "m@example.com")   # "whatever unrelated account active"
+        h.seed(2, "n@example.com")   # slot N
+        monkeypatch.setattr(h.switcher, "_live_session_pids", lambda *a: [])
+        return h
+
+    def test_a_relogin_as_slot_n_heals_its_backup_without_moving_active(
+        self, temp_home, monkeypatch,
+    ):
+        h = self._harness(temp_home, monkeypatch)
+        # Slot N's STORED BACKUP holds the WRONG account's bytes (the field
+        # defect this whole class is about).
+        h.switcher._write_account_credentials("2", "n@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-wrong", "refreshToken": "rt-wrong"}}
+        ))
+        assert h.active_number() == 1, "premise: an unrelated account is active"
+
+        # A bare /login as slot N's OWN roster identity -- no cswap add, no
+        # cswap switch.
+        h.make_live("n@example.com", 2)
+
+        def fake_fetch(num, email, creds, is_active=False, **kwargs):
+            return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+        with (
+            patch("claude_swap.oauth.try_fetch_usage_for_account",
+                  side_effect=fake_fetch),
+            patch("claude_swap.oauth.fetch_oauth_profile",
+                  return_value={"uuid": "uuid-2", "email": "n@example.com",
+                                "organizationUuid": ""}),
+        ):
+            h.engine.tick()
+
+        got = h.switcher._read_account_credentials("2", "n@example.com")
+        assert json.loads(got)["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            f"slot N's stored backup was not healed by the login: {got!r}"
+        )
+        assert h.active_number() == 1, (
+            "the roster's active pointer moved onto the account someone "
+            "merely logged into"
+        )
+
+    def test_a_relogin_as_a_different_managed_slot_heals_that_slot_instead(
+        self, temp_home, monkeypatch,
+    ):
+        """CROSS-WIRE arm, same entry point: the live LABEL claims slot 2,
+        but the oracle resolves the live BYTES to slot 3 -- a THIRD slot,
+        distinct from both the label's slot and the currently-active one
+        (1), so a pointer move onto the resolved owner cannot hide behind
+        it already being active by coincidence. The credential must land in
+        slot 3 (the resolved owner), never in slot 2 (what the label/config
+        names), and the active pointer must still not move off slot 1."""
+        h = self._harness(temp_home, monkeypatch)
+        h.seed(3, "p@example.com")
+        h.switcher._write_account_credentials("3", "p@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-3-old", "refreshToken": "rt-3-old",
+                               "refreshTokenExpiresAt": 1_000_000}}
+        ))
+        assert h.active_number() == 1
+
+        # A bare /login: label says slot 2, but the live bytes (a LATER
+        # login than slot 3's stored generation) resolve to slot 3.
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live",
+                              "refreshTokenExpiresAt": 1_100_000},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "n@example.com", "accountUuid": "uuid-2"},
+        }))
+
+        def fake_fetch(num, email, creds, is_active=False, **kwargs):
+            return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+        with (
+            patch("claude_swap.oauth.try_fetch_usage_for_account",
+                  side_effect=fake_fetch),
+            patch("claude_swap.oauth.fetch_oauth_profile",
+                  # ...but the bytes resolve to slot 3's identity.
+                  return_value={"uuid": "uuid-3", "email": "p@example.com",
+                                "organizationUuid": ""}),
+        ):
+            h.engine.tick()
+
+        got3 = h.switcher._read_account_credentials("3", "p@example.com")
+        assert json.loads(got3)["claudeAiOauth"]["refreshToken"] == "rt-live", (
+            f"the resolved owner's slot was not healed: {got3!r}"
+        )
+        got2 = h.switcher._read_account_credentials("2", "n@example.com")
+        assert json.loads(got2)["claudeAiOauth"]["refreshToken"] == "rt-2", (
+            f"the CONFIG's slot (2) was overwritten with the login instead "
+            f"of leaving it to the resolved owner (3): {got2!r}"
+        )
+        assert h.active_number() == 1, (
+            "the roster's active pointer moved off the unrelated active "
+            "slot onto the resolved owner"
+        )
+
+
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
         data = harness.switcher._get_sequence_data()

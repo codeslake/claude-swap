@@ -3304,35 +3304,6 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
-    def _make_active_if_live(
-        self, data: dict, owner: str, owner_email: str, creds: str
-    ) -> bool:
-        """Move the roster to ``owner`` when the live store holds ``creds``.
-
-        The live store holding an account's credential is what makes it the
-        active slot. A switch moves the roster in the transaction that writes
-        the config; a /login writes neither, so the roster follows the login
-        here. Re-read under ``lock_file``: a switch that landed while the
-        server was asked has moved the roster to its own target, and the live
-        store says so.
-        """
-        if str(data.get("activeAccountNumber")) == str(owner):
-            return False
-        live = self._read_credentials()
-        if not live or (
-            oauth.credential_fingerprint(live)
-            != oauth.credential_fingerprint(creds)
-        ):
-            return False
-        data["activeAccountNumber"] = int(owner)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        self._logger.info(
-            "Account-%s (%s) is now the active slot: the live store holds "
-            "its credential.", owner, owner_email,
-        )
-        return True
-
     def _register_login_as_new_slot(
         self, data: dict, creds: str, resolved: dict
     ) -> bool:
@@ -5153,15 +5124,13 @@ class ClaudeAccountSwitcher:
                 oauth.credential_fingerprint(creds)
                 == oauth.credential_fingerprint(backup)
             ):
-                # The live store holding this slot's own credential makes it
-                # the active slot; a roster naming another one answers every
-                # reader wrong, and the next switch writes a stale backup
-                # over this login. Nothing drifted otherwise.
-                data = self._get_sequence_data() or {}
-                if str(data.get("activeAccountNumber")) != str(account_num):
-                    with FileLock(self.lock_file):
-                        data = self._get_sequence_data() or {}
-                        self._make_active_if_live(data, account_num, email, creds)
+                # Nothing drifted: the live store already agrees with this
+                # slot's own backup. Never moves `activeAccountNumber` here
+                # either -- a `/login` (or a later poll re-observing one) is
+                # not a request to move the fleet onto this slot; only
+                # `cswap switch`/`add_account` are. `current_account_number()`
+                # already reads the live identity directly and needs no
+                # help from this bookkeeping field.
                 return
             fp = oauth.credential_fingerprint(creds) or ""
             lineage = self._lineage_key(account_num, email, fp)

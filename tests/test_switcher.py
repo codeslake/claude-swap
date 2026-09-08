@@ -18254,15 +18254,18 @@ class TestALoginLandsInItsOwnSlot:
         assert json.loads(s._read_account_credentials(
             "1", "c@example.com"))["claudeAiOauth"]["refreshToken"] == "rt-live"
 
-    def test_a_live_store_holding_a_slots_own_credential_moves_the_roster_to_it(
+    def test_a_live_store_holding_a_slots_own_credential_never_moves_the_roster(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
     ):
-        """MEASURED: a recovery had restored slot 1's stored grant into the
-        live store while the roster named another slot. Every pass read
-        "same lineage, nothing drifted" and returned, so the roster never
-        followed and row 12 of the gate stayed red on a machine whose login
-        was exactly what the engine reported."""
+        """A recovery had restored slot 1's stored grant into the live
+        store while the roster named another slot -- same lineage, nothing
+        to attribute, no write needed. Moving `activeAccountNumber` here
+        used to be how the roster caught up to that; it no longer does (a
+        `/login`, or a later pass merely re-observing one, is not a request
+        to move the fleet -- see `TestABareLoginHealsItsSlotThroughTheEngineTick`
+        in test_autoswitch.py). `current_account_number()` reads the live
+        identity directly and needs no help from this bookkeeping field."""
         sample_sequence_data["activeAccountNumber"] = 2
         s = self._owner_slot_fixture(sample_sequence_data)
         live = self._blob("rt-own")
@@ -18271,7 +18274,7 @@ class TestALoginLandsInItsOwnSlot:
         with patch("claude_swap.oauth.fetch_oauth_profile") as oracle:
             s._resync_rotated_backup("1", "c@example.com", "o-1", live)
         oracle.assert_not_called()          # same lineage: nothing to attribute
-        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
 
     def test_CONTROL_the_roster_does_not_follow_bytes_the_live_store_no_longer_holds(
         self, temp_home: Path, mock_claude_config: Path,
