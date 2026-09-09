@@ -15953,6 +15953,87 @@ class TestGateUltraReviewFixes:
             "'transient' handler"
         )
 
+    def test_an_unreadable_identity_with_no_expiry_at_all_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
+        ABSENT `expiresAt` (a well-formed claudeAiOauth dict missing the
+        key) the same as a proven 0 -- unknown again read as "not ahead",
+        the same defect class as the unparseable-profile case above, on a
+        narrower input: `prof_oauth` here is NOT falsy, so that guard alone
+        does not catch it.
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        no_expiry = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ne", "refreshToken": "rt-ne"}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(no_expiry)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "a profile with no expiresAt at all was treated as "
+                "provably not ahead and marked stale"
+            )
+
+        assert outcome.error == "identity-unreadable"
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) for a "
+            "profile whose generation is entirely unknown"
+        )
+
+    def test_an_unreadable_identity_with_a_bool_expiry_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`bool` subclasses `int`, so `isinstance(True, (int, float))` is
+        True and `True <= cur_exp` compares as `1 <= cur_exp` -- a second
+        door into the same "unknown read as proven" defect, one type check
+        further in. `expiresAt: true` is not a real generation marker.
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        bool_expiry = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-be", "refreshToken": "rt-be",
+            "expiresAt": True}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(bool_expiry)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "a boolean expiresAt was treated as a real numeric "
+                "generation and marked stale"
+            )
+
+        assert outcome.error == "identity-unreadable"
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) for a "
+            "profile whose expiresAt was a bool, not a real generation"
+        )
+
     def test_an_older_profile_never_supersedes_the_backup(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -15991,6 +16072,47 @@ class TestGateUltraReviewFixes:
         assert posted["creds"] == backup, (
             "the gate POSTed the profile's older, already-superseded "
             "generation instead of the backup"
+        )
+
+    def test_a_profile_with_no_expiry_never_crashes_the_drift_check(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`prof_exp` no longer defaults to 0 (dropped so the
+        identity-unreadable branch above can't misread an unknown expiry as
+        "not ahead"), and this branch's own `prof_exp > cur_exp` shares that
+        same variable. At 9030eb33 an absent `expiresAt` here safely read as
+        `0 > cur_exp` (False, no resync); it must still not crash now that
+        `prof_exp` can be None.
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 5000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        no_expiry = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-pf", "refreshToken": "rt-pf-noexp"}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(no_expiry)
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error != "transient", (
+            f"got {outcome.error!r}: a profile with no expiresAt crashed "
+            "the drift check into the generic 'transient' handler"
+        )
+        assert posted["creds"] == backup, (
+            "an unknown-expiry profile was treated as ahead and its "
+            "credential was POSTed instead of the backup"
         )
 
     # -- unreadable backup defers ----------------------------------------

@@ -2291,7 +2291,7 @@ class ClaudeAccountSwitcher:
                     except AttributeError:
                         prof_oauth = None
                     cur_exp = (input_oauth or {}).get("expiresAt") or 0
-                    prof_exp = (prof_oauth or {}).get("expiresAt") or 0
+                    prof_exp = (prof_oauth or {}).get("expiresAt")
                     if (
                         profile
                         and not is_session_stale(sdir)
@@ -2318,30 +2318,39 @@ class ClaudeAccountSwitcher:
                         #
                         # Mark the profile stale ONLY when its own
                         # generation is PROVABLY NOT ahead of the backup
-                        # (prof_oauth parsed AND prof_exp <= cur_exp): both
-                        # this branch and the drift-check branch below share
-                        # the `not is_session_stale` guard, so marking stale
+                        # (prof_exp <= cur_exp): both this branch and the
+                        # drift-check branch below share the
+                        # `not is_session_stale` guard, so marking stale
                         # when the profile MIGHT be ahead would drop both
                         # on the next pass and fall through to POST the
                         # backup -- the exact spent-predecessor strike this
                         # deferral exists to avoid. "Unknown" must fall to
                         # the SAME defer side as "ahead", never read as
-                        # "not ahead": an unwrapped or unparseable profile
-                        # (prof_oauth is None) or a non-numeric expiresAt
-                        # (isinstance False) is unknown, not proven <=, so
-                        # both are required before comparing. When the
-                        # profile is provably not ahead the backup is at
-                        # least as fresh, so this write safely satisfies the
-                        # "goes stale" clear from inside the tick and the
-                        # NEXT pass takes the ordinary backup-consume branch
-                        # instead of deferring again. (A possibly-ahead or
-                        # unknown profile keeps deferring on every pass --
-                        # correct-and-incomplete, not fixed here.)
-                        if (
-                            prof_oauth
-                            and isinstance(prof_exp, (int, float))
-                            and prof_exp <= cur_exp
-                        ):
+                        # "not ahead". `prof_exp` comes out of `json.loads`,
+                        # so its type set is CLOSED and finite -- dict,
+                        # list, str, int, float, bool, None -- and exactly
+                        # two of those seven are real numbers.
+                        # `type(prof_exp) in (int, float)` tests membership
+                        # in that closed set (an absent key, a non-numeric
+                        # value, and an unparseable profile all fail it,
+                        # since `prof_oauth` is then None and
+                        # `(None or {}).get(...)` is also None); `bool` is
+                        # deliberately excluded even though it subclasses
+                        # `int` -- `expiresAt: true` is not a real
+                        # generation marker, and `isinstance` would have
+                        # let it through as one. An `isinstance` check here
+                        # would enumerate an EXCLUSION from an open set
+                        # instead, which is the same shape as the "or 0"
+                        # default this replaces: one more door it can miss.
+                        # When the profile is provably not ahead the backup
+                        # is at least as fresh, so this write safely
+                        # satisfies the "goes stale" clear from inside the
+                        # tick and the NEXT pass takes the ordinary
+                        # backup-consume branch instead of deferring again.
+                        # (A possibly-ahead or unknown profile keeps
+                        # deferring on every pass -- correct-and-incomplete,
+                        # not fixed here.)
+                        if type(prof_exp) in (int, float) and prof_exp <= cur_exp:
                             if not mark_session_stale(sdir):
                                 self._logger.error(
                                     "Account %s's session profile identity "
@@ -2366,6 +2375,15 @@ class ClaudeAccountSwitcher:
                             and prof_oauth.get("refreshToken")
                             and oauth.credential_fingerprint(profile)
                             != oauth.credential_fingerprint(refresh_input)
+                            # `prof_exp` no longer defaults to 0 (the branch
+                            # above's fix dropped that default so an
+                            # UNKNOWN expiry can't misread as "not ahead"),
+                            # so this comparison can no longer assume a
+                            # number: guard it the same way, or an absent
+                            # `expiresAt` here raises TypeError on
+                            # `None > cur_exp` where 9030eb33 safely read
+                            # `0 > cur_exp` as False (no resync).
+                            and type(prof_exp) in (int, float)
                             and prof_exp > cur_exp
                         ):
                             # The profile holds the newer generation: the
