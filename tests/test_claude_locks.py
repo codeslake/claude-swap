@@ -228,11 +228,15 @@ class TestProperLockfile:
         assert lock_dir.stat().st_mtime == fresh  # nor did we refresh theirs
 
     def test_release_removes_a_slowly_touched_lock(self, lock_dir, monkeypatch):
-        # A tick's write can be mid-flight, or freshly stalled just past it,
-        # when release runs. On this platform (can_pin=True, the common
-        # case, measured for this fixture's tmp_path) identity is proven by
-        # the held descriptor, not the mtime, so a stalled tick's write
-        # cannot make the release misread its own lock as taken over.
+        # A tick's write can be mid-flight when release runs. Unpinned
+        # (`_RELEASE_WAIT_S` unpatched, its 5.0s default), the release
+        # blocks on the tick's own stamping lock until the tick clears it,
+        # rather than deciding on a half-written stamp; pinned, identity is
+        # proven by the held descriptor and the mtime never enters it.
+        # Either way the tick must actually be let go for release to
+        # proceed -- releasing it only AFTER exiting deadlocks the
+        # unpinned case for the whole `_RELEASE_WAIT_S` budget (measured on
+        # Windows CI, PR 287).
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
         real_utime = os.utime
         stalled = threading.Event()
@@ -247,10 +251,12 @@ class TestProperLockfile:
         monkeypatch.setattr(claude_locks.os, "utime", slow_utime)
         with proper_lockfile(lock_dir):
             assert stalled.wait(5.0), "premise: no tick ever reached the stall"
-            # the tick is now mid-refresh, past its write and stalled --
-            # release below runs while it is still there.
+            # The tick is now mid-refresh, past its write. Releasing it here
+            # (still inside the lock) lets it finish its own bookkeeping
+            # concurrently with the release below, which is free to block
+            # on the tick's mutex until it does.
+            release_tick.set()
 
-        release_tick.set()  # let the daemon thread unwind
         assert not lock_dir.exists()
 
     def test_reacquire_after_release(self, lock_dir):
