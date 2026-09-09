@@ -703,7 +703,10 @@ def test_the_guard_receives_the_triple_THAT_WAS_READ_not_a_rebuild(
         type(s), "_reject_identity_drift_since_verify",
         lambda self, verified: got.append(verified),
     )
-    monkeypatch.setattr(type(s), "_get_current_identity_triple", lambda self: read)
+    monkeypatch.setattr(
+        type(s), "_get_current_identity_triple",
+        lambda self, strict=False: read,
+    )
     with patch.object(s, "_read_capture_credentials", return_value=CREDS), \
          patch("claude_swap.oauth.fetch_oauth_profile",
                return_value={"uuid": read[2], "email": read[0],

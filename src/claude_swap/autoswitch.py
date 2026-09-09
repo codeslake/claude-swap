@@ -87,6 +87,7 @@ _SYSTEMIC_KINDS = (
     "live-store-unreadable",
     "live-store-current",
     "consume-busy",
+    "foreign-lineage",
 )
 _SYSTEMIC_MESSAGES = {k: oauth.ERROR_NOTES[k] for k in _SYSTEMIC_KINDS}
 # Insertion order IS the precedence order, so the remedy and its rank cannot
