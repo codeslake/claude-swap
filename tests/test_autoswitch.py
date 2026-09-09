@@ -3702,6 +3702,42 @@ class TestRunLoop:
             assert harness.engine.run_loop() == 0
         tick.assert_not_called()
 
+    def test_loop_survives_a_raising_next_delay(self, harness):
+        """`_next_delay` and the sleep emit sit AFTER `tick()`'s own guard —
+        a raise there used to escape `run_loop` unseen (`exit_on_error=False`
+        kills the TUI worker with nothing printed anywhere)."""
+        calls = []
+
+        def fake_next_delay(outcome):
+            calls.append(outcome)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            harness.engine.stop()
+            return 0
+
+        with patch.object(
+            harness.engine, "tick", return_value=TickOutcome.NO_ACTION
+        ), patch.object(
+            harness.engine, "_next_delay", side_effect=fake_next_delay
+        ), patch.object(harness.engine._wake, "wait", return_value=None):
+            assert harness.engine.run_loop() == 0
+        assert len(calls) == 2
+        assert any(isinstance(e, ErrorEvent) for e in harness.events)
+
+    def test_normal_stop_leaves_no_engine_stopped_line(self, harness):
+        # CONTROL for the exit-cleanup below: `stop()` already released the
+        # LIVE lock and this exit is expected, so run_loop's own cleanup must
+        # stay silent here — the guard that fires for every OTHER exit must
+        # not fire for this one too. Read via `on_event` (unconditional),
+        # not the decision log: `stop()` sets `dry_run = True`, which gates
+        # the log write on its own and would pass this even unguarded.
+        harness.engine.stop()
+        assert harness.engine.run_loop() == 0
+        assert not any(
+            isinstance(e, ErrorEvent) and e.message.startswith("engine stopped:")
+            for e in harness.events
+        )
+
     def test_wake_during_tick_cuts_the_following_sleep_short(self, harness):
         # No wait patching on purpose: if the clear-at-top ordering were
         # wrong (wake cleared after the wait), the wake fired during tick 1
@@ -11721,6 +11757,19 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
         )
         assert engine.run_loop() == 0
         assert engine._consumer_gone is True
+
+    def test_a_broken_pipe_drops_the_live_lock(self, harness, monkeypatch):
+        """The process outlives the loop with nothing left to release it —
+        #522's signature. A dead engine holding LIVE blocks every later
+        promotion, so the exit itself must drop `.auto-live.lock`."""
+        engine = harness.engine
+        self._no_waiting(engine, monkeypatch)
+        assert engine._live_lock is not None, "premise: this engine is LIVE"
+        engine.on_event = lambda ev: (_ for _ in ()).throw(
+            BrokenPipeError(32, "Broken pipe")
+        )
+        assert engine.run_loop() == 0
+        assert engine._live_lock is None
 
     def test_an_epipe_oserror_is_the_same_exception(self):
         """Not a second path -- a PREMISE, and it is why the check is one

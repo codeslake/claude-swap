@@ -3437,40 +3437,44 @@ class AutoSwitchEngine:
             return delay
 
     def run_loop(self) -> int:
-        """Tick forever (until :meth:`stop`); a failing tick never kills it."""
-        while True:
-            # Clear at the top, not after the wait: a wake() racing a wait
-            # timeout is then never lost — the tick right after this clear
-            # already sees whatever settings that wake announced.
-            self._wake.clear()
-            if self._stop.is_set():
-                return 0
-            # NOBODY IS LISTENING. `cswap auto --json | head -1` closes the pipe
-            # after one line; Python ignores SIGPIPE, so every later emit raises
-            # and used to be swallowed -- the engine kept ticking, kept
-            # switching accounts and kept holding `.auto-live.lock`, which also
-            # demotes any TUI opened afterwards, with nothing reaching a
-            # terminal. Releasing the lock is `stop`'s job; no consumer
-            # wraps `run_loop` in a `finally`, so what actually drops the
-            # flock here is the process exiting.
-            if self._consumer_gone:
-                return 0
-            try:
-                outcome = self.tick()
-            except Exception as e:  # pragma: no cover - tick() already guards
-                self._emit(
-                    ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
-                )
-                outcome = TickOutcome.ERROR
-            delay = self._next_delay(outcome)
-            if delay > self.settings.interval_seconds * 1.5:
-                until = datetime.now(timezone.utc) + timedelta(seconds=delay)
-                self._emit(
-                    SleepEvent(
-                        seconds=delay,
-                        until=until.isoformat(timespec="seconds").replace(
-                            "+00:00", "Z"
-                        ),
+        """Tick forever (until :meth:`stop`); a failing tick never kills it.
+
+        `finally` drops the LIVE lock and announces the exit for every path
+        but `stop()`'s own — that one already does both.
+        """
+        try:
+            while True:
+                # Clear at the top, not after the wait: a wake() racing a wait
+                # timeout is then never lost — the tick right after this
+                # clear already sees whatever settings that wake announced.
+                self._wake.clear()
+                if self._stop.is_set():
+                    return 0
+                if self._consumer_gone:
+                    return 0
+                try:
+                    outcome = self.tick()
+                    delay = self._next_delay(outcome)
+                    if delay > self.settings.interval_seconds * 1.5:
+                        until = datetime.now(timezone.utc) + timedelta(seconds=delay)
+                        self._emit(
+                            SleepEvent(
+                                seconds=delay,
+                                until=until.isoformat(timespec="seconds").replace(
+                                    "+00:00", "Z"
+                                ),
+                            )
+                        )
+                except Exception as e:  # pragma: no cover - tick() already guards
+                    self._emit(
+                        ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                     )
+                    delay = self.settings.interval_seconds
+                self._wake.wait(delay)
+        finally:
+            if not self._stop.is_set():
+                reason = "consumer gone" if self._consumer_gone else "unhandled error"
+                self._emit(
+                    ErrorEvent(message=f"engine stopped: {reason}", transient=False)
                 )
-            self._wake.wait(delay)
+            self._release_live()
