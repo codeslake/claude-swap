@@ -218,7 +218,7 @@ class TestProperLockfile:
 
         def _advanced():
             seen.add(real_stat(lock_dir).st_mtime_ns)
-            return len(seen) > 1
+            return state["fired"] == 1 and len(seen) > 1
 
         with proper_lockfile(lock_dir):
             state["armed"] = True
@@ -267,20 +267,34 @@ class TestProperLockfile:
         assert lock_dir.stat().st_mtime == fresh  # nor did we refresh theirs
 
     def test_release_removes_a_slowly_touched_lock(self, lock_dir, monkeypatch):
-        # Seen half-done, our own refresh reads to the release as a takeover.
-        # A 1.2s tick outlives `_RELEASE_WAIT_S`, so the release reaches its
-        # wait-or-refuse arm rather than deciding on a half-written stamp.
+        # A tick's write can be mid-flight when release runs. Unpinned
+        # (`_RELEASE_WAIT_S` unpatched, its 5.0s default), the release
+        # blocks on the tick's own stamping lock until the tick clears it,
+        # rather than deciding on a half-written stamp; pinned, identity is
+        # proven by the held descriptor and the mtime never enters it.
+        # Either way the tick must actually be let go for release to
+        # proceed -- releasing it only AFTER exiting makes the unpinned
+        # case wait out the whole `_RELEASE_WAIT_S` budget and then
+        # refuse, leaving the lock (measured on Windows CI, PR 287).
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
         real_utime = os.utime
+        stalled = threading.Event()
+        release_tick = threading.Event()
 
         def slow_utime(path, *args, **kwargs):
             real_utime(path, *args, **kwargs)
             if path == lock_dir:
-                time.sleep(1.2)
+                stalled.set()
+                release_tick.wait(5.0)
 
         monkeypatch.setattr(claude_locks.os, "utime", slow_utime)
         with proper_lockfile(lock_dir):
-            time.sleep(0.15)  # a tick starts and stalls mid-refresh
+            assert stalled.wait(5.0), "premise: no tick ever reached the stall"
+            # The tick is now mid-refresh, past its write. Releasing it here
+            # (still inside the lock) lets it finish its own bookkeeping
+            # concurrently with the release below, which is free to block
+            # on the tick's mutex until it does.
+            release_tick.set()
 
         assert not lock_dir.exists()
 
@@ -1920,12 +1934,15 @@ class TestTheAcquireAndReleaseAreBounded:
         lock = tmp_path / "target.lock"
         real_utime = os.utime
         entered = threading.Event()
+        release_tick = threading.Event()
+        who = []
 
         def stalling(path, *a, **k):
             if (not isinstance(path, int)
                     and os.fspath(path) == os.fspath(lock)):
                 entered.set()
-                time.sleep(2.0)
+                who.append(threading.current_thread())
+                release_tick.wait(5.0)
             return real_utime(path, *a, **k)
 
         monkeypatch.setattr(claude_locks.os, "utime", stalling)
@@ -1937,17 +1954,27 @@ class TestTheAcquireAndReleaseAreBounded:
             start = time.monotonic()
             with proper_lockfile(lock, timeout=1.0):
                 assert entered.wait(1.0), "premise: no tick ever entered the stall"
+                # release_tick stays unset through the whole body -- exiting
+                # below forces the release's bounded
+                # stamping.acquire(timeout=_RELEASE_WAIT_S) to genuinely
+                # time out against the still-stalled tick, rather than a
+                # guessed sleep racing it.
             elapsed = time.monotonic() - start
-            # Wait past the 2.0s stall so the tick's own release of the
-            # mutex -- and any exception it raises -- has had time to run.
-            time.sleep(max(0.0, 2.5 - (time.monotonic() - start)))
+            release_tick.set()
+            # The tick's own write and mutex release -- and any exception
+            # that raises -- run on the daemon thread; wait for IT to say
+            # it finished rather than guessing how long that takes.
+            who[0].join(5.0)
+            assert not who[0].is_alive(), (
+                "premise: the stalled tick's thread never finished"
+            )
         finally:
             threading.excepthook = original_excepthook
 
         assert elapsed < 1.5, (
-            f"the release waited {elapsed:.2f}s on a tick stalled 2.0s — the "
-            "acquire of the stamp mutex is unbounded, so the filesystem sets "
-            "the bound"
+            f"the release waited {elapsed:.2f}s on a tick stalled past its "
+            "own release -- the acquire of the stamp mutex is unbounded, so "
+            "the filesystem sets the bound"
         )
         assert any(
             "did not return within" in r.getMessage() for r in caplog.records
