@@ -7119,12 +7119,6 @@ class TestPersistBackupCredentials:
         )
 
 
-def _grant_creds(refresh_token: str) -> str:
-    return json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-" + refresh_token, "refreshToken": refresh_token,
-    }})
-
-
 def _grant_setup_token_creds(token: str) -> str:
     """No ``refreshToken``: falls to the ``sha256-full:`` fingerprint arm."""
     return json.dumps({"claudeAiOauth": {"accessToken": token}})
@@ -7152,7 +7146,7 @@ class TestNoPeerSlotMayShareARefreshGrant:
         (get_backup_root() / "sequence.json").write_text(
             json.dumps(sample_sequence_data)
         )
-        shared = _grant_creds("rt-shared")
+        shared = _oauth_creds("shared", 7200)
         switcher._write_account_credentials(
             "1", "account1@example.com", shared, attributed=True,
         )
@@ -7172,92 +7166,48 @@ class TestNoPeerSlotMayShareARefreshGrant:
             for r in caplog.records
         )
 
-    def test_refuses_via_write_backup_enc_directly(
-        self, temp_home: Path, sample_sequence_data,
+    @pytest.mark.parametrize("writer", ["_write_backup_enc", "_kc_write_backup"])
+    def test_refuses_via_the_other_two_chokepoints_directly(
+        self, temp_home: Path, sample_sequence_data, writer: str,
     ):
         """The guard is called from all THREE chokepoints, not just
-        ``_write_account_credentials`` -- ``_write_backup_enc`` is the
-        macOS-keyring-to-security migration's own direct writer and must
-        refuse before it ever reaches the backend."""
+        ``_write_account_credentials`` -- ``_write_backup_enc`` (the
+        macOS-keyring-to-security migration's direct writer) and
+        ``_kc_write_backup`` (its Keychain-only forwarder) must each refuse
+        before ever reaching the backend, so this needs no real Keychain to
+        run off macOS."""
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         (get_backup_root() / "sequence.json").write_text(
             json.dumps(sample_sequence_data)
         )
-        shared = _grant_creds("rt-shared")
+        shared = _oauth_creds("shared", 7200)
         switcher._write_account_credentials(
             "1", "account1@example.com", shared, attributed=True,
         )
 
         with pytest.raises(CredentialWriteError, match="Account-1"):
-            switcher._write_backup_enc("2", "account2@example.com", shared)
-
-    def test_refuses_via_kc_write_backup_directly(
-        self, temp_home: Path, sample_sequence_data,
-    ):
-        """Same as ``_write_backup_enc`` above, for the Keychain-only
-        forwarder -- the refusal must fire before the backend call, so this
-        runs the same off macOS too."""
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        (get_backup_root() / "sequence.json").write_text(
-            json.dumps(sample_sequence_data)
-        )
-        shared = _grant_creds("rt-shared")
-        switcher._write_account_credentials(
-            "1", "account1@example.com", shared, attributed=True,
-        )
-
-        with pytest.raises(CredentialWriteError, match="Account-1"):
-            switcher._kc_write_backup("2", "account2@example.com", shared)
-
-    @pytest.mark.skipif(
-        os.name == "nt" or os.geteuid() == 0,
-        reason="needs POSIX permission semantics (non-root)",
-    )
-    def test_refuses_when_a_peers_backup_is_unreadable(
-        self, temp_home: Path, sample_sequence_data,
-    ):
-        """RED for the unreadable-peer hole: an EACCES peer read must
-        refuse like a mismatch, not silently permit like an absent slot --
-        the same fail-closed rule ``_check_attribution`` already applies to
-        THIS slot's own prior state, extended to a PEER slot here (an
-        unreadable Keychain on ssh/launchd is exactly where a silent
-        permit would matter)."""
-        switcher = ClaudeAccountSwitcher()
-        switcher._setup_directories()
-        (get_backup_root() / "sequence.json").write_text(
-            json.dumps(sample_sequence_data)
-        )
-        switcher._write_account_credentials(
-            "1", "account1@example.com", _grant_creds("rt-account-1"),
-            attributed=True,
-        )
-        enc = switcher._backup_enc_path("1", "account1@example.com")
-        enc.chmod(0o000)
-        try:
-            with pytest.raises(CredentialWriteError, match="unreadable"):
-                switcher._write_account_credentials(
-                    "2", "account2@example.com", _grant_creds("rt-account-2"),
-                )
-        finally:
-            enc.chmod(0o600)
+            getattr(switcher, writer)("2", "account2@example.com", shared)
 
     def test_refuses_when_a_peers_read_reports_failed_uid_independent(
         self, temp_home: Path, sample_sequence_data, monkeypatch,
     ):
-        """Same as the chmod test above, minus the ``skipif`` -- this one
-        asserts the ``failed`` semantics the guard actually depends on
-        directly, so it still covers this arm on a root-run gate where the
-        chmod test silently skips (POSIX permission checks are inert for
-        uid 0)."""
+        """RED for the unreadable-peer hole: an EACCES-shaped peer read
+        (``failed`` set, no bytes) must refuse like a mismatch, not
+        silently permit like an absent slot -- the same fail-closed rule
+        ``_check_attribution`` already applies to THIS slot's own prior
+        state, extended to a PEER slot here (an unreadable Keychain on
+        ssh/launchd is exactly where a silent permit would matter).
+        Asserts the ``failed`` semantics directly rather than chmod'ing a
+        real file, so this also covers the arm on a root-run gate, where a
+        POSIX permission check is inert."""
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         (get_backup_root() / "sequence.json").write_text(
             json.dumps(sample_sequence_data)
         )
         switcher._write_account_credentials(
-            "1", "account1@example.com", _grant_creds("rt-account-1"),
+            "1", "account1@example.com", _oauth_creds("account-1", 7200),
             attributed=True,
         )
 
@@ -7272,15 +7222,21 @@ class TestNoPeerSlotMayShareARefreshGrant:
 
         with pytest.raises(CredentialWriteError, match="unreadable"):
             switcher._write_account_credentials(
-                "2", "account2@example.com", _grant_creds("rt-account-2"),
+                "2", "account2@example.com", _oauth_creds("account-2", 7200),
             )
 
     def test_a_shared_setup_token_is_a_supported_config_not_this_defect(
         self, temp_home: Path, sample_sequence_data,
     ):
         """A pasted setup-token with no ``refreshToken`` hashes on
-        ``sha256-full:`` and two slots holding the identical one is
-        ``add_account_from_token``'s supported shape -- must never refuse."""
+        ``sha256-full:``, and two slots holding the identical one on
+        purpose is a supported shape (``add_account_from_token`` itself
+        always writes attributed=True, so it never reaches this guard on
+        either arm; what this arm actually exempts is the two UNattributed
+        writers that could otherwise re-refuse an already-duplicated
+        setup-token account afterwards: the public
+        ``write_account_credentials`` seam and a switch's own-family
+        resync) -- must never refuse."""
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         (get_backup_root() / "sequence.json").write_text(
@@ -7310,7 +7266,7 @@ class TestNoPeerSlotMayShareARefreshGrant:
         (get_backup_root() / "sequence.json").write_text(
             json.dumps(sample_sequence_data)
         )
-        shared = _grant_creds("rt-shared")
+        shared = _oauth_creds("shared", 7200)
         switcher._write_account_credentials(
             "1", "account1@example.com", shared, attributed=True,
         )
@@ -7336,13 +7292,12 @@ class TestNoPeerSlotMayShareARefreshGrant:
             json.dumps(sample_sequence_data)
         )
 
-        switcher._write_account_credentials(
-            "2", "account2@example.com", _grant_creds("rt-account-2"),
-        )
+        creds = _oauth_creds("account-2", 7200)
+        switcher._write_account_credentials("2", "account2@example.com", creds)
 
         assert switcher._read_account_credentials(
             "2", "account2@example.com"
-        ) == _grant_creds("rt-account-2")
+        ) == creds
 
 
 class TestFormatUsageLines:

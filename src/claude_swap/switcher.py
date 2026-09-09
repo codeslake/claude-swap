@@ -994,8 +994,11 @@ class ClaudeAccountSwitcher:
 
         Scoped to the ``sha256:`` fingerprint arm only. ``sha256-full:`` is
         a raw setup-token with no ``refreshToken``, and one pasted into two
-        slots on purpose is ``add_account_from_token``'s SUPPORTED shape,
-        not this defect.
+        slots on purpose is a SUPPORTED shape, not this defect --
+        ``add_account_from_token`` itself always writes ``attributed=True``
+        and never reaches this arm either way; what it exempts is the two
+        unattributed writers below that could otherwise re-refuse an
+        already-duplicated setup-token account.
 
         Skipped whenever ``attributed`` is True: every ``attributed=True``
         call site already independently verified this write's identity, and
