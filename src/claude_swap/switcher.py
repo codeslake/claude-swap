@@ -566,6 +566,8 @@ class ClaudeAccountSwitcher:
 
     def _write_json(self, path: Path, data: dict) -> None:
         """Write JSON file with validation."""
+        if path == self.sequence_file:
+            data = self._with_sequence_high_water(data)
         content = json.dumps(data, indent=2)
 
         # Write to temp file first
@@ -586,6 +588,36 @@ class ClaudeAccountSwitcher:
         if sys.platform != "win32":
             os.chmod(temp_path, 0o600)
         shutil.move(str(temp_path), str(path))
+
+    def _with_sequence_high_water(self, data: dict) -> dict:
+        """Stamp ``highestAccountNumber``: the largest slot this install has
+        ever assigned, monotonic across every write of ``sequence.json``.
+
+        The current roster alone can't bound the renumber-fallback sweep in
+        ``CredentialStore._read_account_credentials`` once a wholesale edit
+        drops a slot from ``accounts`` entirely; this survives that because
+        it is a stored number, not a shape read off the roster in front of
+        it. Read off DISK, not off ``data`` alone: an external wholesale
+        rewrite (a roster deploy, ``_init_sequence_file``) hands this a
+        fresh dict with no memory of what was here before, and the prior
+        value would otherwise be lost on exactly the edit it exists to
+        survive. Missing/malformed input reads as 0, so an old or torn
+        ``sequence.json`` just re-derives it from the current write rather
+        than raising. The dotfiles roster-sync script copies unknown
+        top-level keys through untouched (`sync_cswap_roster.py`'s own
+        docstring), so this rides the same wholesale copy every other field
+        does — no migration needed on either side.
+        """
+        accounts = data.get("accounts")
+        if not isinstance(accounts, dict):
+            accounts = {}
+        current_max = max((int(n) for n in accounts if n.isdigit()), default=0)
+        on_disk = self._read_json(self.sequence_file) or {}
+        try:
+            prior = int(on_disk.get("highestAccountNumber", 0))
+        except (TypeError, ValueError):
+            prior = 0
+        return {**data, "highestAccountNumber": max(prior, current_max)}
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #

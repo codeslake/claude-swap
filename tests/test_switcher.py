@@ -8016,6 +8016,116 @@ class TestStashAndRetentionStore:
 
         assert store._read_account_credentials("3", emails[5]) == "creds-five"
 
+    def test_compaction_renumber_above_the_new_max_still_finds_the_backup(
+        self, temp_home,
+    ):
+        """A wholesale edit dropping MORE accounts than survive (12 -> 4)
+        leaves a leftover past the current-roster heuristic ceiling
+        (``max(4,4)+4=8`` cannot reach slot 11) — only the persisted
+        ``highestAccountNumber`` (stamped on every ``sequence.json`` write
+        while the roster still held 12 accounts) still finds it.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        emails = {n: f"acct{n}@example.com" for n in range(1, 13)}
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": list(range(1, 13)),
+                "accounts": {
+                    str(n): {"email": emails[n], "uuid": f"uuid-{n}"}
+                    for n in range(1, 13)
+                },
+            },
+        )
+        store._write_account_credentials("11", emails[11], "creds-eleven")
+
+        # One wholesale edit drops 8 of 12 accounts; account 11 survives,
+        # renumbered to slot 4.
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2, 3, 4],
+                "accounts": {
+                    "1": {"email": emails[1], "uuid": "uuid-1"},
+                    "2": {"email": emails[2], "uuid": "uuid-2"},
+                    "3": {"email": emails[3], "uuid": "uuid-3"},
+                    "4": {"email": emails[11], "uuid": "uuid-11"},
+                },
+            },
+        )
+
+        assert store._read_account_credentials("4", emails[11]) == "creds-eleven"
+
+    def test_no_such_login_returns_empty_and_does_not_converge_write(
+        self, temp_home,
+    ):
+        """CONTROL for the row above: a genuinely absent backup must still
+        answer ``("", False)`` and write nothing, however wide
+        ``highestAccountNumber`` makes the sweep range — a fix that widened
+        the range by inventing candidates rather than by raising the
+        ceiling would pass the defect row and fail this one."""
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {
+                    "1": {"email": "ghost@example.com", "uuid": "uuid-ghost"},
+                },
+            },
+        )
+
+        with patch.object(store, "_write_account_credentials") as write_spy:
+            creds, unreadable = switcher._read_account_credentials_ex(
+                "1", "ghost@example.com"
+            )
+
+        assert (creds, unreadable) == ("", False)
+        write_spy.assert_not_called()
+
+    def test_negative_cache_short_circuits_repeat_read_of_unbacked_slot(
+        self, temp_home,
+    ):
+        """CONTROL: a repeat read of the same unbacked slot, roster
+        unchanged, must not re-probe the sweep's candidate slots again —
+        the cache exists to bound the per-slot backend cost (a `security`
+        spawn each on macOS), and it must survive this fix untouched."""
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1],
+                "accounts": {
+                    "1": {"email": "ghost@example.com", "uuid": "uuid-ghost"},
+                },
+            },
+        )
+
+        first = store._read_account_credentials("1", "ghost@example.com")
+        assert first == ""
+
+        real_direct = store._read_account_credentials_direct
+        with patch.object(
+            store, "_read_account_credentials_direct", side_effect=real_direct,
+        ) as direct_spy:
+            second = store._read_account_credentials("1", "ghost@example.com")
+
+        assert second == ""
+        # Only the primary direct read fires; the candidate sweep (which
+        # would otherwise re-probe slot "2") is skipped by the cache.
+        direct_spy.assert_called_once_with("1", "ghost@example.com", None)
+
     def test_renumber_fallback_pre_mutation_read_never_adopts_a_reassigned_slot(
         self, temp_home,
     ):
