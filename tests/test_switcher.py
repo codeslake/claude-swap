@@ -16582,9 +16582,12 @@ class TestActiveSlotStrikeParity:
             lambda: ActiveCredentials(old_gen, False, True),
         )
         # _build_accounts_info derives active_num from the live IDENTITY
-        # (_get_current_account), not current_account_number.
+        # (_get_current_account), not current_account_number. `*a, **k`:
+        # this double stands in for the real method, which itself takes an
+        # optional `strict` kwarg -- a bare no-arg lambda works today only
+        # because nothing on this path passes it yet.
         monkeypatch.setattr(s, "_get_current_account",
-                             lambda: ("b@example.com", ""))
+                             lambda *a, **k: ("b@example.com", ""))
         with patch.object(s, "current_account_number", return_value="2"):
             info = s._build_accounts_info()
             entries = s._collect_usage_entries(info, fetch=set())
