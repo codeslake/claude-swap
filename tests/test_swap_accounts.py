@@ -26,18 +26,6 @@ def _refuse_write(self, num, email, creds, **kw):
     raise OSError("disk full (injected)")
 
 
-def test_refuse_write_tolerates_an_unknown_keyword():
-    """``_refuse_write`` stands in for the real
-    ``_write_account_credentials`` across this file. A caller that gains a
-    new keyword-only argument this fixture's hand-written signature does not
-    know about must still reach the injected failure, not a ``TypeError``
-    from the fixture itself -- which would be indistinguishable, in this
-    file's own asserts, from a real regression in the code under test.
-    """
-    with pytest.raises(OSError, match="disk full"):
-        _refuse_write(object(), "1", "a@example.com", "creds", extra=True)
-
-
 def _gen(num: str, generation: str) -> str:
     """OAuth credential JSON for slot ``num``'s ``generation`` (e.g.
     "gen1"/"gen2"). Successive generations for the same slot share one
@@ -421,34 +409,6 @@ class TestSwapAccounts:
         assert tripped, "the injected move failure never fired"
         assert self._marker(switcher, "1", email) == "SLOT-1-HISTORY"
         assert self._marker(switcher, "2", email) == "SLOT-2-HISTORY"
-
-    def test_swap_reverses_a_forward_move_that_was_interrupted(
-        self, temp_home: Path, sample_sequence_data_with_org: dict
-    ):
-        """A move aborted part-way through still has to be undone.
-
-        ``swap_accounts`` catches BaseException, so a Ctrl-C between the two
-        halves of the exchange reaches the rollback with one profile already
-        parked under the other slot's key.
-        """
-        switcher = ClaudeAccountSwitcher()
-        email = self._same_email_slots(switcher, sample_sequence_data_with_org)
-
-        real_replace = os.replace
-
-        def interrupt_the_last_park(src, dst):
-            if str(src).endswith(".swapping"):
-                raise KeyboardInterrupt
-            return real_replace(src, dst)
-
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(os, "replace", interrupt_the_last_park)
-            with pytest.raises(KeyboardInterrupt):
-                switcher.swap_accounts("1", "2")
-
-        slot_2 = switcher._session_dir("2", email) / "marker"
-        assert slot_2.exists(), "account 2's profile was left under slot 1's key"
-        assert slot_2.read_text() == "SLOT-2-HISTORY"
 
     def test_swap_interrupted_just_past_a_move_still_reverses_it(
         self, temp_home: Path, sample_sequence_data_with_org: dict

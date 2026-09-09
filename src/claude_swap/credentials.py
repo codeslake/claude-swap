@@ -422,6 +422,16 @@ class CredentialStore:
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
+        # (account_num, email, probe_reassigned_slots) -> the `accounts`
+        # snapshot under which the renumber-fallback sweep in
+        # `_read_account_credentials` last found nothing. The roster is
+        # exactly what the sweep depends on (see that method's docstring);
+        # unchanged roster means an unchanged candidate set and an unchanged
+        # verdict, so a hit skips the sweep's per-slot backend reads
+        # entirely. Keyed on the flag too: it changes the candidate set, so
+        # a negative found under one value says nothing about the other.
+        # See `_read_account_credentials`.
+        self._sweep_negative_cache: dict[tuple[str, str, bool], dict] = {}
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -1596,6 +1606,18 @@ class CredentialStore:
             # must not raise here any more than the comprehension below,
             # which guards the same `int()` with the same check.
             return ""
+        cache_key = (account_num, email, probe_reassigned_slots)
+        if self._sweep_negative_cache.get(cache_key) == accounts:
+            # ponytail: the sweep already ran once against this exact roster
+            # and found nothing; the roster is unchanged so the candidate
+            # set and every candidate read would come back the same. Skips
+            # the per-slot backend reads (a `security` spawn each, on
+            # macOS) that would otherwise repeat on every read of a slot
+            # that is simply unbacked. Ceiling: a backup written to another
+            # slot WITHOUT a roster edit (bypassing sequence.json) between
+            # reads stays invisible until the roster changes; upgrade to a
+            # real generation counter if that ever needs closing.
+            return ""
         # The stale number itself is gone from `accounts` (that IS the
         # renumber), so the candidates are a bounded integer sweep, not
         # `accounts`' own keys.
@@ -1639,6 +1661,7 @@ class CredentialStore:
             if candidate:
                 candidates.append((other_num, candidate))
         if not candidates:
+            self._sweep_negative_cache[cache_key] = accounts
             return ""
         # Never-delete means every one of these candidates can be a
         # legitimate, still-live copy — the newest GENERATION wins, not the
