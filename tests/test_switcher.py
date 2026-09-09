@@ -8608,6 +8608,36 @@ class TestUsageAwareSwitch:
         # Anchored on the live account (2) → next is 3, not 2 (a no-op).
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    def test_plain_rotation_anchors_on_live_account_under_drift(
+        self, temp_home: Path
+    ):
+        """Plain rotation (no strategy) used to anchor on the stale
+        ``activeAccountNumber`` field, on the premise that nothing kept it in
+        sync so anchoring elsewhere would change behaviour. That premise is
+        gone: only explicit switches move the field now, so a bare
+        ``/login`` (or a login adopted into another managed slot) leaves it
+        stale exactly like the next-available case above. Anchoring on the
+        stale record here skips the live login's true "next" slot (4) and
+        can land back on the slot the user is already live on.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._seed(s, 4, "d@example.com")
+        # Recorded active is 1, but the user is actually live on account 3.
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        self._make_live(temp_home, "c@example.com", 3)
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        # Anchored on the live account (3) → next is 4, not 2 (the stale
+        # record's next).
+        assert s._get_sequence_data()["activeAccountNumber"] == 4
+
 
 class TestSwitchTargetLivenessGuard:
     """A switch must never activate a credential the API has already
@@ -16226,6 +16256,159 @@ class TestConsumeGate:
         # nothing consumed; the backup is exactly as it was
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    def test_live_store_holding_the_same_lineage_is_never_consumed(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A bare `/login` into this slot's own account never moves
+        `activeAccountNumber` (95101f58), so the live credential store and
+        this slot's backup can hold the SAME refresh lineage while the
+        roster still routes this slot through the collect pass
+        (`is_active=False`). POSTing the backup grant there retires the
+        generation Claude Code itself is still using -- refuse rather than
+        rotate a lineage the live store currently holds."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=self._OLD), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-current"
+        # nothing consumed; the backup is exactly as it was
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    @pytest.mark.parametrize("live_creds", [_NEW, ""], ids=["different", "absent"])
+    def test_live_store_holding_a_different_lineage_still_consumes(
+        self, temp_home: Path, sample_sequence_data: dict, live_creds: str
+    ):
+        """The control for the guard above: a live store on a DIFFERENT
+        lineage (the ordinary shape -- some other slot is active) must not
+        block this slot's own usage refresh -- and neither must a live store
+        with nothing in it at all (no second holder to collide with), the
+        other arm of the same `if live_creds and ...` short-circuit."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=live_creds), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_called_once()
+        assert result.credentials == self._NEW
+
+    def test_an_unreadable_live_store_refuses_rather_than_posts(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """Fail closed: an unreadable live store is not proof the lineage
+        differs -- refuse the POST rather than treat unreadable as absent."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(
+            s, "_read_capture_credentials",
+            side_effect=CredentialReadError("keychain locked"),
+        ), patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(self._NEW, None),
+        ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-unreadable"
+
+    def test_live_store_holding_this_account_under_a_rotated_lineage_is_never_consumed(
+        self, temp_home: Path, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        """Task #408: a Claude Code self-rotation never dates as a newer
+        login (`_refresh_expiry`'s own docstring), so `_adopt_login_into_slot`
+        refuses to update this INACTIVE slot's backup for it -- the backup
+        stays on the pre-rotation grant while the live store moves to the
+        rotated one. The fingerprint guard above no longer matches (two
+        different generations), but the live store is still THIS slot's own
+        account (``mock_claude_config``'s identity == this slot's email) --
+        POSTing the stale grant risks the token endpoint's refresh-token-reuse
+        detection revoking the whole family, including the live copy Claude
+        Code is using. Defer on account ownership, not just lineage."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=self._NEW), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-current"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    @pytest.mark.parametrize("identity", ["different-account", "absent"])
+    def test_live_store_holding_a_different_account_under_a_rotated_lineage_still_consumes(
+        self, temp_home: Path, sample_sequence_data: dict,
+        mock_claude_config: Path, identity: str,
+    ):
+        """The control for the guard above: a live store on a different
+        lineage AND a different (or absent) account must still be
+        reachable, or the identity arm defers on every mismatch and usage
+        polling silently stops for the whole fleet. ``mock_claude_config``
+        names test@example.com, not slot 2's account2@example.com; the
+        "absent" case removes it entirely -- no live login at all, which
+        must behave like a different account, not like "unreadable"."""
+        if identity == "absent":
+            mock_claude_config.unlink()
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("2", "account2@example.com", self._OLD)
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=self._NEW), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("2", "account2@example.com", self._OLD)
+
+        mock_refresh.assert_called_once()
+        assert result.credentials == self._NEW
+
+    def test_an_unreadable_live_identity_refuses_rather_than_posts(
+        self, temp_home: Path, sample_sequence_data: dict,
+        mock_claude_config: Path,
+    ):
+        """Fail closed on the identity read too: an unreadable
+        ``.claude.json`` is not proof the live account differs from this
+        slot's -- refuse the POST rather than treat unreadable as logged
+        out."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        mock_claude_config.write_text("not json")
+
+        with patch.object(s, "_read_capture_credentials",
+                           return_value=self._NEW), \
+             patch(
+                 "claude_swap.oauth.try_refresh_oauth_credentials",
+                 return_value=oauth.RefreshOutcome(self._NEW, None),
+             ) as mock_refresh:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_refresh.assert_not_called()
+        assert result.credentials is None
+        assert result.error == "live-store-unreadable"
+
     def test_gate_survives_a_roster_read_that_raises_after_the_lock_releases(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -17841,10 +18024,10 @@ class TestGateUltraReviewFixes:
         real_write = ClaudeAccountSwitcher._write_account_credentials
         state = {"post_done": False}
 
-        def failing_write(self_s, num, email, creds):
+        def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
                 raise OSError(28, "No space left on device")
-            return real_write(self_s, num, email, creds)
+            return real_write(self_s, num, email, creds, **kw)
 
         def mock_refresh(credentials, **kw):
             state["post_done"] = True
@@ -17883,10 +18066,10 @@ class TestGateUltraReviewFixes:
         state = {"post_done": False}
         real_write = ClaudeAccountSwitcher._write_account_credentials
 
-        def failing_write(self_s, num, email, creds):
+        def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
                 raise OSError(28, "No space left on device")
-            return real_write(self_s, num, email, creds)
+            return real_write(self_s, num, email, creds, **kw)
 
         def failing_stash(creds, ctx):
             raise OSError(28, "No space left on device")
@@ -17908,6 +18091,102 @@ class TestGateUltraReviewFixes:
             "reported success on a spent grant with nothing stashed"
         )
         assert out.credentials == self._NEW
+
+    def test_interrupt_during_persist_stashes_before_propagating(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A KeyboardInterrupt (or SystemExit) racing the persist is a
+        BaseException, invisible to `except Exception` — the same window as
+        the OSError test above, but nothing there catches THIS. The grant IS
+        consumed (the POST already happened), so the successor must reach
+        the stash before the interrupt is allowed to propagate, or it is
+        lost for good (issue #400's E9)."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+        state = {"post_done": False}
+
+        def failing_write(self_s, num, email, creds, **kw):
+            if state["post_done"]:
+                raise KeyboardInterrupt()
+            return real_write(self_s, num, email, creds, **kw)
+
+        def mock_refresh(credentials, **kw):
+            state["post_done"] = True
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            with pytest.raises(KeyboardInterrupt):
+                s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        entries = s.list_unclaimed_credentials()
+        assert entries, "the interrupt must not swallow the successor"
+        (entry,) = entries.values()
+        assert entry["reason"] == "consume-gate-interrupted"
+        assert entry["consumedFp"] == oauth.credential_fingerprint(self._OLD)
+        # the backup still holds the OLD (spent) generation — nothing
+        # resurrected it, only the stash carries the successor
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_second_interrupt_during_the_stash_attempt_still_reraises_the_first(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch, caplog
+    ):
+        """A SECOND Ctrl-C landing while `stash_successor` itself is blocked
+        (e.g. a contended stash-manifest lock) is ALSO a BaseException,
+        invisible to a plain `except Exception` guarding the stash attempt —
+        a hole in the very arm meant to close this window (opus review,
+        round 400 pass 1). Without `except BaseException` there, the second
+        interrupt escapes straight past the "it is lost" log AND past the
+        outer `raise`, so the ORIGINAL interrupt is replaced by the second
+        one — losing which interrupt reached the caller and losing the
+        error log both."""
+        import logging
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+        state = {"post_done": False}
+        first_interrupt = KeyboardInterrupt("first")
+
+        def failing_write(self_s, num, email, creds, **kw):
+            if state["post_done"]:
+                raise first_interrupt
+            return real_write(self_s, num, email, creds, **kw)
+
+        def failing_stash(creds, ctx):
+            raise KeyboardInterrupt("second")
+
+        def mock_refresh(credentials, **kw):
+            state["post_done"] = True
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+        )
+        monkeypatch.setattr(
+            s._store, "_write_unclaimed_credential", failing_stash
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(KeyboardInterrupt) as exc_info:
+                s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert exc_info.value is first_interrupt, (
+            f"got {exc_info.value!r}: the second interrupt (from the stash "
+            "attempt) replaced the original one that was propagating"
+        )
+        assert any(
+            "it is lost" in r.getMessage() for r in caplog.records
+        ), "a stash failure during an interrupt must still be logged"
+        assert not s.list_unclaimed_credentials(), (
+            "the failing stash must not have written a partial entry"
+        )
 
     # -- consumed_fp on failure outcomes ---------------------------------
 
@@ -18262,6 +18541,348 @@ class TestGateUltraReviewFixes:
             "burn a strike"
         )
 
+    def test_an_unreadable_identity_with_a_possible_self_rotation_never_posts_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """When the corrupt-identity profile's OWN credential generation is
+        AHEAD of the backup (prof_exp > cur_exp), it may be this slot's own
+        self-rotation and the backup on file is its already-spent
+        predecessor. The gate must never mark the profile stale in this
+        case: both this branch and the drift-check branch right below it
+        share the `not is_session_stale` guard, so marking stale here drops
+        BOTH on the next pass and falls through to POST the backup --
+        exactly the invalid_grant strike the comment above exists to avoid.
+
+        Deferring forever is the residual left for this one case (queued
+        separately, not this round's fix) -- correct-and-incomplete. This
+        test only proves the backup is never POSTed.
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # Ahead of the backup: possibly this slot's own self-rotation.
+        successor = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-successor", "refreshToken": "rt-successor",
+            "expiresAt": 999999}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(successor)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            first = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "a profile that may be ahead of the backup was marked "
+                "stale; that drops the guard on the next pass too"
+            )
+            second = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert first.error == "identity-unreadable", (
+            f"got {first.error!r} on the first pass"
+        )
+        assert second.error == "identity-unreadable", (
+            f"got {second.error!r}: an unverifiable, possibly-ahead "
+            "profile must keep deferring, not fall through to POST"
+        )
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) while the "
+            "profile's own generation could not be ruled out as ahead"
+        )
+
+    def test_an_unreadable_identity_not_ahead_self_clears_and_consumes_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The profile's own generation is NOT ahead of the backup (prof_exp
+        <= cur_exp): the backup is at least as fresh, so marking the
+        profile stale here is safe -- none of the gate's own four clears
+        (identity becomes readable, the profile goes stale, a live pid
+        appears, the profile is removed) is reachable from a running tick,
+        so the gate itself must self-clear here. The next pass's
+        fall-through POST is then the ordinary correct consume, not the
+        spent-predecessor case above.
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # Behind the backup: not this slot's own newer rotation.
+        older = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-older", "refreshToken": "rt-older",
+            "expiresAt": 500}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(older)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            first = s.consume_backup_grant("1", "test@example.com", backup)
+            assert is_session_stale(sdir), (
+                "a profile provably not ahead of the backup must be "
+                "marked stale so the next pass stops treating it as "
+                "unconfirmed"
+            )
+            second = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert first.error == "identity-unreadable", (
+            f"got {first.error!r} on the first pass"
+        )
+        assert second.error != "identity-unreadable", (
+            f"got {second.error!r}: the second pass should consume the "
+            "backup normally, not re-defer"
+        )
+        assert posted.call_count == 1, (
+            "expected exactly one POST (the second pass's ordinary "
+            f"consume), got {posted.call_count}"
+        )
+
+    def test_an_unreadable_identity_reports_when_the_stale_mark_fails(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """`mark_session_stale` can itself fail (a read-only session dir),
+        exactly like the two sibling call sites at `_post_backup_write`,
+        which both check its return and log rather than swallow it. Silence
+        here would leave the deferral unbounded with no record of why.
+        """
+        import logging
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # Not ahead of the backup, so the guard would mark it stale.
+        older = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-older", "refreshToken": "rt-older",
+            "expiresAt": 500}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(older)
+        (sdir / ".claude.json").write_text("not json")
+
+        with patch(
+            "claude_swap.session.mark_session_stale", return_value=False,
+        ), patch.object(s, "_live_session_pids", return_value=[]), \
+             caplog.at_level(logging.ERROR, logger="claude-swap"):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error == "identity-unreadable"
+        assert any(
+            "could not be marked stale" in r.getMessage()
+            for r in caplog.records
+        ), f"a failed stale-mark was not reported: {caplog.text}"
+
+    def test_an_unreadable_identity_with_an_unparseable_profile_never_posts_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
+        UNKNOWN generation as 0, and `0 <= cur_exp` is always true — so an
+        unwrapped or otherwise unparseable-as-claudeAiOauth profile credential
+        (`prof_oauth is None`) would mark stale on an expiry that was never
+        actually compared. "Unknown" must fall to the SAME defer side as
+        "possibly ahead", never read as "provably not ahead".
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # Unwrapped: valid JSON, no "claudeAiOauth" key, so extract_oauth_data
+        # returns None cleanly (not the AttributeError case below).
+        unwrapped = json.dumps({
+            "accessToken": "sk-unwrapped", "refreshToken": "rt-unwrapped",
+            "expiresAt": 999999})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(unwrapped)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "an unparseable profile's unknown expiry was treated as "
+                "provably not ahead and marked stale"
+            )
+
+        assert outcome.error == "identity-unreadable"
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) for an "
+            "unknown (unparseable) profile generation"
+        )
+
+    def test_an_unreadable_identity_with_a_non_numeric_expiry_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A non-numeric `expiresAt` must not raise out of the comparison
+        (swallowed by the generic handler further down, which degrades to
+        `transient` -- "could not freshen any candidate (network?)" over a
+        condition that has nothing to do with the network). The outcome
+        must stay `identity-unreadable`.
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        non_numeric = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-nn", "refreshToken": "rt-nn",
+            "expiresAt": "not-a-number"}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(non_numeric)
+        (sdir / ".claude.json").write_text("not json")
+
+        with patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error == "identity-unreadable", (
+            f"got {outcome.error!r}: a non-numeric expiresAt must still "
+            "defer with its own status, not raise into the generic "
+            "'transient' handler"
+        )
+
+    def test_a_stale_profile_with_a_json_scalar_body_reaches_the_ordinary_consume(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A JSON scalar credential body (a torn write mid-login: e.g. a
+        truncated ``.credentials.json`` that happens to parse as a bare
+        number) makes ``extract_oauth_data`` raise ``AttributeError``
+        (``int.get`` does not exist), not return None. Before this branch's
+        stale/not-ahead computation was hoisted above both the
+        identity-unreadable and drift-check branches, an ALREADY-STALE
+        profile never reached that extraction at all and fell straight
+        through to the ordinary backup consume. The hoist must not newly
+        crash that path.
+        """
+        from claude_swap.session import (
+            mark_session_stale, session_dir_for,
+        )
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text("5")  # JSON scalar body
+        mark_session_stale(sdir)
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error != "transient", (
+            f"got {outcome.error!r}: a stale profile's unrelated scalar "
+            "credential body must not crash the consume into the generic "
+            "'transient' handler"
+        )
+
+    def test_an_unreadable_identity_with_no_expiry_at_all_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
+        ABSENT `expiresAt` (a well-formed claudeAiOauth dict missing the
+        key) the same as a proven 0 -- unknown again read as "not ahead",
+        the same defect class as the unparseable-profile case above, on a
+        narrower input: `prof_oauth` here is NOT falsy, so that guard alone
+        does not catch it.
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        no_expiry = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ne", "refreshToken": "rt-ne"}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(no_expiry)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "a profile with no expiresAt at all was treated as "
+                "provably not ahead and marked stale"
+            )
+
+        assert outcome.error == "identity-unreadable"
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) for a "
+            "profile whose generation is entirely unknown"
+        )
+
+    def test_an_unreadable_identity_with_a_bool_expiry_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`bool` subclasses `int`, so `isinstance(True, (int, float))` is
+        True and `True <= cur_exp` compares as `1 <= cur_exp` -- a second
+        door into the same "unknown read as proven" defect, one type check
+        further in. `expiresAt: true` is not a real generation marker.
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        bool_expiry = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-be", "refreshToken": "rt-be",
+            "expiresAt": True}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(bool_expiry)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "a boolean expiresAt was treated as a real numeric "
+                "generation and marked stale"
+            )
+
+        assert outcome.error == "identity-unreadable"
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) for a "
+            "profile whose expiresAt was a bool, not a real generation"
+        )
+
     def test_an_older_profile_never_supersedes_the_backup(
         self, temp_home: Path, sample_sequence_data: dict
     ):
@@ -18300,6 +18921,47 @@ class TestGateUltraReviewFixes:
         assert posted["creds"] == backup, (
             "the gate POSTed the profile's older, already-superseded "
             "generation instead of the backup"
+        )
+
+    def test_a_profile_with_no_expiry_never_crashes_the_drift_check(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`prof_exp` no longer defaults to 0 (dropped so the
+        identity-unreadable branch above can't misread an unknown expiry as
+        "not ahead"), and this branch's own `prof_exp > cur_exp` shares that
+        same variable. At 9030eb33 an absent `expiresAt` here safely read as
+        `0 > cur_exp` (False, no resync); it must still not crash now that
+        `prof_exp` can be None.
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 5000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        no_expiry = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-pf", "refreshToken": "rt-pf-noexp"}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(no_expiry)
+        posted = {}
+
+        def mock_refresh(credentials, **kw):
+            posted["creds"] = credentials
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error != "transient", (
+            f"got {outcome.error!r}: a profile with no expiresAt crashed "
+            "the drift check into the generic 'transient' handler"
+        )
+        assert posted["creds"] == backup, (
+            "an unknown-expiry profile was treated as ahead and its "
+            "credential was POSTed instead of the backup"
         )
 
     # -- unreadable backup defers ----------------------------------------
@@ -19182,9 +19844,12 @@ class TestActiveSlotStrikeParity:
             lambda: ActiveCredentials(old_gen, False, True),
         )
         # _build_accounts_info derives active_num from the live IDENTITY
-        # (_get_current_account), not current_account_number.
+        # (_get_current_account), not current_account_number. `*a, **k`:
+        # this double stands in for the real method, which itself takes an
+        # optional `strict` kwarg -- a bare no-arg lambda works today only
+        # because nothing on this path passes it yet.
         monkeypatch.setattr(s, "_get_current_account",
-                             lambda: ("b@example.com", ""))
+                             lambda *a, **k: ("b@example.com", ""))
         with patch.object(s, "current_account_number", return_value="2"):
             info = s._build_accounts_info()
             entries = s._collect_usage_entries(info, fetch=set())

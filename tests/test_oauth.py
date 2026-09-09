@@ -2202,6 +2202,50 @@ class TestConsumeBusyIsDeterministic:
         ]
         assert not missing, missing
 
+    def test_every_gate_kind_is_registered_or_transient(self):
+        """The subset check above is blind to a kind in NEITHER table: it
+        only asks whether every registered kind has a note, never whether
+        every kind the gate can actually RETURN is registered at all. Such a
+        kind falls through ``try_fetch_usage_for_account`` to the usage
+        endpoint with a known-expired token — a guaranteed 401 every pass,
+        landing as generic "refresh-failed" ("(network?)") — the exact
+        misattribution this module's own kinds exist to avoid.
+
+        Derive the population from the source (every literal
+        ``RefreshOutcome(None, "<kind>")`` inside the consume gate) rather
+        than hand-listing it, so a kind added next month fails this check on
+        its own instead of silently joining the blind spot.
+        """
+        import ast
+        import inspect
+
+        from claude_swap import switcher as switcher_mod
+
+        tree = ast.parse(inspect.getsource(switcher_mod))
+        gate_names = {"consume_backup_grant", "_consume_backup_grant_locked"}
+        kinds = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in gate_names:
+                for call in ast.walk(node):
+                    if (
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "RefreshOutcome"
+                        and len(call.args) >= 2
+                        and isinstance(call.args[0], ast.Constant)
+                        and call.args[0].value is None
+                        and isinstance(call.args[1], ast.Constant)
+                        and isinstance(call.args[1].value, str)
+                    ):
+                        kinds.add(call.args[1].value)
+
+        assert kinds, "derivation found nothing -- the gate's shape moved"
+        unregistered = {
+            k for k in kinds
+            if k != "transient" and k not in oauth._DETERMINISTIC_REFRESH_ERRORS
+        }
+        assert not unregistered, unregistered
+
 
 # OPTS OUT OF #216's AUTOUSE `block_real_oauth_profile_fetch`, which replaces
 # `fetch_oauth_profile` with a stub so dozens of unrelated tests do not open

@@ -3856,6 +3856,111 @@ class TestFreshening:
         assert "2" in unconfirmed_events[0].detail
         assert "b@example.com" in unconfirmed_events[0].detail
 
+    def test_switch_time_unpersisted_successor_warns_against_retry(
+        self, temp_home
+    ):
+        """A confirmed 401 whose escalation POSTed and burned the grant, but
+        whose successor reached neither the store nor the stash
+        (`stashed=False`, the `consume-gate-unpersisted` corner), must not
+        collapse into the same "try again shortly" advice as a pre-POST
+        transient: the backup still holds the spent generation, so a retry
+        re-POSTs it and earns a strike on the very next pass. session.py's
+        `cswap run` path already gives the opposite advice for this exact
+        outcome (`outcome.stashed` False) — the switch path must too."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+
+        rotated = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-2-new",
+                "refreshToken": "rt-2-new",
+                "expiresAt": int(h.clock() * 1000) + 3_600_000,
+            }
+        })
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-2": False, "sk-3": True}.get(token)
+
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ), patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ), patch.object(
+            h.switcher, "consume_backup_grant",
+            return_value=oauth.RefreshOutcome(
+                rotated, "transient", stashed=False
+            ),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3  # landed on 3 in the SAME tick
+        assert "2" not in h.state().get("quarantine", {})  # not struck HERE
+        unconfirmed_events = [
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent)
+            and e.reason == "target-credential-unconfirmed"
+        ]
+        assert unconfirmed_events
+        detail = unconfirmed_events[0].detail
+        assert "Try again shortly" not in detail
+        assert "storage failure" in detail or "re-login" in detail
+
+    def test_switch_time_stashed_successor_advises_safe_retry(self, temp_home):
+        """The other demoted shape: the successor DID reach the stash
+        (`stashed=True`). Retrying is safe here — the next pass adopts it —
+        so the advice must say so, and must differ from the unpersisted
+        corner's warning above."""
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.seed(3, "c@example.com", expires_at=int(h.clock() * 1000) + 3_600_000)
+        h.make_live("a@example.com", 1)
+
+        rotated = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-2-new",
+                "refreshToken": "rt-2-new",
+                "expiresAt": int(h.clock() * 1000) + 3_600_000,
+            }
+        })
+
+        def fake_probe(token: str, timeout_s: float = 5.0) -> bool | None:
+            return {"sk-2": False, "sk-3": True}.get(token)
+
+        with patch(
+            "claude_swap.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ), patch(
+            "claude_swap.oauth.probe_oauth_profile_live", side_effect=fake_probe
+        ), patch.object(
+            h.switcher, "consume_backup_grant",
+            return_value=oauth.RefreshOutcome(
+                rotated, "transient", stashed=True
+            ),
+        ):
+            outcome = h.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(20),
+            })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        unconfirmed_events = [
+            e for e in h.events
+            if isinstance(e, NoSwitchEvent)
+            and e.reason == "target-credential-unconfirmed"
+        ]
+        assert unconfirmed_events
+        detail = unconfirmed_events[0].detail
+        assert "stash" in detail.lower()
+        assert "storage failure" not in detail
+
     def test_transient_failure_skips_without_quarantine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

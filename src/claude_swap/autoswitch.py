@@ -84,6 +84,8 @@ _SYSTEMIC_KINDS = (
     "stash-unreadable",
     "lineage-condemned",
     "identity-unreadable",
+    "live-store-unreadable",
+    "live-store-current",
     "consume-busy",
 )
 _SYSTEMIC_MESSAGES = {k: oauth.ERROR_NOTES[k] for k in _SYSTEMIC_KINDS}

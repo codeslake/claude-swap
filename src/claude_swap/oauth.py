@@ -792,7 +792,8 @@ def fetch_usage(access_token: str) -> dict | None:
 # guaranteed 401 per pass to learn nothing.
 _DETERMINISTIC_REFRESH_ERRORS = (
     "store-unmirrored", "invalid_client", "consume-busy", "stash-unreadable",
-    "identity-unreadable", "lineage-condemned",
+    "identity-unreadable", "lineage-condemned", "live-store-unreadable",
+    "live-store-current",
 )
 
 
