@@ -251,9 +251,19 @@ def _corroborating_daemon_port(_switcher):
     THE REBOOT CASE: a pid can be reused by an unrelated process, and
     ``os.kill(pid, 0)`` cannot tell the two apart -- a surviving record
     naming a pid the OS later hands to something else reads as alive
-    forever and the stale wiring never self-heals. No process can be
-    described by a state file written before it started, so a record whose
-    own mtime predates the CURRENT boot corroborates nothing.
+    forever and the stale wiring never self-heals. A record whose own
+    mtime looks older than the CURRENT boot is the signal, but it is
+    DESTRUCTIVE-direction evidence, not confirmation: ``boot`` is
+    recomputed from the live wall clock on every call, while ``mtime`` was
+    stamped once, at write time -- a forward wall-clock step (an NTP
+    correction after a laptop resumes from sleep, routine on this fleet)
+    moves ``boot`` later without the daemon that wrote the record ever
+    restarting. Reading that as "confirmed dead" would clear a wiring to a
+    proxy that is still serving. Pid reuse right after a genuine reboot is
+    a rare, self-correcting nuisance; condemning a live wiring is an
+    outage -- so a comparison that cannot be trusted (mtime unreadable, in
+    the future, or older than boot) widens the spare instead of narrowing
+    or condemning: it never overrides an alive pid into "not alive".
     """
     try:
         certdir = _certdir(_switcher)
@@ -282,12 +292,19 @@ def _corroborating_daemon_port(_switcher):
         return None
     boot = _boot_time_epoch()
     if boot is not None:
+        import time
+
         try:
             mtime = record_path.stat().st_mtime
         except OSError:
             mtime = None
-        if mtime is not None and mtime < boot:
-            return None  # a pre-boot record cannot describe this pid
+        # FAIL OPEN, NOT CLOSED: `mtime` is untrustworthy against `boot`
+        # (unreadable, ahead of `now` -- a stepped-back clock -- or behind
+        # `boot` -- a stepped-forward one) never condemns; it only forgoes
+        # the narrow, single-port spare below for the conservative
+        # machine-wide one, same as an unreadable record.
+        if mtime is None or mtime > time.time() or mtime < boot:
+            return _SPARE_ALL
     try:
         port = int(state["port"])
     except (KeyError, TypeError, ValueError):

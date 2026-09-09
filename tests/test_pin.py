@@ -7283,16 +7283,21 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "narrow to nothing and condemn a wiring the record cannot rule out"
         )
 
-    def test_a_state_file_older_than_the_current_boot_does_not_spare_a_reused_pid(
+    def test_a_stale_looking_state_file_fails_open_not_closed(
         self, tmp_path, monkeypatch
     ):
-        """[C]: liveness was decided by pid alone. After a reboot, a
-        surviving `proxy.json` naming some pid can collide with an unrelated
-        process the OS later reuses that number for -- `os.kill(pid, 0)`
-        cannot tell the two apart, so the wiring is spared on every launch
-        and never self-heals. No process can be described by a state file
-        written before it started, so a record whose own mtime predates the
-        CURRENT boot must not corroborate an alive-looking pid."""
+        """[m], PASS-2: `mtime < boot` is DESTRUCTIVE-direction evidence, not
+        confirmation, and must never condemn on its own. `boot` is
+        RECOMPUTED from the live wall clock on every call while `mtime` was
+        stamped once, at write time -- a forward wall-clock step (an NTP
+        correction after a laptop resumes from sleep, routine on two of the
+        fleet's three hosts) moves `boot` later without the daemon that
+        wrote the record ever restarting, and reading that as "pre-boot,
+        confirmed dead" clears a wiring to a proxy that is still serving:
+        the exact `/login` cascade the pin exists to prevent. Pid reuse
+        right after a genuine reboot is a rare, self-correcting nuisance;
+        condemning a live wiring is an outage -- so an untrustworthy
+        comparison must fail OPEN (spare) rather than closed (condemn)."""
         from claude_swap import pin
         import claude_swap.paths as paths
 
@@ -7301,20 +7306,57 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
         cfg = _cfg(tmp_path, "cfgdir", dead)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
-        # A real, currently-alive pid stands in for "the OS reused this
-        # number after a reboot" -- this process is alive, but the record
-        # naming it is stamped long before the boot the test fakes.
+        # A real, currently-alive pid: the daemon that wrote this record,
+        # still running, on the same continuous boot -- not a reused pid.
         self._record(sw, port=dead, pid=os.getpid(), fingerprint="fp")
         record_path = sw.backup_dir / "pin-proxy" / "proxy.json"
         pre_boot_mtime = 1_000_000.0
         os.utime(record_path, (pre_boot_mtime, pre_boot_mtime))
+        # A forward clock step recomputed `boot` to land after the record's
+        # (unmoved) mtime, exactly as an NTP correction would.
         monkeypatch.setattr(
             pin, "_boot_time_epoch", lambda: pre_boot_mtime + 3600
         )
 
-        assert bool(pin._dead_wired_configs(sw)) is True, (
-            "a daemon record stamped before the current boot spared a "
-            "wiring as if its pid were confirmed alive"
+        assert bool(pin._dead_wired_configs(sw)) is False, (
+            "a stale-looking-but-possibly-live record was condemned instead "
+            "of spared -- an untrustworthy signal must never act destructively"
+        )
+
+    def test_a_record_mtime_in_the_future_widens_the_spare_machine_wide(
+        self, tmp_path, monkeypatch
+    ):
+        """A record's mtime AHEAD of `now` is itself proof the clock cannot
+        be trusted right now (a backward step, or a mangled stat) -- treat
+        it the same as any other untrustworthy comparison: widen the spare
+        to the whole machine rather than narrow it to the recorded port.
+        TWO wired configs, only one on the recorded port: narrowing (the
+        fallback a dropped future-check would silently take) leaves the
+        OTHER one condemned, which this pins as wrong."""
+        from claude_swap import pin
+
+        sw = self._sw(tmp_path)
+        dead_recorded = _dead_port()
+        dead_other = _dead_port()
+        while dead_other == dead_recorded:
+            dead_other = _dead_port()
+        cfg_recorded = _cfg(tmp_path, "cfgdir-recorded", dead_recorded)
+        cfg_other = _cfg(tmp_path, "cfgdir-other", dead_other)
+        monkeypatch.setattr(
+            pin, "_each_config", lambda *a: [cfg_recorded, cfg_other]
+        )
+        import time
+
+        self._record(sw, port=dead_recorded, pid=os.getpid(), fingerprint="fp")
+        record_path = sw.backup_dir / "pin-proxy" / "proxy.json"
+        future_mtime = time.time() + 3600 * 24 * 365
+        os.utime(record_path, (future_mtime, future_mtime))
+        monkeypatch.setattr(pin, "_boot_time_epoch", lambda: 1.0)
+
+        assert pin._dead_wired_configs(sw) == [], (
+            "a record stamped in the future was narrowed to sparing only "
+            "its own recorded port, condemning the other wired config -- "
+            "the clock cannot be trusted, so nothing destructive at all"
         )
 
 
