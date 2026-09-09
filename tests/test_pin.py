@@ -7208,6 +7208,32 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "an unreadable daemon record was read as proof of death"
         )
 
+    def test_a_broken_impl_is_not_swallowed_into_spare_all(
+        self, tmp_path, monkeypatch
+    ):
+        """[I3]: `impl.read_daemon_state` missing (a version-skewed or
+        half-upgraded cswap-pin install) is a programming bug, not a corrupt
+        record -- nothing distinguishes "there was no daemon state" from
+        "the code has a bug and we stopped healing" if a broad `except
+        Exception:` degrades it into the same `_SPARE_ALL` an unreadable
+        record produces. It must surface instead."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+        import types
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        self._record(sw, port=dead, pid=os.getpid(), fingerprint="fp")
+        # No `read_daemon_state` attribute at all -- exactly what an
+        # incompatible/partially-upgraded cswap-pin install looks like.
+        monkeypatch.setattr(pin, "_live_impl", lambda: types.SimpleNamespace())
+
+        with pytest.raises(AttributeError):
+            pin._corroborating_daemon_port(sw)
+
     def test_no_record_at_all_is_still_condemned(self, tmp_path, monkeypatch):
         """The common case (no package, no daemon ever spawned) must keep
         working exactly as before: no record is not corroboration."""
@@ -7286,29 +7312,46 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
     def test_a_stale_looking_state_file_fails_open_not_closed(
         self, tmp_path, monkeypatch
     ):
-        """[m], PASS-2: `mtime < boot` is DESTRUCTIVE-direction evidence, not
-        confirmation, and must never condemn on its own. `boot` is
-        RECOMPUTED from the live wall clock on every call while `mtime` was
-        stamped once, at write time -- a forward wall-clock step (an NTP
-        correction after a laptop resumes from sleep, routine on two of the
-        fleet's three hosts) moves `boot` later without the daemon that
-        wrote the record ever restarting, and reading that as "pre-boot,
-        confirmed dead" clears a wiring to a proxy that is still serving:
-        the exact `/login` cascade the pin exists to prevent. Pid reuse
-        right after a genuine reboot is a rare, self-correcting nuisance;
-        condemning a live wiring is an outage -- so an untrustworthy
-        comparison must fail OPEN (spare) rather than closed (condemn)."""
+        """[I1], PASS-2/PASS-3: `mtime < boot` is DESTRUCTIVE-direction
+        evidence, not confirmation, and must never condemn its OWN recorded
+        port on its own. `boot` is RECOMPUTED from the live wall clock on
+        every call while `mtime` was stamped once, at write time -- a
+        forward wall-clock step (an NTP correction after a laptop resumes
+        from sleep, routine on two of the fleet's three hosts) moves `boot`
+        later without the daemon that wrote the record ever restarting, and
+        reading that as "pre-boot, confirmed dead" clears a wiring to a
+        proxy that is still serving: the exact `/login` cascade the pin
+        exists to prevent. Pid reuse right after a genuine reboot is a rare,
+        self-correcting nuisance; condemning a live wiring is an outage --
+        so an untrustworthy comparison must fail OPEN (spare) rather than
+        closed (condemn).
+
+        BUT (this is the POST-REBOOT INVARIANT, not this test's anomaly):
+        after ANY genuine reboot, every surviving record's mtime reads
+        older than `boot` -- so this condition is true by construction, on
+        EVERY call, until the daemon that wrote it restarts. Widening to
+        the OLD, machine-wide `_SPARE_ALL` (as an unreadable record does)
+        would disarm `heal` for every OTHER wired config too, permanently,
+        which is a one-config test can't see (it can't tell "spared
+        everything" from "spared coincidentally by falling through to the
+        narrow, single-port spare below"). TWO wired configs, only one on
+        the recorded port, pins the difference: the ambiguous one stays
+        spared, but the unrelated one must still heal."""
         from claude_swap import pin
-        import claude_swap.paths as paths
 
         sw = self._sw(tmp_path)
-        dead = _dead_port()
-        cfg = _cfg(tmp_path, "cfgdir", dead)
-        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
-        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        dead_recorded = _dead_port()
+        dead_other = _dead_port()
+        while dead_other == dead_recorded:
+            dead_other = _dead_port()
+        cfg_recorded = _cfg(tmp_path, "cfgdir-recorded", dead_recorded)
+        cfg_other = _cfg(tmp_path, "cfgdir-other", dead_other)
+        monkeypatch.setattr(
+            pin, "_each_config", lambda *a: [cfg_recorded, cfg_other]
+        )
         # A real, currently-alive pid: the daemon that wrote this record,
         # still running, on the same continuous boot -- not a reused pid.
-        self._record(sw, port=dead, pid=os.getpid(), fingerprint="fp")
+        self._record(sw, port=dead_recorded, pid=os.getpid(), fingerprint="fp")
         record_path = sw.backup_dir / "pin-proxy" / "proxy.json"
         pre_boot_mtime = 1_000_000.0
         os.utime(record_path, (pre_boot_mtime, pre_boot_mtime))
@@ -7318,9 +7361,10 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             pin, "_boot_time_epoch", lambda: pre_boot_mtime + 3600
         )
 
-        assert bool(pin._dead_wired_configs(sw)) is False, (
-            "a stale-looking-but-possibly-live record was condemned instead "
-            "of spared -- an untrustworthy signal must never act destructively"
+        assert pin._dead_wired_configs(sw) == [cfg_other], (
+            "a stale-looking-but-possibly-live record's OWN recorded port "
+            "must stay spared, but must not disarm heal for every other "
+            f"wired config too: {pin._dead_wired_configs(sw)!r}"
         )
 
     def test_a_record_mtime_in_the_future_widens_the_spare_machine_wide(

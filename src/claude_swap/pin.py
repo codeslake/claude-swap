@@ -261,9 +261,12 @@ def _corroborating_daemon_port(_switcher):
     restarting. Reading that as "confirmed dead" would clear a wiring to a
     proxy that is still serving. Pid reuse right after a genuine reboot is
     a rare, self-correcting nuisance; condemning a live wiring is an
-    outage -- so a comparison that cannot be trusted (mtime unreadable, in
-    the future, or older than boot) widens the spare instead of narrowing
-    or condemning: it never overrides an alive pid into "not alive".
+    outage -- so this never overrides an alive pid into "not alive". An
+    UNREADABLE OR FUTURE mtime distrusts the record itself and widens to
+    the machine-wide spare; an mtime OLDER THAN BOOT is true of every
+    surviving record after any reboot, so it narrows to this port instead
+    -- widening it too would disarm healing for every other wired config,
+    permanently, until the daemon restarts.
     """
     try:
         certdir = _certdir(_switcher)
@@ -280,7 +283,13 @@ def _corroborating_daemon_port(_switcher):
             state = json.loads(record_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except Exception:  # noqa: BLE001 — present but unreadable: fail closed
+    except (OSError, ValueError):
+        # present but unreadable (a race on the read, truncated/non-JSON
+        # bytes) -- fail closed. NOT `Exception`: a broken `impl` (e.g. a
+        # version-skewed cswap-pin whose `read_daemon_state` this attr
+        # lookup can't find) is a programming bug, not a corrupt record --
+        # letting it masquerade as one would silently disarm `heal`
+        # forever instead of surfacing the real defect.
         return _SPARE_ALL
     if not isinstance(state, dict):
         return _SPARE_ALL
@@ -298,12 +307,20 @@ def _corroborating_daemon_port(_switcher):
             mtime = record_path.stat().st_mtime
         except OSError:
             mtime = None
-        # FAIL OPEN, NOT CLOSED: `mtime` is untrustworthy against `boot`
-        # (unreadable, ahead of `now` -- a stepped-back clock -- or behind
-        # `boot` -- a stepped-forward one) never condemns; it only forgoes
-        # the narrow, single-port spare below for the conservative
-        # machine-wide one, same as an unreadable record.
-        if mtime is None or mtime > time.time() or mtime < boot:
+        # FAIL OPEN, NOT CLOSED, but the two arms below are different
+        # facts and must not collapse onto the same widen: `mtime`
+        # unreadable or ahead of `now` (a stepped-back clock, a mangled
+        # stat) is a genuinely untrustworthy record -- forgo the narrow,
+        # single-port spare below for the conservative machine-wide one.
+        # `mtime` BEHIND `boot`, on its own, is not: after any reboot every
+        # surviving record reads this way, by construction, until the
+        # daemon that wrote it restarts -- widening to the machine-wide
+        # spare here would disarm `heal` for every OTHER wired config too,
+        # permanently, not just forgo narrowing for this one call. Falls
+        # through to the narrow, single-port spare below instead: still
+        # never condemns THIS port, but stops spreading the uncertainty
+        # past it.
+        if mtime is None or mtime > time.time():
             return _SPARE_ALL
     try:
         port = int(state["port"])

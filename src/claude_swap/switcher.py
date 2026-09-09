@@ -8120,8 +8120,13 @@ class ClaudeAccountSwitcher:
             # override WAS accepted, `current_account` is the slot
             # `_find_account_slot` matched on this exact email, so the two
             # already agree.
-            current_email = data["accounts"][current_account]["email"]
-            from_ref = account_ref(int(current_account), current_email)
+            try:
+                current_email = data["accounts"][current_account]["email"]
+                from_ref = account_ref(int(current_account), current_email)
+            except (KeyError, ValueError, TypeError):
+                raise AccountNotFoundError(
+                    f"Account-{current_account} does not exist"
+                )
 
             # Create transaction for rollback capability
             try:

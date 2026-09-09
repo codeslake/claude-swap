@@ -8568,6 +8568,74 @@ class TestActiveRefreshProvenance:
         )
 
 
+class TestDanglingActiveAccountRaisesNamedError:
+    """[I2/m] `current_account` can stay `str(activeAccountNumber)` — a slot
+    the roster no longer carries (edited by hand, or a stale value a prior
+    bug left behind) — when the live identity resolves to a REAL slot whose
+    stored backup does not (yet) match the live bytes, so the override at
+    `_perform_switch_locked`'s top declines to trust it. `data["accounts"]
+    [current_account]["email"]` then raises a raw `KeyError` that escapes
+    the switch, telling the caller nothing -- this file's own convention two
+    hundred lines up (`AccountNotFoundError(f"Account-{account_num} does
+    not exist")`, e.g. `_remove_account`) names the containment instead.
+    `int(current_account)` right below it is the same failure mode for a
+    non-numeric `activeAccountNumber`.
+    """
+
+    def test_dangling_current_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        sample_sequence_data["activeAccountNumber"] = 99  # not in "accounts"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_live_login_identity",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch_locked(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
+
+    def test_non_numeric_active_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The `int(current_account)` conversion right below the dict lookup
+        has the same containment gap: `activeAccountNumber` is arbitrary,
+        hand-editable JSON, so a non-numeric slot key that IS still present
+        in "accounts" clears the dict lookup and then raises a raw
+        `ValueError` instead."""
+        sample_sequence_data["activeAccountNumber"] = "abc"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        sample_sequence_data["accounts"]["abc"] = {
+            "email": "other@example.com", "uuid": "uuid-abc",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_live_login_identity",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch_locked(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
+
+
 class TestDirectActivationPreservation:
     """Direct activation replaces the live credential without a backup step —
     invariant II requires the displaced credential to be stashed first."""
