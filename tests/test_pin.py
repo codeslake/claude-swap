@@ -13414,9 +13414,11 @@ class TestThePinStateVerb:
     `grep -c OK` must not see an unreachable host and a broken pin merge
     into one number, so UNKNOWN has to stay distinguishable from NOT-OK.
 
-    Model: `.claude/skills/agentic-dev/references/pict-models/
-    task-490-pin-state-verb.md` (`WiredStale` x `ServingDaemon` x
-    `HealthVerdict`, 5 rows, exhaustive for the constrained space).
+    Covers `WiredStale` x `ServingDaemon` x `HealthVerdict` x `PinnedRecord`
+    (the last only asked when nothing is served): a stale wiring or a
+    can_pin=false daemon is NOT-OK, a served daemon with no verdict is
+    UNKNOWN (not NOT-OK), and nothing served with no pin ever recorded is
+    the only OK.
     """
 
     def _sw(self, tmp_path):
@@ -13449,19 +13451,38 @@ class TestThePinStateVerb:
     def test_stale_wiring_is_not_ok(self, tmp_path, monkeypatch, capsys):
         """`yes / no / none`: row 2a, the wiring half fails.
 
-        `serving_port` is wired to raise if it is ever called: a stale
-        wiring must short-circuit before the token half is asked at all.
+        A spy, not a raise: `run()`'s own `except Exception` would swallow
+        an `AssertionError` raised from inside `serving_port` and report
+        UNKNOWN, masking the very thing this test checks. Recording the call
+        and asserting on it AFTER `pin.run` returns keeps the failure named.
         """
         from claude_swap import pin
 
         monkeypatch.setattr(pin, "_dead_wired_configs",
                              lambda *a, **k: [tmp_path / "cfg.json"])
-
-        def _unreached(*a, **k):
-            raise AssertionError("the token probe ran despite a stale wiring")
-
-        monkeypatch.setattr(pin, "serving_port", _unreached)
+        calls = []
+        monkeypatch.setattr(pin, "serving_port",
+                             lambda *a, **k: calls.append(1) or 4242)
         rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "NOT-OK"
+        assert not calls, "the token probe ran despite a stale wiring"
+
+    def test_pinned_but_nothing_served_is_not_ok(self, tmp_path, monkeypatch, capsys):
+        """A pin `--ensure` just tore down (dead wiring cleared, no daemon
+        restarted yet) must not read the same as a machine that was never
+        pinned: `_pinned_email_now` still names the record, and only that
+        record's absence makes `nothing served` an honest OK."""
+        import json as _json
+
+        from claude_swap import pin
+        from claude_swap.settings import settings_path
+
+        sw = self._sw(tmp_path)
+        settings_path(sw.backup_dir).write_text(_json.dumps(
+            {"remoteControl": {"pinnedEmail": "a@example.com"}}))
+        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+        rc = pin.run(sw, None, state=True)
         assert rc == 0
         assert capsys.readouterr().out.strip() == "NOT-OK"
 
@@ -13488,9 +13509,11 @@ class TestThePinStateVerb:
         monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: None)
         rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
-        out = capsys.readouterr().out.strip()
+        captured = capsys.readouterr()
+        out = captured.out.strip()
         assert out == "UNKNOWN", out
         assert out != "NOT-OK"
+        assert captured.err.strip(), "no detail on stderr"
 
     def test_a_probe_raise_still_exits_0(self, tmp_path, monkeypatch, capsys):
         """EXIT 0 ON EVERY PATH, including a raise from a probe: that is
@@ -13503,7 +13526,9 @@ class TestThePinStateVerb:
         monkeypatch.setattr(pin, "_dead_wired_configs", _boom)
         rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
-        assert capsys.readouterr().out.strip() == "UNKNOWN"
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "UNKNOWN"
+        assert "disk gone" in captured.err, captured.err
 
 
 class TestDaemonCanPinReadsHealth:
@@ -13515,12 +13540,11 @@ class TestDaemonCanPinReadsHealth:
     cannot tell."""
 
     def _stub_urlopen(self, monkeypatch, body=b"", *, raises=None):
-        if raises is not None:
-            def _raise(*a, **k):
-                raise raises
-
-            monkeypatch.setattr("urllib.request.urlopen", _raise)
-            return
+        """Stubs the OPENER `_daemon_can_pin` builds, not `urlopen` itself --
+        it calls `build_opener(...).open(...)` so a real proxy env var
+        cannot redirect a loopback probe. Returns the list of handler tuples
+        `build_opener` was called with, for the bypass test below."""
+        calls = []
 
         class _Resp:
             def __enter__(self):
@@ -13532,7 +13556,18 @@ class TestDaemonCanPinReadsHealth:
             def read(self):
                 return body
 
-        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp())
+        class _Opener:
+            def open(self, url, timeout=None):
+                if raises is not None:
+                    raise raises
+                return _Resp()
+
+        def _build_opener(*handlers):
+            calls.append(handlers)
+            return _Opener()
+
+        monkeypatch.setattr("urllib.request.build_opener", _build_opener)
+        return calls
 
     def test_can_pin_true(self, monkeypatch):
         from claude_swap import pin
@@ -13571,3 +13606,20 @@ class TestDaemonCanPinReadsHealth:
 
         self._stub_urlopen(monkeypatch, b"[1, 2, 3]")
         assert pin._daemon_can_pin(4242, timeout=1.0) is None
+
+    def test_bypasses_the_environments_proxy_settings(self, monkeypatch):
+        """A loopback health check must not be routed through `http_proxy`:
+        this box's own proxy chain has no reason to exempt 127.0.0.1, and a
+        probe of OUR daemon redirected through it would misread a healthy
+        pin as unreachable."""
+        import urllib.request
+
+        from claude_swap import pin
+
+        calls = self._stub_urlopen(monkeypatch, b'{"can_pin": true}')
+        assert pin._daemon_can_pin(4242, timeout=1.0) is True
+        assert calls, "build_opener was never called"
+        assert any(
+            isinstance(h, urllib.request.ProxyHandler) and h.proxies == {}
+            for h in calls[0]
+        ), f"no empty ProxyHandler passed to build_opener: {calls[0]}"

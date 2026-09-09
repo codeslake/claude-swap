@@ -2327,8 +2327,14 @@ def _daemon_can_pin(port: int, *, timeout: float) -> bool | None:
     """
     import urllib.request
 
+    # A LOOPBACK CALL, ROUTED DIRECT. `urlopen`'s default opener reads
+    # `http_proxy`/`no_proxy` from the environment on every call, and a host
+    # wired through a corporate/cache proxy has no reason to exempt
+    # 127.0.0.1 -- probing our OWN daemon must not be redirected through it.
+    # `_port_answers` avoids the same trap by using a raw socket instead.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(
+        with opener.open(
             f"http://127.0.0.1:{port}/health", timeout=timeout
         ) as resp:
             data = json.loads(resp.read().decode())
@@ -2337,26 +2343,34 @@ def _daemon_can_pin(port: int, *, timeout: float) -> bool | None:
     return data.get("can_pin") if isinstance(data, dict) else None
 
 
-def _pin_state(switcher, *, connect_timeout: float) -> str:
-    """``cswap pin --state``'s verdict: OK / NOT-OK / UNKNOWN.
+def _pin_state(switcher, *, connect_timeout: float) -> tuple[str, str]:
+    """``cswap pin --state``'s verdict and detail: OK / NOT-OK / UNKNOWN.
 
     The wiring half reuses `_dead_wired_configs` -- "should any wiring be
     removed" is already the staleness verdict `--ensure` clears on, so a
     stale wired port is NOT-OK without a second implementation of the
     config walk. The token half only asks a daemon `serving_port` already
-    located: nothing served means nothing to ask (OK, same as an unpinned
-    machine), and a served daemon that can't say either way is UNKNOWN, not
-    NOT-OK -- that distinction is the entire point of this verb.
+    located: nothing served means nothing to ask, UNLESS a pin is still
+    RECORDED (`_pinned_email_now`) -- `--ensure` clears a dead wiring without
+    touching that record, so "nothing served" alone would read a pin
+    `--ensure` just tore down as a healthy unpinned machine. A served daemon
+    that can't say either way is UNKNOWN, not NOT-OK -- that distinction is
+    the entire point of this verb.
     """
-    if _dead_wired_configs(switcher, connect_timeout=connect_timeout):
-        return "NOT-OK"
+    dead = _dead_wired_configs(switcher, connect_timeout=connect_timeout)
+    if dead:
+        return "NOT-OK", f"{len(dead)} wired config(s) not answering on their own port"
     port = serving_port(switcher, connect_timeout=connect_timeout)
     if port is None:
-        return "OK"
+        if _pinned_email_now(switcher) is not None:
+            return "NOT-OK", "a pin is recorded but nothing is wired or serving"
+        return "OK", "nothing wired, nothing served"
     can_pin = _daemon_can_pin(port, timeout=connect_timeout)
     if can_pin is None:
-        return "UNKNOWN"
-    return "OK" if can_pin else "NOT-OK"
+        return "UNKNOWN", f"the daemon on port {port} gave no verdict on /health"
+    if can_pin:
+        return "OK", f"serving on port {port}, can_pin=true"
+    return "NOT-OK", f"serving on port {port}, but can_pin=false"
 
 
 def run(
@@ -2475,11 +2489,14 @@ def run(
         # EXIT 0 ON EVERY PATH, including a raise from the probes below: a
         # caller's `grep -c OK` must not see an unreachable host and a
         # broken pin merge into one exit code.
+        import sys
+
         try:
-            verdict = _pin_state(switcher, connect_timeout=2.0)
-        except Exception:  # noqa: BLE001 — no verdict, not a crash
-            verdict = "UNKNOWN"
+            verdict, detail = _pin_state(switcher, connect_timeout=2.0)
+        except Exception as exc:  # noqa: BLE001 — no verdict, not a crash
+            verdict, detail = "UNKNOWN", f"the probe raised: {_safe(exc)}"
         print(verdict)
+        print(detail, file=sys.stderr)
         return 0
 
     if heal_only:
