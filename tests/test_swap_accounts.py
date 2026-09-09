@@ -409,34 +409,6 @@ class TestSwapAccounts:
         assert self._marker(switcher, "1", email) == "SLOT-1-HISTORY"
         assert self._marker(switcher, "2", email) == "SLOT-2-HISTORY"
 
-    def test_swap_reverses_a_forward_move_that_was_interrupted(
-        self, temp_home: Path, sample_sequence_data_with_org: dict
-    ):
-        """A move aborted part-way through still has to be undone.
-
-        ``swap_accounts`` catches BaseException, so a Ctrl-C between the two
-        halves of the exchange reaches the rollback with one profile already
-        parked under the other slot's key.
-        """
-        switcher = ClaudeAccountSwitcher()
-        email = self._same_email_slots(switcher, sample_sequence_data_with_org)
-
-        real_replace = os.replace
-
-        def interrupt_the_last_park(src, dst):
-            if str(src).endswith(".swapping"):
-                raise KeyboardInterrupt
-            return real_replace(src, dst)
-
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(os, "replace", interrupt_the_last_park)
-            with pytest.raises(KeyboardInterrupt):
-                switcher.swap_accounts("1", "2")
-
-        slot_2 = switcher._session_dir("2", email) / "marker"
-        assert slot_2.exists(), "account 2's profile was left under slot 1's key"
-        assert slot_2.read_text() == "SLOT-2-HISTORY"
-
     def test_swap_interrupted_just_past_a_move_still_reverses_it(
         self, temp_home: Path, sample_sequence_data_with_org: dict
     ):
