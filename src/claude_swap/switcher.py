@@ -5935,6 +5935,17 @@ class ClaudeAccountSwitcher:
                         continue
                 elif not r_email or r_email != want_email:
                     continue
+                elif self._slot_owning_resolved_identity(
+                    data, resolved
+                ) not in (None, num):
+                    # This slot's own record carries no uuid, so the branch
+                    # above never ran — but the stash entry's OWN uuid can
+                    # still resolve unambiguously to a DIFFERENT slot (opus
+                    # review, round 400 pass 2). Only a POSITIVE claim on
+                    # another slot refuses; `None` (ambiguous, or no uuid
+                    # anywhere to resolve) leaves the address-only heal this
+                    # branch exists for untouched.
+                    continue
                 creds, unreadable = self._store._read_unclaimed_credential(entry_id)
                 if unreadable or not creds:
                     continue

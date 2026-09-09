@@ -417,6 +417,88 @@ class TestAdoptStashedLoginForSlot:
             oauth.credential_fingerprint(DEAD)
         assert entry_id in sw._store._list_unclaimed_credentials()
 
+    def _uuidless_slot_setup(self, sample_sequence_data, resolved_uuid):
+        """This slot (2) has NO uuid recorded at all — an add-token
+        placeholder — so the uuid branch above never runs and the match
+        falls to the email-only `elif`. Slot 1 shares the same email under
+        its own uuid+org (opus review, round 400 pass 2: the email-only arm
+        had no equivalent org check at all)."""
+        sample_sequence_data["accounts"]["1"]["email"] = "owner@example.com"
+        sample_sequence_data["accounts"]["1"]["uuid"] = "uuid-owner"
+        sample_sequence_data["accounts"]["1"]["organizationUuid"] = "org-A"
+        sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
+        sample_sequence_data["accounts"]["2"].pop("uuid", None)
+        sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-B"
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        sw._write_account_credentials("2", "owner@example.com", DEAD)
+        entry_id = sw._store._write_unclaimed_credential(FRESH, {
+            "reason": "foreign",
+            "configSlot": "1",
+            "fingerprint": oauth.credential_fingerprint(FRESH),
+            "resolvedIdentity": {"uuid": resolved_uuid,
+                                 "email": "owner@example.com",
+                                 "organizationUuid": "org-A" if resolved_uuid
+                                 else None},
+        })
+        path = sw._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "2": {
+                    "email": "owner@example.com",
+                    "organizationUuid": "org-B",
+                    "authDeadStrikes": AUTH_DEAD_STRIKES,
+                    "struckFingerprint": oauth.credential_fingerprint(DEAD),
+                    "consecutiveFailures": 2,
+                    "lastError": "invalid_grant",
+                    "lastGood": {"five_hour": {"pct": 10.0}},
+                }
+            },
+        }))
+        return sw, entry_id
+
+    def test_a_sibling_s_uuid_owned_login_is_not_adopted_on_email_alone(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """This slot has no uuid on file, so the uuid branch is skipped —
+        but the STASH entry names a uuid the roster resolves unambiguously
+        to slot 1. Matching this slot on the shared email alone would plant
+        slot 1's refresh token into slot 2 too; the roster positively says
+        the login is slot 1's, so it must be refused here even though this
+        slot's own record carries no uuid to compare against."""
+        sw, entry_id = self._uuidless_slot_setup(
+            sample_sequence_data, resolved_uuid="uuid-owner")
+
+        assert sw._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+
+        stored, _ = sw._read_account_credentials_ex("2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD)
+        assert entry_id in sw._store._list_unclaimed_credentials()
+
+    def test_a_truly_uuid_less_login_still_heals_on_address(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """CONTROL: the stash entry carries no uuid AT ALL (not even a
+        sibling's) — the roster resolver can name nobody, so heal-on-address
+        must still work. The org check on the email-only arm must refuse
+        only a POSITIVE claim on a different slot, never turn into a
+        blanket refusal for the uuid-less case this arm exists for."""
+        sw, entry_id = self._uuidless_slot_setup(
+            sample_sequence_data, resolved_uuid="")
+
+        assert sw._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is True
+
+        stored, _ = sw._read_account_credentials_ex("2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(FRESH)
+        assert entry_id not in sw._store._list_unclaimed_credentials()
+
 
 class TestTheAdoptIsASlotMutation:
     """Every other path that writes a slot credential holds the slot lock, and
