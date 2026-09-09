@@ -7667,6 +7667,36 @@ class TestUsageAwareSwitch:
         # Anchored on the live account (2) → next is 3, not 2 (a no-op).
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    def test_plain_rotation_anchors_on_live_account_under_drift(
+        self, temp_home: Path
+    ):
+        """Plain rotation (no strategy) used to anchor on the stale
+        ``activeAccountNumber`` field, on the premise that nothing kept it in
+        sync so anchoring elsewhere would change behaviour. That premise is
+        gone: only explicit switches move the field now, so a bare
+        ``/login`` (or a login adopted into another managed slot) leaves it
+        stale exactly like the next-available case above. Anchoring on the
+        stale record here skips the live login's true "next" slot (4) and
+        can land back on the slot the user is already live on.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._seed(s, 4, "d@example.com")
+        # Recorded active is 1, but the user is actually live on account 3.
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        self._make_live(temp_home, "c@example.com", 3)
+
+        with patch.object(s, "list_accounts"):
+            s.switch()
+
+        # Anchored on the live account (3) → next is 4, not 2 (the stale
+        # record's next).
+        assert s._get_sequence_data()["activeAccountNumber"] == 4
+
 
 class TestSwitchTargetLivenessGuard:
     """A switch must never activate a credential the API has already
@@ -15660,6 +15690,53 @@ class TestGateUltraReviewFixes:
         assert outcome.error == "identity-unreadable", (
             f"got {outcome.error!r}: a corrupt identity must defer, not "
             "burn a strike"
+        )
+
+    def test_an_unreadable_identity_self_clears_on_the_next_pass(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The `identity-unreadable` deferral above must not repeat forever.
+
+        None of the gate's own four clears is reachable from a running tick
+        (no writer for `.claude.json`, no live pid, the profile isn't
+        removed, and the tick's own path returns before the one call that
+        marks a profile stale) -- so the gate itself must mark the profile
+        stale on this refusal. The NEXT pass then reads `is_session_stale`
+        True and stops treating the corrupt profile as unconfirmed, so it
+        falls through to the ordinary backup consume instead of re-deferring.
+
+        Measured with the self-clear missing: the second pass also returns
+        `identity-unreadable` (unbounded deferral).
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        corrupt = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-corrupt", "refreshToken": "rt-corrupt",
+            "expiresAt": 999999}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(corrupt)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            first = s.consume_backup_grant("1", "test@example.com", backup)
+            second = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert first.error == "identity-unreadable", (
+            f"got {first.error!r} on the first pass"
+        )
+        assert second.error != "identity-unreadable", (
+            "the second pass re-deferred instead of self-clearing: "
+            f"{second.error!r}"
         )
 
     def test_an_older_profile_never_supersedes_the_backup(

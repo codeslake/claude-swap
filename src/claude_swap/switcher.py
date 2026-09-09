@@ -2188,6 +2188,7 @@ class ClaudeAccountSwitcher:
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
         from claude_swap.session import (
             is_session_stale,
+            mark_session_stale,
             read_session_credentials,
             session_dir_for,
             session_identity_drifted,
@@ -2297,6 +2298,22 @@ class ClaudeAccountSwitcher:
                         # clear (the only writer that could refresh the
                         # fingerprint refuses on this same corrupt file).
                         # Defer, like every other "unknown" in this method.
+                        #
+                        # But mark the profile stale first: none of this
+                        # gate's own four clears (identity becomes readable,
+                        # the profile goes stale, a live pid appears, the
+                        # profile is removed) is reachable from a running
+                        # tick -- there is no writer for `.claude.json` but
+                        # Claude Code itself, and this same early return
+                        # happens before the one call in this method
+                        # (`_write_account_credentials`) that could mark the
+                        # profile stale. Without this, an unreadable identity
+                        # bars the slot as both a refresh AND a switch target
+                        # (autoswitch.py's `_SYSTEMIC_MESSAGES`) forever. This
+                        # write satisfies the "goes stale" clear from inside
+                        # the tick, so the NEXT pass takes the ordinary
+                        # backup-consume branch instead of deferring again.
+                        mark_session_stale(sdir)
                         return oauth.RefreshOutcome(None, "identity-unreadable")
                     elif (
                         profile
@@ -7189,10 +7206,17 @@ class ClaudeAccountSwitcher:
         # live state into a fresh backup before swapping, so the active
         # slot's stored backup may be stale or absent without blocking us.
         #
-        # Usage-aware rotation anchors on the live account (current_num) so it
-        # never lands a no-op on the slot you're already on when the live login
-        # has drifted from the recorded activeAccountNumber. Plain rotation keeps
-        # anchoring on active_account for byte-for-byte unchanged behavior.
+        # Every strategy anchors on the live account (current_num), not the
+        # recorded activeAccountNumber: only an explicit switch moves that
+        # field now (`_make_active_if_live`, which used to resync it on every
+        # automatic credential refresh, was deliberately removed), so a bare
+        # `/login`, or a login adopted into another managed slot, leaves it
+        # stale exactly like the usage-aware drift case below. Anchoring
+        # plain rotation on the stale field then skips the live login's true
+        # "next" slot and can land back on the slot the user is already on.
+        # `current_num` already falls back to `active_account` when the live
+        # identity resolves to no managed slot, so this changes nothing in
+        # the case the two values can't differ.
         #
         # The whole scan is retried, bounded by the candidate count, when
         # `_perform_switch`'s own liveness probe (issue #199) proves a
@@ -7202,7 +7226,7 @@ class ClaudeAccountSwitcher:
         # this within one call — it needs a SECOND strike before it agrees a
         # row is dead (see `_select_best_switchable`'s `exclude` docstring).
         for _ in range(len(sequence)):
-            anchor = current_num if strategy == "next-available" else active_account
+            anchor = current_num
             try:
                 current_index = sequence.index(int(anchor))
             except (TypeError, ValueError):
