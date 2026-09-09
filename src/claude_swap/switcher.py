@@ -2683,6 +2683,37 @@ class ClaudeAccountSwitcher:
                     "storage failure, then re-login and `cswap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
+        except BaseException:
+            # The grant IS consumed (the POST above already happened), and
+            # `except Exception` above cannot see this: a Ctrl-C or
+            # SystemExit while the FileLock is held or the store is read is
+            # a BaseException, not an Exception. Stash before it propagates
+            # — same last resort as the branch above — then re-raise so the
+            # interrupt still reaches the caller unchanged.
+            #
+            # ponytail: closes only the window this try/except already
+            # covers. A SIGTERM with no handler (every command but `cswap
+            # auto`) and a daemon-thread engine frozen at quit (menubar.py)
+            # unwind through neither this nor any `finally`; nothing short
+            # of a durable pre-POST intent record closes those, and none is
+            # measured reachable enough to build yet (analyzer, round 400).
+            try:
+                stash_successor(
+                    "consume-gate-interrupted",
+                    "Account %s's refresh grant was consumed but an "
+                    "interrupt raced the persist; successor stashed for "
+                    "the next pass.",
+                )
+            except Exception:
+                # The stash write itself failed too — do not let THIS
+                # exception replace the BaseException below; only log.
+                self._logger.error(
+                    "Account %s's consumed successor could not be stashed "
+                    "before an interrupt propagated — it is lost. Fix the "
+                    "storage failure, then re-login and `cswap add` if the "
+                    "slot strikes.", account_num, exc_info=True,
+                )
+            raise
         if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
             # generation whose grant we just spent. Callers read `error is
@@ -8409,7 +8440,7 @@ class ClaudeAccountSwitcher:
 
     def _probe_target_credential(
         self, num: str, email: str, creds: str
-    ) -> tuple[bool | None, str | None, bool]:
+    ) -> tuple[bool | None, str | None, bool, bool | None]:
         """Confirm a switch target's stored credential is actually accepted
         by the API before it is ever activated — called BEFORE any lock (see
         `_perform_switch`'s "no network while locks are held" invariant).
@@ -8431,35 +8462,42 @@ class ClaudeAccountSwitcher:
         itself carry a revoked grant. So a success from the gate is
         RE-PROBED here with its own profile GET before it is trusted.
 
-        Returns ``(live, creds_to_activate, proven_401)``:
+        Returns ``(live, creds_to_activate, proven_401, stash_state)``:
 
-        - ``(True, creds, False)`` — confirmed live: a profile 200, or a 401
-          whose escalation (refresh or re-probe of a freshened credential)
-          confirmed a live token, in which case ``creds`` is that credential,
-          not the input.
-        - ``(False, None, True)`` — dead: a 401 followed by a refresh (or a
-          re-probe of a freshened credential) that came back dead. Already
-          struck, through the same writer the collector uses (see
+        - ``(True, creds, False, None)`` — confirmed live: a profile 200, or
+          a 401 whose escalation (refresh or re-probe of a freshened
+          credential) confirmed a live token, in which case ``creds`` is
+          that credential, not the input.
+        - ``(False, None, True, None)`` — dead: a 401 followed by a refresh
+          (or a re-probe of a freshened credential) that came back dead.
+          Already struck, through the same writer the collector uses (see
           `_strike_dead_target`).
-        - ``(None, creds, False)`` — transport failure on the profile GET
-          itself, or nothing to probe (a non-OAuth blob): no verdict at all,
-          proceed as before.
-        - ``(None, creds, True)`` — the access token got a REAL 401, but the
-          escalation could not confirm it dead or alive (consume-lock
-          contention, a transient refresh failure, or a transport failure
-          re-probing a freshened credential): not proven dead, so nothing is
-          struck — but a proven refusal, so it must not be activated blind
-          either (`TargetCredentialUnconfirmed`).
+        - ``(None, creds, False, None)`` — transport failure on the profile
+          GET itself, or nothing to probe (a non-OAuth blob): no verdict at
+          all, proceed as before.
+        - ``(None, creds, True, stash_state)`` — the access token got a REAL
+          401, but the escalation could not confirm it dead or alive: not
+          proven dead, so nothing is struck — but a proven refusal, so it
+          must not be activated blind either (`TargetCredentialUnconfirmed`).
+          ``stash_state`` tells the caller WHICH refusal this is, since a
+          retry is safe for one and a strike for the other (mirrors
+          `session.py`'s `outcome.stashed` read on the same gate):
+          ``None`` — the gate never POSTed (consume-lock contention, a
+          pre-POST transient); ``True`` — POSTed and the successor reached
+          the stash, a retry is adopted next pass; ``False`` — POSTed and
+          the successor reached NEITHER the store nor the stash
+          (`consume-gate-unpersisted`), so a retry re-POSTs the now-spent
+          grant and strikes the slot.
         """
         oauth_data = oauth.extract_oauth_data(creds) or {}
         access_token = oauth_data.get("accessToken")
         if not access_token:
-            return None, creds, False  # nothing to probe (non-OAuth blob)
+            return None, creds, False, None  # nothing to probe (non-OAuth blob)
         live = oauth.probe_oauth_profile_live(access_token)
         if live is True:
-            return True, creds, False
+            return True, creds, False, None
         if live is None:
-            return None, creds, False  # transport failure — no verdict
+            return None, creds, False, None  # transport failure — no verdict
         # A real 401 from here on: every return below is `proven_401=True`.
         outcome = self.consume_backup_grant(num, email, creds)
         if outcome.error is None and outcome.credentials:
@@ -8470,7 +8508,7 @@ class ClaudeAccountSwitcher:
                 if reprobe_token else None
             )
             if reprobe_live is True:
-                return True, outcome.credentials, False
+                return True, outcome.credentials, False, None
             if reprobe_live is False:
                 # NOT `outcome.consumed_fp` — that fingerprints the
                 # PRE-refresh bytes the gate POSTed, and the store now holds
@@ -8482,14 +8520,20 @@ class ClaudeAccountSwitcher:
                 self._strike_dead_target(
                     num, email, oauth.credential_fingerprint(outcome.credentials)
                 )
-                return False, None, True
-            return None, creds, True  # re-probe gave no verdict
+                return False, None, True, None
+            return None, creds, True, None  # re-probe gave no verdict; already persisted
         if outcome.error in PERMANENT_AUTH_ERRORS:
             self._strike_dead_target(
                 num, email, outcome.consumed_fp or oauth.credential_fingerprint(creds)
             )
-            return False, None, True
-        return None, creds, True  # consume-busy/transient after a confirmed 401
+            return False, None, True, None
+        # `outcome.stashed` is only meaningful on a DEMOTED outcome — POST
+        # happened and burned a generation (oauth.py:157-164) — never on a
+        # pre-POST kind (consume-busy, lock contention), which never sets it
+        # and defaults False indistinguishably from "stashed=False". Gate on
+        # `outcome.credentials` too: only a demoted outcome carries them.
+        demoted = outcome.error == "transient" and outcome.credentials is not None
+        return None, creds, True, (outcome.stashed if demoted else None)
 
     def _refuse_session_shell(self) -> None:
         """Refuse live-store mutation from inside a ``cswap run`` shell.
@@ -8634,8 +8678,10 @@ class ClaudeAccountSwitcher:
                 target_account, pre_email
             )
             if target_creds_probe:
-                live, probed_creds, proven_401 = self._probe_target_credential(
-                    target_account, pre_email, target_creds_probe
+                live, probed_creds, proven_401, stash_state = (
+                    self._probe_target_credential(
+                        target_account, pre_email, target_creds_probe
+                    )
                 )
                 if live is False:
                     raise TargetCredentialDead(
@@ -8644,6 +8690,31 @@ class ClaudeAccountSwitcher:
                         "activated. Log in as it and run: cswap add"
                     )
                 if live is None and proven_401:
+                    # `stash_state` distinguishes what the escalation's POST
+                    # did, same read as `session.py`'s `outcome.stashed` on
+                    # this gate — collapsing all three into "try again
+                    # shortly" told a caller to retry the one shape (`False`)
+                    # where retrying re-POSTs the spent grant and strikes.
+                    if stash_state is False:
+                        raise TargetCredentialUnconfirmed(
+                            f"Account-{target_account} ({pre_email})'s stored "
+                            "credential got a 401; the refresh check consumed "
+                            "a grant but its successor could neither be "
+                            "stored nor stashed, so the backup holds a spent "
+                            "grant and the successor is gone. Fix the storage "
+                            "failure first; retrying before that spends "
+                            "nothing but earns a strike. If the slot strikes, "
+                            f"log in again and re-add it: cswap --add-account "
+                            f"--slot {target_account}"
+                        )
+                    if stash_state is True:
+                        raise TargetCredentialUnconfirmed(
+                            f"Account-{target_account} ({pre_email})'s stored "
+                            "credential got a 401; the refresh check consumed "
+                            "a grant and its successor is stashed — nothing "
+                            "was activated. Retry, and the next pass adopts "
+                            "it automatically."
+                        )
                     raise TargetCredentialUnconfirmed(
                         f"Account-{target_account} ({pre_email})'s stored "
                         "credential got a 401 and the refresh check could not "

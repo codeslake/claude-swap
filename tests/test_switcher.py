@@ -15339,6 +15339,47 @@ class TestGateUltraReviewFixes:
         )
         assert out.credentials == self._NEW
 
+    def test_interrupt_during_persist_stashes_before_propagating(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch
+    ):
+        """A KeyboardInterrupt (or SystemExit) racing the persist is a
+        BaseException, invisible to `except Exception` — the same window as
+        the OSError test above, but nothing there catches THIS. The grant IS
+        consumed (the POST already happened), so the successor must reach
+        the stash before the interrupt is allowed to propagate, or it is
+        lost for good (issue #400's E9)."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+        state = {"post_done": False}
+
+        def failing_write(self_s, num, email, creds):
+            if state["post_done"]:
+                raise KeyboardInterrupt()
+            return real_write(self_s, num, email, creds)
+
+        def mock_refresh(credentials, **kw):
+            state["post_done"] = True
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh):
+            with pytest.raises(KeyboardInterrupt):
+                s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        entries = s.list_unclaimed_credentials()
+        assert entries, "the interrupt must not swallow the successor"
+        (entry,) = entries.values()
+        assert entry["reason"] == "consume-gate-interrupted"
+        assert entry["consumedFp"] == oauth.credential_fingerprint(self._OLD)
+        # the backup still holds the OLD (spent) generation — nothing
+        # resurrected it, only the stash carries the successor
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
     # -- consumed_fp on failure outcomes ---------------------------------
 
     def test_failure_outcome_carries_consumed_fp_of_posted_bytes(
