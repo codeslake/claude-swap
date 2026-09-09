@@ -7243,6 +7243,38 @@ class TestNoPeerSlotMayShareARefreshGrant:
         finally:
             enc.chmod(0o600)
 
+    def test_refuses_when_a_peers_read_reports_failed_uid_independent(
+        self, temp_home: Path, sample_sequence_data, monkeypatch,
+    ):
+        """Same as the chmod test above, minus the ``skipif`` -- this one
+        asserts the ``failed`` semantics the guard actually depends on
+        directly, so it still covers this arm on a root-run gate where the
+        chmod test silently skips (POSIX permission checks are inert for
+        uid 0)."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        switcher._write_account_credentials(
+            "1", "account1@example.com", _grant_creds("rt-account-1"),
+            attributed=True,
+        )
+
+        def unreadable(account_num, email, failed=None):
+            if failed is not None:
+                failed.append(True)
+            return ""
+
+        monkeypatch.setattr(
+            switcher._store, "_read_account_credentials_direct", unreadable,
+        )
+
+        with pytest.raises(CredentialWriteError, match="unreadable"):
+            switcher._write_account_credentials(
+                "2", "account2@example.com", _grant_creds("rt-account-2"),
+            )
+
     def test_a_shared_setup_token_is_a_supported_config_not_this_defect(
         self, temp_home: Path, sample_sequence_data,
     ):
