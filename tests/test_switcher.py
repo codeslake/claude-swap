@@ -7826,6 +7826,52 @@ class TestProvenanceGuard:
             for w in op["warnings"]
         )
 
+    def test_own_rotation_with_wrong_active_slot_lands_in_the_right_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Same wmac shape as the test above, but the live bytes are
+        genuinely slot 2's OWN rotation (same refresh-token lineage as its
+        stored backup) — the [C] finding's "right-slot-but-wrong-email"
+        case. `current_account` correctly stays 2 (the override above is
+        rejected), but `current_email` must not be left as slot 1's:
+        `_classify_outgoing_credential` reads the backup keyed on
+        ``(current_account, current_email)``, and slot 2's backup is stored
+        under slot 2's OWN email, not slot 1's. The wrong email makes the
+        own-family fast path unreachable and the classifier falls through to
+        "unresolved", stashing the freshly rotated token as unclaimed
+        instead of landing it in slot 2 — the same re-login-forcing outcome
+        this PR exists to prevent, reached one branch over."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-orig", "refreshToken": "rt-2",
+        }})
+        creds_store[("2", "account2@example.com")] = a2_backup
+        # Same refresh-token lineage as the stored backup — a routine
+        # access-token rotation, not a foreign credential.
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-rotated", "refreshToken": "rt-2",
+        }})
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == rotated, (
+            "slot 2's own rotation was not recognised as its own lineage — "
+            "current_email leaked slot 1's identity into the classifier"
+        )
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
+
     def test_cached_foreign_verdict_survives_a_failed_switch_time_probe(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):

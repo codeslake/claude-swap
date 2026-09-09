@@ -8107,7 +8107,20 @@ class ClaudeAccountSwitcher:
                 )
                 return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
-            current_email, _ = current_identity
+            # NOT `current_identity[0]`: when the override above was
+            # rejected, that email is the identity file's unverified claim
+            # (e.g. slot 1's), while `current_account` correctly stayed the
+            # roster's real active slot (e.g. 6) -- pairing the two would
+            # feed `_classify_outgoing_credential` a (slot, email) pair
+            # assembled from two different sources, so its backup lookup
+            # for the REAL slot misses (keyed on the wrong email) and a
+            # genuine own-rotation falls through to "unresolved" and is
+            # stashed as unclaimed instead of landing in its slot. The
+            # account's own stored email is right either way: when the
+            # override WAS accepted, `current_account` is the slot
+            # `_find_account_slot` matched on this exact email, so the two
+            # already agree.
+            current_email = data["accounts"][current_account]["email"]
             from_ref = account_ref(int(current_account), current_email)
 
             # Create transaction for rollback capability

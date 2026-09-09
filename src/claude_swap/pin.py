@@ -181,56 +181,119 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def _wired_daemon_is_alive(_switcher) -> bool:
-    """Is a still-alive daemon recorded behind this machine's pin wiring?
+def _boot_time_epoch() -> float | None:
+    """This machine's boot time as epoch seconds, or None when unknowable.
 
-    Corroborates a dead PROBE against the daemon's own state file
+    POSIX only, matching the pin package itself. Never raises: "cannot tell"
+    must not turn a genuinely-alive daemon's record into a condemned one.
+    """
+    import sys
+
+    if sys.platform == "darwin":
+        import re
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["sysctl", "-n", "kern.boottime"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if out.returncode != 0:
+            return None
+        m = re.search(r"sec\s*=\s*(\d+)", out.stdout)
+        return float(m.group(1)) if m else None
+    from pathlib import Path
+
+    try:
+        text = Path("/proc/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("btime "):
+            try:
+                return float(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+# Sentinel: the record corroborates SOMETHING but not a single port, so the
+# whole machine is spared -- the old, more conservative default whenever a
+# caller cannot narrow. Distinct from `None` (nothing to protect at all).
+_SPARE_ALL = object()
+
+
+def _corroborating_daemon_port(_switcher):
+    """A currently-alive recorded daemon's port, when its record says so.
+
+    Corroborates a dead loopback PROBE against the daemon's own state file
     (``pin-proxy/proxy.json``, written by cswap-pin's ``write_daemon_state``
     as ``{port, pid, fingerprint}``): a daemon draining requests under load
     can miss a single budgeted connect and still be alive, and a launch-path
-    probe must not be the sole judge of that. Fails CLOSED wherever the
-    record cannot be read as "confirmed gone" -- deleting a live wiring is
-    the destructive direction. No record at all (the common case: no
-    package, nothing ever spawned) is not corroboration either way, so it
-    reads as "nothing to corroborate with", same as before this existed.
+    probe must not be the sole judge of that. Goes through the package's own
+    ``read_daemon_state`` when it is importable, rather than parsing
+    ``proxy.json`` a second time here -- a rename of the file or its keys
+    inside cswap-pin is then caught in the one place that changes with it.
+    Falls back to the same literal read when the package is not importable
+    (e.g. removed after the daemon it left behind was spawned): the record
+    is still plain JSON, and a leftover daemon must stay detectable without
+    the package installed.
+
+    Returns ``None`` when there is nothing to protect a wiring with (no
+    record at all, or a confirmed-dead pid) -- freely condemn. Returns
+    `_SPARE_ALL` when a record exists but cannot be narrowed to one port
+    (unreadable, no usable pid, or an alive pid with no valid port) -- the
+    old, conservative machine-wide spare. Otherwise the port a confirmed-
+    alive daemon actually serves.
+
+    THE REBOOT CASE: a pid can be reused by an unrelated process, and
+    ``os.kill(pid, 0)`` cannot tell the two apart -- a surviving record
+    naming a pid the OS later hands to something else reads as alive
+    forever and the stale wiring never self-heals. No process can be
+    described by a state file written before it started, so a record whose
+    own mtime predates the CURRENT boot corroborates nothing.
     """
     try:
         certdir = _certdir(_switcher)
     except Exception:  # noqa: BLE001 — no switcher to ask: nothing to corroborate with
-        return False
+        return None
+    record_path = certdir / "proxy.json"
+    if not record_path.exists():
+        return None  # the common case: no package, nothing ever spawned
+    impl = _live_impl()
     try:
-        raw = json.loads((certdir / "proxy.json").read_text(encoding="utf-8"))
+        if impl is not None:
+            state = impl.read_daemon_state(certdir)
+        else:
+            state = json.loads(record_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return False
+        return None
     except Exception:  # noqa: BLE001 — present but unreadable: fail closed
-        return True
+        return _SPARE_ALL
+    if not isinstance(state, dict):
+        return _SPARE_ALL
     try:
-        pid = int(raw["pid"])
+        pid = int(state["pid"])
     except (KeyError, TypeError, ValueError):
-        return True  # no readable pid: fail closed
-    return _pid_is_alive(pid)
-
-
-def _wired_daemon_port(_switcher) -> int | None:
-    """The port a CONFIRMED-alive recorded daemon serves, or None.
-
-    `_wired_daemon_is_alive` answers whether ANY dead wiring may be spared at
-    all; this narrows WHICH one, because the record names one port and a
-    daemon alive on that port says nothing about a wired config on another.
-    Returns None on anything short of "a valid port behind a pid confirmed
-    alive" -- including an unreadable record -- so a caller that cannot
-    narrow keeps its prior, more conservative (machine-wide) behaviour rather
-    than silently narrowing the spare to nothing.
-    """
+        return _SPARE_ALL
+    if not _pid_is_alive(pid):
+        return None
+    boot = _boot_time_epoch()
+    if boot is not None:
+        try:
+            mtime = record_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime is not None and mtime < boot:
+            return None  # a pre-boot record cannot describe this pid
     try:
-        certdir = _certdir(_switcher)
-        raw = json.loads((certdir / "proxy.json").read_text(encoding="utf-8"))
-        pid = int(raw["pid"])
-        port = int(raw["port"])
-    except Exception:  # noqa: BLE001 — unreadable/missing: caller falls back
-        return None
-    if not (0 < port <= 65535) or not _pid_is_alive(pid):
-        return None
+        port = int(state["port"])
+    except (KeyError, TypeError, ValueError):
+        return _SPARE_ALL
+    if not (0 < port <= 65535):
+        return _SPARE_ALL
     return port
 
 
@@ -251,7 +314,7 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
 
     Whether any of it is cswap's to condemn at all is asked by
     :func:`_port_of_config`, once per config, and not again here. A dead
-    PORT is not on its own a dead DAEMON: :func:`_wired_daemon_is_alive`
+    PORT is not on its own a dead DAEMON: :func:`_corroborating_daemon_port`
     corroborates the miss against the daemon's own record before this
     condemns.
     """
@@ -271,15 +334,16 @@ def _dead_wired_configs(_switcher, connect_timeout: float = 2.0) -> list:
     ]
     # Only asked when the probe already condemns something: an idle machine
     # (nothing dead) never touches the daemon record.
-    if dead and _wired_daemon_is_alive(_switcher):
+    if dead:
         # THE SPARE MUST NOT BE MACHINE-WIDE EITHER: one recorded pid alive
         # says nothing about a config wired to a DIFFERENT port. Narrowed to
         # the port the record actually names; an unreadable/portless record
-        # keeps the old, more conservative machine-wide spare (`None`).
-        rec_port = _wired_daemon_port(_switcher)
-        if rec_port is None:
+        # keeps the old, more conservative machine-wide spare (`_SPARE_ALL`).
+        rec_port = _corroborating_daemon_port(_switcher)
+        if rec_port is _SPARE_ALL:
             return []
-        dead = [(path, port) for path, port in dead if port != rec_port]
+        if rec_port is not None:
+            dead = [(path, port) for path, port in dead if port != rec_port]
     return [path for path, _port in dead]
 
 

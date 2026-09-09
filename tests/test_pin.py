@@ -7283,6 +7283,40 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "narrow to nothing and condemn a wiring the record cannot rule out"
         )
 
+    def test_a_state_file_older_than_the_current_boot_does_not_spare_a_reused_pid(
+        self, tmp_path, monkeypatch
+    ):
+        """[C]: liveness was decided by pid alone. After a reboot, a
+        surviving `proxy.json` naming some pid can collide with an unrelated
+        process the OS later reuses that number for -- `os.kill(pid, 0)`
+        cannot tell the two apart, so the wiring is spared on every launch
+        and never self-heals. No process can be described by a state file
+        written before it started, so a record whose own mtime predates the
+        CURRENT boot must not corroborate an alive-looking pid."""
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+        # A real, currently-alive pid stands in for "the OS reused this
+        # number after a reboot" -- this process is alive, but the record
+        # naming it is stamped long before the boot the test fakes.
+        self._record(sw, port=dead, pid=os.getpid(), fingerprint="fp")
+        record_path = sw.backup_dir / "pin-proxy" / "proxy.json"
+        pre_boot_mtime = 1_000_000.0
+        os.utime(record_path, (pre_boot_mtime, pre_boot_mtime))
+        monkeypatch.setattr(
+            pin, "_boot_time_epoch", lambda: pre_boot_mtime + 3600
+        )
+
+        assert bool(pin._dead_wired_configs(sw)) is True, (
+            "a daemon record stamped before the current boot spared a "
+            "wiring as if its pid were confirmed alive"
+        )
+
 
 class TestPidIsAliveIsPortableAcrossOS:
     """`os.kill(pid, 0)` is a pure liveness probe on POSIX. On Windows the
