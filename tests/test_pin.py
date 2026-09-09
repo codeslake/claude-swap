@@ -5348,11 +5348,11 @@ class TestHealADeadPin:
         # caught it, and the case failed as `exit 1` — a real signal, but for
         # the wrong reason and in the wrong place.)
         def _run(switcher, account, *, clear, heal_only, get_port, get_certdir,
-                 set_port, ensure):
+                 set_port, ensure, state):
             seen.update(
                 account=account, clear=clear, heal_only=heal_only,
                 get_port=get_port, get_certdir=get_certdir,
-                set_port=set_port, ensure=ensure,
+                set_port=set_port, ensure=ensure, state=state,
             )
             return 0
 
@@ -5474,7 +5474,7 @@ class TestHealADeadPin:
         assert seen == {
             "account": None, "clear": False, "heal_only": True,
             "get_port": False, "get_certdir": False, "set_port": None,
-            "ensure": False,
+            "ensure": False, "state": False,
         }
 
     def test_get_port_answers_only_a_serving_pin(self, tmp_path, monkeypatch):
@@ -12595,7 +12595,7 @@ class TestAskSwallowsThePackagesOwnExceptions:
 
 class TestThePinFlagsAreMutuallyExclusive:
     """`cswap pin` takes exactly one of NUM|EMAIL / --clear / --heal /
-    --get_port / --get_certdir / --set_port / --ensure.
+    --get_port / --get_certdir / --set_port / --ensure / --state.
 
     Every pair has to be refused, and refused with an exit code a shell can
     branch on. A query that silently discarded an action would be
@@ -12603,7 +12603,8 @@ class TestThePinFlagsAreMutuallyExclusive:
     """
 
     ONE_OF = (["2"], ["--clear"], ["--heal"], ["--get_port"],
-              ["--get_certdir"], ["--set_port", "5"], ["--ensure"])
+              ["--get_certdir"], ["--set_port", "5"], ["--ensure"],
+              ["--state"])
 
     def test_every_pair_is_refused(self):
         import itertools
@@ -13406,3 +13407,167 @@ class TestTheSwitchSplicesTheDaemonsFresherIdentity:
             got = pin.identity_for_config(self._sw(stored),
                                           email="a@example.com", num="5")
             assert got == stored, (kept, got)
+
+
+class TestThePinStateVerb:
+    """`cswap pin --state`: one word on stdout, exit 0 always. A caller's
+    `grep -c OK` must not see an unreachable host and a broken pin merge
+    into one number, so UNKNOWN has to stay distinguishable from NOT-OK.
+
+    Model: `.claude/skills/agentic-dev/references/pict-models/
+    task-490-pin-state-verb.md` (`WiredStale` x `ServingDaemon` x
+    `HealthVerdict`, 5 rows, exhaustive for the constrained space).
+    """
+
+    def _sw(self, tmp_path):
+        import types
+
+        backup = tmp_path / "backup"
+        (backup / "pin-proxy").mkdir(parents=True)
+        return types.SimpleNamespace(backup_dir=backup)
+
+    def test_nothing_wired_nothing_served_is_ok(self, tmp_path, monkeypatch, capsys):
+        """`no / no / none`: an unpinned machine has nothing to ask."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+        rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "OK"
+
+    def test_both_probes_ok_is_ok(self, tmp_path, monkeypatch, capsys):
+        """`no / yes / ok`: the RED test, row 1 of the brief."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+        monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
+        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: True)
+        rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "OK"
+
+    def test_stale_wiring_is_not_ok(self, tmp_path, monkeypatch, capsys):
+        """`yes / no / none`: row 2a, the wiring half fails.
+
+        `serving_port` is wired to raise if it is ever called: a stale
+        wiring must short-circuit before the token half is asked at all.
+        """
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_dead_wired_configs",
+                             lambda *a, **k: [tmp_path / "cfg.json"])
+
+        def _unreached(*a, **k):
+            raise AssertionError("the token probe ran despite a stale wiring")
+
+        monkeypatch.setattr(pin, "serving_port", _unreached)
+        rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "NOT-OK"
+
+    def test_daemon_says_cannot_pin_is_not_ok(self, tmp_path, monkeypatch, capsys):
+        """`no / yes / bad`: row 2b, the token half fails -- same word as
+        row 2a from a different probe, which is why both must be driven."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+        monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
+        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: False)
+        rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "NOT-OK"
+
+    def test_daemon_with_no_verdict_is_unknown(self, tmp_path, monkeypatch, capsys):
+        """`no / yes / none`: row 3, THE CONTROL that separates UNKNOWN
+        from NOT-OK. Without this row a verb that maps every non-OK probe
+        outcome to NOT-OK passes every other row in this class too."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+        monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
+        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: None)
+        rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        assert out == "UNKNOWN", out
+        assert out != "NOT-OK"
+
+    def test_a_probe_raise_still_exits_0(self, tmp_path, monkeypatch, capsys):
+        """EXIT 0 ON EVERY PATH, including a raise from a probe: that is
+        the property `--state` exists to give a caller in the first place."""
+        from claude_swap import pin
+
+        def _boom(*a, **k):
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(pin, "_dead_wired_configs", _boom)
+        rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "UNKNOWN"
+
+
+class TestDaemonCanPinReadsHealth:
+    """`_daemon_can_pin` is the only genuinely new probe `--state` needed --
+    `_dead_wired_configs` and `serving_port` are exercised at length
+    elsewhere in this file. Unreachable, malformed JSON and a missing
+    `can_pin` field must all collapse to the same "no verdict" (None): none
+    of them says whether the pin can read the token, only that this probe
+    cannot tell."""
+
+    def _stub_urlopen(self, monkeypatch, body=b"", *, raises=None):
+        if raises is not None:
+            def _raise(*a, **k):
+                raise raises
+
+            monkeypatch.setattr("urllib.request.urlopen", _raise)
+            return
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return body
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _Resp())
+
+    def test_can_pin_true(self, monkeypatch):
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, b'{"can_pin": true}')
+        assert pin._daemon_can_pin(4242, timeout=1.0) is True
+
+    def test_can_pin_false(self, monkeypatch):
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, b'{"can_pin": false}')
+        assert pin._daemon_can_pin(4242, timeout=1.0) is False
+
+    def test_missing_field_is_no_verdict(self, monkeypatch):
+        """An old daemon whose `/health` predates the field."""
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, b'{"ok": true}')
+        assert pin._daemon_can_pin(4242, timeout=1.0) is None
+
+    def test_unreachable_is_no_verdict(self, monkeypatch):
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, raises=OSError("connection refused"))
+        assert pin._daemon_can_pin(4242, timeout=1.0) is None
+
+    def test_malformed_json_is_no_verdict(self, monkeypatch):
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, b"not json")
+        assert pin._daemon_can_pin(4242, timeout=1.0) is None
+
+    def test_valid_but_non_dict_json_is_no_verdict(self, monkeypatch):
+        """Valid JSON, but not an object -- `can_pin` cannot exist on it."""
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, b"[1, 2, 3]")
+        assert pin._daemon_can_pin(4242, timeout=1.0) is None

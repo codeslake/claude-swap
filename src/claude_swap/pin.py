@@ -2316,6 +2316,49 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     return port if _port_answers(port, connect_timeout) else None
 
 
+def _daemon_can_pin(port: int, *, timeout: float) -> bool | None:
+    """`/health`'s ``can_pin``, or None with no verdict at all — unreachable,
+    non-JSON, or an old daemon whose ``/health`` predates the field. All
+    three collapse into one signal on purpose: none of them says whether the
+    pin can read the token, only that this probe cannot tell. A locked
+    keychain and a daemon started outside the GUI session both read
+    ``can_pin=false`` here, and that is as far as this probe goes -- the two
+    are indistinguishable over ssh, so False stays one measurement, not two.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/health", timeout=timeout
+        ) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:  # noqa: BLE001 — unreachable/malformed: no verdict
+        return None
+    return data.get("can_pin") if isinstance(data, dict) else None
+
+
+def _pin_state(switcher, *, connect_timeout: float) -> str:
+    """``cswap pin --state``'s verdict: OK / NOT-OK / UNKNOWN.
+
+    The wiring half reuses `_dead_wired_configs` -- "should any wiring be
+    removed" is already the staleness verdict `--ensure` clears on, so a
+    stale wired port is NOT-OK without a second implementation of the
+    config walk. The token half only asks a daemon `serving_port` already
+    located: nothing served means nothing to ask (OK, same as an unpinned
+    machine), and a served daemon that can't say either way is UNKNOWN, not
+    NOT-OK -- that distinction is the entire point of this verb.
+    """
+    if _dead_wired_configs(switcher, connect_timeout=connect_timeout):
+        return "NOT-OK"
+    port = serving_port(switcher, connect_timeout=connect_timeout)
+    if port is None:
+        return "OK"
+    can_pin = _daemon_can_pin(port, timeout=connect_timeout)
+    if can_pin is None:
+        return "UNKNOWN"
+    return "OK" if can_pin else "NOT-OK"
+
+
 def run(
     switcher,
     account: str | None,
@@ -2325,6 +2368,7 @@ def run(
     get_certdir: bool = False,
     set_port: int | None = None,
     ensure: bool = False,
+    state: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
@@ -2332,9 +2376,10 @@ def run(
 
     # EVERY BRANCH ABOVE `_impl()` RUNS WITHOUT THE PACKAGE, and that ordering
     # is the contract, not an accident: `--ensure`, `--set_port`, `--get_port`,
-    # `--get_certdir`, `--heal` and `--clear` are the commands a user reaches
-    # for when the pin is the broken thing. Each is answered from cswap's own
-    # files. Only pinning itself needs the package, so only it resolves one.
+    # `--get_certdir`, `--state`, `--heal` and `--clear` are the commands a
+    # user reaches for when the pin is the broken thing. Each is answered
+    # from cswap's own files. Only pinning itself needs the package, so only
+    # it resolves one.
     if ensure:
         # The launch contract, which `--heal` deliberately does not make. An
         # rc hook calls this before EVERY `claude`, so it never fails (every
@@ -2424,6 +2469,17 @@ def run(
         # SEARCH for. Unlike --get_port this does NOT probe: "where does this
         # host keep it" is true whether or not a daemon is up.
         print(_certdir(switcher))
+        return 0
+
+    if state:
+        # EXIT 0 ON EVERY PATH, including a raise from the probes below: a
+        # caller's `grep -c OK` must not see an unreachable host and a
+        # broken pin merge into one exit code.
+        try:
+            verdict = _pin_state(switcher, connect_timeout=2.0)
+        except Exception:  # noqa: BLE001 — no verdict, not a crash
+            verdict = "UNKNOWN"
+        print(verdict)
         return 0
 
     if heal_only:
