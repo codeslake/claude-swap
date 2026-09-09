@@ -15837,6 +15837,122 @@ class TestGateUltraReviewFixes:
             for r in caplog.records
         ), f"a failed stale-mark was not reported: {caplog.text}"
 
+    def test_an_unreadable_identity_with_an_unparseable_profile_never_posts_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """`prof_exp = (prof_oauth or {}).get("expiresAt") or 0` reads an
+        UNKNOWN generation as 0, and `0 <= cur_exp` is always true — so an
+        unwrapped or otherwise unparseable-as-claudeAiOauth profile credential
+        (`prof_oauth is None`) would mark stale on an expiry that was never
+        actually compared. "Unknown" must fall to the SAME defer side as
+        "possibly ahead", never read as "provably not ahead".
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # Unwrapped: valid JSON, no "claudeAiOauth" key, so extract_oauth_data
+        # returns None cleanly (not the AttributeError case below).
+        unwrapped = json.dumps({
+            "accessToken": "sk-unwrapped", "refreshToken": "rt-unwrapped",
+            "expiresAt": 999999})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(unwrapped)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "an unparseable profile's unknown expiry was treated as "
+                "provably not ahead and marked stale"
+            )
+
+        assert outcome.error == "identity-unreadable"
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) for an "
+            "unknown (unparseable) profile generation"
+        )
+
+    def test_an_unreadable_identity_with_a_non_numeric_expiry_still_defers(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A non-numeric `expiresAt` must not raise out of the comparison
+        (swallowed by the generic handler further down, which degrades to
+        `transient` -- "could not freshen any candidate (network?)" over a
+        condition that has nothing to do with the network). The outcome
+        must stay `identity-unreadable`.
+        """
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        non_numeric = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-nn", "refreshToken": "rt-nn",
+            "expiresAt": "not-a-number"}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(non_numeric)
+        (sdir / ".claude.json").write_text("not json")
+
+        with patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error == "identity-unreadable", (
+            f"got {outcome.error!r}: a non-numeric expiresAt must still "
+            "defer with its own status, not raise into the generic "
+            "'transient' handler"
+        )
+
+    def test_a_stale_profile_with_a_json_scalar_body_reaches_the_ordinary_consume(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """A JSON scalar credential body (a torn write mid-login: e.g. a
+        truncated ``.credentials.json`` that happens to parse as a bare
+        number) makes ``extract_oauth_data`` raise ``AttributeError``
+        (``int.get`` does not exist), not return None. Before this branch's
+        stale/not-ahead computation was hoisted above both the
+        identity-unreadable and drift-check branches, an ALREADY-STALE
+        profile never reached that extraction at all and fell straight
+        through to the ordinary backup consume. The hoist must not newly
+        crash that path.
+        """
+        from claude_swap.session import (
+            mark_session_stale, session_dir_for,
+        )
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text("5")  # JSON scalar body
+        mark_session_stale(sdir)
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error != "transient", (
+            f"got {outcome.error!r}: a stale profile's unrelated scalar "
+            "credential body must not crash the consume into the generic "
+            "'transient' handler"
+        )
+
     def test_an_older_profile_never_supersedes_the_backup(
         self, temp_home: Path, sample_sequence_data: dict
     ):

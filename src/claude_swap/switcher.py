@@ -2275,7 +2275,21 @@ class ClaudeAccountSwitcher:
                 if not self._live_session_pids(account_num, email):
                     sdir = session_dir_for(self.backup_dir, account_num, email)
                     profile = read_session_credentials(sdir)
-                    prof_oauth = oauth.extract_oauth_data(profile) if profile else None
+                    # A JSON scalar body (torn write mid-login) parses clean
+                    # but is not a dict, and `.get("claudeAiOauth")` inside
+                    # extract_oauth_data then raises AttributeError instead
+                    # of returning None -- unreached before this hoist (the
+                    # elif below only called this on a NOT-stale, NOT-drifted
+                    # profile), so hoisting it above both branches must not
+                    # newly crash a stale/drifted one. Same defensive shape
+                    # as `_session_profile_ahead`'s own extraction: an
+                    # unreadable shape is "unknown", not a raise.
+                    try:
+                        prof_oauth = (
+                            oauth.extract_oauth_data(profile) if profile else None
+                        )
+                    except AttributeError:
+                        prof_oauth = None
                     cur_exp = (input_oauth or {}).get("expiresAt") or 0
                     prof_exp = (prof_oauth or {}).get("expiresAt") or 0
                     if (
@@ -2303,22 +2317,31 @@ class ClaudeAccountSwitcher:
                         # Defer, like every other "unknown" in this method.
                         #
                         # Mark the profile stale ONLY when its own
-                        # generation is provably NOT ahead of the backup
-                        # (prof_exp <= cur_exp): both this branch and the
-                        # drift-check branch below share the
-                        # `not is_session_stale` guard, so marking stale
+                        # generation is PROVABLY NOT ahead of the backup
+                        # (prof_oauth parsed AND prof_exp <= cur_exp): both
+                        # this branch and the drift-check branch below share
+                        # the `not is_session_stale` guard, so marking stale
                         # when the profile MIGHT be ahead would drop both
                         # on the next pass and fall through to POST the
                         # backup -- the exact spent-predecessor strike this
-                        # deferral exists to avoid. When the profile is not
-                        # ahead the backup is at least as fresh, so this
-                        # write safely satisfies the "goes stale" clear from
-                        # inside the tick and the NEXT pass takes the
-                        # ordinary backup-consume branch instead of
-                        # deferring again. (A possibly-ahead profile keeps
-                        # deferring on every pass -- correct-and-incomplete,
-                        # not fixed here.)
-                        if prof_exp <= cur_exp:
+                        # deferral exists to avoid. "Unknown" must fall to
+                        # the SAME defer side as "ahead", never read as
+                        # "not ahead": an unwrapped or unparseable profile
+                        # (prof_oauth is None) or a non-numeric expiresAt
+                        # (isinstance False) is unknown, not proven <=, so
+                        # both are required before comparing. When the
+                        # profile is provably not ahead the backup is at
+                        # least as fresh, so this write safely satisfies the
+                        # "goes stale" clear from inside the tick and the
+                        # NEXT pass takes the ordinary backup-consume branch
+                        # instead of deferring again. (A possibly-ahead or
+                        # unknown profile keeps deferring on every pass --
+                        # correct-and-incomplete, not fixed here.)
+                        if (
+                            prof_oauth
+                            and isinstance(prof_exp, (int, float))
+                            and prof_exp <= cur_exp
+                        ):
                             if not mark_session_stale(sdir):
                                 self._logger.error(
                                     "Account %s's session profile identity "
