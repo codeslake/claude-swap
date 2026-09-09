@@ -15271,10 +15271,10 @@ class TestGateUltraReviewFixes:
         real_write = ClaudeAccountSwitcher._write_account_credentials
         state = {"post_done": False}
 
-        def failing_write(self_s, num, email, creds):
+        def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
                 raise OSError(28, "No space left on device")
-            return real_write(self_s, num, email, creds)
+            return real_write(self_s, num, email, creds, **kw)
 
         def mock_refresh(credentials, **kw):
             state["post_done"] = True
@@ -15313,10 +15313,10 @@ class TestGateUltraReviewFixes:
         state = {"post_done": False}
         real_write = ClaudeAccountSwitcher._write_account_credentials
 
-        def failing_write(self_s, num, email, creds):
+        def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
                 raise OSError(28, "No space left on device")
-            return real_write(self_s, num, email, creds)
+            return real_write(self_s, num, email, creds, **kw)
 
         def failing_stash(creds, ctx):
             raise OSError(28, "No space left on device")
@@ -15354,10 +15354,10 @@ class TestGateUltraReviewFixes:
         real_write = ClaudeAccountSwitcher._write_account_credentials
         state = {"post_done": False}
 
-        def failing_write(self_s, num, email, creds):
+        def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
                 raise KeyboardInterrupt()
-            return real_write(self_s, num, email, creds)
+            return real_write(self_s, num, email, creds, **kw)
 
         def mock_refresh(credentials, **kw):
             state["post_done"] = True
@@ -15400,10 +15400,10 @@ class TestGateUltraReviewFixes:
         state = {"post_done": False}
         first_interrupt = KeyboardInterrupt("first")
 
-        def failing_write(self_s, num, email, creds):
+        def failing_write(self_s, num, email, creds, **kw):
             if state["post_done"]:
                 raise first_interrupt
-            return real_write(self_s, num, email, creds)
+            return real_write(self_s, num, email, creds, **kw)
 
         def failing_stash(creds, ctx):
             raise KeyboardInterrupt("second")
