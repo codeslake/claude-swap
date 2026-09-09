@@ -8126,7 +8126,7 @@ class ClaudeAccountSwitcher:
             except (KeyError, ValueError, TypeError):
                 raise AccountNotFoundError(
                     f"Account-{current_account} does not exist"
-                )
+                ) from None
 
             # Create transaction for rollback capability
             try:

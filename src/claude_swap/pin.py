@@ -214,11 +214,13 @@ def _corroborating_daemon_port(_switcher):
     hands to an unrelated process) is a known, carried gap: three passes at
     corroborating it against the record's mtime each broke on the wall
     clock -- boot time is recomputed live, and a laptop's NTP correction
-    after sleep moves it without the daemon restarting, so every attempt
-    either failed to condemn a live wiring or failed to condemn anything.
-    The real fix is stamp-vs-stamp (the daemon's own recorded process start
-    time against a fresh read of it, not wall-clock-derived), carried as a
-    project finding rather than built here.
+    after sleep moves it without the daemon restarting. None of the three
+    ever varied WHETHER something got condemned on this signal alone (never
+    did); only the BREADTH of the spare moved, between the recorded port
+    and the whole machine. The real fix is stamp-vs-stamp (the daemon's own
+    recorded process start time against a fresh read of it, not
+    wall-clock-derived), carried as a project finding rather than built
+    here.
     """
     try:
         certdir = _certdir(_switcher)
@@ -228,20 +230,23 @@ def _corroborating_daemon_port(_switcher):
     if not record_path.exists():
         return None  # the common case: no package, nothing ever spawned
     impl = _live_impl()
+    # `getattr`, not a bare attribute access: a SYMBOL check, not a bet on
+    # cswap-pin's exception types. `read_daemon_state` missing (a
+    # version-skewed or half-upgraded install -- pin.py carries NO runtime
+    # version floor on purpose) falls back to the same literal read `impl is
+    # None` already takes, instead of raising `AttributeError` into `heal`'s
+    # handler and turning a healable dead wiring into a loud failure.
+    reader = getattr(impl, "read_daemon_state", None) if impl is not None else None
     try:
-        if impl is not None:
-            state = impl.read_daemon_state(certdir)
+        if reader is not None:
+            state = reader(certdir)
         else:
             state = json.loads(record_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
         # present but unreadable (a race on the read, truncated/non-JSON
-        # bytes) -- fail closed. NOT `Exception`: a broken `impl` (e.g. a
-        # version-skewed cswap-pin whose `read_daemon_state` this attr
-        # lookup can't find) is a programming bug, not a corrupt record --
-        # letting it masquerade as one would silently disarm `heal`
-        # forever instead of surfacing the real defect.
+        # bytes) -- fail closed.
         return _SPARE_ALL
     if not isinstance(state, dict):
         return _SPARE_ALL

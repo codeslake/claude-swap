@@ -7208,31 +7208,42 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "an unreadable daemon record was read as proof of death"
         )
 
-    def test_a_broken_impl_is_not_swallowed_into_spare_all(
+    def test_a_broken_impl_falls_back_and_still_heals(
         self, tmp_path, monkeypatch
     ):
-        """[I3]: `impl.read_daemon_state` missing (a version-skewed or
-        half-upgraded cswap-pin install) is a programming bug, not a corrupt
-        record -- nothing distinguishes "there was no daemon state" from
-        "the code has a bug and we stopped healing" if a broad `except
-        Exception:` degrades it into the same `_SPARE_ALL` an unreadable
-        record produces. It must surface instead."""
+        """[I]: `impl.read_daemon_state` missing (a version-skewed or
+        half-upgraded cswap-pin install -- pin.py carries NO runtime version
+        floor, on purpose) must not turn a healable dead wiring into a loud
+        `heal` failure. It must fall back to the same literal JSON read the
+        "package not installed" case already takes -- the USER-VISIBLE
+        behaviour is `heal` still clearing the dead wiring, not merely that
+        some internal call doesn't raise."""
+        import subprocess
+        import sys
+        import types
+
         from claude_swap import pin
         import claude_swap.paths as paths
-        import types
 
         sw = self._sw(tmp_path)
         dead = _dead_port()
         cfg = _cfg(tmp_path, "cfgdir", dead)
         monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
         monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
-        self._record(sw, port=dead, pid=os.getpid(), fingerprint="fp")
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self._record(sw, port=dead, pid=proc.pid, fingerprint="fp")
         # No `read_daemon_state` attribute at all -- exactly what an
         # incompatible/partially-upgraded cswap-pin install looks like.
         monkeypatch.setattr(pin, "_live_impl", lambda: types.SimpleNamespace())
 
-        with pytest.raises(AttributeError):
-            pin._corroborating_daemon_port(sw)
+        changed, message = pin.heal(sw)
+        assert changed, message
+        assert message == (
+            "Removed a cloud pin wiring whose proxy was gone. sessions "
+            "fall back to the proxy they had before the pin"
+        ), message
 
     def test_no_record_at_all_is_still_condemned(self, tmp_path, monkeypatch):
         """The common case (no package, no daemon ever spawned) must keep
