@@ -15380,6 +15380,61 @@ class TestGateUltraReviewFixes:
         # resurrected it, only the stash carries the successor
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
 
+    def test_second_interrupt_during_the_stash_attempt_still_reraises_the_first(
+        self, temp_home: Path, sample_sequence_data: dict, monkeypatch, caplog
+    ):
+        """A SECOND Ctrl-C landing while `stash_successor` itself is blocked
+        (e.g. a contended stash-manifest lock) is ALSO a BaseException,
+        invisible to a plain `except Exception` guarding the stash attempt —
+        a hole in the very arm meant to close this window (opus review,
+        round 400 pass 1). Without `except BaseException` there, the second
+        interrupt escapes straight past the "it is lost" log AND past the
+        outer `raise`, so the ORIGINAL interrupt is replaced by the second
+        one — losing which interrupt reached the caller and losing the
+        error log both."""
+        import logging
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        real_write = ClaudeAccountSwitcher._write_account_credentials
+        state = {"post_done": False}
+        first_interrupt = KeyboardInterrupt("first")
+
+        def failing_write(self_s, num, email, creds):
+            if state["post_done"]:
+                raise first_interrupt
+            return real_write(self_s, num, email, creds)
+
+        def failing_stash(creds, ctx):
+            raise KeyboardInterrupt("second")
+
+        def mock_refresh(credentials, **kw):
+            state["post_done"] = True
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "_write_account_credentials", failing_write
+        )
+        monkeypatch.setattr(
+            s._store, "_write_unclaimed_credential", failing_stash
+        )
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh), \
+             caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(KeyboardInterrupt) as exc_info:
+                s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert exc_info.value is first_interrupt, (
+            f"got {exc_info.value!r}: the second interrupt (from the stash "
+            "attempt) replaced the original one that was propagating"
+        )
+        assert any(
+            "it is lost" in r.getMessage() for r in caplog.records
+        ), "a stash failure during an interrupt must still be logged"
+        assert not s.list_unclaimed_credentials(), (
+            "the failing stash must not have written a partial entry"
+        )
+
     # -- consumed_fp on failure outcomes ---------------------------------
 
     def test_failure_outcome_carries_consumed_fp_of_posted_bytes(

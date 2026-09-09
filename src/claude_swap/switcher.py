@@ -2704,9 +2704,13 @@ class ClaudeAccountSwitcher:
                     "interrupt raced the persist; successor stashed for "
                     "the next pass.",
                 )
-            except Exception:
-                # The stash write itself failed too — do not let THIS
-                # exception replace the BaseException below; only log.
+            except BaseException:
+                # BaseException, not Exception: a SECOND Ctrl-C landing
+                # while this stash attempt is itself blocked (a contended
+                # stash-manifest lock) is invisible to a plain `except
+                # Exception` here — the same gap this whole arm exists to
+                # close. Do not let it replace the ORIGINAL interrupt below;
+                # only log.
                 self._logger.error(
                     "Account %s's consumed successor could not be stashed "
                     "before an interrupt propagated — it is lost. Fix the "
