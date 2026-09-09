@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import sys
 import time
@@ -7116,6 +7117,124 @@ class TestPersistBackupCredentials:
         assert switcher._read_account_credentials("2", "test@example.com") == (
             "gen-2"
         )
+
+
+def _grant_creds(refresh_token: str) -> str:
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-" + refresh_token, "refreshToken": refresh_token,
+    }})
+
+
+def _grant_setup_token_creds(token: str) -> str:
+    """No ``refreshToken``: falls to the ``sha256-full:`` fingerprint arm."""
+    return json.dumps({"claudeAiOauth": {"accessToken": token}})
+
+
+class TestNoPeerSlotMayShareARefreshGrant:
+    """Queue row #474: two slots holding the same refresh grant race to
+    each POST it once -- one wins, the other's lineage dies and forces a
+    re-login inside its own grant's lifetime. The fix removes the
+    precondition instead of locking the race: refuse the WRITE that would
+    let a second slot come to hold the bytes a populated peer already
+    holds, scoped to the ``sha256:`` arm (never ``sha256-full:``, the
+    supported shared-setup-token config) and skipped whenever the caller
+    passes ``attributed=True`` (a verified move/rotation legitimately
+    holds the same bytes in two slots for an instant)."""
+
+    def test_refuses_an_unattested_write_that_would_duplicate_a_peers_grant(
+        self, temp_home: Path, sample_sequence_data, caplog,
+    ):
+        """RED: an unattributed write into the EMPTY slot 2 that happens to
+        carry slot 1's exact refresh grant is exactly the shape that
+        creates the double-spend precondition."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _grant_creds("rt-shared")
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(CredentialWriteError, match="Account-1"):
+                switcher._write_account_credentials(
+                    "2", "account2@example.com", shared,
+                )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == ""
+
+    def test_a_shared_setup_token_is_a_supported_config_not_this_defect(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """A pasted setup-token with no ``refreshToken`` hashes on
+        ``sha256-full:`` and two slots holding the identical one is
+        ``add_account_from_token``'s supported shape -- must never refuse."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _grant_setup_token_creds("sk-ant-setup-shared")
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared,
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == shared
+
+    def test_attributed_true_still_permits_a_verified_move(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """A caller that independently verified the write (a slot swap or
+        relocate) may pass ``attributed=True`` even while a peer still
+        holds the same bytes for the instant between the two halves."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _grant_creds("rt-shared")
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared, attributed=True,
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == shared
+
+    def test_CONTROL_an_unattested_write_with_no_peer_match_still_succeeds(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """Positive control: without a peer holding a matching fingerprint,
+        the routine unattributed write (a first population, or a same-slot
+        re-write) must still go through -- otherwise the RED test above
+        would pass just as well for a guard that refuses every write."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", _grant_creds("rt-account-2"),
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == _grant_creds("rt-account-2")
 
 
 class TestFormatUsageLines:
