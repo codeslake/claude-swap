@@ -7166,6 +7166,82 @@ class TestNoPeerSlotMayShareARefreshGrant:
         assert switcher._read_account_credentials(
             "2", "account2@example.com"
         ) == ""
+        assert any(
+            "Account-1 already holds this exact refresh grant" in r.message
+            and "cswap add --slot 2" in r.message
+            for r in caplog.records
+        )
+
+    def test_refuses_via_write_backup_enc_directly(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """The guard is called from all THREE chokepoints, not just
+        ``_write_account_credentials`` -- ``_write_backup_enc`` is the
+        macOS-keyring-to-security migration's own direct writer and must
+        refuse before it ever reaches the backend."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _grant_creds("rt-shared")
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        with pytest.raises(CredentialWriteError, match="Account-1"):
+            switcher._write_backup_enc("2", "account2@example.com", shared)
+
+    def test_refuses_via_kc_write_backup_directly(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """Same as ``_write_backup_enc`` above, for the Keychain-only
+        forwarder -- the refusal must fire before the backend call, so this
+        runs the same off macOS too."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _grant_creds("rt-shared")
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        with pytest.raises(CredentialWriteError, match="Account-1"):
+            switcher._kc_write_backup("2", "account2@example.com", shared)
+
+    @pytest.mark.skipif(
+        os.name == "nt" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_refuses_when_a_peers_backup_is_unreadable(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """RED for the unreadable-peer hole: an EACCES peer read must
+        refuse like a mismatch, not silently permit like an absent slot --
+        the same fail-closed rule ``_check_attribution`` already applies to
+        THIS slot's own prior state, extended to a PEER slot here (an
+        unreadable Keychain on ssh/launchd is exactly where a silent
+        permit would matter)."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        switcher._write_account_credentials(
+            "1", "account1@example.com", _grant_creds("rt-account-1"),
+            attributed=True,
+        )
+        enc = switcher._backup_enc_path("1", "account1@example.com")
+        enc.chmod(0o000)
+        try:
+            with pytest.raises(CredentialWriteError, match="unreadable"):
+                switcher._write_account_credentials(
+                    "2", "account2@example.com", _grant_creds("rt-account-2"),
+                )
+        finally:
+            enc.chmod(0o600)
 
     def test_a_shared_setup_token_is_a_supported_config_not_this_defect(
         self, temp_home: Path, sample_sequence_data,

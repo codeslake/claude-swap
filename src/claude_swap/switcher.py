@@ -986,8 +986,11 @@ class ClaudeAccountSwitcher:
         single-use refresh grant -- the precondition for the fan-out
         double-spend (queue row #474): two slots each POST the same grant,
         one wins, the other's lineage dies and forces a re-login inside its
-        own grant's window. Removes the precondition instead of locking the
-        race, so no lock is needed at consume time either.
+        own grant's window. Closes the write-time path that CREATES a new
+        duplicate; it does not by itself retire the consume gate's lock (an
+        attributed=True write -- the same login added under a second org,
+        for one -- can still leave a peer holding matching bytes, since
+        ``attributed`` attests IDENTITY, never NON-DUPLICATION).
 
         Scoped to the ``sha256:`` fingerprint arm only. ``sha256-full:`` is
         a raw setup-token with no ``refreshToken``, and one pasted into two
@@ -1004,6 +1007,15 @@ class ClaudeAccountSwitcher:
         payers are the rare unattributed writes (a switch's own-family
         resync, the pin's session-bootstrap seam), each an O(other slots)
         read, never a network call.
+
+        Reads each peer with ``_read_account_credentials_direct`` -- this
+        slot's own key, never a merge partner's renumber-fallback sweep for
+        the same email under a different slot (see
+        ``_check_attribution``'s docstring) -- and refuses on a peer whose
+        backup could not be read at all, the same fail-closed rule
+        ``_check_attribution`` already applies to THIS slot's own prior
+        state: unreadable is "cannot verify", which refuses like a
+        mismatch, never "empty", which would permit like an absent slot.
         """
         # ponytail: refuses the write that would CREATE a new duplicate, not
         # a backfill scan for one already on disk before this guard existed
@@ -1022,7 +1034,22 @@ class ClaudeAccountSwitcher:
             peer_email = data.get("accounts", {}).get(peer_num, {}).get(
                 "email", "unknown"
             )
-            peer_creds = self._read_account_credentials(peer_num, peer_email)
+            failed: list = []
+            peer_creds = self._store._read_account_credentials_direct(
+                peer_num, peer_email, failed
+            )
+            if bool(failed) and not peer_creds:
+                self._logger.error(
+                    "Refusing to write Account-%s-%s's backup: Account-%s's "
+                    "own backup could not be read to verify it does not "
+                    "already hold this grant. Retry once it is readable.",
+                    account_num, email, peer_num,
+                )
+                raise CredentialWriteError(
+                    f"Refusing write into Account-{account_num} ({email}): "
+                    f"Account-{peer_num}'s backup is unreadable, so it "
+                    "cannot be ruled out as already holding this grant"
+                )
             if peer_creds and oauth.credential_fingerprint(peer_creds) == fp:
                 self._logger.error(
                     "Refusing to write Account-%s-%s's backup: Account-%s "
