@@ -5923,6 +5923,16 @@ class ClaudeAccountSwitcher:
                 if uuid and r_uuid:
                     if r_uuid != uuid:
                         continue
+                    # ONE UUID CAN NAME TWO SLOTS (same account, two orgs —
+                    # `_slot_owning_resolved_identity`'s own docstring).
+                    # The uuid alone does not say WHICH of them this login
+                    # belongs to; reuse the whole-roster resolver rather
+                    # than re-deriving the org comparison here, and refuse
+                    # on anything but an unambiguous match to THIS slot.
+                    if self._slot_owning_resolved_identity(
+                        data, resolved
+                    ) != num:
+                        continue
                 elif not r_email or r_email != want_email:
                     continue
                 creds, unreadable = self._store._read_unclaimed_credential(entry_id)

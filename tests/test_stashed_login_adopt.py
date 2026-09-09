@@ -314,6 +314,109 @@ class TestAdoptStashedLoginForSlot:
             oauth.credential_fingerprint(DEAD)
         assert entry_id in switcher._store._list_unclaimed_credentials()
 
+    def _sibling_org_setup(self, sample_sequence_data, stash_org):
+        """Two slots share ONE account uuid under two different orgs — the
+        same person's account, in two organizations (queue row #474). Slot
+        1 owns org-A, slot 2 (dead, the adopt target) owns org-B; the
+        stashed login resolves to `stash_org`."""
+        sample_sequence_data["accounts"]["1"]["uuid"] = "uuid-owner"
+        sample_sequence_data["accounts"]["1"]["organizationUuid"] = "org-A"
+        sample_sequence_data["accounts"]["2"]["email"] = "owner@example.com"
+        sample_sequence_data["accounts"]["2"]["uuid"] = "uuid-owner"
+        sample_sequence_data["accounts"]["2"]["organizationUuid"] = "org-B"
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        sw._write_account_credentials("2", "owner@example.com", DEAD)
+        entry_id = sw._store._write_unclaimed_credential(FRESH, {
+            "reason": "foreign",
+            "configSlot": "1",
+            "fingerprint": oauth.credential_fingerprint(FRESH),
+            "resolvedIdentity": {"uuid": "uuid-owner",
+                                 "email": "owner@example.com",
+                                 "organizationUuid": stash_org},
+        })
+        # NOT the shared `_strike` helper: it hardcodes organizationUuid=""
+        # for slot 2's usage-store row, and `_slot_token_dead` matches the
+        # roster's org for EQUALITY (`UsageStore._matches`) — slot 2 here
+        # has a real org ("org-B"), so a blank-org strike row would silently
+        # not match and the slot would never read as dead.
+        path = sw._usage_store.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "schemaVersion": 2,
+            "accounts": {
+                "2": {
+                    "email": "owner@example.com",
+                    "organizationUuid": "org-B",
+                    "authDeadStrikes": AUTH_DEAD_STRIKES,
+                    "struckFingerprint": oauth.credential_fingerprint(DEAD),
+                    "consecutiveFailures": 2,
+                    "lastError": "invalid_grant",
+                    "lastGood": {"five_hour": {"pct": 10.0}},
+                }
+            },
+        }))
+        return sw, entry_id
+
+    def test_a_sibling_org_s_login_under_a_shared_uuid_is_left_alone(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """ONE UUID CAN NAME TWO SLOTS: the same account uuid, in two
+        different orgs, is two roster records (`_slot_owning_resolved_
+        identity`'s own docstring). Matching on uuid alone — the naive
+        check before this fix — adopted the OTHER org's login into this
+        slot, planting the same refresh token behind two slots at once and
+        burning it twice as fast (issue #400, queue row #474)."""
+        sw, entry_id = self._sibling_org_setup(sample_sequence_data,
+                                               stash_org="org-A")
+
+        assert sw._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+
+        stored, _ = sw._read_account_credentials_ex("2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD)
+        assert entry_id in sw._store._list_unclaimed_credentials()
+
+    def test_this_slot_s_own_org_under_a_shared_uuid_still_adopts(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """CONTROL for the refusal above: the same shared-uuid roster, but
+        the stashed login's org matches THIS slot's own (org-B) — the org
+        check must not turn into a blanket refusal whenever a uuid is
+        shared, only when the login belongs to the sibling."""
+        sw, entry_id = self._sibling_org_setup(sample_sequence_data,
+                                               stash_org="org-B")
+
+        assert sw._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is True
+
+        stored, _ = sw._read_account_credentials_ex("2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(FRESH)
+        assert entry_id not in sw._store._list_unclaimed_credentials()
+
+    def test_a_blank_org_login_under_a_shared_uuid_is_left_alone(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """The stash entry predates org capture (blank org) but the uuid is
+        shared by two slots with distinct, non-blank orgs: neither slot
+        corroborates it, so `_slot_owning_resolved_identity`'s blank-org
+        tolerance matches BOTH and the whole-roster resolver reports
+        ambiguous (None) — same refusal as an outright org mismatch, not a
+        different code path from the two tests above."""
+        sw, entry_id = self._sibling_org_setup(sample_sequence_data,
+                                               stash_org=None)
+
+        assert sw._adopt_stashed_login_for_slot(
+            "2", "owner@example.com") is False
+
+        stored, _ = sw._read_account_credentials_ex("2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD)
+        assert entry_id in sw._store._list_unclaimed_credentials()
+
 
 class TestTheAdoptIsASlotMutation:
     """Every other path that writes a slot credential holds the slot lock, and
