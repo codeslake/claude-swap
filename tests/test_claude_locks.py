@@ -234,9 +234,9 @@ class TestProperLockfile:
         # rather than deciding on a half-written stamp; pinned, identity is
         # proven by the held descriptor and the mtime never enters it.
         # Either way the tick must actually be let go for release to
-        # proceed -- releasing it only AFTER exiting deadlocks the
-        # unpinned case for the whole `_RELEASE_WAIT_S` budget (measured on
-        # Windows CI, PR 287).
+        # proceed -- releasing it only AFTER exiting makes the unpinned
+        # case wait out the whole `_RELEASE_WAIT_S` budget and then
+        # refuse, leaving the lock (measured on Windows CI, PR 287).
         monkeypatch.setattr(claude_locks, "TOUCH_INTERVAL_S", 0.05)
         real_utime = os.utime
         stalled = threading.Event()
@@ -867,11 +867,13 @@ class TestTheAcquireAndReleaseAreBounded:
         real_utime = os.utime
         entered = threading.Event()
         release_tick = threading.Event()
+        who = []
 
         def stalling(path, *a, **k):
-            is_lock = not isinstance(path, int) and os.fspath(path) == os.fspath(lock)
-            if is_lock:
+            if (not isinstance(path, int)
+                    and os.fspath(path) == os.fspath(lock)):
                 entered.set()
+                who.append(threading.current_thread())
                 release_tick.wait(5.0)
             return real_utime(path, *a, **k)
 
@@ -880,7 +882,6 @@ class TestTheAcquireAndReleaseAreBounded:
         thread_errors = []
         original_excepthook = threading.excepthook
         threading.excepthook = thread_errors.append
-        before_threads = set(threading.enumerate())
         try:
             start = time.monotonic()
             with proper_lockfile(lock, timeout=1.0):
@@ -890,18 +891,13 @@ class TestTheAcquireAndReleaseAreBounded:
                 # stamping.acquire(timeout=_RELEASE_WAIT_S) to genuinely
                 # time out against the still-stalled tick, rather than a
                 # guessed sleep racing it.
-                new_threads = set(threading.enumerate()) - before_threads
-                assert len(new_threads) == 1, (
-                    f"premise: expected exactly one toucher thread, got {new_threads}"
-                )
-                toucher = next(iter(new_threads))
             elapsed = time.monotonic() - start
             release_tick.set()
             # The tick's own write and mutex release -- and any exception
             # that raises -- run on the daemon thread; wait for IT to say
             # it finished rather than guessing how long that takes.
-            toucher.join(5.0)
-            assert not toucher.is_alive(), (
+            who[0].join(5.0)
+            assert not who[0].is_alive(), (
                 "premise: the stalled tick's thread never finished"
             )
         finally:
