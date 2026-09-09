@@ -51,8 +51,15 @@ LIVE_DATED = _dated("rt-live-dated", _NOW_MS + 30 * _DAY_MS)
 NEARLY_SPENT = _dated("rt-nearly-spent", _NOW_MS + 60_000)
 
 
-def _strike(sw, creds=DEAD):
-    """Quarantine slot 2 against ``creds``' generation."""
+def _strike(sw, creds=DEAD, org=""):
+    """Quarantine slot 2 against ``creds``' generation.
+
+    ``org`` must match slot 2's OWN roster ``organizationUuid`` for the
+    strike to be seen at all: ``_slot_token_dead`` builds its lookup key
+    from the roster's org and ``UsageStore._matches`` compares it for
+    EQUALITY, so a blank-org strike row silently misses a slot whose
+    roster record carries a real org.
+    """
     path = sw._usage_store.path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -60,7 +67,7 @@ def _strike(sw, creds=DEAD):
         "accounts": {
             "2": {
                 "email": "owner@example.com",
-                "organizationUuid": "",
+                "organizationUuid": org,
                 "authDeadStrikes": AUTH_DEAD_STRIKES,
                 "struckFingerprint": oauth.credential_fingerprint(creds),
                 "consecutiveFailures": 2,
@@ -336,27 +343,10 @@ class TestAdoptStashedLoginForSlot:
                                  "email": "owner@example.com",
                                  "organizationUuid": stash_org},
         })
-        # NOT the shared `_strike` helper: it hardcodes organizationUuid=""
-        # for slot 2's usage-store row, and `_slot_token_dead` matches the
-        # roster's org for EQUALITY (`UsageStore._matches`) — slot 2 here
-        # has a real org ("org-B"), so a blank-org strike row would silently
-        # not match and the slot would never read as dead.
-        path = sw._usage_store.path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "schemaVersion": 2,
-            "accounts": {
-                "2": {
-                    "email": "owner@example.com",
-                    "organizationUuid": "org-B",
-                    "authDeadStrikes": AUTH_DEAD_STRIKES,
-                    "struckFingerprint": oauth.credential_fingerprint(DEAD),
-                    "consecutiveFailures": 2,
-                    "lastError": "invalid_grant",
-                    "lastGood": {"five_hour": {"pct": 10.0}},
-                }
-            },
-        }))
+        # org="org-B": slot 2's roster record carries a real org, and
+        # `_slot_token_dead` matches it for EQUALITY (`UsageStore._matches`)
+        # — the default blank-org strike would silently miss it.
+        _strike(sw, org="org-B")
         return sw, entry_id
 
     def test_a_sibling_org_s_login_under_a_shared_uuid_is_left_alone(
@@ -442,22 +432,7 @@ class TestAdoptStashedLoginForSlot:
                                  "organizationUuid": "org-A" if resolved_uuid
                                  else None},
         })
-        path = sw._usage_store.path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
-            "schemaVersion": 2,
-            "accounts": {
-                "2": {
-                    "email": "owner@example.com",
-                    "organizationUuid": "org-B",
-                    "authDeadStrikes": AUTH_DEAD_STRIKES,
-                    "struckFingerprint": oauth.credential_fingerprint(DEAD),
-                    "consecutiveFailures": 2,
-                    "lastError": "invalid_grant",
-                    "lastGood": {"five_hour": {"pct": 10.0}},
-                }
-            },
-        }))
+        _strike(sw, org="org-B")
         return sw, entry_id
 
     def test_a_sibling_s_uuid_owned_login_is_not_adopted_on_email_alone(
