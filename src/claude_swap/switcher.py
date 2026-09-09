@@ -25,6 +25,7 @@ from claude_swap.exceptions import (
     ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
+    CredentialWriteError,
     LockError,
     SessionError,
     SwitchError,
@@ -1336,6 +1337,7 @@ class ClaudeAccountSwitcher:
         pass ``attributed=True`` only with the same independent proof that
         method requires.
         """
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
         self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._write_backup_enc(account_num, email, credentials)
 
@@ -1348,8 +1350,96 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Backend-only write (no session invalidation, no dispatch): see
         ``_write_backup_enc``, same guard and same reason it exists."""
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
         self._store._check_attribution(account_num, email, credentials, attributed)
         self._store._kc_write_backup(account_num, email, credentials)
+
+    def _refuse_if_peer_shares_grant(
+        self, account_num: str, email: str, credentials: str, attributed: bool,
+    ) -> None:
+        """Refuse a write that would leave two slots holding the same
+        single-use refresh grant -- the precondition for the fan-out
+        double-spend (queue row #474): two slots each POST the same grant,
+        one wins, the other's lineage dies and forces a re-login inside its
+        own grant's window. Closes the write-time path that CREATES a new
+        duplicate; it does not by itself retire the consume gate's lock (an
+        attributed=True write -- the same login added under a second org,
+        for one -- can still leave a peer holding matching bytes, since
+        ``attributed`` attests IDENTITY, never NON-DUPLICATION).
+
+        Scoped to the ``sha256:`` fingerprint arm only. ``sha256-full:`` is
+        a raw setup-token with no ``refreshToken``, and one pasted into two
+        slots on purpose is a SUPPORTED shape, not this defect --
+        ``add_account_from_token`` itself always writes ``attributed=True``
+        and never reaches this arm either way; what it exempts is the two
+        unattributed writers below that could otherwise re-refuse an
+        already-duplicated setup-token account.
+
+        Skipped whenever ``attributed`` is True: every ``attributed=True``
+        call site already independently verified this write's identity, and
+        several of them (a slot swap, a relocate) legitimately hold the same
+        bytes in two slots for the instant between the two halves of a move.
+        By the same token every write on the consume gate's fan-out
+        (``_consume_backup_grant_locked``, ``_fetch_active_usage``) is
+        always attributed=True, so this guard costs it nothing -- the only
+        payers are the rare unattributed writes (a switch's own-family
+        resync, the pin's session-bootstrap seam), each an O(other slots)
+        read, never a network call.
+
+        Reads each peer with ``_read_account_credentials_direct`` -- this
+        slot's own key, never a merge partner's renumber-fallback sweep for
+        the same email under a different slot (see
+        ``_check_attribution``'s docstring) -- and refuses on a peer whose
+        backup could not be read at all, the same fail-closed rule
+        ``_check_attribution`` already applies to THIS slot's own prior
+        state: unreadable is "cannot verify", which refuses like a
+        mismatch, never "empty", which would permit like an absent slot.
+        """
+        # ponytail: refuses the write that would CREATE a new duplicate, not
+        # a backfill scan for one already on disk before this guard existed
+        # -- the fleet's own zero-collision reading is what makes that
+        # ceiling acceptable today.
+        if attributed:
+            return
+        fp = oauth.credential_fingerprint(credentials)
+        if not fp or not fp.startswith("sha256:"):
+            return
+        data = self._get_sequence_data() or {}
+        for num in data.get("sequence", []):
+            peer_num = str(num)
+            if peer_num == str(account_num):
+                continue
+            peer_email = data.get("accounts", {}).get(peer_num, {}).get(
+                "email", "unknown"
+            )
+            failed: list = []
+            peer_creds = self._store._read_account_credentials_direct(
+                peer_num, peer_email, failed
+            )
+            if bool(failed) and not peer_creds:
+                self._logger.error(
+                    "Refusing to write Account-%s-%s's backup: Account-%s's "
+                    "own backup could not be read to verify it does not "
+                    "already hold this grant. Retry once it is readable.",
+                    account_num, email, peer_num,
+                )
+                raise CredentialWriteError(
+                    f"Refusing write into Account-{account_num} ({email}): "
+                    f"Account-{peer_num}'s backup is unreadable, so it "
+                    "cannot be ruled out as already holding this grant"
+                )
+            if peer_creds and oauth.credential_fingerprint(peer_creds) == fp:
+                self._logger.error(
+                    "Refusing to write Account-%s-%s's backup: Account-%s "
+                    "already holds this exact refresh grant, and writing it "
+                    "here too would let both slots race to spend it once. "
+                    "Log in fresh for one of them: cswap add --slot %s",
+                    account_num, email, peer_num, account_num,
+                )
+                raise CredentialWriteError(
+                    f"Refusing write into Account-{account_num} ({email}): "
+                    f"Account-{peer_num} already holds this refresh grant"
+                )
 
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
         self._store._delete_backup_keychain_quiet(account_num, email)
@@ -1449,6 +1539,7 @@ class ClaudeAccountSwitcher:
         ``Exception`` disarmed exactly that guard for every write routing
         through here.
         """
+        self._refuse_if_peer_shares_grant(account_num, email, credentials, attributed)
         retained = self._store._write_account_credentials(
             account_num, email, credentials, attributed=attributed
         )
@@ -3683,8 +3774,26 @@ class ClaudeAccountSwitcher:
             # never fires and the POST proceeds.
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
+        def _condemned(fp: str) -> bool:
+            # This runs OUTSIDE any handler here (between the pre-consume
+            # window's own `except` above and the next `try` below), and
+            # `_lineage_key` -> `account_identity` -> `_get_sequence_data()`
+            # reads `sequence.json` with `strict=True` — a torn/unreadable
+            # file at this exact instant raises `ConfigError` straight
+            # through `try_refresh_oauth_credentials` (whose own `condemned`
+            # call is likewise unguarded) and `consume_backup_grant`
+            # (try/finally, no except), killing the whole collect pass. R1:
+            # unreadable is absence of evidence, never a refusal — caught
+            # here and reported as "no evidence" rather than left to raise.
+            try:
+                return self._probe_verdicts.get(
+                    self._lineage_key(account_num, email, fp)
+                ) is False
+            except Exception:
+                return False
+
         result = oauth.try_refresh_oauth_credentials(
-            refresh_input, slot=account_num
+            refresh_input, slot=account_num, condemned=_condemned,
         )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
@@ -6495,12 +6604,28 @@ class ClaudeAccountSwitcher:
                         self._resync_rotated_backup(
                             account_num, email, org_uuid, creds
                         )
-                    if self._probe_verdicts and self._probe_verdicts.get(
-                        self._lineage_key(
-                            account_num, email,
-                            oauth.credential_fingerprint(creds) or "",
-                        )
-                    ) is False:
+
+                    def _confirmed_foreign() -> bool:
+                        # Same shape as `_consume_backup_grant_locked`'s
+                        # `_condemned`: this runs outside the locked `try`
+                        # below, and `_lineage_key` reads `sequence.json`
+                        # with `strict=True`, raising `ConfigError` on a
+                        # torn/unreadable file. R1: unreadable is absence of
+                        # evidence, never a refusal — caught here instead of
+                        # escaping uncaught through `_fetch_active_usage`
+                        # (whose caller, `_fetch_account_usage`, promises
+                        # never to raise) and killing the whole collect pass.
+                        try:
+                            return self._probe_verdicts.get(
+                                self._lineage_key(
+                                    account_num, email,
+                                    oauth.credential_fingerprint(creds) or "",
+                                )
+                            ) is False
+                        except Exception:
+                            return False
+
+                    if self._probe_verdicts and _confirmed_foreign():
                         # The probe just proved the served credential is
                         # another account's: its quota is not this slot's,
                         # and recording it would poison history and switch
@@ -6824,8 +6949,26 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
+                        def _condemned(fp: str) -> bool:
+                            # Same shape as `_consume_backup_grant_locked`'s
+                            # `_condemned`: `_lineage_key` reads
+                            # `sequence.json` with `strict=True` and raises
+                            # `ConfigError` on a torn/unreadable file. R1:
+                            # unreadable is absence of evidence, never a
+                            # refusal — caught here instead of escaping to
+                            # this call's own blanket `except Exception`
+                            # (below), which would otherwise defer a live
+                            # refresh for one pass on no evidence at all.
+                            try:
+                                return self._probe_verdicts.get(
+                                    self._lineage_key(account_num, email, fp)
+                                ) is False
+                            except Exception:
+                                return False
+
                         result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0, slot=account_num
+                            refresh_input, timeout_s=6.0, slot=account_num,
+                            condemned=_condemned,
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -6887,7 +7030,17 @@ class ClaudeAccountSwitcher:
                             )
                         if result.error is not None:
                             # Transient (network) failure: backoff via store.
-                            return FetchRecord(error="refresh-failed")
+                            # "foreign-lineage" keeps its own identity here
+                            # too (mirrors try_fetch_usage_for_account's own
+                            # retry-branch treatment) — collapsing it to the
+                            # generic "refresh-failed" hides the one signal
+                            # this round exists to produce. No strike either
+                            # way: struck_fp is only set in the branch above.
+                            return FetchRecord(
+                                error=result.error
+                                if result.error == "foreign-lineage"
+                                else "refresh-failed"
+                            )
                         working = result.credentials
                         # Our own POST produced this lineage — self-attributed,
                         # no oracle needed. The verdict is what lets the next
@@ -10930,8 +11083,26 @@ class ClaudeAccountSwitcher:
                     result["validated"] = True
                 return result
 
-            current_email, _ = current_identity
-            from_ref = account_ref(int(current_account), current_email)
+            # NOT `current_identity[0]`: when the override above was
+            # rejected, that email is the identity file's unverified claim
+            # (e.g. slot 1's), while `current_account` correctly stayed the
+            # roster's real active slot (e.g. 6) -- pairing the two would
+            # feed `_classify_outgoing_credential` a (slot, email) pair
+            # assembled from two different sources, so its backup lookup
+            # for the REAL slot misses (keyed on the wrong email) and a
+            # genuine own-rotation falls through to "unresolved" and is
+            # stashed as unclaimed instead of landing in its slot. The
+            # account's own stored email is right either way: when the
+            # override WAS accepted, `current_account` is the slot
+            # `_find_account_slot` matched on this exact email, so the two
+            # already agree.
+            try:
+                current_email = data["accounts"][current_account]["email"]
+                from_ref = account_ref(int(current_account), current_email)
+            except (KeyError, ValueError, TypeError):
+                raise AccountNotFoundError(
+                    f"Account-{current_account} does not exist"
+                ) from None
 
             # Create transaction for rollback capability
             try:

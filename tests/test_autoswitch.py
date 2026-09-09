@@ -11084,6 +11084,14 @@ class TestHorizonAxisDoesNotFlap:
             h = EngineHarness(temp_home)
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
+            # Each case shares `temp_home`'s sequence.json with the ones
+            # before it in this loop, so a prior case's switch can leave
+            # `activeAccountNumber` at 2 -- reset it to match `make_live`
+            # below, or this case starts from a roster/identity mismatch
+            # none of its own fixtures intended.
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = 1
+            h.switcher._write_json(h.switcher.sequence_file, data)
             h.make_live("a@example.com", 1)
 
             outcome = None
@@ -11175,6 +11183,14 @@ class TestHorizonAxisDoesNotFlap:
             h = EngineHarness(temp_home)
             h.seed(1, "a@example.com")
             h.seed(2, "b@example.com")
+            # Each case shares `temp_home`'s sequence.json with the ones
+            # before it in this loop, so a prior case's switch can leave
+            # `activeAccountNumber` at 2 -- reset it to match `make_live`
+            # below, or this case starts from a roster/identity mismatch
+            # none of its own fixtures intended.
+            data = h.switcher._get_sequence_data()
+            data["activeAccountNumber"] = 1
+            h.switcher._write_json(h.switcher.sequence_file, data)
             h.make_live("a@example.com", 1)
 
             outcome = None

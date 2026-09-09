@@ -2067,6 +2067,88 @@ class TestActiveAccountRefresh:
             "1", "test@example.com", self._REFRESHED, attributed=True
         )
 
+    def test_a_condemned_lineage_is_never_posted_by_this_recovery_branch(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """This is the SECOND POST call site (the consume gate is the
+        first) — the bytes gate lives once, inside
+        ``oauth.try_refresh_oauth_credentials`` itself, so this site
+        inherits it for free rather than needing its own duplicate check.
+        The verdict must also reach the store AS ``foreign-lineage``, not
+        the generic ``refresh-failed`` this site's own error-collapse used
+        to fall back to (2026-09-08 breadth review, F3) — same subject as
+        the consume-gate path, same identity."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts[
+            switcher._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._EXPIRED),
+            )
+        ] = False
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch("claude_swap.oauth.urllib.request.urlopen") as mock_urlopen:
+            result = switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
+        assert result.error == "foreign-lineage"  # not the generic "refresh-failed"
+
+    def test_an_unreadable_sequence_file_at_this_recovery_post_never_defers(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review), at this site's own
+        `condemned` callback: `_lineage_key` reads `sequence.json` with
+        `strict=True` and raises `ConfigError` on a torn/unreadable file.
+        Before the fix that escaped to this call's own blanket `except
+        Exception`, which answers `_defer(force_refresh)` — an unreadable
+        store deferring a live refresh on no evidence at all (the softest
+        form of R1's violation: bounded to one pass, no strike, no
+        `/login`, but still a refusal `_condemned`'s own wrapping was meant
+        to end). Wrapped the same way, the POST must proceed instead."""
+        switcher = self._switcher(sample_sequence_data)
+        fault_fired = []
+        real_lineage_key = switcher._lineage_key
+
+        def raise_once(*a, **kw):
+            if not fault_fired:
+                fault_fired.append(True)
+                raise ConfigError(
+                    "sequence.json exists but could not be read"
+                )
+            return real_lineage_key(*a, **kw)
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "sk-new", "refresh_token": "rt-new",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda self_: self_
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(
+                 switcher, "_read_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_lineage_key", side_effect=raise_once), \
+             patch(
+                 "claude_swap.oauth.urllib.request.urlopen",
+                 return_value=mock_response,
+             ):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._EXPIRED
+            )
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.sentinel is None      # not deferred
+        assert result.error is None
+
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -3022,6 +3104,38 @@ class TestActiveAccountRefresh:
             if "Registered a login as Account-" in r.getMessage()
         ]
         assert len(registered) == 1, [r.getMessage() for r in caplog.records]
+
+    def test_an_unreadable_sequence_file_at_the_served_credential_check_never_raises(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review), at this site's own
+        foreign-lineage check: it sits OUTSIDE the locked `try` further
+        down in this method, and `_lineage_key` reads `sequence.json` with
+        `strict=True`, raising `ConfigError` on a torn/unreadable file.
+        Uncaught here it would escape `_fetch_active_usage` entirely and
+        (via `_fetch_account_usage`'s `executor.map`) kill the whole
+        collect pass — the exact defect the consume-gate's own
+        `_condemned` was wrapped for. Wrapped the same way, an unreadable
+        store must not even raise, let alone refuse to serve usage."""
+        switcher = self._switcher(sample_sequence_data)
+        switcher._probe_verdicts["seed"] = True  # non-empty: reaches the check
+        fault_fired = []
+
+        def raise_fault(*a, **kw):
+            fault_fired.append(True)
+            raise ConfigError("sequence.json exists but could not be read")
+
+        with patch.object(switcher, "_lineage_key", side_effect=raise_fault), \
+             patch.object(switcher, "_resync_rotated_backup"), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 7}})):
+            result = switcher._fetch_active_usage(
+                "1", "test@example.com", self._REFRESHED
+            )
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.sentinel is None      # absence of evidence -> served, not refused
+        assert result.usage == {"five_hour": {"pct": 7}}
 
     def test_fresh_probe_failure_skips_resync_and_retries_next_pass(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -10062,6 +10176,187 @@ class TestPersistBackupCredentials:
         )
 
 
+def _grant_setup_token_creds(token: str) -> str:
+    """No ``refreshToken``: falls to the ``sha256-full:`` fingerprint arm."""
+    return json.dumps({"claudeAiOauth": {"accessToken": token}})
+
+
+class TestNoPeerSlotMayShareARefreshGrant:
+    """Queue row #474: two slots holding the same refresh grant race to
+    each POST it once -- one wins, the other's lineage dies and forces a
+    re-login inside its own grant's lifetime. The fix removes the
+    precondition instead of locking the race: refuse the WRITE that would
+    let a second slot come to hold the bytes a populated peer already
+    holds, scoped to the ``sha256:`` arm (never ``sha256-full:``, the
+    supported shared-setup-token config) and skipped whenever the caller
+    passes ``attributed=True`` (a verified move/rotation legitimately
+    holds the same bytes in two slots for an instant)."""
+
+    def test_refuses_an_unattested_write_that_would_duplicate_a_peers_grant(
+        self, temp_home: Path, sample_sequence_data, caplog,
+    ):
+        """RED: an unattributed write into the EMPTY slot 2 that happens to
+        carry slot 1's exact refresh grant is exactly the shape that
+        creates the double-spend precondition."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _oauth_creds("shared", 7200)
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        with caplog.at_level(logging.ERROR, logger="claude-swap"):
+            with pytest.raises(CredentialWriteError, match="Account-1"):
+                switcher._write_account_credentials(
+                    "2", "account2@example.com", shared,
+                )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == ""
+        assert any(
+            "Account-1 already holds this exact refresh grant" in r.message
+            and "cswap add --slot 2" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize("writer", ["_write_backup_enc", "_kc_write_backup"])
+    def test_refuses_via_the_other_two_chokepoints_directly(
+        self, temp_home: Path, sample_sequence_data, writer: str,
+    ):
+        """The guard is called from all THREE chokepoints, not just
+        ``_write_account_credentials`` -- ``_write_backup_enc`` (the
+        macOS-keyring-to-security migration's direct writer) and
+        ``_kc_write_backup`` (its Keychain-only forwarder) must each refuse
+        before ever reaching the backend, so this needs no real Keychain to
+        run off macOS."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _oauth_creds("shared", 7200)
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        with pytest.raises(CredentialWriteError, match="Account-1"):
+            getattr(switcher, writer)("2", "account2@example.com", shared)
+
+    def test_refuses_when_a_peers_read_reports_failed_uid_independent(
+        self, temp_home: Path, sample_sequence_data, monkeypatch,
+    ):
+        """RED for the unreadable-peer hole: an EACCES-shaped peer read
+        (``failed`` set, no bytes) must refuse like a mismatch, not
+        silently permit like an absent slot -- the same fail-closed rule
+        ``_check_attribution`` already applies to THIS slot's own prior
+        state, extended to a PEER slot here (an unreadable Keychain on
+        ssh/launchd is exactly where a silent permit would matter).
+        Asserts the ``failed`` semantics directly rather than chmod'ing a
+        real file, so this also covers the arm on a root-run gate, where a
+        POSIX permission check is inert."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        switcher._write_account_credentials(
+            "1", "account1@example.com", _oauth_creds("account-1", 7200),
+            attributed=True,
+        )
+
+        def unreadable(account_num, email, failed=None):
+            if failed is not None:
+                failed.append(True)
+            return ""
+
+        monkeypatch.setattr(
+            switcher._store, "_read_account_credentials_direct", unreadable,
+        )
+
+        with pytest.raises(CredentialWriteError, match="unreadable"):
+            switcher._write_account_credentials(
+                "2", "account2@example.com", _oauth_creds("account-2", 7200),
+            )
+
+    def test_a_shared_setup_token_is_a_supported_config_not_this_defect(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """A pasted setup-token with no ``refreshToken`` hashes on
+        ``sha256-full:``, and two slots holding the identical one on
+        purpose is a supported shape (``add_account_from_token`` itself
+        always writes attributed=True, so it never reaches this guard on
+        either arm; what this arm actually exempts is the two UNattributed
+        writers that could otherwise re-refuse an already-duplicated
+        setup-token account afterwards: the public
+        ``write_account_credentials`` seam and a switch's own-family
+        resync) -- must never refuse."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _grant_setup_token_creds("sk-ant-setup-shared")
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared,
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == shared
+
+    def test_attributed_true_still_permits_a_verified_move(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """A caller that independently verified the write (a slot swap or
+        relocate) may pass ``attributed=True`` even while a peer still
+        holds the same bytes for the instant between the two halves."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _oauth_creds("shared", 7200)
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared, attributed=True,
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == shared
+
+    def test_CONTROL_an_unattested_write_with_no_peer_match_still_succeeds(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """Positive control: without a peer holding a matching fingerprint,
+        the routine unattributed write (a first population, or a same-slot
+        re-write) must still go through -- otherwise the RED test above
+        would pass just as well for a guard that refuses every write."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+
+        creds = _oauth_creds("account-2", 7200)
+        switcher._write_account_credentials("2", "account2@example.com", creds)
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == creds
+
+
 class TestFormatUsageLines:
     """Test _format_usage_lines rendering, including per-model scoped windows."""
 
@@ -11075,6 +11370,52 @@ class TestProvenanceGuard:
             "could not be verified" in w and "Account-2" in w
             for w in op["warnings"]
         )
+
+    def test_own_rotation_with_wrong_active_slot_lands_in_the_right_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data,
+    ):
+        """Same wmac shape as the test above, but the live bytes are
+        genuinely slot 2's OWN rotation (same refresh-token lineage as its
+        stored backup) — the [C] finding's "right-slot-but-wrong-email"
+        case. `current_account` correctly stays 2 (the override above is
+        rejected), but `current_email` must not be left as slot 1's:
+        `_classify_outgoing_credential` reads the backup keyed on
+        ``(current_account, current_email)``, and slot 2's backup is stored
+        under slot 2's OWN email, not slot 1's. The wrong email makes the
+        own-family fast path unreachable and the classifier falls through to
+        "unresolved", stashing the freshly rotated token as unclaimed
+        instead of landing it in slot 2 — the same re-login-forcing outcome
+        this PR exists to prevent, reached one branch over."""
+        sample_sequence_data["activeAccountNumber"] = 2
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        creds_store[("1", "test@example.com")] = self._A1_BACKUP
+        a2_backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-orig", "refreshToken": "rt-2",
+        }})
+        creds_store[("2", "account2@example.com")] = a2_backup
+        # Same refresh-token lineage as the stored backup — a routine
+        # access-token rotation, not a foreign credential.
+        rotated = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2-rotated", "refreshToken": "rt-2",
+        }})
+        live_state = {"creds": rotated}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        try:
+            op = self._run_switch(switcher, resolver=None)
+        finally:
+            for p in patches:
+                p.stop()
+        assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
+        assert creds_store[("2", "account2@example.com")] == rotated, (
+            "slot 2's own rotation was not recognised as its own lineage — "
+            "current_email leaked slot 1's identity into the classifier"
+        )
+        assert switcher.list_unclaimed_credentials() == {}
+        assert op["warnings"] == []
 
     def test_cached_foreign_verdict_survives_a_failed_switch_time_probe(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -13602,6 +13943,74 @@ class TestActiveRefreshProvenance:
         write_backup.assert_called_once_with(
             "1", "test@example.com", refreshed, attributed=True
         )
+
+
+class TestDanglingActiveAccountRaisesNamedError:
+    """[I2/m] `current_account` can stay `str(activeAccountNumber)` — a slot
+    the roster no longer carries (edited by hand, or a stale value a prior
+    bug left behind) — when the live identity resolves to a REAL slot whose
+    stored backup does not (yet) match the live bytes, so the override at
+    `_perform_switch_locked`'s top declines to trust it. `data["accounts"]
+    [current_account]["email"]` then raises a raw `KeyError` that escapes
+    the switch, telling the caller nothing -- this file's own convention two
+    hundred lines up (`AccountNotFoundError(f"Account-{account_num} does
+    not exist")`, e.g. `_remove_account`) names the containment instead.
+    `int(current_account)` right below it is the same failure mode for a
+    non-numeric `activeAccountNumber`.
+    """
+
+    def test_dangling_current_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        sample_sequence_data["activeAccountNumber"] = 99  # not in "accounts"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_live_login_identity",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch_locked(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
+
+    def test_non_numeric_active_account_raises_account_not_found(
+        self, temp_home, sample_sequence_data,
+    ):
+        """The `int(current_account)` conversion right below the dict lookup
+        has the same containment gap: `activeAccountNumber` is arbitrary,
+        hand-editable JSON, so a non-numeric slot key that IS still present
+        in "accounts" clears the dict lookup and then raises a raw
+        `ValueError` instead."""
+        sample_sequence_data["activeAccountNumber"] = "abc"
+        sample_sequence_data["accounts"]["1"]["email"] = "live@example.com"
+        sample_sequence_data["accounts"]["abc"] = {
+            "email": "other@example.com", "uuid": "uuid-abc",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+
+        with patch.object(
+            switcher, "_live_login_identity",
+            return_value=("live@example.com", ""),
+        ):
+            with pytest.raises(AccountNotFoundError):
+                switcher._perform_switch_locked(
+                    "2", emit_output=False,
+                    provenance={"live": None, "resolved": None},
+                )
 
 
 class TestDirectActivationPreservation:
@@ -16443,6 +16852,79 @@ class TestConsumeGate:
         assert result.error == "transient"
         # nothing consumed; the backup is exactly as it was
         assert s._read_account_credentials("1", "test@example.com") == self._OLD
+    def test_a_lineage_already_condemned_as_foreign_is_never_posted(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The bytes gate this chokepoint was missing (2026-09-08 audit): a
+        lineage the oracle already condemned as another account's must
+        never be POSTed here — the elsewhere-checked
+        ``_probe_verdicts.get(_lineage_key(...)) is False`` verdict
+        attaches to THIS slot's re-read bytes too, not only to the `live`
+        adopt branch `_fetch_active_usage` already refuses on. Refusing
+        must not strike the account: a confirmed-foreign lineage is not
+        evidence this slot's OWN grant is dead.
+
+        ``try_refresh_oauth_credentials`` itself runs (not mocked away): the
+        guard lives INSIDE it (the one chokepoint every POST call site
+        shares), so mocking the function wholesale would hide whether the
+        guard fired. ``urlopen`` is mocked instead — the network is the
+        thing that must never see these bytes."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        s._probe_verdicts[
+            s._lineage_key(
+                "1", "test@example.com",
+                oauth.credential_fingerprint(self._OLD),
+            )
+        ] = False
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen"
+        ) as mock_urlopen:
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        mock_urlopen.assert_not_called()   # the condemned grant must not be POSTed
+        assert result.error == "lineage-condemned"
+        assert s._read_account_credentials("1", "test@example.com") == self._OLD
+
+    def test_an_unreadable_sequence_file_at_consume_time_never_raises_through_the_pass(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """R1's own case (2026-09-08 breadth review): the `condemned` check
+        sits OUTSIDE any handler in `_consume_backup_grant_locked` (between
+        the pre-consume window's own `except` and the next `try`), and
+        OUTSIDE `try_refresh_oauth_credentials`'s own POST `try`. Its
+        `_lineage_key` -> `account_identity` -> `_get_sequence_data()` reads
+        `sequence.json` with `strict=True`, which raises `ConfigError` on a
+        torn/unreadable file — and `consume_backup_grant` is try/**finally**,
+        no except, so an uncaught raise here would kill the whole collect
+        pass for every account. R1: unreadable is absence of evidence, never
+        a refusal, and never a raise — the POST must proceed."""
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+        fault_fired = []
+
+        def raises(*a, **kw):
+            fault_fired.append(True)
+            raise ConfigError("sequence.json exists but could not be read")
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "sk-new", "refresh_token": "rt-new",
+            "expires_in": 3600,
+        }).encode()
+        mock_response.__enter__ = lambda self_: self_
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(s, "_lineage_key", side_effect=raises), \
+             patch(
+                 "claude_swap.oauth.urllib.request.urlopen",
+                 return_value=mock_response,
+             ):
+            result = s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        assert fault_fired, "the unreadable-sequence-file condition never fired"
+        assert result.error == "transient"      # absence of evidence -> proceeded, not refused
 
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict

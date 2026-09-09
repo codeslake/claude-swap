@@ -7208,6 +7208,43 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "an unreadable daemon record was read as proof of death"
         )
 
+    def test_a_broken_impl_falls_back_and_still_heals(
+        self, tmp_path, monkeypatch
+    ):
+        """[I]: `impl.read_daemon_state` missing (a version-skewed or
+        half-upgraded cswap-pin install -- pin.py carries NO runtime version
+        floor, on purpose) must not turn a healable dead wiring into a loud
+        `heal` failure. It must fall back to the same literal JSON read the
+        "package not installed" case already takes -- the USER-VISIBLE
+        behaviour is `heal` still clearing the dead wiring, not merely that
+        some internal call doesn't raise."""
+        import subprocess
+        import sys
+        import types
+
+        from claude_swap import pin
+        import claude_swap.paths as paths
+
+        sw = self._sw(tmp_path)
+        dead = _dead_port()
+        cfg = _cfg(tmp_path, "cfgdir", dead)
+        monkeypatch.setattr(paths, "get_global_config_path", lambda: cfg)
+        monkeypatch.setattr(paths, "get_default_global_config_path", lambda: cfg)
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        self._record(sw, port=dead, pid=proc.pid, fingerprint="fp")
+        # No `read_daemon_state` attribute at all -- exactly what an
+        # incompatible/partially-upgraded cswap-pin install looks like.
+        monkeypatch.setattr(pin, "_live_impl", lambda: types.SimpleNamespace())
+
+        changed, message = pin.heal(sw)
+        assert changed, message
+        assert message == (
+            "Removed a cloud pin wiring whose proxy was gone. sessions "
+            "fall back to the proxy they had before the pin"
+        ), message
+
     def test_no_record_at_all_is_still_condemned(self, tmp_path, monkeypatch):
         """The common case (no package, no daemon ever spawned) must keep
         working exactly as before: no record is not corroboration."""
@@ -7282,7 +7319,6 @@ class TestADaemonRecordCorroboratesAOneShotProbe:
             "an alive-pid record with no port must spare everything, not "
             "narrow to nothing and condemn a wiring the record cannot rule out"
         )
-
 
 class TestPidIsAliveIsPortableAcrossOS:
     """`os.kill(pid, 0)` is a pure liveness probe on POSIX. On Windows the
