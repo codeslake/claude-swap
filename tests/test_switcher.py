@@ -4703,13 +4703,17 @@ class TestPerformSwitchPostDisplay:
             },
         })
         for n, w in (("1", "target"), ("2", "current")):
+            # DISTINCT per-account refresh tokens: two slots sharing the
+            # literal grant now trips the cross-slot duplicate-grant guard
+            # (#210), which is not what this fixture is testing -- only the
+            # config-rollback arm is under test here.
             switcher._write_account_credentials(n, f"{w}@example.com", json.dumps(
-                {"claudeAiOauth": {"accessToken": f"t-{w}", "refreshToken": "r"}}))
+                {"claudeAiOauth": {"accessToken": f"t-{w}", "refreshToken": f"r-{w}"}}))
             switcher._write_account_config(n, f"{w}@example.com", json.dumps(
                 {"oauthAccount": {"emailAddress": f"{w}@example.com",
                                   "accountUuid": f"u{n}"}}))
         (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
-            {"claudeAiOauth": {"accessToken": "t-current", "refreshToken": "r"}}))
+            {"claudeAiOauth": {"accessToken": "t-current", "refreshToken": "r-current"}}))
 
         cap = 100_000
         # PREMISE: the config cannot fit under the cap, so the write faults.
