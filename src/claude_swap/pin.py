@@ -181,44 +181,6 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
-def _boot_time_epoch() -> float | None:
-    """This machine's boot time as epoch seconds, or None when unknowable.
-
-    POSIX only, matching the pin package itself. Never raises: "cannot tell"
-    must not turn a genuinely-alive daemon's record into a condemned one.
-    """
-    import sys
-
-    if sys.platform == "darwin":
-        import re
-        import subprocess
-
-        try:
-            out = subprocess.run(
-                ["sysctl", "-n", "kern.boottime"],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if out.returncode != 0:
-            return None
-        m = re.search(r"sec\s*=\s*(\d+)", out.stdout)
-        return float(m.group(1)) if m else None
-    from pathlib import Path
-
-    try:
-        text = Path("/proc/stat").read_text(encoding="ascii", errors="replace")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        if line.startswith("btime "):
-            try:
-                return float(line.split()[1])
-            except (IndexError, ValueError):
-                return None
-    return None
-
-
 # Sentinel: the record corroborates SOMETHING but not a single port, so the
 # whole machine is spared -- the old, more conservative default whenever a
 # caller cannot narrow. Distinct from `None` (nothing to protect at all).
@@ -248,25 +210,15 @@ def _corroborating_daemon_port(_switcher):
     old, conservative machine-wide spare. Otherwise the port a confirmed-
     alive daemon actually serves.
 
-    THE REBOOT CASE: a pid can be reused by an unrelated process, and
-    ``os.kill(pid, 0)`` cannot tell the two apart -- a surviving record
-    naming a pid the OS later hands to something else reads as alive
-    forever and the stale wiring never self-heals. A record whose own
-    mtime looks older than the CURRENT boot is the signal, but it is
-    DESTRUCTIVE-direction evidence, not confirmation: ``boot`` is
-    recomputed from the live wall clock on every call, while ``mtime`` was
-    stamped once, at write time -- a forward wall-clock step (an NTP
-    correction after a laptop resumes from sleep, routine on this fleet)
-    moves ``boot`` later without the daemon that wrote the record ever
-    restarting. Reading that as "confirmed dead" would clear a wiring to a
-    proxy that is still serving. Pid reuse right after a genuine reboot is
-    a rare, self-correcting nuisance; condemning a live wiring is an
-    outage -- so this never overrides an alive pid into "not alive". An
-    UNREADABLE OR FUTURE mtime distrusts the record itself and widens to
-    the machine-wide spare; an mtime OLDER THAN BOOT is true of every
-    surviving record after any reboot, so it narrows to this port instead
-    -- widening it too would disarm healing for every other wired config,
-    permanently, until the daemon restarts.
+    PID REUSE AFTER A REBOOT (a surviving record naming a pid the OS later
+    hands to an unrelated process) is a known, carried gap: three passes at
+    corroborating it against the record's mtime each broke on the wall
+    clock -- boot time is recomputed live, and a laptop's NTP correction
+    after sleep moves it without the daemon restarting, so every attempt
+    either failed to condemn a live wiring or failed to condemn anything.
+    The real fix is stamp-vs-stamp (the daemon's own recorded process start
+    time against a fresh read of it, not wall-clock-derived), carried as a
+    project finding rather than built here.
     """
     try:
         certdir = _certdir(_switcher)
@@ -299,29 +251,6 @@ def _corroborating_daemon_port(_switcher):
         return _SPARE_ALL
     if not _pid_is_alive(pid):
         return None
-    boot = _boot_time_epoch()
-    if boot is not None:
-        import time
-
-        try:
-            mtime = record_path.stat().st_mtime
-        except OSError:
-            mtime = None
-        # FAIL OPEN, NOT CLOSED, but the two arms below are different
-        # facts and must not collapse onto the same widen: `mtime`
-        # unreadable or ahead of `now` (a stepped-back clock, a mangled
-        # stat) is a genuinely untrustworthy record -- forgo the narrow,
-        # single-port spare below for the conservative machine-wide one.
-        # `mtime` BEHIND `boot`, on its own, is not: after any reboot every
-        # surviving record reads this way, by construction, until the
-        # daemon that wrote it restarts -- widening to the machine-wide
-        # spare here would disarm `heal` for every OTHER wired config too,
-        # permanently, not just forgo narrowing for this one call. Falls
-        # through to the narrow, single-port spare below instead: still
-        # never condemns THIS port, but stops spreading the uncertainty
-        # past it.
-        if mtime is None or mtime > time.time():
-            return _SPARE_ALL
     try:
         port = int(state["port"])
     except (KeyError, TypeError, ValueError):
