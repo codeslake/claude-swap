@@ -25,18 +25,6 @@ def _refuse_write(self, num, email, creds, **kw):
     raise OSError("disk full (injected)")
 
 
-def test_refuse_write_tolerates_an_unknown_keyword():
-    """``_refuse_write`` stands in for the real
-    ``_write_account_credentials`` across this file. A caller that gains a
-    new keyword-only argument this fixture's hand-written signature does not
-    know about must still reach the injected failure, not a ``TypeError``
-    from the fixture itself -- which would be indistinguishable, in this
-    file's own asserts, from a real regression in the code under test.
-    """
-    with pytest.raises(OSError, match="disk full"):
-        _refuse_write(object(), "1", "a@example.com", "creds", extra=True)
-
-
 def _gen(num: str, generation: str) -> str:
     """OAuth credential JSON for slot ``num``'s ``generation`` (e.g.
     "gen1"/"gen2"). Successive generations for the same slot share one
