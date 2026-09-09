@@ -2275,6 +2275,9 @@ class ClaudeAccountSwitcher:
                 if not self._live_session_pids(account_num, email):
                     sdir = session_dir_for(self.backup_dir, account_num, email)
                     profile = read_session_credentials(sdir)
+                    prof_oauth = oauth.extract_oauth_data(profile) if profile else None
+                    cur_exp = (input_oauth or {}).get("expiresAt") or 0
+                    prof_exp = (prof_oauth or {}).get("expiresAt") or 0
                     if (
                         profile
                         and not is_session_stale(sdir)
@@ -2299,21 +2302,31 @@ class ClaudeAccountSwitcher:
                         # fingerprint refuses on this same corrupt file).
                         # Defer, like every other "unknown" in this method.
                         #
-                        # But mark the profile stale first: none of this
-                        # gate's own four clears (identity becomes readable,
-                        # the profile goes stale, a live pid appears, the
-                        # profile is removed) is reachable from a running
-                        # tick -- there is no writer for `.claude.json` but
-                        # Claude Code itself, and this same early return
-                        # happens before the one call in this method
-                        # (`_write_account_credentials`) that could mark the
-                        # profile stale. Without this, an unreadable identity
-                        # bars the slot as both a refresh AND a switch target
-                        # (autoswitch.py's `_SYSTEMIC_MESSAGES`) forever. This
-                        # write satisfies the "goes stale" clear from inside
-                        # the tick, so the NEXT pass takes the ordinary
-                        # backup-consume branch instead of deferring again.
-                        mark_session_stale(sdir)
+                        # Mark the profile stale ONLY when its own
+                        # generation is provably NOT ahead of the backup
+                        # (prof_exp <= cur_exp): both this branch and the
+                        # drift-check branch below share the
+                        # `not is_session_stale` guard, so marking stale
+                        # when the profile MIGHT be ahead would drop both
+                        # on the next pass and fall through to POST the
+                        # backup -- the exact spent-predecessor strike this
+                        # deferral exists to avoid. When the profile is not
+                        # ahead the backup is at least as fresh, so this
+                        # write safely satisfies the "goes stale" clear from
+                        # inside the tick and the NEXT pass takes the
+                        # ordinary backup-consume branch instead of
+                        # deferring again. (A possibly-ahead profile keeps
+                        # deferring on every pass -- correct-and-incomplete,
+                        # not fixed here.)
+                        if prof_exp <= cur_exp:
+                            if not mark_session_stale(sdir):
+                                self._logger.error(
+                                    "Account %s's session profile identity "
+                                    "could not be read and the profile "
+                                    "could not be marked stale; it may "
+                                    "keep deferring the refresh.",
+                                    account_num,
+                                )
                         return oauth.RefreshOutcome(None, "identity-unreadable")
                     elif (
                         profile
@@ -2324,9 +2337,6 @@ class ClaudeAccountSwitcher:
                         and not is_session_stale(sdir)
                         and not session_identity_drifted(sdir, email, org_uuid)
                     ):
-                        prof_oauth = oauth.extract_oauth_data(profile)
-                        cur_exp = (input_oauth or {}).get("expiresAt") or 0
-                        prof_exp = (prof_oauth or {}).get("expiresAt") or 0
                         if (
                             prof_oauth
                             and prof_oauth.get("accessToken")
@@ -7342,13 +7352,17 @@ class ClaudeAccountSwitcher:
                 ))
                 return None
 
-            # Rotation anchored on a drifted activeAccountNumber can land on the
-            # slot the user is already on — a self-switch would pointlessly rewrite
-            # the live credentials (issue #79's hazard, on the strategy path).
-            # Provenance-aware: only a no-op when the live credential matches the
-            # slot's backup (or the divergence can't be classified — pre-fix
-            # behavior, silent); a resolved divergence falls through so
-            # _perform_switch can reconcile it.
+            # The walk above starts at offset 1 from current_index, so anchoring
+            # directly on current_num never revisits its own position — this only
+            # fires through the except fallback a few lines up (current_num
+            # unparseable or absent from sequence, so the walk anchors on the
+            # recorded, possibly-drifted activeAccountNumber instead) and lands
+            # back on the slot the user is already on. A self-switch would
+            # pointlessly rewrite the live credentials (issue #79's hazard, on
+            # the strategy path). Provenance-aware: only a no-op when the live
+            # credential matches the slot's backup (or the divergence can't be
+            # classified — pre-fix behavior, silent); a resolved divergence
+            # falls through so _perform_switch can reconcile it.
             provenance: dict | None = None
             if next_account == current_num:
                 action, provenance = self._self_switch_action(

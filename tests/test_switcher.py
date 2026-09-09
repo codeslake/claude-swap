@@ -15692,52 +15692,150 @@ class TestGateUltraReviewFixes:
             "burn a strike"
         )
 
-    def test_an_unreadable_identity_self_clears_on_the_next_pass(
+    def test_an_unreadable_identity_with_a_possible_self_rotation_never_posts_the_backup(
         self, temp_home: Path, sample_sequence_data: dict
     ):
-        """The `identity-unreadable` deferral above must not repeat forever.
+        """When the corrupt-identity profile's OWN credential generation is
+        AHEAD of the backup (prof_exp > cur_exp), it may be this slot's own
+        self-rotation and the backup on file is its already-spent
+        predecessor. The gate must never mark the profile stale in this
+        case: both this branch and the drift-check branch right below it
+        share the `not is_session_stale` guard, so marking stale here drops
+        BOTH on the next pass and falls through to POST the backup --
+        exactly the invalid_grant strike the comment above exists to avoid.
 
-        None of the gate's own four clears is reachable from a running tick
-        (no writer for `.claude.json`, no live pid, the profile isn't
-        removed, and the tick's own path returns before the one call that
-        marks a profile stale) -- so the gate itself must mark the profile
-        stale on this refusal. The NEXT pass then reads `is_session_stale`
-        True and stops treating the corrupt profile as unconfirmed, so it
-        falls through to the ordinary backup consume instead of re-deferring.
-
-        Measured with the self-clear missing: the second pass also returns
-        `identity-unreadable` (unbounded deferral).
+        Deferring forever is the residual left for this one case (queued
+        separately, not this round's fix) -- correct-and-incomplete. This
+        test only proves the backup is never POSTed.
         """
-        from claude_swap.session import session_dir_for
+        from claude_swap.session import is_session_stale, session_dir_for
         s = self._switcher(sample_sequence_data)
         backup = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-bk", "refreshToken": "rt-bk",
             "expiresAt": 1000}})
         s._write_account_credentials("1", "test@example.com", backup)
-        corrupt = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk-corrupt", "refreshToken": "rt-corrupt",
+        # Ahead of the backup: possibly this slot's own self-rotation.
+        successor = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-successor", "refreshToken": "rt-successor",
             "expiresAt": 999999}})
         sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
         sdir.mkdir(parents=True, exist_ok=True)
-        (sdir / ".credentials.json").write_text(corrupt)
+        (sdir / ".credentials.json").write_text(successor)
         (sdir / ".claude.json").write_text("not json")
 
         def mock_refresh(credentials, **kw):
             return oauth.RefreshOutcome(self._NEW, None)
 
         with patch("claude_swap.oauth.try_refresh_oauth_credentials",
-                   side_effect=mock_refresh), \
+                   side_effect=mock_refresh) as posted, \
              patch.object(s, "_live_session_pids", return_value=[]):
             first = s.consume_backup_grant("1", "test@example.com", backup)
+            assert not is_session_stale(sdir), (
+                "a profile that may be ahead of the backup was marked "
+                "stale; that drops the guard on the next pass too"
+            )
+            second = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert first.error == "identity-unreadable", (
+            f"got {first.error!r} on the first pass"
+        )
+        assert second.error == "identity-unreadable", (
+            f"got {second.error!r}: an unverifiable, possibly-ahead "
+            "profile must keep deferring, not fall through to POST"
+        )
+        assert not posted.called, (
+            f"the backup was POSTed {posted.call_count} time(s) while the "
+            "profile's own generation could not be ruled out as ahead"
+        )
+
+    def test_an_unreadable_identity_not_ahead_self_clears_and_consumes_the_backup(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """The profile's own generation is NOT ahead of the backup (prof_exp
+        <= cur_exp): the backup is at least as fresh, so marking the
+        profile stale here is safe -- none of the gate's own four clears
+        (identity becomes readable, the profile goes stale, a live pid
+        appears, the profile is removed) is reachable from a running tick,
+        so the gate itself must self-clear here. The next pass's
+        fall-through POST is then the ordinary correct consume, not the
+        spent-predecessor case above.
+        """
+        from claude_swap.session import is_session_stale, session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # Behind the backup: not this slot's own newer rotation.
+        older = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-older", "refreshToken": "rt-older",
+            "expiresAt": 500}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(older)
+        (sdir / ".claude.json").write_text("not json")
+
+        def mock_refresh(credentials, **kw):
+            return oauth.RefreshOutcome(self._NEW, None)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=mock_refresh) as posted, \
+             patch.object(s, "_live_session_pids", return_value=[]):
+            first = s.consume_backup_grant("1", "test@example.com", backup)
+            assert is_session_stale(sdir), (
+                "a profile provably not ahead of the backup must be "
+                "marked stale so the next pass stops treating it as "
+                "unconfirmed"
+            )
             second = s.consume_backup_grant("1", "test@example.com", backup)
 
         assert first.error == "identity-unreadable", (
             f"got {first.error!r} on the first pass"
         )
         assert second.error != "identity-unreadable", (
-            "the second pass re-deferred instead of self-clearing: "
-            f"{second.error!r}"
+            f"got {second.error!r}: the second pass should consume the "
+            "backup normally, not re-defer"
         )
+        assert posted.call_count == 1, (
+            "expected exactly one POST (the second pass's ordinary "
+            f"consume), got {posted.call_count}"
+        )
+
+    def test_an_unreadable_identity_reports_when_the_stale_mark_fails(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        """`mark_session_stale` can itself fail (a read-only session dir),
+        exactly like the two sibling call sites at `_post_backup_write`,
+        which both check its return and log rather than swallow it. Silence
+        here would leave the deferral unbounded with no record of why.
+        """
+        import logging
+        from claude_swap.session import session_dir_for
+        s = self._switcher(sample_sequence_data)
+        backup = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-bk", "refreshToken": "rt-bk",
+            "expiresAt": 1000}})
+        s._write_account_credentials("1", "test@example.com", backup)
+        # Not ahead of the backup, so the guard would mark it stale.
+        older = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-older", "refreshToken": "rt-older",
+            "expiresAt": 500}})
+        sdir = session_dir_for(s.backup_dir, "1", "test@example.com")
+        sdir.mkdir(parents=True, exist_ok=True)
+        (sdir / ".credentials.json").write_text(older)
+        (sdir / ".claude.json").write_text("not json")
+
+        with patch(
+            "claude_swap.session.mark_session_stale", return_value=False,
+        ), patch.object(s, "_live_session_pids", return_value=[]), \
+             caplog.at_level(logging.ERROR, logger="claude-swap"):
+            outcome = s.consume_backup_grant("1", "test@example.com", backup)
+
+        assert outcome.error == "identity-unreadable"
+        assert any(
+            "could not be marked stale" in r.getMessage()
+            for r in caplog.records
+        ), f"a failed stale-mark was not reported: {caplog.text}"
 
     def test_an_older_profile_never_supersedes_the_backup(
         self, temp_home: Path, sample_sequence_data: dict
