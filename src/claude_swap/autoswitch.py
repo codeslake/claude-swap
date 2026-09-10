@@ -3440,7 +3440,9 @@ class AutoSwitchEngine:
         """Tick forever (until :meth:`stop`); a failing tick never kills it.
 
         `finally` drops the LIVE lock and announces the exit for every path
-        but `stop()`'s own — that one already does both.
+        but `stop()`'s own — that one already released it under `_stop_lock`
+        and decided `dry_run`; releasing here too would race it for
+        `_live_lock` and can make it skip that flip.
         """
         try:
             while True:
@@ -3474,7 +3476,7 @@ class AutoSwitchEngine:
         finally:
             if not self._stop.is_set():
                 reason = "consumer gone" if self._consumer_gone else "unhandled error"
+                self._release_live()
                 self._emit(
                     ErrorEvent(message=f"engine stopped: {reason}", transient=False)
                 )
-            self._release_live()

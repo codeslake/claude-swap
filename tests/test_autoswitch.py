@@ -3738,6 +3738,42 @@ class TestRunLoop:
             for e in harness.events
         )
 
+    def test_lock_drops_even_if_the_exit_announcement_raises(self, temp_home):
+        """`_emit`'s decision-log write sits outside `_emit`'s own try (an
+        unwritable backup_dir raises there, same fault
+        `_retry_live_promotion` already guards for) -- the release must not
+        sit behind it, or a process that cannot log its own death keeps
+        `.auto-live.lock` forever, which is the exact bug this exit cleanup
+        exists to close."""
+        h = EngineHarness(temp_home, decision_log=True)
+        engine = h.engine
+        assert engine._live_lock is not None, "premise: this engine is LIVE"
+
+        class _BoomLogger:
+            def info(self, *a, **kw):
+                raise OSError("disk full")
+
+        engine._decisions = _BoomLogger()
+        engine._consumer_gone = True
+        with pytest.raises(OSError):
+            engine.run_loop()
+        assert engine._live_lock is None
+
+    def test_stop_initiated_exit_does_not_also_touch_the_live_lock(
+        self, harness, monkeypatch
+    ):
+        """`stop()` releases under `_stop_lock` and decides `dry_run` itself
+        (autoview's LIVE badge reads `not dry_run`). If run_loop's own
+        cleanup ALSO calls `_release_live()` on this exit, the two race for
+        `_live_lock`: `stop()` can find it already `None` and skip
+        `dry_run = True`, leaving a dead engine badged LIVE."""
+        engine = harness.engine
+        calls = []
+        monkeypatch.setattr(engine, "_release_live", lambda: calls.append(1))
+        engine.stop()
+        assert engine.run_loop() == 0
+        assert calls == [], "run_loop must leave the LIVE release to stop()"
+
     def test_wake_during_tick_cuts_the_following_sleep_short(self, harness):
         # No wait patching on purpose: if the clear-at-top ordering were
         # wrong (wake cleared after the wait), the wake fired during tick 1
