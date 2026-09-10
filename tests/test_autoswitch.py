@@ -3694,6 +3694,38 @@ class TestRunLoop:
         assert len(calls) == 2
         assert any(isinstance(e, ErrorEvent) for e in harness.events)
 
+    def test_next_delay_exception_retry_keeps_the_thundering_herd_jitter(
+        self, harness
+    ):
+        """`tick()` documents "never raises" and has its own safety net, so
+        run_loop's outer except is for `_next_delay`/the sleep emit, not for
+        `tick()` -- it cannot retry through `_next_delay` on ITS OWN
+        exception, but the flat `interval_seconds` fallback that replaced it
+        must not drop the +-10% jitter `_next_delay` exists to add, or every
+        machine erroring on the same upstream fault polls it in lockstep."""
+        calls = []
+
+        def fake_next_delay(outcome):
+            calls.append(outcome)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            harness.engine.stop()
+            return 0
+
+        waits = []
+
+        with patch.object(
+            harness.engine, "tick", return_value=TickOutcome.NO_ACTION
+        ), patch.object(
+            harness.engine, "_next_delay", side_effect=fake_next_delay
+        ), patch.object(
+            harness.engine._wake, "wait", side_effect=lambda d=None: waits.append(d)
+        ), patch("random.random", return_value=0.0):
+            harness.engine.run_loop()
+        assert waits[0] == pytest.approx(
+            harness.engine.settings.interval_seconds * 0.9
+        )
+
     def test_stop_before_start_is_not_lost(self, harness):
         # A stop() issued before the worker thread enters run_loop must not
         # be cleared away: the loop exits without a single tick.
@@ -3739,12 +3771,13 @@ class TestRunLoop:
         )
 
     def test_lock_drops_even_if_the_exit_announcement_raises(self, temp_home):
-        """`_emit`'s decision-log write sits outside `_emit`'s own try (an
-        unwritable backup_dir raises there, same fault
-        `_retry_live_promotion` already guards for) -- the release must not
-        sit behind it, or a process that cannot log its own death keeps
-        `.auto-live.lock` forever, which is the exact bug this exit cleanup
-        exists to close."""
+        """`_emit`'s decision-log write sits outside `_emit`'s own try (only
+        `on_event` is guarded) -- nothing that can raise may sit between the
+        exit and the release, or a process that cannot log its own death
+        keeps `.auto-live.lock` forever, which is the exact bug this exit
+        cleanup exists to close. Faked here (today's `RotatingFileHandler`
+        swallows its own write errors via `Handler.handleError`) as an
+        ordering pin against a future logger that does not."""
         h = EngineHarness(temp_home, decision_log=True)
         engine = h.engine
         assert engine._live_lock is not None, "premise: this engine is LIVE"

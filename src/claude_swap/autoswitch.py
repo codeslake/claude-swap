@@ -3471,7 +3471,10 @@ class AutoSwitchEngine:
                     self._emit(
                         ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
                     )
-                    delay = self.settings.interval_seconds
+                    # Not `_next_delay(ERROR)`: that is the function that may
+                    # itself have just raised. Same +-10% jitter by hand so a
+                    # fleet-wide fault doesn't poll it in lockstep.
+                    delay = self.settings.interval_seconds * (0.9 + 0.2 * random.random())
                 self._wake.wait(delay)
         finally:
             if not self._stop.is_set():
