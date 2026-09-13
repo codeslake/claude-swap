@@ -2316,15 +2316,34 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     return port if _port_answers(port, connect_timeout) else None
 
 
-def _daemon_can_pin(port: int, *, timeout: float) -> bool | None:
-    """`/health`'s ``can_pin``, or None with no verdict at all — unreachable,
-    non-JSON, or an old daemon whose ``/health`` predates the field. All
-    three collapse into one signal on purpose: none of them says whether the
-    pin can read the token, only that this probe cannot tell. A locked
-    keychain and a daemon started outside the GUI session both read
-    ``can_pin=false`` here, and that is as far as this probe goes -- the two
-    are indistinguishable over ssh, so False stays one measurement, not two.
+_MINT_STALL_WEDGE_S = 60.0  # matches cswap-pin's own bound, proxy.py _serving_can_pin
+
+
+def _daemon_can_pin(port: int, *, timeout: float) -> tuple[bool | None, str]:
+    """`/health`'s serving verdict and the reason for it. None with no
+    verdict at all — unreachable or non-JSON — collapses two causes into one
+    signal on purpose: neither says whether the pin can read the token, only
+    that this probe cannot tell. The reason travels WITH the verdict because
+    the causes of a False do not share one repair (below), and a caller that
+    sees only True/False/None cannot say which one happened.
+
+    ``can_pin`` alone is not the pin's own serving verdict: the pin's own
+    reader (``_serving_can_pin``) refuses once ``mint_stalled_s`` exceeds
+    `_MINT_STALL_WEDGE_S`, before it ever looks at ``can_pin`` -- the mint
+    lock forces ``can_pin`` true while busy so a false reading does not
+    trigger a port recycle. Mirrored here, or this probe calls OK a pin the
+    pin itself would already call not-serving. A body with no
+    ``mint_stalled_s`` (an old daemon) is read as not stalled, never as
+    NOT-OK.
+
+    A connection this function receives already passed `_port_answers`'s raw
+    connect, so a bare socket timeout or a reset mid-response here
+    (`TimeoutError`, `http.client.RemoteDisconnected` -- not a refused
+    connection, which `_port_answers` would already have ruled out) is the
+    daemon accepting TCP and never answering -- the same wedge the pin's own
+    reader treats as not-serving, not "no verdict".
     """
+    import http.client
     import urllib.request
 
     # A LOOPBACK CALL, ROUTED DIRECT. `urlopen`'s default opener reads
@@ -2337,13 +2356,27 @@ def _daemon_can_pin(port: int, *, timeout: float) -> bool | None:
         with opener.open(
             f"http://127.0.0.1:{port}/health", timeout=timeout
         ) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:  # noqa: BLE001 — unreachable/malformed: no verdict
-        return None
-    return data.get("can_pin") if isinstance(data, dict) else None
+            body = resp.read()
+    except (TimeoutError, http.client.RemoteDisconnected):
+        return False, "accepted a connection but never answered /health"
+    except Exception:  # noqa: BLE001 — unreachable: no verdict
+        return None, "the daemon is unreachable"
+    try:
+        data = json.loads(body.decode())
+    except Exception:  # noqa: BLE001 — malformed: no verdict
+        data = None
+    if not isinstance(data, dict):
+        return None, "/health returned unparseable JSON"
+    stalled = data.get("mint_stalled_s")
+    if isinstance(stalled, (int, float)) and stalled > _MINT_STALL_WEDGE_S:
+        return False, f"mint stalled {stalled:.0f}s past the {_MINT_STALL_WEDGE_S:.0f}s wedge"
+    can_pin = data.get("can_pin")
+    if can_pin is None:
+        return None, "/health carries no can_pin verdict"
+    return can_pin, ("can_pin=true" if can_pin else "can_pin=false")
 
 
-def _pin_state(switcher, *, connect_timeout: float) -> tuple[str, str]:
+def _pin_state(switcher, *, connect_timeout: float = 2.0) -> tuple[str, str]:
     """``cswap pin --state``'s verdict and detail: OK / NOT-OK / UNKNOWN.
 
     The wiring half reuses `_dead_wired_configs` -- "should any wiring be
@@ -2365,12 +2398,12 @@ def _pin_state(switcher, *, connect_timeout: float) -> tuple[str, str]:
         if _pinned_email_now(switcher) is not None:
             return "NOT-OK", "a pin is recorded but nothing is wired or serving"
         return "OK", "nothing wired, nothing served"
-    can_pin = _daemon_can_pin(port, timeout=connect_timeout)
+    can_pin, why = _daemon_can_pin(port, timeout=connect_timeout)
     if can_pin is None:
-        return "UNKNOWN", f"the daemon on port {port} gave no verdict on /health"
+        return "UNKNOWN", f"the daemon on port {port} gave no verdict on /health ({why})"
     if can_pin:
-        return "OK", f"serving on port {port}, can_pin=true"
-    return "NOT-OK", f"serving on port {port}, but can_pin=false"
+        return "OK", f"serving on port {port}, {why}"
+    return "NOT-OK", f"serving on port {port}, {why}"
 
 
 def run(
@@ -2492,7 +2525,7 @@ def run(
         import sys
 
         try:
-            verdict, detail = _pin_state(switcher, connect_timeout=2.0)
+            verdict, detail = _pin_state(switcher)
         except Exception as exc:  # noqa: BLE001 — no verdict, not a crash
             verdict, detail = "UNKNOWN", f"the probe raised: {_safe(exc)}"
         print(verdict)

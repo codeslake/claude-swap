@@ -13443,7 +13443,7 @@ class TestThePinStateVerb:
 
         monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
         monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
-        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: True)
+        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: (True, "can_pin=true"))
         rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
         assert capsys.readouterr().out.strip() == "OK"
@@ -13493,10 +13493,28 @@ class TestThePinStateVerb:
 
         monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
         monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
-        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: False)
+        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: (False, "can_pin=false"))
         rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
         assert capsys.readouterr().out.strip() == "NOT-OK"
+
+    def test_not_ok_names_a_mint_stall_not_a_false_can_pin(self, tmp_path, monkeypatch, capsys):
+        """A stalled mint and a plain `can_pin: false` are the same word,
+        NOT-OK, but different repairs -- the detail must name the one that
+        actually happened, not assume the field this probe started with."""
+        from claude_swap import pin
+
+        monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
+        monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
+        monkeypatch.setattr(
+            pin, "_daemon_can_pin",
+            lambda *a, **k: (False, "mint stalled 90s past the 60s wedge"))
+        rc = pin.run(self._sw(tmp_path), None, state=True)
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "NOT-OK"
+        assert "stall" in captured.err, captured.err
+        assert "can_pin=false" not in captured.err, captured.err
 
     def test_daemon_with_no_verdict_is_unknown(self, tmp_path, monkeypatch, capsys):
         """`no / yes / none`: row 3, THE CONTROL that separates UNKNOWN
@@ -13506,13 +13524,12 @@ class TestThePinStateVerb:
 
         monkeypatch.setattr(pin, "_dead_wired_configs", lambda *a, **k: [])
         monkeypatch.setattr(pin, "serving_port", lambda *a, **k: 4242)
-        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: None)
+        monkeypatch.setattr(pin, "_daemon_can_pin", lambda *a, **k: (None, "no verdict"))
         rc = pin.run(self._sw(tmp_path), None, state=True)
         assert rc == 0
         captured = capsys.readouterr()
         out = captured.out.strip()
         assert out == "UNKNOWN", out
-        assert out != "NOT-OK"
         assert captured.err.strip(), "no detail on stderr"
 
     def test_a_probe_raise_still_exits_0(self, tmp_path, monkeypatch, capsys):
@@ -13573,39 +13590,101 @@ class TestDaemonCanPinReadsHealth:
         from claude_swap import pin
 
         self._stub_urlopen(monkeypatch, b'{"can_pin": true}')
-        assert pin._daemon_can_pin(4242, timeout=1.0) is True
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
 
     def test_can_pin_false(self, monkeypatch):
         from claude_swap import pin
 
         self._stub_urlopen(monkeypatch, b'{"can_pin": false}')
-        assert pin._daemon_can_pin(4242, timeout=1.0) is False
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
 
     def test_missing_field_is_no_verdict(self, monkeypatch):
         """An old daemon whose `/health` predates the field."""
         from claude_swap import pin
 
         self._stub_urlopen(monkeypatch, b'{"ok": true}')
-        assert pin._daemon_can_pin(4242, timeout=1.0) is None
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
 
     def test_unreachable_is_no_verdict(self, monkeypatch):
         from claude_swap import pin
 
         self._stub_urlopen(monkeypatch, raises=OSError("connection refused"))
-        assert pin._daemon_can_pin(4242, timeout=1.0) is None
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
+
+    def test_accepts_tcp_but_never_answers_is_not_can_pin(self, monkeypatch):
+        """A connection this probe receives already passed `_port_answers`'s
+        raw connect, so a plain socket timeout here -- not a refused or reset
+        connection -- is a daemon accepting TCP and never responding: the
+        same wedge the pin's own reader (`_serving_can_pin`) calls
+        not-serving, not "no verdict"."""
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, raises=TimeoutError("timed out"))
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
+
+    def test_accepts_tcp_but_drops_mid_response_is_not_can_pin(self, monkeypatch):
+        """Same wedge, the other way it shows up: the daemon accepts, starts
+        answering, then the connection resets before a response arrives."""
+        import http.client
+
+        from claude_swap import pin
+
+        self._stub_urlopen(
+            monkeypatch, raises=http.client.RemoteDisconnected("disconnected"))
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
 
     def test_malformed_json_is_no_verdict(self, monkeypatch):
         from claude_swap import pin
 
         self._stub_urlopen(monkeypatch, b"not json")
-        assert pin._daemon_can_pin(4242, timeout=1.0) is None
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
 
     def test_valid_but_non_dict_json_is_no_verdict(self, monkeypatch):
         """Valid JSON, but not an object -- `can_pin` cannot exist on it."""
         from claude_swap import pin
 
         self._stub_urlopen(monkeypatch, b"[1, 2, 3]")
-        assert pin._daemon_can_pin(4242, timeout=1.0) is None
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is None
+
+    def test_mint_stalled_past_wedge_is_not_can_pin(self, monkeypatch):
+        """The pin's own consumer (`proxy.py _serving_can_pin`) reads
+        `can_pin` only after checking this same wedge; a reader of the same
+        `/health` body that skips it calls OK a pin the pin itself would
+        already refuse to serve from."""
+        from claude_swap import pin
+
+        self._stub_urlopen(
+            monkeypatch, b'{"can_pin": true, "mint_stalled_s": 90.0}')
+        can_pin, why = pin._daemon_can_pin(4242, timeout=1.0)
+        assert can_pin is False
+        assert "stall" in why, why
+
+    def test_mint_stalled_at_wedge_boundary_is_still_can_pin(self, monkeypatch):
+        """Exactly at the wedge is not past it -- mirrors the pin's own
+        strict `>`, not `>=`."""
+        from claude_swap import pin
+
+        self._stub_urlopen(
+            monkeypatch, b'{"can_pin": true, "mint_stalled_s": 60.0}')
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
+
+    def test_mint_stalled_s_explicit_null_is_unaffected(self, monkeypatch):
+        """Every HEALTHY 0.1.262 daemon publishes `mint_stalled_s` on every
+        response, `null` when nothing is stalled -- the live common case,
+        distinct from a field genuinely absent (an old daemon)."""
+        from claude_swap import pin
+
+        self._stub_urlopen(
+            monkeypatch, b'{"can_pin": true, "mint_stalled_s": null}')
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
+
+    def test_mint_stalled_past_wedge_wins_over_a_missing_can_pin(self, monkeypatch):
+        """The wedge check runs before `can_pin` is even read, so it
+        overrides a missing field too, not only `can_pin: true`."""
+        from claude_swap import pin
+
+        self._stub_urlopen(monkeypatch, b'{"mint_stalled_s": 90.0}')
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is False
 
     def test_bypasses_the_environments_proxy_settings(self, monkeypatch):
         """A loopback health check must not be routed through `http_proxy`:
@@ -13617,7 +13696,7 @@ class TestDaemonCanPinReadsHealth:
         from claude_swap import pin
 
         calls = self._stub_urlopen(monkeypatch, b'{"can_pin": true}')
-        assert pin._daemon_can_pin(4242, timeout=1.0) is True
+        assert pin._daemon_can_pin(4242, timeout=1.0)[0] is True
         assert calls, "build_opener was never called"
         assert any(
             isinstance(h, urllib.request.ProxyHandler) and h.proxies == {}
