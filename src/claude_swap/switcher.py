@@ -313,6 +313,14 @@ class ClaudeAccountSwitcher:
     # default makes that an AttributeError instead of the "not moving
     # keys" it means.
     _moving_keys = False
+    # `None` means "landing not tracked here, assume moved" -- the
+    # rollback's own `_moving_keys = True` scope (its restore write is a
+    # different shape: the profile's home, not a rename destination) relies
+    # on that default and is untouched. A caller that CAN tell which
+    # destinations a best-effort rename actually landed at (the swap, the
+    # move) sets this to that set of `Path`s before writing and clears it
+    # in the same `finally` that clears `_moving_keys`.
+    _moving_keys_landed: set | None = None
 
     def __init__(self, debug: bool = False):
         self.home = Path.home()
@@ -914,7 +922,21 @@ class ClaudeAccountSwitcher:
             # HERE, not inside the chokepoint: the rollback's crossed-key
             # repair calls it DIRECTLY, on the other slot's profile, and
             # that one really is stale.
-            if not self._moving_keys:
+            #
+            # THE SKIP IS EARNED BY THE RENAME LANDING, not by being in a
+            # key-move call. `_swap_session_dirs`/`move_account`'s renames
+            # are best-effort (a leftover `.swapping`, a pre-existing
+            # destination) and can leave THIS destination's profile right
+            # where it was while the backup write above still lands --
+            # skipping invalidation there strands a profile serving the
+            # account that used to own this key. `_moving_keys_landed`
+            # (`None` = not tracked, assume moved) is how a caller that DOES
+            # know which destinations landed narrows the skip to those.
+            landed = self._moving_keys_landed
+            if not (self._moving_keys and (
+                landed is None
+                or self._session_dir(account_num, email) in landed
+            )):
                 self._post_backup_write(account_num, email)
         except OSError:
             from claude_swap.session import mark_session_stale
@@ -1263,7 +1285,16 @@ class ClaudeAccountSwitcher:
             # Scoped to the FORWARD writes only. The rollback's restores put
             # back a value the profile's lineage really did move past, so
             # they must invalidate as usual.
+            #
+            # NARROWED TO WHAT ACTUALLY LANDED: `_swap_session_dirs` is
+            # best-effort (a leftover `.swapping`, a pre-existing
+            # destination) and `moved` names only the destinations whose
+            # rename landed. A destination NOT in `moved` still gets this
+            # backup write, but its profile is still at the OLD key --
+            # skipping invalidation there would leave it serving the
+            # account that used to own this slot.
             self._moving_keys = True
+            self._moving_keys_landed = set(moved)
             try:
                 if creds_a:
                     self._write_account_credentials(num_b, email_a, creds_a)
@@ -1283,6 +1314,7 @@ class ClaudeAccountSwitcher:
                     self._delete_config_backup(num_a, email_b)
             finally:
                 self._moving_keys = False
+                self._moving_keys_landed = None
 
             data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
             int_a, int_b = int(num_a), int(num_b)
@@ -2025,9 +2057,11 @@ class ClaudeAccountSwitcher:
             # profile and leaves its flag at the old key, where the post-
             # commit prune deletes it.
             was_stale = stale_marker_for(src_dir).exists()
+            profile_landed = False
             if src_dir.exists() and not dst_dir.exists():
                 try:
                     os.replace(src_dir, dst_dir)
+                    profile_landed = True
                 except OSError as e:
                     self._logger.warning(
                         f"Session profile move skipped during move: {e}"
@@ -2047,7 +2081,16 @@ class ClaudeAccountSwitcher:
             # A MOVE IS A KEY MOVE, like the swap. `os.replace` above took
             # the matching profile to the new key, so it is still this
             # account's own and still newer than these bytes.
+            #
+            # NARROWED TO WHETHER THE RENAME ACTUALLY LANDED (`profile_
+            # landed`, set only inside the `try` above): a leftover at
+            # `dst_dir` from BEFORE this move (the guard skipped the rename
+            # outright) or a failed `os.replace` both leave a profile at
+            # the target that is NOT this account's, and skipping
+            # invalidation would leave it serving the account that used to
+            # own this slot.
             self._moving_keys = True
+            self._moving_keys_landed = {dst_dir} if profile_landed else set()
             try:
                 if creds:
                     self._write_account_credentials(target, email, creds)
@@ -2059,6 +2102,7 @@ class ClaudeAccountSwitcher:
                     self._delete_config_backup(target, email)
             finally:
                 self._moving_keys = False
+                self._moving_keys_landed = None
 
             data["accounts"][target] = record
             del data["accounts"][num_src]

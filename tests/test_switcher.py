@@ -7929,6 +7929,51 @@ class TestStashAndRetentionStore:
 
         assert store._read_account_credentials("2", email_c) == "creds-c"
 
+    def test_renumber_fallback_never_borrows_when_a_live_sibling_shares_the_email(
+        self, temp_home,
+    ):
+        """CRITICAL: two roster slots can legitimately share one email (same
+        login, different org — the docstring's own example). A leaked
+        orphan backup at a freed number, keyed to that shared email, cannot
+        be told apart from a leftover belonging to the OTHER live sibling's
+        own renumber history — mirroring it into this slot would duplicate
+        that sibling's refresh-token lineage across two slots, which is the
+        duplicate-grant race (``switcher.py``'s consume gate then POSTs the
+        same refresh token from either slot). The fallback must fail closed
+        (return "") whenever any OTHER roster slot currently lists this
+        email, not merely skip that slot as a mirror candidate.
+        """
+        switcher = self._switcher(temp_home)
+        store = switcher._store
+        email = "shared@example.com"
+        switcher._write_json(
+            switcher.sequence_file,
+            {
+                "activeAccountNumber": 1,
+                "lastUpdated": "2024-01-01T00:00:00Z",
+                "sequence": [1, 2],
+                "accounts": {
+                    "1": {"email": email, "uuid": "uuid-1"},
+                    "2": {"email": email, "uuid": "uuid-2"},
+                },
+            },
+        )
+        store._write_account_credentials("1", email, "slot-1-lineage")
+        # A leaked orphan at a freed number, keyed to the shared email —
+        # e.g. left behind by an earlier renumber of slot 1's own history.
+        store._write_account_credentials("3", email, "slot-1-lineage")
+
+        assert store._read_account_credentials("2", email) == "", (
+            "DEFECT: the leaked orphan was mirrored into slot 2, "
+            "duplicating slot 1's refresh-token lineage across two slots"
+        )
+        assert store._read_account_credentials_direct("2", email) == "", (
+            "the fallback wrote the orphan back under slot 2"
+        )
+        # Never touch the source items.
+        assert store._read_account_credentials_direct("1", email) == "slot-1-lineage"
+        assert store._read_account_credentials_direct("3", email) == "slot-1-lineage"
+
     def test_renumber_fallback_finds_a_stale_backup_after_two_removals_in_one_edit(
         self, temp_home,
     ):

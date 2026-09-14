@@ -146,6 +146,37 @@ class TestMoveAccount:
         data = switcher._get_sequence_data()
         assert data["accounts"]["5"]["email"] == "account2@example.com"
 
+    def test_move_invalidates_a_stray_profile_the_rename_could_not_displace(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CRITICAL: the target key's session-profile rename is best-effort
+        and is skipped outright when a profile already sits at the target
+        (the guard `not dst_dir.exists()`) — a leftover from an earlier
+        crash, never this account's own. The commit still writes this
+        account's real backup material under the target key, so a stray
+        profile left uninvalidated there would go on serving whatever
+        account the leftover belonged to under the reuse check, passing as
+        this move's own account.
+        """
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials(
+            "2", "account2@example.com", "account-2-creds"
+        )
+        # A stray profile already at the target key/email pair, unrelated to
+        # this move — the rename below must skip it (guard), never adopt it.
+        stray = switcher._session_dir("5", "account2@example.com")
+        stray.mkdir(parents=True, exist_ok=True)
+        (stray / ".credentials.json").write_text("stray-material", encoding="utf-8")
+
+        switcher.move_account("2", "5")
+
+        assert not (stray / ".credentials.json").exists(), (
+            "DEFECT: the stray profile at the target key was never "
+            "invalidated, so it keeps serving material that predates this "
+            "move's own backup write"
+        )
+
     def test_move_failed_required_clear_aborts_commit(
         self, temp_home: Path, sample_sequence_data: dict
     ):

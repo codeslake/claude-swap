@@ -1290,6 +1290,21 @@ class CredentialStore:
             # must not raise here any more than the comprehension below,
             # which guards the same `int()` with the same check.
             return ""
+        if any(
+            num != account_num and other_email == email
+            for num, other_email in accounts.items()
+        ):
+            # A live sibling under this same email (two slots can
+            # legitimately share one login, different org) means an
+            # unbacked candidate found below could be a leaked orphan from
+            # THAT sibling's own renumber history, not this slot's — the
+            # two are indistinguishable once read back, and mirroring the
+            # wrong one in duplicates the sibling's refresh-token lineage
+            # across two slots (the consume gate then POSTs the same
+            # refresh token from either). Fail closed rather than guess;
+            # the single-account renumber recovery (no other slot claims
+            # this email) is untouched by this check.
+            return ""
         cache_key = (account_num, email, probe_reassigned_slots)
         if self._sweep_negative_cache.get(cache_key) == accounts:
             # ponytail: the sweep already ran once against this exact roster
