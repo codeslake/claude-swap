@@ -7173,7 +7173,7 @@ def _grant_setup_token_creds(token: str) -> str:
 
 
 class TestNoPeerSlotMayShareARefreshGrant:
-    """Queue row #474: two slots holding the same refresh grant race to
+    """Two slots holding the same refresh grant race to
     each POST it once -- one wins, the other's lineage dies and forces a
     re-login inside its own grant's lifetime. The fix removes the
     precondition instead of locking the race: refuse the WRITE that would
@@ -8007,8 +8007,8 @@ class TestProvenanceGuard:
         CONSTRUCTION the instant it was written (the gate is only
         `configSlot == account_num AND consumedFp == the slot's current
         stored backup`), so the next `consume_backup_grant` on that slot
-        would silently adopt genuinely foreign bytes into it — the wmac
-        cross-wire incident one step later. The CAS proves the slot has not
+        would silently adopt genuinely foreign bytes into it — a
+        cross-wire one step later. The CAS proves the slot has not
         moved since the stash; it never proves ownership, and for
         `unresolved` ownership is unknown by definition."""
         switcher, creds_store, configs_store = self._setup_two_accounts(
@@ -8039,7 +8039,7 @@ class TestProvenanceGuard:
     def test_unresolvable_mismatch_with_wrong_active_slot_never_poisons_it(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """The wmac shape (2026-09-07): the roster's active slot is 2, but
+        """A cross-wire shape: the roster's active slot is 2, but
         the un-spliced identity file names slot 1's email. Two independent
         guards must both hold: the roster's active slot (2) is not
         overridden by the unverified identity-file claim (never attributed
@@ -8091,10 +8091,10 @@ class TestProvenanceGuard:
     def test_own_rotation_with_wrong_active_slot_lands_in_the_right_backup(
         self, temp_home, mock_claude_config, sample_sequence_data,
     ):
-        """Same wmac shape as the test above, but the live bytes are
+        """Same cross-wire shape as the test above, but the live bytes are
         genuinely slot 2's OWN rotation (same refresh-token lineage as its
-        stored backup) — the [C] finding's "right-slot-but-wrong-email"
-        case. `current_account` correctly stays 2 (the override above is
+        stored backup) — the "right-slot-but-wrong-email" case.
+        `current_account` correctly stays 2 (the override above is
         rejected), but `current_email` must not be left as slot 1's:
         `_classify_outgoing_credential` reads the backup keyed on
         ``(current_account, current_email)``, and slot 2's backup is stored
