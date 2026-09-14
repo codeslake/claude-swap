@@ -286,7 +286,6 @@ class TestListJson:
         ordinary_by_num = {a["number"]: a for a in ordinary_payload["accounts"]}
         for acct in read_only_payload["accounts"]:
             other = ordinary_by_num[acct["number"]]
-            assert acct["number"] == other["number"]
             assert acct["active"] == other["active"]
             assert acct["usageStatus"] == other["usageStatus"]
             assert acct["usage"] == other["usage"]
@@ -464,6 +463,33 @@ class TestStatusJson:
         assert active["usageStatus"] == "ok"
         assert active["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
         assert payload["totalManagedAccounts"] == 2
+
+    def test_status_read_only_reaches_the_switcher_unfetched(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The real chain end to end, not a mocked ``status``/switcher class:
+        ``status(read_only=True)`` -> ``_active_account_usage(read_only=True)``
+        -> ``_collect_usage_entries(read_only=True)`` must reach the store
+        without a fetch."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch_mock:
+            payload = switcher.status(json_output=True, read_only=True)
+
+        fetch_mock.assert_not_called()
+        active = payload["active"]
+        assert active["number"] == 1
+        assert active["managed"] is True
+        assert active["usageStatus"] == "unavailable"
+        assert active["usage"] is None
 
     def test_status_managed_includes_display_grade_last_good(
         self, temp_home: Path, mock_claude_config: Path,
