@@ -5663,10 +5663,12 @@ class ClaudeAccountSwitcher:
         is persisted (``_persist_poll_plans``), making every surface inherit
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
-        (stale-on-error). ``read_only=True`` returns right after the pure
-        store read below: no dead-token adopt, no stash sweep, no reserve
-        claim, no fetch -- the store is served exactly as the last pass left
-        it.
+        (stale-on-error). ``read_only=True`` still runs the dead-token and
+        expired-credential SCANS below (both pure reads, so a quarantined or
+        expired slot still reports its sentinel), but skips every WRITE: no
+        stashed-login adopt, no stale-strike clear, no stash sweep, no
+        reserve claim, no fetch -- nothing is adopted and no refresh grant is
+        consumed.
         """
         store = self._usage_store
         identities = {
@@ -5684,18 +5686,13 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
-        if read_only:
-            # Skip the dead-token scan (it adopts/clears), the stash sweep,
-            # the reserve claim and the fetch pool: read-only means the store
-            # is served as-is, so no login is adopted and no refresh grant
-            # is consumed.
-            return {
-                num: with_sentinel(entries[num], sentinels.get(num))
-                for num in info_by_num
-            }
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        # ``_entry_token_dead`` is itself a pure read, so this scan still runs
+        # under ``read_only`` -- only its two WRITE arms (the adopt below and
+        # ``clear_dead_token`` further down) are skipped, or a quarantined slot
+        # would report stale last-good numbers instead of "re-login needed".
         live_slots: set[str] = set()
         for num in info_by_num:
             if num in sentinels:
@@ -5707,7 +5704,7 @@ class ClaudeAccountSwitcher:
             )
             if dead is False:
                 live_slots.add(num)
-            if dead and self._adopt_stashed_login_for_slot(num, _i[1]):
+            if dead and not read_only and self._adopt_stashed_login_for_slot(num, _i[1]):
                 # A login for this slot was set aside while the slot was
                 # still healthy, and nothing looked again once it died. This
                 # is the moment its condition became true, so re-read the row
@@ -5734,7 +5731,7 @@ class ClaudeAccountSwitcher:
                 # it answers, the next pass compares real bytes and the
                 # `elif` below either clears the strike or confirms it.
                 pass
-            elif entry.auth_dead_strikes and entry.token_dead():
+            elif not read_only and entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict. Clear the
                 # stale strike ROW too: display and fetch eligibility
@@ -5753,6 +5750,27 @@ class ClaudeAccountSwitcher:
                     expected_fingerprints={num: entry.struck_fingerprint},
                 )
                 entries = store.entries(identities, models)
+
+        if read_only:
+            # An expired ACTIVE credential gets the same read-only treatment:
+            # a pure read (no reserve claim, no fetch path runs to surface it
+            # otherwise), so it must be checked here rather than left to the
+            # claims-gated loop below, which read-only never reaches.
+            for num, info in info_by_num.items():
+                if num in sentinels or not info[4]:  # info[4] = is_active
+                    continue
+                active_oauth = oauth.extract_oauth_data(info[5])
+                if active_oauth and oauth.is_oauth_token_expired(
+                    active_oauth.get("expiresAt")
+                ):
+                    sentinels[num] = USAGE_TOKEN_EXPIRED
+            # Skip the stash sweep, the reserve claim and the fetch pool:
+            # read-only means the store is served as-is, so no login is
+            # adopted and no refresh grant is consumed.
+            return {
+                num: with_sentinel(entries[num], sentinels.get(num))
+                for num in info_by_num
+            }
         # Every pass, fetches or none: arm A of the sweep still drains a
         # refresh-and-access-dead row even when every fetch below fails, and
         # only THIS loop measures which slots are live enough to license

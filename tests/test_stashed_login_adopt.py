@@ -640,7 +640,9 @@ class TestTheCollectPassReachesTheStash:
     ):
         """The control above proves the ordinary pass adopts. A read-only
         pass must skip that write entirely: the stashed login stays
-        unclaimed and slot 2 keeps its DEAD fingerprint."""
+        unclaimed and slot 2 keeps its DEAD fingerprint. The quarantine
+        sentinel itself is a pure read, so it still surfaces -- read-only
+        skips the write, not the "re-login needed" signal."""
         sw = self._switcher(sample_sequence_data)
         entry_id = sw._store._write_unclaimed_credential(FRESH, {
             "reason": "foreign",
@@ -658,7 +660,7 @@ class TestTheCollectPassReachesTheStash:
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(DEAD)
         assert entry_id in sw._store._list_unclaimed_credentials()
-        assert "2" in entries
+        assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
 
     def test_the_adopt_runs_before_the_sweep_that_follows_it(
         self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
