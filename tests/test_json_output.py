@@ -284,6 +284,8 @@ class TestListJson:
         assert (read_only_payload["activeAccountNumber"]
                 == ordinary_payload["activeAccountNumber"])
         ordinary_by_num = {a["number"]: a for a in ordinary_payload["accounts"]}
+        assert {a["number"] for a in read_only_payload["accounts"]} == \
+            set(ordinary_by_num)
         for acct in read_only_payload["accounts"]:
             other = ordinary_by_num[acct["number"]]
             assert acct["active"] == other["active"]
@@ -471,13 +473,21 @@ class TestStatusJson:
         """The real chain end to end, not a mocked ``status``/switcher class:
         ``status(read_only=True)`` -> ``_active_account_usage(read_only=True)``
         -> ``_collect_usage_entries(read_only=True)`` must reach the store
-        without a fetch."""
+        without a fetch. The store is seeded first so an empty-store early
+        return could not pass this by coincidence: the served pct must be
+        the seeded one, not merely absent."""
+        from claude_swap.usage_store import FetchRecord
+
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
 
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        switcher._usage_store.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25.0}})},
+            {"1": ("test@example.com", "")},
+        )
 
         with patch.object(switcher, "_read_active_credentials",
                           return_value=ActiveCredentials(active_creds, False)), \
@@ -488,8 +498,8 @@ class TestStatusJson:
         active = payload["active"]
         assert active["number"] == 1
         assert active["managed"] is True
-        assert active["usageStatus"] == "unavailable"
-        assert active["usage"] is None
+        assert active["usageStatus"] == "ok"
+        assert active["usage"]["fiveHour"]["pct"] == 25.0
 
     def test_status_managed_includes_display_grade_last_good(
         self, temp_home: Path, mock_claude_config: Path,
