@@ -177,6 +177,122 @@ class TestMoveAccount:
             "move's own backup write"
         )
 
+    def test_move_stray_at_target_does_not_strip_the_source_profiles_stale_flag(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CRITICAL: a stray profile already at the target key makes the
+        rename-guard skip the move outright — the source profile is left
+        exactly where it was, still needing its own re-bootstrap. The
+        carry-the-flag step must gate on the rename having actually
+        LANDED, not on `dst_dir.exists()` (true here only because of the
+        unrelated stray), or the source's own genuinely-stale profile loses
+        its flag for no reason connected to it.
+
+        A commit that then SUCCEEDS prunes slot 2 outright (by design: an
+        unmoved profile "costs at most that slot's history"), which would
+        mask the bug — the flag only matters, and only shows the loss, when
+        the commit then FAILS and the source profile is left in place.
+        """
+        from unittest.mock import patch
+
+        from claude_swap.session import mark_session_stale, stale_marker_for
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials(
+            "2", "account2@example.com", "account-2-creds"
+        )
+        src = switcher._session_dir("2", "account2@example.com")
+        src.mkdir(parents=True, exist_ok=True)
+        (src / ".credentials.json").write_text("live-profile", encoding="utf-8")
+        assert mark_session_stale(src)
+
+        stray = switcher._session_dir("5", "account2@example.com")
+        stray.mkdir(parents=True, exist_ok=True)
+
+        real_json = ClaudeAccountSwitcher._write_json
+        calls = {"n": 0}
+
+        def failing_json(self, path, data):
+            if path == self.sequence_file and "5" in data.get("accounts", {}):
+                calls["n"] += 1
+                raise OSError("disk full (injected)")
+            return real_json(self, path, data)
+
+        with patch.object(ClaudeAccountSwitcher, "_write_json", failing_json):
+            with pytest.raises(Exception):
+                switcher.move_account("2", "5")
+
+        assert calls["n"] >= 1, "premise: the targeted commit write must have failed"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "account2@example.com", (
+            "premise: the commit failed, so the account is still at slot 2"
+        )
+        assert src.exists(), "premise: the stray blocked the rename, so the " \
+            "source profile never left slot 2"
+
+        assert stale_marker_for(src).exists(), (
+            "DEFECT: the source profile's own stale flag was stripped even "
+            "though it never moved (a stray at the target blocked the "
+            "rename, not this profile's own re-bootstrap having landed)"
+        )
+
+    def test_move_failed_commit_restores_the_profiles_stale_flag_with_it(
+        self, temp_home: Path, sample_sequence_data: dict
+    ):
+        """CRITICAL: the stale marker is a SIBLING of the profile dir, not a
+        child, so restoring the profile dir on a failed commit does not
+        restore the marker with it — that must be done explicitly, or an
+        abort strips a stale flag the base never touched.
+        """
+        from unittest.mock import patch
+
+        from claude_swap.session import mark_session_stale, stale_marker_for
+
+        switcher = ClaudeAccountSwitcher()
+        self._write(switcher, sample_sequence_data)
+        switcher._write_account_credentials(
+            "2", "account2@example.com", "account-2-creds"
+        )
+        src = switcher._session_dir("2", "account2@example.com")
+        src.mkdir(parents=True, exist_ok=True)
+        (src / ".credentials.json").write_text("live-profile", encoding="utf-8")
+        assert mark_session_stale(src)
+
+        real_json = ClaudeAccountSwitcher._write_json
+        calls = {"n": 0}
+
+        def failing_json(self, path, data):
+            # Scoped to the write that actually names the target slot: an
+            # earlier internal write (e.g. a migration touch inside
+            # `_get_sequence_data_migrated`) also hits `sequence_file`, and
+            # failing THAT one aborts before the rename/carry even run,
+            # which would pass this test for the wrong reason.
+            if path == self.sequence_file and "5" in data.get("accounts", {}):
+                calls["n"] += 1
+                raise OSError("disk full (injected)")
+            return real_json(self, path, data)
+
+        with patch.object(ClaudeAccountSwitcher, "_write_json", failing_json):
+            with pytest.raises(Exception):
+                switcher.move_account("2", "5")
+
+        # PREMISES: the failing write really was the one naming the target,
+        # so the rename and the marker carry really did run first.
+        assert calls["n"] >= 1, "premise: the targeted commit write must have failed"
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["2"]["email"] == "account2@example.com"
+
+        dst = switcher._session_dir("5", "account2@example.com")
+        assert stale_marker_for(src).exists(), (
+            "DEFECT: the aborted move's rename-back restored the profile "
+            "dir but left it without the stale flag it carried before the "
+            "move started"
+        )
+        assert not stale_marker_for(dst).exists(), (
+            "the flag was left orphaned at the target's marker path"
+        )
+
     def test_move_failed_required_clear_aborts_commit(
         self, temp_home: Path, sample_sequence_data: dict
     ):

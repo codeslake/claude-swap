@@ -2066,7 +2066,14 @@ class ClaudeAccountSwitcher:
                     self._logger.warning(
                         f"Session profile move skipped during move: {e}"
                     )
-            if was_stale and dst_dir.exists():
+            # GATED ON `profile_landed`, not `dst_dir.exists()`: a stray
+            # already at the target (the guard above skipped the rename)
+            # makes `dst_dir.exists()` true with the source profile never
+            # having moved -- carrying the flag on that alone strips this
+            # slot's own stale marker while its profile is still sitting,
+            # untouched, at `src_dir`.
+            stale_carried = was_stale and profile_landed
+            if stale_carried:
                 try:
                     stale_marker_for(src_dir).unlink(missing_ok=True)
                 except OSError:
@@ -2128,6 +2135,14 @@ class ClaudeAccountSwitcher:
                 self._delete_config_backup(target, email)
                 if dst_dir.exists() and not src_dir.exists():
                     os.replace(dst_dir, src_dir)
+                if stale_carried:
+                    # The marker is a SIBLING of the profile dir (`stale_
+                    # marker_for`), not a child, so the dir move above does
+                    # not carry it back on its own -- undo the forward
+                    # carry explicitly, or this abort strips a stale flag
+                    # the base never touched.
+                    stale_marker_for(dst_dir).unlink(missing_ok=True)
+                    mark_session_stale(src_dir)
             except Exception as e:
                 self._logger.error(f"Cleanup after failed move incomplete: {e}")
             raise
