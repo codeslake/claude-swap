@@ -984,9 +984,9 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Refuse a write that would leave two slots holding the same
         single-use refresh grant -- the precondition for the fan-out
-        double-spend (queue row #474): two slots each POST the same grant,
-        one wins, the other's lineage dies and forces a re-login inside its
-        own grant's window. Closes the write-time path that CREATES a new
+        double-spend: two slots each POST the same grant, one wins, the
+        other's lineage dies and forces a re-login inside its own grant's
+        window. Closes the write-time path that CREATES a new
         duplicate; it does not by itself retire the consume gate's lock (an
         attributed=True write -- the same login added under a second org,
         for one -- can still leave a peer holding matching bytes, since
@@ -8382,9 +8382,9 @@ class ClaudeAccountSwitcher:
                     # `_adopt_stashed_successor`'s gate by construction the
                     # instant it was written (nothing else need happen to the
                     # slot in between), so a later grant-consume would
-                    # silently adopt these unverified bytes — the wmac
-                    # cross-wire incident one step later. Left stranded until
-                    # a manual `cswap add` confirms it.
+                    # silently adopt these unverified bytes — a cross-wire
+                    # one step later. Left stranded until a manual
+                    # `cswap add` confirms it.
                     self._stash_live_credential(
                         original_creds, "unresolved", current_account,
                         provenance.get("resolved"),

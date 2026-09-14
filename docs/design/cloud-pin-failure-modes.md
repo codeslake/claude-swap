@@ -6,12 +6,12 @@ Written from a code audit plus live measurement on a mac; section C was
 re-verified against the shipped implementation, which is when C4 was
 added and C2's mechanism corrected.
 
-**Sections A, B, D, E are as first written and still hold.** B4 in
-particular is still an OPEN item, not a fixed one: `remove_account` does
-not clear the pin today either. Where a row names a fix, it names the
-layer the fix lives at — C2 is the case where that mattered, because the
-mechanism moved after the row was written and the row kept describing the
-superseded one.
+**Sections A, B, D, E are as first written and still hold**, except where a
+row names a fix — B4 is that case: `remove_account` now clears the pin via
+`_clear_pin_if_removed` (see B4 below). Where a row names a fix, it names
+the layer the fix lives at — C2 is the other case where that mattered,
+because the mechanism moved after the row was written and the row kept
+describing the superseded one.
 
 The pin is **fail-open by design**: when anything below trips, the request
 leaves with the session's own bearer instead of failing. That keeps a

@@ -1424,18 +1424,13 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 # must not wait long. Nothing is lost by giving up — an unremoved wiring is
 # retried on the next launch, and the caller fails open either way.
 #
-# THIS IS THE BUDGET REQUESTED, NOT THE CEILING OBSERVED, and the gap is not
-# ours to close from here. `proper_lockfile` checks its deadline and THEN
-# sleeps `0.25 + random() * 0.25` unclamped, so one acquisition can overrun by
-# a full jittered sleep. The two consumers then differ: `_config_lock_is_free`
-# spends this PER CONFIG (~2.0s across two), while `clear_wiring` treats it as
-# a TOTAL split into fair shares (~1.5s by the same overrun). Neither is 0.5s.
-#
-# Clamping that sleep to the remaining budget is a one-line fix in
-# `claude_locks.py`, which is CORE cswap and deliberately out of this branch's
-# scope. Raising this number instead would be the wrong repair: it would make
-# the launch wait longer rather than less. Left as the request it is, with the
-# real ceiling named so nobody re-derives it from the constant.
+# `claude_locks.proper_lockfile`'s retry sleep is clamped to whatever is left
+# of the caller's budget (`_nap`), so one acquisition no longer overruns by a
+# full jittered `0.25 + random() * 0.25` sleep the way an unclamped one used
+# to; both consumers (`_config_lock_is_free`, `clear_wiring`) inherit that
+# clamp automatically through `proper_lockfile` itself. 0.5s stays the budget
+# requested rather than a measured ceiling, since the last retry can still
+# run past a near-empty remainder before the deadline check catches it.
 _LAUNCH_LOCK_BUDGET_S = 0.5
 
 # The same reasoning for the SERVING probe on that path. A refused connect on
