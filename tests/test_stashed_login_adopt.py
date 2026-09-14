@@ -19,7 +19,7 @@ import pytest
 from claude_swap import oauth
 from claude_swap.locking import FileLock
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+from claude_swap.json_output import USAGE_RELOGIN_REQUIRED, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import AUTH_DEAD_STRIKES, FetchRecord as FR
 
 
@@ -661,6 +661,28 @@ class TestTheCollectPassReachesTheStash:
             oauth.credential_fingerprint(DEAD)
         assert entry_id in sw._store._list_unclaimed_credentials()
         assert entries["2"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_a_read_only_pass_surfaces_an_expired_active_token(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """The active slot's own expired-credential sentinel is also a pure
+        read (``oauth.extract_oauth_data`` + ``is_oauth_token_expired``), so
+        read-only must still surface ``USAGE_TOKEN_EXPIRED`` for it rather
+        than silently serving stale last-good usage."""
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sample_sequence_data["accounts"]["1"]["email"] = "owner@example.com"
+        sw._write_json(sw.sequence_file, sample_sequence_data)
+        past_ms = int((time.time() - 3600) * 1000)
+        expired_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "old-access", "refreshToken": "old-refresh",
+            "expiresAt": past_ms,
+        }})
+        info = (1, "owner@example.com", "", "", True, expired_creds, "")
+
+        entries = sw._collect_usage_entries([info], fetch=set(), read_only=True)
+
+        assert entries["1"].sentinel == USAGE_TOKEN_EXPIRED
 
     def test_the_adopt_runs_before_the_sweep_that_follows_it(
         self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
