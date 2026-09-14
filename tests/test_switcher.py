@@ -3779,6 +3779,54 @@ class TestPerformSwitchPostDisplay:
         )
         assert backup_oauth["accessToken"] == "sk-rotated-1"
 
+    def test_ordinary_switch_carries_live_pointers_too(
+        self,
+        temp_home: Path,
+        mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """RED: ``pin.carry_live_pointers()``'s own docstring says it runs
+        "right after a switch writes ``~/.claude.json``" -- no carve-out for
+        which branch wrote it. The direct-activation branch calls it; the
+        ordinary rotation branch (every plain ``cswap switch`` and every auto
+        rotation) is the far more common path and must call it too, or a
+        switch made with the pin daemon down leaves every live session
+        vetoed until the daemon notices the file move on its own."""
+        switcher, creds_store, configs_store = self._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-live-1",
+                "refreshToken": "rt-orig-1",
+            },
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+
+        carried = []
+        try:
+            with patch(
+                "claude_swap.oauth.fetch_oauth_profile",
+                return_value={
+                    "uuid": "uuid-1",
+                    "email": "test@example.com",
+                    "organizationUuid": "",
+                },
+            ), patch(
+                "claude_swap.pin.carry_live_pointers",
+                side_effect=lambda: carried.append(True),
+            ):
+                switcher._perform_switch("2")
+        finally:
+            for p in patches:
+                p.stop()
+
+        assert carried, (
+            "carry_live_pointers() was not called on the ordinary switch path"
+        )
+
     def test_switch_refuses_to_overwrite_backup_with_empty_current_creds(
         self,
         temp_home: Path,
@@ -7245,6 +7293,38 @@ class TestNoPeerSlotMayShareARefreshGrant:
         shared = _grant_setup_token_creds("sk-ant-setup-shared")
         switcher._write_account_credentials(
             "1", "account1@example.com", shared, attributed=True,
+        )
+
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared,
+        )
+
+        assert switcher._read_account_credentials(
+            "2", "account2@example.com"
+        ) == shared
+
+    def test_own_family_resync_writing_back_an_existing_duplicate_does_not_refuse(
+        self, temp_home: Path, sample_sequence_data,
+    ):
+        """RED: the guard exists to refuse a write that CREATES a new
+        duplicate (the ponytail note at ``_refuse_if_peer_shares_grant``'s
+        call site), not to backfill-scan for one already on disk. If slot 1
+        and slot 2 already share a grant (a pre-existing duplicate, however
+        it got there) and a switch's own-family resync writes slot 2's
+        stored backup back into slot 2 unattributed -- the exact bytes slot
+        2 already held before this write -- that write creates nothing
+        new and must not be refused."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        (get_backup_root() / "sequence.json").write_text(
+            json.dumps(sample_sequence_data)
+        )
+        shared = _oauth_creds("shared", 7200)
+        switcher._write_account_credentials(
+            "1", "account1@example.com", shared, attributed=True,
+        )
+        switcher._write_account_credentials(
+            "2", "account2@example.com", shared, attributed=True,
         )
 
         switcher._write_account_credentials(
