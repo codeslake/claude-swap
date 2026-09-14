@@ -1148,6 +1148,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help=(
+            "Read the store as-is: no usage fetch, no login adopt, no stash "
+            "sweep (use with 'list' or 'status')"
+        ),
+    )
+    parser.add_argument(
         "--strategy",
         choices=["best", "next-available"],
         metavar="{best,next-available}",
@@ -1370,6 +1378,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # silently ignore it (a future additive field can add it).
         parser.error("--token-status cannot be combined with --json")
 
+    if args.read_only and not (args.list or args.status):
+        parser.error("--read-only can only be used with 'list' or 'status'")
+
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with bare 'switch'")
 
@@ -1452,6 +1463,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             payload = switcher.list_accounts(
                 show_token_status=args.token_status,
                 json_output=args.json,
+                read_only=args.read_only,
             )
         elif args.switch:
             from claude_swap.settings import load_settings, parse_model_names
@@ -1480,7 +1492,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 args.switch_to, json_output=args.json, force=args.force
             )
         elif args.status:
-            payload = switcher.status(json_output=args.json)
+            payload = switcher.status(json_output=args.json, read_only=args.read_only)
         elif args.purge:
             switcher.purge()
         elif args.export:

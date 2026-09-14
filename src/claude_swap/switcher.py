@@ -5647,6 +5647,7 @@ class ClaudeAccountSwitcher:
         *,
         scheduled: bool = False,
         sweep_stash: bool = True,
+        read_only: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -5662,7 +5663,10 @@ class ClaudeAccountSwitcher:
         is persisted (``_persist_poll_plans``), making every surface inherit
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
-        (stale-on-error).
+        (stale-on-error). ``read_only=True`` returns right after the pure
+        store read below: no dead-token adopt, no stash sweep, no reserve
+        claim, no fetch -- the store is served exactly as the last pass left
+        it.
         """
         store = self._usage_store
         identities = {
@@ -5680,6 +5684,15 @@ class ClaudeAccountSwitcher:
                 sentinels[num] = static
 
         entries = store.entries(identities, models)
+        if read_only:
+            # Skip the dead-token scan (it adopts/clears), the stash sweep,
+            # the reserve claim and the fetch pool: read-only means the store
+            # is served as-is, so no login is adopted and no refresh grant
+            # is consumed.
+            return {
+                num: with_sentinel(entries[num], sentinels.get(num))
+                for num in info_by_num
+            }
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
@@ -6673,6 +6686,7 @@ class ClaudeAccountSwitcher:
         show_token_status: bool = False,
         json_output: bool = False,
         fetch: set[str] | None = None,
+        read_only: bool = False,
     ) -> dict | None:
         """List all managed accounts.
 
@@ -6681,7 +6695,8 @@ class ClaudeAccountSwitcher:
 
         ``fetch`` restricts which accounts *may* be fetched this pass (the TUI
         watch view's adaptive set); ``None`` — the CLI default — leaves every
-        stale account eligible.
+        stale account eligible. ``read_only`` reads the store as-is: no fetch,
+        no login adopt, no stash sweep.
         """
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
@@ -6697,7 +6712,9 @@ class ClaudeAccountSwitcher:
             return None
 
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, read_only=read_only
+        )
 
         if json_output:
             return self._build_list_payload(accounts_info, entries)
@@ -6769,7 +6786,12 @@ class ClaudeAccountSwitcher:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def _active_account_usage(
-        self, account_num: str, current_email: str, org_uuid: str
+        self,
+        account_num: str,
+        current_email: str,
+        org_uuid: str,
+        *,
+        read_only: bool = False,
     ) -> UsageEntry:
         """Store-backed usage entry for just the active account.
 
@@ -6785,9 +6807,11 @@ class ClaudeAccountSwitcher:
         # A one-slot pass has no roster to compare against, so a `slot_creds`
         # map built from just this slot would make arms B/C keep rows a full
         # pass drops, flickering the kept-set warning: never sweep here.
-        return self._collect_usage_entries([info], sweep_stash=False)[str(account_num)]
+        return self._collect_usage_entries(
+            [info], sweep_stash=False, read_only=read_only
+        )[str(account_num)]
 
-    def _build_status_payload(self) -> dict:
+    def _build_status_payload(self, *, read_only: bool = False) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
         identity = self._get_current_account()
         if identity is None:
@@ -6812,7 +6836,9 @@ class ClaudeAccountSwitcher:
         org_name = acct.get("organizationName", "") or ""
         org_uuid = acct.get("organizationUuid", "") or ""
         alias = acct.get("alias", "") or ""
-        entry = self._active_account_usage(account_num, current_email, org_uuid)
+        entry = self._active_account_usage(
+            account_num, current_email, org_uuid, read_only=read_only
+        )
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
@@ -6847,10 +6873,12 @@ class ClaudeAccountSwitcher:
             "totalManagedAccounts": len(data.get("accounts", {})),
         }
 
-    def status(self, json_output: bool = False) -> dict | None:
+    def status(
+        self, json_output: bool = False, *, read_only: bool = False
+    ) -> dict | None:
         """Display current account status (or return the schema-v1 payload)."""
         if json_output:
-            return self._build_status_payload()
+            return self._build_status_payload(read_only=read_only)
 
         identity = self._get_current_account()
         if identity is None:
@@ -6877,7 +6905,7 @@ class ClaudeAccountSwitcher:
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(
-                account_num, current_email, current_org_uuid
+                account_num, current_email, current_org_uuid, read_only=read_only
             )
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")

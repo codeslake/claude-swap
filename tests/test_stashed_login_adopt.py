@@ -635,6 +635,31 @@ class TestTheCollectPassReachesTheStash:
         assert oauth.credential_fingerprint(stored) == \
             oauth.credential_fingerprint(FRESH)
 
+    def test_a_read_only_pass_leaves_the_stashed_login_where_it_is(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        """The control above proves the ordinary pass adopts. A read-only
+        pass must skip that write entirely: the stashed login stays
+        unclaimed and slot 2 keeps its DEAD fingerprint."""
+        sw = self._switcher(sample_sequence_data)
+        entry_id = sw._store._write_unclaimed_credential(FRESH, {
+            "reason": "foreign",
+            "configSlot": "1",
+            "fingerprint": oauth.credential_fingerprint(FRESH),
+            "resolvedIdentity": {"uuid": "uuid-owner",
+                                 "email": "owner@example.com",
+                                 "organizationUuid": None},
+        })
+
+        entries = sw._collect_usage_entries(
+            sw._build_accounts_info(), fetch=set(), read_only=True)
+
+        stored, _ = sw._read_account_credentials_ex("2", "owner@example.com")
+        assert oauth.credential_fingerprint(stored) == \
+            oauth.credential_fingerprint(DEAD)
+        assert entry_id in sw._store._list_unclaimed_credentials()
+        assert "2" in entries
+
     def test_the_adopt_runs_before_the_sweep_that_follows_it(
         self, temp_home, mock_claude_config, sample_sequence_data, monkeypatch
     ):
