@@ -186,9 +186,10 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     → ``3d00h``, ``resets 14h 4m`` → ``0d14h``, dropping the minute the same
     way a day-plus reading already does). Routing a two-digit hour through
     the day shape instead of zero-padding the hour digit itself keeps every
-    reading exactly 5 wide without ever writing ``02h04m`` or ``03d04h`` —
-    neither of which any caller or test expects. ``resets now`` and
-    ``refetching`` keep their own words.
+    reading 5 wide for any window the API serves today (none past 7d)
+    without ever writing ``02h04m`` or ``03d04h`` — neither of which any
+    caller or test expects. ``resets now`` and ``refetching`` keep their
+    own words.
 
     An unknown reset is a fact worth showing, not a reason to go blank: the
     strategy needs exactly this account activated once to learn it (see
