@@ -1424,18 +1424,13 @@ _WIRE_MARK = "_cswapPinWiredKeys"
 # must not wait long. Nothing is lost by giving up — an unremoved wiring is
 # retried on the next launch, and the caller fails open either way.
 #
-# THIS IS THE BUDGET REQUESTED, NOT THE CEILING OBSERVED, and the gap is not
-# ours to close from here. `proper_lockfile` checks its deadline and THEN
-# sleeps `0.25 + random() * 0.25` unclamped, so one acquisition can overrun by
-# a full jittered sleep. The two consumers then differ: `_config_lock_is_free`
-# spends this PER CONFIG (~2.0s across two), while `clear_wiring` treats it as
-# a TOTAL split into fair shares (~1.5s by the same overrun). Neither is 0.5s.
-#
-# Clamping that sleep to the remaining budget is a one-line fix in
-# `claude_locks.py`, which is CORE cswap and deliberately out of this branch's
-# scope. Raising this number instead would be the wrong repair: it would make
-# the launch wait longer rather than less. Left as the request it is, with the
-# real ceiling named so nobody re-derives it from the constant.
+# `claude_locks.proper_lockfile`'s retry sleep is clamped to whatever is left
+# of the caller's budget (`_nap`), so one acquisition no longer overruns by a
+# full jittered `0.25 + random() * 0.25` sleep the way an unclamped one used
+# to; both consumers (`_config_lock_is_free`, `clear_wiring`) inherit that
+# clamp automatically through `proper_lockfile` itself. 0.5s stays the budget
+# requested rather than a measured ceiling, since the last retry can still
+# run past a near-empty remainder before the deadline check catches it.
 _LAUNCH_LOCK_BUDGET_S = 0.5
 
 # The same reasoning for the SERVING probe on that path. A refused connect on
@@ -2316,6 +2311,96 @@ def serving_port(switcher, *, connect_timeout: float = 2.0) -> int | None:
     return port if _port_answers(port, connect_timeout) else None
 
 
+_MINT_STALL_WEDGE_S = 60.0  # matches cswap-pin's own bound, proxy.py _serving_can_pin
+
+
+def _daemon_can_pin(port: int, *, timeout: float) -> tuple[bool | None, str]:
+    """`/health`'s serving verdict and the reason for it. None with no
+    verdict at all — unreachable or non-JSON — collapses two causes into one
+    signal on purpose: neither says whether the pin can read the token, only
+    that this probe cannot tell. The reason travels WITH the verdict because
+    the causes of a False do not share one repair (below), and a caller that
+    sees only True/False/None cannot say which one happened.
+
+    ``can_pin`` alone is not the pin's own serving verdict: the pin's own
+    reader (``_serving_can_pin``) refuses once ``mint_stalled_s`` exceeds
+    `_MINT_STALL_WEDGE_S`, before it ever looks at ``can_pin`` -- the mint
+    lock forces ``can_pin`` true while busy so a false reading does not
+    trigger a port recycle. Mirrored here, or this probe calls OK a pin the
+    pin itself would already call not-serving. A body with no
+    ``mint_stalled_s`` (an old daemon) is read as not stalled, never as
+    NOT-OK.
+
+    A connection this function receives already passed `_port_answers`'s raw
+    connect, so a bare socket timeout or a reset mid-response here
+    (`TimeoutError`, `http.client.RemoteDisconnected` -- not a refused
+    connection, which `_port_answers` would already have ruled out) is the
+    daemon accepting TCP and never answering -- the same wedge the pin's own
+    reader treats as not-serving, not "no verdict".
+    """
+    import http.client
+    import urllib.request
+
+    # A LOOPBACK CALL, ROUTED DIRECT. `urlopen`'s default opener reads
+    # `http_proxy`/`no_proxy` from the environment on every call, and a host
+    # wired through a corporate/cache proxy has no reason to exempt
+    # 127.0.0.1 -- probing our OWN daemon must not be redirected through it.
+    # `_port_answers` avoids the same trap by using a raw socket instead.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(
+            f"http://127.0.0.1:{port}/health", timeout=timeout
+        ) as resp:
+            body = resp.read()
+    except (TimeoutError, http.client.RemoteDisconnected):
+        return False, "accepted a connection but never answered /health"
+    except Exception:  # noqa: BLE001 — unreachable: no verdict
+        return None, "the daemon is unreachable"
+    try:
+        data = json.loads(body.decode())
+    except Exception:  # noqa: BLE001 — malformed: no verdict
+        data = None
+    if not isinstance(data, dict):
+        return None, "/health returned unparseable JSON"
+    stalled = data.get("mint_stalled_s")
+    if isinstance(stalled, (int, float)) and stalled > _MINT_STALL_WEDGE_S:
+        return False, f"mint stalled {stalled:.0f}s past the {_MINT_STALL_WEDGE_S:.0f}s wedge"
+    can_pin = data.get("can_pin")
+    if can_pin is None:
+        return None, "/health carries no can_pin verdict"
+    return can_pin, ("can_pin=true" if can_pin else "can_pin=false")
+
+
+def _pin_state(switcher, *, connect_timeout: float = 2.0) -> tuple[str, str]:
+    """``cswap pin --state``'s verdict and detail: OK / NOT-OK / UNKNOWN.
+
+    The wiring half reuses `_dead_wired_configs` -- "should any wiring be
+    removed" is already the staleness verdict `--ensure` clears on, so a
+    stale wired port is NOT-OK without a second implementation of the
+    config walk. The token half only asks a daemon `serving_port` already
+    located: nothing served means nothing to ask, UNLESS a pin is still
+    RECORDED (`_pinned_email_now`) -- `--ensure` clears a dead wiring without
+    touching that record, so "nothing served" alone would read a pin
+    `--ensure` just tore down as a healthy unpinned machine. A served daemon
+    that can't say either way is UNKNOWN, not NOT-OK -- that distinction is
+    the entire point of this verb.
+    """
+    dead = _dead_wired_configs(switcher, connect_timeout=connect_timeout)
+    if dead:
+        return "NOT-OK", f"{len(dead)} wired config(s) not answering on their own port"
+    port = serving_port(switcher, connect_timeout=connect_timeout)
+    if port is None:
+        if _pinned_email_now(switcher) is not None:
+            return "NOT-OK", "a pin is recorded but nothing is wired or serving"
+        return "OK", "nothing wired, nothing served"
+    can_pin, why = _daemon_can_pin(port, timeout=connect_timeout)
+    if can_pin is None:
+        return "UNKNOWN", f"the daemon on port {port} gave no verdict on /health ({why})"
+    if can_pin:
+        return "OK", f"serving on port {port}, {why}"
+    return "NOT-OK", f"serving on port {port}, {why}"
+
+
 def run(
     switcher,
     account: str | None,
@@ -2325,6 +2410,7 @@ def run(
     get_certdir: bool = False,
     set_port: int | None = None,
     ensure: bool = False,
+    state: bool = False,
 ) -> int:
     """Entry point for ``cswap pin``. Mirrors :func:`claude_swap.menubar.run`:
     the optional dependency is resolved here, at call time, not at import."""
@@ -2332,9 +2418,10 @@ def run(
 
     # EVERY BRANCH ABOVE `_impl()` RUNS WITHOUT THE PACKAGE, and that ordering
     # is the contract, not an accident: `--ensure`, `--set_port`, `--get_port`,
-    # `--get_certdir`, `--heal` and `--clear` are the commands a user reaches
-    # for when the pin is the broken thing. Each is answered from cswap's own
-    # files. Only pinning itself needs the package, so only it resolves one.
+    # `--get_certdir`, `--state`, `--heal` and `--clear` are the commands a
+    # user reaches for when the pin is the broken thing. Each is answered
+    # from cswap's own files. Only pinning itself needs the package, so only
+    # it resolves one.
     if ensure:
         # The launch contract, which `--heal` deliberately does not make. An
         # rc hook calls this before EVERY `claude`, so it never fails (every
@@ -2424,6 +2511,20 @@ def run(
         # SEARCH for. Unlike --get_port this does NOT probe: "where does this
         # host keep it" is true whether or not a daemon is up.
         print(_certdir(switcher))
+        return 0
+
+    if state:
+        # EXIT 0 ON EVERY PATH, including a raise from the probes below: a
+        # caller's `grep -c OK` must not see an unreachable host and a
+        # broken pin merge into one exit code.
+        import sys
+
+        try:
+            verdict, detail = _pin_state(switcher)
+        except Exception as exc:  # noqa: BLE001 — no verdict, not a crash
+            verdict, detail = "UNKNOWN", f"the probe raised: {_safe(exc)}"
+        print(verdict)
+        print(detail, file=sys.stderr)
         return 0
 
     if heal_only:

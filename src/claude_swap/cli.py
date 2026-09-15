@@ -124,6 +124,7 @@ Examples:
   cswap pin --get_certdir  print the cert directory (for scripts)
   cswap pin --set_port N   serve on port N from the next start (0 = dynamic)
   cswap pin --ensure   repair a stale wiring before a launch (rc hooks)
+  cswap pin --state    print OK/NOT-OK/UNKNOWN and exit 0, for a monitor
         """,
     )
     # EXACTLY ONE OF THESE. `--debug` stays outside the group; everything else
@@ -186,6 +187,17 @@ Examples:
             "and does nothing when no pin is set. For rc hooks."
         ),
     )
+    # A monitor's `grep -c OK` collapses a broken pin and an unreachable host
+    # into one number, so this reads with a third word rather than a nonzero
+    # exit: UNKNOWN must stay distinguishable from NOT-OK. Exits 0 always.
+    one_of.add_argument(
+        "--state",
+        action="store_true",
+        help=(
+            "Print the pin's health as one word (OK/NOT-OK/UNKNOWN) on "
+            "stdout, detail on stderr, and always exit 0."
+        ),
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
 
@@ -231,6 +243,7 @@ Examples:
                 get_certdir=args.get_certdir,
                 set_port=args.set_port,
                 ensure=args.ensure,
+                state=args.state,
             )
         )
     except ClaudeSwitchError as e:

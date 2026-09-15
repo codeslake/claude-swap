@@ -1359,9 +1359,9 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Refuse a write that would leave two slots holding the same
         single-use refresh grant -- the precondition for the fan-out
-        double-spend (queue row #474): two slots each POST the same grant,
-        one wins, the other's lineage dies and forces a re-login inside its
-        own grant's window. Closes the write-time path that CREATES a new
+        double-spend: two slots each POST the same grant, one wins, the
+        other's lineage dies and forces a re-login inside its own grant's
+        window. Closes the write-time path that CREATES a new
         duplicate; it does not by itself retire the consume gate's lock (an
         attributed=True write -- the same login added under a second org,
         for one -- can still leave a peer holding matching bytes, since
@@ -1403,6 +1403,16 @@ class ClaudeAccountSwitcher:
             return
         fp = oauth.credential_fingerprint(credentials)
         if not fp or not fp.startswith("sha256:"):
+            return
+        own_failed: list = []
+        own_creds = self._store._read_account_credentials_direct(
+            account_num, email, own_failed
+        )
+        if own_creds and oauth.credential_fingerprint(own_creds) == fp:
+            # This slot's own stored backup already carries this exact
+            # fingerprint -- an own-family resync writing back what the
+            # slot already held creates no NEW duplicate, even if a peer
+            # also shares it from before this guard existed.
             return
         data = self._get_sequence_data() or {}
         for num in data.get("sequence", []):
@@ -9770,11 +9780,13 @@ class ClaudeAccountSwitcher:
           access token in the blob, bytes moved since the pre-lock read) —
           or was only *partially* established: a response missing email or
           organization matching nothing is indistinguishable from schema
-          drift, and preserve-and-skip on drift would silently recreate the
-          fail-closed behavior this design forbids. The caller falls back to
-          the exact pre-fix backup: the identity oracle is advisory, and
-          endpoint state must never change switch behavior beyond skipping
-          the extra safety.
+          drift. Routed like ``"foreign"``/``"alien"``: preserved in a
+          safety stash, never written into any slot. No longer fail-open
+          (an incident on 2026-09-07 traced a wrong active slot resolving
+          to slot 1 while the live bytes were slot 6's; the old pre-fix
+          backup here wrote slot 6's refresh token into slot 1's backup) —
+          the identity oracle is advisory only in the sense that its
+          failure never widens what gets written, only narrows it.
         """
         backup = self._read_account_credentials(current_account, current_email)
         if backup and backup == original_creds:
@@ -11202,9 +11214,11 @@ class ClaudeAccountSwitcher:
                 # says which slot is active; only the classification says who
                 # owns the live bytes (issue #117: an external write here
                 # used to destroy the outgoing slot's refresh token). The
-                # identity oracle is strictly advisory — "unresolved" falls
-                # back to the exact pre-fix backup, so endpoint state never
-                # decides whether a switch completes.
+                # identity oracle is strictly advisory — "unresolved" is
+                # preserved in a safety stash and never written into any
+                # slot (see the classifier's docstring), so endpoint state
+                # never decides whether a switch completes, only whether
+                # the outgoing bytes get backed up or stashed aside.
                 kind, foreign_slot = self._classify_outgoing_credential(
                     current_account, current_email, original_creds,
                     provenance, data,
@@ -11313,9 +11327,9 @@ class ClaudeAccountSwitcher:
                     # `_adopt_stashed_successor`'s gate by construction the
                     # instant it was written (nothing else need happen to the
                     # slot in between), so a later grant-consume would
-                    # silently adopt these unverified bytes — the wmac
-                    # cross-wire incident one step later. Left stranded until
-                    # a manual `cswap add` confirms it.
+                    # silently adopt these unverified bytes — a cross-wire
+                    # one step later. Left stranded until a manual
+                    # `cswap add` confirms it.
                     self._stash_live_credential(
                         original_creds, "unresolved", current_account,
                         provenance.get("resolved"),
@@ -11471,6 +11485,14 @@ class ClaudeAccountSwitcher:
                             f"Manual recovery may be needed."
                         )
                 raise
+
+            # AFTER the rollback block, so a carry can never undo a switch
+            # that succeeded -- same contract as the direct-activation
+            # branch above (:8186). This is the far more common path (every
+            # plain switch and every auto rotation), so leaving it out here
+            # left every live session vetoed until the daemon noticed the
+            # config move on its own.
+            _pin.carry_live_pointers()
 
         # Lock released. Safe to do network I/O and let persist callbacks
         # re-acquire the lock from inside list_accounts(). All of this is
