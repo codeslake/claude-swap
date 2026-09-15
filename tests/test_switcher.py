@@ -25643,7 +25643,9 @@ def test_a_completed_copy_is_not_emptied_by_the_recovery(
     from claude_swap import switcher as switcher_mod
 
     switcher = ClaudeAccountSwitcher()
-    target = switcher.backup_dir / "sequence.json"
+    # NOT `sequence.json`: this test is about `_write_json`'s own recovery,
+    # generic to any destination, not about the sequence file's own writer.
+    target = switcher.backup_dir / "test.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     switcher._write_json(target, {"activeAccountNumber": 1, "accounts": {}})
     os.chmod(target, 0o644)
