@@ -306,6 +306,12 @@ class TestFormatting:
         assert tui_data.chip_label("7d", "resets 3d 4h") == "7d(⟳3d04h):"
         assert tui_data.chip_label("7d", "resets 3d") == "7d(⟳3d00h):"
         assert tui_data.chip_label("7d", "resets 1d 11h") == "7d(⟳1d11h):"
+        # a two-digit hour with no day component would be 6 wide
+        # ("14h04m") if it stayed in the hour shape -- one column wider
+        # than every other reading; routed through the day-plus shape
+        # instead (correctness review, T0688) it stays 5 wide.
+        assert tui_data.chip_label("7d", "resets 14h 4m") == "7d(⟳0d14h):"
+        assert tui_data.chip_label("7d", "resets 10h") == "7d(⟳0d10h):"
         # unchanged branches
         assert tui_data.chip_label("5h", "resets now") == "5h(⟳now):"
         assert tui_data.chip_label("5h", tui_data.REFETCHING) == "5h(⟳refetching):"
@@ -2749,12 +2755,23 @@ class TestUnswitchableRowsAreListed:
                 "scoped": [{"name": "Fable", "pct": 60.0,
                             "resets_at": (now + timedelta(minutes=12)).isoformat()}],
             }),
+            # A 7d window with 10-23h left and no day component -- the
+            # hour shape alone would be 6 wide ("14h04m") here, one column
+            # wider than the other rows' 5-wide readings.
+            self._acct("4", "cccc@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 50.0,
+                              "resets_at": (now + timedelta(hours=2, minutes=4)).isoformat()},
+                "seven_day": {"pct": 40.0,
+                              "resets_at": (now + timedelta(hours=14, minutes=4)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 30.0,
+                            "resets_at": (now + timedelta(minutes=12)).isoformat()}],
+            }),
         ), active="9", settings=settings)
-        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 "))]
-        assert len(lines) == 2, lines
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 ", "4 "))]
+        assert len(lines) == 3, lines
         for window in ("5h(", "7d(", "Fable("):
             cols = [line.index(":", line.index(window)) for line in lines]
-            assert cols[0] == cols[1], (
+            assert len(set(cols)) == 1, (
                 f"{window!r} % column not aligned: {cols} in {lines!r}"
             )
 
