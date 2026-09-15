@@ -1606,6 +1606,21 @@ class CredentialStore:
             # must not raise here any more than the comprehension below,
             # which guards the same `int()` with the same check.
             return ""
+        if any(
+            num != account_num and other_email == email
+            for num, other_email in accounts.items()
+        ):
+            # A live sibling under this same email (two slots can
+            # legitimately share one login, different org) means an
+            # unbacked candidate found below could be a leaked orphan from
+            # THAT sibling's own renumber history, not this slot's — the
+            # two are indistinguishable once read back, and mirroring the
+            # wrong one in duplicates the sibling's refresh-token lineage
+            # across two slots (the consume gate then POSTs the same
+            # refresh token from either). Fail closed rather than guess;
+            # the single-account renumber recovery (no other slot claims
+            # this email) is untouched by this check.
+            return ""
         cache_key = (account_num, email, probe_reassigned_slots)
         if self._sweep_negative_cache.get(cache_key) == accounts:
             # ponytail: the sweep already ran once against this exact roster
@@ -1622,22 +1637,29 @@ class CredentialStore:
         # renumber), so the candidates are a bounded integer sweep, not
         # `accounts`' own keys.
         #
-        # This ceiling is a HEURISTIC, not a guarantee: the dotfiles roster
-        # is edited and synced as one wholesale file write, so N removals
-        # can land as a single renumber, and `+ len(accounts)` covers that
-        # only while N does not exceed the number of accounts that SURVIVE
-        # the edit (a survivor's leftover shifts down by at most N, and this
-        # adds N slots of headroom per current account). A wholesale write
-        # dropping MORE accounts than remain — e.g. 6 of 8 — can still leave
-        # a leftover past this ceiling (2 survivors give a ceiling of only
-        # +2, not +6). No SOUND bound exists at all on the Keychain backend
-        # (it cannot enumerate, so there is no way to glob for "anything
-        # left over" either) — this is the best available approximation,
-        # not a proof of coverage.
-        bound = (
+        # The current-roster HEURISTIC alone is not a guarantee: the
+        # dotfiles roster is edited and synced as one wholesale file write,
+        # so N removals can land as a single renumber, and `+ len(accounts)`
+        # covers that only while N does not exceed the number of accounts
+        # that SURVIVE the edit. A wholesale write dropping MORE accounts
+        # than remain — e.g. 6 of 8 — can still leave a leftover past this
+        # ceiling. `highestAccountNumber` (stamped on every `sequence.json`
+        # write, see `switcher._with_sequence_high_water`) is the real
+        # defense: a number persisted from BEFORE the edit, not a shape
+        # read off the roster the edit already changed, and it needs no
+        # enumeration — sound on the Keychain backend the same as the file
+        # one. The heuristic below is only the floor for a roster that has
+        # never carried the field (a fresh install, or one written before
+        # this defense existed).
+        heuristic_bound = (
             max([int(account_num)] + [int(n) for n in accounts if n.isdigit()])
             + len(accounts)
         )
+        try:
+            ever_used = int((sequence_data or {}).get("highestAccountNumber", 0))
+        except (TypeError, ValueError):
+            ever_used = 0
+        bound = max(heuristic_bound, ever_used)
         candidates: list[tuple[str, str]] = []
         for n in range(1, bound + 1):
             other_num = str(n)
