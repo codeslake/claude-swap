@@ -7521,6 +7521,7 @@ class ClaudeAccountSwitcher:
         *,
         scheduled: bool = False,
         sweep_stash: bool = True,
+        read_only: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
 
@@ -7536,7 +7537,12 @@ class ClaudeAccountSwitcher:
         is persisted (``_persist_poll_plans``), making every surface inherit
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
-        (stale-on-error).
+        (stale-on-error). ``read_only=True`` still runs the dead-token and
+        expired-credential SCANS below (both pure reads, so a quarantined or
+        expired slot still reports its sentinel), but skips every WRITE: no
+        stashed-login adopt, no stale-strike clear, no stash sweep, no
+        reserve claim, no fetch -- nothing is adopted and no refresh grant is
+        consumed.
         """
         store = self._usage_store
         identities = {
@@ -7557,6 +7563,10 @@ class ClaudeAccountSwitcher:
         # Dead refresh-token lineage: quarantine. Surfacing the sentinel here both
         # drives the "re-login needed" display and (via ``num not in sentinels``
         # below) stops the endless fetch loop that would otherwise 401/429 forever.
+        # ``_entry_token_dead`` is itself a pure read, so this scan still runs
+        # under ``read_only`` -- only its two WRITE arms (the adopt below and
+        # ``clear_dead_token`` further down) are skipped, or a quarantined slot
+        # would report stale last-good numbers instead of "re-login needed".
         live_slots: set[str] = set()
         for num in info_by_num:
             if num in sentinels:
@@ -7568,7 +7578,7 @@ class ClaudeAccountSwitcher:
             )
             if dead is False:
                 live_slots.add(num)
-            if dead and self._adopt_stashed_login_for_slot(num, _i[1]):
+            if dead and not read_only and self._adopt_stashed_login_for_slot(num, _i[1]):
                 # A login for this slot was set aside while the slot was
                 # still healthy, and nothing looked again once it died. This
                 # is the moment its condition became true, so re-read the row
@@ -7595,7 +7605,7 @@ class ClaudeAccountSwitcher:
                 # it answers, the next pass compares real bytes and the
                 # `elif` below either clears the strike or confirms it.
                 pass
-            elif entry.auth_dead_strikes and entry.token_dead():
+            elif not read_only and entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict. Clear the
                 # stale strike ROW too: display and fetch eligibility
@@ -7614,6 +7624,27 @@ class ClaudeAccountSwitcher:
                     expected_fingerprints={num: entry.struck_fingerprint},
                 )
                 entries = store.entries(identities, models)
+
+        if read_only:
+            # An expired ACTIVE credential gets the same read-only treatment:
+            # a pure read (no reserve claim, no fetch path runs to surface it
+            # otherwise), so it must be checked here rather than left to the
+            # claims-gated loop below, which read-only never reaches.
+            for num, info in info_by_num.items():
+                if num in sentinels or not info[4]:  # info[4] = is_active
+                    continue
+                active_oauth = oauth.extract_oauth_data(info[5])
+                if active_oauth and oauth.is_oauth_token_expired(
+                    active_oauth.get("expiresAt")
+                ):
+                    sentinels[num] = USAGE_TOKEN_EXPIRED
+            # Skip the stash sweep, the reserve claim and the fetch pool:
+            # read-only means the store is served as-is, so no login is
+            # adopted and no refresh grant is consumed.
+            return {
+                num: with_sentinel(entries[num], sentinels.get(num))
+                for num in info_by_num
+            }
         # Every pass, fetches or none: arm A of the sweep still drains a
         # refresh-and-access-dead row even when every fetch below fails, and
         # only THIS loop measures which slots are live enough to license
@@ -8573,6 +8604,7 @@ class ClaudeAccountSwitcher:
         show_token_status: bool = False,
         json_output: bool = False,
         fetch: set[str] | None = None,
+        read_only: bool = False,
     ) -> dict | None:
         """List all managed accounts.
 
@@ -8581,7 +8613,8 @@ class ClaudeAccountSwitcher:
 
         ``fetch`` restricts which accounts *may* be fetched this pass (the TUI
         watch view's adaptive set); ``None`` — the CLI default — leaves every
-        stale account eligible.
+        stale account eligible. ``read_only`` reads the store as-is: no fetch,
+        no login adopt, no stash sweep.
         """
         if not self.sequence_file.exists():
             # JSON mode must never prompt — emit an empty list instead of the
@@ -8597,7 +8630,9 @@ class ClaudeAccountSwitcher:
             return None
 
         accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, read_only=read_only
+        )
 
         if json_output:
             return self._build_list_payload(accounts_info, entries)
@@ -8669,7 +8704,12 @@ class ClaudeAccountSwitcher:
             self._logger.debug("Failed to detect running instances", exc_info=True)
 
     def _active_account_usage(
-        self, account_num: str, current_email: str, org_uuid: str
+        self,
+        account_num: str,
+        current_email: str,
+        org_uuid: str,
+        *,
+        read_only: bool = False,
     ) -> UsageEntry:
         """Store-backed usage entry for just the active account.
 
@@ -8685,9 +8725,11 @@ class ClaudeAccountSwitcher:
         # A one-slot pass has no roster to compare against, so a `slot_creds`
         # map built from just this slot would make arms B/C keep rows a full
         # pass drops, flickering the kept-set warning: never sweep here.
-        return self._collect_usage_entries([info], sweep_stash=False)[str(account_num)]
+        return self._collect_usage_entries(
+            [info], sweep_stash=False, read_only=read_only
+        )[str(account_num)]
 
-    def _build_status_payload(self) -> dict:
+    def _build_status_payload(self, *, read_only: bool = False) -> dict:
         """Build the ``--status --json`` payload (no active / unmanaged / managed)."""
         # THE LIVE LOGIN — this payload reports who is active.
         identity = self._live_login_identity()
@@ -8713,7 +8755,9 @@ class ClaudeAccountSwitcher:
         org_name = acct.get("organizationName", "") or ""
         org_uuid = acct.get("organizationUuid", "") or ""
         alias = acct.get("alias", "") or ""
-        entry = self._active_account_usage(account_num, current_email, org_uuid)
+        entry = self._active_account_usage(
+            account_num, current_email, org_uuid, read_only=read_only
+        )
         # Decision-grade projection, same rule as the --list payload: stale
         # beyond STALE_OK_S reports unavailable, not "ok" with old numbers.
         # models=() — see `_usage_by_account`; `--status` shows the
@@ -8750,10 +8794,12 @@ class ClaudeAccountSwitcher:
             "totalManagedAccounts": len(data.get("accounts", {})),
         }
 
-    def status(self, json_output: bool = False) -> dict | None:
+    def status(
+        self, json_output: bool = False, *, read_only: bool = False
+    ) -> dict | None:
         """Display current account status (or return the schema-v1 payload)."""
         if json_output:
-            return self._build_status_payload()
+            return self._build_status_payload(read_only=read_only)
 
         # THE LIVE LOGIN — this prints who is active, and the identity file
         # names the PIN after a rotation. See `_live_login_identity`.
@@ -8782,7 +8828,7 @@ class ClaudeAccountSwitcher:
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
             entry = self._active_account_usage(
-                account_num, current_email, current_org_uuid
+                account_num, current_email, current_org_uuid, read_only=read_only
             )
             for line in _usage_entry_lines(entry):
                 print(f"  {line}")

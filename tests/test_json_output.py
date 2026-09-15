@@ -247,6 +247,60 @@ class TestListJson:
         assert acct1["usageStatus"] == "ok"
         assert acct1["usage"]["fiveHour"]["resetsAt"] == resets_at
 
+    def test_read_only_list_names_the_live_slot_without_fetching(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """A read-only pass must answer 'which slot is live' from local reads
+        only: no fetch, no stashed-login adopt, no stash sweep, no reserve
+        claim — and, on an unchanged tree, the same content an ordinary pass
+        would have reported."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
+        usage = {
+            "five_hour": {"pct": 10.0, "resets_at": "2026-01-01T00:00:00Z",
+                          "countdown": "1h", "clock": "01:00"},
+        }
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(usage)):
+            ordinary_payload = switcher.list_accounts(json_output=True)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch_mock, \
+             patch.object(switcher, "_adopt_stashed_login_for_slot") as adopt_mock, \
+             patch.object(switcher, "_sweep_unclaimed_stash") as sweep_mock, \
+             patch.object(switcher._usage_store, "reserve") as reserve_mock:
+            read_only_payload = switcher.list_accounts(json_output=True, read_only=True)
+
+        fetch_mock.assert_not_called()
+        adopt_mock.assert_not_called()
+        sweep_mock.assert_not_called()
+        reserve_mock.assert_not_called()
+        assert read_only_payload["activeAccountNumber"] == 1
+        acct1 = next(a for a in read_only_payload["accounts"] if a["number"] == 1)
+        assert acct1["active"] is True
+
+        assert (read_only_payload["activeAccountNumber"]
+                == ordinary_payload["activeAccountNumber"])
+        ordinary_by_num = {a["number"]: a for a in ordinary_payload["accounts"]}
+        assert {a["number"] for a in read_only_payload["accounts"]} == \
+            set(ordinary_by_num)
+        for acct in read_only_payload["accounts"]:
+            other = ordinary_by_num[acct["number"]]
+            assert acct["active"] == other["active"]
+            assert acct["usageStatus"] == other["usageStatus"]
+            assert acct["usage"] == other["usage"]
+
     def test_list_payload_includes_alias(
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
@@ -429,6 +483,41 @@ class TestStatusJson:
         assert active["usageStatus"] == "ok"
         assert active["usage"]["fiveHour"]["resetsAt"] == resets_at
         assert payload["totalManagedAccounts"] == 2
+
+    def test_status_read_only_reaches_the_switcher_unfetched(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """The real chain end to end, not a mocked ``status``/switcher class:
+        ``status(read_only=True)`` -> ``_active_account_usage(read_only=True)``
+        -> ``_collect_usage_entries(read_only=True)`` must reach the store
+        without a fetch. The store is seeded first so an empty-store early
+        return could not pass this by coincidence: the served pct must be
+        the seeded one, not merely absent."""
+        from claude_swap.usage_store import FetchRecord
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        switcher._usage_store.record(
+            {"1": FetchRecord(usage={"five_hour": {"pct": 25.0}})},
+            {"1": ("test@example.com", "")},
+        )
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as fetch_mock:
+            payload = switcher.status(json_output=True, read_only=True)
+
+        fetch_mock.assert_not_called()
+        active = payload["active"]
+        assert active["number"] == 1
+        assert active["managed"] is True
+        assert active["usageStatus"] == "ok"
+        assert active["usage"]["fiveHour"]["pct"] == 25.0
 
     def test_status_managed_includes_display_grade_last_good(
         self, temp_home: Path, mock_claude_config: Path,

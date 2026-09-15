@@ -181,6 +181,7 @@ class TestCLI:
         switcher_cls.return_value.list_accounts.assert_called_once_with(
             show_token_status=True,
             json_output=False,
+            read_only=False,
         )
 
     def test_strategy_best_requires_switch(self, capsys):
@@ -912,7 +913,7 @@ class TestSubcommandAliases:
             switcher_cls.return_value.list_accounts.return_value = payload
             cli.main()
         switcher_cls.return_value.list_accounts.assert_called_once_with(
-            show_token_status=False, json_output=True,
+            show_token_status=False, json_output=True, read_only=False,
         )
 
     def test_run_subcommand_still_dispatches(self):
@@ -982,7 +983,7 @@ class TestJsonOutputCli:
             cli.main()
 
         switcher_cls.return_value.list_accounts.assert_called_once_with(
-            show_token_status=False, json_output=True,
+            show_token_status=False, json_output=True, read_only=False,
         )
         out = capsys.readouterr().out
         assert json.loads(out) == payload  # exactly one JSON object, no extra text
@@ -1019,6 +1020,41 @@ class TestJsonOutputCli:
         assert out["models"] == ["Fable"]
         assert out["modelSource"] == "cli"
         assert out["switched"] is True
+
+    def test_read_only_rejected_without_list_or_status(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "--switch", "--read-only"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "--read-only can only be used with 'list' or 'status'" in \
+            capsys.readouterr().err
+
+    def test_list_json_read_only_forwarded(self, capsys):
+        payload = {"schemaVersion": 1, "activeAccountNumber": None, "accounts": []}
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv",
+                          ["claude-swap", "--list", "--json", "--read-only"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.list_accounts.return_value = payload
+            cli.main()
+
+        switcher_cls.return_value.list_accounts.assert_called_once_with(
+            show_token_status=False, json_output=True, read_only=True,
+        )
+        assert json.loads(capsys.readouterr().out) == payload
+
+    def test_status_read_only_forwarded(self, capsys):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--status", "--read-only"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            switcher_cls.return_value.status.return_value = None
+            cli.main()
+
+        switcher_cls.return_value.status.assert_called_once_with(
+            json_output=False, read_only=True,
+        )
 
     def test_error_envelope_on_stdout_with_exit_1(self, capsys):
         from claude_swap.exceptions import ConfigError

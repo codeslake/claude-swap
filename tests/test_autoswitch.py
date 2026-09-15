@@ -4742,6 +4742,38 @@ class TestRunLoop:
         assert len(calls) == 2
         assert any(isinstance(e, ErrorEvent) for e in harness.events)
 
+    def test_next_delay_exception_retry_keeps_the_thundering_herd_jitter(
+        self, harness
+    ):
+        """`tick()` documents "never raises" and has its own safety net, so
+        run_loop's outer except is for `_next_delay`/the sleep emit, not for
+        `tick()` -- it cannot retry through `_next_delay` on ITS OWN
+        exception, but the flat `interval_seconds` fallback that replaced it
+        must not drop the +-10% jitter `_next_delay` exists to add, or every
+        machine erroring on the same upstream fault polls it in lockstep."""
+        calls = []
+
+        def fake_next_delay(outcome):
+            calls.append(outcome)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            harness.engine.stop()
+            return 0
+
+        waits = []
+
+        with patch.object(
+            harness.engine, "tick", return_value=TickOutcome.NO_ACTION
+        ), patch.object(
+            harness.engine, "_next_delay", side_effect=fake_next_delay
+        ), patch.object(
+            harness.engine._wake, "wait", side_effect=lambda d=None: waits.append(d)
+        ), patch("random.random", return_value=0.0):
+            harness.engine.run_loop()
+        assert waits[0] == pytest.approx(
+            harness.engine.settings.interval_seconds * 0.9
+        )
+
     def test_stop_before_start_is_not_lost(self, harness):
         # A stop() issued before the worker thread enters run_loop must not
         # be cleared away: the loop exits without a single tick.
@@ -4749,6 +4781,79 @@ class TestRunLoop:
         with patch.object(harness.engine, "tick") as tick:
             assert harness.engine.run_loop() == 0
         tick.assert_not_called()
+
+    def test_loop_survives_a_raising_next_delay(self, harness):
+        """`_next_delay` and the sleep emit sit AFTER `tick()`'s own guard —
+        a raise there used to escape `run_loop` unseen (`exit_on_error=False`
+        kills the TUI worker with nothing printed anywhere)."""
+        calls = []
+
+        def fake_next_delay(outcome):
+            calls.append(outcome)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            harness.engine.stop()
+            return 0
+
+        with patch.object(
+            harness.engine, "tick", return_value=TickOutcome.NO_ACTION
+        ), patch.object(
+            harness.engine, "_next_delay", side_effect=fake_next_delay
+        ), patch.object(harness.engine._wake, "wait", return_value=None):
+            assert harness.engine.run_loop() == 0
+        assert len(calls) == 2
+        assert any(isinstance(e, ErrorEvent) for e in harness.events)
+
+    def test_normal_stop_leaves_no_engine_stopped_line(self, harness):
+        # CONTROL for the exit-cleanup below: `stop()` already released the
+        # LIVE lock and this exit is expected, so run_loop's own cleanup must
+        # stay silent here — the guard that fires for every OTHER exit must
+        # not fire for this one too. Read via `on_event` (unconditional),
+        # not the decision log: `stop()` sets `dry_run = True`, which gates
+        # the log write on its own and would pass this even unguarded.
+        harness.engine.stop()
+        assert harness.engine.run_loop() == 0
+        assert not any(
+            isinstance(e, ErrorEvent) and e.message.startswith("engine stopped:")
+            for e in harness.events
+        )
+
+    def test_lock_drops_even_if_the_exit_announcement_raises(self, temp_home):
+        """`_emit`'s decision-log write sits outside `_emit`'s own try (only
+        `on_event` is guarded) -- nothing that can raise may sit between the
+        exit and the release, or a process that cannot log its own death
+        keeps `.auto-live.lock` forever, which is the exact bug this exit
+        cleanup exists to close. Faked here (today's `RotatingFileHandler`
+        swallows its own write errors via `Handler.handleError`) as an
+        ordering pin against a future logger that does not."""
+        h = EngineHarness(temp_home, decision_log=True)
+        engine = h.engine
+        assert engine._live_lock is not None, "premise: this engine is LIVE"
+
+        class _BoomLogger:
+            def info(self, *a, **kw):
+                raise OSError("disk full")
+
+        engine._decisions = _BoomLogger()
+        engine._consumer_gone = True
+        with pytest.raises(OSError):
+            engine.run_loop()
+        assert engine._live_lock is None
+
+    def test_stop_initiated_exit_does_not_also_touch_the_live_lock(
+        self, harness, monkeypatch
+    ):
+        """`stop()` releases under `_stop_lock` and decides `dry_run` itself
+        (autoview's LIVE badge reads `not dry_run`). If run_loop's own
+        cleanup ALSO calls `_release_live()` on this exit, the two race for
+        `_live_lock`: `stop()` can find it already `None` and skip
+        `dry_run = True`, leaving a dead engine badged LIVE."""
+        engine = harness.engine
+        calls = []
+        monkeypatch.setattr(engine, "_release_live", lambda: calls.append(1))
+        engine.stop()
+        assert engine.run_loop() == 0
+        assert calls == [], "run_loop must leave the LIVE release to stop()"
 
     def test_wake_during_tick_cuts_the_following_sleep_short(self, harness):
         # No wait patching on purpose: if the clear-at-top ordering were
@@ -15216,6 +15321,19 @@ class TestABrokenPipeEndsTheLoopInsteadOfOrphaningIt:
         )
         assert engine.run_loop() == 0
         assert engine._consumer_gone is True
+
+    def test_a_broken_pipe_drops_the_live_lock(self, harness, monkeypatch):
+        """The process outlives the loop with nothing left to release it —
+        #522's signature. A dead engine holding LIVE blocks every later
+        promotion, so the exit itself must drop `.auto-live.lock`."""
+        engine = harness.engine
+        self._no_waiting(engine, monkeypatch)
+        assert engine._live_lock is not None, "premise: this engine is LIVE"
+        engine.on_event = lambda ev: (_ for _ in ()).throw(
+            BrokenPipeError(32, "Broken pipe")
+        )
+        assert engine.run_loop() == 0
+        assert engine._live_lock is None
 
     def test_an_epipe_oserror_is_the_same_exception(self):
         """Not a second path -- a PREMISE, and it is why the check is one

@@ -554,6 +554,41 @@ class TestTryRefreshOAuthCredentials:
         assert rotated["accessToken"] == "new-access"
         assert rotated["refreshToken"] == "new-refresh"
 
+    def test_refresh_drops_the_previous_blobs_tier(self):
+        credentials = json.dumps({
+            "organizationUuid": "org-1",
+            "claudeAiOauth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 0,
+                "subscriptionType": "pro",
+                "rateLimitTier": "default_claude_ai",
+            },
+        })
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "scope": "user:profile user:inference",
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            outcome = oauth.try_refresh_oauth_credentials(credentials)
+
+        rotated = json.loads(outcome.credentials)
+        oauth_blob = rotated["claudeAiOauth"]
+        assert "subscriptionType" not in oauth_blob
+        assert "rateLimitTier" not in oauth_blob
+        assert rotated["organizationUuid"] == "org-1"
+        assert oauth_blob["accessToken"] == "new-access"
+        assert oauth_blob["refreshToken"] == "new-refresh"
+        assert oauth_blob["scopes"] == ["user:profile", "user:inference"]
+
     def test_invalid_grant_body_on_400_is_permanent(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
