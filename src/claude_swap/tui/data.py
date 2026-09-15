@@ -182,7 +182,14 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     countdowns differ in width (owner, 2026-09-15): under a day, ``{h}h{mm}m``
     (``resets 2h 4m`` → ``2h04m``, ``resets 2h`` → ``2h00m``); a day or more,
     ``{d}d{hh}h`` (``resets 3d 4h`` → ``3d04h``, ``resets 3d`` → ``3d00h``).
-    ``resets now`` and ``refetching`` keep their own words.
+    ``resets now`` and ``refetching`` keep their own words. The leading digit
+    (``h`` here, ``d`` in the day-plus shape) is deliberately NOT
+    zero-padded — the required shape pins ``2h04m``, not ``02h04m`` — so a
+    7d/scoped window can still land one column off in the narrow band where
+    10-23h remain within its own last day (a two-digit hour there is one
+    character wider than every other under-a-day or day-plus reading); the
+    5h window never reaches that band (it caps at under 5h) and the
+    countdowns the owner reported (all under 10h) are unaffected.
 
     An unknown reset is a fact worth showing, not a reason to go blank: the
     strategy needs exactly this account activated once to learn it (see
@@ -202,7 +209,7 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     if not reset:
         return "5h(⟳5h00m):" if label == "5h" and pct == 0 else f"{label}(⟳?):"
     countdown = reset.removeprefix("resets ")
-    if countdown not in ("now",) and countdown != REFETCHING:
+    if countdown != "now" and countdown != REFETCHING:
         units = {unit: num for num, unit in re.findall(r"(\d+)([dhms])", countdown)}
         days = int(units.get("d", 0))
         countdown = (
