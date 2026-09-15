@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -176,6 +177,13 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     colour it by severity. The countdown shows whenever it is known, not only
     at 100%: a saturated candidate's worth IS when it comes back.
 
+    A known countdown renders in one fixed-width shape, zero-padded, so the
+    ``:`` before the pct lands on the same column across rows whose raw
+    countdowns differ in width (owner, 2026-09-15): under a day, ``{h}h{mm}m``
+    (``resets 2h 4m`` → ``2h04m``, ``resets 2h`` → ``2h00m``); a day or more,
+    ``{d}d{hh}h`` (``resets 3d 4h`` → ``3d04h``, ``resets 3d`` → ``3d00h``).
+    ``resets now`` and ``refetching`` keep their own words.
+
     An unknown reset is a fact worth showing, not a reason to go blank: the
     strategy needs exactly this account activated once to learn it (see
     autoswitch.py's consume-first probe admission), so hiding the gap read as
@@ -193,7 +201,16 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     """
     if not reset:
         return "5h(⟳5h00m):" if label == "5h" and pct == 0 else f"{label}(⟳?):"
-    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
+    countdown = reset.removeprefix("resets ")
+    if countdown not in ("now",) and countdown != REFETCHING:
+        units = {unit: num for num, unit in re.findall(r"(\d+)([dhms])", countdown)}
+        days = int(units.get("d", 0))
+        countdown = (
+            f"{days}d{int(units.get('h', 0)):02d}h"
+            if days
+            else f"{int(units.get('h', 0))}h{int(units.get('m', 0)):02d}m"
+        )
+    return f"{label}(⟳{countdown}):"
 
 
 def format_duration(seconds: float) -> str:
