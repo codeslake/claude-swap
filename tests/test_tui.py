@@ -309,7 +309,7 @@ class TestFormatting:
         # a two-digit hour with no day component would be 6 wide
         # ("14h04m") if it stayed in the hour shape -- one column wider
         # than every other reading; routed through the day-plus shape
-        # instead (correctness review, T0688) it stays 5 wide.
+        # instead it stays 5 wide.
         assert tui_data.chip_label("7d", "resets 14h 4m") == "7d(⟳0d14h):"
         assert tui_data.chip_label("7d", "resets 10h") == "7d(⟳0d10h):"
         # unchanged branches
