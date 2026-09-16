@@ -2620,6 +2620,19 @@ class TestUnswitchableRowsAreListed:
         assert "7d full" in out, (
             f"the excluded 7d-exhausted row gave no reason: {out!r}"
         )
+        # `at-limit` (active exhausted) with every account -- active
+        # included -- at/over the threshold is `_rank_candidates_pass`'s
+        # OTHER `by_recovery_axis` disjunct (autoswitch.py): a known active
+        # recovery plus nothing worth having takes the recovery axis here
+        # too, not just under `proactive`/consume-first's plain `all_above`
+        # case. Consume-first's usual "soonest reset" would be the wrong
+        # claim -- this admits `fivehour@x.com` on recovery time, not its
+        # weekly reset (10 days behind `sevenday@x.com`'s, which stays
+        # excluded regardless).
+        assert "Next best (soonest to recover)" in out, (
+            f"the legend named consume-first's usual key over an at-limit "
+            f"recovery-axis ranking: {out!r}"
+        )
 
     def test_CONTROL_a_7d_exhausted_account_alone_is_excluded_not_ranked(self):
         """CONTROL for the row above: with no 5h-exhausted peer to land on,

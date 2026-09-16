@@ -28,8 +28,10 @@ from textual.widgets import Footer, RichLog, Static
 from claude_swap import oauth
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
+    SPENT_HEADROOM_PCT,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
     _every_account_above_threshold,
@@ -650,24 +652,49 @@ class AutoScreen(Screen):
         # measured account, active included, is at/over the threshold,
         # `_rank_candidates_pass`'s own `by_recovery_axis` (autoswitch.py)
         # switches to "who returns first" instead -- neither "soonest
-        # reset" nor "most headroom" has an answer there. Same axis, same
-        # trigger set (`"proactive"`, `*CONSUME_FIRST_STRATEGIES`), same
-        # `headroom` dict the ranking pass above actually used
-        # (`final_axis`, not always `models` -- the retry can move it).
+        # reset" nor "most headroom" has an answer there. Same predicate,
+        # same axis (`final_axis`, not always `models` -- the retry can
+        # move it), same TWO disjuncts `by_recovery_axis` itself checks:
+        # `proactive`/consume-first/dynamic take it on `all_above` alone;
+        # `at-limit` only past its own narrower bar (a known active
+        # recovery, and nothing else worth having) -- reusing
+        # `_binding_recovery_ts`/`SPENT_HEADROOM_PCT`, not a re-derived
+        # threshold, for the same reason `_every_account_above_threshold`
+        # itself is imported rather than copied.
         final_headroom = _headroom_by_account(usage, final_axis)
-        recovery_axis = trigger in (
-            "proactive", *CONSUME_FIRST_STRATEGIES
-        ) and _every_account_above_threshold(
+        all_above = _every_account_above_threshold(
             oauth_candidates, final_headroom, final_headroom.get(active_number),
             settings.threshold,
         )
-        if recovery_axis:
-            rank_key = "soonest to recover"
-        elif consume_first and trigger not in (None, "at-limit"):
-            rank_key = "soonest reset"
+        recovery_axis = all_above and (
+            trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
+            or (
+                trigger == "at-limit"
+                and _binding_recovery_ts(usage.get(active_number), final_axis, now)
+                != float("inf")
+                and max(
+                    (h for h in map(final_headroom.get, oauth_candidates)
+                     if h is not None),
+                    default=0.0,
+                ) <= SPENT_HEADROOM_PCT
+            )
+        )
+        if dynamic_unmodeled:
+            # No key at all: every row above rendered in slot order
+            # (`ordered_rank` is empty), so naming ANY axis here would be
+            # the same false claim the "not previewed" body text exists to
+            # avoid.
+            text.append("Next best", style=palette.muted)
         else:
-            rank_key = "most headroom"
-        text.append(f"Next best ({rank_key})", style=palette.muted)
+            if recovery_axis:
+                rank_key = "soonest to recover"
+            elif (
+                consume_first and trigger not in (None, "at-limit") and not all_above
+            ):
+                rank_key = "soonest reset"
+            else:
+                rank_key = "most headroom"
+            text.append(f"Next best ({rank_key})", style=palette.muted)
         if not ranked:
             # Reached only when this is the sole account. Slots that cannot be
             # switched to are listed above with the reason, so "no other
