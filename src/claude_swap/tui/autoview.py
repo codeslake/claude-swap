@@ -30,7 +30,9 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _classify_dynamic_trigger,
     _headroom_by_account,
+    _model_window_binds_everywhere,
     binding_pct,
     classify_candidate_block,
     model_block_label,
@@ -388,44 +390,6 @@ class AutoScreen(Screen):
         consume_first = bool(
             self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
         )
-        # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
-        # `models`: `_rank_candidates` (autoswitch.py) drops the model set
-        # and retries on 5h/7d alone when the model-gated pass finds no
-        # healthy candidate — so a panel that always ranks on `models` can
-        # name a top row the engine would never pick (still model-gated
-        # ranking a fleet the engine has already dropped it for). But the
-        # engine only runs that retry under `strategy == "dynamic"`
-        # (autoswitch.py's `_rank_candidates`) — gated the same way here, or
-        # `best`/`consume-first` rank on an axis the engine is forbidden to
-        # use. Same predicate as the model-gated pass's own health filter
-        # (`classify_candidate_block` — "open" is exactly what that filter
-        # lets through): any candidate reading "open" means the model-gated
-        # pass has something to work with, so keep `models`; none reading
-        # "open" means it would come back empty, so rank on the retry's
-        # axis instead — a "model"-only block clears once `models` drops,
-        # and a "full" block stays blocked either way.
-        rank_models = models
-        if models and self._settings and self._settings.strategy == "dynamic":
-            threshold = self._settings.threshold
-            for acc in snap.accounts:
-                if (
-                    acc.number == active_number
-                    or not acc.switchable
-                    or acc.usage.sentinel is not None
-                    or binding_pct(acc.usage.last_good, models) is None
-                ):
-                    continue
-                windows = (
-                    (label, p)
-                    for label, p, _ in oauth.relevant_windows(
-                        acc.usage.last_good, models
-                    )
-                )
-                kind, _ = classify_candidate_block(windows, threshold)
-                if kind == "open":
-                    break
-            else:
-                rank_models = ()
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         # The badge rides on that account's own row rather than the summary
@@ -445,14 +409,7 @@ class AutoScreen(Screen):
             default=0,
         )
         now = time.time()
-        # THE ENGINE'S OWN ADMISSION, not a re-derived predicate (#199): a
-        # static pass call, needing no engine instance, for which candidates
-        # a tick would consider and in what order. `decision_value`, not raw
-        # `last_good`, so a rolled window (#325) reads the same as the pass.
-        usage_by_account = {
-            acc.number: acc.usage.decision_value(rank_models)
-            for acc in snap.accounts
-        }
+        settings = self._settings or AutoSwitchSettings()
         # `switchable_account_numbers()` (switcher.py) drops `disabled` too.
         oauth_candidates = [
             acc.number
@@ -462,23 +419,73 @@ class AutoScreen(Screen):
             and not acc.disabled
             and acc.kind != "api_key"
         ]
-        headroom = _headroom_by_account(usage_by_account, rank_models)
-        settings = self._settings or AutoSwitchSettings()
-        # `trigger=settings.strategy`: the same literal the engine itself
-        # passes on a below-threshold consume-first/dynamic tick
-        # (`_tick_inner`) -- the panel tracks none of its other tick-time
-        # trigger state (disabled-active/at-limit/proactive/failover).
-        ordered, *_rest = rank_candidates_pass(
-            models=rank_models, trigger=settings.strategy,
-            consume_first=consume_first, oauth_candidates=oauth_candidates,
-            no_return=None, usage=usage_by_account, headroom=headroom,
-            current=active_number, active_headroom=headroom.get(active_number),
-            settings=settings, now=now, entries=None,
-            probe_cooldown=(
-                self._engine._last_probe_cooldown
-                if getattr(self, "_engine", None) is not None else None
-            ),
-        )
+
+        def _trigger_for(active_headroom: float) -> str:
+            # Mirrors `_tick_inner`'s own classification closely enough for
+            # `_rank_candidates_pass`'s gates to engage the way they would
+            # on a real tick -- an unrecognized literal (e.g. the bare
+            # strategy name "best") skips every gate in the pass and admits
+            # whatever is readable, unranked, which is the defect class
+            # this refactor exists to close (#199). Called only once
+            # `active_headroom` is known not to be `None` (see `_rank_on`).
+            if settings.strategy == "dynamic":
+                kind = _classify_dynamic_trigger(active_headroom)
+                # "dynamic-healthy" is `dynamic`'s own warm-tier alternation
+                # ranking in real ticks, a separate mechanism entirely and
+                # out of this panel's scope; "proactive" is the closest
+                # trigger the pass itself recognizes.
+                return "proactive" if kind == "dynamic-healthy" else kind
+            if (
+                settings.strategy in CONSUME_FIRST_STRATEGIES
+                and (100.0 - active_headroom) < settings.threshold
+            ):
+                return settings.strategy
+            return "at-limit" if active_headroom <= 0 else "proactive"
+
+        def _rank_on(axis: tuple[str, ...]) -> tuple[list[str], dict]:
+            usage = {
+                acc.number: acc.usage.decision_value(axis) for acc in snap.accounts
+            }
+            headroom = _headroom_by_account(usage, axis)
+            active_headroom = headroom.get(active_number)
+            if active_headroom is None:
+                # The active's own state is unmeasured (a stale store row
+                # past `STALE_OK_S`, or an unreadable/sentinel entry): no
+                # trigger this panel can derive maps to a real tick's
+                # "failover" (that needs `unhealthy_ticks` state this panel
+                # never sees), and every OTHER trigger's landing gate falls
+                # through unfiltered once `active_headroom` is None -- so
+                # rank nothing rather than admit everything.
+                return [], usage
+            ordered, *_rest = rank_candidates_pass(
+                models=axis, trigger=_trigger_for(active_headroom),
+                consume_first=consume_first, oauth_candidates=oauth_candidates,
+                no_return=None, usage=usage, headroom=headroom,
+                current=active_number, active_headroom=active_headroom,
+                settings=settings, now=now, entries=None,
+                probe_cooldown=getattr(
+                    getattr(self, "_engine", None), "_last_probe_cooldown", None
+                ),
+            )
+            return ordered, usage
+
+        # THE ENGINE'S OWN ADMISSION, not a re-derived predicate (#199): a
+        # static pass call, needing no engine instance, for which candidates
+        # a tick would consider and in what order.
+        ordered, usage_by_account = _rank_on(models)
+        # The SAME retry `_rank_candidates` makes (`dynamic` only): drop the
+        # model set and re-rank on 5h/7d alone, but only when the model
+        # window is what is actually blocking every account, active
+        # included -- never a per-account "any row reads open" heuristic,
+        # which ran for every strategy and could retry when the active
+        # itself still had real model headroom (#199 review).
+        if (
+            not ordered and models and settings.strategy == "dynamic"
+            and _model_window_binds_everywhere(
+                usage_by_account, models, settings.threshold
+            )
+        ):
+            ordered, usage_by_account = _rank_on(())
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
@@ -646,9 +653,12 @@ class AutoScreen(Screen):
                     entry.append("  auto-swap disabled", style=palette.muted)
                 elif acc.number not in ordered_rank and kind == "open":
                     # "open": nothing per-window blocks it, yet the pass
-                    # still dropped it (a healthier peer, the no-return bar,
-                    # hysteresis) -- every other excluded row already has a
-                    # reason from the block label above.
+                    # still dropped it -- a weekly reset later than the
+                    # active's own (consume-first/dynamic), losing the
+                    # hysteresis margin to a healthier peer (best), or
+                    # ranking behind a sooner recovery when every account
+                    # is at/over the threshold. Every other excluded row
+                    # already has a reason from the block label above.
                     entry.append("  not a candidate", style=palette.muted)
                 # Position from `ordered_rank` (the pass, called once
                 # above), never a locally re-derived key.

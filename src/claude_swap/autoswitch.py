@@ -1008,15 +1008,16 @@ def select_probe_target(
     reset is unknown or has already elapsed, and which is not cooling down
     from a previous probe.
 
-    ONE FUNCTION, TWO READERS — ``_rank_candidates_pass`` calls it (already
+    ONE FUNCTION, ONE READER — ``_rank_candidates_pass`` calls it (already
     narrowed to candidates that cleared its own servability/no-return/
-    recovery-axis gates) to decide the switch; the "Next best" panel calls
-    it on the full candidate list to decide what to DISPLAY. Before this
-    function existed the panel had no notion of probing at all and ranked
-    every candidate with ``probe=False``, so an unknown-reset account read
-    its own absent reset as ``+inf`` (last) there while the engine ranks
-    the same candidate ``-inf`` (first) — the two could name different
-    accounts for the identical fleet. A single shared answer is the fix,
+    recovery-axis gates) to decide the switch; the "Next best" panel goes
+    through that same pass now (``rank_candidates_pass``, the module-level
+    alias) rather than calling this directly. Before the pass call existed
+    the panel had no notion of probing at all and ranked every candidate
+    with ``probe=False``, so an unknown-reset account read its own absent
+    reset as ``+inf`` (last) there while the engine ranks the same
+    candidate ``-inf`` (first) — the two could name different accounts for
+    the identical fleet. Running the engine's own admission is the fix,
     not a second, hand-matched copy of the predicate.
 
     ``active_usage`` (the ACTIVE account's own decision value, not a
@@ -1450,8 +1451,8 @@ class AutoSwitchEngine:
         self._last_probe_num: str | None = None
         # The type-guarded `probeCooldown` this tick read from state (see
         # `_tick_inner`), cached the same way as `_last_probe_num` so the
-        # "Next best" panel's own `select_probe_target` call can see exactly
-        # the cooldown record the engine ranked against instead of a
+        # "Next best" panel's own `_rank_candidates_pass` call can see
+        # exactly the cooldown record the engine ranked against instead of a
         # hardcoded `None` — a probe the engine is still cooling down from
         # would otherwise read as fresh to the panel and jump back to the top.
         self._last_probe_cooldown: dict[str, float] = {}

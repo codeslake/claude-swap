@@ -2100,9 +2100,16 @@ class TestAutoScreen:
         above (both candidates blocked ONLY by the pinned model), but
         `strategy: "best"` — the engine's own retry never drops the model
         set for `best`/`consume-first` (autoswitch.py:2400), so the panel
-        must not either. Ranking stays on the model-gated axis: #3 (90%
-        Fable) ranks first, the OPPOSITE order from the `dynamic` test
-        above."""
+        must not either: both rows stay labelled "Fable-walled", the
+        model-gated block reason, never the 5h-based ranking the `dynamic`
+        test above takes.
+
+        Confirmed against a real tick (`EngineHarness.tick_with_usage` on
+        this exact fleet): the outcome is `BLOCKED`, account 1 stays active.
+        With the active also above the threshold (91% 5h) every account here
+        is at/over the bar, so `_rank_candidates_pass`'s `all_above` recovery
+        axis applies and admits neither candidate — "next best" must say so
+        rather than picking a top row the engine would never reach for."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -2128,8 +2135,10 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user3@example.com") < plain.index(
-                "user2@example.com"
+            assert "no candidate qualifies" in plain, plain
+            assert plain.count("Fable-walled") == 2, (
+                f"both rows must stay model-gated, never re-ranked on the "
+                f"5h axis `best` never uses: {plain!r}"
             )
 
     async def test_candidates_drain_soonest_seven_day_reset_first(
@@ -2828,9 +2837,12 @@ class TestUnswitchableRowsAreListed:
         """Every OTHER unswitchable/blocked row already says why; `disabled`
         was the one silent exception in the real-usage (chip) branch --
         `acc.disabled` used to be read only in the spend-only branch. The
-        disabled slot here has MORE headroom than the enabled one, so a
-        headroom-blind reader would rank it first; it must not be offered
-        at all.
+        disabled slot here has the SOONEST weekly reset of the three (1 day,
+        against the active's 10 and the enabled peer's 3) -- under
+        consume-first that is exactly what wins the competitive ranking, so
+        without the `and not acc.disabled` filter on `oauth_candidates` this
+        account would be admitted AND rank first, not merely tie on
+        headroom. It must not be offered at all.
         """
         active = {
             "five_hour": {"pct": 10.0},
@@ -2842,7 +2854,7 @@ class TestUnswitchableRowsAreListed:
         }
         disabled = {
             "five_hour": {"pct": 0.0},
-            "seven_day": {"pct": 0.0, "resets_at": _iso_in(20 * 86400)},
+            "seven_day": {"pct": 0.0, "resets_at": _iso_in(1 * 86400)},
         }
         out = self._render(self._snap(
             self._acct("1", "active@x.com", switchable=True, last_good=active),
