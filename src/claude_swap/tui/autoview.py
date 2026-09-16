@@ -385,11 +385,13 @@ class AutoScreen(Screen):
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
+        settings = self._settings or AutoSwitchSettings()
         # Same strategy the engine ticks on, so the panel's order can never
-        # disagree with the account a tick would actually switch to.
-        consume_first = bool(
-            self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
-        )
+        # disagree with the account a tick would actually switch to. Off
+        # `settings` (never `self._settings` directly, which can be `None`
+        # before `on_mount` loads it) so this can never read a DIFFERENT
+        # strategy than the one `_trigger_for`/`_rank_on` below rank on.
+        consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         # The badge rides on that account's own row rather than the summary
@@ -409,7 +411,6 @@ class AutoScreen(Screen):
             default=0,
         )
         now = time.time()
-        settings = self._settings or AutoSwitchSettings()
         # `switchable_account_numbers()` (switcher.py) drops `disabled` too.
         oauth_candidates = [
             acc.number
@@ -420,21 +421,38 @@ class AutoScreen(Screen):
             and acc.kind != "api_key"
         ]
 
-        def _trigger_for(active_headroom: float) -> str:
+        def _trigger_for(active_headroom: float | None) -> str | None:
             # Mirrors `_tick_inner`'s own classification closely enough for
             # `_rank_candidates_pass`'s gates to engage the way they would
             # on a real tick -- an unrecognized literal (e.g. the bare
             # strategy name "best") skips every gate in the pass and admits
             # whatever is readable, unranked, which is the defect class
-            # this refactor exists to close (#199). Called only once
-            # `active_headroom` is known not to be `None` (see `_rank_on`).
+            # this refactor exists to close (#199). `None` means no trigger
+            # this panel can derive reaches this pass on a real tick at
+            # all; the caller ranks nothing rather than guess.
+            if active_headroom is None:
+                # `_tick_inner`'s idle-hold/eventual-failover branch, taken
+                # regardless of strategy. The pass ranks fine with
+                # `active_headroom=None` under "failover" -- only the
+                # hysteresis-margin leg (`elif active_headroom is not
+                # None`) is unreachable, not the landing gate itself
+                # (`_every_account_above_threshold` already returns False
+                # on an unknown active). `unhealthy_ticks` gates WHEN a
+                # real tick acts on this, not what it would rank.
+                return "failover"
             if settings.strategy == "dynamic":
                 kind = _classify_dynamic_trigger(active_headroom)
-                # "dynamic-healthy" is `dynamic`'s own warm-tier alternation
-                # ranking in real ticks, a separate mechanism entirely and
-                # out of this panel's scope; "proactive" is the closest
-                # trigger the pass itself recognizes.
-                return "proactive" if kind == "dynamic-healthy" else kind
+                if kind != "at-limit":
+                    # `_tick_inner` never reaches `_rank_candidates_pass`
+                    # for "proactive"/"dynamic-healthy" under `dynamic` --
+                    # both set `dynamic_ordered` via the separate warm/cold
+                    # -tiered `_rank_dynamic_candidates` (needs
+                    # `last_active_at` engine state this panel does not
+                    # track). Only "at-limit" reaches this pass for
+                    # `dynamic`; a wrong ranking for the other two is worse
+                    # than none.
+                    return None
+                return "at-limit"
             if (
                 settings.strategy in CONSUME_FIRST_STRATEGIES
                 and (100.0 - active_headroom) < settings.threshold
@@ -448,17 +466,11 @@ class AutoScreen(Screen):
             }
             headroom = _headroom_by_account(usage, axis)
             active_headroom = headroom.get(active_number)
-            if active_headroom is None:
-                # The active's own state is unmeasured (a stale store row
-                # past `STALE_OK_S`, or an unreadable/sentinel entry): no
-                # trigger this panel can derive maps to a real tick's
-                # "failover" (that needs `unhealthy_ticks` state this panel
-                # never sees), and every OTHER trigger's landing gate falls
-                # through unfiltered once `active_headroom` is None -- so
-                # rank nothing rather than admit everything.
+            trigger = _trigger_for(active_headroom)
+            if trigger is None:
                 return [], usage
             ordered, *_rest = rank_candidates_pass(
-                models=axis, trigger=_trigger_for(active_headroom),
+                models=axis, trigger=trigger,
                 consume_first=consume_first, oauth_candidates=oauth_candidates,
                 no_return=None, usage=usage, headroom=headroom,
                 current=active_number, active_headroom=active_headroom,
@@ -626,8 +638,8 @@ class AutoScreen(Screen):
                 # log — same helper, `classify_candidate_block`. Always on
                 # `models`, the full pinned set: this label explains why the
                 # row is not simply "open" on the criteria the user actually
-                # configured, independent of whether `rank_models` below has
-                # dropped to the retry's axis for ORDERING purposes.
+                # configured, independent of whether `_rank_on` above has
+                # retried on the 5h/7d-only axis for ORDERING purposes.
                 kind = "open"
                 if self._settings:
                     # A window whose chip just read data.REFETCHING has no

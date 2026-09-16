@@ -2833,6 +2833,38 @@ class TestUnswitchableRowsAreListed:
             f"the excluded 7d-exhausted row gave no reason: {out!r}"
         )
 
+    def test_dynamic_never_ranks_a_healthy_active_via_the_wrong_mechanism(self):
+        """`dynamic`'s own steady state (the active neither at-limit nor
+        about to wall) never reaches `_rank_candidates_pass` on a real
+        tick -- `_tick_inner` ranks it with the separate warm/cold-tiered
+        `_rank_dynamic_candidates` instead, gated on `last_active_at`/
+        `cold_switch_cost_pct` state this panel does not track. Passing
+        "proactive" or "dynamic-healthy" into the pass anyway would rank a
+        candidate the real engine might refuse below the cold-switch
+        floor -- so the panel must show "no candidate qualifies" here
+        rather than a specific, unverifiable top pick.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        candidate = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 5.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "candidate@x.com", switchable=True,
+                       last_good=candidate),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, (
+            f"dynamic's steady state named a top pick this pass cannot "
+            f"verify against the real (warm/cold-tiered) mechanism: {out!r}"
+        )
+
     def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
         """Every OTHER unswitchable/blocked row already says why; `disabled`
         was the one silent exception in the real-usage (chip) branch --
@@ -3383,13 +3415,19 @@ class TestUnswitchableRowsAreListed:
         staleness -- so once the active account's store row aged past
         `STALE_OK_S` the panel still saw its old known 7-day reset while the
         engine's own gate (`decision_value()`) had already stopped trusting
-        it and reads no active reset at all. Now the panel runs
-        `_rank_candidates_pass` itself: with the active's own reset
-        unmeasured, `consume-first`'s admission (`active_reset_ts is None:
-        continue`) refuses every candidate outright, so NEITHER the unknown-
-        reset account nor the known-soon one is a candidate -- the stronger
-        form of the same guarantee (an unmeasured active can no longer even
-        promote the known-soon reader to "next best").
+        it and reads no active reset at all.
+
+        Now the panel runs `_rank_candidates_pass` itself, and an unmeasured
+        active (`headroom.get(current) is None`) takes `_tick_inner`'s own
+        idle-hold/eventual-failover branch -- trigger "failover" -- rather
+        than the below-threshold `consume-first` literal this scenario used
+        to reach. The ORIGINAL guarantee still holds, structurally rather
+        than by a special case: "failover" never enters the
+        `if trigger in CONSUME_FIRST_STRATEGIES:` admission block at all, so
+        `select_probe_target`'s pool is never populated and neither account
+        can be probed or sorted on `-inf` -- both rank on plain headroom
+        (tied at 90%) instead, and the known-soon reader ("3") wins the tie
+        the pass itself already breaks in its favour.
         """
         from tests.test_autoswitch import _iso_at
         from claude_swap.settings import AutoSwitchSettings
@@ -3419,13 +3457,14 @@ class TestUnswitchableRowsAreListed:
             self._acct("3", "c@x.invalid", switchable=True, last_good=known_soon),
         ), active="1", settings=settings)
 
-        assert "no candidate qualifies" in rendered, (
-            f"panel named a next-best account while the active's own reset "
-            f"is stale and unknown to the engine -- panel out:\n{rendered}"
+        assert "no candidate qualifies" not in rendered, (
+            f"a readable candidate exists -- refusing to rank at all is "
+            f"the OLD over-correction, not what a real failover tick "
+            f"does: {rendered!r}"
         )
-        assert rendered.count("not a candidate") == 2, (
-            f"expected both b@x.invalid and c@x.invalid excluded, "
-            f"neither promoted -- panel out:\n{rendered}"
+        assert rendered.index("c@x.invalid") < rendered.index("b@x.invalid"), (
+            f"the known-soon reader must not lose a tied-headroom race to "
+            f"the unknown-reset one -- panel out:\n{rendered}"
         )
 
 
