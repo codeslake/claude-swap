@@ -3359,8 +3359,8 @@ class AutoSwitchEngine:
                 return fb
         return result
 
+    @staticmethod
     def _rank_candidates_pass(
-        self,
         *,
         models: Sequence[str],
         trigger: str,
@@ -3376,7 +3376,11 @@ class AutoSwitchEngine:
     ) -> tuple[list[str], bool, float | None, bool]:
         """Filter and rank OAuth candidates for this tick's trigger, on one
         window set (``models``); pure, no state writes, called at most
-        twice per tick by ``_rank_candidates`` (see its docstring).
+        twice per tick by ``_rank_candidates`` (see its docstring), and by
+        the "Next best" panel through the module-level ``rank_candidates_pass``
+        alias below (a static method needs no engine instance) -- the panel
+        gets the engine's own admission instead of a second, hand-matched
+        copy of it.
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
@@ -4556,3 +4560,9 @@ class AutoSwitchEngine:
                     )
                 )
             self._wake.wait(delay)
+
+
+# A direct module-level name, not `AutoSwitchEngine._rank_candidates_pass`:
+# a caller that only wants the (pure, static) ranking -- the "Next best"
+# panel -- needs no engine instance to reach it.
+rank_candidates_pass = AutoSwitchEngine._rank_candidates_pass

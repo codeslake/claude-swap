@@ -1858,61 +1858,22 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
-    async def test_candidates_drop_the_model_gate_when_every_row_is_model_only(
-        self, tmp_path, fake_engine
-    ):
-        """Both candidates' ONLY over-bar window is the pinned model, exactly
-        the shape ``_rank_candidates`` (autoswitch.py) retries on 5h/7d alone
-        for — but that retry is `dynamic`-only (autoswitch.py:2400): `best`/
-        `consume-first` never rank on 5h/7d alone, so under those strategies
-        the panel must NOT drop the model gate either, even here. `strategy`
-        must be `dynamic` for the panel to take this path at all — ranking on
-        the model-gated axis here would name #2 (95% Fable) the worse account
-        when its real 5h is #3's better one: the two are on OPPOSITE sides of
-        `-Fable, +5h` vs `+Fable, -5h`."""
-        import json as _json
-
-        (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1,
-            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
-        }))
-        fake = FakeSwitcher(
-            [
-                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
-                make_account(
-                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 95.0)])
-                ),
-                make_account(
-                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 90.0)])
-                ),
-            ],
-            tmp_path,
-        )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            # #2's real 5h (20%) beats #3's (60%): once the model gate drops
-            # (neither #2 nor #3 has a 5h/7d window over the bar on its own),
-            # #2 must rank first — ranking on the model-gated axis instead
-            # would put #3 first (90% Fable < 95% Fable).
-            assert plain.index("user2@example.com") < plain.index(
-                "user3@example.com"
-            )
-
     async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):
-        """The regression this gate exists to stop: same fleet as the test
-        above (both candidates blocked ONLY by the pinned model), but
-        `strategy: "best"` — the engine's own retry never drops the model
-        set for `best`/`consume-first` (autoswitch.py:2400), so the panel
-        must not either. Ranking stays on the model-gated axis: #3 (90%
-        Fable) ranks first, the OPPOSITE order from the `dynamic` test
-        above."""
+        """The regression this gate exists to stop: both candidates blocked
+        ONLY by the pinned model (their 5h/7d are open; only the Fable
+        window is over the bar), but `strategy: "best"` — the engine's own
+        retry never drops the model set for `best`/`consume-first`
+        (autoswitch.py:2400), so the panel must not either: both rows stay
+        labelled "Fable-walled", the model-gated block reason, never a
+        5h-based ranking (which `dynamic`, not exercised by this fleet,
+        would take instead).
+
+        With the active also above the threshold (91% 5h) every account here
+        is at/over the bar, so `_rank_candidates_pass`'s `all_above` recovery
+        axis applies and admits neither candidate — "next best" must say so
+        rather than picking a top row the engine would never reach for."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -1938,18 +1899,101 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            assert plain.index("user3@example.com") < plain.index(
-                "user2@example.com"
+            assert "no candidate qualifies" in plain, plain
+            assert plain.count("Fable-walled") == 2, (
+                f"both rows must stay model-gated, never re-ranked on the "
+                f"5h axis `best` never uses: {plain!r}"
             )
+
+    async def test_candidates_rank_unconditionally_under_a_disabled_active(
+        self, tmp_path, fake_engine
+    ):
+        """The engine checks `is_account_disabled(current)` FIRST and
+        unconditionally, before any headroom reading, and its trigger --
+        "disabled-active" -- is in neither gated tuple, so a disabled
+        active's own healthy headroom (50%) must never derive "proactive"
+        here and gate out a low-headroom candidate the way it would for a
+        merely-healthy active. #2's own utilization (96% 5h) is itself over
+        the threshold (90) -- excluded by the landing-health gate under
+        "proactive" before `best`'s hysteresis margin is ever reached -- but
+        a disabled active must still rank it rather than report no
+        candidate at all."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "best", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, disabled=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=make_entry(96.0, 5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "no candidate qualifies" not in plain, plain
+
+    async def test_candidates_dynamic_retry_ranks_once_the_model_gate_drops(
+        self, tmp_path, fake_engine
+    ):
+        """A single trigger, carried into both the model-gated pass and the
+        5h/7d retry, must still let the retry itself land a real ranking --
+        this is the case the retry exists for, not merely a case that
+        returns empty either way. The active is genuinely spent on BOTH 5h
+        and 7d (100%/100%), so widening is a no-op and the trigger
+        classifies "at-limit" on either axis; #2 is maxed ONLY on the pinned
+        Fable window (100%) with 5h/7d wide open (10%/5%). On the
+        model-gated axis #2 reads spent too (headroom 0), which sends the
+        pass onto `dynamic`'s own recovery axis; there `dynamic`'s landing
+        rule refuses to admit ANY zero-headroom account unconditionally --
+        unlike `best`/`consume-first`, which would still take the recovery
+        escape -- so the primary pass comes back empty and
+        `_model_window_binds_everywhere` sends it to the retry; there, with
+        the model dropped, #2's real 5h/7d headroom (90) has nothing to
+        exclude it and the retry ranks it.
+        """
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(100.0, 100.0)),
+                make_account(
+                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 100.0)])
+                ),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "no candidate qualifies" not in plain, plain
 
     async def test_candidates_drain_soonest_seven_day_reset_first(
         self, tmp_path, fake_engine
     ):
-        """Under the default (consume-first) strategy, 'Next best' lists
-        switchable accounts in the order the engine would actually switch to
-        them: soonest 7-day reset first, so quota is spent before it resets
-        and goes to waste. The active's 5-hour window stays a gate, never a
-        key -- it plays no part in this order."""
+        """Under the default (consume-first) strategy, `_rank_candidates_pass`
+        only ever admits an account whose 7-day reset comes SOONER than the
+        active's own -- moving to one that resets LATER would waste nothing
+        yet and is not something a consume-first tick would do (it revisits
+        the rest on later ticks, once the active's own reset moves). Of six
+        peers only "5" resets sooner than the active's 1.75 days out; the
+        other four must be named "not a candidate" rather than fleet-wide
+        sorted as if every one of them were reachable this tick."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -1999,10 +2043,14 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            positions = [
-                plain.index(f"user{n}@example.com") for n in ("5", "3", "2", "1", "6", "7")
-            ]
-            assert positions == sorted(positions), plain
+            positions = {
+                n: plain.index(f"user{n}@example.com")
+                for n in ("5", "1", "2", "3", "6")
+            }
+            assert positions["5"] == min(positions.values()), plain
+            five_row = plain[positions["5"]:positions["1"]]
+            assert "not a candidate" not in five_row, plain
+            assert plain.count("not a candidate") == 4, plain
 
 
 class TestEventText:
@@ -2353,8 +2401,14 @@ class TestUnswitchableRowsAreListed:
         a = MagicMock()
         a.number, a.email, a.switchable, a.kind = number, email, switchable, kind
         a.disabled = disabled
-        a.usage.last_good = last_good
-        a.usage.sentinel = sentinel
+        # A real UsageEntry, not a MagicMock -- `.decision_value()` (the
+        # ranking pass's own read) is real code, not an auto-mocked
+        # callable, and needs actual `sentinel`/`last_good`/`age_s` to
+        # answer correctly. `age_s=0.0` reads as freshly-fetched.
+        a.usage = UsageEntry(
+            sentinel=sentinel, last_good=last_good,
+            fetched_at=time.time(), age_s=0.0,
+        )
         return a
 
     def _render(self, snap, active, *, settings=None):
@@ -2523,6 +2577,153 @@ class TestUnswitchableRowsAreListed:
         ), active="1")
         assert "usage unknown" in out, (
             f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
+        )
+
+    def test_a_7d_exhausted_account_never_outranks_a_5h_exhausted_one(self):
+        """The panel used to re-derive its own order from the raw window
+        pcts and could rank an account the engine would never pick above
+        one it could actually reach. The engine only admits an at-limit
+        escape through a conjunction that needs the ACTIVE account at its
+        own limit too -- so the active here is 5h-exhausted with no 7d
+        window at all (an annual-plan style reading).
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        five_hour_full = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_in(300)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+            self._acct("3", "fivehour@x.com", switchable=True,
+                       last_good=five_hour_full),
+        ), active="1", settings=settings)
+        assert out.index("fivehour@x.com") < out.index("sevenday@x.com"), (
+            f"the 7d-exhausted account outranked the 5h-exhausted one the "
+            f"engine could still reach: {out!r}"
+        )
+        assert "7d full" in out, (
+            f"the excluded 7d-exhausted row gave no reason: {out!r}"
+        )
+
+    def test_CONTROL_a_7d_exhausted_account_alone_is_excluded_not_ranked(self):
+        """CONTROL for the row above: with no 5h-exhausted peer to land on,
+        the 7d-exhausted account is still excluded (the engine's own
+        conjunction never admits it), and the panel must say so rather than
+        naming it "Next best" — the empty-competitive-list case, distinct
+        from "no other accounts" (there IS another account, just none the
+        engine would pick).
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, (
+            f"an unusable account was ranked as next best instead: {out!r}"
+        )
+        assert "7d full" in out, (
+            f"the excluded 7d-exhausted row gave no reason: {out!r}"
+        )
+
+    def test_dynamic_never_ranks_a_healthy_active_via_the_wrong_mechanism(self):
+        """`dynamic`'s own steady state (the active neither at-limit nor
+        about to wall) never reaches `_rank_candidates_pass` on a real
+        tick -- `_tick_inner` ranks it with the separate warm/cold-tiered
+        `_rank_dynamic_candidates` instead, gated on `last_active_at`/
+        `cold_switch_cost_pct` state this panel does not track. Passing
+        "proactive" or "dynamic-healthy" into the pass anyway would rank a
+        candidate the real engine might refuse below the cold-switch
+        floor -- so the panel must show "no candidate qualifies" here
+        rather than a specific, unverifiable top pick.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="dynamic", threshold=90.0)
+        active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        candidate = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 5.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "candidate@x.com", switchable=True,
+                       last_good=candidate),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, (
+            f"dynamic's steady state named a top pick this pass cannot "
+            f"verify against the real (warm/cold-tiered) mechanism: {out!r}"
+        )
+
+    def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
+        """Every OTHER unswitchable/blocked row already says why; `disabled`
+        was the one silent exception in the real-usage (chip) branch --
+        `acc.disabled` used to be read only in the spend-only branch. The
+        disabled slot here has the SOONEST weekly reset of the three (1 day,
+        against the active's 10 and the enabled peer's 3) -- under
+        consume-first that is exactly what wins the competitive ranking, so
+        without the `and not acc.disabled` filter on `oauth_candidates` this
+        account would be admitted AND rank first, not merely tie on
+        headroom. It must not be offered at all.
+        """
+        active = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(10 * 86400)},
+        }
+        enabled = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 5.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        disabled = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 0.0, "resets_at": _iso_in(1 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("9", "enabled@x.com", switchable=True, last_good=enabled),
+            self._acct("8", "disabled@x.com", switchable=True,
+                       last_good=disabled, disabled=True),
+        ), active="1")
+        assert "auto-swap disabled" in out, (
+            f"the disabled account gave no reason it is never chosen: {out!r}"
+        )
+        assert out.index("enabled@x.com") < out.index("disabled@x.com"), (
+            f"the disabled account, with more headroom, outranked the "
+            f"enabled one: {out!r}"
+        )
+
+    def test_the_legend_names_the_ranking_key(self):
+        """The header must say WHICH order this is (soonest reset under
+        consume-first/dynamic, most headroom under best) so the list is
+        readable without reading `_rank_candidates_pass` -- a reader must
+        not have to guess whether "Next best" is a raw pct sort."""
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True,
+                        last_good={"five_hour": {"pct": 10.0}}),
+            self._acct("2", "b@x.com", switchable=True,
+                        last_good={"five_hour": {"pct": 5.0}}),
+        ), active="1")
+        assert "Next best (engine order)" in out, (
+            f"the legend does not name the ranking key: {out!r}"
         )
 
     def test_unswitchable_rows_sort_last(self):

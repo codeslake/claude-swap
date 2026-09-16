@@ -30,16 +30,25 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _classify_dynamic_trigger,
+    _dynamic_active_headroom,
+    _headroom_by_account,
+    _model_window_binds_everywhere,
     binding_pct,
     classify_candidate_block,
-    consume_first_rank_key,
     model_block_label,
     pct_label,
     proactive_switch_bar_pct,
+    rank_candidates_pass,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    AutoSwitchSettings,
+    load_settings,
+    parse_model_names,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -376,51 +385,119 @@ class AutoScreen(Screen):
         # displayed ranking can never disagree with the account it picks.
         palette = Palette.from_theme(self.app.current_theme)
         models = parse_model_names(self._settings.model) if self._settings else ()
+        settings = self._settings or AutoSwitchSettings()
         # Same strategy the engine ticks on, so the panel's order can never
-        # disagree with the account a tick would actually switch to.
-        consume_first = bool(
-            self._settings and self._settings.strategy in CONSUME_FIRST_STRATEGIES
-        )
-        # THE AXIS THE ENGINE WILL ACTUALLY RANK ON THIS TICK, not always
-        # `models`: `_rank_candidates` (autoswitch.py) drops the model set
-        # and retries on 5h/7d alone when the model-gated pass finds no
-        # healthy candidate — so a panel that always ranks on `models` can
-        # name a top row the engine would never pick (still model-gated
-        # ranking a fleet the engine has already dropped it for). But the
-        # engine only runs that retry under `strategy == "dynamic"`
-        # (autoswitch.py's `_rank_candidates`) — gated the same way here, or
-        # `best`/`consume-first` rank on an axis the engine is forbidden to
-        # use. Same predicate as the model-gated pass's own health filter
-        # (`classify_candidate_block` — "open" is exactly what that filter
-        # lets through): any candidate reading "open" means the model-gated
-        # pass has something to work with, so keep `models`; none reading
-        # "open" means it would come back empty, so rank on the retry's
-        # axis instead — a "model"-only block clears once `models` drops,
-        # and a "full" block stays blocked either way.
-        rank_models = models
-        if models and self._settings and self._settings.strategy == "dynamic":
-            threshold = self._settings.threshold
-            for acc in snap.accounts:
-                if (
-                    acc.number == active_number
-                    or not acc.switchable
-                    or acc.usage.sentinel is not None
-                    or binding_pct(acc.usage.last_good, models) is None
-                ):
-                    continue
-                windows = (
-                    (label, p)
-                    for label, p, _ in oauth.relevant_windows(
-                        acc.usage.last_good, models
-                    )
-                )
-                kind, _ = classify_candidate_block(windows, threshold)
-                if kind == "open":
-                    break
-            else:
-                rank_models = ()
+        # disagree with the account a tick would actually switch to. Off
+        # `settings` (never `self._settings` directly, which can be `None`
+        # before `on_mount` loads it) so this can never read a DIFFERENT
+        # strategy than the trigger/ranking below run on.
+        consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
+        now = time.time()
+        # `usage` is model-independent (`decision_value()` reads sentinel/
+        # last_good/staleness only); the model axis is folded in per-call by
+        # `_headroom_by_account`/`_rank_candidates_pass` below, so one dict
+        # serves both the model-gated pass and the 5h/7d retry.
+        usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
+        # `switchable_account_numbers()` (switcher.py) drops `disabled` too.
+        oauth_candidates = [
+            acc.number
+            for acc in snap.accounts
+            if acc.number != active_number
+            and acc.switchable
+            and not acc.disabled
+            and acc.kind != "api_key"
+        ]
+
+        def _trigger_for(
+            active_headroom: float | None, active_disabled: bool
+        ) -> str | None:
+            """Mirror `_tick_inner`'s own trigger classification (autoswitch.py)
+            closely enough for `_rank_candidates_pass`'s gates to engage the
+            way they would on a real tick. `None` means no trigger this panel
+            can derive reaches the pass on a real tick at all -- the caller
+            ranks nothing rather than guess.
+            """
+            # UNCONDITIONAL, before any headroom reading: `_tick_inner` checks
+            # `is_account_disabled(current)` first. Its own trigger name, not
+            # "at-limit"/"proactive": a disabled active is withdrawn from
+            # rotation, not merely blocked, so any readable candidate should
+            # rank, not just a healthy one.
+            if active_disabled:
+                return "disabled-active"
+            if active_headroom is None:
+                # `_tick_inner`'s failover branch, taken regardless of
+                # strategy once the active's own usage is unreadable.
+                return "failover"
+            if settings.strategy == "dynamic":
+                kind = _classify_dynamic_trigger(active_headroom)
+                if kind != "at-limit":
+                    # `_tick_inner` never reaches `_rank_candidates_pass` for
+                    # "proactive"/"dynamic-healthy" under `dynamic` -- both
+                    # rank through the separate warm/cold `_rank_dynamic_
+                    # candidates` path instead (needs `last_active_at` engine
+                    # state this panel does not track). Only "at-limit"
+                    # reaches this pass for `dynamic`.
+                    return None
+                return "at-limit"
+            if (
+                settings.strategy in CONSUME_FIRST_STRATEGIES
+                and (100.0 - active_headroom) < settings.threshold
+            ):
+                return settings.strategy
+            # Not a real trigger under any other strategy below the
+            # threshold: the engine emits `below-threshold` and returns
+            # NO_ACTION rather than reaching this pass at all.
+            return "at-limit" if active_headroom <= 0 else "proactive"
+
+        def _rank_on(axis: tuple[str, ...], trigger: str | None) -> list[str]:
+            if trigger is None:
+                return []
+            headroom = _headroom_by_account(usage, axis)
+            ordered, *_rest = rank_candidates_pass(
+                models=axis,
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                no_return=None,
+                usage=usage,
+                headroom=headroom,
+                current=active_number,
+                active_headroom=headroom.get(active_number),
+                settings=settings,
+                now=now,
+            )
+            return ordered
+
+        # THE ENGINE'S OWN ADMISSION (`_rank_candidates_pass`), not a
+        # re-derived predicate: one trigger, classified once (mirroring
+        # `_tick_inner`'s own single classification), carried into both the
+        # model-gated pass and the 5h/7d retry below.
+        model_headroom = _headroom_by_account(usage, models)
+        active_account = next(
+            (acc for acc in snap.accounts if acc.number == active_number), None
+        )
+        active_disabled = (
+            active_account.disabled if active_account is not None else False
+        )
+        trigger = _trigger_for(
+            _dynamic_active_headroom(
+                settings, models, usage, active_number, model_headroom.get(active_number)
+            ),
+            active_disabled,
+        )
+        ordered = _rank_on(models, trigger)
+        # The SAME retry `_rank_candidates` makes (`dynamic` only): drop the
+        # model set and re-rank on 5h/7d alone, but only when the model
+        # window is what is actually blocking every account, active
+        # included.
+        if (
+            not ordered and models and settings.strategy == "dynamic"
+            and _model_window_binds_everywhere(usage, models, settings.threshold)
+        ):
+            ordered = _rank_on((), trigger)
+        ordered_rank = {num: i for i, num in enumerate(ordered)}
         for acc in snap.accounts:
             if acc.number == active_number:
                 continue
@@ -518,8 +595,9 @@ class AutoScreen(Screen):
                 # log — same helper, `classify_candidate_block`. Always on
                 # `models`, the full pinned set: this label explains why the
                 # row is not simply "open" on the criteria the user actually
-                # configured, independent of whether `rank_models` below has
-                # dropped to the retry's axis for ORDERING purposes.
+                # configured, independent of whether the pass above retried
+                # on the 5h/7d-only axis for ORDERING purposes.
+                kind = "open"
                 if self._settings:
                     kind, blocked_model = classify_candidate_block(
                         ((label, p) for label, p, _ in windows), self._settings.threshold
@@ -531,25 +609,42 @@ class AutoScreen(Screen):
                         )
                     elif kind == "full":
                         entry.append(f"  {blocked_model} full", style=palette.muted)
-                rank_pct = binding_pct(acc.usage.last_good, rank_models)
+                if acc.disabled:
+                    entry.append("  auto-swap disabled", style=palette.muted)
+                elif acc.number not in ordered_rank and kind == "open":
+                    # "open": nothing per-window blocks it, yet the engine's
+                    # own pass still refused it -- a weekly reset later than
+                    # the active's own, losing the hysteresis margin to a
+                    # healthier peer, or ranking behind a sooner recovery.
+                    # Every other excluded row already has a reason above.
+                    entry.append("  not a candidate", style=palette.muted)
+                # Position from `ordered_rank` (the engine's own pass, called
+                # once above), never a locally re-derived key.
                 key = (
-                    consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now, rank_models
-                    )
-                    if consume_first
-                    else (pct if rank_pct is None else rank_pct,)
+                    (0, ordered_rank[acc.number])
+                    if acc.number in ordered_rank
+                    else (1,)
                 )
                 ranked.append((key, acc.number))
             lines[acc.number] = entry
 
         text = Text()
-        text.append("Next best", style=palette.muted)
+        # The order below is the engine's own admission (soonest 7-day reset
+        # under consume-first/dynamic, most headroom under best), not a
+        # re-derived read of the raw window pcts.
+        text.append("Next best (engine order)", style=palette.muted)
         if not ranked:
             # Reached only when this is the sole account. Slots that cannot be
             # switched to are listed above with the reason, so "no other
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
+        if not ordered:
+            # DIFFERENT from "no other accounts": rows are still listed
+            # below, each naming why -- but none is something a tick would
+            # switch to, and ranking one anyway would name a top row the
+            # engine could never pick.
+            text.append("\n  no candidate qualifies", style=palette.muted)
         for _key, number in sorted(ranked):
             text.append(lines[number])
         return text
