@@ -298,6 +298,30 @@ class TestFormatting:
         assert tui_data.format_duration(7980) == "2h 13m"
         assert tui_data.format_duration(3600 * 26) == "1d 2h"
 
+    def test_chip_label_countdown_is_zero_padded_to_a_fixed_width(self):
+        """The owner, 2026-09-15: a chip's countdown must render in one
+        fixed-width shape so the `:` before every window's `%` lands on
+        the same column regardless of how wide the raw countdown text is
+        (`2h 4m` vs `12m` vs `3d 4h`)."""
+        assert tui_data.chip_label("5h", "resets 2h 4m") == "5h(⟳2h04m):"
+        assert tui_data.chip_label("5h", "resets 2h") == "5h(⟳2h00m):"
+        assert tui_data.chip_label("5h", "resets 12m") == "5h(⟳0h12m):"
+        assert tui_data.chip_label("5h", "resets 45s") == "5h(⟳0h00m):"
+        assert tui_data.chip_label("7d", "resets 3d 4h") == "7d(⟳3d04h):"
+        assert tui_data.chip_label("7d", "resets 3d") == "7d(⟳3d00h):"
+        assert tui_data.chip_label("7d", "resets 1d 11h") == "7d(⟳1d11h):"
+        # a two-digit hour with no day component would be 6 wide
+        # ("14h04m") if it stayed in the hour shape -- one column wider
+        # than every other reading; routed through the day-plus shape
+        # instead it stays 5 wide.
+        assert tui_data.chip_label("7d", "resets 14h 4m") == "7d(⟳0d14h):"
+        assert tui_data.chip_label("7d", "resets 10h") == "7d(⟳0d10h):"
+        # unchanged branches
+        assert tui_data.chip_label("5h", "resets now") == "5h(⟳now):"
+        assert tui_data.chip_label("5h", tui_data.REFETCHING) == "5h(⟳refetching):"
+        assert tui_data.chip_label("5h", None) == "5h(⟳?):"
+        assert tui_data.chip_label("5h", None, pct=0.0) == "5h(⟳5h00m):"
+
     def test_format_age_fresh_is_silent(self):
         # Ages inside the serve TTL are the polling cadence at work, not
         # staleness worth flagging.
@@ -948,7 +972,7 @@ class TestMiniAccountText:
         acc = make_account(
             1, entry=UsageEntry(last_good=last_good, fetched_at=now, age_s=0.0)
         )
-        assert "5h(⟳1h):42%" in mini_account_text(acc, now).plain
+        assert "5h(⟳1h00m):42%" in mini_account_text(acc, now).plain
 
     def test_scoped_window_below_100_shows_its_pct_alongside_5h_7d(self):
         """PROBE: the scoped loop only fires at/over 100 (`maxed`), so once a
@@ -2822,6 +2846,56 @@ class TestUnswitchableRowsAreListed:
         fable = [line.index("Fable") for line in lines]
         assert seven_d[0] == seven_d[1], f"7d chip not aligned: {seven_d} in {lines!r}"
         assert fable[0] == fable[1], f"Fable chip not aligned: {fable} in {lines!r}"
+
+    def test_next_best_percent_columns_align_across_countdown_widths(self):
+        """The owner, 2026-09-15 (live auto-switch panel): `5h(⟳3h14m):25%`
+        vs `7d(⟳2h4m):100%` -- the countdown's own width varies (`12m`,
+        `2h4m`, `3d4h`) so the `:` before a window's percentage does not
+        land on the same column across rows even when the window chips
+        themselves already align by name. Rows below carry minutes-only,
+        hour+minute, and day+hour countdowns spread across the three
+        windows so every magnitude appears; the `:` right before each
+        window's `%` must fall on the same column in every row."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(model="Fable", threshold=99.0)
+        now = datetime.now(timezone.utc)
+        out = self._render(self._snap(
+            self._acct("2", "aaaa@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 25.0,
+                              "resets_at": (now + timedelta(minutes=12)).isoformat()},
+                "seven_day": {"pct": 9.0,
+                              "resets_at": (now + timedelta(hours=2, minutes=4)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 8.0,
+                            "resets_at": (now + timedelta(days=3, hours=4)).isoformat()}],
+            }),
+            self._acct("3", "bbbb@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 80.0,
+                              "resets_at": (now + timedelta(hours=2, minutes=4)).isoformat()},
+                "seven_day": {"pct": 70.0,
+                              "resets_at": (now + timedelta(days=3, hours=4)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 60.0,
+                            "resets_at": (now + timedelta(minutes=12)).isoformat()}],
+            }),
+            # A 7d window with 10-23h left and no day component -- the
+            # hour shape alone would be 6 wide ("14h04m") here, one column
+            # wider than the other rows' 5-wide readings.
+            self._acct("4", "cccc@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 50.0,
+                              "resets_at": (now + timedelta(hours=2, minutes=4)).isoformat()},
+                "seven_day": {"pct": 40.0,
+                              "resets_at": (now + timedelta(hours=14, minutes=4)).isoformat()},
+                "scoped": [{"name": "Fable", "pct": 30.0,
+                            "resets_at": (now + timedelta(minutes=12)).isoformat()}],
+            }),
+        ), active="9", settings=settings)
+        lines = [line for line in out.split("\n") if line.strip().startswith(("2 ", "3 ", "4 "))]
+        assert len(lines) == 3, lines
+        for window in ("5h(", "7d(", "Fable("):
+            cols = [line.index(":", line.index(window)) for line in lines]
+            assert len(set(cols)) == 1, (
+                f"{window!r} % column not aligned: {cols} in {lines!r}"
+            )
 
     def test_the_panel_labels_a_model_only_block_and_a_full_block(self):
         """`classify_candidate_block`'s two blocked outcomes must both reach

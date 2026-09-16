@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -176,6 +177,20 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     colour it by severity. The countdown shows whenever it is known, not only
     at 100%: a saturated candidate's worth IS when it comes back.
 
+    A known countdown renders in one fixed-width shape, zero-padded, so the
+    ``:`` before the pct lands on the same column across rows whose raw
+    countdowns differ in width (owner, 2026-09-15): under a day AND under 10
+    hours, ``{h}h{mm}m`` (``resets 2h 4m`` → ``2h04m``, ``resets 2h`` →
+    ``2h00m``); a day or more, OR 10-23 hours with no day component, the
+    day-plus shape ``{d}d{hh}h`` (``resets 3d 4h`` → ``3d04h``, ``resets 3d``
+    → ``3d00h``, ``resets 14h 4m`` → ``0d14h``, dropping the minute the same
+    way a day-plus reading already does). Routing a two-digit hour through
+    the day shape instead of zero-padding the hour digit itself keeps every
+    reading 5 wide for any window the API serves today (none past 7d)
+    without ever writing ``02h04m`` or ``03d04h`` — neither of which any
+    caller or test expects. ``resets now`` and ``refetching`` keep their
+    own words.
+
     An unknown reset is a fact worth showing, not a reason to go blank: the
     strategy needs exactly this account activated once to learn it (see
     autoswitch.py's consume-first probe admission), so hiding the gap read as
@@ -193,7 +208,17 @@ def chip_label(label: str, reset: str | None, pct: float | None = None) -> str:
     """
     if not reset:
         return "5h(⟳5h00m):" if label == "5h" and pct == 0 else f"{label}(⟳?):"
-    return f"{label}(⟳{reset.removeprefix('resets ').replace(' ', '')}):"
+    countdown = reset.removeprefix("resets ")
+    if countdown != "now" and countdown != REFETCHING:
+        units = {unit: num for num, unit in re.findall(r"(\d+)([dhms])", countdown)}
+        days = int(units.get("d", 0))
+        hours = int(units.get("h", 0))
+        countdown = (
+            f"{days}d{hours:02d}h"
+            if days or hours >= 10
+            else f"{hours}h{int(units.get('m', 0)):02d}m"
+        )
+    return f"{label}(⟳{countdown}):"
 
 
 def window_chip_label(last_good: dict | None, key: str, label: str, now: float) -> str:
