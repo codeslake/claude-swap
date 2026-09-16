@@ -1904,6 +1904,13 @@ class TestAutoScreen:
                 f"both rows must stay model-gated, never re-ranked on the "
                 f"5h axis `best` never uses: {plain!r}"
             )
+            # `all_above` (every account read here is at/over the 90%
+            # threshold) moves the pass to `by_recovery_axis` regardless of
+            # `best`'s ordinary "most headroom" key -- the legend must say
+            # so, not the strategy's usual key, or a reader is told the
+            # wrong axis for a state the panel already detected correctly
+            # enough to refuse ranking on.
+            assert "Next best (soonest to recover)" in plain, plain
 
     async def test_candidates_rank_unconditionally_under_a_disabled_active(
         self, tmp_path, fake_engine
