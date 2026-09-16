@@ -37,6 +37,7 @@ from claude_swap.autoswitch import (
     _every_account_above_threshold,
     _headroom_by_account,
     _model_window_binds_everywhere,
+    _recovery_is_useful,
     binding_pct,
     classify_candidate_block,
     model_block_label,
@@ -666,19 +667,38 @@ class AutoScreen(Screen):
             oauth_candidates, final_headroom, final_headroom.get(active_number),
             settings.threshold,
         )
+        active_recovery_ts = (
+            _binding_recovery_ts(usage.get(active_number), final_axis, now)
+            if all_above else 0.0  # unread unless all_above, matches the pass
+        )
+        best_candidate_headroom = max(
+            (h for h in map(final_headroom.get, oauth_candidates) if h is not None),
+            default=0.0,
+        )
         recovery_axis = all_above and (
             trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
             or (
                 trigger == "at-limit"
-                and _binding_recovery_ts(usage.get(active_number), final_axis, now)
-                != float("inf")
-                and max(
-                    (h for h in map(final_headroom.get, oauth_candidates)
-                     if h is not None),
-                    default=0.0,
-                ) <= SPENT_HEADROOM_PCT
+                and active_recovery_ts != float("inf")
+                and best_candidate_headroom <= SPENT_HEADROOM_PCT
             )
         )
+        if recovery_axis and ordered:
+            # The GATE decides whether the pass ranks on this axis AT ALL,
+            # but the KEY it ranks with is itself tiered PER CANDIDATE
+            # (`_recovery_is_useful`, autoswitch.py): past
+            # `RECOVERY_HORIZON_S` with real headroom still on the table,
+            # a candidate falls back to the SAME "most headroom" key the
+            # gate being false would have used. Only the row a reader
+            # calls "next best" is the top of `ordered` -- check only it,
+            # the same argument every other candidate's own tier read.
+            recovery_axis = _recovery_is_useful(
+                _binding_recovery_ts(usage.get(ordered[0]), final_axis, now),
+                active_recovery_ts,
+                final_headroom.get(active_number) or 0.0,
+                best_candidate_headroom,
+                now,
+            )
         if dynamic_unmodeled:
             # No key at all: every row above rendered in slot order
             # (`ordered_rank` is empty), so naming ANY axis here would be
