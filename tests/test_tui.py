@@ -2649,9 +2649,16 @@ class TestUnswitchableRowsAreListed:
         `_rank_dynamic_candidates` instead, gated on `last_active_at`/
         `cold_switch_cost_pct` state this panel does not track. Passing
         "proactive" or "dynamic-healthy" into the pass anyway would rank a
-        candidate the real engine might refuse below the cold-switch
-        floor -- so the panel must show "no candidate qualifies" here
-        rather than a specific, unverifiable top pick.
+        candidate the real engine might refuse below the cold-switch floor
+        -- so the panel must not name a specific, unverifiable top pick.
+
+        But it must also not claim the opposite: `_tick_inner`'s own warm/
+        cold mechanism CAN and does switch on this exact tick (as
+        "alternation"), so "no candidate qualifies" -- which says nothing
+        will be picked -- is just as false a claim as a wrong top pick
+        would be, and so is stamping the open candidate row "not a
+        candidate". The honest state is neither: say the ranking was not
+        previewed, and leave the row unlabelled.
         """
         from claude_swap.settings import AutoSwitchSettings
 
@@ -2669,9 +2676,18 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "candidate@x.com", switchable=True,
                        last_good=candidate),
         ), active="1", settings=settings)
-        assert "no candidate qualifies" in out, (
-            f"dynamic's steady state named a top pick this pass cannot "
-            f"verify against the real (warm/cold-tiered) mechanism: {out!r}"
+        assert "no candidate qualifies" not in out, (
+            f"dynamic's steady state claimed nothing will be picked, but "
+            f"the real (warm/cold-tiered) mechanism can switch this tick: "
+            f"{out!r}"
+        )
+        assert "not previewed (dynamic warm/cold state)" in out, (
+            f"the panel did not say it could not preview this state: {out!r}"
+        )
+        row2 = out[out.index("candidate@x.com"):]
+        assert "not a candidate" not in row2, (
+            f"the panel named a row the real mechanism might switch to as "
+            f"never a candidate: {out!r}"
         )
 
     def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
@@ -2715,15 +2731,29 @@ class TestUnswitchableRowsAreListed:
         """The header must say WHICH order this is (soonest reset under
         consume-first/dynamic, most headroom under best) so the list is
         readable without reading `_rank_candidates_pass` -- a reader must
-        not have to guess whether "Next best" is a raw pct sort."""
-        out = self._render(self._snap(
+        not have to guess whether "Next best" is a raw pct sort. Checked on
+        both keys, not just one literal: a hardcoded string ("engine
+        order") would pass a single-key assertion just as well as stating
+        the real key does."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        snap = self._snap(
             self._acct("1", "active@x.com", switchable=True,
                         last_good={"five_hour": {"pct": 10.0}}),
             self._acct("2", "b@x.com", switchable=True,
                         last_good={"five_hour": {"pct": 5.0}}),
-        ), active="1")
-        assert "Next best (engine order)" in out, (
-            f"the legend does not name the ranking key: {out!r}"
+        )
+        out = self._render(
+            snap, active="1", settings=AutoSwitchSettings(strategy="consume-first")
+        )
+        assert "Next best (soonest reset)" in out, (
+            f"the legend does not name consume-first's ranking key: {out!r}"
+        )
+        out = self._render(
+            snap, active="1", settings=AutoSwitchSettings(strategy="best")
+        )
+        assert "Next best (most headroom)" in out, (
+            f"the legend does not name best's ranking key: {out!r}"
         )
 
     def test_unswitchable_rows_sort_last(self):

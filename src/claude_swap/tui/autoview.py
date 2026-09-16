@@ -487,6 +487,13 @@ class AutoScreen(Screen):
             ),
             active_disabled,
         )
+        # `_trigger_for` returns `None` for exactly one reason: `dynamic`'s
+        # own steady state (`proactive`/`dynamic-healthy`), ranked by the
+        # separate warm/cold `_rank_dynamic_candidates` mechanism this panel
+        # does not track. That is "not modeled", never "modeled and empty" --
+        # a real trigger that resolves to nothing ranking still says so
+        # truthfully below, but this state must not borrow that same claim.
+        dynamic_unmodeled = trigger is None
         ordered = _rank_on(models, trigger)
         # The SAME retry `_rank_candidates` makes (`dynamic` only): drop the
         # model set and re-rank on 5h/7d alone, but only when the model
@@ -611,12 +618,18 @@ class AutoScreen(Screen):
                         entry.append(f"  {blocked_model} full", style=palette.muted)
                 if acc.disabled:
                     entry.append("  auto-swap disabled", style=palette.muted)
-                elif acc.number not in ordered_rank and kind == "open":
+                elif (
+                    acc.number not in ordered_rank
+                    and kind == "open"
+                    and not dynamic_unmodeled
+                ):
                     # "open": nothing per-window blocks it, yet the engine's
                     # own pass still refused it -- a weekly reset later than
                     # the active's own, losing the hysteresis margin to a
                     # healthier peer, or ranking behind a sooner recovery.
                     # Every other excluded row already has a reason above.
+                    # Never under `dynamic_unmodeled`: this pass never ran,
+                    # so "refused" is not a claim this row can support.
                     entry.append("  not a candidate", style=palette.muted)
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key.
@@ -629,10 +642,12 @@ class AutoScreen(Screen):
             lines[acc.number] = entry
 
         text = Text()
-        # The order below is the engine's own admission (soonest 7-day reset
-        # under consume-first/dynamic, most headroom under best), not a
-        # re-derived read of the raw window pcts.
-        text.append("Next best (engine order)", style=palette.muted)
+        # The KEY itself, not just its source: `consume_first` (true for
+        # both `consume-first` and `dynamic`, CONSUME_FIRST_STRATEGIES)
+        # ranks by soonest weekly reset; `best` ranks by most headroom --
+        # the same two axes `_rank_candidates_pass` sorts on.
+        rank_key = "soonest reset" if consume_first else "most headroom"
+        text.append(f"Next best ({rank_key})", style=palette.muted)
         if not ranked:
             # Reached only when this is the sole account. Slots that cannot be
             # switched to are listed above with the reason, so "no other
@@ -640,11 +655,21 @@ class AutoScreen(Screen):
             text.append("\n  no other accounts", style=palette.muted)
             return text
         if not ordered:
-            # DIFFERENT from "no other accounts": rows are still listed
-            # below, each naming why -- but none is something a tick would
-            # switch to, and ranking one anyway would name a top row the
-            # engine could never pick.
-            text.append("\n  no candidate qualifies", style=palette.muted)
+            if dynamic_unmodeled:
+                # NOT "no candidate qualifies": that claims the engine will
+                # switch to nothing, which is false here -- `dynamic`'s own
+                # warm/cold mechanism may still switch on this very tick,
+                # this pass just cannot preview which row it would land on.
+                text.append(
+                    "\n  not previewed (dynamic warm/cold state)",
+                    style=palette.muted,
+                )
+            else:
+                # DIFFERENT from "no other accounts": rows are still listed
+                # below, each naming why -- but none is something a tick would
+                # switch to, and ranking one anyway would name a top row the
+                # engine could never pick.
+                text.append("\n  no candidate qualifies", style=palette.muted)
         for _key, number in sorted(ranked):
             text.append(lines[number])
         return text
