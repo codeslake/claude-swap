@@ -2051,13 +2051,14 @@ class TestAutoScreen:
     async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):
-        """The regression this gate exists to stop: same fleet as the test
-        above (both candidates blocked ONLY by the pinned model), but
-        `strategy: "best"` — the engine's own retry never drops the model
-        set for `best`/`consume-first` (autoswitch.py:2400), so the panel
-        must not either: both rows stay labelled "Fable-walled", the
-        model-gated block reason, never the 5h-based ranking the `dynamic`
-        test above takes.
+        """The regression this gate exists to stop: both candidates blocked
+        ONLY by the pinned model (their 5h/7d are open; only the Fable
+        window is over the bar), but `strategy: "best"` — the engine's own
+        retry never drops the model set for `best`/`consume-first`
+        (autoswitch.py:2400), so the panel must not either: both rows stay
+        labelled "Fable-walled", the model-gated block reason, never a
+        5h-based ranking (which `dynamic`, not exercised by this fleet,
+        would take instead).
 
         Confirmed against a real tick (`EngineHarness.tick_with_usage` on
         this exact fleet): the outcome is `BLOCKED`, account 1 stays active.
@@ -2104,10 +2105,11 @@ class TestAutoScreen:
         and its trigger -- "disabled-active" -- is in neither gated tuple
         (3952, 4048), so a disabled active's own healthy headroom (50%) must
         never derive "proactive" here and gate out a low-headroom candidate
-        the way it would for a merely-healthy active. #2 (4% headroom) fails
-        `best`'s hysteresis margin against a 50%-headroom active by 46
-        points -- excluded under "proactive" -- but a disabled active must
-        still rank it rather than report no candidate at all."""
+        the way it would for a merely-healthy active. #2's own utilization
+        (96% 5h) is itself over the threshold (90) -- excluded by the
+        landing-health gate (autoswitch.py:4082) under "proactive" before
+        `best`'s hysteresis margin is ever reached -- but a disabled active
+        must still rank it rather than report no candidate at all."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -2118,6 +2120,49 @@ class TestAutoScreen:
             [
                 make_account(1, active=True, disabled=True, entry=make_entry(50.0, 50.0)),
                 make_account(2, entry=make_entry(96.0, 5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "no candidate qualifies" not in plain, plain
+
+    async def test_candidates_dynamic_retry_ranks_once_the_model_gate_drops(
+        self, tmp_path, fake_engine
+    ):
+        """A single trigger, carried into both the model-gated pass and the
+        5h/7d retry, must still let the retry itself land a real ranking --
+        this is the case the retry exists for, not merely a case that
+        returns empty either way. The active is genuinely spent on BOTH 5h
+        and 7d (100%/100%), so widening is a no-op and the trigger
+        classifies "at-limit" on either axis; #2 is maxed ONLY on the pinned
+        Fable window (100%) with 5h/7d wide open (10%/5%). On the
+        model-gated axis #2 reads spent too (headroom 0) and the primary
+        pass's own spent-candidate admission needs a sooner weekly reset
+        than the active has, which this fleet does not give it, so the
+        primary pass comes back empty and `_model_window_binds_everywhere`
+        sends it to the retry; there, with the model dropped, #2's real
+        5h/7d headroom (90) has nothing to exclude it and the retry ranks
+        it. (Confirmed directly against `rank_candidates_pass`: the primary
+        call returns `ordered=[]`, the retry call returns `ordered=['2']`.)
+        """
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(100.0, 100.0)),
+                make_account(
+                    2, entry=make_entry(10.0, 5.0, scoped=[("Fable", 100.0)])
+                ),
             ],
             tmp_path,
         )
