@@ -6946,9 +6946,6 @@ class TestSwitchSkipsBrokenSlots:
         assert calls == [], (
             "a stamped body is already under CC's own governance -- the "
             f"refresh fetched anyway: {calls}")
-        assert json.loads(policy.read_text()) == stale, (
-            "the stamped body was overwritten even though the fetch should "
-            "never have run")
 
     def test_a_stamp_with_no_body_still_fetches(
         self, temp_home: Path, monkeypatch

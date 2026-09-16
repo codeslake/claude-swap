@@ -657,15 +657,14 @@ class ClaudeAccountSwitcher:
         and CC refuses the body and re-fetches with its own local identity
         (2.1.271 also added the credential-store change broadcast that
         drives this). So the refresh window this function guards against
-        exists with or without our write; when the body is already present
-        AND stamped, the fetch below is skipped entirely, because it would
-        be a redundant network round-trip and nothing more. An absent body
-        still needs the fetch regardless of the stamp: on a CC that enforces
-        the gate a fresh write with no matching stamp reads "unstamped" no
-        better than absent, and on an older or downgraded CC that reads the
-        body directly there is no gate to satisfy at all -- either way there
-        is nothing this skip could be preserving, see "DELETING IT IS NOT
-        THE FIX" above.
+        exists with or without our write when CC enforces the stamp; a body
+        that is already present AND stamped skips the fetch below, which
+        would otherwise only reproduce what CC does on its own -- at the
+        accepted cost that a CC too old to enforce the gate keeps whatever
+        answer is already on disk, same as the stale-fetch case above. An
+        ABSENT body still needs the fetch regardless of the stamp: nothing
+        here could be preserving an answer that does not exist, see
+        "DELETING IT IS NOT THE FIX" above.
         """
         # THE PIN DAEMON OWNS THIS FILE when a pin is set: `sweep_policy_once`
         # runs on its sweep beat, asks as the PIN -- the account every pinned
@@ -685,20 +684,13 @@ class ClaudeAccountSwitcher:
         except Exception:  # noqa: BLE001 — a switch must not fail on this
             pass
         # SKIP THE FETCH, NOT JUST THE WRITE, when a stamp sits beside an
-        # EXISTING body: the stamp is CC's own governance marker (see the
-        # docstring), so the round-trip below would only reproduce what CC
-        # already does on its own. A stamp with no body is NOT that case --
-        # absent is DENIED, same as the docstring's opening argument, so an
-        # absent file still needs the fetch that writes it. Tested by
-        # presence, not by version -- more accurate than a `claude --version`
-        # gate, and needs no subprocess here. NEITHER PATH IS RESOLVED
+        # EXISTING body -- see the docstring. NEITHER PATH IS RESOLVED
         # THROUGH A SYMLINK here, unlike the writer below: CC names the
         # stamp itself, at `<config home>/policy-limits.json.stamp.json`,
         # and has no reason to chase a link cswap's own writer follows only
         # because `os.replace` must land on the real file.
-        config_home = get_claude_config_home()
-        if (config_home / "policy-limits.json").exists() and \
-                (config_home / "policy-limits.json.stamp.json").exists():
+        body = get_claude_config_home() / "policy-limits.json"
+        if body.exists() and body.with_name(body.name + ".stamp.json").exists():
             return
         # `switcher` is passed because the seam cannot reach a keychain-aware
         # read without it: where the live credential is Keychain-only the
@@ -712,7 +704,7 @@ class ClaudeAccountSwitcher:
             return
         if not isinstance(doc, dict):
             return
-        path = config_home / "policy-limits.json"
+        path = body
         # THROUGH A SYMLINK, NEVER OVER IT -- the rule `_write_json` states
         # above. `os.replace` swaps a directory entry and does not follow
         # links, so a dotfiles-managed cache would be detached from its target.
