@@ -648,18 +648,24 @@ class ClaudeAccountSwitcher:
         stamp in this order: `stamp is null or stamp.sha != bodySha` ->
         "unstamped"; else `stamp.identity != identity` -> "foreign"; else
         "match". The `sha` covers canonical (recursive key-sorted) JSON, so a
-        same-content rewrite still reads `match` and is admitted -- but a
-        SWITCH invalidates the stamp on its own, through `identity`, not
-        through `sha`: `identity` is the LOCAL credential, so the account
-        that just went active no longer matches whatever account the stamp
-        was saved under, the body reads "foreign", and CC refuses it and
-        re-fetches with its own local identity (2.1.271 also added the
-        credential-store change broadcast that drives this). So the refresh
-        window this function guards against exists with or without our
-        write; when the body is already present AND stamped, the fetch below
-        is skipped entirely, because it would be a redundant network
-        round-trip and nothing more. An absent body still needs the fetch
-        regardless of the stamp -- see "DELETING IT IS NOT THE FIX" above.
+        same-content rewrite BY THE SAME ACCOUNT clears the first arm and
+        reads `match` -- but a SWITCH invalidates the stamp on its own,
+        through `identity`, not through `sha`: `identity` is the LOCAL
+        credential, so the account that just went active no longer matches
+        whatever account the stamp was saved under, the first arm still
+        passes (nobody touched the bytes) but the second reads "foreign",
+        and CC refuses the body and re-fetches with its own local identity
+        (2.1.271 also added the credential-store change broadcast that
+        drives this). So the refresh window this function guards against
+        exists with or without our write; when the body is already present
+        AND stamped, the fetch below is skipped entirely, because it would
+        be a redundant network round-trip and nothing more. An absent body
+        still needs the fetch regardless of the stamp: on a CC that enforces
+        the gate a fresh write with no matching stamp reads "unstamped" no
+        better than absent, and on an older or downgraded CC that reads the
+        body directly there is no gate to satisfy at all -- either way there
+        is nothing this skip could be preserving, see "DELETING IT IS NOT
+        THE FIX" above.
         """
         # THE PIN DAEMON OWNS THIS FILE when a pin is set: `sweep_policy_once`
         # runs on its sweep beat, asks as the PIN -- the account every pinned
