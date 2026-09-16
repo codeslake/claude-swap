@@ -6904,6 +6904,52 @@ class TestSwitchSkipsBrokenSlots:
             "a failed fetch cleared the cache; absent is DENIED, so that is "
             "strictly worse than the answer it replaced")
 
+    def test_a_stamped_cache_skips_the_fetch_entirely(
+        self, temp_home: Path, monkeypatch
+    ):
+        """CC 2.1.271+ gates the body on a sidecar stamp
+        (`policy-limits.json.stamp.json`): a body whose stamp is present is
+        already under CC's own governance, so our fetch-and-write is a
+        redundant network round-trip, not a fix for anything. Skip the fetch,
+        not just the write -- the value being claimed is one fewer request on
+        the switch path, so a call-count assertion is the one that matters,
+        not just the untouched bytes.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        stale = {"restrictions": {"allow_remote_control": {"allowed": True}}}
+        policy.write_text(json.dumps(stale))
+        stamp = policy.with_name(policy.name + ".stamp.json")
+        stamp.write_text(json.dumps({"sha": "sha256:whatever"}))
+
+        calls: list[object] = []
+
+        def _spy(**kw):
+            calls.append(kw)
+            return {"restrictions": {}, "compliance_taints": []}
+
+        monkeypatch.setattr("claude_swap.switcher.fetch_policy_limits", _spy)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert calls == [], (
+            "a stamped body is already under CC's own governance -- the "
+            f"refresh fetched anyway: {calls}")
+        assert json.loads(policy.read_text()) == stale, (
+            "the stamped body was overwritten even though the fetch should "
+            "never have run")
+
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
         s = self._setup(temp_home)

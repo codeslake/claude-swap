@@ -642,6 +642,17 @@ class ClaudeAccountSwitcher:
         absent is wrong for every account. Never raises, for the same reason:
         a switch must not fail over a cache file, and the worst case of doing
         nothing is the state we already had.
+
+        CC 2.1.271+ ADMITS THIS FILE ONLY UNDER A SIDECAR STAMP
+        (`policy-limits.json.stamp.json`) -- measured live: the stamp's `sha`
+        covers canonical (recursive key-sorted) JSON, so a same-content
+        rewrite still reads `match` and is admitted, but a CONTENT change
+        reads "foreign" (the stale stamp names the previous account) and CC
+        refuses the body and re-fetches itself with its own local identity.
+        So the refresh window this function guards against exists with or
+        without our write; a stamped file skips straight to the fetch this
+        function would otherwise make, which is a redundant network
+        round-trip and nothing more.
         """
         # THE PIN DAEMON OWNS THIS FILE when a pin is set: `sweep_policy_once`
         # runs on its sweep beat, asks as the PIN -- the account every pinned
@@ -660,6 +671,16 @@ class ClaudeAccountSwitcher:
                 return
         except Exception:  # noqa: BLE001 — a switch must not fail on this
             pass
+        # SKIP THE FETCH, NOT JUST THE WRITE, when a stamp sits beside the
+        # body: the stamp is CC's own governance marker (see the docstring),
+        # so the round-trip below would only reproduce what CC already does
+        # on its own. Tested by presence, not by version -- more accurate
+        # than a `claude --version` gate, and needs no subprocess here.
+        stamp_path = get_claude_config_home() / "policy-limits.json"
+        if stamp_path.is_symlink():
+            stamp_path = Path(os.path.realpath(stamp_path))
+        if stamp_path.with_name(stamp_path.name + ".stamp.json").exists():
+            return
         # `switcher` is passed because the seam cannot reach a keychain-aware
         # read without it: where the live credential is Keychain-only the
         # plaintext fallback finds nothing and the refresh returns before it
