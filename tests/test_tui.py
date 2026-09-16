@@ -2142,14 +2142,16 @@ class TestAutoScreen:
         and 7d (100%/100%), so widening is a no-op and the trigger
         classifies "at-limit" on either axis; #2 is maxed ONLY on the pinned
         Fable window (100%) with 5h/7d wide open (10%/5%). On the
-        model-gated axis #2 reads spent too (headroom 0) and the primary
-        pass's own spent-candidate admission needs a sooner weekly reset
-        than the active has, which this fleet does not give it, so the
-        primary pass comes back empty and `_model_window_binds_everywhere`
-        sends it to the retry; there, with the model dropped, #2's real
-        5h/7d headroom (90) has nothing to exclude it and the retry ranks
-        it. (Confirmed directly against `rank_candidates_pass`: the primary
-        call returns `ordered=[]`, the retry call returns `ordered=['2']`.)
+        model-gated axis #2 reads spent too (headroom 0), which sends the
+        pass onto `dynamic`'s own recovery axis (autoswitch.py ~4046); there
+        `dynamic`'s landing rule refuses to admit ANY zero-headroom account
+        unconditionally -- unlike `best`/`consume-first`, which would still
+        take the recovery escape -- so the primary pass comes back empty and
+        `_model_window_binds_everywhere` sends it to the retry; there, with
+        the model dropped, #2's real 5h/7d headroom (90) has nothing to
+        exclude it and the retry ranks it. (Confirmed directly against
+        `rank_candidates_pass`: the primary call returns `ordered=[]`, the
+        retry call returns `ordered=['2']`.)
         """
         import json as _json
 
