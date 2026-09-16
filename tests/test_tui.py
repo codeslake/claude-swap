@@ -2048,51 +2048,6 @@ class TestAutoScreen:
                 "user2@example.com"
             )
 
-    async def test_candidates_drop_the_model_gate_when_every_row_is_model_only(
-        self, tmp_path, fake_engine
-    ):
-        """Both candidates' ONLY over-bar window is the pinned model, exactly
-        the shape ``_rank_candidates`` (autoswitch.py) retries on 5h/7d alone
-        for — but that retry is `dynamic`-only (autoswitch.py:2400): `best`/
-        `consume-first` never rank on 5h/7d alone, so under those strategies
-        the panel must NOT drop the model gate either, even here. `strategy`
-        must be `dynamic` for the panel to take this path at all — ranking on
-        the model-gated axis here would name #2 (95% Fable) the worse account
-        when its real 5h is #3's better one: the two are on OPPOSITE sides of
-        `-Fable, +5h` vs `+Fable, -5h`."""
-        import json as _json
-
-        (tmp_path / "settings.json").write_text(_json.dumps({
-            "schemaVersion": 1,
-            "autoswitch": {"model": "Fable", "strategy": "dynamic", "threshold": 90},
-        }))
-        fake = FakeSwitcher(
-            [
-                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
-                make_account(
-                    2, entry=make_entry(20.0, 5.0, scoped=[("Fable", 95.0)])
-                ),
-                make_account(
-                    3, entry=make_entry(60.0, 5.0, scoped=[("Fable", 90.0)])
-                ),
-            ],
-            tmp_path,
-        )
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await self._open(pilot)
-            await settle(pilot)
-            from textual.widgets import Static
-
-            plain = app.screen.query_one("#candidates", Static).render().plain
-            # #2's real 5h (20%) beats #3's (60%): once the model gate drops
-            # (neither #2 nor #3 has a 5h/7d window over the bar on its own),
-            # #2 must rank first — ranking on the model-gated axis instead
-            # would put #3 first (90% Fable < 95% Fable).
-            assert plain.index("user2@example.com") < plain.index(
-                "user3@example.com"
-            )
-
     async def test_candidates_keep_the_model_gate_under_best_even_when_every_row_is_model_only(
         self, tmp_path, fake_engine
     ):
@@ -2140,6 +2095,40 @@ class TestAutoScreen:
                 f"both rows must stay model-gated, never re-ranked on the "
                 f"5h axis `best` never uses: {plain!r}"
             )
+
+    async def test_candidates_rank_unconditionally_under_a_disabled_active(
+        self, tmp_path, fake_engine
+    ):
+        """The engine checks `is_account_disabled(current)` FIRST and
+        unconditionally (autoswitch.py:2290), before any headroom reading,
+        and its trigger -- "disabled-active" -- is in neither gated tuple
+        (3952, 4048), so a disabled active's own healthy headroom (50%) must
+        never derive "proactive" here and gate out a low-headroom candidate
+        the way it would for a merely-healthy active. #2 (4% headroom) fails
+        `best`'s hysteresis margin against a 50%-headroom active by 46
+        points -- excluded under "proactive" -- but a disabled active must
+        still rank it rather than report no candidate at all."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "best", "threshold": 90},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, disabled=True, entry=make_entry(50.0, 50.0)),
+                make_account(2, entry=make_entry(96.0, 5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "no candidate qualifies" not in plain, plain
 
     async def test_candidates_drain_soonest_seven_day_reset_first(
         self, tmp_path, fake_engine

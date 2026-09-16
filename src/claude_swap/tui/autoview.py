@@ -31,6 +31,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
     _classify_dynamic_trigger,
+    _dynamic_active_headroom,
     _headroom_by_account,
     _model_window_binds_everywhere,
     binding_pct,
@@ -421,7 +422,9 @@ class AutoScreen(Screen):
             and acc.kind != "api_key"
         ]
 
-        def _trigger_for(active_headroom: float | None) -> str | None:
+        def _trigger_for(
+            active_headroom: float | None, active_disabled: bool
+        ) -> str | None:
             # Mirrors `_tick_inner`'s own classification closely enough for
             # `_rank_candidates_pass`'s gates to engage the way they would
             # on a real tick -- an unrecognized literal (e.g. the bare
@@ -430,6 +433,18 @@ class AutoScreen(Screen):
             # this refactor exists to close (#199). `None` means no trigger
             # this panel can derive reaches this pass on a real tick at
             # all; the caller ranks nothing rather than guess.
+            #
+            # FIRST AND UNCONDITIONAL, before any headroom reading --
+            # `_tick_inner` checks `is_account_disabled(current)` ahead of
+            # everything else (autoswitch.py:2290), so a disabled active
+            # must win here even when its own headroom reads healthy.
+            # Its own trigger name, not "at-limit"/"proactive": both
+            # landing-health gates (3952, 4048) key on those literals, and
+            # a disabled active is withdrawn from rotation, not merely
+            # blocked -- any readable candidate should rank, not just a
+            # healthy one.
+            if active_disabled:
+                return "disabled-active"
             if active_headroom is None:
                 # `_tick_inner`'s idle-hold/eventual-failover branch, taken
                 # regardless of strategy. The pass ranks fine with
@@ -458,15 +473,24 @@ class AutoScreen(Screen):
                 and (100.0 - active_headroom) < settings.threshold
             ):
                 return settings.strategy
+            # Not a real trigger -- nothing this panel can derive reaches
+            # the pass under it on a real tick: a non-consume-first
+            # strategy below the threshold never assigns a trigger at all
+            # in the engine (it emits `below-threshold` and returns
+            # `TickOutcome.NO_ACTION`, autoswitch.py:2314). "proactive" is
+            # this panel's own answer to "what would it pick if it had
+            # to", which is the panel's whole job -- there is simply no
+            # engine trigger to mirror here.
             return "at-limit" if active_headroom <= 0 else "proactive"
 
-        def _rank_on(axis: tuple[str, ...]) -> tuple[list[str], dict]:
+        def _rank_on(
+            axis: tuple[str, ...], trigger: str | None
+        ) -> tuple[list[str], dict]:
             usage = {
                 acc.number: acc.usage.decision_value(axis) for acc in snap.accounts
             }
             headroom = _headroom_by_account(usage, axis)
             active_headroom = headroom.get(active_number)
-            trigger = _trigger_for(active_headroom)
             if trigger is None:
                 return [], usage
             ordered, *_rest = rank_candidates_pass(
@@ -484,7 +508,37 @@ class AutoScreen(Screen):
         # THE ENGINE'S OWN ADMISSION, not a re-derived predicate (#199): a
         # static pass call, needing no engine instance, for which candidates
         # a tick would consider and in what order.
-        ordered, usage_by_account = _rank_on(models)
+        #
+        # ONE TRIGGER, CLASSIFIED ONCE -- `_tick_inner` decides `trigger` at
+        # a single site (autoswitch.py:2290-2368) and carries that one
+        # literal into both its own `_rank_candidates_pass` calls through
+        # the `kw` dict (3760, used at 3782 and 3803). Calling `_trigger_for`
+        # separately per axis let the model-gated pass and the 5h/7d retry
+        # disagree on what a real tick would classify as one decision.
+        model_usage = {
+            acc.number: acc.usage.decision_value(models) for acc in snap.accounts
+        }
+        model_headroom = _headroom_by_account(model_usage, models)
+        active_account = next(
+            (acc for acc in snap.accounts if acc.number == active_number), None
+        )
+        active_disabled = (
+            active_account.disabled if active_account is not None else False
+        )
+        # Widened exactly like the engine's own `active_headroom` ahead of
+        # classification (autoswitch.py:2246) -- `_rank_on` below keeps its
+        # own per-axis, UNWIDENED read for `active_headroom=` (autoswitch.py
+        # deliberately re-derives that per axis, 3771-3781: passing the
+        # widened value through mixes a margin between two different axes).
+        # Only the trigger classification widens.
+        trigger = _trigger_for(
+            _dynamic_active_headroom(
+                settings, models, model_usage, active_number,
+                model_headroom.get(active_number),
+            ),
+            active_disabled,
+        )
+        ordered, usage_by_account = _rank_on(models, trigger)
         # The SAME retry `_rank_candidates` makes (`dynamic` only): drop the
         # model set and re-rank on 5h/7d alone, but only when the model
         # window is what is actually blocking every account, active
@@ -497,7 +551,7 @@ class AutoScreen(Screen):
                 usage_by_account, models, settings.threshold
             )
         ):
-            ordered, usage_by_account = _rank_on(())
+            ordered, usage_by_account = _rank_on((), trigger)
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
