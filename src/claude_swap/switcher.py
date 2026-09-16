@@ -650,9 +650,11 @@ class ClaudeAccountSwitcher:
         reads "foreign" (the stale stamp names the previous account) and CC
         refuses the body and re-fetches itself with its own local identity.
         So the refresh window this function guards against exists with or
-        without our write; a stamped file skips straight to the fetch this
-        function would otherwise make, which is a redundant network
-        round-trip and nothing more.
+        without our write; when the body is already present AND stamped, the
+        fetch below is skipped entirely, because it would be a redundant
+        network round-trip and nothing more. An absent body still needs the
+        fetch regardless of the stamp -- see "DELETING IT IS NOT THE FIX"
+        above.
         """
         # THE PIN DAEMON OWNS THIS FILE when a pin is set: `sweep_policy_once`
         # runs on its sweep beat, asks as the PIN -- the account every pinned
@@ -671,15 +673,21 @@ class ClaudeAccountSwitcher:
                 return
         except Exception:  # noqa: BLE001 — a switch must not fail on this
             pass
-        # SKIP THE FETCH, NOT JUST THE WRITE, when a stamp sits beside the
-        # body: the stamp is CC's own governance marker (see the docstring),
-        # so the round-trip below would only reproduce what CC already does
-        # on its own. Tested by presence, not by version -- more accurate
-        # than a `claude --version` gate, and needs no subprocess here.
-        stamp_path = get_claude_config_home() / "policy-limits.json"
-        if stamp_path.is_symlink():
-            stamp_path = Path(os.path.realpath(stamp_path))
-        if stamp_path.with_name(stamp_path.name + ".stamp.json").exists():
+        # SKIP THE FETCH, NOT JUST THE WRITE, when a stamp sits beside an
+        # EXISTING body: the stamp is CC's own governance marker (see the
+        # docstring), so the round-trip below would only reproduce what CC
+        # already does on its own. A stamp with no body is NOT that case --
+        # absent is DENIED, same as the docstring's opening argument, so an
+        # absent file still needs the fetch that writes it. Tested by
+        # presence, not by version -- more accurate than a `claude --version`
+        # gate, and needs no subprocess here. NEITHER PATH IS RESOLVED
+        # THROUGH A SYMLINK here, unlike the writer below: CC names the
+        # stamp itself, at `<config home>/policy-limits.json.stamp.json`,
+        # and has no reason to chase a link cswap's own writer follows only
+        # because `os.replace` must land on the real file.
+        config_home = get_claude_config_home()
+        if (config_home / "policy-limits.json").exists() and \
+                (config_home / "policy-limits.json.stamp.json").exists():
             return
         # `switcher` is passed because the seam cannot reach a keychain-aware
         # read without it: where the live credential is Keychain-only the
