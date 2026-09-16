@@ -6950,6 +6950,48 @@ class TestSwitchSkipsBrokenSlots:
             "the stamped body was overwritten even though the fetch should "
             "never have run")
 
+    def test_a_stamp_with_no_body_still_fetches(
+        self, temp_home: Path, monkeypatch
+    ):
+        """THE CONTROL for the skip above. A stamp with no body is not "CC
+        already governs this" -- it is the case the docstring's "DELETING IT
+        IS NOT THE FIX" already argues about: absent means DENIED, so a
+        leftover stamp with no body must still fetch and write, not skip.
+        """
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+
+        policy = temp_home / ".claude" / "policy-limits.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        stamp = policy.with_name(policy.name + ".stamp.json")
+        stamp.write_text(json.dumps({"sha": "sha256:whatever"}))
+        assert not policy.exists(), "premise: the body is absent, only the stamp is there"
+
+        fresh = {"restrictions": {}, "compliance_taints": []}
+        calls: list[object] = []
+
+        def _spy(**kw):
+            calls.append(kw)
+            return fresh
+
+        monkeypatch.setattr("claude_swap.switcher.fetch_policy_limits", _spy)
+
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-live-1",
+                               "refreshToken": "rt-live-1"}}))
+        (temp_home / ".claude.json").write_text(json.dumps(
+            {"oauthAccount": {"emailAddress": "a@example.com",
+                              "accountUuid": "uuid-1"}}))
+
+        s.switch()
+
+        assert calls, (
+            "a stamp with no body was read as governed and the fetch was "
+            "skipped -- the body stays absent, and absent is DENIED")
+        assert json.loads(policy.read_text()) == fresh, (
+            "the fetch ran but the body still was not written")
+
     def test_rotation_skips_broken_next_slot(self, temp_home: Path, capsys):
         """Three accounts, active=1, slot 2 broken — rotation must land on 3."""
         s = self._setup(temp_home)

@@ -644,17 +644,22 @@ class ClaudeAccountSwitcher:
         nothing is the state we already had.
 
         CC 2.1.271+ ADMITS THIS FILE ONLY UNDER A SIDECAR STAMP
-        (`policy-limits.json.stamp.json`) -- measured live: the stamp's `sha`
-        covers canonical (recursive key-sorted) JSON, so a same-content
-        rewrite still reads `match` and is admitted, but a CONTENT change
-        reads "foreign" (the stale stamp names the previous account) and CC
-        refuses the body and re-fetches itself with its own local identity.
-        So the refresh window this function guards against exists with or
-        without our write; when the body is already present AND stamped, the
-        fetch below is skipped entirely, because it would be a redundant
-        network round-trip and nothing more. An absent body still needs the
-        fetch regardless of the stamp -- see "DELETING IT IS NOT THE FIX"
-        above.
+        (`policy-limits.json.stamp.json`) -- measured live, CC checks the
+        stamp in this order: `stamp is null or stamp.sha != bodySha` ->
+        "unstamped"; else `stamp.identity != identity` -> "foreign"; else
+        "match". The `sha` covers canonical (recursive key-sorted) JSON, so a
+        same-content rewrite still reads `match` and is admitted -- but a
+        SWITCH invalidates the stamp on its own, through `identity`, not
+        through `sha`: `identity` is the LOCAL credential, so the account
+        that just went active no longer matches whatever account the stamp
+        was saved under, the body reads "foreign", and CC refuses it and
+        re-fetches with its own local identity (2.1.271 also added the
+        credential-store change broadcast that drives this). So the refresh
+        window this function guards against exists with or without our
+        write; when the body is already present AND stamped, the fetch below
+        is skipped entirely, because it would be a redundant network
+        round-trip and nothing more. An absent body still needs the fetch
+        regardless of the stamp -- see "DELETING IT IS NOT THE FIX" above.
         """
         # THE PIN DAEMON OWNS THIS FILE when a pin is set: `sweep_policy_once`
         # runs on its sweep beat, asks as the PIN -- the account every pinned
@@ -701,7 +706,7 @@ class ClaudeAccountSwitcher:
             return
         if not isinstance(doc, dict):
             return
-        path = get_claude_config_home() / "policy-limits.json"
+        path = config_home / "policy-limits.json"
         # THROUGH A SYMLINK, NEVER OVER IT -- the rule `_write_json` states
         # above. `os.replace` swaps a directory entry and does not follow
         # links, so a dotfiles-managed cache would be detached from its target.
