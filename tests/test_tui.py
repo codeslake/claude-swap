@@ -2843,6 +2843,14 @@ class TestUnswitchableRowsAreListed:
             self._acct("3", "c@x.invalid", switchable=True, last_good=fleet["3"]),
             self._acct("4", "d@x.invalid", switchable=True, last_good=fleet["4"]),
         ), active="1", settings=settings)
+        # A row's POSITION falls back to unranked/sequence order when the
+        # panel refuses to rank at all ("no candidate qualifies") -- so
+        # `panel_top` alone cannot tell a real top pick from that fallback
+        # naming the same account by coincidence.
+        assert "no candidate qualifies" not in rendered, (
+            f"the panel refused to rank at all instead of naming a top "
+            f"pick: {rendered!r}"
+        )
         emails = {"2": "b@x.invalid", "3": "c@x.invalid", "4": "d@x.invalid"}
         positions = {n: rendered.index(e) for n, e in emails.items()}
         panel_top = min(positions, key=positions.get)
