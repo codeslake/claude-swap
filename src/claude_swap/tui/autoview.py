@@ -30,18 +30,23 @@ from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
+    _headroom_by_account,
     binding_pct,
     classify_candidate_block,
-    consume_first_rank_key,
     model_block_label,
     pct_label,
     proactive_switch_bar_pct,
-    select_probe_target,
+    rank_candidates_pass,
 )
 from claude_swap import pin
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.models import AccountsSnapshot
-from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
+from claude_swap.settings import (
+    SETTING_SPECS,
+    AutoSwitchSettings,
+    load_settings,
+    parse_model_names,
+)
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
@@ -440,51 +445,41 @@ class AutoScreen(Screen):
             default=0,
         )
         now = time.time()
-        # THE SAME PROBE TARGET THE ENGINE WOULD ADMIT, never re-derived --
-        # `select_probe_target` (autoswitch.py) is the one function both
-        # this panel and `_rank_candidates_pass` call, so an unknown-reset
-        # candidate cannot sort last here while the engine ranks it first.
-        probe_num = None
-        if consume_first:
-            # `decision_value(rank_models)`, not a raw sentinel-or-last_good
-            # read: the engine's own gate (`select_probe_target`'s
-            # `active_reset_ts is None` guard, and `_rank_candidates_pass`'s
-            # admission loop) runs on `decision_value()`, which drops a
-            # `last_good` older than `STALE_OK_S` AND (#325) a window whose
-            # own reset has elapsed -- reading the raw `last_good` here
-            # instead let the panel disagree with the engine on exactly what
-            # :417-420 assumes cannot happen: a candidate the engine reads
-            # as unknown-reset (its rolled window dropped) could still show
-            # here with the pre-drop reading, sorting differently than the
-            # engine would ever rank it.
-            usage_by_account = {
-                acc.number: acc.usage.decision_value(rank_models)
-                for acc in snap.accounts
-            }
-            oauth_candidates = [
-                acc.number
-                for acc in snap.accounts
-                if acc.number != active_number
-                and acc.switchable
-                and acc.kind != "api_key"
-            ]
-            active_acc_usage = next(
-                (acc.usage for acc in snap.accounts if acc.number == active_number),
-                None,
-            )
-            active_value = (
-                active_acc_usage.decision_value(rank_models)
-                if active_acc_usage is not None
-                else None
-            )
-            probe_num = select_probe_target(
-                usage_by_account,
-                oauth_candidates,
-                rank_models,
-                active_value,
-                self._engine._last_probe_cooldown if self._engine is not None else None,
-                now,
-            )
+        # THE ENGINE'S OWN ADMISSION, not a re-derived predicate (#199): a
+        # static pass call, needing no engine instance, for which candidates
+        # a tick would consider and in what order. `decision_value`, not raw
+        # `last_good`, so a rolled window (#325) reads the same as the pass.
+        usage_by_account = {
+            acc.number: acc.usage.decision_value(rank_models)
+            for acc in snap.accounts
+        }
+        # `switchable_account_numbers()` (switcher.py) drops `disabled` too.
+        oauth_candidates = [
+            acc.number
+            for acc in snap.accounts
+            if acc.number != active_number
+            and acc.switchable
+            and not acc.disabled
+            and acc.kind != "api_key"
+        ]
+        headroom = _headroom_by_account(usage_by_account, rank_models)
+        settings = self._settings or AutoSwitchSettings()
+        # `trigger=settings.strategy`: the same literal the engine itself
+        # passes on a below-threshold consume-first/dynamic tick
+        # (`_tick_inner`) -- the panel tracks none of its other tick-time
+        # trigger state (disabled-active/at-limit/proactive/failover).
+        ordered, *_rest = rank_candidates_pass(
+            models=rank_models, trigger=settings.strategy,
+            consume_first=consume_first, oauth_candidates=oauth_candidates,
+            no_return=None, usage=usage_by_account, headroom=headroom,
+            current=active_number, active_headroom=headroom.get(active_number),
+            settings=settings, now=now, entries=None,
+            probe_cooldown=(
+                self._engine._last_probe_cooldown
+                if getattr(self, "_engine", None) is not None else None
+            ),
+        )
+        ordered_rank = {num: i for i, num in enumerate(ordered)}
         # Chip columns are keyed by WINDOW NAME, never by position: two rows
         # can have different-length window lists built from that account's
         # own payload (`relevant_windows`), so "chip 1" is not the same
@@ -626,6 +621,7 @@ class AutoScreen(Screen):
                 # row is not simply "open" on the criteria the user actually
                 # configured, independent of whether `rank_models` below has
                 # dropped to the retry's axis for ORDERING purposes.
+                kind = "open"
                 if self._settings:
                     # A window whose chip just read data.REFETCHING has no
                     # opinion to contribute -- its pct provably predates its
@@ -646,14 +642,20 @@ class AutoScreen(Screen):
                         )
                     elif kind == "full":
                         entry.append(f"  {blocked_model} full", style=palette.muted)
-                rank_pct = binding_pct(acc.usage.last_good, rank_models)
+                if acc.disabled:
+                    entry.append("  auto-swap disabled", style=palette.muted)
+                elif acc.number not in ordered_rank and kind == "open":
+                    # "open": nothing per-window blocks it, yet the pass
+                    # still dropped it (a healthier peer, the no-return bar,
+                    # hysteresis) -- every other excluded row already has a
+                    # reason from the block label above.
+                    entry.append("  not a candidate", style=palette.muted)
+                # Position from `ordered_rank` (the pass, called once
+                # above), never a locally re-derived key.
                 key = (
-                    consume_first_rank_key(
-                        acc.usage.last_good, self._settings.threshold, now,
-                        rank_models, probe=(acc.number == probe_num),
-                    )
-                    if consume_first
-                    else (pct if rank_pct is None else rank_pct,)
+                    (0, ordered_rank[acc.number])
+                    if acc.number in ordered_rank
+                    else (1,)
                 )
                 ranked.append((key, acc.number))
             # Outside the usage branches on purpose: an account whose usage is
@@ -676,13 +678,21 @@ class AutoScreen(Screen):
             lines[acc.number] = entry
 
         text = Text()
-        text.append("Next best", style=palette.muted)
+        # The order below is the engine's own admission, not a re-derived
+        # read of the raw window pcts.
+        text.append("Next best (engine order)", style=palette.muted)
         if not ranked:
             # Reached only when this is the sole account. Slots that cannot be
             # switched to are listed above with the reason, so "no other
             # accounts" is now literal rather than a filter's side effect.
             text.append("\n  no other accounts", style=palette.muted)
             return text
+        if not ordered:
+            # DIFFERENT from "no other accounts": rows are still listed
+            # below, each naming why -- but none is something a tick would
+            # switch to, and ranking one anyway would name a top row the
+            # engine could never pick.
+            text.append("\n  no candidate qualifies", style=palette.muted)
         for _key, number in sorted(ranked):
             text.append(lines[number])
         return text

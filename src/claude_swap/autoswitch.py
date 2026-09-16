@@ -3815,8 +3815,8 @@ class AutoSwitchEngine:
         self._last_probe_num = probe_num
         return ordered, any_known, active_reset_ts, waiting
 
+    @staticmethod
     def _rank_candidates_pass(
-        self,
         *,
         models: Sequence[str],
         trigger: str,
@@ -5210,6 +5210,13 @@ class AutoSwitchEngine:
                 self._emit(
                     ErrorEvent(message=f"engine stopped: {reason}", transient=False)
                 )
+
+
+# A direct module-level name, not `AutoSwitchEngine._rank_candidates_pass`:
+# a caller that only wants the (pure, static) ranking -- the "Next best"
+# panel -- survives a test that stands a fake class in for
+# `AutoSwitchEngine` the constructor.
+rank_candidates_pass = AutoSwitchEngine._rank_candidates_pass
 
 
 def _access_token_of(credentials) -> str | None:

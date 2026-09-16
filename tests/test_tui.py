@@ -2135,11 +2135,14 @@ class TestAutoScreen:
     async def test_candidates_drain_soonest_seven_day_reset_first(
         self, tmp_path, fake_engine
     ):
-        """Under the default (consume-first) strategy, 'Next best' lists
-        switchable accounts in the order the engine would actually switch to
-        them: soonest 7-day reset first, so quota is spent before it resets
-        and goes to waste. The active's 5-hour window stays a gate, never a
-        key -- it plays no part in this order."""
+        """Under the default (consume-first) strategy, `_rank_candidates_pass`
+        only ever admits an account whose 7-day reset comes SOONER than the
+        active's own -- moving to one that resets LATER would waste nothing
+        yet and is not something a consume-first tick would do (it revisits
+        the rest on later ticks, once the active's own reset moves). Of six
+        peers only "5" resets sooner than the active's 1.75 days out; the
+        other four must be named "not a candidate" rather than fleet-wide
+        sorted as if every one of them were reachable this tick (#199)."""
         import json as _json
 
         (tmp_path / "settings.json").write_text(_json.dumps({
@@ -2189,10 +2192,14 @@ class TestAutoScreen:
             from textual.widgets import Static
 
             plain = app.screen.query_one("#candidates", Static).render().plain
-            positions = [
-                plain.index(f"user{n}@example.com") for n in ("5", "3", "2", "1", "6", "7")
-            ]
-            assert positions == sorted(positions), plain
+            positions = {
+                n: plain.index(f"user{n}@example.com")
+                for n in ("5", "1", "2", "3", "6")
+            }
+            assert positions["5"] == min(positions.values()), plain
+            five_row = plain[positions["5"]:positions["1"]]
+            assert "not a candidate" not in five_row, plain
+            assert plain.count("not a candidate") == 4, plain
 
 
 class TestEventText:
@@ -2752,6 +2759,105 @@ class TestUnswitchableRowsAreListed:
             f"CONTROL BROKEN: an account with no usage stopped saying so: {out!r}"
         )
 
+    def test_a_7d_exhausted_account_never_outranks_a_5h_exhausted_one(self):
+        """The panel used to re-derive its own order from the raw window
+        pcts and could rank an account the engine would never pick above
+        one it could actually reach (#199, owner's live fleet: three 7d-
+        exhausted accounts outranked a 5h-exhausted one). The engine only
+        admits an at-limit escape through the conjunction at
+        `_rank_candidates_pass` (autoswitch.py:4030-4038), which needs the
+        ACTIVE account at its own limit too -- so the active here is 5h-
+        exhausted with no 7d window at all (an annual-plan style reading).
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        five_hour_full = {
+            "five_hour": {"pct": 100.0, "resets_at": _iso_in(300)},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(5 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+            self._acct("3", "fivehour@x.com", switchable=True,
+                       last_good=five_hour_full),
+        ), active="1", settings=settings)
+        assert out.index("fivehour@x.com") < out.index("sevenday@x.com"), (
+            f"the 7d-exhausted account outranked the 5h-exhausted one the "
+            f"engine could still reach: {out!r}"
+        )
+        assert "7d full" in out, (
+            f"the excluded 7d-exhausted row gave no reason: {out!r}"
+        )
+
+    def test_CONTROL_a_7d_exhausted_account_alone_is_excluded_not_ranked(self):
+        """CONTROL for the row above: with no 5h-exhausted peer to land on,
+        the 7d-exhausted account is still excluded (the engine's own
+        conjunction never admits it), and the panel must say so rather than
+        naming it "Next best" — the empty-competitive-list case, distinct
+        from "no other accounts" (there IS another account, just none the
+        engine would pick).
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, (
+            f"an unusable account was ranked as next best instead: {out!r}"
+        )
+        assert "7d full" in out, (
+            f"the excluded 7d-exhausted row gave no reason: {out!r}"
+        )
+
+    def test_a_disabled_account_with_the_most_headroom_is_not_offered(self):
+        """Every OTHER unswitchable/blocked row already says why; `disabled`
+        was the one silent exception in the real-usage (chip) branch --
+        `acc.disabled` used to be read only in the spend-only branch. The
+        disabled slot here has MORE headroom than the enabled one, so a
+        headroom-blind reader would rank it first; it must not be offered
+        at all.
+        """
+        active = {
+            "five_hour": {"pct": 10.0},
+            "seven_day": {"pct": 10.0, "resets_at": _iso_in(10 * 86400)},
+        }
+        enabled = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 5.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        disabled = {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": 0.0, "resets_at": _iso_in(20 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("9", "enabled@x.com", switchable=True, last_good=enabled),
+            self._acct("8", "disabled@x.com", switchable=True,
+                       last_good=disabled, disabled=True),
+        ), active="1")
+        assert "auto-swap disabled" in out, (
+            f"the disabled account gave no reason it is never chosen: {out!r}"
+        )
+        assert out.index("enabled@x.com") < out.index("disabled@x.com"), (
+            f"the disabled account, with more headroom, outranked the "
+            f"enabled one: {out!r}"
+        )
+
     def test_unswitchable_rows_sort_last(self):
         out = self._render(self._snap(
             self._acct("4", "empty@x.com", switchable=False),
@@ -3265,11 +3371,13 @@ class TestUnswitchableRowsAreListed:
         staleness -- so once the active account's store row aged past
         `STALE_OK_S` the panel still saw its old known 7-day reset while the
         engine's own gate (`decision_value()`) had already stopped trusting
-        it and reads no active reset at all. `select_probe_target`'s
-        ``active_reset_ts is None`` guard (autoswitch.py) exists exactly for
-        that case: with a stale active it must refuse to name any probe
-        target, and the unknown-reset candidate must sort LAST like any
-        other candidate with no reset, never jump to the top on `-inf`.
+        it and reads no active reset at all. Now the panel runs
+        `_rank_candidates_pass` itself: with the active's own reset
+        unmeasured, `consume-first`'s admission (`active_reset_ts is None:
+        continue`) refuses every candidate outright, so NEITHER the unknown-
+        reset account nor the known-soon one is a candidate -- the stronger
+        form of the same guarantee (an unmeasured active can no longer even
+        promote the known-soon reader to "next best").
         """
         from tests.test_autoswitch import _iso_at
         from claude_swap.settings import AutoSwitchSettings
@@ -3299,13 +3407,13 @@ class TestUnswitchableRowsAreListed:
             self._acct("3", "c@x.invalid", switchable=True, last_good=known_soon),
         ), active="1", settings=settings)
 
-        emails = {"2": "b@x.invalid", "3": "c@x.invalid"}
-        positions = {n: rendered.index(e) for n, e in emails.items()}
-        panel_top = min(positions, key=positions.get)
-        assert panel_top == "3", (
-            f"panel put the unknown-reset account on top ({panel_top!r}) "
-            f"while the active account's own reset is stale and unknown to "
-            f"the engine -- panel out:\n{rendered}"
+        assert "no candidate qualifies" in rendered, (
+            f"panel named a next-best account while the active's own reset "
+            f"is stale and unknown to the engine -- panel out:\n{rendered}"
+        )
+        assert rendered.count("not a candidate") == 2, (
+            f"expected both b@x.invalid and c@x.invalid excluded, "
+            f"neither promoted -- panel out:\n{rendered}"
         )
 
 
