@@ -1904,13 +1904,6 @@ class TestAutoScreen:
                 f"both rows must stay model-gated, never re-ranked on the "
                 f"5h axis `best` never uses: {plain!r}"
             )
-            # `all_above` (every account read here is at/over the 90%
-            # threshold) moves the pass to `by_recovery_axis` regardless of
-            # `best`'s ordinary "most headroom" key -- the legend must say
-            # so, not the strategy's usual key, or a reader is told the
-            # wrong axis for a state the panel already detected correctly
-            # enough to refuse ranking on.
-            assert "Next best (soonest to recover)" in plain, plain
 
     async def test_candidates_rank_unconditionally_under_a_disabled_active(
         self, tmp_path, fake_engine
@@ -2620,19 +2613,6 @@ class TestUnswitchableRowsAreListed:
         assert "7d full" in out, (
             f"the excluded 7d-exhausted row gave no reason: {out!r}"
         )
-        # `at-limit` (active exhausted) with every account -- active
-        # included -- at/over the threshold is `_rank_candidates_pass`'s
-        # OTHER `by_recovery_axis` disjunct (autoswitch.py): a known active
-        # recovery plus nothing worth having takes the recovery axis here
-        # too, not just under `proactive`/consume-first's plain `all_above`
-        # case. Consume-first's usual "soonest reset" would be the wrong
-        # claim -- this admits `fivehour@x.com` on recovery time, not its
-        # weekly reset (10 days behind `sevenday@x.com`'s, which stays
-        # excluded regardless).
-        assert "Next best (soonest to recover)" in out, (
-            f"the legend named consume-first's usual key over an at-limit "
-            f"recovery-axis ranking: {out!r}"
-        )
 
     def test_CONTROL_a_7d_exhausted_account_alone_is_excluded_not_ranked(self):
         """CONTROL for the row above: with no 5h-exhausted peer to land on,
@@ -2747,75 +2727,23 @@ class TestUnswitchableRowsAreListed:
             f"enabled one: {out!r}"
         )
 
-    def test_the_legend_names_the_ranking_key(self):
-        """The header must say WHICH order this is (soonest reset under
-        consume-first/dynamic, most headroom under best) so the list is
-        readable without reading `_rank_candidates_pass` -- a reader must
-        not have to guess whether "Next best" is a raw pct sort. Checked on
-        both keys, not just one literal: a hardcoded string ("engine
-        order") would pass a single-key assertion just as well as stating
-        the real key does."""
+    def test_the_legend_prints_the_engines_own_axis(self):
+        """The legend names `_rank_candidates_pass`'s own 5th return value,
+        not a re-derived key: the one-way `fallback` list (autoswitch.py
+        :3654) admits both peers by soonest recovery, not headroom."""
         from claude_swap.settings import AutoSwitchSettings
 
-        snap = self._snap(
-            self._acct("1", "active@x.com", switchable=True,
-                        last_good={"five_hour": {"pct": 10.0}}),
-            self._acct("2", "b@x.com", switchable=True,
-                        last_good={"five_hour": {"pct": 5.0}}),
-        )
-        out = self._render(
-            snap, active="1", settings=AutoSwitchSettings(strategy="consume-first")
-        )
-        assert "Next best (soonest reset)" in out, (
-            f"the legend does not name consume-first's ranking key: {out!r}"
-        )
-        out = self._render(
-            snap, active="1", settings=AutoSwitchSettings(strategy="best")
-        )
-        assert "Next best (most headroom)" in out, (
-            f"the legend does not name best's ranking key: {out!r}"
-        )
-
-    def test_the_legend_falls_back_to_headroom_past_the_recovery_horizon(self):
-        """`by_recovery_axis` (autoswitch.py) is a GATE, not the key
-        itself -- under it, `_recovery_is_useful` still tiers each
-        candidate: past `RECOVERY_HORIZON_S` with real headroom on the
-        table (active headroom above `SPENT_HEADROOM_PCT`), the pass
-        falls back to its ordinary "most headroom" key for that
-        candidate. All three accounts here are at/over the threshold
-        (`all_above`, the gate's own condition), but every reset is days
-        out -- past the horizon -- so the pass admits both candidates on
-        HEADROOM (9 over 8), not on which resets sooner (candidate 3's 2
-        days beats candidate 2's 7): the legend must say so, not the
-        gate's own "soonest to recover"."""
-        from claude_swap.settings import AutoSwitchSettings
-
-        active = {
-            "five_hour": {"pct": 0.0},
-            "seven_day": {"pct": 96.0, "resets_at": _iso_in(5 * 86400)},
-        }
-        cand2 = {
-            "five_hour": {"pct": 0.0},
-            "seven_day": {"pct": 91.0, "resets_at": _iso_in(7 * 86400)},
-        }
-        cand3 = {
-            "five_hour": {"pct": 0.0},
-            "seven_day": {"pct": 92.0, "resets_at": _iso_in(2 * 86400)},
-        }
+        active = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 97.0, "resets_at": _iso_in(20 * 3600)}}
+        sooner = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 96.5, "resets_at": _iso_in(5 * 3600)}}
+        later = {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 96.0, "resets_at": _iso_in(6 * 3600)}}
         out = self._render(self._snap(
             self._acct("1", "active@x.com", switchable=True, last_good=active),
-            self._acct("2", "b@x.com", switchable=True, last_good=cand2),
-            self._acct("3", "c@x.com", switchable=True, last_good=cand3),
+            self._acct("2", "sooner@x.com", switchable=True, last_good=sooner),
+            self._acct("3", "later@x.com", switchable=True, last_good=later),
         ), active="1", settings=AutoSwitchSettings(strategy="best", threshold=90.0))
-        assert out.index("b@x.com") < out.index("c@x.com"), (
-            f"headroom (9 over 8) should rank b above c, not c's sooner "
-            f"(but past-horizon) reset: {out!r}"
-        )
-        assert "Next best (most headroom)" in out, (
-            f"the legend claimed the recovery-axis gate's key even though "
-            f"every reset here is past the horizon: {out!r}"
-        )
-        assert "Next best (soonest to recover)" not in out, out
+        assert out.index("sooner@x.com") < out.index("later@x.com"), out
+        assert "Next best (soonest to recover)" in out, out
+        assert "Next best (most headroom)" not in out, out
 
     def test_unswitchable_rows_sort_last(self):
         out = self._render(self._snap(

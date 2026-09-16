@@ -3332,7 +3332,7 @@ class AutoSwitchEngine:
         # (current)` is that same widened value's PRE-widen input, so this is
         # a no-op for `best`/`consume-first` (never widened) and only changes
         # `dynamic`'s primary pass.
-        ordered, any_known, active_reset_ts, waiting = self._rank_candidates_pass(
+        ordered, any_known, active_reset_ts, waiting, _axis = self._rank_candidates_pass(
             models=self._models, headroom=headroom, active_headroom=headroom.get(current), **kw
         )
         if settings.strategy != "dynamic":
@@ -3356,7 +3356,7 @@ class AutoSwitchEngine:
                 **kw,
             )
             if fb[0]:
-                return fb
+                return fb[:4]
         return result
 
     @staticmethod
@@ -3373,14 +3373,15 @@ class AutoSwitchEngine:
         active_headroom: float | None,
         settings: AutoSwitchSettings,
         now: float,
-    ) -> tuple[list[str], bool, float | None, bool]:
+    ) -> tuple[list[str], bool, float | None, bool, str | None]:
         """Filter and rank OAuth candidates for this tick's trigger, on one
         window set (``models``); pure, no state writes, called at most
         twice per tick by ``_rank_candidates`` (see its docstring), and by
         the "Next best" panel through the module-level ``rank_candidates_pass``
         alias below (a static method needs no engine instance) -- the panel
         gets the engine's own admission instead of a second, hand-matched
-        copy of it.
+        copy of it. 5th element: the axis ``ordered`` sorted on, or
+        ``None`` when nothing ranked -- read off, never re-derived.
         """
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
@@ -3497,6 +3498,7 @@ class AutoSwitchEngine:
 
         qualifying: list[tuple[tuple, str]] = []
         fallback: list[tuple[tuple, str]] = []
+        key_axis: dict[str, str] = {}  # per candidate, set alongside its key
         any_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
@@ -3652,6 +3654,7 @@ class AutoSwitchEngine:
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
                                 fallback.append(((0, recovery_ts, -h), num))
+                                key_axis[num] = "soonest to recover"
                             continue
                 elif (
                     trigger in CONSUME_FIRST_STRATEGIES
@@ -3739,6 +3742,7 @@ class AutoSwitchEngine:
                 key: tuple = (
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
+                key_axis[num] = "soonest to recover" if by_recovery else "most headroom"
             elif consume_first and trigger != "at-limit" and not all_above:
                 # Soonest weekly reset first (unknown resets sort last), most
                 # headroom breaks ties, then sequence order.
@@ -3768,6 +3772,7 @@ class AutoSwitchEngine:
                 key = consume_first_rank_key(
                     usage.get(num), settings.threshold, now, models
                 )
+                key_axis[num] = "soonest reset"
             else:
                 # Escape ranking, on the axis that actually blocked us. Falls
                 # back to `-h` when the label is unknown (usage without window
@@ -3829,11 +3834,13 @@ class AutoSwitchEngine:
                     -max(escape_h if escape_h is not None else h, 0.0),
                     recovery_ts,
                 )
+                key_axis[num] = "at-limit escape" if escape_label is not None else "most headroom"
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
+        axis = key_axis.get(ordered[0]) if ordered else None  # winner's own axis
         # EVERY CANDIDATE READABLE, not merely one of them holding room. A
         # row we could not read may be a healthy account, and announcing a
         # reset over it claims a fleet nobody measured.
@@ -3848,7 +3855,7 @@ class AutoSwitchEngine:
             trigger == "at-limit" and by_recovery_axis and not ordered
             and all(headroom.get(n) is not None for n in oauth_candidates)
         )
-        return ordered, any_known, active_reset_ts, waiting
+        return ordered, any_known, active_reset_ts, waiting, axis
 
     # -- adaptive usage scheduling ---------------------------------------------
 

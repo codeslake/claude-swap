@@ -28,16 +28,12 @@ from textual.widgets import Footer, RichLog, Static
 from claude_swap import oauth
 from claude_swap.autoswitch import (
     CONSUME_FIRST_STRATEGIES,
-    SPENT_HEADROOM_PCT,
     AutoSwitchEngine,
     AutoSwitchEvent,
-    _binding_recovery_ts,
     _classify_dynamic_trigger,
     _dynamic_active_headroom,
-    _every_account_above_threshold,
     _headroom_by_account,
     _model_window_binds_everywhere,
-    _recovery_is_useful,
     binding_pct,
     classify_candidate_block,
     model_block_label,
@@ -455,11 +451,13 @@ class AutoScreen(Screen):
             # NO_ACTION rather than reaching this pass at all.
             return "at-limit" if active_headroom <= 0 else "proactive"
 
-        def _rank_on(axis: tuple[str, ...], trigger: str | None) -> list[str]:
+        def _rank_on(
+            axis: tuple[str, ...], trigger: str | None
+        ) -> tuple[list[str], str | None]:
             if trigger is None:
-                return []
+                return [], None
             headroom = _headroom_by_account(usage, axis)
-            ordered, *_rest = rank_candidates_pass(
+            ordered, _any_known, _active_reset_ts, _waiting, rank_axis = rank_candidates_pass(
                 models=axis,
                 trigger=trigger,
                 consume_first=consume_first,
@@ -472,7 +470,7 @@ class AutoScreen(Screen):
                 settings=settings,
                 now=now,
             )
-            return ordered
+            return ordered, rank_axis
 
         # THE ENGINE'S OWN ADMISSION (`_rank_candidates_pass`), not a
         # re-derived predicate: one trigger, classified once (mirroring
@@ -498,8 +496,7 @@ class AutoScreen(Screen):
         # a real trigger that resolves to nothing ranking still says so
         # truthfully below, but this state must not borrow that same claim.
         dynamic_unmodeled = trigger is None
-        ordered = _rank_on(models, trigger)
-        final_axis = models
+        ordered, rank_axis = _rank_on(models, trigger)
         # The SAME retry `_rank_candidates` makes (`dynamic` only): drop the
         # model set and re-rank on 5h/7d alone, but only when the model
         # window is what is actually blocking every account, active
@@ -508,8 +505,7 @@ class AutoScreen(Screen):
             not ordered and models and settings.strategy == "dynamic"
             and _model_window_binds_everywhere(usage, models, settings.threshold)
         ):
-            ordered = _rank_on((), trigger)
-            final_axis = ()
+            ordered, rank_axis = _rank_on((), trigger)
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         for acc in snap.accounts:
             if acc.number == active_number:
@@ -648,73 +644,11 @@ class AutoScreen(Screen):
             lines[acc.number] = entry
 
         text = Text()
-        # The KEY itself, not just its source, and not just `consume_first`
-        # (true for both `consume-first` and `dynamic`) either: when EVERY
-        # measured account, active included, is at/over the threshold,
-        # `_rank_candidates_pass`'s own `by_recovery_axis` (autoswitch.py)
-        # switches to "who returns first" instead -- neither "soonest
-        # reset" nor "most headroom" has an answer there. Same predicate,
-        # same axis (`final_axis`, not always `models` -- the retry can
-        # move it), same TWO disjuncts `by_recovery_axis` itself checks:
-        # `proactive`/consume-first/dynamic take it on `all_above` alone;
-        # `at-limit` only past its own narrower bar (a known active
-        # recovery, and nothing else worth having) -- reusing
-        # `_binding_recovery_ts`/`SPENT_HEADROOM_PCT`, not a re-derived
-        # threshold, for the same reason `_every_account_above_threshold`
-        # itself is imported rather than copied.
-        final_headroom = _headroom_by_account(usage, final_axis)
-        all_above = _every_account_above_threshold(
-            oauth_candidates, final_headroom, final_headroom.get(active_number),
-            settings.threshold,
-        )
-        active_recovery_ts = (
-            _binding_recovery_ts(usage.get(active_number), final_axis, now)
-            if all_above else 0.0  # unread unless all_above, matches the pass
-        )
-        best_candidate_headroom = max(
-            (h for h in map(final_headroom.get, oauth_candidates) if h is not None),
-            default=0.0,
-        )
-        recovery_axis = all_above and (
-            trigger in ("proactive", *CONSUME_FIRST_STRATEGIES)
-            or (
-                trigger == "at-limit"
-                and active_recovery_ts != float("inf")
-                and best_candidate_headroom <= SPENT_HEADROOM_PCT
-            )
-        )
-        if recovery_axis and ordered:
-            # The GATE decides whether the pass ranks on this axis AT ALL,
-            # but the KEY it ranks with is itself tiered PER CANDIDATE
-            # (`_recovery_is_useful`, autoswitch.py): past
-            # `RECOVERY_HORIZON_S` with real headroom still on the table,
-            # a candidate falls back to the SAME "most headroom" key the
-            # gate being false would have used. Only the row a reader
-            # calls "next best" is the top of `ordered` -- check only it,
-            # the same argument every other candidate's own tier read.
-            recovery_axis = _recovery_is_useful(
-                _binding_recovery_ts(usage.get(ordered[0]), final_axis, now),
-                active_recovery_ts,
-                final_headroom.get(active_number) or 0.0,
-                best_candidate_headroom,
-                now,
-            )
-        if dynamic_unmodeled:
-            # No key at all: every row above rendered in slot order
-            # (`ordered_rank` is empty), so naming ANY axis here would be
-            # the same false claim the "not previewed" body text exists to
-            # avoid.
-            text.append("Next best", style=palette.muted)
+        # `rank_axis`: the engine's own report, never re-derived here.
+        if rank_axis is not None:
+            text.append(f"Next best ({rank_axis})", style=palette.muted)
         else:
-            if recovery_axis:
-                rank_key = "soonest to recover"
-            elif (
-                consume_first and trigger not in (None, "at-limit") and not all_above
-            ):
-                rank_key = "soonest reset"
-            else:
-                rank_key = "most headroom"
-            text.append(f"Next best ({rank_key})", style=palette.muted)
+            text.append("Next best", style=palette.muted)
         if not ranked:
             # Reached only when this is the sole account. Slots that cannot be
             # switched to are listed above with the reason, so "no other
@@ -722,14 +656,11 @@ class AutoScreen(Screen):
             text.append("\n  no other accounts", style=palette.muted)
             return text
         if not ordered:
-            if dynamic_unmodeled and oauth_candidates:
+            if dynamic_unmodeled:
                 # NOT "no candidate qualifies": that claims the engine will
                 # switch to nothing, which is false here -- `dynamic`'s own
                 # warm/cold mechanism may still switch on this very tick,
                 # this pass just cannot preview which row it would land on.
-                # Gated on `oauth_candidates`: with none at all, no
-                # mechanism (modeled or not) has anything to switch to, and
-                # "no candidate qualifies" is simply true.
                 text.append(
                     "\n  not previewed (dynamic warm/cold state)",
                     style=palette.muted,
