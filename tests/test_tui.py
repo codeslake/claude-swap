@@ -460,7 +460,15 @@ class TestFormatting:
         now = time.time()
         window = {"resets_at": _iso_in(-60)}
         fetched_at = now - 120
-        claimed = UsageEntry(fetched_at=fetched_at, claim_until=now + 30)
+        # `next_poll_at` is ALSO set, so this is a real discriminator: if
+        # `claimed(now)` were ignored (or always read False) the retry
+        # branch below would fire instead and this would read "retry 5m",
+        # not "refetching" -- a bare `claim_until` with nothing else set
+        # cannot tell "claimed" apart from "no signal at all" (reviewer
+        # finding, #325 follow-up).
+        claimed = UsageEntry(
+            fetched_at=fetched_at, claim_until=now + 30, next_poll_at=now + 300,
+        )
         assert (
             tui_data.reset_text(window, now, fetched_at, entry=claimed)
             == "refetching"
@@ -784,9 +792,12 @@ class TestUsageRows:
         now = time.time()
         last_good = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}}
         fetched_at = now - 120  # measured well before the reset fired
+        # `next_poll_at` is ALSO set: a real discriminator (see the test
+        # above) rather than a bare `claim_until` a stubbed-out `claimed()`
+        # would pass just as well.
         claimed = UsageEntry(
             last_good=last_good, fetched_at=fetched_at, age_s=120.0,
-            claim_until=now + 30,
+            claim_until=now + 30, next_poll_at=now + 300,
         )
         row = usage_rows(last_good, now, fetched_at, entry=claimed)[0]
         assert row[2] == "refetching", row
@@ -945,11 +956,13 @@ class TestMiniAccountText:
 
         now = time.time()
         fetched_at = now - 120
+        # `next_poll_at` is ALSO set: a real discriminator (see
+        # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
         claimed = UsageEntry(
             last_good={"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}},
             fetched_at=fetched_at,
             age_s=120.0,
-            claim_until=now + 30,
+            claim_until=now + 30, next_poll_at=now + 300,
         )
         acc = make_account(1, entry=claimed)
         out = mini_account_text(acc, now).plain
@@ -2735,7 +2748,9 @@ class TestUnswitchableRowsAreListed:
             },
             fetched_at=now - 120,  # measured well before the reset fired
             age_s=120.0,
-            claim_until=now + 30,
+            # `next_poll_at` is ALSO set: a real discriminator (see
+            # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+            claim_until=now + 30, next_poll_at=now + 330,
         )
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
@@ -2960,7 +2975,9 @@ class TestUnswitchableRowsAreListed:
             },
             fetched_at=now - 120,  # measured well before the reset fired
             age_s=120.0,
-            claim_until=now + 30,
+            # `next_poll_at` is ALSO set: a real discriminator (see
+            # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+            claim_until=now + 30, next_poll_at=now + 330,
         )
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
