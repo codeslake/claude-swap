@@ -499,6 +499,22 @@ class TestFormatting:
         assert text == "429 2m", text
         assert text != tui_data.REFETCHING
 
+    def test_reset_text_names_overdue_when_the_retry_instant_has_passed(self):
+        """A `next_poll_at` already in the past (no collector has claimed
+        the row since it fell due) must not clamp through `_short_wait`'s
+        `max(0, ...)` into a frozen "retry 0s" -- that is the same
+        unqualified resting placeholder this range set out to stop, just
+        spelled differently. It should decay to a distinct, non-decaying-
+        looking marker instead."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        overdue = UsageEntry(fetched_at=fetched_at, next_poll_at=now - 30)
+        text = tui_data.reset_text(window, now, fetched_at, entry=overdue)
+        assert text == "overdue", text
+        assert text != tui_data.REFETCHING
+        assert not text.startswith("retry 0")
+
     def test_a_known_or_absent_reset_never_placeholders_or_fetches(self):
         """CONTROL for the three states above: state 1 (a live countdown)
         and state 2 (a reset never reported) must never render the

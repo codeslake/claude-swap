@@ -166,6 +166,11 @@ def _stale_reset_text(entry: usage_store.UsageEntry | None, now: float) -> str:
         if entry.in_backoff(now):
             return f"{_reason_word(entry.last_error)} {_short_wait(entry.backoff_until - now)}"
         if entry.next_poll_at is not None:
+            if entry.next_poll_at <= now:
+                # Past due and unclaimed: `_short_wait` would clamp a
+                # negative remainder to "0s" forever, the same unqualified
+                # resting placeholder this range removed, just relabeled.
+                return "overdue"
             return f"retry {_short_wait(entry.next_poll_at - now)}"
     return REFETCHING
 
