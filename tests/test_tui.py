@@ -1487,43 +1487,50 @@ class TestOrderedAccounts:
         for unusable in ("2", "4", "5"):  # disabled / token-expired / 7d-full
             assert order.index("1") < order.index(unusable)
 
+    def test_a_two_digit_slot_ties_the_same_way_the_auto_switch_view_does(self):
+        """Two disabled (never-ranked, same-bucket) accounts settle on the
+        NUMBER STRING like the auto view does -- "12" before "2"."""
+        snap = AccountsSnapshot(
+            accounts=[
+                make_account(1, active=True),
+                make_account(2, disabled=True),
+                make_account(12, disabled=True),
+            ],
+            active_number="1",
+            taken_at=0.0,
+        )
+        settings = AutoSwitchSettings(strategy="best", threshold=1.0)
+        order = tui_data.ordered_accounts(snap, settings, time.time())
+        assert order == ["1", "12", "2"]
+
 
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
-    """The dashboard panel and the Switch/Watch list render the same order
-    `ordered_accounts` computes; Remove/Disable keep slot order and say so."""
+    """Dashboard/Switch/Watch render `ordered_accounts`; Remove/Disable
+    keep slot order and say so."""
 
-    async def test_dashboard_panel_follows_the_shared_order(self, tmp_path):
-        fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
-        app = make_app(fake)
-        async with app.run_test(size=(100, 40)) as pilot:
-            await settle(pilot)
-            from claude_swap.tui.widgets import AccountsPanel
-
-            panel = app.screen.query_one(AccountsPanel).render().plain
-            order = tui_data.ordered_accounts(
-                fake.accounts_snapshot(), app.auto_settings, time.time()
-            )
-            positions = [panel.index(f"user{n}@example.com") for n in order]
-            assert positions == sorted(positions)
-
-    async def test_switch_and_watch_lists_follow_the_shared_order(self, tmp_path):
+    async def test_every_listing_screen_follows_the_shared_order(self, tmp_path):
         from textual.widgets import ListView
 
-        from claude_swap.tui.widgets import AccountItem
+        from claude_swap.tui.widgets import AccountItem, AccountsPanel
 
-        for menu_id in ("switch", "watch"):
+        for menu_id in (None, "switch", "watch"):  # None: the dashboard itself
             fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
             app = make_app(fake)
             async with app.run_test(size=(100, 40)) as pilot:
                 await settle(pilot)
+                order = tui_data.ordered_accounts(
+                    fake.accounts_snapshot(), app.auto_settings, time.time()
+                )
+                if menu_id is None:
+                    panel = app.screen.query_one(AccountsPanel).render().plain
+                    positions = [panel.index(f"user{n}@example.com") for n in order]
+                    assert positions == sorted(positions)
+                    continue
                 await menu_select(pilot, menu_id)
                 await settle(pilot)
                 listview = app.screen.query_one("#accounts", ListView)
                 numbers = [item.number for item in listview.query(AccountItem)]
-                order = tui_data.ordered_accounts(
-                    fake.accounts_snapshot(), app.auto_settings, time.time()
-                )
                 assert numbers == order
 
     async def test_remove_and_disable_menus_keep_slot_order_and_say_so(
@@ -1573,10 +1580,9 @@ class TestSharedAccountOrder:
             listview = app.screen.query_one("#accounts", ListView)
             before = [item.number for item in listview.query(AccountItem)]
             assert before == ["1", "3", "2"]  # "3" (5%) ranks ahead of "2" (30%)
-            listview.index = before.index("2")  # cursor on the WORSE candidate
+            listview.index = before.index("2")  # cursor on the worse one
 
-            # Invert the ranking: "2" becomes the better candidate.
-            swapped = [
+            swapped = [  # invert the ranking: "2" becomes the better candidate
                 dataclasses.replace(a, usage=make_entry(5.0, 5.0))
                 if a.number == "2"
                 else dataclasses.replace(a, usage=make_entry(30.0, 30.0))

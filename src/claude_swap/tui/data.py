@@ -21,6 +21,14 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable
 
 from claude_swap import oauth, printer, usage_store
+from claude_swap.autoswitch import (
+    CONSUME_FIRST_STRATEGIES,
+    _classify_dynamic_trigger,
+    _dynamic_active_headroom,
+    _headroom_by_account,
+    _model_window_binds_everywhere,
+    rank_candidates_pass,
+)
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountsSnapshot
 from claude_swap.poll_policy import binding_pct
@@ -220,16 +228,7 @@ def rank_switch_candidates(
     accounts`` and the auto-switch view's "Next best" panel both read off
     this one call, never a second, hand-matched pass of their own.
     """
-    from claude_swap.autoswitch import (
-        CONSUME_FIRST_STRATEGIES,
-        _classify_dynamic_trigger,
-        _dynamic_active_headroom,
-        _headroom_by_account,
-        _model_window_binds_everywhere,
-        rank_candidates_pass,
-    )
-
-    models = parse_model_names(settings.model) if settings else ()
+    models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
     usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
     oauth_candidates = [
@@ -334,7 +333,7 @@ def ordered_accounts(
         snap, settings, now, active_number
     )
     ordered_rank = {num: i for i, num in enumerate(ordered)}
-    models = parse_model_names(settings.model) if settings else ()
+    models = parse_model_names(settings.model)
 
     def bucket(acc) -> tuple:
         if not acc.switchable:
@@ -347,7 +346,10 @@ def ordered_accounts(
             return (3,)
         return (1,)
 
-    numbers = [acc.number for acc in sorted(others, key=bucket)]
+    # `(bucket, number)`: same tie-break as the auto view's own `sorted`.
+    numbers = [
+        acc.number for acc in sorted(others, key=lambda a: (bucket(a), a.number))
+    ]
     return ([active_number] if active_number is not None else []) + numbers
 
 

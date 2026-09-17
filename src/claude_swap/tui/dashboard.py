@@ -172,7 +172,6 @@ class DashboardScreen(Screen):
         elif action_id == "add-menu":
             await self._push_menu("add account", self._add_entries())
         elif action_id == "remove-menu":
-            # Slot order, stated: finding an account BY its slot.
             await self._push_menu(
                 "remove account (slot order)", self._remove_entries()
             )
@@ -192,7 +191,6 @@ class DashboardScreen(Screen):
             app.notify(f"Theme: {name}")
             await self._pop_menu()
         elif action_id == "disable-menu":
-            # Same reason as above: finding an account BY its slot.
             await self._push_menu(
                 "disable / enable (slot order)", self._disable_entries()
             )
@@ -221,8 +219,7 @@ class DashboardScreen(Screen):
 
 class AccountListScreen(Screen):
     """Shared machinery: a live ListView of full account cards, in the
-    shared ranked order (``data.ordered_accounts``) -- the active account
-    pinned first.
+    shared ranked order (``data.ordered_accounts``), active first.
 
     Subclasses decide what the cursor does — :class:`SwitchScreen` is
     selection-first, :class:`WatchScreen` is a monitor that can arm

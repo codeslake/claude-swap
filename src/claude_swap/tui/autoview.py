@@ -80,9 +80,8 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
-# `data.rank_switch_candidates`'s trigger names, keyed to WHY the ranking
-# pass never ran -- never "no candidate qualifies", the claim only a real,
-# empty pass earns.
+# Trigger names keyed to WHY the ranking pass never ran -- never "no
+# candidate qualifies", the claim only a real, empty pass earns.
 _UNMODELED_TEXT = {
     "dynamic-unmodeled": "not previewed (dynamic warm/cold state)",
     "below-threshold": "not previewed (active below threshold)",
@@ -397,10 +396,8 @@ class AutoScreen(Screen):
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         now = time.time()
-        # THE engine's own admission and order (`data.rank_switch_
-        # candidates`), never a second, hand-matched trigger/rank pass of
-        # this screen's own -- `ordered_accounts` (data.py) reads off the
-        # exact same call for every other account-listing screen.
+        # THE engine's own admission and order -- `ordered_accounts` (data.py)
+        # reads off this exact same call for every other listing screen.
         ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
             snap, settings, now, active_number
         )
