@@ -86,6 +86,14 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
+# `_trigger_for` sentinel returns naming WHY the ranking pass never ran --
+# never "no candidate qualifies", the claim only a real, empty pass earns.
+_UNMODELED_TEXT = {
+    "dynamic-unmodeled": "not previewed (dynamic warm/cold state)",
+    "below-threshold": "not previewed (active below threshold)",
+    "unreadable-active": "not previewed (active status unknown)",
+}
+
 
 class AutoScreen(Screen):
     BINDINGS = [
@@ -412,12 +420,12 @@ class AutoScreen(Screen):
 
         def _trigger_for(
             active_headroom: float | None, active_disabled: bool
-        ) -> str | None:
+        ) -> str:
             """Mirror `_tick_inner`'s own trigger classification (autoswitch.py)
             closely enough for `_rank_candidates_pass`'s gates to engage the
-            way they would on a real tick. `None` means no trigger this panel
-            can derive reaches the pass on a real tick at all -- the caller
-            ranks nothing rather than guess.
+            way they would on a real tick. A key of `_UNMODELED_TEXT` means
+            no trigger this panel can derive reaches the pass on a real tick
+            at all -- the caller ranks nothing rather than guess.
             """
             # UNCONDITIONAL, before any headroom reading: `_tick_inner` checks
             # `is_account_disabled(current)` first. Its own trigger name, not
@@ -427,9 +435,13 @@ class AutoScreen(Screen):
             if active_disabled:
                 return "disabled-active"
             if active_headroom is None:
-                # `_tick_inner`'s failover branch, taken regardless of
-                # strategy once the active's own usage is unreadable.
-                return "failover"
+                # NOT one honest trigger: real `failover` needs
+                # `settings.unhealthy_ticks` CONSECUTIVE unreadable ticks
+                # (plus an idle-hold grace on an expired token), state this
+                # one-shot render does not carry -- and the same unreadable
+                # headroom also covers no active at all, and an API-key
+                # active outside `include_api_key_accounts`. Cannot preview.
+                return "unreadable-active"
             if settings.strategy == "dynamic":
                 kind = _classify_dynamic_trigger(active_headroom)
                 if kind != "at-limit":
@@ -439,25 +451,23 @@ class AutoScreen(Screen):
                     # candidates` path instead (needs `last_active_at` engine
                     # state this panel does not track). Only "at-limit"
                     # reaches this pass for `dynamic`.
-                    return None
+                    return "dynamic-unmodeled"
                 return "at-limit"
             if (100.0 - active_headroom) < settings.threshold:
                 if settings.strategy in CONSUME_FIRST_STRATEGIES:
                     return settings.strategy
                 # Not a real trigger under any other strategy below the
                 # threshold: the engine emits `below-threshold` and returns
-                # NO_ACTION rather than reaching this pass at all. A
-                # sentinel distinct from `dynamic`'s `None` above -- this
-                # state IS modeled (the engine deterministically ranks
-                # nothing this tick), so it must not borrow `dynamic`'s
-                # "not previewed" claim below.
+                # NO_ACTION rather than reaching this pass at all -- the
+                # SAME "pass never ran" shape as `dynamic-unmodeled` above,
+                # just a different reason.
                 return "below-threshold"
             return "at-limit" if active_headroom <= 0 else "proactive"
 
         def _rank_on(
-            axis: tuple[str, ...], trigger: str | None
+            axis: tuple[str, ...], trigger: str
         ) -> tuple[list[str], str | None]:
-            if trigger is None or trigger == "below-threshold":
+            if trigger in _UNMODELED_TEXT:
                 return [], None
             headroom = _headroom_by_account(usage, axis)
             ordered, _any_known, _active_reset_ts, _waiting, rank_axis = rank_candidates_pass(
@@ -492,13 +502,8 @@ class AutoScreen(Screen):
             ),
             active_disabled,
         )
-        # `_trigger_for` returns `None` for exactly one reason: `dynamic`'s
-        # own steady state (`proactive`/`dynamic-healthy`), ranked by the
-        # separate warm/cold `_rank_dynamic_candidates` mechanism this panel
-        # does not track. That is "not modeled", never "modeled and empty" --
-        # a real trigger that resolves to nothing ranking still says so
-        # truthfully below, but this state must not borrow that same claim.
-        dynamic_unmodeled = trigger is None
+        # A key of `_UNMODELED_TEXT`: the ranking pass never ran.
+        unmodeled = trigger in _UNMODELED_TEXT
         ordered, rank_axis = _rank_on(models, trigger)
         # The SAME retry `_rank_candidates` makes (`dynamic` only): drop the
         # model set and re-rank on 5h/7d alone, but only when the model
@@ -626,15 +631,15 @@ class AutoScreen(Screen):
                 elif (
                     acc.number not in ordered_rank
                     and kind == "open"
-                    and not dynamic_unmodeled
+                    and not unmodeled
                 ):
                     # "open": nothing per-window blocks it, yet the engine's
                     # own pass still refused it -- a weekly reset later than
                     # the active's own, losing the hysteresis margin to a
                     # healthier peer, or ranking behind a sooner recovery.
                     # Every other excluded row already has a reason above.
-                    # Never under `dynamic_unmodeled`: this pass never ran,
-                    # so "refused" is not a claim this row can support.
+                    # Never when `unmodeled`: this pass never ran, so
+                    # "refused" is not a claim this row can support.
                     entry.append("  not a candidate", style=palette.muted)
                 # Position from `ordered_rank` (the engine's own pass, called
                 # once above), never a locally re-derived key.
@@ -659,15 +664,11 @@ class AutoScreen(Screen):
             text.append("\n  no other accounts", style=palette.muted)
             return text
         if not ordered:
-            if dynamic_unmodeled:
-                # NOT "no candidate qualifies": that claims the engine will
-                # switch to nothing, which is false here -- `dynamic`'s own
-                # warm/cold mechanism may still switch on this very tick,
-                # this pass just cannot preview which row it would land on.
-                text.append(
-                    "\n  not previewed (dynamic warm/cold state)",
-                    style=palette.muted,
-                )
+            reason = _UNMODELED_TEXT.get(trigger)
+            if reason is not None:
+                # The honest claim for WHY the pass never ran -- never
+                # "no candidate qualifies", which claims one did.
+                text.append(f"\n  {reason}", style=palette.muted)
             else:
                 # DIFFERENT from "no other accounts": rows are still listed
                 # below, each naming why -- but none is something a tick would

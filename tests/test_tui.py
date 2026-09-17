@@ -2727,28 +2727,30 @@ class TestUnswitchableRowsAreListed:
             f"enabled one: {out!r}"
         )
 
-    def test_a_below_threshold_active_under_best_ranks_nothing_the_tick_also_refuses(
-        self,
-    ):
-        """A non-consume-first, non-dynamic active below `settings.threshold`
-        is a real `_tick_inner` NO_ACTION (`below-threshold`); the panel used
-        to fall through to `"proactive"` and rank a top pick anyway. Must
-        read "no candidate qualifies", never `dynamic`'s "not previewed"."""
+    def test_below_threshold_under_best_reads_not_previewed(self):
+        """Below threshold under `best`: real NO_ACTION, reads "not
+        previewed", never "no candidate qualifies"/`dynamic`'s reason."""
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(strategy="best", threshold=90.0)
-        # 95 - 80 = 15 clears `hysteresis_pct` (10.0 default), so a real
-        # "proactive" ranking pass would admit and top-rank the candidate.
         active = {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 20.0}}
         candidate = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
         out = self._render(self._snap(
             self._acct("1", "active@x.com", switchable=True, last_good=active),
-            self._acct("2", "candidate@x.com", switchable=True,
-                       last_good=candidate),
+            self._acct("2", "candidate@x.com", switchable=True, last_good=candidate),
         ), active="1", settings=settings)
-        assert "no candidate qualifies" in out, out
-        assert "not previewed (dynamic warm/cold state)" not in out, out
-        assert "not a candidate" in out[out.index("candidate@x.com"):], out
+        assert "not previewed (active below threshold)" in out, out
+        assert "no candidate qualifies" not in out and "not a candidate" not in out, out
+
+    def test_an_unreadable_active_is_not_asserted_as_failover(self):
+        """Real `failover` needs consecutive unreadable ticks; one is not
+        enough to tell apart from still-counting/idle-held/no-active."""
+        candidate = {"five_hour": {"pct": 5.0}, "seven_day": {"pct": 5.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, sentinel=USAGE_TOKEN_EXPIRED),
+            self._acct("2", "candidate@x.com", switchable=True, last_good=candidate),
+        ), active="1")
+        assert "not previewed (active status unknown)" in out and "not a candidate" not in out, out
 
     def test_the_legend_prints_the_engines_own_axis(self):
         """The legend names `_rank_candidates_pass`'s own 5th return value,
