@@ -1444,10 +1444,11 @@ class TestWatchScreen:
 
 
 def _order_fixture_accounts():
-    """Active "3", usable "1", unusable "2"/"4"/"12" (disabled/expired/full)."""
+    """Active "3", usable "5" (ranks first only by admission, never by
+    sorting numbers), unusable "2"/"4"/"12" (disabled/expired/full)."""
     return [
         make_account(3, active=True, entry=make_entry(95.0, 95.0)),
-        make_account(1, entry=make_entry(5.0, 5.0)),
+        make_account(5, entry=make_entry(5.0, 5.0)),
         make_account(2, entry=make_entry(20.0, 20.0), disabled=True),
         make_account(4, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
         make_account(12, entry=make_entry(50.0, 100.0)),
@@ -1477,8 +1478,7 @@ class TestOrderedAccounts:
     """One order every listing screen renders -- never a re-derived key."""
 
     def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
-        """Also the tie-break control: never-ranked "2" and two-digit "12"
-        settle in the auto view's OWN relative order -- "12" before "2"."""
+        """Also the tie-break control: never-ranked "2"/"12" settle "12" < "2"."""
         snap = AccountsSnapshot(
             accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
         )
@@ -1486,7 +1486,7 @@ class TestOrderedAccounts:
         assert order[0] == "3"  # active pinned first
         assert order[1:] == _autoview_order(snap, "3", _ORDER_SETTINGS)
         for unusable in ("2", "4", "12"):  # disabled / token-expired / 7d-full
-            assert order.index("1") < order.index(unusable)
+            assert order.index("5") < order.index(unusable)
 
     def test_unmodeled_trigger_keys_stay_in_sync_with_the_auto_view_text(self):
         """Two files key the same trigger names; a name added to one alone
@@ -1557,7 +1557,7 @@ class TestSharedAccountOrder:
                     item.action_id for item in menu.query(MenuItem)
                     if item.action_id.startswith(prefix)
                 ]
-                assert ids == [f"{prefix}{n}" for n in ("3", "1", "2", "4", "12")]
+                assert ids == [f"{prefix}{n}" for n in ("3", "5", "2", "4", "12")]
                 await menu_select(pilot, "back")
 
     async def test_switch_cursor_follows_the_account_when_order_changes(
