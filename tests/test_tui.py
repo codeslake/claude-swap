@@ -2799,6 +2799,33 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "not previewed (active below threshold)" in out, out
 
+    def test_the_api_key_last_resort_sorts_above_a_refused_oauth_row(self):
+        """The fallback (:539) can set `ordered` to an API-key row while a
+        refused OAuth peer is also listed -- that peer is not the engine's
+        pick, so it must not sort ABOVE the one that is. The spend/sentinel
+        branches used their own hard-coded (998.0,)/(999.0,) keys, never
+        `ordered_rank`, so a row the engine refused always outranked the
+        engine's own last-resort pick."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0,
+                                       include_api_key_accounts=True)
+        active = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(4 * 3600)}}
+        seven_day_full = {
+            "five_hour": {"pct": 20.0, "resets_at": _iso_in(3600)},
+            "seven_day": {"pct": 100.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "sevenday@x.com", switchable=True,
+                       last_good=seven_day_full),
+            self._acct("3", "apikey@x.com", switchable=True, kind="api_key",
+                       last_good={}),
+        ), active="1", settings=settings)
+        assert out.index("apikey@x.com") < out.index("sevenday@x.com"), (
+            f"the engine's own pick sorted behind a row it refused: {out!r}"
+        )
+
     def test_an_unreadable_active_is_not_asserted_as_failover(self):
         """Real `failover` needs consecutive unreadable ticks; one is not
         enough to tell apart from still-counting/idle-held/no-active."""

@@ -578,7 +578,14 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append(((998.0,), acc.number))
+                # `ordered_rank` first: the API-key last resort (:539) can
+                # name THIS row as the engine's actual next pick, and it must
+                # not sort behind every refused OAuth row when it does.
+                key = (
+                    (0, ordered_rank[acc.number])
+                    if acc.number in ordered_rank else (998.0,)
+                )
+                ranked.append((key, acc.number))
             elif pct is None:
                 # An extra-usage (pay-as-you-go) account has no 5h/7d window,
                 # so binding_pct answers None — but it is not unknown, it has
@@ -603,10 +610,17 @@ class AutoScreen(Screen):
                 # it is never chosen, and this was the one silent exception.
                 if acc.disabled:
                     entry.append("  auto-swap disabled", style=palette.muted)
-                # RANKED LAST EITHER WAY. Spend is not headroom: folding it
-                # into the sort key would change which account the engine
-                # picks, and the ranking axis is not this row's to move.
-                ranked.append(((999.0,), acc.number))
+                # RANKED LAST, UNLESS THE API-KEY LAST RESORT NAMED IT (:539):
+                # spend is not headroom, so folding it into the sort key
+                # would change which account the engine picks -- but when
+                # `ordered_rank` already names this row (never derived here),
+                # it IS the engine's pick and must not sort behind a row the
+                # engine refused.
+                key = (
+                    (0, ordered_rank[acc.number])
+                    if acc.number in ordered_rank else (999.0,)
+                )
+                ranked.append((key, acc.number))
             else:
                 # Per-window chips, from the same helper the dashboard uses
                 # (data.chip_label) so one account cannot read two ways. The
