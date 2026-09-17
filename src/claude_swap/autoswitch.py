@@ -3834,7 +3834,7 @@ class AutoSwitchEngine:
                     -max(escape_h if escape_h is not None else h, 0.0),
                     recovery_ts,
                 )
-                key_axis[num] = "at-limit escape" if escape_label is not None else "most headroom"
+                key_axis[num] = "at-limit escape" if escape_h is not None else "most headroom"
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
