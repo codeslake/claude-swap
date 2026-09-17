@@ -2833,6 +2833,25 @@ class TestUnswitchableRowsAreListed:
             f"the engine's own pick sorted behind a row it refused: {out!r}"
         )
 
+    def test_CONTROL_a_sentinel_blocked_candidate_does_not_enter_the_ranking(self):
+        """CONTROL for the `ordered_rank` arm added to the sentinel branch:
+        a sentinel-blocked account is never in `ordered_rank` (its
+        `decision_value()` is the sentinel string, so headroom reads None
+        and `_rank_candidates_pass` drops it) -- an unconditional top key
+        there would put an unusable row above a real peer, the same
+        false-claim class this task closes."""
+        out = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "healthy@x.com", switchable=True, last_good={
+                "five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0},
+            }),
+            self._acct("3", "expired@x.com", switchable=True,
+                       sentinel=USAGE_TOKEN_EXPIRED),
+        ), active="1")
+        assert out.index("healthy@x.com") < out.index("expired@x.com"), (
+            f"a sentinel-blocked row outranked a real peer: {out!r}"
+        )
+
     def test_an_unreadable_active_is_not_asserted_as_failover(self):
         """Real `failover` needs consecutive unreadable ticks; one is not
         enough to tell apart from still-counting/idle-held/no-active."""
