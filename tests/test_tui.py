@@ -1552,7 +1552,7 @@ class TestSharedAccountOrder:
                 await settle(pilot)
                 title = app.screen.query_one("#menu-title", Static).render().plain
                 assert "slot order" in title
-                assert "by number" in title  # states the reason, not just the label
+                assert "by account number" in title  # states the reason, not just the label
                 menu = app.screen.query_one("#menu", ListView)
                 ids = [
                     item.action_id for item in menu.query(MenuItem)
