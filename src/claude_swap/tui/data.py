@@ -224,9 +224,8 @@ def rank_switch_candidates(
     active_number: str | None,
 ) -> tuple[list[str], str | None, str, bool]:
     """(ordered, rank_axis, trigger, unmodeled): the engine's own admission
-    and order for this snapshot. THE shared computation -- ``ordered_
-    accounts`` and the auto-switch view's "Next best" panel both read off
-    this one call, never a second, hand-matched pass of their own.
+    and order. THE shared computation -- ``ordered_accounts`` and the auto
+    view's "Next best" panel both read off this, never a pass of their own.
     """
     models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
@@ -320,12 +319,10 @@ def rank_switch_candidates(
 def ordered_accounts(
     snap: AccountsSnapshot, settings: "AutoSwitchSettings", now: float
 ) -> list[str]:
-    """Every account number: the active one first, then the rest as the
-    engine's own pass would rank them -- ranked-and-open first, then
-    usable-but-refused, sentinel-blocked, spend-only, unswitchable last.
-
-    THE one order every account-listing screen renders in -- a screen with
-    a reason to keep slot order instead says so at its own call site.
+    """Every account number, active first, then the rest as the engine's own
+    pass would rank them: ranked-and-open, usable-but-refused, sentinel-
+    blocked, spend-only, unswitchable last. THE one order every screen
+    renders in -- a screen keeping slot order says so at its own call site.
     """
     active_number = snap.active_number
     others = [acc for acc in snap.accounts if acc.number != active_number]

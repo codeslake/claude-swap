@@ -1444,8 +1444,7 @@ class TestWatchScreen:
 
 
 def _order_fixture_accounts():
-    """Active "3", usable "1", and three unusable -- disabled "2", 7d-full
-    "5", token-expired "4" -- in slot order 3,1,2,4,5."""
+    """Active "3", usable "1", unusable "2"/"4"/"5" (disabled/expired/full)."""
     return [
         make_account(3, active=True, entry=make_entry(95.0, 95.0)),
         make_account(1, entry=make_entry(5.0, 5.0)),
@@ -1458,38 +1457,38 @@ def _order_fixture_accounts():
 _ORDER_SETTINGS = AutoSwitchSettings(strategy="best", threshold=90.0)
 
 
+def _autoview_order(snap, active, settings):
+    """The account numbers "Next best" renders, in its own displayed order."""
+    from unittest.mock import MagicMock, patch
+
+    from claude_swap.tui.autoview import AutoScreen
+    from claude_swap.tui.theme import CSWAP_DARK
+
+    v = AutoScreen.__new__(AutoScreen)
+    v._settings = settings
+    app = MagicMock()
+    app.current_theme = CSWAP_DARK
+    with patch.object(AutoScreen, "app", property(lambda s: app)):
+        rendered = str(v._candidates_text(snap, active_number=active))
+    others = [acc.number for acc in snap.accounts if acc.number != active]
+    return sorted(others, key=lambda n: rendered.index(f"user{n}@example.com"))
+
+
 class TestOrderedAccounts:
-    """One order every account-listing screen renders in -- never a second,
-    hand-matched key per screen (#371's own defect, repeated)."""
+    """One order every listing screen renders -- never a re-derived key."""
 
     def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
-        from unittest.mock import MagicMock, patch
-
-        from claude_swap.tui.autoview import AutoScreen
-        from claude_swap.tui.theme import CSWAP_DARK
-
         snap = AccountsSnapshot(
             accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
         )
-        now = time.time()
-        v = AutoScreen.__new__(AutoScreen)
-        v._settings = _ORDER_SETTINGS
-        app = MagicMock()
-        app.current_theme = CSWAP_DARK
-        with patch.object(AutoScreen, "app", property(lambda s: app)):
-            rendered = str(v._candidates_text(snap, active_number="3"))
-        autoview_order = sorted(
-            ("1", "2", "4", "5"), key=lambda n: rendered.index(f"user{n}@example.com")
-        )
-        order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, now)
+        order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, time.time())
         assert order[0] == "3"  # active pinned first
-        assert order[1:] == autoview_order  # THE auto-switch view's own order
+        assert order[1:] == _autoview_order(snap, "3", _ORDER_SETTINGS)
         for unusable in ("2", "4", "5"):  # disabled / token-expired / 7d-full
             assert order.index("1") < order.index(unusable)
 
     def test_a_two_digit_slot_ties_the_same_way_the_auto_switch_view_does(self):
-        """Two disabled (never-ranked, same-bucket) accounts settle on the
-        NUMBER STRING like the auto view does -- "12" before "2"."""
+        """Two never-ranked accounts settle on the NUMBER STRING: "12" < "2"."""
         snap = AccountsSnapshot(
             accounts=[
                 make_account(1, active=True),
@@ -1501,7 +1500,14 @@ class TestOrderedAccounts:
         )
         settings = AutoSwitchSettings(strategy="best", threshold=1.0)
         order = tui_data.ordered_accounts(snap, settings, time.time())
-        assert order == ["1", "12", "2"]
+        assert order[1:] == _autoview_order(snap, "1", settings) == ["12", "2"]
+
+    def test_unmodeled_trigger_keys_stay_in_sync_with_the_auto_view_text(self):
+        """Two files key the same trigger names; a name added to one alone
+        is a silent mis-render, not an import error."""
+        from claude_swap.tui import autoview
+
+        assert set(autoview._UNMODELED_TEXT) == tui_data._UNMODELED_TRIGGERS
 
 
 @pytest.mark.asyncio

@@ -282,10 +282,7 @@ class AccountListScreen(Screen):
         return 0  # the account under the cursor is gone (e.g. removed)
 
     def _number_index(self, number: str | None) -> int | None:
-        """This account's row in the current (post-rebuild) list order."""
-        return next(
-            (i for i, n in enumerate(self._numbers) if n == number), None
-        )
+        return next((i for i, n in enumerate(self._numbers) if n == number), None)
 
     def _active_index(self, snap: AccountsSnapshot) -> int:
         idx = self._number_index(snap.active_number)
