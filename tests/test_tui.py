@@ -2781,6 +2781,24 @@ class TestUnswitchableRowsAreListed:
         ), active="1", settings=settings)
         assert "no candidate qualifies" in out, out
 
+    def test_CONTROL_the_api_key_last_resort_is_withheld_when_unmodeled(self):
+        """CONTROL: a real below-threshold tick returns NO_ACTION at
+        autoswitch.py :1945, before :2600's last resort is ever reached --
+        so an API-key candidate present under `include_api_key_accounts`
+        must not make the fallback fire and swallow the "not previewed"
+        text the way "no candidate qualifies" was swallowed above."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0,
+                                       include_api_key_accounts=True)
+        active = {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 20.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                       last_good={}),
+        ), active="1", settings=settings)
+        assert "not previewed (active below threshold)" in out, out
+
     def test_an_unreadable_active_is_not_asserted_as_failover(self):
         """Real `failover` needs consecutive unreadable ticks; one is not
         enough to tell apart from still-counting/idle-held/no-active."""

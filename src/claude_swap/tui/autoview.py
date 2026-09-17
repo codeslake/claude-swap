@@ -530,9 +530,13 @@ class AutoScreen(Screen):
             ordered, rank_axis = _rank_on((), trigger)
         # THE SAME last resort `_tick_inner` takes (autoswitch.py :2600), else
         # a real switch target reads "no candidate qualifies". Never for a
-        # below-threshold consume-first nudge (no weekly window to consume).
+        # below-threshold consume-first nudge (no weekly window to consume),
+        # and never when `unmodeled`: a real "below-threshold"/"dynamic-
+        # unmodeled"/"unreadable-active" tick returns NO_ACTION before :2600
+        # is ever reached (e.g. autoswitch.py :1945), so the fallback would
+        # itself be the false claim here.
         if (
-            not ordered and api_key_candidates
+            not ordered and api_key_candidates and not unmodeled
             and trigger not in CONSUME_FIRST_STRATEGIES
         ):
             ordered, rank_axis = api_key_candidates, None
