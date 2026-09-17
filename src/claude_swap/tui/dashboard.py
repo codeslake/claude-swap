@@ -173,7 +173,7 @@ class DashboardScreen(Screen):
             await self._push_menu("add account", self._add_entries())
         elif action_id == "remove-menu":
             await self._push_menu(
-                "remove account (slot order, by account number)", self._remove_entries()
+                "remove account (slot order: numbers stay put)", self._remove_entries()
             )
         elif action_id.startswith("remove:"):
             number = action_id.split(":", 1)[1]
@@ -192,7 +192,7 @@ class DashboardScreen(Screen):
             await self._pop_menu()
         elif action_id == "disable-menu":
             await self._push_menu(
-                "disable / enable (slot order, by account number)", self._disable_entries()
+                "disable / enable (slot order: numbers stay put)", self._disable_entries()
             )
         elif action_id.startswith("disable:"):
             number = action_id.split(":", 1)[1]
