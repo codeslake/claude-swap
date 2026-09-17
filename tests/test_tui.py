@@ -1444,13 +1444,13 @@ class TestWatchScreen:
 
 
 def _order_fixture_accounts():
-    """Active "3", usable "1", unusable "2"/"4"/"5" (disabled/expired/full)."""
+    """Active "3", usable "1", unusable "2"/"4"/"12" (disabled/expired/full)."""
     return [
         make_account(3, active=True, entry=make_entry(95.0, 95.0)),
         make_account(1, entry=make_entry(5.0, 5.0)),
         make_account(2, entry=make_entry(20.0, 20.0), disabled=True),
         make_account(4, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
-        make_account(5, entry=make_entry(50.0, 100.0)),
+        make_account(12, entry=make_entry(50.0, 100.0)),
     ]
 
 
@@ -1466,8 +1466,7 @@ def _autoview_order(snap, active, settings):
 
     v = AutoScreen.__new__(AutoScreen)
     v._settings = settings
-    app = MagicMock()
-    app.current_theme = CSWAP_DARK
+    app = MagicMock(current_theme=CSWAP_DARK)
     with patch.object(AutoScreen, "app", property(lambda s: app)):
         rendered = str(v._candidates_text(snap, active_number=active))
     others = [acc.number for acc in snap.accounts if acc.number != active]
@@ -1478,29 +1477,16 @@ class TestOrderedAccounts:
     """One order every listing screen renders -- never a re-derived key."""
 
     def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
+        """Also the tie-break control: never-ranked "2" and two-digit "12"
+        settle in the auto view's OWN relative order -- "12" before "2"."""
         snap = AccountsSnapshot(
             accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
         )
         order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, time.time())
         assert order[0] == "3"  # active pinned first
         assert order[1:] == _autoview_order(snap, "3", _ORDER_SETTINGS)
-        for unusable in ("2", "4", "5"):  # disabled / token-expired / 7d-full
+        for unusable in ("2", "4", "12"):  # disabled / token-expired / 7d-full
             assert order.index("1") < order.index(unusable)
-
-    def test_a_two_digit_slot_ties_the_same_way_the_auto_switch_view_does(self):
-        """Two never-ranked accounts settle on the NUMBER STRING: "12" < "2"."""
-        snap = AccountsSnapshot(
-            accounts=[
-                make_account(1, active=True),
-                make_account(2, disabled=True),
-                make_account(12, disabled=True),
-            ],
-            active_number="1",
-            taken_at=0.0,
-        )
-        settings = AutoSwitchSettings(strategy="best", threshold=1.0)
-        order = tui_data.ordered_accounts(snap, settings, time.time())
-        assert order[1:] == _autoview_order(snap, "1", settings) == ["12", "2"]
 
     def test_unmodeled_trigger_keys_stay_in_sync_with_the_auto_view_text(self):
         """Two files key the same trigger names; a name added to one alone
@@ -1512,8 +1498,19 @@ class TestOrderedAccounts:
 
 @pytest.mark.asyncio
 class TestSharedAccountOrder:
-    """Dashboard/Switch/Watch render `ordered_accounts`; Remove/Disable
-    keep slot order and say so."""
+    """Dashboard/Switch/Watch render `ordered_accounts`; Remove/Disable keep slot order."""
+
+    async def test_opening_the_auto_view_resyncs_auto_settings(self, tmp_path, fake_engine):
+        app = make_app(FakeSwitcher([make_account(1, active=True)], tmp_path))
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"schemaVersion": 1, "autoswitch": {"strategy": "best"}})
+        )
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            assert app.auto_settings.strategy == "consume-first"  # stale copy
+            await pilot.press("g")
+            await pilot.pause()
+            assert app.auto_settings.strategy == "best"
 
     async def test_every_listing_screen_follows_the_shared_order(self, tmp_path):
         from textual.widgets import ListView
@@ -1560,7 +1557,7 @@ class TestSharedAccountOrder:
                     item.action_id for item in menu.query(MenuItem)
                     if item.action_id.startswith(prefix)
                 ]
-                assert ids == [f"{prefix}3", f"{prefix}1", f"{prefix}2", f"{prefix}4", f"{prefix}5"]
+                assert ids == [f"{prefix}{n}" for n in ("3", "1", "2", "4", "12")]
                 await menu_select(pilot, "back")
 
     async def test_switch_cursor_follows_the_account_when_order_changes(

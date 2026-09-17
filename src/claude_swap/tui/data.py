@@ -39,8 +39,8 @@ from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
 if TYPE_CHECKING:
     from claude_swap.settings import AutoSwitchSettings
 
-# Trigger names where the ranking pass never runs a tick at all -- shared
-# with the auto view's `_UNMODELED_TEXT`, same three keys.
+# Triggers where the ranking pass never runs -- keys the auto view's own
+# `_UNMODELED_TEXT` shares (kept in sync by a test, not by import).
 _UNMODELED_TRIGGERS = frozenset(
     {"dynamic-unmodeled", "below-threshold", "unreadable-active"}
 )
@@ -223,9 +223,10 @@ def rank_switch_candidates(
     now: float,
     active_number: str | None,
 ) -> tuple[list[str], str | None, str, bool]:
-    """(ordered, rank_axis, trigger, unmodeled): the engine's own admission
-    and order. THE shared computation -- ``ordered_accounts`` and the auto
-    view's "Next best" panel both read off this, never a pass of their own.
+    """(ordered, rank_axis, trigger, unmodeled): mirrors the engine's own
+    admission and order. THE shared computation -- ``ordered_accounts`` and
+    the auto view's "Next best" panel both read off this, never a pass of
+    their own.
     """
     models = parse_model_names(settings.model)
     consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
@@ -287,10 +288,9 @@ def rank_switch_candidates(
         return ordered, rank_axis
 
     model_headroom = _headroom_by_account(usage, models)
-    active_account = next(
-        (acc for acc in snap.accounts if acc.number == active_number), None
+    active_disabled = next(
+        (acc.disabled for acc in snap.accounts if acc.number == active_number), False
     )
-    active_disabled = active_account.disabled if active_account is not None else False
     trigger = _trigger_for(
         _dynamic_active_headroom(
             settings, models, usage, active_number, model_headroom.get(active_number)
@@ -326,9 +326,7 @@ def ordered_accounts(
     """
     active_number = snap.active_number
     others = [acc for acc in snap.accounts if acc.number != active_number]
-    ordered, _axis, _trigger, _unmodeled = rank_switch_candidates(
-        snap, settings, now, active_number
-    )
+    ordered, *_ = rank_switch_candidates(snap, settings, now, active_number)
     ordered_rank = {num: i for i, num in enumerate(ordered)}
     models = parse_model_names(settings.model)
 
@@ -343,10 +341,8 @@ def ordered_accounts(
             return (3,)
         return (1,)
 
-    # `(bucket, number)`: same tie-break as the auto view's own `sorted`.
-    numbers = [
-        acc.number for acc in sorted(others, key=lambda a: (bucket(a), a.number))
-    ]
+    others.sort(key=lambda a: (bucket(a), a.number))  # matches the auto view's tie-break
+    numbers = [acc.number for acc in others]
     return ([active_number] if active_number is not None else []) + numbers
 
 

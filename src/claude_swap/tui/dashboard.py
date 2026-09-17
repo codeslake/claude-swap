@@ -250,8 +250,7 @@ class AccountListScreen(Screen):
         ordered_accounts_ = [by_number[n] for n in numbers]
         if numbers != self._numbers:
             first_build = not self._numbers
-            # The ACCOUNT under the cursor (old order), not its row.
-            previous_number = (
+            previous_number = (  # the ACCOUNT under the cursor, not its row
                 self._numbers[listview.index]
                 if listview.index is not None and listview.index < len(self._numbers)
                 else None

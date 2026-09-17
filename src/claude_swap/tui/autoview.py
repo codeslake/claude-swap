@@ -138,14 +138,14 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
-        # The bar tick everywhere reads app.threshold_pct, loaded once at app
-        # startup — sync it to the fresh file value so bars and engine agree,
-        # and remember that value: unmount restores it (only the session
-        # adjustment reverts, not this correction).
+        # threshold_pct AND auto_settings are loaded once at app startup;
+        # sync both to the fresh file value (unmount reverts only the
+        # session threshold adjustment, never this correction).
         self._configured_threshold = self._settings.threshold
         self.app.threshold_pct = proactive_switch_bar_pct(
             self._settings.strategy, self._settings.threshold
         )
+        self.app.auto_settings = self._settings
         self._configured_strategy = self._settings.strategy
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -439,9 +439,9 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                # `ordered_rank` first: the API-key last resort (:539) can
-                # name THIS row as the engine's actual next pick, and it must
-                # not sort behind every refused OAuth row when it does.
+                # `ordered_rank` first: the API-key last resort (data.rank_
+                # switch_candidates) can name THIS row as the engine's actual
+                # next pick, and it must not sort behind every refused row.
                 key = (
                     (0, ordered_rank[acc.number])
                     if acc.number in ordered_rank else (998.0,)
@@ -471,7 +471,7 @@ class AutoScreen(Screen):
                 # it is never chosen, and this was the one silent exception.
                 if acc.disabled:
                     entry.append("  auto-swap disabled", style=palette.muted)
-                # RANKED LAST, UNLESS THE API-KEY LAST RESORT NAMED IT (:539):
+                # RANKED LAST, UNLESS THE API-KEY LAST RESORT NAMED IT:
                 # spend is not headroom, so folding it into the sort key
                 # would change which account the engine picks -- but when
                 # `ordered_rank` already names this row (never derived here),
