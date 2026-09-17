@@ -2839,15 +2839,26 @@ class TestUnswitchableRowsAreListed:
         `decision_value()` is the sentinel string, so headroom reads None
         and `_rank_candidates_pass` drops it) -- an unconditional top key
         there would put an unusable row above a real peer, the same
-        false-claim class this task closes."""
+        false-claim class this task closes. The active must itself be
+        readable and over threshold (else the pass never runs at all and
+        neither row reaches this arm, `not previewed` instead) and the
+        sentinel row must carry the LOWER account number: a mutated
+        unconditional `(0, 0)` ties the peer's own `(0, 0)`, and the tie
+        breaks on `acc.number` as a string -- a higher-numbered sentinel
+        row would let that tie-break mask the mutation.
+        """
+        active = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0}}
         out = self._render(self._snap(
-            self._acct("1", "a@x.com", switchable=True),
-            self._acct("2", "healthy@x.com", switchable=True, last_good={
+            self._acct("1", "a@x.com", switchable=True, last_good=active),
+            self._acct("2", "expired@x.com", switchable=True,
+                       sentinel=USAGE_TOKEN_EXPIRED),
+            self._acct("3", "healthy@x.com", switchable=True, last_good={
                 "five_hour": {"pct": 10.0}, "seven_day": {"pct": 10.0},
             }),
-            self._acct("3", "expired@x.com", switchable=True,
-                       sentinel=USAGE_TOKEN_EXPIRED),
         ), active="1")
+        assert "not previewed" not in out, (
+            f"the ranking pass never ran, so this control tested nothing: {out!r}"
+        )
         assert out.index("healthy@x.com") < out.index("expired@x.com"), (
             f"a sentinel-blocked row outranked a real peer: {out!r}"
         )
