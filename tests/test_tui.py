@@ -2727,6 +2727,54 @@ class TestUnswitchableRowsAreListed:
             f"enabled one: {out!r}"
         )
 
+    def test_a_below_threshold_active_under_best_ranks_nothing_the_tick_also_refuses(
+        self,
+    ):
+        """`_tick_inner` returns NO_ACTION (`below-threshold`) whenever the
+        active's utilization is under `settings.threshold` and the strategy
+        is not consume-first -- `dynamic` is the only exception, gated
+        separately above. The panel used to fall through to `"proactive"`
+        here and rank a top pick in a tick the real engine never reaches
+        `_rank_candidates_pass` for. Correct is the same "nothing will be
+        picked" claim a real `below-threshold` tick makes -- distinct from
+        `dynamic`'s "not modeled" state: this one IS modeled, and modeled
+        to rank nothing.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(strategy="best", threshold=90.0)
+        # Headroom gap (95 - 80 = 15) clears `hysteresis_pct` (10.0 default)
+        # comfortably, so a real ranking pass -- were the trigger genuinely
+        # "proactive" -- would admit and top-rank the candidate; this isolates
+        # the trigger-classification bug from the hysteresis gate.
+        active = {
+            "five_hour": {"pct": 20.0},
+            "seven_day": {"pct": 20.0, "resets_at": _iso_in(10 * 86400)},
+        }
+        candidate = {
+            "five_hour": {"pct": 5.0},
+            "seven_day": {"pct": 5.0, "resets_at": _iso_in(3 * 86400)},
+        }
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "candidate@x.com", switchable=True,
+                       last_good=candidate),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, (
+            f"a below-threshold tick under `best` must claim nothing will "
+            f"be picked, the same as a real `below-threshold` NO_ACTION: "
+            f"{out!r}"
+        )
+        assert "not previewed (dynamic warm/cold state)" not in out, (
+            f"`best` borrowed `dynamic`'s unmodeled claim: {out!r}"
+        )
+        row2 = out[out.index("candidate@x.com"):]
+        assert "not a candidate" in row2, (
+            f"the open candidate row gave no reason it is never picked "
+            f"this tick, even though the real engine never reaches "
+            f"ranking below the threshold: {out!r}"
+        )
+
     def test_the_legend_prints_the_engines_own_axis(self):
         """The legend names `_rank_candidates_pass`'s own 5th return value,
         not a re-derived key: the one-way `fallback` list (autoswitch.py

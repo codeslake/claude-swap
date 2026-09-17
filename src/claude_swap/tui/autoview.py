@@ -441,20 +441,23 @@ class AutoScreen(Screen):
                     # reaches this pass for `dynamic`.
                     return None
                 return "at-limit"
-            if (
-                settings.strategy in CONSUME_FIRST_STRATEGIES
-                and (100.0 - active_headroom) < settings.threshold
-            ):
-                return settings.strategy
-            # Not a real trigger under any other strategy below the
-            # threshold: the engine emits `below-threshold` and returns
-            # NO_ACTION rather than reaching this pass at all.
+            if (100.0 - active_headroom) < settings.threshold:
+                if settings.strategy in CONSUME_FIRST_STRATEGIES:
+                    return settings.strategy
+                # Not a real trigger under any other strategy below the
+                # threshold: the engine emits `below-threshold` and returns
+                # NO_ACTION rather than reaching this pass at all. A
+                # sentinel distinct from `dynamic`'s `None` above -- this
+                # state IS modeled (the engine deterministically ranks
+                # nothing this tick), so it must not borrow `dynamic`'s
+                # "not previewed" claim below.
+                return "below-threshold"
             return "at-limit" if active_headroom <= 0 else "proactive"
 
         def _rank_on(
             axis: tuple[str, ...], trigger: str | None
         ) -> tuple[list[str], str | None]:
-            if trigger is None:
+            if trigger is None or trigger == "below-threshold":
                 return [], None
             headroom = _headroom_by_account(usage, axis)
             ordered, _any_known, _active_reset_ts, _waiting, rank_axis = rank_candidates_pass(
