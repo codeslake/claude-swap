@@ -23,7 +23,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES
-from claude_swap.usage_store import STALE_OK_S
+from claude_swap.usage_store import STALE_OK_S, UsageEntry
 from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
 
@@ -95,7 +95,8 @@ def usage_bar(
 
 
 def _reset_parts(
-    window: dict, now: float, fetched_at: float | None = None
+    window: dict, now: float, fetched_at: float | None = None,
+    entry: UsageEntry | None = None,
 ) -> tuple[str, str]:
     """Countdown suffix and its clock-extended variant for one window.
 
@@ -106,8 +107,12 @@ def _reset_parts(
     then went blank — the same "nothing to report" reading that hid it in
     the chips, on the account's OWN detail card this time. Named instead, so
     the reset column never disappears merely because it is unmeasured.
+
+    ``entry``, when given, is what tells a rolled reset's "refetching" from
+    its retry/backoff naming (see ``data.reset_text``) — this card's own
+    copy of the same #325 follow-up the chips carry.
     """
-    reset = data.reset_text(window, now, fetched_at)
+    reset = data.reset_text(window, now, fetched_at, entry=entry)
     if not reset:
         return "reset unknown", "reset unknown"
     clock = data.reset_clock(window, now)
@@ -121,7 +126,8 @@ def _pace_suffix(window: dict, fetched_at: float | None) -> str:
 
 
 def usage_rows(
-    last_good: dict | None, now: float, fetched_at: float | None = None
+    last_good: dict | None, now: float, fetched_at: float | None = None,
+    entry: UsageEntry | None = None,
 ) -> list[tuple[str, float, str, str]]:
     """(label, pct, suffix, suffix_full) rows mirroring the CLI's
     ``_format_usage_lines``.
@@ -134,6 +140,11 @@ def usage_rows(
     the latter marked ``(!)`` at/over their limit. The weekly (7d) and scoped
     rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
     week's expected usage (issue #125) — never the 5h row.
+
+    ``entry``, when given, is threaded to every ``_reset_parts`` call so a
+    rolled reset names its retry/backoff wait instead of resting on
+    "refetching" (#325 follow-up) — the same object as ``fetched_at`` came
+    from, passed alongside it rather than in place of it.
     """
     if not isinstance(last_good, dict):
         return []
@@ -147,13 +158,13 @@ def usage_rows(
         # (the amounts alone) instead of borrowing "reset unknown".
         suffix = suffix_full = amounts
         if spend.get("resets_at"):
-            reset, reset_full = _reset_parts(spend, now, fetched_at)
+            reset, reset_full = _reset_parts(spend, now, fetched_at, entry=entry)
             suffix, suffix_full = f"{reset}  {amounts}", f"{reset_full}  {amounts}"
         rows.append((SPEND_LABEL, float(spend["pct"]), suffix, suffix_full))
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key)
         if window:
-            reset, reset_full = _reset_parts(window, now, fetched_at)
+            reset, reset_full = _reset_parts(window, now, fetched_at, entry=entry)
             # A lapsed 5h window (no reported reset, no usage) has nothing
             # withheld -- "reset unknown" would assert a gap that isn't one.
             if key == "five_hour" and not window.get("resets_at") and window["pct"] == 0:
@@ -167,7 +178,7 @@ def usage_rows(
             rows.append((label, float(window["pct"]), suffix, suffix_full))
     for window in last_good.get("scoped") or []:
         pct = float(window["pct"])
-        suffix, suffix_full = _reset_parts(window, now, fetched_at)
+        suffix, suffix_full = _reset_parts(window, now, fetched_at, entry=entry)
         suffix, suffix_full = suffix or "", suffix_full or ""
         if pct >= 100:
             suffix = f"{suffix}  (!)" if suffix else "(!)"
@@ -268,7 +279,7 @@ def account_card_text(
                 text.append(f"└ {last_seen}", style=palette.muted)
         return text
 
-    rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at)
+    rows = usage_rows(acc.usage.last_good, now, acc.usage.fetched_at, entry=acc.usage)
     if not rows:
         text.append("\n    ")
         text.append("usage unavailable", style=palette.muted)
@@ -358,6 +369,7 @@ def mini_account_text(
 
     last_good = acc.usage.last_good
     fetched_at = acc.usage.fetched_at
+    entry = acc.usage
     stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
     parts = 0
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
@@ -372,7 +384,7 @@ def mini_account_text(
         # helper — one account must not read two ways on two screens.
         text.append(
             data.chip_label(
-                label, data.reset_text(window, now, fetched_at),
+                label, data.reset_text(window, now, fetched_at, entry=entry),
                 pct,
             ),
             style=palette.muted,
@@ -392,7 +404,9 @@ def mini_account_text(
         # the same way whether it is the account's only window or sits
         # beside 5h/7d.
         text.append(
-            data.chip_label(window["name"], data.reset_text(window, now, fetched_at)),
+            data.chip_label(
+                window["name"], data.reset_text(window, now, fetched_at, entry=entry)
+            ),
             style=palette.muted,
         )
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
@@ -405,7 +419,7 @@ def mini_account_text(
     # when nothing else was shown; a budget can be 95% spent behind a window
     # that still reads perfectly healthy. From `usage_rows`, not a third
     # spelling of the same amounts.
-    rows = usage_rows(last_good, now, fetched_at)
+    rows = usage_rows(last_good, now, fetched_at, entry=entry)
     spend = spend_row(rows)
     if spend is not None:
         if parts:

@@ -321,6 +321,17 @@ class TestFormatting:
         assert tui_data.chip_label("5h", tui_data.REFETCHING) == "5h(⟳refetching):"
         assert tui_data.chip_label("5h", None) == "5h(⟳?):"
         assert tui_data.chip_label("5h", None, pct=0.0) == "5h(⟳5h00m):"
+        # #325 follow-up: the retry/backoff markers `reset_text` can now
+        # name for a rolled-but-unclaimed window (see
+        # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`
+        # below) are not a plain duration shape either, so they keep their
+        # own words too instead of being mangled into `0h05m`/`0h02m` —
+        # and stay inside REFETCHING's width, the widest token this column
+        # already budgets for, so no layout changes (PR #323's business).
+        assert tui_data.chip_label("5h", "retry 5m") == "5h(⟳retry 5m):"
+        assert tui_data.chip_label("5h", "429 2m") == "5h(⟳429 2m):"
+        assert len("retry 5m") <= len(tui_data.REFETCHING)
+        assert len("429 2m") <= len(tui_data.REFETCHING)
 
     def test_format_age_fresh_is_silent(self):
         # Ages inside the serve TTL are the polling cadence at work, not
@@ -417,7 +428,15 @@ class TestFormatting:
     def test_reset_text_names_a_pct_that_provably_predates_the_reset(self):
         """A window whose reset elapsed while the served pct is older still
         (`fetched_at < resets_at <= now`) must not claim "resets now" beside
-        a pct that is provably pre-reset -- PR #325."""
+        a pct that is provably pre-reset -- PR #325.
+
+        #325 follow-up: `fetched_at < resets_at <= now` alone proves the pct
+        is stale, but it does NOT prove a fetch is under way -- that needs
+        `entry` (see the three tests below). Without one, `reset_text` has
+        no way to tell a live claim from a stalled one and keeps its old,
+        conservative "refetching" guess; every production caller now passes
+        an `entry`, so this bare-`fetched_at` call is a unit-level probe of
+        `reset_text` itself, not a claim about what the UI shows."""
         now = time.time()
         window = {"resets_at": _iso_in(-60)}
         fetched_before_reset = now - 120
@@ -434,6 +453,107 @@ class TestFormatting:
         )
         # No fetched_at at all: cannot prove staleness, keep prior behaviour.
         assert tui_data.reset_text(window, now) == "resets now"
+
+    def test_reset_text_shows_refetching_only_while_a_fetch_is_claimed(self):
+        """#325 follow-up: the placeholder was measured RESTING -- three
+        frames 3s apart on an unchanged `(last_good, fetched_at)` all read
+        `refetching`, with nothing in the branch to decay, retry or count.
+        The corrected premise: "refetching" names a fetch genuinely CLAIMED
+        (`entry.claimed(now)`, bounded by `CLAIM_TTL_S`), not merely "the
+        reset elapsed and the served pct predates it"."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        # `next_poll_at` is ALSO set, so this is a real discriminator: if
+        # `claimed(now)` were ignored (or always read False) the retry
+        # branch below would fire instead and this would read "retry 5m",
+        # not "refetching" -- a bare `claim_until` with nothing else set
+        # cannot tell "claimed" apart from "no signal at all" (reviewer
+        # finding, #325 follow-up).
+        claimed = UsageEntry(
+            fetched_at=fetched_at, claim_until=now + 30, next_poll_at=now + 300,
+        )
+        assert (
+            tui_data.reset_text(window, now, fetched_at, entry=claimed)
+            == "refetching"
+        )
+
+    def test_reset_text_names_the_retry_instant_when_nothing_is_in_flight(self):
+        """State 4a: the same rolled row, nothing claimed, a scheduled
+        `next_poll_at` -- names the retry instant instead of resting on the
+        placeholder forever."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        waiting = UsageEntry(fetched_at=fetched_at, next_poll_at=now + 300)
+        text = tui_data.reset_text(window, now, fetched_at, entry=waiting)
+        assert text == "retry 5m", text
+        assert text != tui_data.REFETCHING
+
+    def test_reset_text_names_the_backoff_reason_and_retry(self):
+        """State 4b: the same rolled row, in backoff after a failed attempt
+        -- names the reason and the retry, not the placeholder."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        backing_off = UsageEntry(
+            fetched_at=fetched_at, backoff_until=now + 120, last_error="http-429",
+        )
+        text = tui_data.reset_text(window, now, fetched_at, entry=backing_off)
+        assert text == "429 2m", text
+        assert text != tui_data.REFETCHING
+
+    def test_reset_text_names_overdue_when_the_retry_instant_has_passed(self):
+        """A `next_poll_at` already in the past (no collector has claimed
+        the row since it fell due) must not clamp through `_short_wait`'s
+        `max(0, ...)` into a frozen "retry 0s" -- that is the same
+        unqualified resting placeholder this range set out to stop, just
+        spelled differently. It should decay to a distinct, non-decaying-
+        looking marker instead."""
+        now = time.time()
+        window = {"resets_at": _iso_in(-60)}
+        fetched_at = now - 120
+        overdue = UsageEntry(fetched_at=fetched_at, next_poll_at=now - 30)
+        text = tui_data.reset_text(window, now, fetched_at, entry=overdue)
+        assert text == "overdue", text
+        assert text != tui_data.REFETCHING
+        assert not text.startswith("retry 0")
+
+    def test_a_known_or_absent_reset_never_placeholders_or_fetches(self):
+        """CONTROL for the three states above: state 1 (a live countdown)
+        and state 2 (a reset never reported) must never render the
+        placeholder, and rendering must never reach a fetch path -- the
+        render pass is the Textual event loop (`autoview.py`, `app.py`'s
+        `POLL_INTERVAL_S`) and `data.py`'s own module docstring says
+        everything blocking there must never run on it. No scheduling gap
+        excuses a network call from a render function."""
+        from unittest.mock import patch
+
+        from claude_swap.tui.widgets import mini_account_text
+
+        now = time.time()
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account"
+        ) as fetch, patch.object(
+            ClaudeAccountSwitcher, "consume_backup_grant"
+        ) as consume:
+            # state 1: known future reset
+            live = UsageEntry(
+                last_good={"five_hour": {"pct": 40.0, "resets_at": _iso_in(3600)}},
+                fetched_at=now,
+            )
+            out_live = mini_account_text(make_account(1, entry=live), now).plain
+            assert tui_data.REFETCHING not in out_live, out_live
+
+            # state 2: reset never reported
+            unknown = UsageEntry(
+                last_good={"five_hour": {"pct": 40.0}}, fetched_at=now,
+            )
+            out_unknown = mini_account_text(make_account(1, entry=unknown), now).plain
+            assert tui_data.REFETCHING not in out_unknown, out_unknown
+
+        fetch.assert_not_called()
+        consume.assert_not_called()
 
 
 class TestSnapshotSource:
@@ -681,20 +801,38 @@ class TestUsageRows:
         """A window whose reset has passed while the served pct still
         predates it must not claim "resets now" beside a 100% that is
         already wrong -- PR #325, the active card's own copy of the defect
-        the inactive-row chip and the Next-best row also carried."""
+        the inactive-row chip and the Next-best row also carried.
+
+        #325 follow-up: the active card is threaded with `entry` too (not
+        only `fetched_at`), so it must ALSO tell a genuinely claimed fetch
+        (still "refetching") from nothing in flight (names its own retry
+        instead of resting on the placeholder)."""
         from claude_swap.tui.widgets import account_card_text, usage_rows
 
         now = time.time()
         last_good = {"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}}
         fetched_at = now - 120  # measured well before the reset fired
-        row = usage_rows(last_good, now, fetched_at)[0]
+        # `next_poll_at` is ALSO set: a real discriminator (see the test
+        # above) rather than a bare `claim_until` a stubbed-out `claimed()`
+        # would pass just as well.
+        claimed = UsageEntry(
+            last_good=last_good, fetched_at=fetched_at, age_s=120.0,
+            claim_until=now + 30, next_poll_at=now + 300,
+        )
+        row = usage_rows(last_good, now, fetched_at, entry=claimed)[0]
         assert row[2] == "refetching", row
         assert row[3] == "refetching", row
 
-        entry = UsageEntry(last_good=last_good, fetched_at=fetched_at, age_s=120.0)
-        card = account_card_text(make_account(1, active=True, entry=entry), 80).plain
+        card = account_card_text(make_account(1, active=True, entry=claimed), 80).plain
         assert "refetching" in card, card
         assert "resets now" not in card, card
+
+        # Nothing claimed, a scheduled next poll: names the retry, not the
+        # placeholder -- the row must not rest on "refetching" forever.
+        waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
+        row = usage_rows(last_good, now, fetched_at, entry=waiting)[0]
+        assert row[2] == "retry 5m", row
+        assert "refetching" not in row[2], row
 
         # CONTROL: a fetch that landed after the reset carries a fresh pct,
         # so the ordinary "resets now" reading must still apply.
@@ -829,20 +967,32 @@ class TestMiniAccountText:
     def test_dashboard_chip_reads_refetching_not_stale_reset_now(self):
         """Same PR #325 defect, third surface: the dashboard's inactive-row
         chip must not say `⟳now` beside a pct that provably predates the
-        reset it names."""
+        reset it names.
+
+        #325 follow-up: "refetching" here names a fetch genuinely claimed;
+        the same row with nothing in flight must name its own retry
+        instead of resting on the placeholder."""
         from claude_swap.tui.widgets import mini_account_text
 
         now = time.time()
         fetched_at = now - 120
-        entry = UsageEntry(
+        # `next_poll_at` is ALSO set: a real discriminator (see
+        # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+        claimed = UsageEntry(
             last_good={"five_hour": {"pct": 100.0, "resets_at": _iso_in(-60)}},
             fetched_at=fetched_at,
             age_s=120.0,
+            claim_until=now + 30, next_poll_at=now + 300,
         )
-        acc = make_account(1, entry=entry)
+        acc = make_account(1, entry=claimed)
         out = mini_account_text(acc, now).plain
         assert "5h(⟳refetching):100%" in out, out
         assert "⟳now" not in out, out
+
+        waiting = dataclasses.replace(claimed, claim_until=None, next_poll_at=now + 300)
+        out2 = mini_account_text(make_account(1, entry=waiting), now).plain
+        assert "5h(⟳retry 5m):100%" in out2, out2
+        assert "refetching" not in out2, out2
 
     @pytest.mark.parametrize(
         "age_s, expect_dim",
@@ -2692,7 +2842,10 @@ class TestUnswitchableRowsAreListed:
         pre-reset pct read `resets now` here while the dashboard's
         `mini_account_text` (which IS threaded) already read `refetching`
         for the same account -- one account reading two ways again, the
-        exact defect the comment three lines above names."""
+        exact defect the comment three lines above names.
+
+        #325 follow-up: "refetching" only while genuinely claimed; the same
+        row with nothing in flight names its own retry instead."""
         now = time.time()
         stale_usage = UsageEntry(
             last_good={
@@ -2703,6 +2856,9 @@ class TestUnswitchableRowsAreListed:
             },
             fetched_at=now - 120,  # measured well before the reset fired
             age_s=120.0,
+            # `next_poll_at` is ALSO set: a real discriminator (see
+            # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+            claim_until=now + 30, next_poll_at=now + 330,
         )
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
@@ -2710,6 +2866,19 @@ class TestUnswitchableRowsAreListed:
         ), active="1")
         assert "refetching" in out, out
         assert "resets now" not in out, out
+
+        # _render computes its own `time.time()` internally, drifting a
+        # little from this test's `now` -- a wide margin past the 5m
+        # boundary keeps the floor-divided minute stable either side of it.
+        waiting_usage = dataclasses.replace(
+            stale_usage, claim_until=None, next_poll_at=now + 330
+        )
+        out2 = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("6", "paid@x.com", switchable=True, usage=waiting_usage),
+        ), active="1")
+        assert "retry 5m" in out2, out2
+        assert "refetching" not in out2, out2
 
     def test_spend_does_not_enter_the_ranking(self):
         """Showing spend must not make it a sort key. Spend is a budget, not
@@ -2929,7 +3098,13 @@ class TestUnswitchableRowsAreListed:
         """PR #325: a 5h window whose reset just fired reads `refetching`
         on the chip -- the same row's block label must not still say
         `5h full` off the same provably-stale pct, which would contradict
-        the chip it sits beside."""
+        the chip it sits beside.
+
+        #325 follow-up: the block label stays suppressed on the SAME stale
+        pct whether the chip beside it is genuinely claimed ("refetching")
+        or names its own retry -- the block filter is keyed on the pct's
+        staleness, not on which of those two words the chip happens to
+        show."""
         now = time.time()
         stale_usage = UsageEntry(
             last_good={
@@ -2938,6 +3113,9 @@ class TestUnswitchableRowsAreListed:
             },
             fetched_at=now - 120,  # measured well before the reset fired
             age_s=120.0,
+            # `next_poll_at` is ALSO set: a real discriminator (see
+            # `test_reset_text_shows_refetching_only_while_a_fetch_is_claimed`).
+            claim_until=now + 30, next_poll_at=now + 330,
         )
         out = self._render(self._snap(
             self._acct("1", "a@x.com", switchable=True),
@@ -2945,6 +3123,18 @@ class TestUnswitchableRowsAreListed:
         ), active="1")
         assert "5h(⟳refetching):" in out, out
         assert "5h full" not in out, out
+
+        # Same drift note as the spend-only variant above: a wide margin
+        # past the 5m boundary.
+        waiting_usage = dataclasses.replace(
+            stale_usage, claim_until=None, next_poll_at=now + 330
+        )
+        out2 = self._render(self._snap(
+            self._acct("1", "a@x.com", switchable=True),
+            self._acct("2", "b@x.com", switchable=True, usage=waiting_usage),
+        ), active="1")
+        assert "5h(⟳retry 5m):" in out2, out2
+        assert "5h full" not in out2, out2
 
     def test_the_panel_still_calls_a_genuinely_full_window_full(self):
         """CONTROL for the test above: a fetch that landed AFTER the reset
