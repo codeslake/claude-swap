@@ -417,6 +417,20 @@ class AutoScreen(Screen):
             and not acc.disabled
             and acc.kind != "api_key"
         ]
+        # Mirrors `api_key_candidates` (autoswitch.py :2035), invisible to
+        # OAuth-only `_rank_candidates_pass`.
+        api_key_candidates = (
+            [
+                acc.number
+                for acc in snap.accounts
+                if acc.number != active_number
+                and acc.switchable
+                and not acc.disabled
+                and acc.kind == "api_key"
+            ]
+            if settings.include_api_key_accounts
+            else []
+        )
 
         def _trigger_for(
             active_headroom: float | None, active_disabled: bool
@@ -514,6 +528,14 @@ class AutoScreen(Screen):
             and _model_window_binds_everywhere(usage, models, settings.threshold)
         ):
             ordered, rank_axis = _rank_on((), trigger)
+        # THE SAME last resort `_tick_inner` takes (autoswitch.py :2600), else
+        # a real switch target reads "no candidate qualifies". Never for a
+        # below-threshold consume-first nudge (no weekly window to consume).
+        if (
+            not ordered and api_key_candidates
+            and trigger not in CONSUME_FIRST_STRATEGIES
+        ):
+            ordered, rank_axis = api_key_candidates, None
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         for acc in snap.accounts:
             if acc.number == active_number:

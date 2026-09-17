@@ -2742,6 +2742,45 @@ class TestUnswitchableRowsAreListed:
         assert "not previewed (active below threshold)" in out, out
         assert "no candidate qualifies" not in out and "not a candidate" not in out, out
 
+    def test_an_api_key_last_resort_is_not_asserted_as_no_candidate(self):
+        """`_tick_inner` takes `api_key_candidates` as a last resort whenever
+        `not ordered and trigger not in CONSUME_FIRST_STRATEGIES`
+        (autoswitch.py :2600) -- which covers `proactive`/`at-limit`/
+        `disabled-active` under the default (consume-first) strategy too,
+        not just `best`: those trigger literals are never the strategy's own
+        name. With no OAuth peer and `include_api_key_accounts` on, the next
+        tick switches to the API-key slot, so the panel must not claim "no
+        candidate qualifies" -- the false-claim class `_UNMODELED_TEXT` stops.
+        """
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(include_api_key_accounts=True)
+        active = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                       last_good={}),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" not in out, (
+            f"the API-key slot is the engine's own last-resort pick, not "
+            f"'no candidate qualifies': {out!r}"
+        )
+
+    def test_CONTROL_the_api_key_last_resort_needs_the_flag(self):
+        """CONTROL for the row above: same fleet, `include_api_key_accounts`
+        off -- the engine never falls back to the API-key slot either, so
+        "no candidate qualifies" is the honest claim here."""
+        from claude_swap.settings import AutoSwitchSettings
+
+        settings = AutoSwitchSettings(include_api_key_accounts=False)
+        active = {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 20.0}}
+        out = self._render(self._snap(
+            self._acct("1", "active@x.com", switchable=True, last_good=active),
+            self._acct("2", "apikey@x.com", switchable=True, kind="api_key",
+                       last_good={}),
+        ), active="1", settings=settings)
+        assert "no candidate qualifies" in out, out
+
     def test_an_unreadable_active_is_not_asserted_as_failover(self):
         """Real `failover` needs consecutive unreadable ticks; one is not
         enough to tell apart from still-counting/idle-held/no-active."""
