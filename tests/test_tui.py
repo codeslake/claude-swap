@@ -2805,7 +2805,14 @@ class TestUnswitchableRowsAreListed:
         pick, so it must not sort ABOVE the one that is. The spend/sentinel
         branches used their own hard-coded (998.0,)/(999.0,) keys, never
         `ordered_rank`, so a row the engine refused always outranked the
-        engine's own last-resort pick."""
+        engine's own last-resort pick.
+
+        `sentinel=USAGE_API_KEY`, not `last_good={}`: a real switchable
+        API-key account always carries that sentinel (switcher.py:5184's
+        `_static_usage_sentinel`), so this is the branch (:577) a live TUI
+        actually reaches, not the spend one (:590) an empty `last_good`
+        would exercise instead.
+        """
         from claude_swap.settings import AutoSwitchSettings
 
         settings = AutoSwitchSettings(strategy="consume-first", threshold=90.0,
@@ -2820,7 +2827,7 @@ class TestUnswitchableRowsAreListed:
             self._acct("2", "sevenday@x.com", switchable=True,
                        last_good=seven_day_full),
             self._acct("3", "apikey@x.com", switchable=True, kind="api_key",
-                       last_good={}),
+                       sentinel=USAGE_API_KEY),
         ), active="1", settings=settings)
         assert out.index("apikey@x.com") < out.index("sevenday@x.com"), (
             f"the engine's own pick sorted behind a row it refused: {out!r}"
