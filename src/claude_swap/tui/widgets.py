@@ -349,9 +349,9 @@ def mini_account_text(
 
 
 class AccountsPanel(Static):
-    """Static account overview: the active account full-size, others as
-    one-line minis (in slot order, expanded in place). The dashboard's — and
-    with ``show_minis=False`` the auto screen's — always-visible monitor."""
+    """Static account overview: the active full-size and pinned first,
+    others as minis in the shared ranked order (``data.ordered_accounts``).
+    The dashboard's — and with ``show_minis=False`` the auto screen's."""
 
     def __init__(self, *, show_minis: bool = True, id: str | None = None) -> None:
         super().__init__(id=id)
@@ -377,7 +377,10 @@ class AccountsPanel(Static):
         now = time.time()
         width = (self.size.width or 80) - 2
         blocks: list[Text] = []
-        for acc in snap.accounts:
+        by_number = {acc.number: acc for acc in snap.accounts}
+        order = data.ordered_accounts(snap, app.auto_settings, now)
+        for number in order:
+            acc = by_number[number]
             if acc.is_active:
                 blocks.append(
                     account_card_text(

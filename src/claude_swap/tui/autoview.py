@@ -27,19 +27,13 @@ from textual.widgets import Footer, RichLog, Static
 
 from claude_swap import oauth
 from claude_swap.autoswitch import (
-    CONSUME_FIRST_STRATEGIES,
     AutoSwitchEngine,
     AutoSwitchEvent,
-    _classify_dynamic_trigger,
-    _dynamic_active_headroom,
-    _headroom_by_account,
-    _model_window_binds_everywhere,
     binding_pct,
     classify_candidate_block,
     model_block_label,
     pct_label,
     proactive_switch_bar_pct,
-    rank_candidates_pass,
 )
 from claude_swap.json_output import USAGE_API_KEY, USAGE_NO_CREDENTIALS
 from claude_swap.models import AccountsSnapshot
@@ -86,8 +80,9 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
 
 _STRATEGY_CYCLE = ("best", "consume-first", "dynamic")
 
-# `_trigger_for` sentinel returns naming WHY the ranking pass never ran --
-# never "no candidate qualifies", the claim only a real, empty pass earns.
+# `data.rank_switch_candidates`'s trigger names, keyed to WHY the ranking
+# pass never ran -- never "no candidate qualifies", the claim only a real,
+# empty pass earns.
 _UNMODELED_TEXT = {
     "dynamic-unmodeled": "not previewed (dynamic warm/cold state)",
     "below-threshold": "not previewed (active below threshold)",
@@ -399,147 +394,16 @@ class AutoScreen(Screen):
         # `settings` (never `self._settings` directly, which can be `None`
         # before `on_mount` loads it) so this can never read a DIFFERENT
         # strategy than the trigger/ranking below run on.
-        consume_first = settings.strategy in CONSUME_FIRST_STRATEGIES
         ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
         now = time.time()
-        # `usage` is model-independent (`decision_value()` reads sentinel/
-        # last_good/staleness only); the model axis is folded in per-call by
-        # `_headroom_by_account`/`_rank_candidates_pass` below, so one dict
-        # serves both the model-gated pass and the 5h/7d retry.
-        usage = {acc.number: acc.usage.decision_value() for acc in snap.accounts}
-        # `switchable_account_numbers()` (switcher.py) drops `disabled` too.
-        oauth_candidates = [
-            acc.number
-            for acc in snap.accounts
-            if acc.number != active_number
-            and acc.switchable
-            and not acc.disabled
-            and acc.kind != "api_key"
-        ]
-        # Mirrors `api_key_candidates` (autoswitch.py :2035), invisible to
-        # OAuth-only `_rank_candidates_pass`.
-        api_key_candidates = (
-            [
-                acc.number
-                for acc in snap.accounts
-                if acc.number != active_number
-                and acc.switchable
-                and not acc.disabled
-                and acc.kind == "api_key"
-            ]
-            if settings.include_api_key_accounts
-            else []
+        # THE engine's own admission and order (`data.rank_switch_
+        # candidates`), never a second, hand-matched trigger/rank pass of
+        # this screen's own -- `ordered_accounts` (data.py) reads off the
+        # exact same call for every other account-listing screen.
+        ordered, rank_axis, trigger, unmodeled = data.rank_switch_candidates(
+            snap, settings, now, active_number
         )
-
-        def _trigger_for(
-            active_headroom: float | None, active_disabled: bool
-        ) -> str:
-            """Mirror `_tick_inner`'s own trigger classification (autoswitch.py)
-            closely enough for `_rank_candidates_pass`'s gates to engage the
-            way they would on a real tick. A key of `_UNMODELED_TEXT` means
-            no trigger this panel can derive reaches the pass on a real tick
-            at all -- the caller ranks nothing rather than guess.
-            """
-            # UNCONDITIONAL, before any headroom reading: `_tick_inner` checks
-            # `is_account_disabled(current)` first. Its own trigger name, not
-            # "at-limit"/"proactive": a disabled active is withdrawn from
-            # rotation, not merely blocked, so any readable candidate should
-            # rank, not just a healthy one.
-            if active_disabled:
-                return "disabled-active"
-            if active_headroom is None:
-                # NOT one honest trigger: real `failover` needs
-                # `settings.unhealthy_ticks` CONSECUTIVE unreadable ticks
-                # (plus an idle-hold grace on an expired token), state this
-                # one-shot render does not carry -- and the same unreadable
-                # headroom also covers no active at all, and an API-key
-                # active outside `include_api_key_accounts`. Cannot preview.
-                return "unreadable-active"
-            if settings.strategy == "dynamic":
-                kind = _classify_dynamic_trigger(active_headroom)
-                if kind != "at-limit":
-                    # `_tick_inner` never reaches `_rank_candidates_pass` for
-                    # "proactive"/"dynamic-healthy" under `dynamic` -- both
-                    # rank through the separate warm/cold `_rank_dynamic_
-                    # candidates` path instead (needs `last_active_at` engine
-                    # state this panel does not track). Only "at-limit"
-                    # reaches this pass for `dynamic`.
-                    return "dynamic-unmodeled"
-                return "at-limit"
-            if (100.0 - active_headroom) < settings.threshold:
-                if settings.strategy in CONSUME_FIRST_STRATEGIES:
-                    return settings.strategy
-                # Not a real trigger under any other strategy below the
-                # threshold: the engine emits `below-threshold` and returns
-                # NO_ACTION rather than reaching this pass at all -- the
-                # SAME "pass never ran" shape as `dynamic-unmodeled` above,
-                # just a different reason.
-                return "below-threshold"
-            return "at-limit" if active_headroom <= 0 else "proactive"
-
-        def _rank_on(
-            axis: tuple[str, ...], trigger: str
-        ) -> tuple[list[str], str | None]:
-            if trigger in _UNMODELED_TEXT:
-                return [], None
-            headroom = _headroom_by_account(usage, axis)
-            ordered, _any_known, _active_reset_ts, _waiting, rank_axis = rank_candidates_pass(
-                models=axis,
-                trigger=trigger,
-                consume_first=consume_first,
-                oauth_candidates=oauth_candidates,
-                no_return=None,
-                usage=usage,
-                headroom=headroom,
-                current=active_number,
-                active_headroom=headroom.get(active_number),
-                settings=settings,
-                now=now,
-            )
-            return ordered, rank_axis
-
-        # THE ENGINE'S OWN ADMISSION (`_rank_candidates_pass`), not a
-        # re-derived predicate: one trigger, classified once (mirroring
-        # `_tick_inner`'s own single classification), carried into both the
-        # model-gated pass and the 5h/7d retry below.
-        model_headroom = _headroom_by_account(usage, models)
-        active_account = next(
-            (acc for acc in snap.accounts if acc.number == active_number), None
-        )
-        active_disabled = (
-            active_account.disabled if active_account is not None else False
-        )
-        trigger = _trigger_for(
-            _dynamic_active_headroom(
-                settings, models, usage, active_number, model_headroom.get(active_number)
-            ),
-            active_disabled,
-        )
-        # A key of `_UNMODELED_TEXT`: the ranking pass never ran.
-        unmodeled = trigger in _UNMODELED_TEXT
-        ordered, rank_axis = _rank_on(models, trigger)
-        # The SAME retry `_rank_candidates` makes (`dynamic` only): drop the
-        # model set and re-rank on 5h/7d alone, but only when the model
-        # window is what is actually blocking every account, active
-        # included.
-        if (
-            not ordered and models and settings.strategy == "dynamic"
-            and _model_window_binds_everywhere(usage, models, settings.threshold)
-        ):
-            ordered, rank_axis = _rank_on((), trigger)
-        # THE SAME last resort `_tick_inner` takes (autoswitch.py :2600), else
-        # a real switch target reads "no candidate qualifies". Never for a
-        # below-threshold consume-first nudge (no weekly window to consume),
-        # and never when `unmodeled`: a real "below-threshold"/"dynamic-
-        # unmodeled"/"unreadable-active" tick returns NO_ACTION before :2600
-        # is ever reached (e.g. autoswitch.py :1945), so the fallback would
-        # itself be the false claim here.
-        if (
-            not ordered and api_key_candidates and not unmodeled
-            and trigger not in CONSUME_FIRST_STRATEGIES
-        ):
-            ordered, rank_axis = api_key_candidates, None
         ordered_rank = {num: i for i, num in enumerate(ordered)}
         for acc in snap.accounts:
             if acc.number == active_number:

@@ -26,6 +26,7 @@ from claude_swap.json_output import (
     USAGE_TOKEN_EXPIRED,
 )
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.settings import AutoSwitchSettings
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
@@ -1440,6 +1441,157 @@ class TestWatchScreen:
             app._update_refresh_status()
             await pilot.pause()
             assert "refreshing" in title.render().plain
+
+
+def _order_fixture_accounts():
+    """Active "3", usable "1", and three unusable -- disabled "2", 7d-full
+    "5", token-expired "4" -- in slot order 3,1,2,4,5."""
+    return [
+        make_account(3, active=True, entry=make_entry(95.0, 95.0)),
+        make_account(1, entry=make_entry(5.0, 5.0)),
+        make_account(2, entry=make_entry(20.0, 20.0), disabled=True),
+        make_account(4, entry=make_entry(sentinel=USAGE_TOKEN_EXPIRED)),
+        make_account(5, entry=make_entry(50.0, 100.0)),
+    ]
+
+
+_ORDER_SETTINGS = AutoSwitchSettings(strategy="best", threshold=90.0)
+
+
+class TestOrderedAccounts:
+    """One order every account-listing screen renders in -- never a second,
+    hand-matched key per screen (#371's own defect, repeated)."""
+
+    def test_matches_the_auto_switch_view_and_sorts_unusable_last(self):
+        from unittest.mock import MagicMock, patch
+
+        from claude_swap.tui.autoview import AutoScreen
+        from claude_swap.tui.theme import CSWAP_DARK
+
+        snap = AccountsSnapshot(
+            accounts=_order_fixture_accounts(), active_number="3", taken_at=0.0
+        )
+        now = time.time()
+        v = AutoScreen.__new__(AutoScreen)
+        v._settings = _ORDER_SETTINGS
+        app = MagicMock()
+        app.current_theme = CSWAP_DARK
+        with patch.object(AutoScreen, "app", property(lambda s: app)):
+            rendered = str(v._candidates_text(snap, active_number="3"))
+        autoview_order = sorted(
+            ("1", "2", "4", "5"), key=lambda n: rendered.index(f"user{n}@example.com")
+        )
+        order = tui_data.ordered_accounts(snap, _ORDER_SETTINGS, now)
+        assert order[0] == "3"  # active pinned first
+        assert order[1:] == autoview_order  # THE auto-switch view's own order
+        for unusable in ("2", "4", "5"):  # disabled / token-expired / 7d-full
+            assert order.index("1") < order.index(unusable)
+
+
+@pytest.mark.asyncio
+class TestSharedAccountOrder:
+    """The dashboard panel and the Switch/Watch list render the same order
+    `ordered_accounts` computes; Remove/Disable keep slot order and say so."""
+
+    async def test_dashboard_panel_follows_the_shared_order(self, tmp_path):
+        fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            panel = app.screen.query_one(AccountsPanel).render().plain
+            order = tui_data.ordered_accounts(
+                fake.accounts_snapshot(), app.auto_settings, time.time()
+            )
+            positions = [panel.index(f"user{n}@example.com") for n in order]
+            assert positions == sorted(positions)
+
+    async def test_switch_and_watch_lists_follow_the_shared_order(self, tmp_path):
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import AccountItem
+
+        for menu_id in ("switch", "watch"):
+            fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
+            app = make_app(fake)
+            async with app.run_test(size=(100, 40)) as pilot:
+                await settle(pilot)
+                await menu_select(pilot, menu_id)
+                await settle(pilot)
+                listview = app.screen.query_one("#accounts", ListView)
+                numbers = [item.number for item in listview.query(AccountItem)]
+                order = tui_data.ordered_accounts(
+                    fake.accounts_snapshot(), app.auto_settings, time.time()
+                )
+                assert numbers == order
+
+    async def test_remove_and_disable_menus_keep_slot_order_and_say_so(
+        self, tmp_path
+    ):
+        from textual.widgets import ListView, Static
+
+        from claude_swap.tui.widgets import MenuItem
+
+        fake = FakeSwitcher(_order_fixture_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            for menu_id, prefix in (("remove-menu", "remove:"), ("disable-menu", "disable:")):
+                await menu_select(pilot, menu_id)
+                await settle(pilot)
+                title = app.screen.query_one("#menu-title", Static).render().plain
+                assert "slot order" in title  # states the reason
+                menu = app.screen.query_one("#menu", ListView)
+                ids = [
+                    item.action_id for item in menu.query(MenuItem)
+                    if item.action_id.startswith(prefix)
+                ]
+                assert ids == [f"{prefix}3", f"{prefix}1", f"{prefix}2", f"{prefix}4", f"{prefix}5"]
+                await menu_select(pilot, "back")
+
+    async def test_switch_cursor_follows_the_account_when_order_changes(
+        self, tmp_path
+    ):
+        from textual.widgets import ListView
+
+        from claude_swap.tui.widgets import AccountItem
+
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(95.0, 95.0)),
+                make_account(2, entry=make_entry(30.0, 30.0)),
+                make_account(3, entry=make_entry(5.0, 5.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await settle(pilot)
+            await menu_select(pilot, "switch")
+            await settle(pilot)
+            listview = app.screen.query_one("#accounts", ListView)
+            before = [item.number for item in listview.query(AccountItem)]
+            assert before == ["1", "3", "2"]  # "3" (5%) ranks ahead of "2" (30%)
+            listview.index = before.index("2")  # cursor on the WORSE candidate
+
+            # Invert the ranking: "2" becomes the better candidate.
+            swapped = [
+                dataclasses.replace(a, usage=make_entry(5.0, 5.0))
+                if a.number == "2"
+                else dataclasses.replace(a, usage=make_entry(30.0, 30.0))
+                if a.number == "3"
+                else a
+                for a in fake._accounts
+            ]
+            app.snapshot = AccountsSnapshot(
+                active_number="1", accounts=tuple(swapped), taken_at=time.time()
+            )
+            await pilot.pause()
+
+            after = [item.number for item in listview.query(AccountItem)]
+            assert after == ["1", "2", "3"]  # the row order really flipped
+            assert listview.index == after.index("2")  # cursor followed "2"
 
 
 def fake_calls(app) -> list[tuple]:
