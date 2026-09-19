@@ -647,7 +647,10 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "this utilization (50-99.9; default 90). Under --strategy "
+            "dynamic the real switch point is fixed near 97%%; this value "
+            "still steers poll cadence and the exhausted-fleet recovery "
+            "hold"
         ),
     )
     parser.add_argument(

@@ -5431,7 +5431,7 @@ class TestAModelWindowIsNotABlackout:
 
 
 class TestALiveSpecimenNeverLandsOnAnAccountThatIsItselfWalled:
-    """The owner's own fleet (lmd42, 2026-09-08 ~01:2xZ, `dynamic`,
+    """The owner's own fleet (a live host, 2026-09-08 ~01:2xZ, `dynamic`,
     threshold 90, Fable pinned): active #3 is Fable-100 (walled on the
     model axis), and #7 clears the Fable axis (10%) but is ITSELF over the
     departure threshold on its own 5h (91%) -- genuinely unusable, would
@@ -7300,7 +7300,7 @@ class TestConsumeFirstStrategy:
         move. Reverted by gating that guard to `dynamic_landing`: a walled
         consume-first active still declines a candidate whose weekly reset
         is merely later, exactly as base. Prompted by
-        usage-census-2026-09-07 lmd42.md §9's 171-row reset-preference
+        the 2026-09-07 usage census's §9 171-row reset-preference
         bucket, but NOT a replay of it: that census's own rows, at their
         annotated threshold (90), already switch on this branch's floor
         without this guard (`TestUsageCensus20260907Replay`).
@@ -7718,7 +7718,7 @@ class TestConsumeFirstStrategy:
 
 
 class TestUsageCensus20260907Replay:
-    """usage-census-2026-09-07/lmd42.md §9 names 225 "reachable wall" rows
+    """The 2026-09-07 usage census §9 names 225 "reachable wall" rows
     and annotates every one "(trig 90)" -- the fleet's own printed
     threshold. Replayed at that SAME threshold (not the higher one
     ``test_walled_consume_first_still_holds_for_a_merely_later_reset``
@@ -7771,14 +7771,14 @@ class TestUsageCensus20260907Replay:
         return outcome, h
 
     def test_row_39_reset_preference(self, temp_home):
-        # lmd42.md §9 row 39: active #4 91% (0/64/91), best candidate #6
+        # usage census §9 row 39: active #4 91% (0/64/91), best candidate #6
         # (1/55/77). No candidate resets sooner -> old code declined.
         outcome, h = self._replay(temp_home, (0.0, 91.0), (1.0, 77.0))
         assert outcome is TickOutcome.SWITCHED, outcome
         assert h.active_number() == 2
 
     def test_row_171_reset_preference(self, temp_home):
-        # lmd42.md §9 row 171: active #4 100% (94/85/100), best candidate
+        # usage census §9 row 171: active #4 100% (94/85/100), best candidate
         # #2 (0/37/51).
         outcome, h = self._replay(
             temp_home, (94.0, 85.0, 100.0), (0.0, 37.0, 51.0), model="Fable"
@@ -7787,7 +7787,7 @@ class TestUsageCensus20260907Replay:
         assert h.active_number() == 2
 
     def test_row_224_reset_preference(self, temp_home):
-        # lmd42.md §9 row 224: active #4 100% (8/86/100), best candidate
+        # usage census §9 row 224: active #4 100% (8/86/100), best candidate
         # #2 (15/60/82).
         outcome, h = self._replay(
             temp_home, (8.0, 86.0, 100.0), (15.0, 60.0, 82.0), model="Fable"
