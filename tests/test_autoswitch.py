@@ -5994,10 +5994,20 @@ class TestDynamicStrategy:
         healthy on the strength of an unrelated account's headroom — the
         exact bug this round fixed (an active pinned on a real wall while
         a real Fable-healthy candidate sat idle). Account 5 still does not
-        depart, but now because account 7 is COLD (never active) and its
-        model-gated headroom (25) does not clear `cold_switch_cost_pct`
-        (#375's own floor, orthogonal to this fix) — not because the
-        re-pick manufactured a healthier reading for account 5.
+        depart -- account 7 IS cold (never active) but its model-gated
+        headroom (25) DOES clear `cold_switch_cost_pct` (20) and the
+        giveback bar (10 - 25, negative), so it is a real admissible
+        partner; the hold is dwell (`since` is never seeded, so it reads
+        `None` for the whole test -- no switch ever fires here to set it).
+
+        T0807 re-pin: before the cold fallback, a bar-clearing cold entry
+        could only enter `alternation_admissible` through the perishing
+        exemption (account 7's 7-day reset is 100h out, well after
+        account 5's ~14h, so that exemption never applied either) -- so
+        `partner` stayed `None` and the reason fell through to `cold`.
+        Now it is admitted directly and `partner is not None`, which reads
+        the same dwell-pending story `below-threshold` already tells for
+        a warm partner.
         """
         from claude_swap.autoswitch import _dynamic_active_headroom
 
@@ -6045,14 +6055,15 @@ class TestDynamicStrategy:
             "7's later-resetting weekly window must not admit it either"
         )
         assert h.active_number() == 5
-        # Every hold reads as `cold` (#375: `dynamic`'s proactive arm needs
-        # `about_to_wall` (SPENT_HEADROOM_PCT=3.0), and account 5's
-        # headroom (10, no longer widened by this round's fix) is nowhere
-        # near it either; account 7 is open but never active, so it lands
-        # cold and does not clear `cold_switch_cost_pct`) — never the
-        # plain-hysteresis "proactive" a fully-dropped re-pick would have
-        # taken (which would have switched to 7, not held).
-        assert all(r == "cold" for r in reasons), reasons
+        # T0807: every hold reads as `below-threshold` (#375: `dynamic`'s
+        # proactive arm needs `about_to_wall` (SPENT_HEADROOM_PCT=3.0),
+        # and account 5's headroom (10, no longer widened by this round's
+        # fix) is nowhere near it either; account 7 is a real admissible
+        # partner via the cold fallback, pending a dwell that never
+        # starts since no switch ever fires) — never the plain-hysteresis
+        # "proactive" a fully-dropped re-pick would have taken (which
+        # would have switched to 7, not held).
+        assert all(r == "below-threshold" for r in reasons), reasons
 
     def test_owner_fixture_holds_on_account_2_with_no_warm_partner(self, temp_home):
         """#375 superseded this fixture's premise: starting on account 2
@@ -6061,13 +6072,22 @@ class TestDynamicStrategy:
         never genuinely `about_to_wall` (headroom 6 > SPENT_HEADROOM_PCT's
         3). Under #375 `dynamic`'s proactive arm does not fire there, and
         no candidate is a warm alternation partner (none has ever been
-        active) — so the engine now holds on account 2."""
+        active) — so the engine now holds on account 2.
+
+        T0807: re-pinned, premise unchanged -- the fixture's five peers
+        (Fable 90/91/91/94%, headroom 10/9/9/6) are what the fallback now
+        makes reachable AT ALL (none was ever active, so every one of them
+        is cold), but every one of them is walled on the SAME Fable axis
+        the active reads on, and none clears `cold_switch_cost_pct`'s
+        20-point floor -- the fallback widens WHO is reachable, not WHAT
+        clears the bars, so the hold survives unchanged."""
         h = self._owner_harness(temp_home, active_num=2)
         fleet_usage = self._owner_fleet(h.clock.now)
         outcome = h.tick_with_usage(fleet_usage)
         assert outcome is TickOutcome.NO_ACTION, (
             f"got {outcome} — account 2's headroom (6) is not "
-            "`about_to_wall`, so #375's `dynamic` must not move"
+            "`about_to_wall`, and no peer clears the 20-point floor, so "
+            "#375/T0807's `dynamic` must not move"
         )
         assert h.active_number() == 2
 
@@ -6213,17 +6233,27 @@ class TestWarmthAndAlternation375:
     def test_f2_healthy_active_cold_candidate_above_floor_still_refused(
         self, temp_home
     ):
-        """Active not `about_to_wall` -- clearing the floor is not enough;
-        the reason is `cold` (refused: active not walled), distinct from
-        `below-floor` (refused: doesn't even clear the floor)."""
+        """Active not `about_to_wall` -- clearing the floor is not enough
+        on its own to switch.
+
+        T0807 re-pin: account 2 clears BOTH alternation bars now (floor
+        20, giveback 10 -- headroom 50 against the active's 22), so it is
+        a genuine admissible partner (`partner is not None`), not merely
+        a cold entry the old reason-classifier noticed in passing. `since`
+        is unseeded (`None`), so the hold is dwell-pending, same story
+        `below-threshold` already tells elsewhere -- `cold` used to be
+        the label because cold entries could only reach `alternation_
+        admissible` through the perishing exemption; now that the
+        ordinary bars admit them directly, this is no longer distinct
+        from a warm partner pending dwell."""
         h = self._harness(temp_home)
         outcome = h.tick_with_usage({
             "1": _usage(78.0) | {"seven_day": {"pct": 56.0}},
-            "2": _usage(50.0),  # cold, headroom 50 -- clears the floor easily
+            "2": _usage(50.0),  # cold, headroom 50 -- clears both bars
         })
         assert outcome is TickOutcome.NO_ACTION
         reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["cold"], reasons
+        assert reasons == ["below-threshold"], reasons
         assert h.active_number() == 1
 
     def test_m1_dynamic_healthy_hold_detail_has_no_false_comparison(
@@ -6359,7 +6389,16 @@ class TestWarmthAndAlternation375:
 
     def test_f4_a_partner_exactly_at_the_ttl_boundary_is_cold(self, temp_home):
         """m3: pin `_is_warm`'s `<`, not `<=` -- exactly `now - ttl` reads
-        cold. A mutant flipping the comparison must fail this."""
+        cold. A mutant flipping the comparison must fail this.
+
+        T0807: cold is no longer unreachable (the fallback admits it once
+        it clears the bars), so admission alone can no longer tell warm
+        from cold here -- `_is_warm`'s boundary now decides PREFERENCE:
+        account 3, genuinely cold (never active) but holding MORE
+        headroom, must win the pick over account 2 sitting exactly at the
+        TTL. If 2 read warm here it would sort ahead of 3 in `warm_ordered
+        + cold_ordered` despite the lower headroom -- that wrong pick is
+        what this test catches now."""
         h = self._harness(temp_home)
         ttl = h.engine.settings.cache_ttl_seconds
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -6367,16 +6406,29 @@ class TestWarmthAndAlternation375:
             "1": h.clock.now - chunk,   # past the chunk boundary already
             "2": h.clock.now - ttl,     # exactly at the TTL -- cold
         })
-        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
-        assert outcome is TickOutcome.NO_ACTION, (
-            f"got {outcome} — a partner exactly at the TTL boundary is "
-            "cold, never a warm alternation pick"
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),
+            "2": _usage(30.0),   # cold, headroom 70
+            "3": _usage(10.0),   # cold too (never active), headroom 90 -- more
+        })
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a cold peer clearing the bars is reachable "
+            "now regardless of warmth"
         )
-        assert h.active_number() == 1
+        assert h.active_number() == 3, (
+            f"landed on {h.active_number()} — account 2 sitting exactly "
+            "at the TTL boundary must not outrank account 3's real (and "
+            "greater) headroom by being misread as warm"
+        )
 
     def test_f4_a_partner_one_second_inside_the_ttl_is_warm(self, temp_home):
         """m3's other half: one second inside the boundary must still be
-        warm -- pins the same `<` from the other side."""
+        warm -- pins the same `<` from the other side.
+
+        T0807: account 3, genuinely cold (never active) and holding MORE
+        headroom than account 2, is added so the pin is on PREFERENCE, not
+        admission -- account 2 (warm) must still win the pick over a
+        richer cold rival, or `warm_ordered`'s priority is broken."""
         h = self._harness(temp_home)
         ttl = h.engine.settings.cache_ttl_seconds
         chunk = h.engine.settings.alternation_chunk_seconds
@@ -6384,12 +6436,96 @@ class TestWarmthAndAlternation375:
             "1": h.clock.now - chunk,       # past the chunk boundary already
             "2": h.clock.now - ttl + 1.0,   # one second inside -- warm
         })
-        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(30.0)})
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),
+            "2": _usage(30.0),   # warm, headroom 70
+            "3": _usage(10.0),   # cold (never active), headroom 90 -- more
+        })
         assert outcome is TickOutcome.SWITCHED, (
             f"got {outcome} — a partner one second inside the TTL must "
             "still be a warm alternation pick"
         )
+        assert h.active_number() == 2, (
+            f"landed on {h.active_number()} — the warm partner must win "
+            "over a cold rival with more headroom"
+        )
+
+    # -- T0807: a lapsed rotation restarts on a cold partner --------------
+
+    def test_bootstrap_alternation_restarts_on_a_cold_partner(self, temp_home):
+        """T0807: `alternation_admissible` used to be warm-only (plus the
+        perishing exemption), so a peer that has NEVER been active -- no
+        `last_active_at` entry at all, permanently cold -- was unreachable
+        by alternation no matter how much real headroom it carried; once
+        every warm partner cooled past the TTL the rotation could never
+        restart. Seeding only the ACTIVE's own arrival stamp (`last_
+        active_at` carries the current account alone) isolates the dwell
+        gate from the fix under test: the peer stays genuinely cold and
+        must still be taken once it clears both bars (floor 20, giveback
+        10)."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        usage = {"1": _usage(50.0), "2": _usage(55.0)}  # headroom 50 / 45
+
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — a cold peer clearing both bars must restart "
+            "the rotation once no warm partner is admissible"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
         assert h.active_number() == 2
+
+        h.clock.advance(chunk)
+        outcome = h.tick_with_usage(usage)
+        assert outcome is TickOutcome.SWITCHED, (
+            f"got {outcome} — account 1 was stamped warm on departure, so "
+            "the return leg is ordinary warm alternation"
+        )
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "alternation", sw.trigger
+        assert h.active_number() == 1
+        state = h.state()
+        ttl = h.engine.settings.cache_ttl_seconds
+        assert h.clock.now - state["lastActiveAt"]["2"] < ttl, (
+            "both revisits must land inside cache_ttl_seconds"
+        )
+
+    def test_control_no_qualifying_cold_peer_holds(self, temp_home):
+        """CONTROL: a cold peer that never clears `cold_switch_cost_pct`
+        must still hold, even though the fallback now reaches cold
+        entries -- the fallback widens WHO is reachable, never WHAT
+        clears the bars."""
+        h = self._harness(temp_home)
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        outcome = h.tick_with_usage({
+            "1": _usage(50.0),  # active, headroom 50, healthy
+            "2": _usage(90.0),  # cold, headroom 10 -- below the 20pt floor
+        })
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — a cold peer below the floor must not be "
+            "taken just because the fallback now reaches cold entries"
+        )
+        assert h.active_number() == 1
+
+    def test_policy_non_dynamic_strategy_never_alternates(self, temp_home):
+        """POLICY: the bootstrap fixture above, unchanged, under a non-
+        `dynamic` strategy -- `alternation` is `dynamic`-only, so no
+        switch fires at the chunk boundary regardless of the cold
+        fallback."""
+        h = self._harness(temp_home)
+        h.engine.settings = replace(h.engine.settings, strategy="best")
+        chunk = h.engine.settings.alternation_chunk_seconds
+        self._seed_last_active_at(h, {"1": h.clock.now - chunk})
+        outcome = h.tick_with_usage({"1": _usage(50.0), "2": _usage(55.0)})
+        assert outcome is TickOutcome.NO_ACTION, (
+            f"got {outcome} — `alternation` must not fire for a "
+            "non-`dynamic` strategy"
+        )
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert h.active_number() == 1
 
     # -- no-return bar on the proactive/about_to_wall arm -----------------
 

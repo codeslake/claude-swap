@@ -2283,17 +2283,23 @@ class AutoSwitchEngine:
             # both bars and from the warm-only sourcing (it may come from
             # `cold_ordered`); it still had to clear `SPENT_HEADROOM_PCT`
             # to reach either list at all.
+            #
+            # T0758 follow-up: `warm_ordered + cold_ordered`, warm first, so
+            # a lapsed rotation (no partner has switched inside the TTL,
+            # `warm_ordered` empty) restarts on a cold one rather than
+            # holding forever -- `_is_warm` still decides which tier a
+            # candidate sorts into, but no longer whether it is reachable at
+            # all. Both bars gate the cold half exactly as they already gate
+            # the warm half; a live rotation is unchanged because `next(iter(
+            # ...))` still finds its warm partner first in the concatenation.
             alternation_admissible = [
-                n for n in warm_ordered
+                n for n in warm_ordered + cold_ordered
                 if (
                     floor_headroom.get(n, 0.0) >= settings.cold_switch_cost_pct
                     and floor_headroom.get(current, 0.0) - floor_headroom.get(n, 0.0)
                     <= ALTERNATION_MAX_GIVEBACK_PCT
                 )
                 or _perishes_before_active(usage.get(n), usage.get(current), now)
-            ] + [
-                n for n in cold_ordered
-                if _perishes_before_active(usage.get(n), usage.get(current), now)
             ]
             partner = next(iter(alternation_admissible), None)
             since = last_active_at.get(current)
